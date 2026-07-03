@@ -38,6 +38,55 @@ fn schedule_after_uses_current_time() {
 }
 
 #[test]
+fn advance_to_updates_current_time() {
+    let mut scheduler = Scheduler::<&str>::new();
+
+    scheduler.advance_to(SimTime::new(11)).unwrap();
+    assert_eq!(scheduler.now(), SimTime::new(11));
+
+    scheduler.advance_to(SimTime::new(11)).unwrap();
+    assert_eq!(scheduler.now(), SimTime::new(11));
+}
+
+#[test]
+fn advance_to_rejects_past_time() {
+    let mut scheduler = Scheduler::<&str>::new();
+
+    scheduler.advance_to(SimTime::new(8)).unwrap();
+
+    assert_eq!(
+        scheduler.advance_to(SimTime::new(7)),
+        Err(SchedulerError::EventInPast {
+            now: SimTime::new(8),
+            time: SimTime::new(7),
+        })
+    );
+}
+
+#[test]
+fn schedule_after_uses_advanced_time() {
+    let mut scheduler = Scheduler::new();
+
+    scheduler.advance_to(SimTime::new(20)).unwrap();
+    scheduler
+        .schedule_after(SimDuration::new(5), TARGET, "after")
+        .unwrap();
+
+    assert_eq!(scheduler.pop_next().unwrap().time, SimTime::new(25));
+}
+
+#[test]
+fn zero_delay_event_is_allowed() {
+    let mut scheduler = Scheduler::new();
+
+    scheduler
+        .schedule_after(SimDuration::ZERO, TARGET, "zero")
+        .unwrap();
+
+    assert_eq!(scheduler.pop_next().unwrap().time, SimTime::ZERO);
+}
+
+#[test]
 fn rejects_events_before_current_time() {
     let mut scheduler = Scheduler::new();
 

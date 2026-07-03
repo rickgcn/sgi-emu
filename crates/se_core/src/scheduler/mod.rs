@@ -1,8 +1,13 @@
 //! Event scheduling and simulated time.
 //!
-//! The scheduler owns simulated time and determines when events are delivered.
-//! It provides deterministic ordering for delayed hardware behavior without
-//! requiring components to call each other directly.
+//! The scheduler owns internal simulated time and determines when events are
+//! delivered. It provides deterministic ordering for delayed hardware behavior
+//! without requiring components to call each other directly.
+//!
+//! Simulated time is not host wall-clock time. The scheduler does not use
+//! [`std::time::Instant`], sleeping, or real-time pacing. A machine profile may
+//! define the physical meaning of one [`SimTime`] tick, but the scheduler treats
+//! it as an opaque monotonic integer.
 //!
 //! Events are data, not callbacks. The scheduler stores an event payload, its
 //! target component, and the simulated time when it becomes ready. Runtime code
@@ -22,7 +27,8 @@ use crate::component::ComponentId;
 /// Absolute simulated time.
 ///
 /// The scheduler treats this value as an opaque integer tick. A machine model
-/// may define what one tick means for its own timing domain.
+/// may define what one tick means for its own timing domain. The unit is part
+/// of the machine timing ABI, not a runtime scheduler setting.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SimTime(u64);
 
@@ -206,6 +212,23 @@ impl<E> Scheduler<E> {
     /// Returns the delivery time of the next event without removing it.
     pub fn peek_next_time(&self) -> Option<SimTime> {
         self.queue.peek().map(|event| event.inner.time)
+    }
+
+    /// Advances simulated time without delivering events.
+    ///
+    /// This is used by runtimes that advance to an externally selected
+    /// simulated-time boundary. It never dispatches events, creates events, or
+    /// changes event ordering.
+    pub fn advance_to(&mut self, time: SimTime) -> Result<(), SchedulerError> {
+        if time < self.now {
+            return Err(SchedulerError::EventInPast {
+                now: self.now,
+                time,
+            });
+        }
+
+        self.now = time;
+        Ok(())
     }
 
     /// Schedules an event at an absolute simulated time.
