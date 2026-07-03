@@ -7,6 +7,14 @@ name = "se_core"
 version = "0.1.0"
 
 [[package]]
+name = "se_machine"
+version = "0.1.0"
+dependencies = [
+ "se_core",
+ "se_runtime",
+]
+
+[[package]]
 name = "se_runtime"
 version = "0.1.0"
 dependencies = [
