@@ -5,4 +5,6 @@
 //! machine-specific reset wiring.
 
 pub mod config;
+pub mod exception;
+pub mod gpr;
 pub mod instruction;
