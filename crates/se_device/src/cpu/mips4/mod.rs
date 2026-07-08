@@ -4,6 +4,7 @@
 //! not define a concrete processor package, board integration, bus timing, or
 //! machine-specific reset wiring.
 
+pub mod alu;
 pub mod config;
 pub mod exception;
 pub mod gpr;
