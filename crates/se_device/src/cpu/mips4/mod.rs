@@ -15,4 +15,5 @@ pub mod gpr;
 pub mod instruction;
 pub mod memory;
 pub mod mmu;
+pub mod model;
 pub mod tlb;
