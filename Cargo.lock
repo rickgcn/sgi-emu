@@ -25,6 +25,9 @@ version = "0.1.0"
 [[package]]
 name = "se_device"
 version = "0.1.0"
+dependencies = [
+ "se_float",
+]
 
 [[package]]
 name = "se_float"
