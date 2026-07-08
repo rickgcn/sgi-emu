@@ -10,3 +10,4 @@ pub mod config;
 pub mod exception;
 pub mod gpr;
 pub mod instruction;
+pub mod memory;
