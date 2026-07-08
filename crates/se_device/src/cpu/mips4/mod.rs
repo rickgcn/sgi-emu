@@ -5,6 +5,7 @@
 //! machine-specific reset wiring.
 
 pub mod alu;
+pub mod branch;
 pub mod config;
 pub mod exception;
 pub mod gpr;
