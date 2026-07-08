@@ -8,6 +8,7 @@ pub mod alu;
 pub mod branch;
 pub mod cache;
 pub mod config;
+pub mod cp0;
 pub mod exception;
 pub mod gpr;
 pub mod instruction;
