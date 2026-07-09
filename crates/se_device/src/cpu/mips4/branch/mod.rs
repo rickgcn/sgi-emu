@@ -156,6 +156,32 @@ impl Mips4Branch {
         linked_branch(branch_pc, Self::bgezl(branch_pc, value, offset))
     }
 
+    /// Evaluates `BC1F`.
+    ///
+    /// `fcc` is the floating-point condition code bit selected by the instruction
+    /// (`FCC[cc]`); the branch is taken when the condition code is false.
+    pub const fn bc1f(branch_pc: u64, fcc: bool, offset: i16) -> Mips4BranchDecision {
+        conditional_branch(branch_pc, !fcc, offset, false)
+    }
+
+    /// Evaluates `BC1T`.
+    ///
+    /// `fcc` is the floating-point condition code bit selected by the instruction
+    /// (`FCC[cc]`); the branch is taken when the condition code is true.
+    pub const fn bc1t(branch_pc: u64, fcc: bool, offset: i16) -> Mips4BranchDecision {
+        conditional_branch(branch_pc, fcc, offset, false)
+    }
+
+    /// Evaluates `BC1FL`, nullifying the delay slot when the branch is not taken.
+    pub const fn bc1fl(branch_pc: u64, fcc: bool, offset: i16) -> Mips4BranchDecision {
+        conditional_branch(branch_pc, !fcc, offset, true)
+    }
+
+    /// Evaluates `BC1TL`, nullifying the delay slot when the branch is not taken.
+    pub const fn bc1tl(branch_pc: u64, fcc: bool, offset: i16) -> Mips4BranchDecision {
+        conditional_branch(branch_pc, fcc, offset, true)
+    }
+
     /// Evaluates `J`.
     pub const fn j(branch_pc: u64, target: u32) -> Mips4BranchDecision {
         Mips4BranchDecision::taken(jump_target(branch_pc, target))

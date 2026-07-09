@@ -122,3 +122,63 @@ fn register_jumps_reject_unaligned_targets() {
         Err(Mips4Exception::AddressErrorLoad)
     );
 }
+
+#[test]
+fn bc1_branches_take_on_matching_condition_without_nullifying_normal_delay_slots() {
+    assert_eq!(
+        Mips4Branch::bc1f(0x1000, false, 2),
+        Mips4BranchDecision::Taken {
+            target: 0x100c,
+            nullify_delay_slot: false,
+        }
+    );
+    assert_eq!(
+        Mips4Branch::bc1f(0x1000, true, 2),
+        Mips4BranchDecision::NotTaken {
+            nullify_delay_slot: false,
+        }
+    );
+    assert_eq!(
+        Mips4Branch::bc1t(0x1000, true, 2),
+        Mips4BranchDecision::Taken {
+            target: 0x100c,
+            nullify_delay_slot: false,
+        }
+    );
+    assert_eq!(
+        Mips4Branch::bc1t(0x1000, false, 2),
+        Mips4BranchDecision::NotTaken {
+            nullify_delay_slot: false,
+        }
+    );
+}
+
+#[test]
+fn bc1_likely_branches_nullify_only_when_not_taken() {
+    assert_eq!(
+        Mips4Branch::bc1fl(0x1000, false, 2),
+        Mips4BranchDecision::Taken {
+            target: 0x100c,
+            nullify_delay_slot: false,
+        }
+    );
+    assert_eq!(
+        Mips4Branch::bc1fl(0x1000, true, 2),
+        Mips4BranchDecision::NotTaken {
+            nullify_delay_slot: true,
+        }
+    );
+    assert_eq!(
+        Mips4Branch::bc1tl(0x1000, true, 2),
+        Mips4BranchDecision::Taken {
+            target: 0x100c,
+            nullify_delay_slot: false,
+        }
+    );
+    assert_eq!(
+        Mips4Branch::bc1tl(0x1000, false, 2),
+        Mips4BranchDecision::NotTaken {
+            nullify_delay_slot: true,
+        }
+    );
+}
