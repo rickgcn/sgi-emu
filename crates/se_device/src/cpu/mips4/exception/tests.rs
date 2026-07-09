@@ -86,3 +86,39 @@ fn coprocessor_access_gate_returns_unusable_exception_when_disabled() {
         })
     );
 }
+
+#[test]
+fn restart_resumes_at_instruction_pc_when_not_in_delay_slot() {
+    let restart = Mips4ExceptionRestart::new(0x1000, None);
+    assert!(!restart.in_branch_delay_slot);
+    assert_eq!(restart.restart_pc, 0x1000);
+}
+
+#[test]
+fn restart_resumes_at_branch_pc_when_in_delay_slot() {
+    let restart = Mips4ExceptionRestart::new(0x1008, Some(0x1000));
+    assert!(restart.in_branch_delay_slot);
+    assert_eq!(restart.restart_pc, 0x1000);
+}
+
+#[test]
+fn exception_image_records_reason_restart_and_bad_address() {
+    let restart = Mips4ExceptionRestart::new(0x2000, None);
+    let image = Mips4ExceptionImage::new(Mips4Exception::TlbLoad, restart, Some(0xdead_beef));
+
+    assert_eq!(image.reason, Mips4Exception::TlbLoad);
+    assert_eq!(image.reason.cause_code(), 2);
+    assert_eq!(image.restart, restart);
+    assert_eq!(image.bad_virtual_address, Some(0xdead_beef));
+}
+
+#[test]
+fn exception_image_supports_exceptions_without_a_bad_address() {
+    let image = Mips4ExceptionImage::new(
+        Mips4Exception::ArithmeticOverflow,
+        Mips4ExceptionRestart::new(0x3000, None),
+        None,
+    );
+    assert_eq!(image.reason.cause_code(), 12);
+    assert_eq!(image.bad_virtual_address, None);
+}

@@ -133,5 +133,77 @@ pub const fn check_coprocessor_access(
     }
 }
 
+/// Restart metadata for an excepting instruction.
+///
+/// Records the branch delay-slot flag (`Cause.BD`) and the program counter at
+/// which execution resumes after the exception (`EPC`). When the excepting
+/// instruction is in a branch delay slot, the exception resumes at the branch
+/// instruction so it is re-executed; otherwise it resumes at the excepting
+/// instruction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mips4ExceptionRestart {
+    /// Whether the excepting instruction executes in a branch delay slot.
+    pub in_branch_delay_slot: bool,
+
+    /// Program counter at which execution resumes after the exception.
+    pub restart_pc: u64,
+}
+
+impl Mips4ExceptionRestart {
+    /// Creates restart metadata for an excepting instruction.
+    ///
+    /// `branch_pc` is `Some(branch_instruction_pc)` when the excepting
+    /// instruction is in a branch delay slot; the exception resumes at the
+    /// branch with the delay-slot flag set. When `branch_pc` is `None`, the
+    /// exception resumes at `instruction_pc`.
+    pub const fn new(instruction_pc: u64, branch_pc: Option<u64>) -> Self {
+        match branch_pc {
+            Some(branch_pc) => Self {
+                in_branch_delay_slot: true,
+                restart_pc: branch_pc,
+            },
+            None => Self {
+                in_branch_delay_slot: false,
+                restart_pc: instruction_pc,
+            },
+        }
+    }
+}
+
+/// Immutable image of a signalled exception.
+///
+/// This is the manual `SignalException` shape expressed as a pure result: it
+/// records the exception reason, restart metadata, and an optional bad virtual
+/// address. It does not write CP0 registers (`EPC`, `Cause`, `BadVAddr`),
+/// select an exception vector, or mutate architectural state. A processor model
+/// or execution layer consumes the image to update CP0 and vector to the
+/// handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mips4ExceptionImage {
+    /// Reason for the exception.
+    pub reason: Mips4Exception,
+
+    /// Restart metadata recording the delay-slot flag and resume program counter.
+    pub restart: Mips4ExceptionRestart,
+
+    /// Bad virtual address for address-related exceptions, when applicable.
+    pub bad_virtual_address: Option<u64>,
+}
+
+impl Mips4ExceptionImage {
+    /// Creates an exception image from its reason, restart metadata, and optional bad address.
+    pub const fn new(
+        reason: Mips4Exception,
+        restart: Mips4ExceptionRestart,
+        bad_virtual_address: Option<u64>,
+    ) -> Self {
+        Self {
+            reason,
+            restart,
+            bad_virtual_address,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
