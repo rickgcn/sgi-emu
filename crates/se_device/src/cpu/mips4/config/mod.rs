@@ -16,6 +16,25 @@ pub enum Mips4Endianness {
     Little,
 }
 
+impl Mips4Endianness {
+    /// Resolves the effective CPU byte order from the memory endianness and the
+    /// reverse-endian signal.
+    ///
+    /// This mirrors the manual relation
+    /// `BigEndianCPU = BigEndianMem XOR ReverseEndian` (MIPS IV manual section
+    /// A.5, Table A-25). `BigEndianMem` is the reset-configured memory byte order
+    /// carried by this value; `reverse_endian` is the `ReverseEndian` signal,
+    /// which the caller must gate on User mode because the `RE` Status bit only
+    /// takes effect in User mode. When `reverse_endian` is set, the effective CPU
+    /// byte order is the opposite of the memory byte order.
+    pub const fn effective_cpu_endianness(self, reverse_endian: bool) -> Self {
+        match (self, reverse_endian) {
+            (Self::Big, false) | (Self::Little, true) => Self::Big,
+            (Self::Big, true) | (Self::Little, false) => Self::Little,
+        }
+    }
+}
+
 /// Cache configuration visible to a MIPS IV processor model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mips4CacheConfig {

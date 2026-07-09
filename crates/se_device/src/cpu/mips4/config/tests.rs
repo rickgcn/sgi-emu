@@ -80,3 +80,23 @@ fn disabled_cache_has_no_geometry() {
     assert_eq!(cache.size_bytes(), None);
     assert_eq!(cache.line_size_bytes(), None);
 }
+
+#[test]
+fn effective_cpu_endianness_applies_reverse_endian_xor() {
+    assert_eq!(
+        Mips4Endianness::Big.effective_cpu_endianness(false),
+        Mips4Endianness::Big
+    );
+    assert_eq!(
+        Mips4Endianness::Big.effective_cpu_endianness(true),
+        Mips4Endianness::Little
+    );
+    assert_eq!(
+        Mips4Endianness::Little.effective_cpu_endianness(false),
+        Mips4Endianness::Little
+    );
+    assert_eq!(
+        Mips4Endianness::Little.effective_cpu_endianness(true),
+        Mips4Endianness::Big
+    );
+}
