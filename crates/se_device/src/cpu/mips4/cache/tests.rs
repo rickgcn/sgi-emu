@@ -35,6 +35,14 @@ fn memory_access_type_helpers_classify_generic_access_types() {
 }
 
 #[test]
+fn memory_access_type_synchronizability_matches_sync_restriction() {
+    assert!(Mips4MemoryAccessType::Uncached.is_synchronizable());
+    assert!(Mips4MemoryAccessType::CachedCoherent.is_synchronizable());
+    assert!(!Mips4MemoryAccessType::CachedNoncoherent.is_synchronizable());
+    assert!(!Mips4MemoryAccessType::ImplementationSpecific.is_synchronizable());
+}
+
+#[test]
 fn cache_instruction_decodes_only_cache_opcode() {
     let bits = ((MIPS4_CACHE_OPCODE as u32) << 26) | (4 << 21) | (0x15 << 16) | 0xfffc;
     let instruction = Mips4CacheInstruction::from_bits(bits).unwrap();

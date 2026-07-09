@@ -53,6 +53,18 @@ impl Mips4MemoryAccessType {
     pub const fn is_ll_sc_eligible(self) -> bool {
         self.is_cached()
     }
+
+    /// Returns whether `SYNC` orders loads and stores of this access type.
+    ///
+    /// The manual restricts `SYNC` ordering to synchronizable accesses: loads and
+    /// stores to shared memory using an uncached or cached coherent access type
+    /// (MIPS IV manual section A.2, Table A-19). This must be evaluated on a
+    /// processor-model resolved concrete access type; the base layer resolves raw
+    /// cached CCAs to [`Self::ImplementationSpecific`], which is not synchronizable
+    /// until a model refines it.
+    pub const fn is_synchronizable(self) -> bool {
+        matches!(self, Self::Uncached | Self::CachedCoherent)
+    }
 }
 
 /// Raw 3-bit cache-coherence algorithm value.

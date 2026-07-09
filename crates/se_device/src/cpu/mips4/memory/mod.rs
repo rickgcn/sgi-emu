@@ -7,6 +7,7 @@
 
 pub mod ll_sc;
 pub mod operation;
+pub mod sync;
 
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::exception::Mips4Exception;
