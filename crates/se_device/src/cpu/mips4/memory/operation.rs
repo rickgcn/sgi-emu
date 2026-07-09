@@ -227,17 +227,24 @@ pub struct Mips4Prefetch {
 
 /// Result of resolving a prefetch operation.
 ///
-/// The manual states that `PREF` never generates a memory operation for an
-/// uncached location and that it ignores addressing-related exceptions. Both
-/// cases collapse to [`Self::NoOperation`]; only a translated, prefetchable
-/// location produces a [`Self::Request`].
+/// This only reflects whether address translation succeeded; it does not decide
+/// cacheability. The manual states that `PREF` never generates a memory
+/// operation for an uncached location, but whether a raw cache-coherence
+/// algorithm resolves to uncached is processor-specific (see
+/// [`Mips4MmuCacheAttribute::memory_access_type`]). The caller must resolve the
+/// request's cache attribute to a [`Mips4MemoryAccessType`] using a
+/// processor-specific CCA policy and skip the prefetch when that resolves to
+/// uncached.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mips4PrefetchResult {
-    /// Translation succeeded for a prefetchable (non-uncached) location.
+    /// Translation succeeded. The caller resolves the cache attribute to a
+    /// memory access type and performs the advisory prefetch only when the
+    /// location is not uncached.
     Request(Mips4Prefetch),
 
-    /// No prefetch occurs: translation faulted, multiple TLB entries matched, or
-    /// the location is uncached. No exception is raised.
+    /// No prefetch occurs because translation faulted or multiple TLB entries
+    /// matched. Addressing-related exceptions are ignored, so no exception is
+    /// raised.
     NoOperation,
 }
 
@@ -247,8 +254,11 @@ impl Mips4Prefetch {
     /// `virtual_address` is the already-computed effective address. Translation
     /// uses the `LOAD` access kind, matching the manual `PREF` operation. No
     /// alignment check is performed because `PREF` ignores addressing
-    /// exceptions; a translation fault or an uncached location yields
-    /// [`Mips4PrefetchResult::NoOperation`].
+    /// exceptions; a translation fault or multiple TLB match yields
+    /// [`Mips4PrefetchResult::NoOperation`]. This helper does not decide
+    /// cacheability: a successful translation always produces a
+    /// [`Mips4PrefetchResult::Request`] carrying the cache attribute, and the
+    /// caller resolves it and skips the prefetch for an uncached location.
     pub fn prepare(
         virtual_address: u64,
         hint: Mips4PrefetchHint,
@@ -265,18 +275,12 @@ impl Mips4Prefetch {
             virtual_address,
             Mips4TlbAccessKind::Load,
         ) {
-            Mips4MmuTranslationResult::Hit(translation) => {
-                if translation.cache_attribute.is_uncached() {
-                    Mips4PrefetchResult::NoOperation
-                } else {
-                    Mips4PrefetchResult::Request(Self {
-                        virtual_address,
-                        physical_address: translation.physical_address,
-                        hint,
-                        cache_attribute: translation.cache_attribute,
-                    })
-                }
-            }
+            Mips4MmuTranslationResult::Hit(translation) => Mips4PrefetchResult::Request(Self {
+                virtual_address,
+                physical_address: translation.physical_address,
+                hint,
+                cache_attribute: translation.cache_attribute,
+            }),
             Mips4MmuTranslationResult::Fault(_)
             | Mips4MmuTranslationResult::UndefinedMultipleTlbMatch { .. } => {
                 Mips4PrefetchResult::NoOperation
@@ -537,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_requests_cached_location() {
+    fn prefetch_request_carries_translated_address_and_cache_attribute() {
         let request = Mips4Prefetch::prepare(
             KSEG0_BASE,
             Mips4PrefetchHint::Load,
@@ -547,27 +551,35 @@ mod tests {
             &[],
         );
         let Mips4PrefetchResult::Request(prefetch) = request else {
-            panic!("expected prefetch request for cached location");
+            panic!("expected prefetch request for translated location");
         };
         assert_eq!(prefetch.virtual_address, KSEG0_BASE);
-        assert_eq!(prefetch.physical_address, 0);
+        assert_eq!(
+            prefetch.physical_address,
+            KSEG0_BASE.wrapping_sub(KSEG0_BASE)
+        );
         assert_eq!(prefetch.hint, Mips4PrefetchHint::Load);
+        // kseg0 carries a raw cache-coherence algorithm; the caller resolves it.
         assert!(!prefetch.cache_attribute.is_uncached());
     }
 
     #[test]
-    fn prefetch_is_no_operation_for_uncached_location() {
-        assert_eq!(
-            Mips4Prefetch::prepare(
-                KSEG1_BASE,
-                Mips4PrefetchHint::Store,
-                mmu_config(),
-                kernel_status(),
-                ASID,
-                &[],
-            ),
-            Mips4PrefetchResult::NoOperation
+    fn prefetch_request_carries_uncached_attribute_without_filtering_it() {
+        // kseg1 is architecturally uncached, but the base layer does not decide
+        // cacheability; it hands the uncached attribute to the caller.
+        let request = Mips4Prefetch::prepare(
+            KSEG1_BASE,
+            Mips4PrefetchHint::Store,
+            mmu_config(),
+            kernel_status(),
+            ASID,
+            &[],
         );
+        let Mips4PrefetchResult::Request(prefetch) = request else {
+            panic!("expected prefetch request carrying the uncached attribute");
+        };
+        assert_eq!(prefetch.virtual_address, KSEG1_BASE);
+        assert!(prefetch.cache_attribute.is_uncached());
     }
 
     #[test]
