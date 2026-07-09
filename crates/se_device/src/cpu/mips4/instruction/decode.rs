@@ -4,6 +4,9 @@
 //! tables. It does not execute instructions, read architectural state, or apply
 //! processor-specific COP0 behavior.
 
+use crate::cpu::mips4::alu::{
+    Mips4AluClassification, Mips4AluDivideUndefined, Mips4AluOperandWidth, Mips4AluOperation,
+};
 use crate::cpu::mips4::exception::{Mips4CoprocessorNumber, Mips4SystemExceptionKind};
 use crate::cpu::mips4::instruction::Mips4Instruction;
 
@@ -482,6 +485,139 @@ impl Mips4CpuInstruction {
             _ => None,
         }
     }
+
+    /// Classifies this instruction as an integer computational or conditional-move
+    /// operation.
+    ///
+    /// Returns `Some` for every `Mips4CpuInstruction` variant backed by a
+    /// `Mips4Alu` helper: the ALU immediate, 3-operand ALU, shift, and
+    /// multiply/divide/`HI`-`LO` instructions (manual tables A-8 through A-11) plus
+    /// the `MOVN`/`MOVZ` conditional moves (manual table A-20). The classification
+    /// connects the decoded instruction to its `Mips4Alu` helper family and, for
+    /// the A-8..A-11 computational ops, the manual's `NotWordValue`, overflow, and
+    /// `UndefinedResult` rules (manual section A.6); conditional moves carry no
+    /// such rules. Returns `None` for any other CPU instruction. The ALU layer
+    /// owns the classification so this method does not require a dependency from
+    /// the ALU layer back to the decode layer.
+    pub const fn alu_classification(self) -> Option<Mips4AluClassification> {
+        match self {
+            Self::Add | Self::Addi | Self::Sub => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Arithmetic,
+                width: Mips4AluOperandWidth::Word,
+                traps_on_overflow: true,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            Self::Addu | Self::Addiu | Self::Subu => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Arithmetic,
+                width: Mips4AluOperandWidth::Word,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            Self::Dadd | Self::Daddi | Self::Dsub => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Arithmetic,
+                width: Mips4AluOperandWidth::Doubleword,
+                traps_on_overflow: true,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            Self::Daddu | Self::Daddiu | Self::Dsubu => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Arithmetic,
+                width: Mips4AluOperandWidth::Doubleword,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            Self::And | Self::Andi | Self::Or | Self::Ori | Self::Xor | Self::Xori | Self::Nor => {
+                Some(Mips4AluClassification {
+                    operation: Mips4AluOperation::Logical,
+                    width: Mips4AluOperandWidth::WidthInsensitive,
+                    traps_on_overflow: false,
+                    divide_undefined: Mips4AluDivideUndefined::None,
+                })
+            }
+            Self::Lui => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::LoadUpperImmediate,
+                width: Mips4AluOperandWidth::WidthInsensitive,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            Self::Sll | Self::Srl | Self::Sra | Self::Sllv | Self::Srlv | Self::Srav => {
+                Some(Mips4AluClassification {
+                    operation: Mips4AluOperation::Shift,
+                    width: Mips4AluOperandWidth::Word,
+                    traps_on_overflow: false,
+                    divide_undefined: Mips4AluDivideUndefined::None,
+                })
+            }
+            Self::Dsll
+            | Self::Dsrl
+            | Self::Dsra
+            | Self::Dsll32
+            | Self::Dsrl32
+            | Self::Dsra32
+            | Self::Dsllv
+            | Self::Dsrlv
+            | Self::Dsrav => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Shift,
+                width: Mips4AluOperandWidth::Doubleword,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            Self::Slt | Self::Slti | Self::Sltu | Self::Sltiu => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Compare,
+                width: Mips4AluOperandWidth::WidthInsensitive,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            Self::Mult | Self::Multu => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Multiply,
+                width: Mips4AluOperandWidth::Word,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            Self::Dmult | Self::Dmultu => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Multiply,
+                width: Mips4AluOperandWidth::Doubleword,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            Self::Div => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Divide,
+                width: Mips4AluOperandWidth::Word,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::DivideByZeroOrSignedOverflow,
+            }),
+            Self::Divu => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Divide,
+                width: Mips4AluOperandWidth::Word,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::DivideByZero,
+            }),
+            Self::Ddiv => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Divide,
+                width: Mips4AluOperandWidth::Doubleword,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::DivideByZeroOrSignedOverflow,
+            }),
+            Self::Ddivu => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::Divide,
+                width: Mips4AluOperandWidth::Doubleword,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::DivideByZero,
+            }),
+            Self::Mfhi | Self::Mthi | Self::Mflo | Self::Mtlo => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::HiLoTransfer,
+                width: Mips4AluOperandWidth::WidthInsensitive,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            Self::Movn | Self::Movz => Some(Mips4AluClassification {
+                operation: Mips4AluOperation::ConditionalMove,
+                width: Mips4AluOperandWidth::WidthInsensitive,
+                traps_on_overflow: false,
+                divide_undefined: Mips4AluDivideUndefined::None,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -725,5 +861,438 @@ mod tests {
         assert_eq!(Mips4CpuInstruction::Add.system_exception(), None);
         assert_eq!(Mips4CpuInstruction::Teq.system_exception(), None);
         assert_eq!(Mips4CpuInstruction::Sync.system_exception(), None);
+    }
+
+    const fn alu_class(
+        operation: Mips4AluOperation,
+        width: Mips4AluOperandWidth,
+        traps_on_overflow: bool,
+        divide_undefined: Mips4AluDivideUndefined,
+    ) -> Option<Mips4AluClassification> {
+        Some(Mips4AluClassification {
+            operation,
+            width,
+            traps_on_overflow,
+            divide_undefined,
+        })
+    }
+
+    #[test]
+    fn alu_classification_classifies_alu_immediate_operations() {
+        // A-8: ALU instructions with an immediate operand.
+        assert_eq!(
+            Mips4CpuInstruction::Addi.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Word,
+                true,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Addiu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Word,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Slti.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Compare,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Sltiu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Compare,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Andi.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Logical,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Ori.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Logical,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Xori.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Logical,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Lui.alu_classification(),
+            alu_class(
+                Mips4AluOperation::LoadUpperImmediate,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Daddi.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Doubleword,
+                true,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Daddiu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Doubleword,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+    }
+
+    #[test]
+    fn alu_classification_classifies_three_operand_alu_operations() {
+        // A-9: 3-operand ALU instructions.
+        assert_eq!(
+            Mips4CpuInstruction::Add.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Word,
+                true,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Addu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Word,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Sub.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Word,
+                true,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Subu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Word,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::And.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Logical,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Or.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Logical,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Xor.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Logical,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Nor.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Logical,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Slt.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Compare,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Sltu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Compare,
+                Mips4AluOperandWidth::WidthInsensitive,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Dadd.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Doubleword,
+                true,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Daddu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Doubleword,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Dsub.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Doubleword,
+                true,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Dsubu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Arithmetic,
+                Mips4AluOperandWidth::Doubleword,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+    }
+
+    #[test]
+    fn alu_classification_classifies_shift_operations() {
+        // A-10: shift instructions. Word shifts require word operands; doubleword
+        // shifts do not. Neither traps on overflow.
+        for instruction in [
+            Mips4CpuInstruction::Sll,
+            Mips4CpuInstruction::Srl,
+            Mips4CpuInstruction::Sra,
+            Mips4CpuInstruction::Sllv,
+            Mips4CpuInstruction::Srlv,
+            Mips4CpuInstruction::Srav,
+        ] {
+            assert_eq!(
+                instruction.alu_classification(),
+                alu_class(
+                    Mips4AluOperation::Shift,
+                    Mips4AluOperandWidth::Word,
+                    false,
+                    Mips4AluDivideUndefined::None,
+                ),
+                "{instruction:?}"
+            );
+        }
+        for instruction in [
+            Mips4CpuInstruction::Dsll,
+            Mips4CpuInstruction::Dsrl,
+            Mips4CpuInstruction::Dsra,
+            Mips4CpuInstruction::Dsll32,
+            Mips4CpuInstruction::Dsrl32,
+            Mips4CpuInstruction::Dsra32,
+            Mips4CpuInstruction::Dsllv,
+            Mips4CpuInstruction::Dsrlv,
+            Mips4CpuInstruction::Dsrav,
+        ] {
+            assert_eq!(
+                instruction.alu_classification(),
+                alu_class(
+                    Mips4AluOperation::Shift,
+                    Mips4AluOperandWidth::Doubleword,
+                    false,
+                    Mips4AluDivideUndefined::None,
+                ),
+                "{instruction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alu_classification_classifies_multiply_divide_and_hilo_operations() {
+        // A-11: multiply/divide and HI/LO transfer. Word multiply/divide require
+        // word operands; doubleword forms do not. Signed divide is undefined on
+        // divide-by-zero or most-negative divided by -1; unsigned divide only on
+        // divide-by-zero.
+        assert_eq!(
+            Mips4CpuInstruction::Mult.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Multiply,
+                Mips4AluOperandWidth::Word,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Multu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Multiply,
+                Mips4AluOperandWidth::Word,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Dmult.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Multiply,
+                Mips4AluOperandWidth::Doubleword,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Dmultu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Multiply,
+                Mips4AluOperandWidth::Doubleword,
+                false,
+                Mips4AluDivideUndefined::None,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Div.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Divide,
+                Mips4AluOperandWidth::Word,
+                false,
+                Mips4AluDivideUndefined::DivideByZeroOrSignedOverflow,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Divu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Divide,
+                Mips4AluOperandWidth::Word,
+                false,
+                Mips4AluDivideUndefined::DivideByZero,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Ddiv.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Divide,
+                Mips4AluOperandWidth::Doubleword,
+                false,
+                Mips4AluDivideUndefined::DivideByZeroOrSignedOverflow,
+            )
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Ddivu.alu_classification(),
+            alu_class(
+                Mips4AluOperation::Divide,
+                Mips4AluOperandWidth::Doubleword,
+                false,
+                Mips4AluDivideUndefined::DivideByZero,
+            )
+        );
+        for instruction in [
+            Mips4CpuInstruction::Mfhi,
+            Mips4CpuInstruction::Mthi,
+            Mips4CpuInstruction::Mflo,
+            Mips4CpuInstruction::Mtlo,
+        ] {
+            assert_eq!(
+                instruction.alu_classification(),
+                alu_class(
+                    Mips4AluOperation::HiLoTransfer,
+                    Mips4AluOperandWidth::WidthInsensitive,
+                    false,
+                    Mips4AluDivideUndefined::None,
+                ),
+                "{instruction:?}"
+            );
+            assert!(
+                !instruction
+                    .alu_classification()
+                    .unwrap()
+                    .requires_word_operands()
+            );
+        }
+    }
+
+    #[test]
+    fn alu_classification_classifies_conditional_move_operations() {
+        // A-20: MOVN/MOVZ conditionally move a GPR tested against a GPR value.
+        // They are width-insensitive with no overflow or undefined result.
+        for instruction in [Mips4CpuInstruction::Movn, Mips4CpuInstruction::Movz] {
+            assert_eq!(
+                instruction.alu_classification(),
+                alu_class(
+                    Mips4AluOperation::ConditionalMove,
+                    Mips4AluOperandWidth::WidthInsensitive,
+                    false,
+                    Mips4AluDivideUndefined::None,
+                ),
+                "{instruction:?}"
+            );
+            assert!(
+                !instruction
+                    .alu_classification()
+                    .unwrap()
+                    .requires_word_operands()
+            );
+        }
+    }
+
+    #[test]
+    fn alu_classification_returns_none_for_non_computational_instructions() {
+        for instruction in [
+            Mips4CpuInstruction::Beq,
+            Mips4CpuInstruction::Lw,
+            Mips4CpuInstruction::Sw,
+            Mips4CpuInstruction::Syscall,
+            Mips4CpuInstruction::Sync,
+            Mips4CpuInstruction::Pref,
+            Mips4CpuInstruction::Jr,
+            Mips4CpuInstruction::Jal,
+            Mips4CpuInstruction::Teq,
+            Mips4CpuInstruction::Ll,
+            Mips4CpuInstruction::Lld,
+        ] {
+            assert_eq!(instruction.alu_classification(), None, "{instruction:?}");
+        }
     }
 }

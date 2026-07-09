@@ -355,6 +355,101 @@ impl Mips4Alu {
     }
 }
 
+/// ALU helper family for a MIPS IV integer computational or conditional-move
+/// instruction.
+///
+/// Groups the manual tables A-8 through A-11 (computational) and A-20
+/// (conditional move) by operation kind. The exact helper is selected by the
+/// `Mips4CpuInstruction` variant the caller holds; this enum identifies the
+/// family, and the operand width selects the word or doubleword helper form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mips4AluOperation {
+    /// 2's-complement add/subtract (immediate, unsigned, and doubleword forms).
+    Arithmetic,
+    /// Bitwise logical AND/OR/XOR/NOR (and the immediate forms).
+    Logical,
+    /// Load upper immediate.
+    LoadUpperImmediate,
+    /// Word and doubleword shifts (fixed and variable amounts).
+    Shift,
+    /// Set-on-less-than comparisons (immediate and unsigned forms).
+    Compare,
+    /// Multiply producing the full-width product in `HI`/`LO`.
+    Multiply,
+    /// Divide producing the quotient in `LO` and remainder in `HI`.
+    Divide,
+    /// `HI`/`LO` register transfer (`MFHI`/`MTHI`/`MFLO`/`MTLO`).
+    HiLoTransfer,
+    /// Conditional GPR move (`MOVN`/`MOVZ`) tested against a GPR value.
+    ConditionalMove,
+}
+
+/// Operand width class for a MIPS IV integer computational instruction.
+///
+/// `Word` means the word-source operands must be sign-extended 32-bit words; if
+/// a source is not, the result is undefined (manual `NotWordValue`). `Doubleword`
+/// operates on the full 64-bit register with no `NotWordValue` guard.
+/// `WidthInsensitive` covers logical, comparison, `LUI`, and `HI`/`LO` transfer
+/// operations, which the manual states are not sensitive to register width.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mips4AluOperandWidth {
+    /// 32-bit word operation; word sources must be sign-extended words.
+    Word,
+    /// 64-bit doubleword operation; no `NotWordValue` guard.
+    Doubleword,
+    /// Operates on the full register regardless of width.
+    WidthInsensitive,
+}
+
+/// Divide-specific undefined-result condition beyond `NotWordValue`.
+///
+/// Word divide combines this with the `NotWordValue` guard encoded by
+/// [`Mips4AluOperandWidth::Word`]; doubleword divide has no `NotWordValue` guard,
+/// so only this condition applies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mips4AluDivideUndefined {
+    /// The result is always defined (non-divide operations).
+    None,
+    /// The result is undefined when the divisor is zero (unsigned divide:
+    /// `DIVU`/`DDIVU`).
+    DivideByZero,
+    /// The result is undefined when the divisor is zero, or the dividend is the
+    /// most-negative value and the divisor is -1 (signed divide: `DIV`/`DDIV`).
+    DivideByZeroOrSignedOverflow,
+}
+
+/// Per-instruction ALU classification connecting a decoded instruction to its
+/// `Mips4Alu` helper family and the manual's `NotWordValue`, overflow, and
+/// `UndefinedResult` rules (manual tables A-8 through A-11 and section A.6).
+///
+/// The exact helper is selected by the `Mips4CpuInstruction` variant; this
+/// classification supplies the cross-cutting rules. `traps_on_overflow` matches
+/// the helper return type (`Result<_, Mips4Exception>` for trapping operations,
+/// `u64` for wrapping ones), and `divide_undefined` matches the `Option::None`
+/// conditions of the divide helpers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mips4AluClassification {
+    /// The ALU helper family.
+    pub operation: Mips4AluOperation,
+    /// The operand width class, determining `NotWordValue` applicability.
+    pub width: Mips4AluOperandWidth,
+    /// Whether 2's-complement arithmetic overflow raises an `Integer Overflow`
+    /// exception rather than wrapping.
+    pub traps_on_overflow: bool,
+    /// Divide-specific undefined-result condition beyond `NotWordValue`.
+    pub divide_undefined: Mips4AluDivideUndefined,
+}
+
+impl Mips4AluClassification {
+    /// Returns whether word-source operands must be sign-extended words.
+    ///
+    /// When this is `true`, an operand that satisfies `not_word_value` produces
+    /// an undefined result (manual `NotWordValue`).
+    pub const fn requires_word_operands(self) -> bool {
+        matches!(self.width, Mips4AluOperandWidth::Word)
+    }
+}
+
 const fn signed_word(value: u64) -> i32 {
     value as u32 as i32
 }

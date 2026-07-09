@@ -92,5 +92,15 @@ pub const fn is_sign_extended_word(value: u64) -> bool {
     value == sign_extend_word(value as u32)
 }
 
+/// Returns whether a 64-bit value is NOT a sign-extended 32-bit word (manual
+/// `NotWordValue`).
+///
+/// Word ALU, shift, multiply, and divide instructions require their word-source
+/// operands to be sign-extended words; an operand that satisfies this predicate
+/// produces an undefined result (manual section A.6).
+pub const fn not_word_value(value: u64) -> bool {
+    !is_sign_extended_word(value)
+}
+
 #[cfg(test)]
 mod tests;

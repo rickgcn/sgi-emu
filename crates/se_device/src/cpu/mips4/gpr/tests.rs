@@ -65,6 +65,36 @@ fn detects_sign_extended_word_values() {
 }
 
 #[test]
+fn not_word_value_detects_non_sign_extended_words() {
+    // Sign-extended words are not `NotWordValue`.
+    assert!(!not_word_value(0x0000_0000_0000_0000));
+    assert!(!not_word_value(0x0000_0000_7fff_ffff));
+    assert!(!not_word_value(0xffff_ffff_8000_0000));
+    assert!(!not_word_value(0xffff_ffff_ffff_ffff));
+    // Values that are not sign-extended words are `NotWordValue`.
+    assert!(not_word_value(0x0000_0000_8000_0000));
+    assert!(not_word_value(0xffff_ffff_7fff_ffff));
+    assert!(not_word_value(0x0000_0001_1234_5678));
+    assert!(not_word_value(0x1234_5678_9abc_def0));
+    // `not_word_value` is the exact negation of `is_sign_extended_word`.
+    for value in [
+        0u64,
+        1,
+        0x7fff_ffff,
+        0x8000_0000,
+        0xffff_ffff,
+        0x1_0000_0000,
+        0x1234_5678_9abc_def0,
+    ] {
+        assert_eq!(
+            not_word_value(value),
+            !is_sign_extended_word(value),
+            "value {value:#x}"
+        );
+    }
+}
+
+#[test]
 fn write_sign_extended_word_stores_extended_value() {
     let mut registers = Mips4GprFile::new();
     let index = Mips4GprIndex::from_u8(2).unwrap();
