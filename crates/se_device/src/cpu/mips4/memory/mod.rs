@@ -5,6 +5,7 @@
 //! rules. It does not perform address translation, cache lookup, bus access, or
 //! load-delay state updates.
 
+pub mod ll_sc;
 pub mod operation;
 
 use crate::cpu::mips4::config::Mips4Endianness;

@@ -41,6 +41,18 @@ impl Mips4MemoryAccessType {
     pub const fn is_coherent(self) -> bool {
         matches!(self, Self::CachedCoherent)
     }
+
+    /// Returns whether this access type permits LL/SC atomicity.
+    ///
+    /// The manual restricts linked load and store conditional to cached memory:
+    /// cached noncoherent or cached coherent (MIPS IV manual sections A.3 and
+    /// the `LL`/`SC` restrictions). This must be evaluated on a processor-model
+    /// resolved concrete access type; the base layer resolves raw cached CCAs to
+    /// [`Self::ImplementationSpecific`], which is not eligible until a model
+    /// refines it.
+    pub const fn is_ll_sc_eligible(self) -> bool {
+        self.is_cached()
+    }
 }
 
 /// Raw 3-bit cache-coherence algorithm value.

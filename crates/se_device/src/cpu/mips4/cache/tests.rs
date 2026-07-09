@@ -16,18 +16,22 @@ fn memory_access_type_helpers_classify_generic_access_types() {
     assert!(Mips4MemoryAccessType::Uncached.is_uncached());
     assert!(!Mips4MemoryAccessType::Uncached.is_cached());
     assert!(!Mips4MemoryAccessType::Uncached.is_coherent());
+    assert!(!Mips4MemoryAccessType::Uncached.is_ll_sc_eligible());
 
     assert!(Mips4MemoryAccessType::CachedNoncoherent.is_cached());
     assert!(!Mips4MemoryAccessType::CachedNoncoherent.is_uncached());
     assert!(!Mips4MemoryAccessType::CachedNoncoherent.is_coherent());
+    assert!(Mips4MemoryAccessType::CachedNoncoherent.is_ll_sc_eligible());
 
     assert!(Mips4MemoryAccessType::CachedCoherent.is_cached());
     assert!(!Mips4MemoryAccessType::CachedCoherent.is_uncached());
     assert!(Mips4MemoryAccessType::CachedCoherent.is_coherent());
+    assert!(Mips4MemoryAccessType::CachedCoherent.is_ll_sc_eligible());
 
     assert!(!Mips4MemoryAccessType::ImplementationSpecific.is_cached());
     assert!(!Mips4MemoryAccessType::ImplementationSpecific.is_uncached());
     assert!(!Mips4MemoryAccessType::ImplementationSpecific.is_coherent());
+    assert!(!Mips4MemoryAccessType::ImplementationSpecific.is_ll_sc_eligible());
 }
 
 #[test]
