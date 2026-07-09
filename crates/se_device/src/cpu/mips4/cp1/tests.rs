@@ -547,6 +547,18 @@ fn cp1_instruction_extracts_offset_load_store_fields() {
 }
 
 #[test]
+fn cp1_instruction_extracts_prefetch_hint_from_rd_field() {
+    // `PREFX` encodes its hint in the `rd` position (bits 15..11), not the `rt`
+    // position (bits 20..16) that holds the index register and `PREF`'s hint.
+    let bits = ((MIPS4_COP1X_OPCODE as u32) << 26) | (7 << 21) | (8 << 16) | (0x15 << 11) | 0x0f;
+    let instruction = Mips4Cp1Instruction::from_bits(bits).unwrap();
+
+    assert_eq!(instruction.index(), 8);
+    assert_eq!(instruction.prefetch_hint(), 0x15);
+    assert_ne!(instruction.prefetch_hint(), instruction.index());
+}
+
+#[test]
 fn cp1_instruction_extracts_branch_condition_bits() {
     let bits = ((MIPS4_COP1_OPCODE as u32) << 26)
         | ((CP1_FMT_BRANCH as u32) << 21)

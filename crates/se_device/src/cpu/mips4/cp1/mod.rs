@@ -797,6 +797,15 @@ impl Mips4Cp1Instruction {
         self.instruction.signed_immediate()
     }
 
+    /// Returns the `PREFX` hint field.
+    ///
+    /// `PREFX` encodes its hint in the `rd` field position (bits 15..11), distinct
+    /// from `PREF` which encodes its hint in the `rt` position (bits 20..16).
+    /// Combine the result with `Mips4PrefetchHint::from_bits`.
+    pub const fn prefetch_hint(self) -> u8 {
+        self.instruction.rd()
+    }
+
     /// Returns whether this instruction uses the `COP1` primary opcode.
     pub const fn is_cop1(self) -> bool {
         self.opcode() == MIPS4_COP1_OPCODE
