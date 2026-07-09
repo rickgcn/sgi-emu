@@ -1,7 +1,9 @@
-//! Raw MIPS IV instruction bit fields.
+//! MIPS IV instruction bit fields and decode helpers.
 //!
 //! This module provides exact bit extraction for the 32-bit MIPS IV instruction
-//! word. It does not classify opcodes or assign instruction semantics.
+//! word. Decode helpers classify instruction encodings without executing them.
+
+pub mod decode;
 
 /// Raw 32-bit MIPS IV instruction word.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
