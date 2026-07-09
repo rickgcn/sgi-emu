@@ -7,6 +7,7 @@
 //! processor-specific FPU restrictions.
 
 pub mod decode;
+pub mod operation;
 
 use crate::cpu::mips4::exception::Mips4Exception;
 use crate::cpu::mips4::instruction::Mips4Instruction;
@@ -676,6 +677,13 @@ impl Mips4Cp1Instruction {
     /// Returns the base register for CP1 offset load/store instructions.
     pub const fn base(self) -> u8 {
         self.instruction.rs()
+    }
+
+    /// Returns the GPR index register for COP1X indexed memory operations
+    /// (`LWXC1`/`LDXC1`/`SWXC1`/`SDXC1`/`PREFX`). This field occupies the `rt`
+    /// position of the instruction word.
+    pub const fn index(self) -> u8 {
+        self.instruction.rt()
     }
 
     /// Returns the signed offset for CP1 offset load/store instructions.

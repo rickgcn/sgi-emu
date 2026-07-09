@@ -5,6 +5,8 @@
 //! rules. It does not perform address translation, cache lookup, bus access, or
 //! load-delay state updates.
 
+pub mod operation;
+
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::exception::Mips4Exception;
 use crate::cpu::mips4::gpr::sign_extend_word;
@@ -349,7 +351,8 @@ impl Mips4MemoryAccessSize {
 }
 
 impl Mips4MemoryAccessKind {
-    const fn is_store(self) -> bool {
+    /// Returns whether this access stores to memory.
+    pub const fn is_store(self) -> bool {
         matches!(
             self,
             Self::Store { .. }

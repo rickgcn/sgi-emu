@@ -6,7 +6,7 @@
 //! manage TLB replacement policy, perform cache lookup, or initiate bus
 //! transactions.
 
-use crate::cpu::mips4::cache::Mips4CacheCoherenceAlgorithm;
+use crate::cpu::mips4::cache::{Mips4CacheCoherenceAlgorithm, Mips4MemoryAccessType};
 use crate::cpu::mips4::cp0::{Mips4Cp0KernelUserMode, Mips4Cp0Status};
 use crate::cpu::mips4::exception::Mips4Exception;
 use crate::cpu::mips4::tlb::{
@@ -164,6 +164,21 @@ impl Mips4MmuCacheAttribute {
             Self::CacheCoherenceAlgorithm(cache_coherence_algorithm) => {
                 Some(cache_coherence_algorithm)
             }
+        }
+    }
+
+    /// Converts this cache attribute to an architecture-level memory access type.
+    ///
+    /// The `Uncached` attribute resolves directly. A raw cache-coherence
+    /// algorithm resolves to [`Mips4MemoryAccessType::ImplementationSpecific`]
+    /// because the mapping from a raw 3-bit CCA value to a cached access type
+    /// is processor-specific (MIPS IV manual section A.3). A processor model
+    /// must refine such cached attributes to `CachedNoncoherent` or
+    /// `CachedCoherent` before using them for access-type decisions.
+    pub const fn memory_access_type(self) -> Mips4MemoryAccessType {
+        match self {
+            Self::Uncached => Mips4MemoryAccessType::Uncached,
+            Self::CacheCoherenceAlgorithm(_) => Mips4MemoryAccessType::ImplementationSpecific,
         }
     }
 }
