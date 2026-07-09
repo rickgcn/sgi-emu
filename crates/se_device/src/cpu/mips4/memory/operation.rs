@@ -289,6 +289,92 @@ impl Mips4Prefetch {
     }
 }
 
+/// A resolved instruction-fetch address translation ready for the execution
+/// layer.
+///
+/// This is the manual `AddressTranslation(vAddr, INSTRUCTION, ...)` request shape
+/// (MIPS IV manual section A.5.3.2): the program counter is word-aligned
+/// (instructions are word-aligned; a misaligned fetch raises an address error),
+/// then translated with the `InstructionFetch` access kind. It carries the
+/// translated physical address and cache attribute but does not fetch the
+/// instruction word; the caller handles instruction byte selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mips4InstructionFetch {
+    /// Effective virtual address of the fetch (the program counter).
+    pub virtual_address: u64,
+
+    /// Successful address translation carrying the physical address and cache
+    /// attribute.
+    pub translation: Mips4MmuTranslation,
+}
+
+impl Mips4InstructionFetch {
+    /// Resolves an instruction fetch from its virtual address.
+    ///
+    /// `virtual_address` is the program counter. A non-word-aligned fetch raises
+    /// an address error (manual: instructions are word-aligned). Translation uses
+    /// the `InstructionFetch` access kind, which maps to the load-side TLB and
+    /// address-error exceptions. This helper does not fetch the instruction.
+    pub fn prepare(
+        virtual_address: u64,
+        mmu_config: Mips4MmuConfig,
+        status: Mips4Cp0Status,
+        asid: Mips4TlbAsid,
+        tlb_entries: &[Mips4TlbEntry],
+    ) -> Result<Self, Mips4MemoryAccessError> {
+        if virtual_address & 0x3 != 0 {
+            return Err(Mips4MemoryAccessError::AddressError {
+                exception: Mips4Exception::AddressErrorLoad,
+                virtual_address,
+            });
+        }
+
+        match Mips4Mmu::translate(
+            mmu_config,
+            status,
+            asid,
+            tlb_entries,
+            virtual_address,
+            Mips4TlbAccessKind::InstructionFetch,
+        ) {
+            Mips4MmuTranslationResult::Hit(translation) => Ok(Self {
+                virtual_address,
+                translation,
+            }),
+            Mips4MmuTranslationResult::Fault(fault) => {
+                Err(Mips4MemoryAccessError::TranslationFault(fault))
+            }
+            Mips4MmuTranslationResult::UndefinedMultipleTlbMatch {
+                segment,
+                address_mode,
+            } => Err(Mips4MemoryAccessError::UndefinedMultipleTlbMatch {
+                segment,
+                address_mode,
+            }),
+        }
+    }
+
+    /// Returns the translated physical address.
+    pub const fn physical_address(&self) -> u64 {
+        self.translation.physical_address
+    }
+
+    /// Returns the cache attribute selected by translation.
+    pub const fn cache_attribute(&self) -> Mips4MmuCacheAttribute {
+        self.translation.cache_attribute
+    }
+
+    /// Returns the architecture-level memory access type for this fetch.
+    ///
+    /// Cached cache-coherence algorithms resolve to
+    /// [`Mips4MemoryAccessType::ImplementationSpecific`] at this base layer; a
+    /// processor model must refine them before using the result for access-type
+    /// decisions.
+    pub const fn memory_access_type(&self) -> Mips4MemoryAccessType {
+        self.cache_attribute().memory_access_type()
+    }
+}
+
 const fn tlb_access_kind(kind: Mips4MemoryAccessKind) -> Mips4TlbAccessKind {
     if kind.is_store() {
         Mips4TlbAccessKind::Store
@@ -609,5 +695,49 @@ mod tests {
                 "hint {bits}"
             );
         }
+    }
+
+    #[test]
+    fn instruction_fetch_resolves_aligned_kseg0_word_address() {
+        let fetch =
+            Mips4InstructionFetch::prepare(KSEG0_BASE, mmu_config(), kernel_status(), ASID, &[])
+                .unwrap();
+
+        assert_eq!(fetch.virtual_address, KSEG0_BASE);
+        assert_eq!(
+            fetch.physical_address(),
+            KSEG0_BASE.wrapping_sub(KSEG0_BASE)
+        );
+        assert!(!fetch.cache_attribute().is_uncached());
+        assert_eq!(
+            fetch.memory_access_type(),
+            Mips4MemoryAccessType::ImplementationSpecific
+        );
+    }
+
+    #[test]
+    fn instruction_fetch_reports_address_error_for_misaligned_pc() {
+        let address = KSEG0_BASE | 0x1;
+        assert_eq!(
+            Mips4InstructionFetch::prepare(address, mmu_config(), kernel_status(), ASID, &[]),
+            Err(Mips4MemoryAccessError::AddressError {
+                exception: Mips4Exception::AddressErrorLoad,
+                virtual_address: address,
+            })
+        );
+    }
+
+    #[test]
+    fn instruction_fetch_reports_translation_fault_for_unmapped_tlb_miss() {
+        let address: u64 = 0x0000_0000_0000_1000;
+        assert_eq!(
+            Mips4InstructionFetch::prepare(address, mmu_config(), user_status_64(), ASID, &[]),
+            Err(Mips4MemoryAccessError::TranslationFault(Mips4MmuFault {
+                exception: Mips4Exception::TlbLoad,
+                bad_virtual_address: address,
+                segment: Some(Mips4MmuSegment::Xuseg),
+                address_mode: Some(Mips4TlbAddressMode::Bits64),
+            }))
+        );
     }
 }
