@@ -393,6 +393,67 @@ fn recording_unimplemented_operation_sets_e_cause_and_traps() {
 }
 
 #[test]
+fn decide_float_exception_traps_when_cause_and_enable_overlap() {
+    let mut fcsr = Mips4Cp1Fcsr::from_bits(0);
+    fcsr.set_enable_flags(FloatExceptionFlags::OVERFLOW);
+    fcsr.set_flag_flags(FloatExceptionFlags::INEXACT);
+
+    let decision = decide_float_exception(
+        fcsr,
+        FloatExceptionFlags::OVERFLOW | FloatExceptionFlags::UNDERFLOW,
+    );
+
+    assert!(decision.traps);
+    assert_eq!(decision.flag_flags, FloatExceptionFlags::INEXACT);
+}
+
+#[test]
+fn decide_float_exception_unions_flags_when_not_trapping() {
+    let mut fcsr = Mips4Cp1Fcsr::from_bits(0);
+    fcsr.set_enable_flags(FloatExceptionFlags::DIVIDE_BY_ZERO);
+    fcsr.set_flag_flags(FloatExceptionFlags::INEXACT);
+
+    let decision = decide_float_exception(
+        fcsr,
+        FloatExceptionFlags::INVALID | FloatExceptionFlags::UNDERFLOW,
+    );
+
+    assert!(!decision.traps);
+    assert_eq!(
+        decision.flag_flags,
+        FloatExceptionFlags::INEXACT
+            | FloatExceptionFlags::INVALID
+            | FloatExceptionFlags::UNDERFLOW
+    );
+}
+
+#[test]
+fn decide_float_exception_empty_cause_never_traps() {
+    let mut fcsr = Mips4Cp1Fcsr::from_bits(0);
+    fcsr.set_enable_flags(FloatExceptionFlags::OVERFLOW);
+    fcsr.set_flag_flags(FloatExceptionFlags::INEXACT);
+
+    let decision = decide_float_exception(fcsr, FloatExceptionFlags::empty());
+
+    assert!(!decision.traps);
+    assert_eq!(decision.flag_flags, FloatExceptionFlags::INEXACT);
+}
+
+#[test]
+fn decide_unimplemented_operation_always_traps_keeping_flags() {
+    let mut fcsr = Mips4Cp1Fcsr::from_bits(0);
+    fcsr.set_flag_flags(FloatExceptionFlags::INEXACT | FloatExceptionFlags::OVERFLOW);
+
+    let decision = decide_unimplemented_operation(fcsr);
+
+    assert!(decision.traps);
+    assert_eq!(
+        decision.flag_flags,
+        FloatExceptionFlags::INEXACT | FloatExceptionFlags::OVERFLOW
+    );
+}
+
+#[test]
 fn cp1_register_file_reads_and_writes_control_registers() {
     let mut cp1 = Mips4Cp1::new(0xffff_2310);
 
@@ -510,4 +571,33 @@ fn cp1_instruction_extracts_compare_and_conditional_move_bits() {
 
     assert_eq!(instruction.condition_code_bits(), 0b110);
     assert!(instruction.condition_true_bit());
+}
+
+#[test]
+fn fpu_conditional_move_decision_truth_table() {
+    assert!(Mips4Cp1MoveDecision::move_conditional_false(false).is_move());
+    assert!(!Mips4Cp1MoveDecision::move_conditional_false(true).is_move());
+    assert!(Mips4Cp1MoveDecision::move_conditional_true(true).is_move());
+    assert!(!Mips4Cp1MoveDecision::move_conditional_true(false).is_move());
+    assert!(Mips4Cp1MoveDecision::move_conditional_nonzero(1).is_move());
+    assert!(!Mips4Cp1MoveDecision::move_conditional_nonzero(0).is_move());
+    assert!(Mips4Cp1MoveDecision::move_conditional_zero(0).is_move());
+    assert!(!Mips4Cp1MoveDecision::move_conditional_zero(1).is_move());
+
+    assert_eq!(
+        Mips4Cp1MoveDecision::move_conditional_false(false),
+        Mips4Cp1MoveDecision::Move
+    );
+    assert_eq!(
+        Mips4Cp1MoveDecision::move_conditional_false(true),
+        Mips4Cp1MoveDecision::KeepDestination
+    );
+    assert_eq!(
+        Mips4Cp1MoveDecision::move_conditional_zero(0),
+        Mips4Cp1MoveDecision::Move
+    );
+    assert_eq!(
+        Mips4Cp1MoveDecision::move_conditional_nonzero(2),
+        Mips4Cp1MoveDecision::Move
+    );
 }
