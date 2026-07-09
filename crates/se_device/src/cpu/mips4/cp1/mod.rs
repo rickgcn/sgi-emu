@@ -6,6 +6,8 @@
 //! instructions, manage pipeline hazards, modify CP0 state, or model
 //! processor-specific FPU restrictions.
 
+pub mod decode;
+
 use crate::cpu::mips4::exception::Mips4Exception;
 use crate::cpu::mips4::instruction::Mips4Instruction;
 use se_float::control::{FloatControl, FloatExceptionFlags, FloatRoundingMode, FloatTininessMode};
