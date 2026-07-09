@@ -122,3 +122,81 @@ fn exception_image_supports_exceptions_without_a_bad_address() {
     assert_eq!(image.reason.cause_code(), 12);
     assert_eq!(image.bad_virtual_address, None);
 }
+
+#[test]
+fn system_exception_kind_maps_to_cause_codes() {
+    assert_eq!(
+        Mips4SystemExceptionKind::SystemCall.exception(),
+        Mips4Exception::Syscall
+    );
+    assert_eq!(
+        Mips4SystemExceptionKind::SystemCall
+            .exception()
+            .cause_code(),
+        8
+    );
+    assert_eq!(
+        Mips4SystemExceptionKind::Breakpoint.exception(),
+        Mips4Exception::Breakpoint
+    );
+    assert_eq!(
+        Mips4SystemExceptionKind::Breakpoint
+            .exception()
+            .cause_code(),
+        9
+    );
+}
+
+#[test]
+fn trap_decision_reports_should_trap() {
+    assert!(Mips4TrapDecision::Trap.should_trap());
+    assert!(!Mips4TrapDecision::Continue.should_trap());
+}
+
+#[test]
+fn signed_trap_conditions_use_signed_comparisons() {
+    assert!(tge(0, -1_i64 as u64).should_trap());
+    assert!(!tge(-1_i64 as u64, 0).should_trap());
+    assert!(tlt(-1_i64 as u64, 0).should_trap());
+    assert!(!tlt(0, -1_i64 as u64).should_trap());
+}
+
+#[test]
+fn unsigned_trap_conditions_use_unsigned_comparisons() {
+    assert!(tgeu(u64::MAX, 0).should_trap());
+    assert!(!tgeu(0, u64::MAX).should_trap());
+    assert!(tltu(0, u64::MAX).should_trap());
+    assert!(!tltu(u64::MAX, 0).should_trap());
+}
+
+#[test]
+fn equality_trap_conditions_match_exact_values() {
+    assert!(teq(7, 7).should_trap());
+    assert!(!teq(7, 8).should_trap());
+    assert!(tne(7, 8).should_trap());
+    assert!(!tne(7, 7).should_trap());
+}
+
+#[test]
+fn trap_boundaries_distinguish_signed_and_unsigned() {
+    assert!(tge(0, i64::MIN as u64).should_trap());
+    assert!(!tgeu(0, i64::MIN as u64).should_trap());
+    assert!(tlt(i64::MIN as u64, 0).should_trap());
+    assert!(!tltu(i64::MIN as u64, 0).should_trap());
+}
+
+#[test]
+fn immediate_trap_conditions_sign_extend_immediate() {
+    assert!(tgei(0, -1).should_trap());
+    assert!(!tgei(-1_i64 as u64, 0).should_trap());
+    assert!(tgeiu(u64::MAX, -1).should_trap());
+    assert!(!tgeiu(0, -1).should_trap());
+    assert!(tlti(-1_i64 as u64, 0).should_trap());
+    assert!(!tlti(0, -1).should_trap());
+    assert!(tltiu(0, -1).should_trap());
+    assert!(!tltiu(u64::MAX, -1).should_trap());
+    assert!(teqi(-1_i64 as u64, -1).should_trap());
+    assert!(!teqi(0, -1).should_trap());
+    assert!(tnei(0, -1).should_trap());
+    assert!(!tnei(-1_i64 as u64, -1).should_trap());
+}

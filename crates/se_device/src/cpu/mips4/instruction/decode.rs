@@ -4,7 +4,7 @@
 //! tables. It does not execute instructions, read architectural state, or apply
 //! processor-specific COP0 behavior.
 
-use crate::cpu::mips4::exception::Mips4CoprocessorNumber;
+use crate::cpu::mips4::exception::{Mips4CoprocessorNumber, Mips4SystemExceptionKind};
 use crate::cpu::mips4::instruction::Mips4Instruction;
 
 const MIPS4_SPECIAL_OPCODE: u8 = 0x00;
@@ -469,6 +469,21 @@ const fn coprocessor(coprocessor: Mips4CoprocessorNumber) -> Mips4InstructionDec
     Mips4InstructionDecode::Instruction(Mips4InstructionClass::Coprocessor(coprocessor))
 }
 
+impl Mips4CpuInstruction {
+    /// Classifies this instruction as an immediate, unconditional system exception.
+    ///
+    /// Returns `Some` for `SYSCALL` and `BREAK`, and `None` for any other CPU
+    /// instruction. The exception layer owns the classification kind; this method
+    /// bridges the decoded instruction to that classification.
+    pub const fn system_exception(self) -> Option<Mips4SystemExceptionKind> {
+        match self {
+            Self::Syscall => Some(Mips4SystemExceptionKind::SystemCall),
+            Self::Break => Some(Mips4SystemExceptionKind::Breakpoint),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,5 +710,20 @@ mod tests {
             decode_instruction(bits_with_opcode(0x2f)).required_coprocessor(),
             Some(Mips4CoprocessorNumber::Cp0)
         );
+    }
+
+    #[test]
+    fn system_exception_classifies_syscall_and_break() {
+        assert_eq!(
+            Mips4CpuInstruction::Syscall.system_exception(),
+            Some(Mips4SystemExceptionKind::SystemCall)
+        );
+        assert_eq!(
+            Mips4CpuInstruction::Break.system_exception(),
+            Some(Mips4SystemExceptionKind::Breakpoint)
+        );
+        assert_eq!(Mips4CpuInstruction::Add.system_exception(), None);
+        assert_eq!(Mips4CpuInstruction::Teq.system_exception(), None);
+        assert_eq!(Mips4CpuInstruction::Sync.system_exception(), None);
     }
 }

@@ -133,6 +133,136 @@ pub const fn check_coprocessor_access(
     }
 }
 
+/// Classification of an immediate, unconditional system exception raised by the
+/// `SYSCALL` or `BREAK` instructions.
+///
+/// This type is owned by the exception layer so the classification does not
+/// require a dependency on the instruction decode layer (which already depends
+/// on this layer).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mips4SystemExceptionKind {
+    /// `SYSCALL` instruction.
+    SystemCall,
+
+    /// `BREAK` instruction.
+    Breakpoint,
+}
+
+impl Mips4SystemExceptionKind {
+    /// Returns the exception raised by this system instruction.
+    pub const fn exception(self) -> Mips4Exception {
+        match self {
+            Self::SystemCall => Mips4Exception::Syscall,
+            Self::Breakpoint => Mips4Exception::Breakpoint,
+        }
+    }
+}
+
+/// Result of evaluating a trap instruction condition.
+///
+/// Trap instructions compare two values and signal a `Trap` exception when the
+/// condition holds. This decision is pure: it does not deliver the exception or
+/// update CP0 state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mips4TrapDecision {
+    /// The trap condition held; a `Trap` exception is signalled.
+    Trap,
+
+    /// The trap condition did not hold; no exception occurs.
+    Continue,
+}
+
+impl Mips4TrapDecision {
+    /// Returns whether the trap condition held.
+    pub const fn should_trap(self) -> bool {
+        matches!(self, Self::Trap)
+    }
+}
+
+/// Evaluates `TGE`: signed greater-or-equal.
+pub const fn tge(lhs: u64, rhs: u64) -> Mips4TrapDecision {
+    if (lhs as i64) >= (rhs as i64) {
+        Mips4TrapDecision::Trap
+    } else {
+        Mips4TrapDecision::Continue
+    }
+}
+
+/// Evaluates `TGEU`: unsigned greater-or-equal.
+pub const fn tgeu(lhs: u64, rhs: u64) -> Mips4TrapDecision {
+    if lhs >= rhs {
+        Mips4TrapDecision::Trap
+    } else {
+        Mips4TrapDecision::Continue
+    }
+}
+
+/// Evaluates `TLT`: signed less-than.
+pub const fn tlt(lhs: u64, rhs: u64) -> Mips4TrapDecision {
+    if (lhs as i64) < (rhs as i64) {
+        Mips4TrapDecision::Trap
+    } else {
+        Mips4TrapDecision::Continue
+    }
+}
+
+/// Evaluates `TLTU`: unsigned less-than.
+pub const fn tltu(lhs: u64, rhs: u64) -> Mips4TrapDecision {
+    if lhs < rhs {
+        Mips4TrapDecision::Trap
+    } else {
+        Mips4TrapDecision::Continue
+    }
+}
+
+/// Evaluates `TEQ`: equal.
+pub const fn teq(lhs: u64, rhs: u64) -> Mips4TrapDecision {
+    if lhs == rhs {
+        Mips4TrapDecision::Trap
+    } else {
+        Mips4TrapDecision::Continue
+    }
+}
+
+/// Evaluates `TNE`: not-equal.
+pub const fn tne(lhs: u64, rhs: u64) -> Mips4TrapDecision {
+    if lhs != rhs {
+        Mips4TrapDecision::Trap
+    } else {
+        Mips4TrapDecision::Continue
+    }
+}
+
+/// Evaluates `TGEI`: signed greater-or-equal to a sign-extended immediate.
+pub const fn tgei(lhs: u64, immediate: i16) -> Mips4TrapDecision {
+    tge(lhs, immediate as i64 as u64)
+}
+
+/// Evaluates `TGEIU`: unsigned greater-or-equal to a sign-extended immediate.
+pub const fn tgeiu(lhs: u64, immediate: i16) -> Mips4TrapDecision {
+    tgeu(lhs, immediate as i64 as u64)
+}
+
+/// Evaluates `TLTI`: signed less-than a sign-extended immediate.
+pub const fn tlti(lhs: u64, immediate: i16) -> Mips4TrapDecision {
+    tlt(lhs, immediate as i64 as u64)
+}
+
+/// Evaluates `TLTIU`: unsigned less-than a sign-extended immediate.
+pub const fn tltiu(lhs: u64, immediate: i16) -> Mips4TrapDecision {
+    tltu(lhs, immediate as i64 as u64)
+}
+
+/// Evaluates `TEQI`: equal to a sign-extended immediate.
+pub const fn teqi(lhs: u64, immediate: i16) -> Mips4TrapDecision {
+    teq(lhs, immediate as i64 as u64)
+}
+
+/// Evaluates `TNEI`: not-equal to a sign-extended immediate.
+pub const fn tnei(lhs: u64, immediate: i16) -> Mips4TrapDecision {
+    tne(lhs, immediate as i64 as u64)
+}
+
 /// Restart metadata for an excepting instruction.
 ///
 /// Records the branch delay-slot flag (`Cause.BD`) and the program counter at
