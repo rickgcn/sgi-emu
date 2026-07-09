@@ -72,3 +72,17 @@ fn coprocessor_unusable_preserves_coprocessor_number() {
         _ => panic!("expected coprocessor unusable exception"),
     }
 }
+
+#[test]
+fn coprocessor_access_gate_returns_unusable_exception_when_disabled() {
+    assert_eq!(
+        check_coprocessor_access(Mips4CoprocessorNumber::Cp1, true),
+        Ok(())
+    );
+    assert_eq!(
+        check_coprocessor_access(Mips4CoprocessorNumber::Cp2, false),
+        Err(Mips4Exception::CoprocessorUnusable {
+            coprocessor: Mips4CoprocessorNumber::Cp2
+        })
+    );
+}

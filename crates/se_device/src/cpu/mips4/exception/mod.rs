@@ -118,5 +118,20 @@ impl Mips4Exception {
     }
 }
 
+/// Checks whether a coprocessor operation may proceed.
+///
+/// This helper only classifies the architectural exception. It does not read or
+/// update CP0 state.
+pub const fn check_coprocessor_access(
+    coprocessor: Mips4CoprocessorNumber,
+    usable: bool,
+) -> Result<(), Mips4Exception> {
+    if usable {
+        Ok(())
+    } else {
+        Err(Mips4Exception::CoprocessorUnusable { coprocessor })
+    }
+}
+
 #[cfg(test)]
 mod tests;
