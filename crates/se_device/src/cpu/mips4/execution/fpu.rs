@@ -35,7 +35,7 @@ use crate::cpu::mips4::tlb::Mips4TlbAsid;
 
 use super::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransaction, Mips4ExecutionTransferSize};
 use super::memory::{decode_u32, decode_u64, encode_lanes};
-use super::policy::Mips4ExecutionPolicy;
+use super::policy::{Mips4ExecutionPolicy, Mips4PrefetchPolicy};
 use super::state::Mips4ExecutionState;
 
 pub(super) enum Mips4FpuExecution {
@@ -104,6 +104,9 @@ pub(super) fn execute_fpu<F: FloatBackend>(
             prepare_indexed_memory(state, policy, raw, operation, endianness)
         }
         Mips4Cp1InstructionClass::IndexedPrefetch => {
+            if matches!(policy.prefetch_policy(), Mips4PrefetchPolicy::NoOperation) {
+                return Ok(Mips4FpuExecution::Retire);
+            }
             let instruction = Mips4Cp1Instruction::from_instruction(raw).unwrap();
             let hint = Mips4PrefetchHint::from_bits(instruction.prefetch_hint());
             if !hint.is_defined() {
@@ -211,6 +214,14 @@ fn execute_transfer(
             };
             let value = read_gpr(state, raw.rt()) as u32;
             let _ = state.cp1.write_control(register, value);
+            if matches!(register, Mips4Cp1ControlRegister::ControlStatus) {
+                let fcsr = state.cp1.fcsr();
+                if fcsr.unimplemented_operation_cause()
+                    || fcsr.cause_flags().bits() & fcsr.enable_flags().bits() != 0
+                {
+                    return Mips4FpuExecution::Exception(Mips4Exception::FloatingPoint);
+                }
+            }
         }
     }
     Mips4FpuExecution::Retire
@@ -308,7 +319,7 @@ fn execute_formatted_move(
             let fcc = state
                 .cp1
                 .fcsr()
-                .condition_code(condition_code((raw.fd() >> 2) & 0x07));
+                .condition_code(condition_code((raw.ft() >> 2) & 0x07));
             if matches!(operation, Mips4Cp1Operation::MoveConditionalFalse) {
                 Mips4Cp1MoveDecision::move_conditional_false(fcc).is_move()
             } else {
@@ -517,7 +528,8 @@ fn convert_single_to_integer<F: FloatBackend>(
     operation: Mips4Cp1Operation,
 ) -> Mips4FpuExecution {
     let source = Float32Bits::new(state.cp1.fgr().read_word(fgr(raw.fs())));
-    if unsupported_float_class(source.classify(FloatNanMode::QuietBitSet)) {
+    let class = source.classify(FloatNanMode::QuietBitSet);
+    if unsupported_float_class(class) {
         return unimplemented(state);
     }
     let control = state
@@ -525,9 +537,20 @@ fn convert_single_to_integer<F: FloatBackend>(
         .fcsr()
         .conversion_float_control(conversion_rounding(operation));
     if converts_to_long(operation) {
-        commit_i64(state, raw.fd(), backend.f32_to_i64(control, source))
+        let result = backend.f32_to_i64(control, source);
+        if fixed_conversion_is_unimplemented(class, result.flags)
+            || (!class.is_signaling_nan()
+                && !(-(1_i64 << 53)..(1_i64 << 53)).contains(&result.value))
+        {
+            return unimplemented(state);
+        }
+        commit_i64(state, raw.fd(), result)
     } else {
-        commit_i32(state, raw.fd(), backend.f32_to_i32(control, source))
+        let result = backend.f32_to_i32(control, source);
+        if fixed_conversion_is_unimplemented(class, result.flags) {
+            return unimplemented(state);
+        }
+        commit_i32(state, raw.fd(), result)
     }
 }
 
@@ -542,7 +565,8 @@ fn convert_double_to_integer<F: FloatBackend>(
         return unimplemented(state);
     };
     let source = Float64Bits::new(bits);
-    if unsupported_float_class(source.classify(FloatNanMode::QuietBitSet)) {
+    let class = source.classify(FloatNanMode::QuietBitSet);
+    if unsupported_float_class(class) {
         return unimplemented(state);
     }
     let control = state
@@ -550,10 +574,25 @@ fn convert_double_to_integer<F: FloatBackend>(
         .fcsr()
         .conversion_float_control(conversion_rounding(operation));
     if converts_to_long(operation) {
-        commit_i64(state, raw.fd(), backend.f64_to_i64(control, source))
+        let result = backend.f64_to_i64(control, source);
+        if fixed_conversion_is_unimplemented(class, result.flags)
+            || (!class.is_signaling_nan()
+                && !(-(1_i64 << 53)..(1_i64 << 53)).contains(&result.value))
+        {
+            return unimplemented(state);
+        }
+        commit_i64(state, raw.fd(), result)
     } else {
-        commit_i32(state, raw.fd(), backend.f64_to_i32(control, source))
+        let result = backend.f64_to_i32(control, source);
+        if fixed_conversion_is_unimplemented(class, result.flags) {
+            return unimplemented(state);
+        }
+        commit_i32(state, raw.fd(), result)
     }
+}
+
+fn fixed_conversion_is_unimplemented(class: FloatClass, flags: FloatExceptionFlags) -> bool {
+    !class.is_signaling_nan() && flags.contains(FloatExceptionFlags::INVALID)
 }
 
 fn execute_compare<F: FloatBackend>(
@@ -753,10 +792,17 @@ fn commit_f32(
     destination: u8,
     mut result: FloatResult<Float32Bits>,
 ) -> Mips4FpuExecution {
-    if underflow_is_unimplemented(state, result.flags) {
+    let subnormal = matches!(
+        result.value.classify(FloatNanMode::QuietBitSet),
+        FloatClass::PositiveSubnormal | FloatClass::NegativeSubnormal
+    );
+    if underflow_is_unimplemented(state, result.flags, subnormal) {
         return unimplemented(state);
     }
-    if result.flags.contains(FloatExceptionFlags::UNDERFLOW) && state.cp1.fcsr().flush_to_zero() {
+    if (result.flags.contains(FloatExceptionFlags::UNDERFLOW) || subnormal)
+        && state.cp1.fcsr().flush_to_zero()
+    {
+        result.flags |= FloatExceptionFlags::UNDERFLOW | FloatExceptionFlags::INEXACT;
         result.value =
             flush_underflow_f32(result.value, state.cp1.fcsr().float_control().rounding_mode);
     }
@@ -780,10 +826,17 @@ fn commit_f64(
     if !doubleword_register_valid(mode, target) {
         return unimplemented(state);
     }
-    if underflow_is_unimplemented(state, result.flags) {
+    let subnormal = matches!(
+        result.value.classify(FloatNanMode::QuietBitSet),
+        FloatClass::PositiveSubnormal | FloatClass::NegativeSubnormal
+    );
+    if underflow_is_unimplemented(state, result.flags, subnormal) {
         return unimplemented(state);
     }
-    if result.flags.contains(FloatExceptionFlags::UNDERFLOW) && state.cp1.fcsr().flush_to_zero() {
+    if (result.flags.contains(FloatExceptionFlags::UNDERFLOW) || subnormal)
+        && state.cp1.fcsr().flush_to_zero()
+    {
+        result.flags |= FloatExceptionFlags::UNDERFLOW | FloatExceptionFlags::INEXACT;
         result.value =
             flush_underflow_f64(result.value, state.cp1.fcsr().float_control().rounding_mode);
     }
@@ -806,9 +859,6 @@ fn commit_i32(
     destination: u8,
     result: FloatResult<i32>,
 ) -> Mips4FpuExecution {
-    if result.flags.contains(FloatExceptionFlags::INVALID) {
-        return unimplemented(state);
-    }
     if let Err(exception) = state.cp1.fcsr_mut().record_float_flags(result.flags) {
         return Mips4FpuExecution::Exception(exception);
     }
@@ -827,11 +877,6 @@ fn commit_i64(
     let mode = register_mode(state);
     let target = fgr(destination);
     if !doubleword_register_valid(mode, target) {
-        return unimplemented(state);
-    }
-    if result.flags.contains(FloatExceptionFlags::INVALID)
-        || !(-(1_i64 << 53)..(1_i64 << 53)).contains(&result.value)
-    {
         return unimplemented(state);
     }
     if let Err(exception) = state.cp1.fcsr_mut().record_float_flags(result.flags) {
@@ -991,8 +1036,12 @@ fn intermediate_is_unimplemented_f64(result: FloatResult<Float64Bits>) -> bool {
         )
 }
 
-fn underflow_is_unimplemented(state: &Mips4ExecutionState, flags: FloatExceptionFlags) -> bool {
-    if !flags.contains(FloatExceptionFlags::UNDERFLOW) {
+fn underflow_is_unimplemented(
+    state: &Mips4ExecutionState,
+    flags: FloatExceptionFlags,
+    subnormal_result: bool,
+) -> bool {
+    if !flags.contains(FloatExceptionFlags::UNDERFLOW) && !subnormal_result {
         return false;
     }
     let fcsr = state.cp1.fcsr();

@@ -39,6 +39,15 @@ pub enum Mips4Cp0DoublewordTransferPolicy {
     ReservedInstruction,
 }
 
+/// Processor decision for architectural prefetch instructions.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Mips4PrefetchPolicy {
+    /// Execute the prefetch through the functional cache hierarchy.
+    Execute,
+    /// Retire the prefetch without address translation or a memory transaction.
+    NoOperation,
+}
+
 /// Processor implementation policy used by the generic MIPS IV execution target.
 pub trait Mips4ExecutionPolicy {
     /// Returns the reset program counter.
@@ -78,6 +87,11 @@ pub trait Mips4ExecutionPolicy {
         status: Mips4Cp0Status,
         register: Mips4Cp0Register,
     ) -> Mips4Cp0DoublewordTransferPolicy;
+
+    /// Selects processor behavior for `PREF` and `PREFX`.
+    fn prefetch_policy(&self) -> Mips4PrefetchPolicy {
+        Mips4PrefetchPolicy::Execute
+    }
 
     /// Resolves an architecture cache attribute to a processor access type.
     fn resolve_access_type(&self, cache_attribute: Mips4MmuCacheAttribute)

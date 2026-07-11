@@ -44,7 +44,7 @@ use super::memory::{
     Mips4MemoryPlan, Mips4PendingRead, Mips4PendingWrite, complete_read, complete_write,
     prepare_cache_address, prepare_memory,
 };
-use super::policy::Mips4ExecutionPolicy;
+use super::policy::{Mips4ExecutionPolicy, Mips4PrefetchPolicy};
 use super::state::Mips4ExecutionState;
 
 /// Asynchronous input accepted by functional MIPS IV execution.
@@ -910,6 +910,12 @@ where
         ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
         Mips4ExecutionTargetError,
     > {
+        if matches!(
+            self.policy.prefetch_policy(),
+            Mips4PrefetchPolicy::NoOperation
+        ) {
+            return Ok(self.retire_sequential(instruction));
+        }
         let hint = Mips4PrefetchHint::from_bits(instruction.rt());
         if !hint.is_defined() {
             return Ok(self.retire_sequential(instruction));
