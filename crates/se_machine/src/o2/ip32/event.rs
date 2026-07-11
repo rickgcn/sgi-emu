@@ -11,4 +11,10 @@ pub enum Ip32Event {
 
     /// Board reset event.
     Reset,
+
+    /// Executes one CPU architectural boundary for the active reset epoch.
+    CpuStep {
+        /// Reset generation that scheduled this step.
+        generation: u64,
+    },
 }
