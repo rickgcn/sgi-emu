@@ -88,3 +88,67 @@ fn reset_all_uses_stable_component_id_order() {
 
     assert_eq!(*resets.borrow(), vec![10, 20, 30]);
 }
+
+#[test]
+fn typed_lookups_return_the_requested_component() {
+    let resets = Rc::new(RefCell::new(Vec::new()));
+    let mut registry = ComponentRegistry::new();
+    let id = ComponentId::new(40);
+    registry
+        .insert(Box::new(TestComponent::new(40, "typed", resets)))
+        .unwrap();
+
+    assert_eq!(
+        registry.get_typed::<TestComponent>(id).unwrap().name(),
+        "typed"
+    );
+    registry.get_typed_mut::<TestComponent>(id).unwrap().name = "changed";
+    assert_eq!(
+        registry.get_typed::<TestComponent>(id).unwrap().name(),
+        "changed"
+    );
+}
+
+#[test]
+fn typed_lookups_distinguish_missing_components_and_type_mismatches() {
+    #[derive(Default)]
+    struct OtherComponent;
+
+    impl Component for OtherComponent {
+        fn id(&self) -> ComponentId {
+            ComponentId::new(50)
+        }
+
+        fn name(&self) -> &str {
+            "other"
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    let resets = Rc::new(RefCell::new(Vec::new()));
+    let mut registry = ComponentRegistry::new();
+    registry
+        .insert(Box::new(TestComponent::new(50, "typed", resets)))
+        .unwrap();
+
+    assert_eq!(
+        registry
+            .get_typed::<TestComponent>(ComponentId::new(51))
+            .err()
+            .unwrap(),
+        RegistryLookupError::MissingComponent {
+            id: ComponentId::new(51),
+        }
+    );
+    assert_eq!(
+        registry
+            .get_typed::<OtherComponent>(ComponentId::new(50))
+            .err()
+            .unwrap(),
+        RegistryLookupError::TypeMismatch {
+            id: ComponentId::new(50),
+            expected: core::any::type_name::<OtherComponent>(),
+        }
+    );
+}

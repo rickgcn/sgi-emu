@@ -15,6 +15,7 @@
 //! This module should contain only component identity, naming, hierarchy, and
 //! lifecycle concepts. It should not contain bus routing, protocol semantics,
 //! or scheduler policy.
+use core::any::Any;
 use core::fmt;
 
 /// Stable identifier for a component.
@@ -38,7 +39,7 @@ impl fmt::Display for ComponentId {
 }
 
 /// Common identity and lifecycle interface for all emulator components.
-pub trait Component {
+pub trait Component: Any {
     /// Returns the stable component identifier.
     fn id(&self) -> ComponentId;
 

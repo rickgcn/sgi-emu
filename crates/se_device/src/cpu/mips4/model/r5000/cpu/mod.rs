@@ -168,7 +168,7 @@ where
 
 impl<F> Component for R5000Cpu<F>
 where
-    F: FloatBackend,
+    F: FloatBackend + 'static,
 {
     fn id(&self) -> ComponentId {
         self.id

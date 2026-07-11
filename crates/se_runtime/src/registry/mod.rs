@@ -5,6 +5,7 @@
 //! Rust references, so the runtime can borrow and dispatch components without
 //! creating ownership cycles.
 
+use core::any::type_name;
 use core::fmt;
 use std::collections::BTreeMap;
 
@@ -29,6 +30,38 @@ impl fmt::Display for RegistryError {
 }
 
 impl std::error::Error for RegistryError {}
+
+/// Errors produced by typed component lookups.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistryLookupError {
+    /// No component is registered with the requested identifier.
+    MissingComponent {
+        /// Missing component identifier.
+        id: ComponentId,
+    },
+
+    /// The registered component does not have the requested concrete type.
+    TypeMismatch {
+        /// Component identifier whose type did not match.
+        id: ComponentId,
+
+        /// Requested concrete Rust type.
+        expected: &'static str,
+    },
+}
+
+impl fmt::Display for RegistryLookupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingComponent { id } => write!(f, "missing component {id}"),
+            Self::TypeMismatch { id, expected } => {
+                write!(f, "component {id} is not of type {expected}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegistryLookupError {}
 
 /// Ordered component storage owned by the runtime.
 #[derive(Default)]
@@ -60,16 +93,52 @@ impl ComponentRegistry {
     }
 
     /// Returns an immutable component reference.
-    pub fn get(&self, id: ComponentId) -> Option<&(dyn Component + '_)> {
+    pub fn get(&self, id: ComponentId) -> Option<&dyn Component> {
         self.components.get(&id).map(Box::as_ref)
     }
 
     /// Returns a mutable component reference.
-    pub fn get_mut(&mut self, id: ComponentId) -> Option<&mut (dyn Component + '_)> {
+    pub fn get_mut(&mut self, id: ComponentId) -> Option<&mut dyn Component> {
         match self.components.get_mut(&id) {
             Some(component) => Some(component.as_mut()),
             None => None,
         }
+    }
+
+    /// Returns an immutable component reference with its concrete type checked.
+    pub fn get_typed<T>(&self, id: ComponentId) -> Result<&T, RegistryLookupError>
+    where
+        T: Component,
+    {
+        let component = self
+            .components
+            .get(&id)
+            .ok_or(RegistryLookupError::MissingComponent { id })?;
+        let component: &dyn core::any::Any = component.as_ref();
+        component
+            .downcast_ref::<T>()
+            .ok_or(RegistryLookupError::TypeMismatch {
+                id,
+                expected: type_name::<T>(),
+            })
+    }
+
+    /// Returns a mutable component reference with its concrete type checked.
+    pub fn get_typed_mut<T>(&mut self, id: ComponentId) -> Result<&mut T, RegistryLookupError>
+    where
+        T: Component,
+    {
+        let component = self
+            .components
+            .get_mut(&id)
+            .ok_or(RegistryLookupError::MissingComponent { id })?;
+        let component: &mut dyn core::any::Any = component.as_mut();
+        component
+            .downcast_mut::<T>()
+            .ok_or(RegistryLookupError::TypeMismatch {
+                id,
+                expected: type_name::<T>(),
+            })
     }
 
     /// Removes and returns a component.
