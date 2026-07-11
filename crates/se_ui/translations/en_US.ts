@@ -72,6 +72,31 @@
       <source>About</source>
       <translation>About</translation>
     </message>
+    <message><source>Machine</source><translation>Machine</translation></message>
+    <message><source>SGI O2 (IP32)</source><translation>SGI O2 (IP32)</translation></message>
+    <message><source>System PROM</source><translation>System PROM</translation></message>
+    <message><source>Browse...</source><translation>Browse...</translation></message>
+    <message><source>Select System PROM</source><translation>Select System PROM</translation></message>
+    <message><source>PROM images (*)</source><translation>PROM images (*)</translation></message>
+    <message><source>Select a System PROM image.</source><translation>Select a System PROM image.</translation></message>
+    <message><source>Failed to read the selected System PROM.</source><translation>Failed to read the selected System PROM.</translation></message>
+    <message>
+      <source>The System PROM must be exactly 524,288 bytes.</source>
+      <translation>The System PROM must be exactly 524,288 bytes.</translation>
+    </message>
+    <message>
+      <source>The emulator cannot apply this configuration in its current state.</source>
+      <translation>The emulator cannot apply this configuration in its current state.</translation>
+    </message>
+    <message><source>Emulation Error</source><translation>Emulation Error</translation></message>
+    <message><source>IP32: %1</source><translation>IP32: %1</translation></message>
+    <message><source>Unconfigured</source><translation>Unconfigured</translation></message>
+    <message><source>Building</source><translation>Building</translation></message>
+    <message><source>Paused</source><translation>Paused</translation></message>
+    <message><source>Running</source><translation>Running</translation></message>
+    <message><source>Idle</source><translation>Idle</translation></message>
+    <message><source>Faulted</source><translation>Faulted</translation></message>
+    <message><source>Shutting Down</source><translation>Shutting Down</translation></message>
   </context>
   <context>
     <name>TracingDock</name>
@@ -97,6 +122,8 @@
     <message><source>All Sources</source><translation>All Sources</translation></message>
     <message><source>All Targets</source><translation>All Targets</translation></message>
     <message><source>Follow Live</source><translation>Follow Live</translation></message>
+    <message><source>Capture</source><translation>Capture</translation></message>
+    <message><source>Capture Scheduler</source><translation>Capture Scheduler</translation></message>
     <message><source>Clear</source><translation>Clear</translation></message>
     <message><source>No trace records</source><translation>No trace records</translation></message>
     <message><source>Field</source><translation>Field</translation></message>

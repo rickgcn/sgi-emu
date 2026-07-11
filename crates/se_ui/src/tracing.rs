@@ -4,7 +4,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, LazyLock, Mutex, TryLockError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -60,6 +60,7 @@ mod ffi {
     }
 
     struct UiTraceStats {
+        session: u64,
         captured: u64,
         dropped: u64,
     }
@@ -68,14 +69,19 @@ mod ffi {
         fn drain_trace_records(max_records: usize) -> Vec<UiTraceRecord>;
         fn clear_trace_records();
         fn trace_stats() -> UiTraceStats;
+        fn set_trace_capture_enabled(enabled: bool);
+        fn set_scheduler_trace_capture_enabled(enabled: bool);
     }
 }
 
 struct TraceQueue {
     capacity: usize,
     records: Mutex<VecDeque<ffi::UiTraceRecord>>,
+    session: AtomicU64,
     captured: AtomicU64,
     dropped: AtomicU64,
+    capture_enabled: AtomicBool,
+    scheduler_capture_enabled: AtomicBool,
 }
 
 impl TraceQueue {
@@ -84,8 +90,11 @@ impl TraceQueue {
         Self {
             capacity,
             records: Mutex::new(VecDeque::with_capacity(capacity)),
+            session: AtomicU64::new(0),
             captured: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            capture_enabled: AtomicBool::new(true),
+            scheduler_capture_enabled: AtomicBool::new(false),
         }
     }
 
@@ -107,9 +116,17 @@ impl TraceQueue {
 
     fn stats(&self) -> ffi::UiTraceStats {
         ffi::UiTraceStats {
+            session: self.session.load(Ordering::Acquire),
             captured: self.captured.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
         }
+    }
+
+    fn begin_session(&self) -> u64 {
+        self.clear();
+        self.captured.store(0, Ordering::Relaxed);
+        self.dropped.store(0, Ordering::Relaxed);
+        self.session.fetch_add(1, Ordering::AcqRel) + 1
     }
 }
 
@@ -144,6 +161,12 @@ impl UiTraceSink {
 
 impl TraceSink for UiTraceSink {
     fn record(&mut self, record: TraceRecord<'_>) {
+        if !self.queue.capture_enabled.load(Ordering::Relaxed)
+            || matches!(record.source, TraceSource::Scheduler)
+                && !self.queue.scheduler_capture_enabled.load(Ordering::Relaxed)
+        {
+            return;
+        }
         self.queue.captured.fetch_add(1, Ordering::Relaxed);
         let record = ffi::UiTraceRecord::from(record);
 
@@ -256,6 +279,22 @@ fn trace_stats() -> ffi::UiTraceStats {
     APPLICATION_TRACE_QUEUE.stats()
 }
 
+fn set_trace_capture_enabled(enabled: bool) {
+    APPLICATION_TRACE_QUEUE
+        .capture_enabled
+        .store(enabled, Ordering::Relaxed);
+}
+
+fn set_scheduler_trace_capture_enabled(enabled: bool) {
+    APPLICATION_TRACE_QUEUE
+        .scheduler_capture_enabled
+        .store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn begin_application_trace_session() -> u64 {
+    APPLICATION_TRACE_QUEUE.begin_session()
+}
+
 #[cfg(test)]
 mod tests {
     use se_core::{
@@ -264,7 +303,7 @@ mod tests {
         tracing::{TraceField, TraceLevel, TraceRecord, TraceSink, TraceSource},
     };
 
-    use super::{UiTraceSink, ffi};
+    use super::{Ordering, UiTraceSink, ffi};
 
     fn record<'a>(fields: &'a [TraceField<'a>]) -> TraceRecord<'a> {
         TraceRecord {
@@ -339,6 +378,44 @@ mod tests {
         sink.queue.clear();
         assert!(sink.queue.drain(8).is_empty());
         assert_eq!(sink.queue.stats().captured, 2);
+        assert_eq!(sink.queue.stats().dropped, 0);
+    }
+
+    #[test]
+    fn capture_gates_filter_before_counting_records() {
+        let mut sink = UiTraceSink::with_capacity(8);
+        let scheduler_record = TraceRecord {
+            source: TraceSource::Scheduler,
+            ..record(&[])
+        };
+
+        sink.record(scheduler_record);
+        assert!(sink.queue.drain(8).is_empty());
+        assert_eq!(sink.queue.stats().captured, 0);
+
+        sink.queue
+            .scheduler_capture_enabled
+            .store(true, Ordering::Relaxed);
+        sink.record(scheduler_record);
+        assert_eq!(sink.queue.drain(8).len(), 1);
+        assert_eq!(sink.queue.stats().captured, 1);
+
+        sink.queue.capture_enabled.store(false, Ordering::Relaxed);
+        sink.record(record(&[]));
+        assert!(sink.queue.drain(8).is_empty());
+        assert_eq!(sink.queue.stats().captured, 1);
+        assert_eq!(sink.queue.stats().dropped, 0);
+    }
+
+    #[test]
+    fn beginning_a_session_clears_records_and_statistics() {
+        let mut sink = UiTraceSink::with_capacity(8);
+        sink.record(record(&[]));
+
+        assert_eq!(sink.queue.begin_session(), 1);
+        assert!(sink.queue.drain(8).is_empty());
+        assert_eq!(sink.queue.stats().session, 1);
+        assert_eq!(sink.queue.stats().captured, 0);
         assert_eq!(sink.queue.stats().dropped, 0);
     }
 }

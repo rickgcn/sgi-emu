@@ -1,5 +1,6 @@
 #include "se_ui/include/application.h"
 #include "se_ui/include/tracing_dock.h"
+#include "se_ui/src/application.rs.h"
 
 #include <cstdint>
 #include <vector>
@@ -72,6 +73,38 @@ constexpr auto qt_ui_style_text = QT_TRANSLATE_NOOP("MainWindow", "Qt UI Style")
 constexpr auto emulation_settings_text =
   QT_TRANSLATE_NOOP("MainWindow", "Emulation Settings");
 constexpr auto about_text = QT_TRANSLATE_NOOP("MainWindow", "About");
+constexpr auto machine_text = QT_TRANSLATE_NOOP("MainWindow", "Machine");
+constexpr auto ip32_machine_text =
+  QT_TRANSLATE_NOOP("MainWindow", "SGI O2 (IP32)");
+constexpr auto system_prom_text =
+  QT_TRANSLATE_NOOP("MainWindow", "System PROM");
+constexpr auto browse_text = QT_TRANSLATE_NOOP("MainWindow", "Browse...");
+constexpr auto select_prom_text =
+  QT_TRANSLATE_NOOP("MainWindow", "Select System PROM");
+constexpr auto prom_filter_text =
+  QT_TRANSLATE_NOOP("MainWindow", "PROM images (*)");
+constexpr auto prom_required_text =
+  QT_TRANSLATE_NOOP("MainWindow", "Select a System PROM image.");
+constexpr auto prom_read_failed_text =
+  QT_TRANSLATE_NOOP("MainWindow", "Failed to read the selected System PROM.");
+constexpr auto prom_size_text = QT_TRANSLATE_NOOP(
+  "MainWindow",
+  "The System PROM must be exactly 524,288 bytes.");
+constexpr auto configure_failed_text = QT_TRANSLATE_NOOP(
+  "MainWindow",
+  "The emulator cannot apply this configuration in its current state.");
+constexpr auto emulation_error_text =
+  QT_TRANSLATE_NOOP("MainWindow", "Emulation Error");
+constexpr auto ip32_status_text = QT_TRANSLATE_NOOP("MainWindow", "IP32: %1");
+constexpr auto unconfigured_text =
+  QT_TRANSLATE_NOOP("MainWindow", "Unconfigured");
+constexpr auto building_text = QT_TRANSLATE_NOOP("MainWindow", "Building");
+constexpr auto paused_text = QT_TRANSLATE_NOOP("MainWindow", "Paused");
+constexpr auto running_text = QT_TRANSLATE_NOOP("MainWindow", "Running");
+constexpr auto idle_text = QT_TRANSLATE_NOOP("MainWindow", "Idle");
+constexpr auto faulted_text = QT_TRANSLATE_NOOP("MainWindow", "Faulted");
+constexpr auto shutting_down_text =
+  QT_TRANSLATE_NOOP("MainWindow", "Shutting Down");
 
 constexpr auto run_icon_path = ":/icons/run.svg";
 constexpr auto pause_icon_path = ":/icons/pause.svg";
@@ -82,6 +115,13 @@ constexpr auto emulation_settings_icon_path =
 QString translate(const char* source)
 {
   return QCoreApplication::translate("MainWindow", source);
+}
+
+QString from_rust_string(const rust::String& value)
+{
+  return QString::fromUtf8(
+    value.data(),
+    static_cast<qsizetype>(value.size()));
 }
 
 QPixmap tinted_svg_pixmap(
@@ -126,6 +166,27 @@ QIcon palette_icon(const char* path, const QPalette& palette)
   return icon;
 }
 
+QString emulation_state_text(EmulationState state)
+{
+  switch (state) {
+  case EmulationState::Unconfigured:
+    return translate(unconfigured_text);
+  case EmulationState::Building:
+    return translate(building_text);
+  case EmulationState::Paused:
+    return translate(paused_text);
+  case EmulationState::Running:
+    return translate(running_text);
+  case EmulationState::Idle:
+    return translate(idle_text);
+  case EmulationState::Faulted:
+    return translate(faulted_text);
+  case EmulationState::ShuttingDown:
+    return translate(shutting_down_text);
+  }
+  return {};
+}
+
 void show_settings_dialog(QWidget* parent)
 {
   QDialog dialog(parent);
@@ -160,10 +221,94 @@ void show_settings_dialog(QWidget* parent)
   }
 }
 
+void show_emulation_settings_dialog(
+  QWidget* parent,
+  const EmulationController& controller)
+{
+  constexpr qsizetype prom_size = 512 * 1024;
+
+  QDialog dialog(parent);
+  dialog.setWindowTitle(translate(emulation_settings_text));
+
+  auto* layout = new QFormLayout(&dialog);
+  layout->addRow(translate(machine_text), new QLabel(translate(ip32_machine_text), &dialog));
+
+  auto* prom_row = new QWidget(&dialog);
+  auto* prom_layout = new QHBoxLayout(prom_row);
+  prom_layout->setContentsMargins(0, 0, 0, 0);
+  auto* prom_path = new QLineEdit(prom_row);
+  auto* browse = new QPushButton(translate(browse_text), prom_row);
+  prom_layout->addWidget(prom_path, 1);
+  prom_layout->addWidget(browse);
+  layout->addRow(translate(system_prom_text), prom_row);
+
+  QObject::connect(browse, &QPushButton::clicked, &dialog, [&dialog, prom_path] {
+    const auto path = QFileDialog::getOpenFileName(
+      &dialog,
+      translate(select_prom_text),
+      {},
+      translate(prom_filter_text));
+    if (!path.isEmpty()) {
+      prom_path->setText(path);
+    }
+  });
+
+  auto* buttons = new QDialogButtonBox(
+    QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+    &dialog);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  QObject::connect(
+    buttons,
+    &QDialogButtonBox::accepted,
+    &dialog,
+    [&dialog, prom_path, &controller] {
+      if (prom_path->text().isEmpty()) {
+        QMessageBox::warning(
+          &dialog,
+          translate(emulation_settings_text),
+          translate(prom_required_text));
+        return;
+      }
+
+      QFile file(prom_path->text());
+      if (!file.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(
+          &dialog,
+          translate(emulation_settings_text),
+          translate(prom_read_failed_text));
+        return;
+      }
+      const auto prom = file.readAll();
+      if (prom.size() != prom_size) {
+        QMessageBox::warning(
+          &dialog,
+          translate(emulation_settings_text),
+          translate(prom_size_text));
+        return;
+      }
+
+      const auto* data = reinterpret_cast<const std::uint8_t*>(prom.constData());
+      if (!controller.configure_prom(
+            rust::Slice<const std::uint8_t>(
+              data,
+              static_cast<std::size_t>(prom.size())))) {
+        QMessageBox::warning(
+          &dialog,
+          translate(emulation_settings_text),
+          translate(configure_failed_text));
+        return;
+      }
+      dialog.accept();
+    });
+  layout->addRow(buttons);
+  dialog.exec();
+}
+
 class MainWindow final : public QMainWindow
 {
 public:
-  MainWindow()
+  explicit MainWindow(const EmulationController& controller)
+    : controller_(controller)
   {
     setObjectName(QStringLiteral("mainWindow"));
     setWindowTitle(QStringLiteral("%1 %2").arg(
@@ -184,13 +329,20 @@ public:
       &QAction::triggered,
       this,
       [this] {
-        run_icon_running_ = !run_icon_running_;
-        run_pause_action_->setText(
-          translate(run_icon_running_ ? pause_text : run_text));
-        refresh_action_icons();
+        const auto snapshot = controller_.snapshot();
+        if (snapshot.state == EmulationState::Running) {
+          controller_.request_pause();
+        } else if (snapshot.state == EmulationState::Paused) {
+          controller_.request_run();
+        }
+        update_emulation_state();
       });
 
     hard_reset_action_ = action_menu->addAction(translate(hard_reset_text));
+    connect(hard_reset_action_, &QAction::triggered, this, [this] {
+      controller_.request_hard_reset();
+      update_emulation_state();
+    });
     auto* settings_action = tools_menu->addAction(translate(settings_text));
     connect(settings_action, &QAction::triggered, this, [this] {
       show_settings_dialog(this);
@@ -198,6 +350,10 @@ public:
     tools_menu->addSeparator();
     emulation_settings_action_ =
       tools_menu->addAction(translate(emulation_settings_text));
+    connect(emulation_settings_action_, &QAction::triggered, this, [this] {
+      show_emulation_settings_dialog(this, controller_);
+      update_emulation_state();
+    });
 
     auto* tool_bar = new QToolBar(this);
     tool_bar->setObjectName(QStringLiteral("mainToolBar"));
@@ -211,6 +367,8 @@ public:
     tool_bar->addAction(emulation_settings_action_);
 
     auto* status_bar = statusBar();
+    emulation_status_ = new QLabel(status_bar);
+    status_bar->addWidget(emulation_status_);
 
     auto* hide_tool_bar_action = view_menu->addAction(translate(hide_toolbar_text));
     hide_tool_bar_action->setCheckable(true);
@@ -270,7 +428,14 @@ public:
           QCoreApplication::applicationVersion()));
     });
 
+    auto* state_timer = new QTimer(this);
+    state_timer->setInterval(50);
+    connect(state_timer, &QTimer::timeout, this, [this] {
+      update_emulation_state();
+    });
+    state_timer->start();
     refresh_action_icons();
+    update_emulation_state();
   }
 
 protected:
@@ -298,10 +463,50 @@ private:
       palette_icon(emulation_settings_icon_path, palette()));
   }
 
+  void update_emulation_state()
+  {
+    const auto snapshot = controller_.snapshot();
+    const auto running = snapshot.state == EmulationState::Running;
+    run_pause_action_->setText(translate(running ? pause_text : run_text));
+    if (run_icon_running_ != running) {
+      run_icon_running_ = running;
+      run_pause_action_->setIcon(palette_icon(
+        running ? pause_icon_path : run_icon_path,
+        palette()));
+    }
+    run_pause_action_->setEnabled(
+      running || snapshot.state == EmulationState::Paused);
+
+    hard_reset_action_->setEnabled(
+      snapshot.has_machine
+      && (snapshot.state == EmulationState::Paused
+          || snapshot.state == EmulationState::Running
+          || snapshot.state == EmulationState::Idle
+          || snapshot.state == EmulationState::Faulted));
+    emulation_settings_action_->setEnabled(
+      snapshot.state == EmulationState::Unconfigured
+      || snapshot.state == EmulationState::Paused
+      || snapshot.state == EmulationState::Idle
+      || snapshot.state == EmulationState::Faulted);
+    emulation_status_->setText(
+      translate(ip32_status_text).arg(emulation_state_text(snapshot.state)));
+
+    if (snapshot.error_id > last_error_id_ && !snapshot.error_message.empty()) {
+      last_error_id_ = snapshot.error_id;
+      QMessageBox::critical(
+        this,
+        translate(emulation_error_text),
+        from_rust_string(snapshot.error_message));
+    }
+  }
+
+  const EmulationController& controller_;
   QAction* run_pause_action_ = nullptr;
   QAction* hard_reset_action_ = nullptr;
   QAction* emulation_settings_action_ = nullptr;
+  QLabel* emulation_status_ = nullptr;
   bool run_icon_running_ = false;
+  std::uint64_t last_error_id_ = 0;
 };
 
 std::vector<QByteArray> make_argument_storage(
@@ -340,7 +545,8 @@ std::vector<char*> make_argument_pointers(std::vector<QByteArray>& storage)
 
 std::int32_t run_application(
   rust::Str version,
-  rust::Vec<rust::String> arguments)
+  rust::Vec<rust::String> arguments,
+  const EmulationController& controller)
 {
   initialize_resources();
 
@@ -362,7 +568,7 @@ std::int32_t run_application(
   }
   QCoreApplication::installTranslator(&translator);
 
-  MainWindow main_window;
+  MainWindow main_window(controller);
   main_window.show();
 
   const auto exit_code = application.exec();

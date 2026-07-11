@@ -76,6 +76,9 @@ constexpr auto all_targets_text =
   QT_TRANSLATE_NOOP("TracingDock", "All Targets");
 constexpr auto follow_live_text =
   QT_TRANSLATE_NOOP("TracingDock", "Follow Live");
+constexpr auto capture_text = QT_TRANSLATE_NOOP("TracingDock", "Capture");
+constexpr auto capture_scheduler_text =
+  QT_TRANSLATE_NOOP("TracingDock", "Capture Scheduler");
 constexpr auto clear_text = QT_TRANSLATE_NOOP("TracingDock", "Clear");
 constexpr auto no_records_text =
   QT_TRANSLATE_NOOP("TracingDock", "No trace records");
@@ -494,6 +497,7 @@ public:
     layout->addWidget(status_);
 
     connect_controls();
+    trace_session_ = trace_stats().session;
     update_empty_state();
     update_status();
 
@@ -545,6 +549,20 @@ private:
       translate(all_targets_text),
       QString());
     controls_->addWidget(target_);
+
+    capture_ = new QCheckBox(translate(capture_text), this);
+    capture_->setChecked(true);
+    capture_->setMinimumWidth(capture_->sizeHint().width());
+    set_trace_capture_enabled(true);
+    controls_->addWidget(capture_);
+    controls_->addSpacing(10);
+
+    scheduler_capture_ = new QCheckBox(translate(capture_scheduler_text), this);
+    scheduler_capture_->setChecked(false);
+    scheduler_capture_->setMinimumWidth(scheduler_capture_->sizeHint().width());
+    set_scheduler_trace_capture_enabled(false);
+    controls_->addWidget(scheduler_capture_);
+    controls_->addSpacing(10);
 
     follow_ = new QCheckBox(translate(follow_live_text), this);
     follow_->setChecked(true);
@@ -633,6 +651,14 @@ private:
       filter_->set_target(target_->currentData().toString());
       update_status();
     });
+    connect(capture_, &QCheckBox::toggled, this, [](bool enabled) {
+      set_trace_capture_enabled(enabled);
+    });
+    connect(
+      scheduler_capture_,
+      &QCheckBox::toggled,
+      this,
+      [](bool enabled) { set_scheduler_trace_capture_enabled(enabled); });
     connect(follow_, &QCheckBox::toggled, this, [this](bool enabled) {
       if (enabled) {
         table_->scrollToBottom();
@@ -676,6 +702,11 @@ private:
 
   void drain_records()
   {
+    const auto stats = trace_stats();
+    if (stats.session != trace_session_) {
+      reset_view_for_session(stats.session);
+    }
+
     auto incoming = drain_trace_records(drain_batch_size);
     if (incoming.empty()) {
       update_status();
@@ -725,8 +756,24 @@ private:
   void clear_records()
   {
     clear_trace_records();
+    clear_view(false);
+    update_status();
+  }
+
+  void reset_view_for_session(std::uint64_t session)
+  {
+    trace_session_ = session;
+    clear_view(true);
+    update_status();
+  }
+
+  void clear_view(bool reset_evictions)
+  {
     model_->clear();
     details_->clear();
+    if (reset_evictions) {
+      local_dropped_ = 0;
+    }
     known_targets_.clear();
     target_->blockSignals(true);
     target_->clear();
@@ -736,7 +783,6 @@ private:
     target_->blockSignals(false);
     filter_->set_target({});
     update_empty_state();
-    update_status();
   }
 
   void show_details(const QModelIndex& proxy_index)
@@ -829,6 +875,8 @@ private:
   QComboBox* level_ = nullptr;
   QComboBox* source_ = nullptr;
   QComboBox* target_ = nullptr;
+  QCheckBox* capture_ = nullptr;
+  QCheckBox* scheduler_capture_ = nullptr;
   QCheckBox* follow_ = nullptr;
   QPushButton* clear_ = nullptr;
   QTableView* table_ = nullptr;
@@ -840,6 +888,7 @@ private:
   QTimer* search_timer_ = nullptr;
   QString pending_search_;
   QStringList known_targets_;
+  std::uint64_t trace_session_ = 0;
   std::uint64_t local_dropped_ = 0;
   bool appending_ = false;
 };
