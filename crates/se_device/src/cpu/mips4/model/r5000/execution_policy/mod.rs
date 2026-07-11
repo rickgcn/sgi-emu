@@ -97,12 +97,8 @@ impl Mips4ExecutionPolicy for R5000ExecutionPolicy {
         RESET_PC
     }
 
-    fn endianness(&self) -> Mips4Endianness {
-        self.profile.endianness
-    }
-
-    fn processor_id(&self) -> u32 {
-        self.profile.processor_id()
+    fn architecture_config(&self) -> crate::cpu::mips4::config::Mips4Config {
+        self.profile.to_mips4_config()
     }
 
     fn cp0_config(&self) -> u32 {

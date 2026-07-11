@@ -101,7 +101,7 @@ impl R5000Profile {
             self.instruction_cache,
             self.data_cache,
             self.secondary_cache,
-            Mips4CoprocessorConfig::new(true, false, true),
+            Mips4CoprocessorConfig::new(true, false),
         )
     }
 }

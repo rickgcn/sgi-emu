@@ -65,7 +65,7 @@ pub(super) fn prepare_cache_address(
             size: Mips4MemoryAccessSize::Byte,
             signed: false,
         },
-        policy.endianness(),
+        state.config.endianness,
         policy.mmu_config(state.cp0.config()),
         state.cp0.status(),
         Mips4TlbAsid::new(state.cp0.entry_hi().address_space_identifier()),

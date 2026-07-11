@@ -1,7 +1,10 @@
 //! Architectural state owned by functional MIPS IV execution.
 
+use core::fmt;
+
 use crate::cpu::mips4::cache::Mips4CacheCoherenceAlgorithm;
 use crate::cpu::mips4::cache::hierarchy::{Mips4CacheConfigError, Mips4CacheHierarchy};
+use crate::cpu::mips4::config::Mips4Config;
 use crate::cpu::mips4::cp0::Mips4Cp0;
 use crate::cpu::mips4::cp1::Mips4Cp1;
 use crate::cpu::mips4::gpr::Mips4GprFile;
@@ -14,9 +17,45 @@ use crate::cpu::mips4::tlb::{
 
 use super::policy::Mips4ExecutionPolicy;
 
+/// Invalid configuration supplied to functional MIPS IV execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mips4ExecutionConfigError {
+    /// The implemented physical address width is outside the MIPS IV range.
+    InvalidPhysicalAddressWidth {
+        /// Invalid width in bits.
+        bits: u8,
+    },
+
+    /// The implemented virtual address width is outside the MIPS IV range.
+    InvalidVirtualAddressWidth {
+        /// Invalid width in bits.
+        bits: u8,
+    },
+
+    /// The configured functional cache hierarchy is invalid.
+    Cache(Mips4CacheConfigError),
+}
+
+impl fmt::Display for Mips4ExecutionConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPhysicalAddressWidth { bits } => {
+                write!(f, "invalid MIPS IV physical address width: {bits}")
+            }
+            Self::InvalidVirtualAddressWidth { bits } => {
+                write!(f, "invalid MIPS IV virtual address width: {bits}")
+            }
+            Self::Cache(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for Mips4ExecutionConfigError {}
+
 /// Complete architectural state required by functional MIPS IV execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mips4ExecutionState {
+    pub(super) config: Mips4Config,
     pub(super) pc: u64,
     pub(super) next_pc: u64,
     pub(super) delay_slot_branch_pc: Option<u64>,
@@ -34,9 +73,12 @@ pub struct Mips4ExecutionState {
 
 impl Mips4ExecutionState {
     /// Creates reset architectural state for one processor policy.
-    pub fn new(policy: &impl Mips4ExecutionPolicy) -> Result<Self, Mips4CacheConfigError> {
+    pub fn new(policy: &impl Mips4ExecutionPolicy) -> Result<Self, Mips4ExecutionConfigError> {
+        let config = policy.architecture_config();
+        validate_architecture_config(config)?;
         let pc = policy.reset_pc();
         Ok(Self {
+            config,
             pc,
             next_pc: pc.wrapping_add(4),
             delay_slot_branch_pc: None,
@@ -44,7 +86,7 @@ impl Mips4ExecutionState {
             hi: 0,
             lo: 0,
             cp0: Mips4Cp0::new(
-                policy.processor_id(),
+                config.processor_id,
                 policy.cp0_config(),
                 policy.tlb_random_upper_bound(),
             ),
@@ -55,8 +97,14 @@ impl Mips4ExecutionState {
             llbit: Mips4LlBit::Clear,
             external_interrupts: 0,
             standby: false,
-            cache: Mips4CacheHierarchy::new(policy.cache_config())?,
+            cache: Mips4CacheHierarchy::new(policy.cache_config())
+                .map_err(Mips4ExecutionConfigError::Cache)?,
         })
+    }
+
+    /// Returns the architectural processor configuration.
+    pub const fn config(&self) -> Mips4Config {
+        self.config
     }
 
     /// Returns the current program counter.
@@ -140,6 +188,20 @@ impl Mips4ExecutionState {
     }
 }
 
+fn validate_architecture_config(config: Mips4Config) -> Result<(), Mips4ExecutionConfigError> {
+    if !(32..=36).contains(&config.address.physical_address_bits) {
+        return Err(Mips4ExecutionConfigError::InvalidPhysicalAddressWidth {
+            bits: config.address.physical_address_bits,
+        });
+    }
+    if !(32..=40).contains(&config.address.virtual_address_bits) {
+        return Err(Mips4ExecutionConfigError::InvalidVirtualAddressWidth {
+            bits: config.address.virtual_address_bits,
+        });
+    }
+    Ok(())
+}
+
 fn invalid_tlb_entry(index: usize) -> Mips4TlbEntry {
     let page_mask = Mips4TlbPageMask::from_page_size(Mips4TlbPageSize::Size4KiB);
     let entry_hi = Mips4TlbEntryHi::from_parts(index as u64, Mips4TlbAsid::new(0xff), 0).unwrap();
@@ -152,4 +214,47 @@ fn invalid_tlb_entry(index: usize) -> Mips4TlbEntry {
     )
     .unwrap();
     Mips4TlbEntry::new(page_mask, entry_hi, entry_lo, entry_lo)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cpu::mips4::config::{
+        Mips4AddressConfig, Mips4CacheConfig, Mips4CoprocessorConfig, Mips4Endianness,
+    };
+
+    use super::*;
+
+    fn config(physical_address_bits: u8, virtual_address_bits: u8) -> Mips4Config {
+        Mips4Config::new(
+            Mips4Endianness::Big,
+            0x2300,
+            Mips4AddressConfig::new(physical_address_bits, virtual_address_bits),
+            Mips4CacheConfig::disabled(),
+            Mips4CacheConfig::disabled(),
+            Mips4CacheConfig::disabled(),
+            Mips4CoprocessorConfig::new(true, false),
+        )
+    }
+
+    #[test]
+    fn architecture_address_widths_are_validated_at_execution_construction() {
+        assert_eq!(validate_architecture_config(config(32, 32)), Ok(()));
+        assert_eq!(validate_architecture_config(config(36, 40)), Ok(()));
+        assert_eq!(
+            validate_architecture_config(config(31, 40)),
+            Err(Mips4ExecutionConfigError::InvalidPhysicalAddressWidth { bits: 31 })
+        );
+        assert_eq!(
+            validate_architecture_config(config(37, 40)),
+            Err(Mips4ExecutionConfigError::InvalidPhysicalAddressWidth { bits: 37 })
+        );
+        assert_eq!(
+            validate_architecture_config(config(36, 31)),
+            Err(Mips4ExecutionConfigError::InvalidVirtualAddressWidth { bits: 31 })
+        );
+        assert_eq!(
+            validate_architecture_config(config(36, 41)),
+            Err(Mips4ExecutionConfigError::InvalidVirtualAddressWidth { bits: 41 })
+        );
+    }
 }

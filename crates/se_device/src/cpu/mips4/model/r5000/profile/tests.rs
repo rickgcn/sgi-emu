@@ -94,7 +94,6 @@ fn profile_builds_generic_mips4_config() {
     assert!(config.coprocessors.cp0());
     assert!(config.coprocessors.cp1);
     assert!(!config.coprocessors.cp2);
-    assert!(config.coprocessors.cp3);
 }
 
 #[test]

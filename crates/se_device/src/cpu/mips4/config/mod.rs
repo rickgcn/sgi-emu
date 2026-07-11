@@ -117,15 +117,12 @@ pub struct Mips4CoprocessorConfig {
 
     /// Whether coprocessor 2 is available.
     pub cp2: bool,
-
-    /// Whether coprocessor 3 is available.
-    pub cp3: bool,
 }
 
 impl Mips4CoprocessorConfig {
     /// Creates coprocessor availability configuration.
-    pub const fn new(cp1: bool, cp2: bool, cp3: bool) -> Self {
-        Self { cp1, cp2, cp3 }
+    pub const fn new(cp1: bool, cp2: bool) -> Self {
+        Self { cp1, cp2 }
     }
 
     /// Returns whether coprocessor 0 is available.

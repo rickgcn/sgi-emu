@@ -6,7 +6,9 @@ use crate::cpu::mips4::cache::hierarchy::{
     Mips4CacheAccessPolicy, Mips4CacheGeometry, Mips4CacheHierarchyConfig,
 };
 use crate::cpu::mips4::cache::{Mips4CacheCoherenceAlgorithm, Mips4MemoryAccessType};
-use crate::cpu::mips4::config::Mips4Endianness;
+use crate::cpu::mips4::config::{
+    Mips4AddressConfig, Mips4CacheConfig, Mips4Config, Mips4CoprocessorConfig, Mips4Endianness,
+};
 use crate::cpu::mips4::cp0::{Mips4Cp0CacheErr, Mips4Cp0Config, Mips4Cp0Register};
 use crate::cpu::mips4::exception::{Mips4ErrorException, Mips4Exception, Mips4ExceptionImage};
 use crate::cpu::mips4::gpr::Mips4GprIndex;
@@ -30,17 +32,25 @@ struct TestPolicy;
 
 struct CachedTestPolicy;
 
+fn test_architecture_config(primary_cache: Mips4CacheConfig) -> Mips4Config {
+    Mips4Config::new(
+        Mips4Endianness::Big,
+        0x2300,
+        Mips4AddressConfig::new(36, 40),
+        primary_cache,
+        primary_cache,
+        Mips4CacheConfig::disabled(),
+        Mips4CoprocessorConfig::new(true, false),
+    )
+}
+
 impl Mips4ExecutionPolicy for TestPolicy {
     fn reset_pc(&self) -> u64 {
         RESET_PC
     }
 
-    fn endianness(&self) -> Mips4Endianness {
-        Mips4Endianness::Big
-    }
-
-    fn processor_id(&self) -> u32 {
-        0x2300
+    fn architecture_config(&self) -> Mips4Config {
+        test_architecture_config(Mips4CacheConfig::disabled())
     }
 
     fn cp0_config(&self) -> u32 {
@@ -136,12 +146,8 @@ impl Mips4ExecutionPolicy for CachedTestPolicy {
         RESET_PC
     }
 
-    fn endianness(&self) -> Mips4Endianness {
-        Mips4Endianness::Big
-    }
-
-    fn processor_id(&self) -> u32 {
-        0x2300
+    fn architecture_config(&self) -> Mips4Config {
+        test_architecture_config(Mips4CacheConfig::present(32 * 1024, 32))
     }
 
     fn cp0_config(&self) -> u32 {

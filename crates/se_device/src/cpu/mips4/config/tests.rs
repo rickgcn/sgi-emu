@@ -9,7 +9,7 @@ fn config_preserves_raw_processor_id() {
         Mips4CacheConfig::disabled(),
         Mips4CacheConfig::disabled(),
         Mips4CacheConfig::disabled(),
-        Mips4CoprocessorConfig::new(false, false, false),
+        Mips4CoprocessorConfig::new(false, false),
     );
 
     assert_eq!(config.processor_id, 0x1234_5678);
@@ -32,7 +32,7 @@ fn caches_can_use_distinct_geometry() {
         Mips4CacheConfig::present(32 * 1024, 32),
         Mips4CacheConfig::present(32 * 1024, 32),
         Mips4CacheConfig::present(512 * 1024, 32),
-        Mips4CoprocessorConfig::new(false, false, false),
+        Mips4CoprocessorConfig::new(false, false),
     );
 
     assert_eq!(
@@ -63,12 +63,11 @@ fn caches_can_use_distinct_geometry() {
 
 #[test]
 fn coprocessor_availability_is_independent() {
-    let coprocessors = Mips4CoprocessorConfig::new(true, false, true);
+    let coprocessors = Mips4CoprocessorConfig::new(true, false);
 
     assert!(coprocessors.cp0());
     assert!(coprocessors.cp1);
     assert!(!coprocessors.cp2);
-    assert!(coprocessors.cp3);
 }
 
 #[test]

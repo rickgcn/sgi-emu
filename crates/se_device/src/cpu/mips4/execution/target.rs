@@ -11,8 +11,7 @@ use crate::cpu::mips4::branch::Mips4BranchDecision;
 use crate::cpu::mips4::cache::Mips4CacheInstruction;
 use crate::cpu::mips4::cache::Mips4MemoryAccessType;
 use crate::cpu::mips4::cache::hierarchy::{
-    MIPS4_FUNCTIONAL_CACHE_LINE_BYTES, Mips4CacheAccessPolicy, Mips4CacheConfigError,
-    Mips4CacheLine, line_base,
+    MIPS4_FUNCTIONAL_CACHE_LINE_BYTES, Mips4CacheAccessPolicy, Mips4CacheLine, line_base,
 };
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::cp0::{Mips4Cp0CacheErr, Mips4Cp0Register};
@@ -45,6 +44,7 @@ use super::memory::{
     prepare_cache_address, prepare_memory,
 };
 use super::policy::{Mips4ExecutionPolicy, Mips4PrefetchPolicy};
+use super::state::Mips4ExecutionConfigError;
 use super::state::Mips4ExecutionState;
 
 /// Asynchronous input accepted by functional MIPS IV execution.
@@ -251,7 +251,7 @@ where
     F: FloatBackend,
 {
     /// Creates a functional target in reset state.
-    pub fn new(policy: P, float_backend: F) -> Result<Self, Mips4CacheConfigError> {
+    pub fn new(policy: P, float_backend: F) -> Result<Self, Mips4ExecutionConfigError> {
         let state = Mips4ExecutionState::new(&policy)?;
         Ok(Self {
             policy,
@@ -1390,8 +1390,9 @@ where
             Mips4MmuPrivilegeMode::from_status(status),
             Some(Mips4MmuPrivilegeMode::User)
         ) && status.reverse_endianness();
-        self.policy
-            .endianness()
+        self.state
+            .config
+            .endianness
             .effective_cpu_endianness(reverse_endian)
     }
 
