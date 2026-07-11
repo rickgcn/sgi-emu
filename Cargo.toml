@@ -7,3 +7,10 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["rickgcn"]
+
+[workspace.dependencies]
+cc = "1"
+se_core = { path = "crates/se_core" }
+se_device = { path = "crates/se_device" }
+se_float = { path = "crates/se_float" }
+se_runtime = { path = "crates/se_runtime" }

@@ -8,4 +8,4 @@ authors.workspace = true
 [dependencies]
 
 [build-dependencies]
-cc = "1"
+cc.workspace = true

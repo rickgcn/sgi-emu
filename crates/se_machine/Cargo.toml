@@ -6,6 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-se_core = { path = "../se_core" }
-se_device = { path = "../se_device" }
-se_runtime = { path = "../se_runtime" }
+se_core.workspace = true
+se_device.workspace = true
+se_runtime.workspace = true
