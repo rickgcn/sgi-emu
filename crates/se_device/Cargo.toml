@@ -6,4 +6,5 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+se_core = { path = "../se_core" }
 se_float = { path = "../se_float" }

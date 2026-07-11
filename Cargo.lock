@@ -26,6 +26,7 @@ version = "0.1.0"
 name = "se_device"
 version = "0.1.0"
 dependencies = [
+ "se_core",
  "se_float",
 ]
 
