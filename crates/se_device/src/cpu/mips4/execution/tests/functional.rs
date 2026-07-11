@@ -13,15 +13,15 @@ use crate::cpu::mips4::gpr::Mips4GprIndex;
 use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig};
 use crate::cpu::mips4::tlb::Mips4TlbAddressMode;
 
-use super::bus::{
+use super::super::bus::{
     Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransaction,
     Mips4ExecutionTransferSize,
 };
-use super::policy::{
+use super::super::policy::{
     Mips4Cp0DoublewordTransferDirection, Mips4Cp0DoublewordTransferPolicy, Mips4Cp0WaitPolicy,
     Mips4ExecutionPolicy,
 };
-use super::target::{Mips4ExecutionBoundary, Mips4ExecutionSignal, Mips4ExecutionTarget};
+use super::super::target::{Mips4ExecutionBoundary, Mips4ExecutionSignal, Mips4ExecutionTarget};
 
 const RESET_PC: u64 = 0xffff_ffff_8000_0000;
 const EXCEPTION_VECTOR: u64 = 0xffff_ffff_8000_0180;
