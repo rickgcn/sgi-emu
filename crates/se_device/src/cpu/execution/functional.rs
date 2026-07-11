@@ -4,7 +4,7 @@ use super::protocol::{
     ExecutionAction, ExecutionCompletion, ExecutionTransaction, ExecutionTransactionId,
     FunctionalExecutorError, FunctionalExecutorState,
 };
-use super::target::{ExecutionTarget, ExecutionTargetAction};
+use super::target::{ExecutionTarget, ExecutionTargetAction, ExecutionTargetSignalAction};
 
 /// Poll result produced by a functional executor.
 pub type FunctionalExecutorPoll<T> = Result<
@@ -66,7 +66,13 @@ where
 
     /// Delivers an asynchronous signal without interpreting its ISA-specific meaning.
     pub fn signal(&mut self, signal: T::Signal) {
-        self.target.signal(signal);
+        if matches!(
+            self.target.signal(signal),
+            ExecutionTargetSignalAction::CancelPending
+        ) {
+            self.state = FunctionalExecutorState::Ready;
+            self.queued_action = None;
+        }
     }
 
     /// Polls for the next transaction, architectural boundary, idle state, or wait state.

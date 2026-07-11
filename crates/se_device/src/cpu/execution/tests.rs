@@ -5,7 +5,9 @@ use super::protocol::{
     ExecutionAction, ExecutionCompletion, ExecutionTransactionId, FunctionalExecutorError,
     FunctionalExecutorState,
 };
-use super::target::{ExecutionBoundary, ExecutionTarget, ExecutionTargetAction};
+use super::target::{
+    ExecutionBoundary, ExecutionTarget, ExecutionTargetAction, ExecutionTargetSignalAction,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TestBoundary {
@@ -71,8 +73,9 @@ impl ExecutionTarget for TestTarget {
         self.resets += 1;
     }
 
-    fn signal(&mut self, signal: Self::Signal) {
+    fn signal(&mut self, signal: Self::Signal) -> ExecutionTargetSignalAction {
         self.signals.push(signal);
+        ExecutionTargetSignalAction::Continue
     }
 
     fn begin(

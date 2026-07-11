@@ -16,6 +16,16 @@ pub enum ExecutionTargetAction<T, B> {
     Idle,
 }
 
+/// Effect of an asynchronous signal on an outstanding transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionTargetSignalAction {
+    /// Preserve the current executor state and any outstanding transaction.
+    Continue,
+
+    /// Cancel any outstanding transaction and resume by polling the target.
+    CancelPending,
+}
+
 /// ISA-specific target driven by the functional executor.
 pub trait ExecutionTarget {
     /// External transaction payload produced by the target.
@@ -37,7 +47,7 @@ pub trait ExecutionTarget {
     fn reset(&mut self);
 
     /// Delivers an asynchronous signal to the target.
-    fn signal(&mut self, signal: Self::Signal);
+    fn signal(&mut self, signal: Self::Signal) -> ExecutionTargetSignalAction;
 
     /// Begins execution at an architectural instruction boundary.
     fn begin(
