@@ -255,6 +255,17 @@ impl Mips4CacheLine {
         self.check_bits = data_check_bits(&self.data);
         self.tag_check_bit = tag_check_bit(self.physical_line_base);
     }
+
+    pub(crate) fn check_errors(self, physical_address: u64, bytes: usize) -> (bool, bool) {
+        let expected = data_check_bits(&self.data);
+        let offset = (physical_address - self.physical_line_base) as usize;
+        let first_doubleword = offset / 8;
+        let last_doubleword = (offset + bytes - 1) / 8;
+        let data_error = (first_doubleword..=last_doubleword)
+            .any(|doubleword| self.check_bits[doubleword] != expected[doubleword]);
+        let tag_error = self.tag_check_bit != tag_check_bit(self.physical_line_base);
+        (data_error, tag_error)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -641,6 +652,12 @@ mod tests {
         assert_eq!(line.read_lanes(0x1003, 4), 0x8877_6655);
         assert_eq!(&line.data[3..7], &[0x55, 0x66, 0x77, 0x88]);
         assert_eq!(line.check_bits, data_check_bits(&line.data));
+        assert_eq!(line.check_errors(0x1003, 4), (false, false));
+        line.check_bits[0] ^= 1;
+        assert_eq!(line.check_errors(0x1003, 4), (true, false));
+        line.check_bits[0] ^= 1;
+        line.tag_check_bit = !line.tag_check_bit;
+        assert_eq!(line.check_errors(0x1003, 4), (false, true));
         assert!(!line.dirty);
     }
 

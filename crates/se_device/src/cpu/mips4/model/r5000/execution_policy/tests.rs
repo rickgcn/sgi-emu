@@ -83,6 +83,41 @@ fn exception_vectors_distinguish_refill_width_and_general_entry() {
 }
 
 #[test]
+fn error_exception_vectors_match_r5000_reset_and_cache_entries() {
+    let policy = R5000ExecutionPolicy::new(
+        profile(Mips4Endianness::Big, Mips4CacheConfig::disabled()),
+        boot_mode(),
+    );
+
+    assert_eq!(
+        policy
+            .error_exception_vector(Mips4Cp0Status::from_bits(0), Mips4ErrorException::SoftReset,),
+        RESET_PC
+    );
+    assert_eq!(
+        policy.error_exception_vector(
+            Mips4Cp0Status::from_bits(0),
+            Mips4ErrorException::NonMaskableInterrupt,
+        ),
+        RESET_PC
+    );
+    assert_eq!(
+        policy.error_exception_vector(
+            Mips4Cp0Status::from_bits(0),
+            Mips4ErrorException::CacheError,
+        ),
+        NORMAL_CACHE_ERROR_VECTOR
+    );
+    assert_eq!(
+        policy.error_exception_vector(
+            Mips4Cp0Status::from_bits(1 << 22),
+            Mips4ErrorException::CacheError,
+        ),
+        BOOT_VECTOR_BASE + 0x100
+    );
+}
+
+#[test]
 fn r5000_cca_mapping_has_no_coherent_cache_mode() {
     let policy = R5000ExecutionPolicy::new(
         profile(Mips4Endianness::Big, Mips4CacheConfig::disabled()),

@@ -7,8 +7,8 @@ use crate::cpu::mips4::cache::hierarchy::{
 };
 use crate::cpu::mips4::cache::{Mips4CacheCoherenceAlgorithm, Mips4MemoryAccessType};
 use crate::cpu::mips4::config::Mips4Endianness;
-use crate::cpu::mips4::cp0::{Mips4Cp0Config, Mips4Cp0Register};
-use crate::cpu::mips4::exception::{Mips4Exception, Mips4ExceptionImage};
+use crate::cpu::mips4::cp0::{Mips4Cp0CacheErr, Mips4Cp0Config, Mips4Cp0Register};
+use crate::cpu::mips4::exception::{Mips4ErrorException, Mips4Exception, Mips4ExceptionImage};
 use crate::cpu::mips4::gpr::Mips4GprIndex;
 use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig};
 use crate::cpu::mips4::tlb::Mips4TlbAddressMode;
@@ -110,6 +110,25 @@ impl Mips4ExecutionPolicy for TestPolicy {
     ) -> u64 {
         EXCEPTION_VECTOR
     }
+
+    fn error_exception_vector(
+        &self,
+        status_before_exception: crate::cpu::mips4::cp0::Mips4Cp0Status,
+        reason: Mips4ErrorException,
+    ) -> u64 {
+        match reason {
+            Mips4ErrorException::SoftReset | Mips4ErrorException::NonMaskableInterrupt => {
+                0xffff_ffff_bfc0_0000
+            }
+            Mips4ErrorException::CacheError => {
+                if status_before_exception.boot_exception_vectors() {
+                    0xffff_ffff_bfc0_0300
+                } else {
+                    0xffff_ffff_a000_0100
+                }
+            }
+        }
+    }
 }
 
 impl Mips4ExecutionPolicy for CachedTestPolicy {
@@ -197,6 +216,25 @@ impl Mips4ExecutionPolicy for CachedTestPolicy {
     ) -> u64 {
         EXCEPTION_VECTOR
     }
+
+    fn error_exception_vector(
+        &self,
+        status_before_exception: crate::cpu::mips4::cp0::Mips4Cp0Status,
+        reason: Mips4ErrorException,
+    ) -> u64 {
+        match reason {
+            Mips4ErrorException::SoftReset | Mips4ErrorException::NonMaskableInterrupt => {
+                0xffff_ffff_bfc0_0000
+            }
+            Mips4ErrorException::CacheError => {
+                if status_before_exception.boot_exception_vectors() {
+                    0xffff_ffff_bfc0_0300
+                } else {
+                    0xffff_ffff_a000_0100
+                }
+            }
+        }
+    }
 }
 
 fn executor() -> FunctionalExecutor<Mips4ExecutionTarget<TestPolicy, NativeFloatBackend>> {
@@ -282,6 +320,46 @@ fn failed_instruction_fill_does_not_install_a_partial_cache_line() {
             .instruction_lookup(RESET_PC, 0)
             .is_none()
     );
+}
+
+#[test]
+fn corrupted_instruction_cache_data_enters_cache_error_vector() {
+    let target = Mips4ExecutionTarget::new(CachedTestPolicy, NativeFloatBackend::new()).unwrap();
+    let mut executor = FunctionalExecutor::new(target);
+    for _ in 0..4 {
+        let ExecutionAction::Transaction(transaction) = executor.poll().unwrap() else {
+            panic!("expected cache-line fill transaction");
+        };
+        executor
+            .complete(ExecutionCompletion {
+                id: transaction.id,
+                payload: Mips4ExecutionCompletion::ReadData(0),
+            })
+            .unwrap();
+    }
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::Retired { .. })
+    ));
+    executor
+        .target_mut()
+        .state_mut()
+        .cache
+        .primary_hit_line_mut(true, RESET_PC + 4, 4)
+        .unwrap()
+        .check_bits[0] ^= 1;
+
+    let ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException { image, vector, .. }) =
+        executor.poll().unwrap()
+    else {
+        panic!("expected cache-error boundary");
+    };
+    assert_eq!(image.reason, Mips4ErrorException::CacheError);
+    let cache_error = Mips4Cp0CacheErr::from_bits(image.cache_error.unwrap());
+    assert!(!cache_error.data_reference());
+    assert!(cache_error.data_field_error());
+    assert!(!cache_error.tag_field_error());
+    assert_eq!(vector, 0xffff_ffff_bfc0_0300);
 }
 
 fn complete_instruction(
@@ -468,6 +546,193 @@ fn word_store_emits_byte_enables_without_read_modify_write() {
         data.id,
         Mips4ExecutionCompletion::WriteComplete,
     );
+}
+
+#[test]
+fn soft_reset_aborts_an_outstanding_transaction_and_enters_error_level() {
+    let mut executor = executor();
+    let ExecutionAction::Transaction(transaction) = executor.poll().unwrap() else {
+        panic!("expected instruction fetch");
+    };
+
+    executor.signal(Mips4ExecutionSignal::SoftReset);
+
+    let ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException { pc, image, vector }) =
+        executor.poll().unwrap()
+    else {
+        panic!("expected soft-reset boundary");
+    };
+    assert_eq!(pc, RESET_PC);
+    assert_eq!(image.reason, Mips4ErrorException::SoftReset);
+    assert_eq!(image.restart.restart_pc, RESET_PC);
+    assert_eq!(image.cache_error, None);
+    assert_eq!(vector, 0xffff_ffff_bfc0_0000);
+    assert_eq!(executor.target().state().pc(), vector);
+    assert_eq!(
+        executor.target().state().cp0().error_epc().address(),
+        RESET_PC
+    );
+    assert!(executor.target().state().cp0().status().error_level());
+    assert!(
+        executor
+            .target()
+            .state()
+            .cp0()
+            .status()
+            .boot_exception_vectors()
+    );
+    assert!(executor.target().state().cp0().status().soft_reset_or_nmi());
+    assert!(matches!(
+        executor.complete(ExecutionCompletion {
+            id: transaction.id,
+            payload: Mips4ExecutionCompletion::ReadData(0),
+        }),
+        Err(crate::cpu::execution::protocol::FunctionalExecutorError::UnexpectedCompletion { .. })
+    ));
+}
+
+#[test]
+fn nmi_waits_for_the_current_instruction_boundary() {
+    let mut executor = executor();
+    let ExecutionAction::Transaction(transaction) = executor.poll().unwrap() else {
+        panic!("expected instruction fetch");
+    };
+
+    executor.signal(Mips4ExecutionSignal::NonMaskableInterrupt);
+    assert_eq!(
+        executor.poll().unwrap(),
+        ExecutionAction::Waiting {
+            transaction_id: transaction.id,
+        }
+    );
+    executor
+        .complete(ExecutionCompletion {
+            id: transaction.id,
+            payload: Mips4ExecutionCompletion::ReadData(big_endian_word(0)),
+        })
+        .unwrap();
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::Retired { pc: RESET_PC, .. })
+    ));
+
+    let ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException { pc, image, vector }) =
+        executor.poll().unwrap()
+    else {
+        panic!("expected NMI boundary");
+    };
+    assert_eq!(pc, RESET_PC + 4);
+    assert_eq!(image.reason, Mips4ErrorException::NonMaskableInterrupt);
+    assert_eq!(image.restart.restart_pc, RESET_PC + 4);
+    assert_eq!(vector, 0xffff_ffff_bfc0_0000);
+}
+
+#[test]
+fn cache_error_records_cacheerr_and_uses_the_boot_vector() {
+    let mut executor = executor();
+    let cache_error = Mips4Cp0CacheErr::from_bits(0xb300_1231);
+
+    executor.signal(Mips4ExecutionSignal::CacheError(cache_error));
+
+    let ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException { pc, image, vector }) =
+        executor.poll().unwrap()
+    else {
+        panic!("expected cache-error boundary");
+    };
+    assert_eq!(pc, RESET_PC);
+    assert_eq!(image.reason, Mips4ErrorException::CacheError);
+    assert_eq!(image.cache_error, Some(cache_error.bits()));
+    assert_eq!(vector, 0xffff_ffff_bfc0_0300);
+    assert_eq!(executor.target().state().cp0().cache_err(), cache_error);
+    assert!(executor.target().state().cp0().status().error_level());
+    assert!(!executor.target().state().cp0().status().soft_reset_or_nmi());
+}
+
+#[test]
+fn cache_error_cancels_a_latched_nmi() {
+    let mut executor = executor();
+    executor.signal(Mips4ExecutionSignal::NonMaskableInterrupt);
+    executor.signal(Mips4ExecutionSignal::CacheError(
+        Mips4Cp0CacheErr::from_bits(0xb300_1231),
+    ));
+
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException {
+            image: crate::cpu::mips4::exception::Mips4ErrorExceptionImage {
+                reason: Mips4ErrorException::CacheError,
+                ..
+            },
+            ..
+        })
+    ));
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Transaction(_)
+    ));
+}
+
+#[test]
+fn eret_returns_from_cache_error_using_error_epc() {
+    let mut executor = executor();
+    executor.signal(Mips4ExecutionSignal::CacheError(
+        Mips4Cp0CacheErr::from_bits(0xb300_1231),
+    ));
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException { .. })
+    ));
+
+    let ExecutionAction::Transaction(fetch) = executor.poll().unwrap() else {
+        panic!("expected uncached cache-error-vector fetch");
+    };
+    assert_eq!(
+        fetch.payload,
+        Mips4ExecutionTransaction::Read {
+            physical_address: 0x1fc0_0300,
+            size: Mips4ExecutionTransferSize::Word,
+            kind: Mips4ExecutionAccessKind::InstructionFetch,
+            access_type: Mips4MemoryAccessType::Uncached,
+        }
+    );
+    executor
+        .complete(ExecutionCompletion {
+            id: fetch.id,
+            payload: Mips4ExecutionCompletion::ReadData(big_endian_word(0x4200_0018)),
+        })
+        .unwrap();
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::Retired { .. })
+    ));
+
+    assert_eq!(executor.target().state().pc(), RESET_PC);
+    assert!(!executor.target().state().cp0().status().error_level());
+}
+
+#[test]
+fn status_de_masks_cache_error_signals() {
+    let mut executor = executor();
+    complete_instruction(&mut executor, 0x3c01_0001);
+    complete_instruction(&mut executor, 0x4081_6000);
+    assert!(
+        executor
+            .target()
+            .state()
+            .cp0()
+            .status()
+            .cache_error_disabled()
+    );
+
+    executor.signal(Mips4ExecutionSignal::CacheError(
+        Mips4Cp0CacheErr::from_bits(0xb300_1231),
+    ));
+
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Transaction(_)
+    ));
+    assert_eq!(executor.target().state().cp0().cache_err().bits(), 0);
 }
 
 #[test]

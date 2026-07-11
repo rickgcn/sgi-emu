@@ -7,7 +7,7 @@ use crate::cpu::mips4::cache::{Mips4CacheCoherenceAlgorithm, Mips4MemoryAccessTy
 use crate::cpu::mips4::config::Mips4CacheConfig;
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::cp0::{Mips4Cp0Config, Mips4Cp0Register, Mips4Cp0Status};
-use crate::cpu::mips4::exception::Mips4ExceptionImage;
+use crate::cpu::mips4::exception::{Mips4ErrorException, Mips4ExceptionImage};
 use crate::cpu::mips4::execution::policy::{
     Mips4Cp0DoublewordTransferDirection, Mips4Cp0DoublewordTransferPolicy, Mips4Cp0WaitPolicy,
     Mips4ExecutionPolicy,
@@ -21,6 +21,7 @@ use super::profile::R5000Profile;
 const RESET_PC: u64 = 0xffff_ffff_bfc0_0000;
 const NORMAL_VECTOR_BASE: u64 = 0xffff_ffff_8000_0000;
 const BOOT_VECTOR_BASE: u64 = 0xffff_ffff_bfc0_0200;
+const NORMAL_CACHE_ERROR_VECTOR: u64 = 0xffff_ffff_a000_0100;
 
 const CONFIG_EC_SHIFT: u8 = 28;
 const CONFIG_EP_SHIFT: u8 = 24;
@@ -232,6 +233,23 @@ impl Mips4ExecutionPolicy for R5000ExecutionPolicy {
             }
         };
         base + offset
+    }
+
+    fn error_exception_vector(
+        &self,
+        status_before_exception: Mips4Cp0Status,
+        reason: Mips4ErrorException,
+    ) -> u64 {
+        match reason {
+            Mips4ErrorException::SoftReset | Mips4ErrorException::NonMaskableInterrupt => RESET_PC,
+            Mips4ErrorException::CacheError => {
+                if status_before_exception.boot_exception_vectors() {
+                    BOOT_VECTOR_BASE + 0x100
+                } else {
+                    NORMAL_CACHE_ERROR_VECTOR
+                }
+            }
+        }
     }
 }
 

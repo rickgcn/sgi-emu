@@ -203,6 +203,34 @@ fn raw_wrappers_preserve_or_mask_expected_bits() {
 }
 
 #[test]
+fn cache_error_register_exposes_r5000_error_fields() {
+    let cache_error = Mips4Cp0CacheErr::from_bits(
+        CACHE_ERR_DATA_REFERENCE
+            | CACHE_ERR_DATA_FIELD
+            | CACHE_ERR_TAG_FIELD
+            | CACHE_ERR_SYSTEM_BUS
+            | CACHE_ERR_ADDITIONAL_DATA
+            | CACHE_ERR_FILL_ON_STORE_MISS
+            | (0x5_4321 << CACHE_ERR_PHYSICAL_INDEX_SHIFT)
+            | 2
+            | (1 << 27)
+            | (1 << 22)
+            | (1 << 2),
+    );
+
+    assert!(cache_error.data_reference());
+    assert!(!cache_error.cache_level());
+    assert!(cache_error.data_field_error());
+    assert!(cache_error.tag_field_error());
+    assert!(cache_error.system_bus_error());
+    assert!(cache_error.additional_data_error());
+    assert!(cache_error.fill_on_store_miss());
+    assert_eq!(cache_error.physical_index(), 0x5_4321);
+    assert_eq!(cache_error.virtual_index(), 2);
+    assert_eq!(cache_error.bits() & ((1 << 27) | (1 << 22) | (1 << 2)), 0);
+}
+
+#[test]
 fn tlb_interop_round_trips_defined_fields() {
     let tlb_entry_lo = Mips4TlbEntryLo::from_bits(0x0123_4567).unwrap();
     let cp0_entry_lo = Mips4Cp0EntryLo::from_tlb_entry_lo(tlb_entry_lo);
@@ -336,6 +364,37 @@ fn compare_write_clears_timer_interrupt_pending() {
 
     assert_eq!(cp0.compare().bits(), 0x1234_5678);
     assert_eq!(cp0.cause().bits(), CAUSE_SOFTWARE_IP_MASK);
+}
+
+#[test]
+fn error_level_exceptions_update_error_epc_status_and_cache_error() {
+    let mut cp0 = Mips4Cp0::new(0, 0, 47);
+    cp0.write(Mips4Cp0Register::Status, STATUS_EXL as u64)
+        .unwrap();
+    let restart = crate::cpu::mips4::exception::Mips4ExceptionRestart::new(
+        0xffff_ffff_8000_1004,
+        Some(0xffff_ffff_8000_1000),
+    );
+
+    cp0.enter_error_exception(Mips4ErrorExceptionImage::new(
+        Mips4ErrorException::NonMaskableInterrupt,
+        restart,
+    ));
+    assert_eq!(cp0.error_epc().address(), 0xffff_ffff_8000_1000);
+    assert!(cp0.status().error_level());
+    assert!(cp0.status().boot_exception_vectors());
+    assert!(cp0.status().soft_reset_or_nmi());
+    assert!(cp0.status().exception_level());
+
+    cp0.write(Mips4Cp0Register::Status, 0).unwrap();
+    cp0.enter_error_exception(Mips4ErrorExceptionImage::cache_error(restart, 0xb300_1231));
+    assert!(cp0.status().error_level());
+    assert!(!cp0.status().boot_exception_vectors());
+    assert!(!cp0.status().soft_reset_or_nmi());
+    assert_eq!(
+        cp0.cache_err().bits(),
+        0xb300_1231 & CACHE_ERR_READABLE_MASK
+    );
 }
 
 #[test]

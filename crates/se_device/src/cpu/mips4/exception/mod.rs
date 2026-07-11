@@ -320,6 +320,52 @@ pub struct Mips4ExceptionImage {
     pub bad_virtual_address: Option<u64>,
 }
 
+/// Exception that enters CP0 error level instead of ordinary exception level.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mips4ErrorException {
+    /// Warm-reset exception raised by the processor reset input.
+    SoftReset,
+
+    /// Nonmaskable interrupt exception.
+    NonMaskableInterrupt,
+
+    /// Cache parity or system-interface data-check exception.
+    CacheError,
+}
+
+/// Captured state for a MIPS IV error-level exception.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mips4ErrorExceptionImage {
+    /// Error-level exception reason.
+    pub reason: Mips4ErrorException,
+
+    /// Restart metadata saved in `ErrorEPC`.
+    pub restart: Mips4ExceptionRestart,
+
+    /// Raw processor-specific `CacheErr` value for a cache error.
+    pub cache_error: Option<u32>,
+}
+
+impl Mips4ErrorExceptionImage {
+    /// Creates a soft-reset or nonmaskable-interrupt image.
+    pub const fn new(reason: Mips4ErrorException, restart: Mips4ExceptionRestart) -> Self {
+        Self {
+            reason,
+            restart,
+            cache_error: None,
+        }
+    }
+
+    /// Creates a cache-error image carrying the processor-specific error record.
+    pub const fn cache_error(restart: Mips4ExceptionRestart, cache_error: u32) -> Self {
+        Self {
+            reason: Mips4ErrorException::CacheError,
+            restart,
+            cache_error: Some(cache_error),
+        }
+    }
+}
+
 impl Mips4ExceptionImage {
     /// Creates an exception image from its reason, restart metadata, and optional bad address.
     pub const fn new(

@@ -4,7 +4,9 @@ use core::fmt;
 
 use se_float::backend::FloatBackend;
 
-use crate::cpu::execution::target::{ExecutionBoundary, ExecutionTarget, ExecutionTargetAction};
+use crate::cpu::execution::target::{
+    ExecutionBoundary, ExecutionTarget, ExecutionTargetAction, ExecutionTargetSignalAction,
+};
 use crate::cpu::mips4::branch::Mips4BranchDecision;
 use crate::cpu::mips4::cache::Mips4CacheInstruction;
 use crate::cpu::mips4::cache::Mips4MemoryAccessType;
@@ -13,9 +15,10 @@ use crate::cpu::mips4::cache::hierarchy::{
     Mips4CacheLine, line_base,
 };
 use crate::cpu::mips4::config::Mips4Endianness;
-use crate::cpu::mips4::cp0::Mips4Cp0Register;
+use crate::cpu::mips4::cp0::{Mips4Cp0CacheErr, Mips4Cp0Register};
 use crate::cpu::mips4::exception::{
-    Mips4CoprocessorNumber, Mips4Exception, Mips4ExceptionImage, Mips4ExceptionRestart,
+    Mips4CoprocessorNumber, Mips4ErrorException, Mips4ErrorExceptionImage, Mips4Exception,
+    Mips4ExceptionImage, Mips4ExceptionRestart,
 };
 use crate::cpu::mips4::gpr::Mips4GprIndex;
 use crate::cpu::mips4::instruction::Mips4Instruction;
@@ -52,6 +55,15 @@ pub enum Mips4ExecutionSignal {
 
     /// Clear an outstanding LL/SC reservation.
     InvalidateReservation,
+
+    /// Raise a warm-reset exception and reset functional execution state machines.
+    SoftReset,
+
+    /// Latch a nonmaskable interrupt for the next instruction boundary.
+    NonMaskableInterrupt,
+
+    /// Raise a processor cache-error exception with a captured `CacheErr` value.
+    CacheError(Mips4Cp0CacheErr),
 }
 
 /// Architectural boundary produced by functional MIPS IV execution.
@@ -75,6 +87,18 @@ pub enum Mips4ExecutionBoundary {
         image: Mips4ExceptionImage,
 
         /// Selected exception vector.
+        vector: u64,
+    },
+
+    /// A soft reset, NMI, or cache error entered CP0 error level.
+    ErrorException {
+        /// Address at which the error-level exception was observed.
+        pc: u64,
+
+        /// Captured error-level exception image.
+        image: Mips4ErrorExceptionImage,
+
+        /// Selected error-level exception vector.
         vector: u64,
     },
 }
@@ -128,6 +152,12 @@ enum PendingOperation {
     },
     Cached(Mips4PendingCachedAccess),
     CacheWriteback(Mips4PendingCacheWriteback),
+}
+
+#[derive(Clone, Copy)]
+struct PendingErrorException {
+    reason: Mips4ErrorException,
+    cache_error: Option<Mips4Cp0CacheErr>,
 }
 
 enum Mips4CachedClient {
@@ -212,6 +242,7 @@ pub struct Mips4ExecutionTarget<P, F> {
     float_backend: F,
     state: Mips4ExecutionState,
     pending: Option<PendingOperation>,
+    pending_error_exception: Option<PendingErrorException>,
 }
 
 impl<P, F> Mips4ExecutionTarget<P, F>
@@ -227,6 +258,7 @@ where
             float_backend,
             state,
             pending: None,
+            pending_error_exception: None,
         })
     }
 
@@ -243,6 +275,11 @@ where
     /// Returns architectural state.
     pub const fn state(&self) -> &Mips4ExecutionState {
         &self.state
+    }
+
+    #[cfg(test)]
+    pub(super) fn state_mut(&mut self) -> &mut Mips4ExecutionState {
+        &mut self.state
     }
 
     /// Advances CP0 Count by externally calculated increments.
@@ -329,6 +366,21 @@ where
                 .data_lookup(virtual_address, physical_address)
         };
         if let Some(line) = hit {
+            let (data_error, tag_error) = line.check_errors(physical_address, size);
+            if (data_error || tag_error) && !self.state.cp0.status().cache_error_disabled() {
+                self.cancel_pending_nmi();
+                let cache_error = Mips4Cp0CacheErr::primary_cache_error(
+                    !instruction,
+                    data_error,
+                    tag_error,
+                    physical_address,
+                    virtual_address,
+                );
+                return Ok(self.error_exception_boundary(PendingErrorException {
+                    reason: Mips4ErrorException::CacheError,
+                    cache_error: Some(cache_error),
+                }));
+            }
             if !is_write {
                 let lanes = line.read_lanes(physical_address, size);
                 return self
@@ -381,6 +433,24 @@ where
                 data: [0; MIPS4_FUNCTIONAL_CACHE_LINE_BYTES],
             }
         };
+        if victim.valid && victim.dirty {
+            let (data_error, tag_error) =
+                victim.check_errors(victim.physical_line_base, MIPS4_FUNCTIONAL_CACHE_LINE_BYTES);
+            if (data_error || tag_error) && !self.state.cp0.status().cache_error_disabled() {
+                self.cancel_pending_nmi();
+                let cache_error = Mips4Cp0CacheErr::primary_cache_error(
+                    !instruction,
+                    data_error,
+                    tag_error,
+                    victim.physical_line_base,
+                    virtual_address,
+                );
+                return Ok(self.error_exception_boundary(PendingErrorException {
+                    reason: Mips4ErrorException::CacheError,
+                    cache_error: Some(cache_error),
+                }));
+            }
+        }
         let pending = Mips4PendingCachedAccess {
             client,
             virtual_address,
@@ -1198,6 +1268,12 @@ where
         reason: Mips4Exception,
         bad_virtual_address: Option<u64>,
     ) -> ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary> {
+        if matches!(
+            reason,
+            Mips4Exception::InstructionBusError | Mips4Exception::DataBusError
+        ) {
+            self.cancel_pending_nmi();
+        }
         self.exception_boundary_with_refill(reason, bad_virtual_address, None)
     }
 
@@ -1220,6 +1296,62 @@ where
         self.state.delay_slot_branch_pc = None;
         self.state.llbit = Mips4LlBit::Clear;
         ExecutionTargetAction::Boundary(Mips4ExecutionBoundary::Exception { pc, image, vector })
+    }
+
+    fn error_exception_boundary(
+        &mut self,
+        pending: PendingErrorException,
+    ) -> ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary> {
+        let pc = self.state.pc;
+        let status = self.state.cp0.status();
+        let restart = Mips4ExceptionRestart::new(pc, self.state.delay_slot_branch_pc);
+        let image = match pending.cache_error {
+            Some(cache_error) => Mips4ErrorExceptionImage::cache_error(restart, cache_error.bits()),
+            None => Mips4ErrorExceptionImage::new(pending.reason, restart),
+        };
+        let vector = self.policy.error_exception_vector(status, pending.reason);
+        self.state.cp0.enter_error_exception(image);
+        self.state.pc = vector;
+        self.state.next_pc = vector.wrapping_add(4);
+        self.state.delay_slot_branch_pc = None;
+        self.state.llbit = Mips4LlBit::Clear;
+        self.state.standby = false;
+        ExecutionTargetAction::Boundary(Mips4ExecutionBoundary::ErrorException {
+            pc,
+            image,
+            vector,
+        })
+    }
+
+    fn latch_error_exception(&mut self, pending: PendingErrorException) {
+        let replace = match (pending.reason, self.pending_error_exception) {
+            (Mips4ErrorException::SoftReset, _) => true,
+            (
+                Mips4ErrorException::CacheError,
+                Some(PendingErrorException {
+                    reason: Mips4ErrorException::SoftReset,
+                    ..
+                }),
+            ) => false,
+            (Mips4ErrorException::CacheError, _) => true,
+            (Mips4ErrorException::NonMaskableInterrupt, None) => true,
+            (Mips4ErrorException::NonMaskableInterrupt, Some(_)) => false,
+        };
+        if replace {
+            self.pending_error_exception = Some(pending);
+        }
+    }
+
+    fn cancel_pending_nmi(&mut self) {
+        if matches!(
+            self.pending_error_exception,
+            Some(PendingErrorException {
+                reason: Mips4ErrorException::NonMaskableInterrupt,
+                ..
+            })
+        ) {
+            self.pending_error_exception = None;
+        }
     }
 
     fn refill_address_mode(
@@ -1657,16 +1789,48 @@ where
         self.state = Mips4ExecutionState::new(&self.policy)
             .expect("a previously validated cache configuration must remain valid");
         self.pending = None;
+        self.pending_error_exception = None;
     }
 
-    fn signal(&mut self, signal: Self::Signal) {
+    fn signal(&mut self, signal: Self::Signal) -> ExecutionTargetSignalAction {
         match signal {
             Mips4ExecutionSignal::ExternalInterrupts(pending) => {
                 self.state.external_interrupts = pending;
                 self.state.cp0.set_external_interrupts(pending);
+                ExecutionTargetSignalAction::Continue
             }
             Mips4ExecutionSignal::InvalidateReservation => {
                 self.state.llbit = Mips4LlBit::Clear;
+                ExecutionTargetSignalAction::Continue
+            }
+            Mips4ExecutionSignal::SoftReset => {
+                self.latch_error_exception(PendingErrorException {
+                    reason: Mips4ErrorException::SoftReset,
+                    cache_error: None,
+                });
+                self.pending = None;
+                self.state.standby = false;
+                ExecutionTargetSignalAction::CancelPending
+            }
+            Mips4ExecutionSignal::NonMaskableInterrupt => {
+                self.latch_error_exception(PendingErrorException {
+                    reason: Mips4ErrorException::NonMaskableInterrupt,
+                    cache_error: None,
+                });
+                self.state.standby = false;
+                ExecutionTargetSignalAction::Continue
+            }
+            Mips4ExecutionSignal::CacheError(cache_error) => {
+                if self.state.cp0.status().cache_error_disabled() {
+                    return ExecutionTargetSignalAction::Continue;
+                }
+                self.latch_error_exception(PendingErrorException {
+                    reason: Mips4ErrorException::CacheError,
+                    cache_error: Some(cache_error),
+                });
+                self.pending = None;
+                self.state.standby = false;
+                ExecutionTargetSignalAction::CancelPending
             }
         }
     }
@@ -1676,6 +1840,9 @@ where
     ) -> Result<ExecutionTargetAction<Self::Transaction, Self::Boundary>, Self::Error> {
         if self.pending.is_some() {
             return Err(Mips4ExecutionTargetError::MissingPendingOperation);
+        }
+        if let Some(pending) = self.pending_error_exception.take() {
+            return Ok(self.error_exception_boundary(pending));
         }
         if self.state.standby {
             if self.state.cp0.cause().interrupt_pending() == 0 {

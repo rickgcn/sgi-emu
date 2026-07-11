@@ -4,7 +4,7 @@ use crate::cpu::mips4::cache::Mips4MemoryAccessType;
 use crate::cpu::mips4::cache::hierarchy::{Mips4CacheAccessPolicy, Mips4CacheHierarchyConfig};
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::cp0::{Mips4Cp0Config, Mips4Cp0Register, Mips4Cp0Status};
-use crate::cpu::mips4::exception::Mips4ExceptionImage;
+use crate::cpu::mips4::exception::{Mips4ErrorException, Mips4ExceptionImage};
 use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig};
 use crate::cpu::mips4::tlb::Mips4TlbAddressMode;
 
@@ -98,5 +98,12 @@ pub trait Mips4ExecutionPolicy {
         status_before_exception: Mips4Cp0Status,
         image: Mips4ExceptionImage,
         refill_address_mode: Option<Mips4TlbAddressMode>,
+    ) -> u64;
+
+    /// Selects the vector for an exception that enters CP0 error level.
+    fn error_exception_vector(
+        &self,
+        status_before_exception: Mips4Cp0Status,
+        reason: Mips4ErrorException,
     ) -> u64;
 }

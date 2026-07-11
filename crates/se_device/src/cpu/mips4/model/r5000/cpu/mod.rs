@@ -12,6 +12,7 @@ use crate::cpu::execution::protocol::{
     ExecutionAction, ExecutionCompletion, FunctionalExecutorError,
 };
 use crate::cpu::mips4::cache::hierarchy::Mips4CacheConfigError;
+use crate::cpu::mips4::cp0::Mips4Cp0CacheErr;
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use crate::cpu::mips4::execution::state::Mips4ExecutionState;
 use crate::cpu::mips4::execution::target::{
@@ -30,6 +31,15 @@ pub enum R5000CpuSignal {
 
     /// Invalidates an outstanding load-linked reservation.
     InvalidateReservation,
+
+    /// Raises a warm-reset exception and aborts any outstanding bus transaction.
+    SoftReset,
+
+    /// Latches a nonmaskable interrupt for the next instruction boundary.
+    NonMaskableInterrupt,
+
+    /// Raises a cache-error exception unless cache errors are disabled.
+    CacheError(Mips4Cp0CacheErr),
 }
 
 /// Terminal functional R5000 execution error.
@@ -202,6 +212,11 @@ where
                 Mips4ExecutionSignal::ExternalInterrupts(levels)
             }
             R5000CpuSignal::InvalidateReservation => Mips4ExecutionSignal::InvalidateReservation,
+            R5000CpuSignal::SoftReset => Mips4ExecutionSignal::SoftReset,
+            R5000CpuSignal::NonMaskableInterrupt => Mips4ExecutionSignal::NonMaskableInterrupt,
+            R5000CpuSignal::CacheError(cache_error) => {
+                Mips4ExecutionSignal::CacheError(cache_error)
+            }
         };
         self.executor.signal(signal);
     }

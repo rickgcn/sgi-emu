@@ -124,6 +124,36 @@ fn exception_image_supports_exceptions_without_a_bad_address() {
 }
 
 #[test]
+fn error_exception_images_distinguish_reset_nmi_and_cache_errors() {
+    let restart = Mips4ExceptionRestart::new(0xffff_ffff_8000_1004, Some(0xffff_ffff_8000_1000));
+
+    assert_eq!(
+        Mips4ErrorExceptionImage::new(Mips4ErrorException::SoftReset, restart),
+        Mips4ErrorExceptionImage {
+            reason: Mips4ErrorException::SoftReset,
+            restart,
+            cache_error: None,
+        }
+    );
+    assert_eq!(
+        Mips4ErrorExceptionImage::new(Mips4ErrorException::NonMaskableInterrupt, restart),
+        Mips4ErrorExceptionImage {
+            reason: Mips4ErrorException::NonMaskableInterrupt,
+            restart,
+            cache_error: None,
+        }
+    );
+    assert_eq!(
+        Mips4ErrorExceptionImage::cache_error(restart, 0xa900_1231),
+        Mips4ErrorExceptionImage {
+            reason: Mips4ErrorException::CacheError,
+            restart,
+            cache_error: Some(0xa900_1231),
+        }
+    );
+}
+
+#[test]
 fn system_exception_kind_maps_to_cause_codes() {
     assert_eq!(
         Mips4SystemExceptionKind::SystemCall.exception(),

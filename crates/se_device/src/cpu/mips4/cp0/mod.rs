@@ -1,11 +1,14 @@
 //! Generic MIPS IV system control coprocessor register primitives.
 //!
 //! This module models CP0 register numbers, raw register bit fields, typed
-//! wrappers, and a minimal register file. It does not execute CP0 instructions,
-//! perform exception entry, manage TLB replacement, translate addresses, or
-//! model implementation-specific cache diagnostic behavior.
+//! wrappers, exception-entry register transitions, and a minimal register file.
+//! It does not execute CP0 instructions, manage TLB replacement, translate
+//! addresses, or own implementation-specific cache diagnostic behavior.
 
-use crate::cpu::mips4::exception::{Mips4CoprocessorNumber, Mips4Exception, Mips4ExceptionImage};
+use crate::cpu::mips4::exception::{
+    Mips4CoprocessorNumber, Mips4ErrorException, Mips4ErrorExceptionImage, Mips4Exception,
+    Mips4ExceptionImage,
+};
 use crate::cpu::mips4::tlb::{Mips4TlbAsid, Mips4TlbEntryHi, Mips4TlbEntryLo, Mips4TlbPageMask};
 
 const INDEX_PROBE_FAILURE: u64 = 1 << 31;
@@ -96,6 +99,25 @@ const CAUSE_READABLE_MASK: u32 = CAUSE_BD | CAUSE_CE_MASK | CAUSE_IP_MASK | CAUS
 
 const PROCESSOR_ID_READABLE_MASK: u32 = 0x0000_ffff;
 const ECC_READABLE_MASK: u32 = 0x0000_00ff;
+const CACHE_ERR_DATA_REFERENCE: u32 = 1 << 31;
+const CACHE_ERR_CACHE_LEVEL: u32 = 1 << 30;
+const CACHE_ERR_DATA_FIELD: u32 = 1 << 29;
+const CACHE_ERR_TAG_FIELD: u32 = 1 << 28;
+const CACHE_ERR_SYSTEM_BUS: u32 = 1 << 25;
+const CACHE_ERR_ADDITIONAL_DATA: u32 = 1 << 24;
+const CACHE_ERR_FILL_ON_STORE_MISS: u32 = 1 << 23;
+const CACHE_ERR_PHYSICAL_INDEX_SHIFT: u8 = 3;
+const CACHE_ERR_PHYSICAL_INDEX_MASK: u32 = 0x0007_ffff;
+const CACHE_ERR_VIRTUAL_INDEX_MASK: u32 = 0x3;
+const CACHE_ERR_READABLE_MASK: u32 = CACHE_ERR_DATA_REFERENCE
+    | CACHE_ERR_CACHE_LEVEL
+    | CACHE_ERR_DATA_FIELD
+    | CACHE_ERR_TAG_FIELD
+    | CACHE_ERR_SYSTEM_BUS
+    | CACHE_ERR_ADDITIONAL_DATA
+    | CACHE_ERR_FILL_ON_STORE_MISS
+    | (CACHE_ERR_PHYSICAL_INDEX_MASK << CACHE_ERR_PHYSICAL_INDEX_SHIFT)
+    | CACHE_ERR_VIRTUAL_INDEX_MASK;
 
 /// MIPS IV CP0 register number.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -874,14 +896,82 @@ impl Mips4Cp0Ecc {
 pub struct Mips4Cp0CacheErr(u32);
 
 impl Mips4Cp0CacheErr {
-    /// Creates a `CacheErr` register value.
+    /// Creates a `CacheErr` register value from raw readable bits.
     pub const fn from_bits(bits: u32) -> Self {
-        Self(bits)
+        Self(bits & CACHE_ERR_READABLE_MASK)
+    }
+
+    /// Creates the R5000 record for a primary-cache parity error.
+    pub const fn primary_cache_error(
+        data_reference: bool,
+        data_field_error: bool,
+        tag_field_error: bool,
+        physical_address: u64,
+        virtual_address: u64,
+    ) -> Self {
+        let mut bits = (((physical_address >> 3) as u32) & CACHE_ERR_PHYSICAL_INDEX_MASK)
+            << CACHE_ERR_PHYSICAL_INDEX_SHIFT;
+        bits |= ((virtual_address >> 12) as u32) & CACHE_ERR_VIRTUAL_INDEX_MASK;
+        if data_reference {
+            bits |= CACHE_ERR_DATA_REFERENCE;
+        }
+        if data_field_error {
+            bits |= CACHE_ERR_DATA_FIELD;
+        }
+        if tag_field_error {
+            bits |= CACHE_ERR_TAG_FIELD;
+        }
+        Self::from_bits(bits)
     }
 
     /// Returns the raw `CacheErr` register bits.
     pub const fn bits(self) -> u32 {
         self.0
+    }
+
+    /// Returns whether the failed reference was a data reference.
+    pub const fn data_reference(self) -> bool {
+        self.0 & CACHE_ERR_DATA_REFERENCE != 0
+    }
+
+    /// Returns the processor-specific cache-level field.
+    pub const fn cache_level(self) -> bool {
+        self.0 & CACHE_ERR_CACHE_LEVEL != 0
+    }
+
+    /// Returns whether a data-field check error occurred.
+    pub const fn data_field_error(self) -> bool {
+        self.0 & CACHE_ERR_DATA_FIELD != 0
+    }
+
+    /// Returns whether a tag-field check error occurred.
+    pub const fn tag_field_error(self) -> bool {
+        self.0 & CACHE_ERR_TAG_FIELD != 0
+    }
+
+    /// Returns whether the error was detected on the system bus.
+    pub const fn system_bus_error(self) -> bool {
+        self.0 & CACHE_ERR_SYSTEM_BUS != 0
+    }
+
+    /// Returns whether an additional data error accompanied an instruction error.
+    pub const fn additional_data_error(self) -> bool {
+        self.0 & CACHE_ERR_ADDITIONAL_DATA != 0
+    }
+
+    /// Returns whether the error occurred while filling after a store miss.
+    pub const fn fill_on_store_miss(self) -> bool {
+        self.0 & CACHE_ERR_FILL_ON_STORE_MISS != 0
+    }
+
+    /// Returns physical address bits 21:3 captured for the failed reference.
+    pub const fn physical_index(self) -> u32 {
+        (self.0 >> CACHE_ERR_PHYSICAL_INDEX_SHIFT) & CACHE_ERR_PHYSICAL_INDEX_MASK
+    }
+
+    /// Returns virtual address bits 13:12 captured for the failed reference.
+    pub const fn virtual_index(self) -> u8 {
+        (self.0 & CACHE_ERR_VIRTUAL_INDEX_MASK) as u8
     }
 }
 
@@ -1227,6 +1317,21 @@ impl Mips4Cp0 {
                 self.record_tlb_fault_context(address);
             }
         }
+    }
+
+    /// Applies processor error-level exception state updates.
+    pub(crate) fn enter_error_exception(&mut self, image: Mips4ErrorExceptionImage) {
+        self.error_epc = Mips4Cp0ErrorEpc::from_bits(image.restart.restart_pc);
+        let status = match image.reason {
+            Mips4ErrorException::SoftReset | Mips4ErrorException::NonMaskableInterrupt => {
+                self.status.bits() | STATUS_ERL | STATUS_BEV | STATUS_SR
+            }
+            Mips4ErrorException::CacheError => {
+                self.cache_err = Mips4Cp0CacheErr::from_bits(image.cache_error.unwrap_or(0));
+                self.status.bits() | STATUS_ERL
+            }
+        };
+        self.status = Mips4Cp0Status::from_bits(status);
     }
 
     /// Clears exception level for `ERET` and returns the saved program counter.

@@ -106,6 +106,58 @@ fn bus_device_signals_update_interrupt_lines() {
 }
 
 #[test]
+fn bus_device_signals_deliver_r5000_error_level_exceptions() {
+    let mut nmi_cpu = cpu();
+    BusDeviceRole::accept(&mut nmi_cpu, R5000CpuSignal::NonMaskableInterrupt);
+    assert!(matches!(
+        nmi_cpu.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException {
+            image: crate::cpu::mips4::exception::Mips4ErrorExceptionImage {
+                reason: crate::cpu::mips4::exception::Mips4ErrorException::NonMaskableInterrupt,
+                ..
+            },
+            vector: 0xffff_ffff_bfc0_0000,
+            ..
+        })
+    ));
+
+    let mut cache_cpu = cpu();
+    let cache_error = crate::cpu::mips4::cp0::Mips4Cp0CacheErr::from_bits(0xb300_1231);
+    BusDeviceRole::accept(&mut cache_cpu, R5000CpuSignal::CacheError(cache_error));
+    assert!(matches!(
+        cache_cpu.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException {
+            image: crate::cpu::mips4::exception::Mips4ErrorExceptionImage {
+                reason: crate::cpu::mips4::exception::Mips4ErrorException::CacheError,
+                cache_error: Some(0xb300_1231),
+                ..
+            },
+            vector: 0xffff_ffff_bfc0_0300,
+            ..
+        })
+    ));
+    assert_eq!(cache_cpu.state().cp0().cache_err(), cache_error);
+
+    let mut reset_cpu = cpu();
+    assert!(matches!(
+        reset_cpu.poll().unwrap(),
+        ExecutionAction::Transaction(_)
+    ));
+    BusDeviceRole::accept(&mut reset_cpu, R5000CpuSignal::SoftReset);
+    assert!(matches!(
+        reset_cpu.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException {
+            image: crate::cpu::mips4::exception::Mips4ErrorExceptionImage {
+                reason: crate::cpu::mips4::exception::Mips4ErrorException::SoftReset,
+                ..
+            },
+            vector: 0xffff_ffff_bfc0_0000,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn wait_idle_does_not_advance_random_or_count() {
     let mut cpu = cpu();
     let boundary = retire_instruction(&mut cpu, 0x4200_0020);
@@ -289,6 +341,9 @@ fn hand_written_rom_runs_through_cpu_bus_and_ram_roles() {
                 );
                 break;
             }
+            ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException { .. }) => {
+                panic!("test program unexpectedly entered error level")
+            }
             ExecutionAction::Waiting { .. } => panic!("immediate bus must not remain waiting"),
             ExecutionAction::Idle => panic!("test program must not enter standby"),
         }
@@ -351,6 +406,9 @@ fn instruction_tlb_miss_selects_the_boot_refill_vector() {
             ExecutionAction::Boundary(Mips4ExecutionBoundary::Retired { .. }) => retired += 1,
             ExecutionAction::Boundary(Mips4ExecutionBoundary::Exception { .. }) => {
                 panic!("setup instruction unexpectedly trapped");
+            }
+            ExecutionAction::Boundary(Mips4ExecutionBoundary::ErrorException { .. }) => {
+                panic!("setup unexpectedly entered error level");
             }
             ExecutionAction::Waiting { .. } => unreachable!(),
             ExecutionAction::Idle => unreachable!(),
