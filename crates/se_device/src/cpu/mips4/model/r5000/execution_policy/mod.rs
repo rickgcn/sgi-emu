@@ -8,8 +8,11 @@ use crate::cpu::mips4::config::Mips4CacheConfig;
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::cp0::{Mips4Cp0Config, Mips4Cp0Register, Mips4Cp0Status};
 use crate::cpu::mips4::exception::Mips4ExceptionImage;
-use crate::cpu::mips4::execution::policy::Mips4ExecutionPolicy;
-use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig};
+use crate::cpu::mips4::execution::policy::{
+    Mips4Cp0DoublewordTransferDirection, Mips4Cp0DoublewordTransferPolicy, Mips4Cp0WaitPolicy,
+    Mips4ExecutionPolicy,
+};
+use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig, Mips4MmuPrivilegeMode};
 use crate::cpu::mips4::tlb::Mips4TlbAddressMode;
 
 use super::boot_mode::R5000BootMode;
@@ -128,6 +131,41 @@ impl Mips4ExecutionPolicy for R5000ExecutionPolicy {
             _ => u64::MAX,
         };
         (current & !mask) | (requested & mask)
+    }
+
+    fn cp0_wait_policy(&self) -> Mips4Cp0WaitPolicy {
+        Mips4Cp0WaitPolicy::Standby
+    }
+
+    fn cp0_doubleword_transfer_policy(
+        &self,
+        _direction: Mips4Cp0DoublewordTransferDirection,
+        status: Mips4Cp0Status,
+        register: Mips4Cp0Register,
+    ) -> Mips4Cp0DoublewordTransferPolicy {
+        match Mips4MmuPrivilegeMode::from_status(status) {
+            Some(Mips4MmuPrivilegeMode::Kernel) => {}
+            Some(Mips4MmuPrivilegeMode::Supervisor) if status.supervisor_64_bit_addressing() => {}
+            Some(Mips4MmuPrivilegeMode::User) if status.user_64_bit_addressing() => {}
+            Some(Mips4MmuPrivilegeMode::Supervisor | Mips4MmuPrivilegeMode::User) | None => {
+                return Mips4Cp0DoublewordTransferPolicy::ReservedInstruction;
+            }
+        }
+        if matches!(
+            register,
+            Mips4Cp0Register::EntryLo0
+                | Mips4Cp0Register::EntryLo1
+                | Mips4Cp0Register::Context
+                | Mips4Cp0Register::BadVaddr
+                | Mips4Cp0Register::EntryHi
+                | Mips4Cp0Register::Epc
+                | Mips4Cp0Register::XContext
+                | Mips4Cp0Register::ErrorEpc
+        ) {
+            Mips4Cp0DoublewordTransferPolicy::Execute
+        } else {
+            Mips4Cp0DoublewordTransferPolicy::NoOperation
+        }
     }
 
     fn resolve_access_type(

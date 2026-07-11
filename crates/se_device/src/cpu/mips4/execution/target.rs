@@ -1051,6 +1051,10 @@ where
     ) -> ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary> {
         match execution {
             Mips4Cp0Execution::Retire => self.retire_sequential(instruction),
+            Mips4Cp0Execution::Standby => {
+                self.state.standby = true;
+                self.retire_sequential(instruction)
+            }
             Mips4Cp0Execution::SetPc(pc) => self.retire_at_pc(instruction, pc),
             Mips4Cp0Execution::Exception(exception) => self.exception_boundary(exception, None),
         }
@@ -1672,6 +1676,12 @@ where
     ) -> Result<ExecutionTargetAction<Self::Transaction, Self::Boundary>, Self::Error> {
         if self.pending.is_some() {
             return Err(Mips4ExecutionTargetError::MissingPendingOperation);
+        }
+        if self.state.standby {
+            if self.state.cp0.cause().interrupt_pending() == 0 {
+                return Ok(ExecutionTargetAction::Idle);
+            }
+            self.state.standby = false;
         }
         let status = self.state.cp0.status();
         let pending = self.state.cp0.cause().interrupt_pending() & status.interrupt_mask();

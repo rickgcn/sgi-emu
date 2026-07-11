@@ -18,6 +18,7 @@ impl ExecutionBoundary for TestBoundary {}
 enum TestAction {
     Transaction(u32),
     Boundary(u32),
+    Idle,
     Failure,
 }
 
@@ -53,6 +54,7 @@ impl TestTarget {
             TestAction::Boundary(value) => Ok(ExecutionTargetAction::Boundary(
                 TestBoundary::Retired(value),
             )),
+            TestAction::Idle => Ok(ExecutionTargetAction::Idle),
             TestAction::Failure => Err(TestError),
         }
     }
@@ -96,6 +98,22 @@ fn immediate_boundary_leaves_executor_ready() {
         Ok(ExecutionAction::Boundary(TestBoundary::Retired(7)))
     );
     assert_eq!(executor.state(), FunctionalExecutorState::Ready);
+}
+
+#[test]
+fn idle_action_leaves_executor_ready_without_allocating_a_transaction() {
+    let mut executor = FunctionalExecutor::new(TestTarget::new([
+        TestAction::Idle,
+        TestAction::Transaction(9),
+        TestAction::Boundary(10),
+    ]));
+
+    assert_eq!(executor.poll(), Ok(ExecutionAction::Idle));
+    assert_eq!(executor.state(), FunctionalExecutorState::Ready);
+    let ExecutionAction::Transaction(transaction) = executor.poll().unwrap() else {
+        panic!("expected transaction after idle");
+    };
+    assert_eq!(transaction.id, ExecutionTransactionId::new(0));
 }
 
 #[test]

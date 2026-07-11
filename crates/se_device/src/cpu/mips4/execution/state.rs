@@ -28,6 +28,7 @@ pub struct Mips4ExecutionState {
     pub(super) tlb_entries: Vec<Mips4TlbEntry>,
     pub(super) llbit: Mips4LlBit,
     pub(super) external_interrupts: u8,
+    pub(super) standby: bool,
     pub(super) cache: Mips4CacheHierarchy,
 }
 
@@ -53,6 +54,7 @@ impl Mips4ExecutionState {
                 .collect(),
             llbit: Mips4LlBit::Clear,
             external_interrupts: 0,
+            standby: false,
             cache: Mips4CacheHierarchy::new(policy.cache_config())?,
         })
     }

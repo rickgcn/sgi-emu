@@ -37,7 +37,7 @@ fn big_endian_word(bits: u32) -> u64 {
     u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], 0, 0, 0, 0])
 }
 
-fn retire_nop(cpu: &mut R5000Cpu<NativeFloatBackend>) {
+fn retire_instruction(cpu: &mut R5000Cpu<NativeFloatBackend>, bits: u32) -> Mips4ExecutionBoundary {
     let ExecutionAction::Transaction(fetch) = cpu.poll().unwrap() else {
         panic!("expected fetch");
     };
@@ -54,13 +54,18 @@ fn retire_nop(cpu: &mut R5000Cpu<NativeFloatBackend>) {
         cpu,
         ExecutionCompletion {
             id: fetch.id,
-            payload: Mips4ExecutionCompletion::ReadData(big_endian_word(0)),
+            payload: Mips4ExecutionCompletion::ReadData(big_endian_word(bits)),
         },
     );
-    let ExecutionAction::Boundary(Mips4ExecutionBoundary::Retired { .. }) = cpu.poll().unwrap()
-    else {
+    let ExecutionAction::Boundary(boundary) = cpu.poll().unwrap() else {
         panic!("expected retired boundary");
     };
+    boundary
+}
+
+fn retire_nop(cpu: &mut R5000Cpu<NativeFloatBackend>) {
+    let boundary = retire_instruction(cpu, 0);
+    assert!(matches!(boundary, Mips4ExecutionBoundary::Retired { .. }));
 }
 
 #[test]
@@ -98,6 +103,32 @@ fn bus_device_signals_update_interrupt_lines() {
     BusDeviceRole::accept(&mut cpu, R5000CpuSignal::ExternalInterrupts(0x24));
     assert_eq!(cpu.state().external_interrupts(), 0x24);
     assert_eq!(cpu.state().cp0().cause().interrupt_pending() & 0x24, 0x24);
+}
+
+#[test]
+fn wait_idle_does_not_advance_random_or_count() {
+    let mut cpu = cpu();
+    let boundary = retire_instruction(&mut cpu, 0x4200_0020);
+    assert!(matches!(
+        boundary,
+        Mips4ExecutionBoundary::Retired {
+            instruction: 0x4200_0020,
+            ..
+        }
+    ));
+    let random = cpu.state().cp0().random().bits();
+    let count = cpu.state().cp0().count().bits();
+
+    assert_eq!(cpu.poll().unwrap(), ExecutionAction::Idle);
+    assert_eq!(cpu.poll().unwrap(), ExecutionAction::Idle);
+    assert_eq!(cpu.state().cp0().random().bits(), random);
+    assert_eq!(cpu.state().cp0().count().bits(), count);
+
+    BusDeviceRole::accept(&mut cpu, R5000CpuSignal::ExternalInterrupts(0x04));
+    assert!(matches!(
+        cpu.poll().unwrap(),
+        ExecutionAction::Transaction(_)
+    ));
 }
 
 struct FakeRam {
@@ -259,6 +290,7 @@ fn hand_written_rom_runs_through_cpu_bus_and_ram_roles() {
                 break;
             }
             ExecutionAction::Waiting { .. } => panic!("immediate bus must not remain waiting"),
+            ExecutionAction::Idle => panic!("test program must not enter standby"),
         }
     }
 
@@ -321,6 +353,7 @@ fn instruction_tlb_miss_selects_the_boot_refill_vector() {
                 panic!("setup instruction unexpectedly trapped");
             }
             ExecutionAction::Waiting { .. } => unreachable!(),
+            ExecutionAction::Idle => unreachable!(),
         }
     }
 

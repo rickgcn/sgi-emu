@@ -11,6 +11,9 @@ pub enum ExecutionTargetAction<T, B> {
 
     /// The current architectural instruction reached its commit or exception boundary.
     Boundary(B),
+
+    /// Execution is quiescent without an outstanding transaction.
+    Idle,
 }
 
 /// ISA-specific target driven by the functional executor.

@@ -69,6 +69,9 @@ pub enum ExecutionAction<T, B> {
     /// One architectural instruction reached a commit or exception boundary.
     Boundary(B),
 
+    /// The target is quiescent and may be polled again after an external event.
+    Idle,
+
     /// Execution cannot continue until the outstanding transaction completes.
     Waiting {
         /// Outstanding transaction identifier.

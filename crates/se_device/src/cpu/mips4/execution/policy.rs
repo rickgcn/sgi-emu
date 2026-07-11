@@ -8,6 +8,37 @@ use crate::cpu::mips4::exception::Mips4ExceptionImage;
 use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig};
 use crate::cpu::mips4::tlb::Mips4TlbAddressMode;
 
+/// Processor decision for the implementation-specific `WAIT` instruction.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Mips4Cp0WaitPolicy {
+    /// Treat the encoding as a reserved instruction.
+    ReservedInstruction,
+    /// Retire the instruction without entering a low-power state.
+    NoOperation,
+    /// Retire the instruction and enter functional standby.
+    Standby,
+}
+
+/// Direction of a CP0 doubleword register transfer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Mips4Cp0DoublewordTransferDirection {
+    /// `DMFC0` transfers from CP0 to a general-purpose register.
+    FromCp0,
+    /// `DMTC0` transfers from a general-purpose register to CP0.
+    ToCp0,
+}
+
+/// Processor decision for `DMFC0` or `DMTC0` after generic decoding checks.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Mips4Cp0DoublewordTransferPolicy {
+    /// Execute the full 64-bit transfer.
+    Execute,
+    /// Retire without modifying the destination.
+    NoOperation,
+    /// Raise a reserved-instruction exception.
+    ReservedInstruction,
+}
+
 /// Processor implementation policy used by the generic MIPS IV execution target.
 pub trait Mips4ExecutionPolicy {
     /// Returns the reset program counter.
@@ -36,6 +67,17 @@ pub trait Mips4ExecutionPolicy {
 
     /// Applies processor-specific writable masks before a CP0 register write.
     fn cp0_write_value(&self, register: Mips4Cp0Register, current: u64, requested: u64) -> u64;
+
+    /// Selects processor behavior for the implementation-specific `WAIT` instruction.
+    fn cp0_wait_policy(&self) -> Mips4Cp0WaitPolicy;
+
+    /// Validates a CP0 doubleword transfer for the current processor and mode.
+    fn cp0_doubleword_transfer_policy(
+        &self,
+        direction: Mips4Cp0DoublewordTransferDirection,
+        status: Mips4Cp0Status,
+        register: Mips4Cp0Register,
+    ) -> Mips4Cp0DoublewordTransferPolicy;
 
     /// Resolves an architecture cache attribute to a processor access type.
     fn resolve_access_type(&self, cache_attribute: Mips4MmuCacheAttribute)

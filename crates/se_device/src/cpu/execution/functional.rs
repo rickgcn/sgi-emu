@@ -69,7 +69,7 @@ where
         self.target.signal(signal);
     }
 
-    /// Polls for the next transaction, architectural boundary, or wait state.
+    /// Polls for the next transaction, architectural boundary, idle state, or wait state.
     pub fn poll(&mut self) -> FunctionalExecutorPoll<T> {
         match self.state {
             FunctionalExecutorState::Waiting { transaction_id } => {
@@ -142,6 +142,10 @@ where
             ExecutionTargetAction::Boundary(boundary) => {
                 self.state = FunctionalExecutorState::Ready;
                 Ok(ExecutionAction::Boundary(boundary))
+            }
+            ExecutionTargetAction::Idle => {
+                self.state = FunctionalExecutorState::Ready;
+                Ok(ExecutionAction::Idle)
             }
         }
     }

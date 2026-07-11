@@ -163,3 +163,100 @@ fn cache_validation_rejects_primary_and_secondary_configuration_conflicts() {
         );
     }
 }
+
+#[test]
+fn r5000_cp0_wait_enters_standby() {
+    let policy = R5000ExecutionPolicy::new(
+        profile(Mips4Endianness::Big, Mips4CacheConfig::disabled()),
+        boot_mode(),
+    );
+    assert_eq!(policy.cp0_wait_policy(), Mips4Cp0WaitPolicy::Standby);
+}
+
+#[test]
+fn r5000_cp0_doubleword_transfer_checks_effective_mode() {
+    let policy = R5000ExecutionPolicy::new(
+        profile(Mips4Endianness::Big, Mips4CacheConfig::disabled()),
+        boot_mode(),
+    );
+    let decision = |status| {
+        policy.cp0_doubleword_transfer_policy(
+            Mips4Cp0DoublewordTransferDirection::FromCp0,
+            Mips4Cp0Status::from_bits(status),
+            Mips4Cp0Register::Epc,
+        )
+    };
+
+    assert_eq!(decision(0), Mips4Cp0DoublewordTransferPolicy::Execute);
+    assert_eq!(decision(1 << 7), Mips4Cp0DoublewordTransferPolicy::Execute);
+    assert_eq!(
+        decision((1 << 28) | (1 << 3)),
+        Mips4Cp0DoublewordTransferPolicy::ReservedInstruction
+    );
+    assert_eq!(
+        decision((1 << 28) | (1 << 6) | (1 << 3)),
+        Mips4Cp0DoublewordTransferPolicy::Execute
+    );
+    assert_eq!(
+        decision((1 << 28) | (2 << 3)),
+        Mips4Cp0DoublewordTransferPolicy::ReservedInstruction
+    );
+    assert_eq!(
+        decision((1 << 28) | (1 << 5) | (2 << 3)),
+        Mips4Cp0DoublewordTransferPolicy::Execute
+    );
+    assert_eq!(
+        decision((2 << 3) | (1 << 1)),
+        Mips4Cp0DoublewordTransferPolicy::Execute
+    );
+    assert_eq!(
+        decision((2 << 3) | (1 << 2)),
+        Mips4Cp0DoublewordTransferPolicy::Execute
+    );
+    assert_eq!(
+        decision((1 << 28) | (3 << 3)),
+        Mips4Cp0DoublewordTransferPolicy::ReservedInstruction
+    );
+}
+
+#[test]
+fn r5000_cp0_doubleword_transfer_classifies_every_register_width() {
+    let policy = R5000ExecutionPolicy::new(
+        profile(Mips4Endianness::Big, Mips4CacheConfig::disabled()),
+        boot_mode(),
+    );
+    let wide = [
+        Mips4Cp0Register::EntryLo0,
+        Mips4Cp0Register::EntryLo1,
+        Mips4Cp0Register::Context,
+        Mips4Cp0Register::BadVaddr,
+        Mips4Cp0Register::EntryHi,
+        Mips4Cp0Register::Epc,
+        Mips4Cp0Register::XContext,
+        Mips4Cp0Register::ErrorEpc,
+    ];
+    for raw in 0..32 {
+        let Some(register) = Mips4Cp0Register::from_u8(raw) else {
+            continue;
+        };
+        let expected = if wide.contains(&register) {
+            Mips4Cp0DoublewordTransferPolicy::Execute
+        } else {
+            Mips4Cp0DoublewordTransferPolicy::NoOperation
+        };
+        for direction in [
+            Mips4Cp0DoublewordTransferDirection::FromCp0,
+            Mips4Cp0DoublewordTransferDirection::ToCp0,
+        ] {
+            assert_eq!(
+                policy.cp0_doubleword_transfer_policy(
+                    direction,
+                    Mips4Cp0Status::from_bits(0),
+                    register,
+                ),
+                expected,
+                "register {raw} direction {direction:?}"
+            );
+        }
+    }
+}

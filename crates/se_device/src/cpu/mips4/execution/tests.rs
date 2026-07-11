@@ -8,7 +8,7 @@ use crate::cpu::mips4::cache::hierarchy::{
 use crate::cpu::mips4::cache::{Mips4CacheCoherenceAlgorithm, Mips4MemoryAccessType};
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::cp0::{Mips4Cp0Config, Mips4Cp0Register};
-use crate::cpu::mips4::exception::Mips4ExceptionImage;
+use crate::cpu::mips4::exception::{Mips4Exception, Mips4ExceptionImage};
 use crate::cpu::mips4::gpr::Mips4GprIndex;
 use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig};
 use crate::cpu::mips4::tlb::Mips4TlbAddressMode;
@@ -17,7 +17,10 @@ use super::bus::{
     Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransaction,
     Mips4ExecutionTransferSize,
 };
-use super::policy::Mips4ExecutionPolicy;
+use super::policy::{
+    Mips4Cp0DoublewordTransferDirection, Mips4Cp0DoublewordTransferPolicy, Mips4Cp0WaitPolicy,
+    Mips4ExecutionPolicy,
+};
 use super::target::{Mips4ExecutionBoundary, Mips4ExecutionSignal, Mips4ExecutionTarget};
 
 const RESET_PC: u64 = 0xffff_ffff_8000_0000;
@@ -62,6 +65,19 @@ impl Mips4ExecutionPolicy for TestPolicy {
 
     fn cp0_write_value(&self, _register: Mips4Cp0Register, _current: u64, requested: u64) -> u64 {
         requested
+    }
+
+    fn cp0_wait_policy(&self) -> Mips4Cp0WaitPolicy {
+        Mips4Cp0WaitPolicy::Standby
+    }
+
+    fn cp0_doubleword_transfer_policy(
+        &self,
+        _direction: Mips4Cp0DoublewordTransferDirection,
+        _status: crate::cpu::mips4::cp0::Mips4Cp0Status,
+        _register: Mips4Cp0Register,
+    ) -> Mips4Cp0DoublewordTransferPolicy {
+        Mips4Cp0DoublewordTransferPolicy::Execute
     }
 
     fn resolve_access_type(
@@ -131,6 +147,19 @@ impl Mips4ExecutionPolicy for CachedTestPolicy {
 
     fn cp0_write_value(&self, _register: Mips4Cp0Register, _current: u64, requested: u64) -> u64 {
         requested
+    }
+
+    fn cp0_wait_policy(&self) -> Mips4Cp0WaitPolicy {
+        Mips4Cp0WaitPolicy::Standby
+    }
+
+    fn cp0_doubleword_transfer_policy(
+        &self,
+        _direction: Mips4Cp0DoublewordTransferDirection,
+        _status: crate::cpu::mips4::cp0::Mips4Cp0Status,
+        _register: Mips4Cp0Register,
+    ) -> Mips4Cp0DoublewordTransferPolicy {
+        Mips4Cp0DoublewordTransferPolicy::Execute
     }
 
     fn resolve_access_type(
@@ -493,6 +522,84 @@ fn cp0_word_transfers_apply_register_width_and_masks() {
             .read(Mips4GprIndex::from_u8(2).unwrap()),
         0
     );
+}
+
+#[test]
+fn wait_retires_once_then_remains_idle_until_an_interrupt_is_pending() {
+    let mut executor = executor();
+    let boundary = complete_instruction(&mut executor, 0x4200_0020);
+    assert!(matches!(
+        boundary,
+        Mips4ExecutionBoundary::Retired {
+            instruction: 0x4200_0020,
+            ..
+        }
+    ));
+    assert_eq!(executor.poll().unwrap(), ExecutionAction::Idle);
+    assert_eq!(executor.poll().unwrap(), ExecutionAction::Idle);
+
+    executor.signal(Mips4ExecutionSignal::ExternalInterrupts(0x04));
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Transaction(_)
+    ));
+}
+
+#[test]
+fn enabled_interrupt_wakes_wait_and_enters_the_interrupt_vector() {
+    let mut executor = executor();
+    complete_instruction(&mut executor, 0x2401_0401);
+    complete_instruction(&mut executor, 0x4081_6000);
+    complete_instruction(&mut executor, 0x4200_0020);
+    assert_eq!(executor.poll().unwrap(), ExecutionAction::Idle);
+
+    executor.signal(Mips4ExecutionSignal::ExternalInterrupts(0x04));
+    let ExecutionAction::Boundary(Mips4ExecutionBoundary::Exception { image, vector, .. }) =
+        executor.poll().unwrap()
+    else {
+        panic!("expected interrupt exception after wake");
+    };
+    assert_eq!(image.reason, Mips4Exception::Interrupt);
+    assert_eq!(vector, EXCEPTION_VECTOR);
+}
+
+#[test]
+fn pending_software_interrupt_prevents_wait_from_remaining_idle() {
+    let mut executor = executor();
+    complete_instruction(&mut executor, 0x2401_0100);
+    complete_instruction(&mut executor, 0x4081_6800);
+    complete_instruction(&mut executor, 0x4200_0020);
+
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Transaction(_)
+    ));
+}
+
+#[test]
+fn timer_interrupt_and_reset_wake_wait() {
+    {
+        let mut executor = executor();
+        complete_instruction(&mut executor, 0x2401_0001);
+        complete_instruction(&mut executor, 0x4081_5800);
+        complete_instruction(&mut executor, 0x4200_0020);
+        assert_eq!(executor.poll().unwrap(), ExecutionAction::Idle);
+
+        executor.target_mut().advance_count(1, true);
+        assert!(matches!(
+            executor.poll().unwrap(),
+            ExecutionAction::Transaction(_)
+        ));
+    }
+
+    let mut executor = executor();
+    complete_instruction(&mut executor, 0x4200_0020);
+    assert_eq!(executor.poll().unwrap(), ExecutionAction::Idle);
+    executor.reset();
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Transaction(_)
+    ));
 }
 
 #[test]

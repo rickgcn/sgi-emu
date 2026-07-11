@@ -125,7 +125,7 @@ where
         self.executor.target().state()
     }
 
-    /// Polls the next transaction, instruction boundary, or wait state.
+    /// Polls the next transaction, instruction boundary, idle state, or wait state.
     pub fn poll(
         &mut self,
     ) -> Result<ExecutionAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>, R5000CpuError>
