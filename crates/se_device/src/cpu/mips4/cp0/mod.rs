@@ -5,7 +5,7 @@
 //! perform exception entry, manage TLB replacement, translate addresses, or
 //! model implementation-specific cache diagnostic behavior.
 
-use crate::cpu::mips4::exception::Mips4CoprocessorNumber;
+use crate::cpu::mips4::exception::{Mips4CoprocessorNumber, Mips4Exception, Mips4ExceptionImage};
 use crate::cpu::mips4::tlb::{Mips4TlbAsid, Mips4TlbEntryHi, Mips4TlbEntryLo, Mips4TlbPageMask};
 
 const INDEX_PROBE_FAILURE: u64 = 1 << 31;
@@ -1188,6 +1188,121 @@ impl Mips4Cp0 {
 
         Ok(())
     }
+
+    /// Applies precise architectural exception state updates.
+    pub(crate) fn enter_exception(&mut self, image: Mips4ExceptionImage) {
+        let status_before = self.status;
+        let mut cause_bits = self.cause.bits() & CAUSE_IP_MASK;
+        cause_bits |= (image.reason.cause_code() as u32) << CAUSE_EXC_CODE_SHIFT;
+
+        if !status_before.exception_level() {
+            self.epc = Mips4Cp0Epc::from_bits(image.restart.restart_pc);
+            if image.restart.in_branch_delay_slot {
+                cause_bits |= CAUSE_BD;
+            }
+        } else if self.cause.branch_delay() {
+            cause_bits |= CAUSE_BD;
+        }
+
+        if let Mips4Exception::CoprocessorUnusable { coprocessor } = image.reason {
+            cause_bits |= (coprocessor.number() as u32) << CAUSE_CE_SHIFT;
+        }
+
+        self.cause = Mips4Cp0Cause::from_bits(cause_bits);
+        self.status = Mips4Cp0Status::from_bits(status_before.bits() | STATUS_EXL);
+
+        if let Some(address) = image.bad_virtual_address {
+            self.bad_vaddr = Mips4Cp0BadVaddr::from_bits(address);
+            if matches!(
+                image.reason,
+                Mips4Exception::TlbModification
+                    | Mips4Exception::TlbLoad
+                    | Mips4Exception::TlbStore
+            ) {
+                self.record_tlb_fault_context(address);
+            }
+        }
+    }
+
+    /// Clears exception level for `ERET` and returns the saved program counter.
+    pub fn return_from_exception(&mut self) -> u64 {
+        let (pc, clear) = if self.status.error_level() {
+            (self.error_epc.address(), STATUS_ERL)
+        } else {
+            (self.epc.address(), STATUS_EXL)
+        };
+        self.status = Mips4Cp0Status::from_bits(self.status.bits() & !clear);
+        pc
+    }
+
+    /// Advances the architecturally visible pseudo-random TLB replacement index.
+    pub fn advance_random(&mut self, increments: u64) {
+        let lower = self.wired.boundary().min(self.random_upper_bound);
+        let span = u64::from(self.random_upper_bound - lower) + 1;
+        let current_offset = u64::from(self.random.index() - lower);
+        let decrement = increments % span;
+        let next_offset = (current_offset + span - decrement) % span;
+        self.random = Mips4Cp0Random::from_bits(u64::from(lower) + next_offset);
+    }
+
+    /// Replaces the external hardware interrupt portion of Cause IP.
+    pub(crate) fn set_external_interrupts(&mut self, pending: u8) {
+        let software = self.cause.bits() & CAUSE_SOFTWARE_IP_MASK;
+        let timer = self.cause.bits() & CAUSE_TIMER_IP;
+        let hardware = ((pending as u32) << CAUSE_IP_SHIFT)
+            & (CAUSE_IP_MASK & !CAUSE_SOFTWARE_IP_MASK & !CAUSE_TIMER_IP);
+        self.cause = Mips4Cp0Cause::from_bits(
+            (self.cause.bits() & !CAUSE_IP_MASK) | software | timer | hardware,
+        );
+    }
+
+    /// Advances Count and raises the timer interrupt on a Compare match.
+    pub fn advance_count(&mut self, increments: u64, timer_interrupt_enabled: bool) {
+        let old_count = self.count.bits();
+        let new_count = old_count.wrapping_add(increments as u32);
+        self.count = Mips4Cp0Count::from_bits(new_count as u64);
+
+        if timer_interrupt_enabled
+            && count_range_contains(old_count, increments, self.compare.bits())
+        {
+            self.cause = Mips4Cp0Cause::from_bits(self.cause.bits() | CAUSE_TIMER_IP);
+        }
+    }
+
+    fn record_tlb_fault_context(&mut self, address: u64) {
+        let asid = self.entry_hi.address_space_identifier() as u64;
+        let entry_hi_bits = (address
+            & ((ENTRY_HI_REGION_MASK << ENTRY_HI_REGION_SHIFT)
+                | (ENTRY_HI_VPN2_MASK << ENTRY_HI_VPN2_SHIFT)))
+            | asid;
+        self.entry_hi = Mips4Cp0EntryHi::from_bits(entry_hi_bits);
+
+        let context_bits = (self.context.page_table_entry_base() << CONTEXT_PTE_BASE_SHIFT)
+            | (((address >> ENTRY_HI_VPN2_SHIFT) & CONTEXT_BAD_VPN2_MASK)
+                << CONTEXT_BAD_VPN2_SHIFT);
+        self.context = Mips4Cp0Context::from_bits(context_bits);
+
+        let x_context_bits = ((self.x_context.page_table_entry_base() as u64)
+            << XCONTEXT_PTE_BASE_SHIFT)
+            | (((address >> ENTRY_HI_VPN2_SHIFT) & XCONTEXT_BAD_VPN2_MASK)
+                << XCONTEXT_BAD_VPN2_SHIFT)
+            | (((address >> ENTRY_HI_REGION_SHIFT) & XCONTEXT_REGION_MASK)
+                << XCONTEXT_REGION_SHIFT);
+        self.x_context = Mips4Cp0XContext::from_bits(x_context_bits);
+    }
+}
+
+fn count_range_contains(start: u32, increments: u64, target: u32) -> bool {
+    if increments == 0 {
+        return false;
+    }
+
+    if increments > u32::MAX as u64 {
+        return true;
+    }
+
+    let distance = target.wrapping_sub(start) as u64;
+    distance != 0 && distance <= increments
 }
 
 #[cfg(test)]

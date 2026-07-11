@@ -11,6 +11,7 @@ pub mod config;
 pub mod cp0;
 pub mod cp1;
 pub mod exception;
+pub mod execution;
 pub mod gpr;
 pub mod instruction;
 pub mod memory;
