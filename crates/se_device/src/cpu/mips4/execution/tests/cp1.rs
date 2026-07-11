@@ -24,6 +24,63 @@ const COP1_STANDARD_FUNCTIONS: [u8; 24] = [
 const COP1X_FUSED_FUNCTIONS: [u8; 8] = [0x20, 0x21, 0x28, 0x29, 0x30, 0x31, 0x38, 0x39];
 
 #[test]
+fn user_mips4_cp1_denials_are_precise_and_side_effect_free() {
+    const STATUS_CU1: u32 = 1 << 29;
+    let recip_s = cop1_formatted(0x10, 0, 2, 6, 0x15);
+    let marker = 7.0_f32.to_bits();
+    let mut unimplemented = ConformanceMachine::new(Mips4Endianness::Big);
+    write_f32(&mut unimplemented, 2, 2.0);
+    unimplemented
+        .state_mut()
+        .cp1
+        .fgr_mut()
+        .write_word(fgr(6), marker);
+    unimplemented.enter_user_mode(STATUS_CU1);
+    assert!(matches!(
+        unimplemented.execute_user(recip_s),
+        Mips4ExecutionBoundary::Exception {
+            image: crate::cpu::mips4::exception::Mips4ExceptionImage {
+                reason: Mips4Exception::FloatingPoint,
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(
+        unimplemented
+            .state()
+            .cp1()
+            .fcsr()
+            .unimplemented_operation_cause()
+    );
+    assert_eq!(unimplemented.state().cp1().fgr().read_word(fgr(6)), marker);
+
+    let movf = r_type(1, 0, 3, 0, 0x01);
+    let mut reserved = ConformanceMachine::new(Mips4Endianness::Big);
+    reserved.write_gpr(1, 0x1234);
+    reserved.write_gpr(3, 0xfeed);
+    reserved.enter_user_mode(STATUS_CU1);
+    assert!(matches!(
+        reserved.execute_user(movf),
+        Mips4ExecutionBoundary::Exception {
+            image: crate::cpu::mips4::exception::Mips4ExceptionImage {
+                reason: Mips4Exception::ReservedInstruction,
+                ..
+            },
+            ..
+        }
+    ));
+    assert_eq!(reserved.read_gpr(3), 0xfeed);
+    assert!(
+        !reserved
+            .state()
+            .cp1()
+            .fcsr()
+            .unimplemented_operation_cause()
+    );
+}
+
+#[test]
 fn every_cp1_instruction_class_reaches_an_architectural_boundary() {
     let transfer_formats = [0x00, 0x01, 0x02, 0x04, 0x05, 0x06];
     for format in transfer_formats {

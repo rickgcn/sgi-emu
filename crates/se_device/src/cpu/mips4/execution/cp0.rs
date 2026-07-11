@@ -4,10 +4,12 @@ use crate::cpu::mips4::cp0::{Mips4Cp0EntryHi, Mips4Cp0Register, Mips4Cp0Status};
 use crate::cpu::mips4::exception::{Mips4CoprocessorNumber, Mips4Exception};
 use crate::cpu::mips4::gpr::{Mips4GprIndex, sign_extend_word};
 use crate::cpu::mips4::instruction::Mips4Instruction;
+use crate::cpu::mips4::instruction::requirements::cp0_requirements;
 use crate::cpu::mips4::memory::ll_sc::Mips4LlBit;
 use crate::cpu::mips4::mmu::Mips4MmuPrivilegeMode;
 use crate::cpu::mips4::tlb::{Mips4TlbAddressMode, Mips4TlbAsid, Mips4TlbEntry, Mips4TlbEntryHi};
 
+use super::access::{Mips4InstructionAccess, check_architecture_level};
 use super::policy::{
     Mips4Cp0DoublewordTransferDirection, Mips4Cp0DoublewordTransferPolicy, Mips4Cp0WaitPolicy,
     Mips4ExecutionPolicy,
@@ -42,6 +44,11 @@ pub(super) fn execute_cp0(
     instruction: Mips4Instruction,
 ) -> Mips4Cp0Execution {
     if let Err(exception) = check_cp0_access(state.cp0.status()) {
+        return Mips4Cp0Execution::Exception(exception);
+    }
+    if let Mips4InstructionAccess::Exception(exception) =
+        check_architecture_level(state.cp0.status(), cp0_requirements(instruction))
+    {
         return Mips4Cp0Execution::Exception(exception);
     }
     if instruction.opcode() != COP0_OPCODE {

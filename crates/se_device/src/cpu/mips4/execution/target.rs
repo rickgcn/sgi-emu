@@ -24,6 +24,9 @@ use crate::cpu::mips4::instruction::Mips4Instruction;
 use crate::cpu::mips4::instruction::decode::{
     Mips4InstructionClass, Mips4InstructionDecode, decode_instruction,
 };
+use crate::cpu::mips4::instruction::requirements::{
+    coprocessor_requirements, cp0_offset_requirements, cpu_requirements,
+};
 use crate::cpu::mips4::memory::ll_sc::Mips4LlBit;
 use crate::cpu::mips4::memory::operation::{
     Mips4InstructionFetch, Mips4MemoryAccessError, Mips4Prefetch, Mips4PrefetchHint,
@@ -32,6 +35,7 @@ use crate::cpu::mips4::memory::operation::{
 use crate::cpu::mips4::mmu::Mips4MmuPrivilegeMode;
 use crate::cpu::mips4::tlb::{Mips4TlbAddressMode, Mips4TlbAsid};
 
+use super::access::{Mips4InstructionAccess, check_architecture_level, check_coprocessor_access};
 use super::bus::{
     Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransaction,
     Mips4ExecutionTransferSize,
@@ -604,6 +608,11 @@ where
     > {
         match decode_instruction(instruction) {
             Mips4InstructionDecode::Instruction(Mips4InstructionClass::Cpu(decoded)) => {
+                if let Mips4InstructionAccess::Exception(exception) =
+                    check_architecture_level(self.state.cp0.status(), cpu_requirements(decoded))
+                {
+                    return Ok(self.exception_boundary(exception, None));
+                }
                 if matches!(
                     decoded,
                     crate::cpu::mips4::instruction::decode::Mips4CpuInstruction::Pref
@@ -682,10 +691,22 @@ where
             Mips4InstructionDecode::Instruction(Mips4InstructionClass::Coprocessor(
                 coprocessor,
             )) => {
-                let exception = if self.state.cp0.status().coprocessor_usable(coprocessor) {
-                    Mips4Exception::ReservedInstruction
-                } else {
-                    Mips4Exception::CoprocessorUnusable { coprocessor }
+                let present = match coprocessor {
+                    Mips4CoprocessorNumber::Cp2 => self.state.config.coprocessors.cp2,
+                    Mips4CoprocessorNumber::Cp0
+                    | Mips4CoprocessorNumber::Cp1
+                    | Mips4CoprocessorNumber::Cp3 => false,
+                };
+                let access = check_coprocessor_access(
+                    self.state.cp0.status(),
+                    present,
+                    coprocessor,
+                    coprocessor_requirements(instruction),
+                );
+                let exception = match access {
+                    Mips4InstructionAccess::Execute => Mips4Exception::ReservedInstruction,
+                    Mips4InstructionAccess::Exception(exception) => exception,
+                    Mips4InstructionAccess::FloatingPointUnimplemented => unreachable!(),
                 };
                 Ok(self.exception_boundary(exception, None))
             }
@@ -721,6 +742,11 @@ where
         Mips4ExecutionTargetError,
     > {
         if let Err(exception) = check_cp0_access(self.state.cp0.status()) {
+            return Ok(self.exception_boundary(exception, None));
+        }
+        if let Mips4InstructionAccess::Exception(exception) =
+            check_architecture_level(self.state.cp0.status(), cp0_offset_requirements())
+        {
             return Ok(self.exception_boundary(exception, None));
         }
         let address = match prepare_cache_address(&self.state, &self.policy, instruction) {

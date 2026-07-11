@@ -20,19 +20,23 @@ use crate::cpu::mips4::cp1::operation::{
     Mips4Cp1IndexedMemoryAccess, Mips4Cp1IndexedPrefetch, Mips4Cp1OffsetMemoryAccess,
 };
 use crate::cpu::mips4::cp1::{
-    Mips4Cp1ConditionCode, Mips4Cp1ControlRegister, Mips4Cp1ConversionRoundingMode,
-    Mips4Cp1FgrIndex, Mips4Cp1Format, Mips4Cp1Instruction, Mips4Cp1MoveDecision,
-    Mips4Cp1RegisterMode,
+    MIPS4_COP1X_OPCODE, Mips4Cp1ConditionCode, Mips4Cp1ControlRegister,
+    Mips4Cp1ConversionRoundingMode, Mips4Cp1FgrIndex, Mips4Cp1Format, Mips4Cp1Instruction,
+    Mips4Cp1MoveDecision, Mips4Cp1RegisterMode,
 };
 use crate::cpu::mips4::exception::{Mips4CoprocessorNumber, Mips4Exception};
 use crate::cpu::mips4::gpr::{Mips4GprIndex, sign_extend_word};
 use crate::cpu::mips4::instruction::Mips4Instruction;
+use crate::cpu::mips4::instruction::requirements::cp1_requirements;
 use crate::cpu::mips4::memory::operation::{
     Mips4MemoryAccessError, Mips4Prefetch, Mips4PrefetchHint, Mips4PrefetchResult,
 };
 use crate::cpu::mips4::mmu::Mips4MmuCacheAttribute;
 use crate::cpu::mips4::tlb::Mips4TlbAsid;
 
+use super::access::{
+    Mips4InstructionAccess, check_architecture_level, coprocessor_unusable, reserved,
+};
 use super::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransaction, Mips4ExecutionTransferSize};
 use super::memory::{decode_u32, decode_u64, encode_lanes};
 use super::policy::{Mips4ExecutionPolicy, Mips4PrefetchPolicy};
@@ -69,24 +73,26 @@ pub(super) fn execute_fpu<F: FloatBackend>(
     raw: Mips4Instruction,
     endianness: Mips4Endianness,
 ) -> Result<Mips4FpuExecution, Mips4MemoryAccessError> {
-    if !state
-        .cp0
-        .status()
-        .coprocessor_usable(Mips4CoprocessorNumber::Cp1)
-    {
-        return Ok(Mips4FpuExecution::Exception(
-            Mips4Exception::CoprocessorUnusable {
-                coprocessor: Mips4CoprocessorNumber::Cp1,
-            },
-        ));
-    }
-
     let Some(decoded) = decode_instruction(raw) else {
         return Ok(unimplemented(state));
     };
-    let class = match decoded {
-        Mips4Cp1Decode::Instruction(class) => class,
-        Mips4Cp1Decode::ReservedOrUnimplementedOperation => return Ok(unimplemented(state)),
+    let access = check_fpu_access(
+        state.cp0.status(),
+        state.config.coprocessors.cp1,
+        raw,
+        decoded,
+    );
+    match access {
+        Mips4InstructionAccess::Execute => {}
+        Mips4InstructionAccess::Exception(exception) => {
+            return Ok(Mips4FpuExecution::Exception(exception));
+        }
+        Mips4InstructionAccess::FloatingPointUnimplemented => {
+            return Ok(unimplemented(state));
+        }
+    }
+    let Mips4Cp1Decode::Instruction(class) = decoded else {
+        unreachable!();
     };
     match class {
         Mips4Cp1InstructionClass::RegisterTransfer(operation) => {
@@ -130,6 +136,80 @@ pub(super) fn execute_fpu<F: FloatBackend>(
             }
         }
     }
+}
+
+pub(super) fn check_fpu_access(
+    status: crate::cpu::mips4::cp0::Mips4Cp0Status,
+    present: bool,
+    raw: Mips4Instruction,
+    decoded: Mips4Cp1Decode,
+) -> Mips4InstructionAccess {
+    let usable = status.coprocessor_usable(Mips4CoprocessorNumber::Cp1);
+    let cop1x = raw.opcode() == MIPS4_COP1X_OPCODE;
+
+    if cop1x {
+        let requirements =
+            crate::cpu::mips4::instruction::requirements::Mips4InstructionRequirements::new(
+                crate::cpu::mips4::instruction::requirements::Mips4ArchitectureLevel::Mips4,
+            );
+        if !matches!(
+            check_architecture_level(status, requirements),
+            Mips4InstructionAccess::Execute
+        ) {
+            return reserved();
+        }
+        if !usable {
+            return coprocessor_unusable(Mips4CoprocessorNumber::Cp1);
+        }
+        if !present || matches!(decoded, Mips4Cp1Decode::ReservedOrUnimplementedOperation) {
+            return reserved();
+        }
+        return Mips4InstructionAccess::Execute;
+    }
+
+    let Mips4Cp1Decode::Instruction(class) = decoded else {
+        return if !usable {
+            coprocessor_unusable(Mips4CoprocessorNumber::Cp1)
+        } else if !present {
+            reserved()
+        } else {
+            Mips4InstructionAccess::FloatingPointUnimplemented
+        };
+    };
+    let requirements = cp1_requirements(raw, class);
+
+    if matches!(class, Mips4Cp1InstructionClass::Movci(_)) {
+        if !matches!(
+            check_architecture_level(status, requirements),
+            Mips4InstructionAccess::Execute
+        ) {
+            return reserved();
+        }
+        if !usable {
+            return coprocessor_unusable(Mips4CoprocessorNumber::Cp1);
+        }
+        return if present {
+            Mips4InstructionAccess::Execute
+        } else {
+            reserved()
+        };
+    }
+
+    if matches!(class, Mips4Cp1InstructionClass::Branch(_))
+        && !matches!(
+            check_architecture_level(status, requirements),
+            Mips4InstructionAccess::Execute
+        )
+    {
+        return reserved();
+    }
+    if !usable {
+        return coprocessor_unusable(Mips4CoprocessorNumber::Cp1);
+    }
+    if !present {
+        return reserved();
+    }
+    check_architecture_level(status, requirements)
 }
 
 pub(super) fn complete_fpu_read(

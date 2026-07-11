@@ -10,7 +10,9 @@ use se_float::backend::softfloat3::SoftFloat3Backend;
 
 use crate::cpu::execution::functional::FunctionalExecutor;
 use crate::cpu::execution::protocol::{ExecutionAction, ExecutionCompletion, ExecutionTransaction};
+use crate::cpu::mips4::cache::Mips4CacheCoherenceAlgorithm;
 use crate::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
+use crate::cpu::mips4::cp0::Mips4Cp0Register;
 use crate::cpu::mips4::execution::bus::{
     Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransaction,
     Mips4ExecutionTransferSize,
@@ -22,6 +24,10 @@ use crate::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
 use crate::cpu::mips4::model::r5000::execution_policy::R5000ExecutionPolicy;
 use crate::cpu::mips4::model::r5000::profile::R5000Profile;
 use crate::cpu::mips4::model::r5000::revision::R5000Revision;
+use crate::cpu::mips4::tlb::{
+    Mips4TlbAddressMode, Mips4TlbAsid, Mips4TlbEntry, Mips4TlbEntryHi, Mips4TlbEntryLo,
+    Mips4TlbPageMask, Mips4TlbPageSize,
+};
 
 const RESET_PC: u64 = 0xffff_ffff_bfc0_0000;
 const RESET_PHYSICAL_PC: u64 = 0x1fc0_0000;
@@ -151,6 +157,60 @@ impl ConformanceMachine {
                 }
             }
         }
+    }
+
+    fn enter_user_mode(&mut self, extra_status_bits: u32) {
+        let page_mask = Mips4TlbPageMask::from_page_size(Mips4TlbPageSize::Size4KiB);
+        let entry_hi = Mips4TlbEntryHi::from_virtual_address(
+            0,
+            Mips4TlbAsid::new(0),
+            page_mask,
+            Mips4TlbAddressMode::Bits64,
+        );
+        let entry_lo = Mips4TlbEntryLo::from_parts(
+            0,
+            Mips4CacheCoherenceAlgorithm::from_bits(2).unwrap(),
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+        self.state_mut().tlb_entries[0] =
+            Mips4TlbEntry::new(page_mask, entry_hi, entry_lo, entry_lo);
+        self.state_mut().pc = 0;
+        self.state_mut().next_pc = 4;
+        self.state_mut().delay_slot_branch_pc = None;
+        self.state_mut()
+            .cp0
+            .write(
+                Mips4Cp0Register::Status,
+                (2 << 3) | extra_status_bits as u64,
+            )
+            .unwrap();
+    }
+
+    fn execute_user(&mut self, bits: u32) -> Mips4ExecutionBoundary {
+        let ExecutionAction::Transaction(fetch) = self.executor.poll().unwrap() else {
+            panic!("expected user instruction fetch for {bits:#010x}");
+        };
+        assert!(matches!(
+            fetch.payload,
+            Mips4ExecutionTransaction::Read {
+                physical_address: 0,
+                kind: Mips4ExecutionAccessKind::InstructionFetch,
+                ..
+            }
+        ));
+        self.executor
+            .complete(ExecutionCompletion {
+                id: fetch.id,
+                payload: Mips4ExecutionCompletion::ReadData(self.word_lanes(bits)),
+            })
+            .unwrap();
+        let ExecutionAction::Boundary(boundary) = self.executor.poll().unwrap() else {
+            panic!("expected user instruction boundary for {bits:#010x}");
+        };
+        boundary
     }
 
     fn word_lanes(&self, bits: u32) -> u64 {

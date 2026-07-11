@@ -4,6 +4,7 @@
 //! instruction boundaries and external CPU bus transactions. Processor-specific
 //! reset, exception-vector, and cache-coherence policy is supplied separately.
 
+pub mod access;
 pub mod bus;
 mod cp0;
 mod fpu;

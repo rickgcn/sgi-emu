@@ -168,6 +168,72 @@ fn every_cpu_instruction_decodes_and_reaches_an_architectural_boundary() {
 }
 
 #[test]
+fn user_ux_and_xx_enable_mips3_and_mips4_independently() {
+    const STATUS_XX: u32 = 1 << 31;
+    const STATUS_UX: u32 = 1 << 5;
+    let dadd = r_type(1, 2, 3, 0, 0x2c);
+    let movn = r_type(1, 2, 3, 0, 0x0b);
+
+    let mut mips3_disabled = ConformanceMachine::new(Mips4Endianness::Big);
+    mips3_disabled.write_gpr(1, 2);
+    mips3_disabled.write_gpr(2, 3);
+    mips3_disabled.enter_user_mode(STATUS_XX);
+    assert!(matches!(
+        mips3_disabled.execute_user(dadd),
+        super::super::target::Mips4ExecutionBoundary::Exception {
+            image: crate::cpu::mips4::exception::Mips4ExceptionImage {
+                reason: Mips4Exception::ReservedInstruction,
+                ..
+            },
+            ..
+        }
+    ));
+    assert_eq!(mips3_disabled.read_gpr(3), 0);
+
+    let mut mips4_disabled = ConformanceMachine::new(Mips4Endianness::Big);
+    mips4_disabled.write_gpr(1, 2);
+    mips4_disabled.write_gpr(2, 3);
+    mips4_disabled.enter_user_mode(STATUS_UX);
+    assert!(matches!(
+        mips4_disabled.execute_user(movn),
+        super::super::target::Mips4ExecutionBoundary::Exception {
+            image: crate::cpu::mips4::exception::Mips4ExceptionImage {
+                reason: Mips4Exception::ReservedInstruction,
+                ..
+            },
+            ..
+        }
+    ));
+    assert_eq!(mips4_disabled.read_gpr(3), 0);
+
+    let mut mips3_enabled = ConformanceMachine::new(Mips4Endianness::Big);
+    mips3_enabled.write_gpr(1, 2);
+    mips3_enabled.write_gpr(2, 3);
+    mips3_enabled.enter_user_mode(STATUS_UX);
+    assert_eq!(
+        mips3_enabled.execute_user(dadd),
+        super::super::target::Mips4ExecutionBoundary::Retired {
+            pc: 0,
+            instruction: dadd,
+        }
+    );
+    assert_eq!(mips3_enabled.read_gpr(3), 5);
+
+    let mut mips4_enabled = ConformanceMachine::new(Mips4Endianness::Big);
+    mips4_enabled.write_gpr(1, 2);
+    mips4_enabled.write_gpr(2, 3);
+    mips4_enabled.enter_user_mode(STATUS_XX);
+    assert_eq!(
+        mips4_enabled.execute_user(movn),
+        super::super::target::Mips4ExecutionBoundary::Retired {
+            pc: 0,
+            instruction: movn,
+        }
+    );
+    assert_eq!(mips4_enabled.read_gpr(3), 2);
+}
+
+#[test]
 fn integer_alu_instructions_commit_manual_results_through_raw_encodings() {
     struct Case {
         bits: u32,

@@ -4,6 +4,7 @@
 //! word. Decode helpers classify instruction encodings without executing them.
 
 pub mod decode;
+pub mod requirements;
 
 /// Raw 32-bit MIPS IV instruction word.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
