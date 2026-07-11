@@ -1,6 +1,7 @@
 //! Architectural state owned by functional MIPS IV execution.
 
 use crate::cpu::mips4::cache::Mips4CacheCoherenceAlgorithm;
+use crate::cpu::mips4::cache::hierarchy::{Mips4CacheConfigError, Mips4CacheHierarchy};
 use crate::cpu::mips4::cp0::Mips4Cp0;
 use crate::cpu::mips4::cp1::Mips4Cp1;
 use crate::cpu::mips4::gpr::Mips4GprFile;
@@ -27,13 +28,14 @@ pub struct Mips4ExecutionState {
     pub(super) tlb_entries: Vec<Mips4TlbEntry>,
     pub(super) llbit: Mips4LlBit,
     pub(super) external_interrupts: u8,
+    pub(super) cache: Mips4CacheHierarchy,
 }
 
 impl Mips4ExecutionState {
     /// Creates reset architectural state for one processor policy.
-    pub fn new(policy: &impl Mips4ExecutionPolicy) -> Self {
+    pub fn new(policy: &impl Mips4ExecutionPolicy) -> Result<Self, Mips4CacheConfigError> {
         let pc = policy.reset_pc();
-        Self {
+        Ok(Self {
             pc,
             next_pc: pc.wrapping_add(4),
             delay_slot_branch_pc: None,
@@ -51,7 +53,8 @@ impl Mips4ExecutionState {
                 .collect(),
             llbit: Mips4LlBit::Clear,
             external_interrupts: 0,
-        }
+            cache: Mips4CacheHierarchy::new(policy.cache_config())?,
+        })
     }
 
     /// Returns the current program counter.

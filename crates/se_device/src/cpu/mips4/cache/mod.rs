@@ -1,11 +1,13 @@
 //! Generic MIPS IV cache and memory access helpers.
 //!
 //! This module contains architecture-level cache access classifications, raw
-//! `CACHE` instruction field extraction, and cache-line address arithmetic. It
-//! does not define implementation-specific cache operations, cache storage,
-//! cache tags, CP0 cache registers, address translation, or bus transactions.
+//! `CACHE` instruction field extraction, cache-line address arithmetic, and the
+//! validated storage used by functional processor models. Concrete policies
+//! still define processor-specific operations, tags, and cacheability rules.
 
 use crate::cpu::mips4::instruction::Mips4Instruction;
+
+pub mod hierarchy;
 
 /// Primary opcode for the privileged `CACHE` instruction.
 pub const MIPS4_CACHE_OPCODE: u8 = 0x2f;

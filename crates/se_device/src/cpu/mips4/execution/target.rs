@@ -6,7 +6,14 @@ use se_float::backend::FloatBackend;
 
 use crate::cpu::execution::target::{ExecutionBoundary, ExecutionTarget, ExecutionTargetAction};
 use crate::cpu::mips4::branch::Mips4BranchDecision;
+use crate::cpu::mips4::cache::Mips4CacheInstruction;
+use crate::cpu::mips4::cache::Mips4MemoryAccessType;
+use crate::cpu::mips4::cache::hierarchy::{
+    MIPS4_FUNCTIONAL_CACHE_LINE_BYTES, Mips4CacheAccessPolicy, Mips4CacheConfigError,
+    Mips4CacheLine, line_base,
+};
 use crate::cpu::mips4::config::Mips4Endianness;
+use crate::cpu::mips4::cp0::Mips4Cp0Register;
 use crate::cpu::mips4::exception::{
     Mips4CoprocessorNumber, Mips4Exception, Mips4ExceptionImage, Mips4ExceptionRestart,
 };
@@ -16,7 +23,10 @@ use crate::cpu::mips4::instruction::decode::{
     Mips4InstructionClass, Mips4InstructionDecode, decode_instruction,
 };
 use crate::cpu::mips4::memory::ll_sc::Mips4LlBit;
-use crate::cpu::mips4::memory::operation::{Mips4InstructionFetch, Mips4MemoryAccessError};
+use crate::cpu::mips4::memory::operation::{
+    Mips4InstructionFetch, Mips4MemoryAccessError, Mips4Prefetch, Mips4PrefetchHint,
+    Mips4PrefetchResult,
+};
 use crate::cpu::mips4::mmu::Mips4MmuPrivilegeMode;
 use crate::cpu::mips4::tlb::{Mips4TlbAddressMode, Mips4TlbAsid};
 
@@ -24,12 +34,12 @@ use super::bus::{
     Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransaction,
     Mips4ExecutionTransferSize,
 };
-use super::cp0::{Mips4Cp0Execution, execute_cache, execute_cp0};
+use super::cp0::{Mips4Cp0Execution, check_cp0_access, execute_cp0};
 use super::fpu::{Mips4FpuExecution, Mips4PendingFpuRead, complete_fpu_read, execute_fpu};
 use super::integer::{Mips4CpuExecution, execute_cpu};
 use super::memory::{
     Mips4MemoryPlan, Mips4PendingRead, Mips4PendingWrite, complete_read, complete_write,
-    prepare_memory,
+    prepare_cache_address, prepare_memory,
 };
 use super::policy::Mips4ExecutionPolicy;
 use super::state::Mips4ExecutionState;
@@ -113,6 +123,87 @@ enum PendingOperation {
     FpuDataWrite {
         instruction: Mips4Instruction,
     },
+    CacheRetire {
+        instruction: Mips4Instruction,
+    },
+    Cached(Mips4PendingCachedAccess),
+    CacheWriteback(Mips4PendingCacheWriteback),
+}
+
+enum Mips4CachedClient {
+    InstructionFetch,
+    DataRead {
+        instruction: Mips4Instruction,
+        pending: Mips4PendingRead,
+    },
+    DataWrite {
+        instruction: Mips4Instruction,
+        pending: Mips4PendingWrite,
+    },
+    FpuDataRead {
+        instruction: Mips4Instruction,
+        pending: Mips4PendingFpuRead,
+    },
+    FpuDataWrite {
+        instruction: Mips4Instruction,
+    },
+    CacheRetire {
+        instruction: Mips4Instruction,
+    },
+    Prefetch {
+        instruction: Mips4Instruction,
+    },
+}
+
+enum Mips4CachedStage {
+    Writeback {
+        doubleword: u8,
+    },
+    Fill {
+        doubleword: u8,
+        data: [u8; MIPS4_FUNCTIONAL_CACHE_LINE_BYTES],
+    },
+    WriteThrough,
+}
+
+struct Mips4PendingCachedAccess {
+    client: Mips4CachedClient,
+    virtual_address: u64,
+    request: Mips4ExecutionTransaction,
+    policy: Mips4CacheAccessPolicy,
+    victim_set: usize,
+    victim_way: usize,
+    victim: Mips4CacheLine,
+    secondary_source: Option<Mips4CacheLine>,
+    use_secondary: bool,
+    stage: Mips4CachedStage,
+}
+
+enum Mips4CacheWritebackTarget {
+    PrimaryIndex {
+        instruction_cache: bool,
+        virtual_address: u64,
+        invalidate: bool,
+    },
+    PrimaryHit {
+        instruction_cache: bool,
+        virtual_address: u64,
+        physical_address: u64,
+        invalidate: bool,
+    },
+    CreateDirty {
+        virtual_address: u64,
+        physical_address: u64,
+        set: usize,
+        way: usize,
+    },
+}
+
+struct Mips4PendingCacheWriteback {
+    instruction: Mips4Instruction,
+    line: Mips4CacheLine,
+    doubleword: u8,
+    target: Mips4CacheWritebackTarget,
 }
 
 /// Functional MIPS IV execution target parameterized by processor policy and FPU backend.
@@ -129,14 +220,14 @@ where
     F: FloatBackend,
 {
     /// Creates a functional target in reset state.
-    pub fn new(policy: P, float_backend: F) -> Self {
-        let state = Mips4ExecutionState::new(&policy);
-        Self {
+    pub fn new(policy: P, float_backend: F) -> Result<Self, Mips4CacheConfigError> {
+        let state = Mips4ExecutionState::new(&policy)?;
+        Ok(Self {
             policy,
             float_backend,
             state,
             pending: None,
-        }
+        })
     }
 
     /// Returns processor policy.
@@ -186,17 +277,230 @@ where
         ) {
             Ok(fetch) => {
                 let access_type = self.policy.resolve_access_type(fetch.cache_attribute());
-                self.pending = Some(PendingOperation::InstructionFetch);
-                Ok(ExecutionTargetAction::Transaction(
+                let cache_policy = self.policy.resolve_cache_policy(fetch.cache_attribute());
+                self.start_memory_access(
+                    Mips4CachedClient::InstructionFetch,
+                    self.state.pc,
+                    cache_policy,
                     Mips4ExecutionTransaction::Read {
                         physical_address: fetch.physical_address(),
                         size: Mips4ExecutionTransferSize::Word,
                         kind: Mips4ExecutionAccessKind::InstructionFetch,
                         access_type,
                     },
-                ))
+                )
             }
             Err(error) => self.memory_error_boundary(error),
+        }
+    }
+
+    fn start_memory_access(
+        &mut self,
+        client: Mips4CachedClient,
+        virtual_address: u64,
+        cache_policy: Mips4CacheAccessPolicy,
+        request: Mips4ExecutionTransaction,
+    ) -> Result<
+        ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+        Mips4ExecutionTargetError,
+    > {
+        let instruction = matches!(
+            client,
+            Mips4CachedClient::InstructionFetch | Mips4CachedClient::CacheRetire { .. }
+        );
+        let (physical_address, size, is_write) = transaction_shape(request);
+        let cache_exists = if instruction {
+            self.state.cache.has_instruction()
+        } else {
+            self.state.cache.has_data()
+        };
+        if !cache_policy.is_cached() || !cache_exists {
+            self.pending = Some(direct_pending(client));
+            return Ok(ExecutionTargetAction::Transaction(request));
+        }
+
+        let hit = if instruction {
+            self.state
+                .cache
+                .instruction_lookup(virtual_address, physical_address)
+        } else {
+            self.state
+                .cache
+                .data_lookup(virtual_address, physical_address)
+        };
+        if let Some(line) = hit {
+            if !is_write {
+                let lanes = line.read_lanes(physical_address, size);
+                return self
+                    .finish_cached_client(client, Mips4ExecutionCompletion::ReadData(lanes));
+            }
+            if cache_policy.is_write_back() {
+                write_request_to_data_cache(&mut self.state, virtual_address, request, true);
+                return self.finish_cached_client(client, Mips4ExecutionCompletion::WriteComplete);
+            }
+            let pending = Mips4PendingCachedAccess {
+                client,
+                virtual_address,
+                request,
+                policy: cache_policy,
+                victim_set: 0,
+                victim_way: 0,
+                victim: Mips4CacheLine::INVALID,
+                secondary_source: None,
+                use_secondary: false,
+                stage: Mips4CachedStage::WriteThrough,
+            };
+            self.pending = Some(PendingOperation::Cached(pending));
+            return Ok(ExecutionTargetAction::Transaction(request));
+        }
+
+        if is_write && !cache_policy.write_allocates() {
+            self.pending = Some(direct_pending(client));
+            return Ok(ExecutionTargetAction::Transaction(request));
+        }
+
+        let Some((victim_set, victim_way, victim)) = (if instruction {
+            self.state.cache.choose_instruction_victim(virtual_address)
+        } else {
+            self.state.cache.choose_data_victim(virtual_address)
+        }) else {
+            self.pending = Some(direct_pending(client));
+            return Ok(ExecutionTargetAction::Transaction(request));
+        };
+        let use_secondary = cache_policy.is_write_back()
+            && self.state.cp0.config().secondary_cache_enabled()
+            && self.state.cache.has_secondary();
+        let secondary_source = use_secondary
+            .then(|| self.state.cache.secondary_lookup(physical_address))
+            .flatten();
+        let stage = if victim.valid && victim.dirty {
+            Mips4CachedStage::Writeback { doubleword: 0 }
+        } else {
+            Mips4CachedStage::Fill {
+                doubleword: 0,
+                data: [0; MIPS4_FUNCTIONAL_CACHE_LINE_BYTES],
+            }
+        };
+        let pending = Mips4PendingCachedAccess {
+            client,
+            virtual_address,
+            request,
+            policy: cache_policy,
+            victim_set,
+            victim_way,
+            victim,
+            secondary_source,
+            use_secondary,
+            stage,
+        };
+        if victim.valid && victim.dirty {
+            let transaction = cache_writeback_transaction(&pending, 0);
+            self.pending = Some(PendingOperation::Cached(pending));
+            return Ok(ExecutionTargetAction::Transaction(transaction));
+        }
+        self.start_cached_fill(pending)
+    }
+
+    fn start_cached_fill(
+        &mut self,
+        mut pending: Mips4PendingCachedAccess,
+    ) -> Result<
+        ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+        Mips4ExecutionTargetError,
+    > {
+        if let Some(line) = pending.secondary_source.take() {
+            self.install_primary_line(&pending, line);
+            return self.complete_cached_line(pending, line);
+        }
+        pending.stage = Mips4CachedStage::Fill {
+            doubleword: 0,
+            data: [0; MIPS4_FUNCTIONAL_CACHE_LINE_BYTES],
+        };
+        let transaction = cache_fill_transaction(&pending, 0);
+        self.pending = Some(PendingOperation::Cached(pending));
+        Ok(ExecutionTargetAction::Transaction(transaction))
+    }
+
+    fn install_primary_line(&mut self, pending: &Mips4PendingCachedAccess, line: Mips4CacheLine) {
+        if matches!(
+            pending.client,
+            Mips4CachedClient::InstructionFetch | Mips4CachedClient::CacheRetire { .. }
+        ) {
+            self.state
+                .cache
+                .install_instruction(pending.victim_set, pending.victim_way, line);
+        } else {
+            self.state
+                .cache
+                .install_data(pending.victim_set, pending.victim_way, line);
+        }
+    }
+
+    fn complete_cached_line(
+        &mut self,
+        mut pending: Mips4PendingCachedAccess,
+        line: Mips4CacheLine,
+    ) -> Result<
+        ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+        Mips4ExecutionTargetError,
+    > {
+        let (physical_address, size, is_write) = transaction_shape(pending.request);
+        if !is_write {
+            return self.finish_cached_client(
+                pending.client,
+                Mips4ExecutionCompletion::ReadData(line.read_lanes(physical_address, size)),
+            );
+        }
+        if pending.policy.is_write_back() {
+            write_request_to_data_cache(
+                &mut self.state,
+                pending.virtual_address,
+                pending.request,
+                true,
+            );
+            return self
+                .finish_cached_client(pending.client, Mips4ExecutionCompletion::WriteComplete);
+        }
+        pending.stage = Mips4CachedStage::WriteThrough;
+        let request = pending.request;
+        self.pending = Some(PendingOperation::Cached(pending));
+        Ok(ExecutionTargetAction::Transaction(request))
+    }
+
+    fn finish_cached_client(
+        &mut self,
+        client: Mips4CachedClient,
+        completion: Mips4ExecutionCompletion,
+    ) -> Result<
+        ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+        Mips4ExecutionTargetError,
+    > {
+        match client {
+            Mips4CachedClient::InstructionFetch => self.complete_fetch(completion),
+            Mips4CachedClient::DataRead {
+                instruction,
+                pending,
+            } => self.complete_data_read(instruction, pending, completion),
+            Mips4CachedClient::DataWrite {
+                instruction,
+                pending,
+            } => self.complete_data_write(instruction, pending, completion),
+            Mips4CachedClient::FpuDataRead {
+                instruction,
+                pending,
+            } => self.complete_fpu_data_read(instruction, pending, completion),
+            Mips4CachedClient::FpuDataWrite { instruction } => {
+                self.complete_fpu_data_write(instruction, completion)
+            }
+            Mips4CachedClient::CacheRetire { instruction } => match completion {
+                Mips4ExecutionCompletion::ReadData(_) | Mips4ExecutionCompletion::WriteComplete => {
+                    Ok(self.retire_sequential(instruction))
+                }
+                Mips4ExecutionCompletion::BusError => {
+                    Ok(self.exception_boundary(Mips4Exception::DataBusError, None))
+                }
+            },
+            Mips4CachedClient::Prefetch { instruction } => Ok(self.retire_sequential(instruction)),
         }
     }
 
@@ -230,6 +534,12 @@ where
     > {
         match decode_instruction(instruction) {
             Mips4InstructionDecode::Instruction(Mips4InstructionClass::Cpu(decoded)) => {
+                if matches!(
+                    decoded,
+                    crate::cpu::mips4::instruction::decode::Mips4CpuInstruction::Pref
+                ) {
+                    return self.execute_prefetch(instruction);
+                }
                 match execute_cpu(&mut self.state, instruction, decoded) {
                     Mips4CpuExecution::Retire => Ok(self.retire_sequential(instruction)),
                     Mips4CpuExecution::Branch(decision) => {
@@ -246,23 +556,31 @@ where
                             Ok(Mips4MemoryPlan::Read {
                                 pending,
                                 transaction,
-                            }) => {
-                                self.pending = Some(PendingOperation::DataRead {
+                                virtual_address,
+                                cache_policy,
+                            }) => self.start_memory_access(
+                                Mips4CachedClient::DataRead {
                                     instruction,
                                     pending,
-                                });
-                                Ok(ExecutionTargetAction::Transaction(transaction))
-                            }
+                                },
+                                virtual_address,
+                                cache_policy,
+                                transaction,
+                            ),
                             Ok(Mips4MemoryPlan::Write {
                                 pending,
                                 transaction,
-                            }) => {
-                                self.pending = Some(PendingOperation::DataWrite {
+                                virtual_address,
+                                cache_policy,
+                            }) => self.start_memory_access(
+                                Mips4CachedClient::DataWrite {
                                     instruction,
                                     pending,
-                                });
-                                Ok(ExecutionTargetAction::Transaction(transaction))
-                            }
+                                },
+                                virtual_address,
+                                cache_policy,
+                                transaction,
+                            ),
                             Ok(Mips4MemoryPlan::Retire {
                                 register_write,
                                 clear_llbit,
@@ -319,11 +637,411 @@ where
                 Ok(self.exception_boundary(Mips4Exception::ReservedInstruction, None))
             }
             Mips4InstructionDecode::ProcessorSpecificCp0Offset => {
-                let result = execute_cache(&mut self.state, instruction);
-                Ok(self.finish_cp0(instruction, result))
+                self.execute_cache_instruction(instruction)
             }
             Mips4InstructionDecode::UndefinedResult => Ok(self.retire_sequential(instruction)),
         }
+    }
+
+    fn execute_cache_instruction(
+        &mut self,
+        instruction: Mips4Instruction,
+    ) -> Result<
+        ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+        Mips4ExecutionTargetError,
+    > {
+        if let Err(exception) = check_cp0_access(self.state.cp0.status()) {
+            return Ok(self.exception_boundary(exception, None));
+        }
+        let address = match prepare_cache_address(&self.state, &self.policy, instruction) {
+            Ok(address) => address,
+            Err(error) => return self.memory_error_boundary(error),
+        };
+        if !self
+            .policy
+            .resolve_cache_policy(address.cache_attribute)
+            .is_cached()
+        {
+            return Ok(self.retire_sequential(instruction));
+        }
+        let cache = Mips4CacheInstruction::from_instruction(instruction).unwrap();
+        let selector = cache.cache_selector_bits();
+        let operation = cache.operation_bits();
+        let virtual_address = address.virtual_address;
+        let physical_address = address.physical_address;
+        match (selector, operation) {
+            (0, 0) => {
+                if let Some(line) = self
+                    .state
+                    .cache
+                    .primary_index_line_mut(true, virtual_address)
+                {
+                    line.valid = false;
+                    line.dirty = false;
+                }
+            }
+            (0, 1) => self.load_primary_tag(true, virtual_address),
+            (0, 2) => self.store_primary_tag(true, virtual_address),
+            (0, 4) => {
+                if let Some(line) =
+                    self.state
+                        .cache
+                        .primary_hit_line_mut(true, virtual_address, physical_address)
+                {
+                    line.valid = false;
+                    line.dirty = false;
+                }
+            }
+            (0, 5) => {
+                return self.start_instruction_cache_fill(
+                    instruction,
+                    virtual_address,
+                    physical_address,
+                );
+            }
+            (0, 6) => {
+                let line =
+                    self.state
+                        .cache
+                        .primary_hit_line_mut(true, virtual_address, physical_address);
+                if let Some(line) = line.copied() {
+                    return self.start_cache_writeback(
+                        instruction,
+                        line,
+                        Mips4CacheWritebackTarget::PrimaryHit {
+                            instruction_cache: true,
+                            virtual_address,
+                            physical_address,
+                            invalidate: false,
+                        },
+                    );
+                }
+            }
+            (1, 0) => {
+                let line = self.state.cache.primary_index_line(false, virtual_address);
+                if let Some(line) = line {
+                    if line.valid && line.dirty {
+                        return self.start_cache_writeback(
+                            instruction,
+                            line,
+                            Mips4CacheWritebackTarget::PrimaryIndex {
+                                instruction_cache: false,
+                                virtual_address,
+                                invalidate: true,
+                            },
+                        );
+                    }
+                    if let Some(line) = self
+                        .state
+                        .cache
+                        .primary_index_line_mut(false, virtual_address)
+                    {
+                        line.valid = false;
+                        line.dirty = false;
+                    }
+                }
+            }
+            (1, 1) => self.load_primary_tag(false, virtual_address),
+            (1, 2) => self.store_primary_tag(false, virtual_address),
+            (1, 3) => {
+                if let Some(line) =
+                    self.state
+                        .cache
+                        .primary_hit_line_mut(false, virtual_address, physical_address)
+                {
+                    line.dirty = true;
+                } else if let Some((set, way, victim)) =
+                    self.state.cache.choose_data_victim(virtual_address)
+                {
+                    if victim.valid && victim.dirty {
+                        return self.start_cache_writeback(
+                            instruction,
+                            victim,
+                            Mips4CacheWritebackTarget::CreateDirty {
+                                virtual_address,
+                                physical_address,
+                                set,
+                                way,
+                            },
+                        );
+                    }
+                    self.create_dirty_exclusive(
+                        virtual_address,
+                        physical_address,
+                        set,
+                        way,
+                        victim,
+                    );
+                }
+            }
+            (1, 4) => {
+                if let Some(line) =
+                    self.state
+                        .cache
+                        .primary_hit_line_mut(false, virtual_address, physical_address)
+                {
+                    line.valid = false;
+                    line.dirty = false;
+                }
+            }
+            (1, 5) | (1, 6) => {
+                let invalidate = operation == 5;
+                let line = self
+                    .state
+                    .cache
+                    .data_lookup(virtual_address, physical_address);
+                if let Some(line) = line {
+                    if line.dirty {
+                        return self.start_cache_writeback(
+                            instruction,
+                            line,
+                            Mips4CacheWritebackTarget::PrimaryHit {
+                                instruction_cache: false,
+                                virtual_address,
+                                physical_address,
+                                invalidate,
+                            },
+                        );
+                    }
+                    if invalidate
+                        && let Some(line) = self.state.cache.primary_hit_line_mut(
+                            false,
+                            virtual_address,
+                            physical_address,
+                        )
+                    {
+                        line.valid = false;
+                    }
+                }
+            }
+            (3, 0) if self.state.cache.has_secondary() => {
+                self.state.cache.secondary_flash_invalidate();
+            }
+            (3, 1) if self.state.cache.has_secondary() => {
+                self.load_secondary_tag(physical_address);
+            }
+            (3, 2) if self.state.cache.has_secondary() => {
+                self.store_secondary_tag(virtual_address, physical_address);
+            }
+            (3, 5) if self.state.cache.has_secondary() && virtual_address & 0x0fff == 0 => {
+                self.state
+                    .cache
+                    .secondary_page_invalidate(physical_address & !0x0fff);
+            }
+            _ => {}
+        }
+        Ok(self.retire_sequential(instruction))
+    }
+
+    fn execute_prefetch(
+        &mut self,
+        instruction: Mips4Instruction,
+    ) -> Result<
+        ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+        Mips4ExecutionTargetError,
+    > {
+        let hint = Mips4PrefetchHint::from_bits(instruction.rt());
+        if !hint.is_defined() {
+            return Ok(self.retire_sequential(instruction));
+        }
+        let base = self
+            .state
+            .gpr
+            .read(Mips4GprIndex::from_u8(instruction.rs()).unwrap());
+        let virtual_address = base.wrapping_add(instruction.signed_immediate() as i64 as u64);
+        let tlb_entries = self
+            .state
+            .deterministic_tlb_entries(&self.policy, virtual_address);
+        let result = Mips4Prefetch::prepare(
+            virtual_address,
+            hint,
+            self.policy.mmu_config(self.state.cp0.config()),
+            self.state.cp0.status(),
+            Mips4TlbAsid::new(self.state.cp0.entry_hi().address_space_identifier()),
+            tlb_entries,
+        );
+        let Mips4PrefetchResult::Request(prefetch) = result else {
+            return Ok(self.retire_sequential(instruction));
+        };
+        let cache_policy = self.policy.resolve_cache_policy(prefetch.cache_attribute);
+        if !cache_policy.is_cached() {
+            return Ok(self.retire_sequential(instruction));
+        }
+        self.start_memory_access(
+            Mips4CachedClient::Prefetch { instruction },
+            prefetch.virtual_address,
+            cache_policy,
+            Mips4ExecutionTransaction::Read {
+                physical_address: prefetch.physical_address,
+                size: Mips4ExecutionTransferSize::Word,
+                kind: Mips4ExecutionAccessKind::DataLoad,
+                access_type: self.policy.resolve_access_type(prefetch.cache_attribute),
+            },
+        )
+    }
+
+    fn start_instruction_cache_fill(
+        &mut self,
+        instruction: Mips4Instruction,
+        virtual_address: u64,
+        physical_address: u64,
+    ) -> Result<
+        ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+        Mips4ExecutionTargetError,
+    > {
+        let Some((victim_set, victim_way, victim)) =
+            self.state.cache.choose_instruction_victim(virtual_address)
+        else {
+            return Ok(self.retire_sequential(instruction));
+        };
+        let use_secondary =
+            self.state.cp0.config().secondary_cache_enabled() && self.state.cache.has_secondary();
+        let secondary_source = use_secondary
+            .then(|| self.state.cache.secondary_lookup(physical_address))
+            .flatten();
+        self.start_cached_fill(Mips4PendingCachedAccess {
+            client: Mips4CachedClient::CacheRetire { instruction },
+            virtual_address,
+            request: Mips4ExecutionTransaction::Read {
+                physical_address,
+                size: Mips4ExecutionTransferSize::Word,
+                kind: Mips4ExecutionAccessKind::InstructionFetch,
+                access_type: Mips4MemoryAccessType::CachedNoncoherent,
+            },
+            policy: Mips4CacheAccessPolicy::WriteBackWriteAllocate,
+            victim_set,
+            victim_way,
+            victim,
+            secondary_source,
+            use_secondary,
+            stage: Mips4CachedStage::Fill {
+                doubleword: 0,
+                data: [0; MIPS4_FUNCTIONAL_CACHE_LINE_BYTES],
+            },
+        })
+    }
+
+    fn load_primary_tag(&mut self, instruction_cache: bool, virtual_address: u64) {
+        let line = self
+            .state
+            .cache
+            .primary_index_line(instruction_cache, virtual_address)
+            .unwrap_or(Mips4CacheLine::INVALID);
+        let mut tag_lo = (((line.physical_line_base >> 12) & 0x00ff_ffff) as u32) << 8;
+        if line.tag_check_bit {
+            tag_lo |= 1 << 7;
+        }
+        if line.valid {
+            tag_lo |= 3 << 5;
+        }
+        let doubleword = ((virtual_address >> 3) & 3) as usize;
+        let _ = self
+            .state
+            .cp0
+            .write(Mips4Cp0Register::TagLo, u64::from(tag_lo));
+        let _ = self.state.cp0.write(Mips4Cp0Register::TagHi, 0);
+        let _ = self.state.cp0.write(
+            Mips4Cp0Register::Ecc,
+            u64::from(line.check_bits[doubleword]),
+        );
+    }
+
+    fn store_primary_tag(&mut self, instruction_cache: bool, virtual_address: u64) {
+        let tag_lo = self.state.cp0.tag_lo().bits();
+        let ecc = self.state.cp0.ecc().bits() as u8;
+        let check_override = self.state.cp0.status().cache_check_bits();
+        if let Some(line) = self
+            .state
+            .cache
+            .primary_index_line_mut(instruction_cache, virtual_address)
+        {
+            line.physical_line_base = (u64::from((tag_lo >> 8) & 0x00ff_ffff) << 12)
+                | (line_base(virtual_address) & 0x0fe0);
+            line.valid = ((tag_lo >> 5) & 3) == 3;
+            line.dirty = false;
+            line.virtual_index = ((virtual_address >> 12) & 7) as u8;
+            if check_override {
+                line.tag_check_bit = tag_lo & (1 << 7) != 0;
+                line.check_bits[((virtual_address >> 3) & 3) as usize] = ecc;
+            } else {
+                line.recompute_check_bits();
+            }
+        }
+    }
+
+    fn load_secondary_tag(&mut self, physical_address: u64) {
+        let line = self
+            .state
+            .cache
+            .secondary_index_line(physical_address)
+            .unwrap_or(Mips4CacheLine::INVALID);
+        let mut tag_lo = (((line.physical_line_base >> 19) & 0x1ffff) as u32) << 15;
+        if line.valid {
+            tag_lo |= 4 << 12;
+        }
+        let _ = self
+            .state
+            .cp0
+            .write(Mips4Cp0Register::TagLo, u64::from(tag_lo));
+        let _ = self.state.cp0.write(Mips4Cp0Register::TagHi, 0);
+        let _ = self.state.cp0.write(
+            Mips4Cp0Register::Ecc,
+            u64::from(line.check_bits[((physical_address >> 3) & 3) as usize]),
+        );
+    }
+
+    fn store_secondary_tag(&mut self, virtual_address: u64, physical_address: u64) {
+        let tag_lo = self.state.cp0.tag_lo().bits();
+        let ecc = self.state.cp0.ecc().bits() as u8;
+        let check_override = self.state.cp0.status().cache_check_bits();
+        if let Some(line) = self.state.cache.secondary_index_line_mut(physical_address) {
+            line.physical_line_base = (u64::from((tag_lo >> 15) & 0x1ffff) << 19)
+                | (line_base(physical_address) & 0x7_ffe0);
+            line.valid = ((tag_lo >> 12) & 7) == 4;
+            line.dirty = false;
+            line.virtual_index = ((virtual_address >> 12) & 7) as u8;
+            if check_override {
+                line.check_bits[((physical_address >> 3) & 3) as usize] = ecc;
+            } else {
+                line.recompute_check_bits();
+            }
+        }
+    }
+
+    fn create_dirty_exclusive(
+        &mut self,
+        virtual_address: u64,
+        physical_address: u64,
+        set: usize,
+        way: usize,
+        mut line: Mips4CacheLine,
+    ) {
+        line.physical_line_base = line_base(physical_address);
+        line.valid = true;
+        line.dirty = true;
+        line.virtual_index = ((virtual_address >> 12) & 7) as u8;
+        line.recompute_check_bits();
+        self.state.cache.install_data(set, way, line);
+    }
+
+    fn start_cache_writeback(
+        &mut self,
+        instruction: Mips4Instruction,
+        line: Mips4CacheLine,
+        target: Mips4CacheWritebackTarget,
+    ) -> Result<
+        ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+        Mips4ExecutionTargetError,
+    > {
+        let pending = Mips4PendingCacheWriteback {
+            instruction,
+            line,
+            doubleword: 0,
+            target,
+        };
+        let transaction = cache_instruction_writeback_transaction(&pending);
+        self.pending = Some(PendingOperation::CacheWriteback(pending));
+        Ok(ExecutionTargetAction::Transaction(transaction))
     }
 
     fn finish_cp0(
@@ -349,16 +1067,48 @@ where
             Mips4FpuExecution::Read {
                 pending,
                 transaction,
-            } => {
-                self.pending = Some(PendingOperation::FpuDataRead {
-                    instruction,
-                    pending,
-                });
-                ExecutionTargetAction::Transaction(transaction)
-            }
-            Mips4FpuExecution::Write { transaction } => {
-                self.pending = Some(PendingOperation::FpuDataWrite { instruction });
-                ExecutionTargetAction::Transaction(transaction)
+                virtual_address,
+                cache_policy,
+            } => self
+                .start_memory_access(
+                    Mips4CachedClient::FpuDataRead {
+                        instruction,
+                        pending,
+                    },
+                    virtual_address,
+                    cache_policy,
+                    transaction,
+                )
+                .expect("cache access setup cannot fail"),
+            Mips4FpuExecution::Write {
+                transaction,
+                virtual_address,
+                cache_policy,
+            } => self
+                .start_memory_access(
+                    Mips4CachedClient::FpuDataWrite { instruction },
+                    virtual_address,
+                    cache_policy,
+                    transaction,
+                )
+                .expect("cache access setup cannot fail"),
+            Mips4FpuExecution::Prefetch(prefetch) => {
+                let cache_policy = self.policy.resolve_cache_policy(prefetch.cache_attribute);
+                if !cache_policy.is_cached() {
+                    return self.retire_sequential(instruction);
+                }
+                self.start_memory_access(
+                    Mips4CachedClient::Prefetch { instruction },
+                    prefetch.virtual_address,
+                    cache_policy,
+                    Mips4ExecutionTransaction::Read {
+                        physical_address: prefetch.physical_address,
+                        size: Mips4ExecutionTransferSize::Word,
+                        kind: Mips4ExecutionAccessKind::DataLoad,
+                        access_type: self.policy.resolve_access_type(prefetch.cache_attribute),
+                    },
+                )
+                .expect("cache access setup cannot fail")
             }
             Mips4FpuExecution::Exception(exception) => self.exception_boundary(exception, None),
         }
@@ -569,7 +1319,8 @@ where
                     }
                     Mips4FpuExecution::Branch(_)
                     | Mips4FpuExecution::Read { .. }
-                    | Mips4FpuExecution::Write { .. } => {
+                    | Mips4FpuExecution::Write { .. }
+                    | Mips4FpuExecution::Prefetch(_) => {
                         Err(Mips4ExecutionTargetError::UnexpectedCompletion)
                     }
                 }
@@ -601,6 +1352,290 @@ where
             }
         }
     }
+
+    fn complete_cached_access(
+        &mut self,
+        mut pending: Mips4PendingCachedAccess,
+        completion: Mips4ExecutionCompletion,
+    ) -> Result<
+        ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+        Mips4ExecutionTargetError,
+    > {
+        if matches!(completion, Mips4ExecutionCompletion::BusError) {
+            if matches!(pending.client, Mips4CachedClient::Prefetch { .. }) {
+                return self.finish_cached_client(pending.client, completion);
+            }
+            let exception = if matches!(pending.client, Mips4CachedClient::InstructionFetch) {
+                Mips4Exception::InstructionBusError
+            } else {
+                Mips4Exception::DataBusError
+            };
+            return Ok(self.exception_boundary(exception, None));
+        }
+        match pending.stage {
+            Mips4CachedStage::Writeback { doubleword } => {
+                if !matches!(completion, Mips4ExecutionCompletion::WriteComplete) {
+                    return Err(Mips4ExecutionTargetError::UnexpectedCompletion);
+                }
+                if doubleword < 3 {
+                    let next = doubleword + 1;
+                    pending.stage = Mips4CachedStage::Writeback { doubleword: next };
+                    let transaction = cache_writeback_transaction(&pending, next);
+                    self.pending = Some(PendingOperation::Cached(pending));
+                    return Ok(ExecutionTargetAction::Transaction(transaction));
+                }
+                if pending.use_secondary {
+                    self.state.cache.secondary_install(pending.victim);
+                }
+                self.start_cached_fill(pending)
+            }
+            Mips4CachedStage::Fill {
+                doubleword,
+                mut data,
+            } => {
+                let Mips4ExecutionCompletion::ReadData(lanes) = completion else {
+                    return Err(Mips4ExecutionTargetError::UnexpectedCompletion);
+                };
+                let offset = usize::from(doubleword) * 8;
+                data[offset..offset + 8].copy_from_slice(&lanes.to_le_bytes());
+                if doubleword < 3 {
+                    let next = doubleword + 1;
+                    pending.stage = Mips4CachedStage::Fill {
+                        doubleword: next,
+                        data,
+                    };
+                    let transaction = cache_fill_transaction(&pending, next);
+                    self.pending = Some(PendingOperation::Cached(pending));
+                    return Ok(ExecutionTargetAction::Transaction(transaction));
+                }
+                let (physical_address, _, _) = transaction_shape(pending.request);
+                let line = Mips4CacheLine::from_data(
+                    line_base(physical_address),
+                    pending.virtual_address,
+                    data,
+                );
+                if pending.use_secondary {
+                    self.state.cache.secondary_install(line);
+                }
+                self.install_primary_line(&pending, line);
+                self.complete_cached_line(pending, line)
+            }
+            Mips4CachedStage::WriteThrough => {
+                if !matches!(completion, Mips4ExecutionCompletion::WriteComplete) {
+                    return Err(Mips4ExecutionTargetError::UnexpectedCompletion);
+                }
+                write_request_to_data_cache(
+                    &mut self.state,
+                    pending.virtual_address,
+                    pending.request,
+                    false,
+                );
+                self.finish_cached_client(pending.client, completion)
+            }
+        }
+    }
+
+    fn complete_cache_writeback(
+        &mut self,
+        mut pending: Mips4PendingCacheWriteback,
+        completion: Mips4ExecutionCompletion,
+    ) -> Result<
+        ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+        Mips4ExecutionTargetError,
+    > {
+        match completion {
+            Mips4ExecutionCompletion::BusError => {
+                return Ok(self.exception_boundary(Mips4Exception::DataBusError, None));
+            }
+            Mips4ExecutionCompletion::ReadData(_) => {
+                return Err(Mips4ExecutionTargetError::UnexpectedCompletion);
+            }
+            Mips4ExecutionCompletion::WriteComplete => {}
+        }
+        if pending.doubleword < 3 {
+            pending.doubleword += 1;
+            let transaction = cache_instruction_writeback_transaction(&pending);
+            self.pending = Some(PendingOperation::CacheWriteback(pending));
+            return Ok(ExecutionTargetAction::Transaction(transaction));
+        }
+        if self.state.cache.has_secondary() {
+            self.state.cache.secondary_install(pending.line);
+        }
+        match pending.target {
+            Mips4CacheWritebackTarget::PrimaryIndex {
+                instruction_cache,
+                virtual_address,
+                invalidate,
+            } => {
+                if let Some(line) = self
+                    .state
+                    .cache
+                    .primary_index_line_mut(instruction_cache, virtual_address)
+                {
+                    line.dirty = false;
+                    if invalidate {
+                        line.valid = false;
+                    }
+                }
+            }
+            Mips4CacheWritebackTarget::PrimaryHit {
+                instruction_cache,
+                virtual_address,
+                physical_address,
+                invalidate,
+            } => {
+                if let Some(line) = self.state.cache.primary_hit_line_mut(
+                    instruction_cache,
+                    virtual_address,
+                    physical_address,
+                ) {
+                    line.dirty = false;
+                    if invalidate {
+                        line.valid = false;
+                    }
+                }
+            }
+            Mips4CacheWritebackTarget::CreateDirty {
+                virtual_address,
+                physical_address,
+                set,
+                way,
+            } => self.create_dirty_exclusive(
+                virtual_address,
+                physical_address,
+                set,
+                way,
+                pending.line,
+            ),
+        }
+        Ok(self.retire_sequential(pending.instruction))
+    }
+}
+
+fn direct_pending(client: Mips4CachedClient) -> PendingOperation {
+    match client {
+        Mips4CachedClient::InstructionFetch => PendingOperation::InstructionFetch,
+        Mips4CachedClient::DataRead {
+            instruction,
+            pending,
+        } => PendingOperation::DataRead {
+            instruction,
+            pending,
+        },
+        Mips4CachedClient::DataWrite {
+            instruction,
+            pending,
+        } => PendingOperation::DataWrite {
+            instruction,
+            pending,
+        },
+        Mips4CachedClient::FpuDataRead {
+            instruction,
+            pending,
+        } => PendingOperation::FpuDataRead {
+            instruction,
+            pending,
+        },
+        Mips4CachedClient::FpuDataWrite { instruction } => {
+            PendingOperation::FpuDataWrite { instruction }
+        }
+        Mips4CachedClient::CacheRetire { instruction } => {
+            PendingOperation::CacheRetire { instruction }
+        }
+        Mips4CachedClient::Prefetch { instruction } => {
+            PendingOperation::CacheRetire { instruction }
+        }
+    }
+}
+
+fn transaction_shape(transaction: Mips4ExecutionTransaction) -> (u64, usize, bool) {
+    match transaction {
+        Mips4ExecutionTransaction::Read {
+            physical_address,
+            size,
+            ..
+        } => (physical_address, usize::from(size.bytes()), false),
+        Mips4ExecutionTransaction::Write {
+            physical_address,
+            size,
+            ..
+        } => (physical_address, usize::from(size.bytes()), true),
+    }
+}
+
+fn cache_fill_transaction(
+    pending: &Mips4PendingCachedAccess,
+    doubleword: u8,
+) -> Mips4ExecutionTransaction {
+    let (physical_address, _, _) = transaction_shape(pending.request);
+    let kind = if matches!(
+        pending.client,
+        Mips4CachedClient::InstructionFetch | Mips4CachedClient::CacheRetire { .. }
+    ) {
+        Mips4ExecutionAccessKind::InstructionFetch
+    } else {
+        Mips4ExecutionAccessKind::DataLoad
+    };
+    Mips4ExecutionTransaction::Read {
+        physical_address: line_base(physical_address) + u64::from(doubleword) * 8,
+        size: Mips4ExecutionTransferSize::Doubleword,
+        kind,
+        access_type: Mips4MemoryAccessType::CachedNoncoherent,
+    }
+}
+
+fn cache_writeback_transaction(
+    pending: &Mips4PendingCachedAccess,
+    doubleword: u8,
+) -> Mips4ExecutionTransaction {
+    let offset = usize::from(doubleword) * 8;
+    let data = u64::from_le_bytes(pending.victim.data[offset..offset + 8].try_into().unwrap());
+    Mips4ExecutionTransaction::Write {
+        physical_address: pending.victim.physical_line_base + u64::from(doubleword) * 8,
+        size: Mips4ExecutionTransferSize::Doubleword,
+        data,
+        byte_enable: 0xff,
+        access_type: Mips4MemoryAccessType::CachedNoncoherent,
+    }
+}
+
+fn cache_instruction_writeback_transaction(
+    pending: &Mips4PendingCacheWriteback,
+) -> Mips4ExecutionTransaction {
+    let offset = usize::from(pending.doubleword) * 8;
+    Mips4ExecutionTransaction::Write {
+        physical_address: pending.line.physical_line_base + u64::from(pending.doubleword) * 8,
+        size: Mips4ExecutionTransferSize::Doubleword,
+        data: u64::from_le_bytes(pending.line.data[offset..offset + 8].try_into().unwrap()),
+        byte_enable: 0xff,
+        access_type: Mips4MemoryAccessType::CachedNoncoherent,
+    }
+}
+
+fn write_request_to_data_cache(
+    state: &mut Mips4ExecutionState,
+    virtual_address: u64,
+    request: Mips4ExecutionTransaction,
+    dirty: bool,
+) {
+    let Mips4ExecutionTransaction::Write {
+        physical_address,
+        size,
+        data,
+        byte_enable,
+        ..
+    } = request
+    else {
+        unreachable!();
+    };
+    let _ = state.cache.data_write(
+        virtual_address,
+        physical_address,
+        usize::from(size.bytes()),
+        data,
+        byte_enable,
+        dirty,
+    );
 }
 
 impl<P, F> ExecutionTarget for Mips4ExecutionTarget<P, F>
@@ -615,7 +1650,8 @@ where
     type Error = Mips4ExecutionTargetError;
 
     fn reset(&mut self) {
-        self.state = Mips4ExecutionState::new(&self.policy);
+        self.state = Mips4ExecutionState::new(&self.policy)
+            .expect("a previously validated cache configuration must remain valid");
         self.pending = None;
     }
 
@@ -665,6 +1701,20 @@ where
             }) => self.complete_fpu_data_read(instruction, pending, completion),
             Some(PendingOperation::FpuDataWrite { instruction }) => {
                 self.complete_fpu_data_write(instruction, completion)
+            }
+            Some(PendingOperation::CacheRetire { instruction }) => match completion {
+                Mips4ExecutionCompletion::ReadData(_) | Mips4ExecutionCompletion::WriteComplete => {
+                    Ok(self.retire_sequential(instruction))
+                }
+                Mips4ExecutionCompletion::BusError => {
+                    Ok(self.exception_boundary(Mips4Exception::DataBusError, None))
+                }
+            },
+            Some(PendingOperation::Cached(pending)) => {
+                self.complete_cached_access(pending, completion)
+            }
+            Some(PendingOperation::CacheWriteback(pending)) => {
+                self.complete_cache_writeback(pending, completion)
             }
             None => Err(Mips4ExecutionTargetError::MissingPendingOperation),
         }

@@ -1,6 +1,7 @@
 //! Processor-specific policy required by functional MIPS IV execution.
 
 use crate::cpu::mips4::cache::Mips4MemoryAccessType;
+use crate::cpu::mips4::cache::hierarchy::{Mips4CacheAccessPolicy, Mips4CacheHierarchyConfig};
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::cp0::{Mips4Cp0Config, Mips4Cp0Register, Mips4Cp0Status};
 use crate::cpu::mips4::exception::Mips4ExceptionImage;
@@ -39,6 +40,15 @@ pub trait Mips4ExecutionPolicy {
     /// Resolves an architecture cache attribute to a processor access type.
     fn resolve_access_type(&self, cache_attribute: Mips4MmuCacheAttribute)
     -> Mips4MemoryAccessType;
+
+    /// Returns the processor's functional cache geometry.
+    fn cache_config(&self) -> Mips4CacheHierarchyConfig;
+
+    /// Resolves an architecture cache attribute to functional cache behavior.
+    fn resolve_cache_policy(
+        &self,
+        cache_attribute: Mips4MmuCacheAttribute,
+    ) -> Mips4CacheAccessPolicy;
 
     /// Selects the exception vector after CP0 state has been captured.
     fn exception_vector(

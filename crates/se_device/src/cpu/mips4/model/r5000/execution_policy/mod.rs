@@ -1,6 +1,10 @@
 //! R5000 functional execution policy.
 
+use crate::cpu::mips4::cache::hierarchy::{
+    Mips4CacheAccessPolicy, Mips4CacheConfigError, Mips4CacheGeometry, Mips4CacheHierarchyConfig,
+};
 use crate::cpu::mips4::cache::{Mips4CacheCoherenceAlgorithm, Mips4MemoryAccessType};
+use crate::cpu::mips4::config::Mips4CacheConfig;
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::cp0::{Mips4Cp0Config, Mips4Cp0Register, Mips4Cp0Status};
 use crate::cpu::mips4::exception::Mips4ExceptionImage;
@@ -51,6 +55,36 @@ impl R5000ExecutionPolicy {
     /// Returns the sampled boot mode.
     pub const fn boot_mode(self) -> R5000BootMode {
         self.boot_mode
+    }
+
+    /// Validates processor-specific cache geometry and sampled boot settings.
+    pub fn validate_cache_config(self) -> Result<(), Mips4CacheConfigError> {
+        for cache in [self.profile.instruction_cache, self.profile.data_cache] {
+            if cache != Mips4CacheConfig::present(32 * 1024, 32) {
+                return Err(Mips4CacheConfigError::InvalidR5000PrimaryGeometry);
+            }
+        }
+        match self.profile.secondary_cache {
+            Mips4CacheConfig::Disabled => {
+                if self.boot_mode.secondary_cache_enabled() {
+                    return Err(Mips4CacheConfigError::R5000SecondaryBootConflict);
+                }
+            }
+            Mips4CacheConfig::Present {
+                size_bytes,
+                line_size_bytes,
+            } => {
+                if line_size_bytes != 32 || !matches!(size_bytes, 524_288 | 1_048_576 | 2_097_152) {
+                    return Err(Mips4CacheConfigError::InvalidR5000SecondaryGeometry);
+                }
+                if !self.boot_mode.secondary_cache_enabled()
+                    || size_bytes != self.boot_mode.secondary_cache_size().size_bytes()
+                {
+                    return Err(Mips4CacheConfigError::R5000SecondaryBootConflict);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -109,6 +143,36 @@ impl Mips4ExecutionPolicy for R5000ExecutionPolicy {
         }
     }
 
+    fn cache_config(&self) -> Mips4CacheHierarchyConfig {
+        let secondary = match self.profile.secondary_cache {
+            Mips4CacheConfig::Disabled => None,
+            Mips4CacheConfig::Present {
+                size_bytes,
+                line_size_bytes,
+            } => Some(Mips4CacheGeometry::new(size_bytes, line_size_bytes, 1)),
+        };
+        Mips4CacheHierarchyConfig::new(
+            Some(Mips4CacheGeometry::new(32 * 1024, 32, 2)),
+            Some(Mips4CacheGeometry::new(32 * 1024, 32, 2)),
+            secondary,
+        )
+    }
+
+    fn resolve_cache_policy(
+        &self,
+        cache_attribute: Mips4MmuCacheAttribute,
+    ) -> Mips4CacheAccessPolicy {
+        let Some(algorithm) = cache_attribute.cache_coherence_algorithm() else {
+            return Mips4CacheAccessPolicy::Uncached;
+        };
+        match algorithm.bits() {
+            0 => Mips4CacheAccessPolicy::WriteThroughNoWriteAllocate,
+            1 => Mips4CacheAccessPolicy::WriteThroughWriteAllocate,
+            3 => Mips4CacheAccessPolicy::WriteBackWriteAllocate,
+            _ => Mips4CacheAccessPolicy::Uncached,
+        }
+    }
+
     fn exception_vector(
         &self,
         status_before_exception: Mips4Cp0Status,
@@ -146,6 +210,9 @@ const fn reset_config(profile: R5000Profile, boot_mode: R5000BootMode) -> u32 {
         | CONFIG_IB
         | CONFIG_DB
         | 2;
+    if boot_mode.secondary_cache_enabled() {
+        bits |= 1 << 12;
+    }
     if !profile.secondary_cache.is_present() {
         bits |= CONFIG_SC;
     }

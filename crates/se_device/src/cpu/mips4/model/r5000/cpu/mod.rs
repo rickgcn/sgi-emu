@@ -11,6 +11,7 @@ use crate::cpu::execution::functional::FunctionalExecutor;
 use crate::cpu::execution::protocol::{
     ExecutionAction, ExecutionCompletion, FunctionalExecutorError,
 };
+use crate::cpu::mips4::cache::hierarchy::Mips4CacheConfigError;
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use crate::cpu::mips4::execution::state::Mips4ExecutionState;
 use crate::cpu::mips4::execution::target::{
@@ -34,6 +35,9 @@ pub enum R5000CpuSignal {
 /// Terminal functional R5000 execution error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum R5000CpuError {
+    /// The requested cache hierarchy is not a valid R5000 configuration.
+    CacheConfiguration(Mips4CacheConfigError),
+
     /// The generic executor or MIPS IV target rejected an operation.
     Execution(FunctionalExecutorError<Mips4ExecutionTargetError>),
 }
@@ -41,6 +45,9 @@ pub enum R5000CpuError {
 impl fmt::Display for R5000CpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CacheConfiguration(error) => {
+                write!(f, "invalid R5000 cache configuration: {error}")
+            }
             Self::Execution(error) => write!(f, "R5000 execution failed: {error}"),
         }
     }
@@ -69,7 +76,7 @@ impl R5000Cpu<SoftFloat3Backend> {
         name: impl Into<String>,
         profile: R5000Profile,
         boot_mode: R5000BootMode,
-    ) -> Self {
+    ) -> Result<Self, R5000CpuError> {
         Self::with_float_backend(id, name, profile, boot_mode, SoftFloat3Backend::new())
     }
 }
@@ -85,17 +92,22 @@ where
         profile: R5000Profile,
         boot_mode: R5000BootMode,
         float_backend: F,
-    ) -> Self {
+    ) -> Result<Self, R5000CpuError> {
         let policy = R5000ExecutionPolicy::new(profile, boot_mode);
-        Self {
+        policy
+            .validate_cache_config()
+            .map_err(R5000CpuError::CacheConfiguration)?;
+        let target = Mips4ExecutionTarget::new(policy, float_backend)
+            .map_err(R5000CpuError::CacheConfiguration)?;
+        Ok(Self {
             id,
             name: name.into(),
             profile,
             boot_mode,
-            executor: FunctionalExecutor::new(Mips4ExecutionTarget::new(policy, float_backend)),
+            executor: FunctionalExecutor::new(target),
             half_pclock_remainder: 0,
             terminal_error: None,
-        }
+        })
     }
 
     /// Returns the configured processor profile.

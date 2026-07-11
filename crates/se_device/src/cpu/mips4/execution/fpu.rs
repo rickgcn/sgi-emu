@@ -8,6 +8,7 @@ use se_float::value::{
 };
 
 use crate::cpu::mips4::branch::{Mips4Branch, Mips4BranchDecision};
+use crate::cpu::mips4::cache::hierarchy::Mips4CacheAccessPolicy;
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::cp1::decode::{
     Mips4Cp1BranchOperation, Mips4Cp1CompareCondition, Mips4Cp1Decode,
@@ -15,7 +16,9 @@ use crate::cpu::mips4::cp1::decode::{
     Mips4Cp1OffsetMemoryOperation, Mips4Cp1OperandFormatStatus, Mips4Cp1Operation,
     Mips4Cp1RegisterTransferOperation, decode_instruction,
 };
-use crate::cpu::mips4::cp1::operation::{Mips4Cp1IndexedMemoryAccess, Mips4Cp1OffsetMemoryAccess};
+use crate::cpu::mips4::cp1::operation::{
+    Mips4Cp1IndexedMemoryAccess, Mips4Cp1IndexedPrefetch, Mips4Cp1OffsetMemoryAccess,
+};
 use crate::cpu::mips4::cp1::{
     Mips4Cp1ConditionCode, Mips4Cp1ControlRegister, Mips4Cp1ConversionRoundingMode,
     Mips4Cp1FgrIndex, Mips4Cp1Format, Mips4Cp1Instruction, Mips4Cp1MoveDecision,
@@ -24,7 +27,9 @@ use crate::cpu::mips4::cp1::{
 use crate::cpu::mips4::exception::{Mips4CoprocessorNumber, Mips4Exception};
 use crate::cpu::mips4::gpr::{Mips4GprIndex, sign_extend_word};
 use crate::cpu::mips4::instruction::Mips4Instruction;
-use crate::cpu::mips4::memory::operation::Mips4MemoryAccessError;
+use crate::cpu::mips4::memory::operation::{
+    Mips4MemoryAccessError, Mips4Prefetch, Mips4PrefetchHint, Mips4PrefetchResult,
+};
 use crate::cpu::mips4::mmu::Mips4MmuCacheAttribute;
 use crate::cpu::mips4::tlb::Mips4TlbAsid;
 
@@ -39,10 +44,15 @@ pub(super) enum Mips4FpuExecution {
     Read {
         pending: Mips4PendingFpuRead,
         transaction: Mips4ExecutionTransaction,
+        virtual_address: u64,
+        cache_policy: Mips4CacheAccessPolicy,
     },
     Write {
         transaction: Mips4ExecutionTransaction,
+        virtual_address: u64,
+        cache_policy: Mips4CacheAccessPolicy,
     },
+    Prefetch(Mips4Prefetch),
     Exception(Mips4Exception),
 }
 
@@ -93,7 +103,29 @@ pub(super) fn execute_fpu<F: FloatBackend>(
         Mips4Cp1InstructionClass::IndexedMemory(operation) => {
             prepare_indexed_memory(state, policy, raw, operation, endianness)
         }
-        Mips4Cp1InstructionClass::IndexedPrefetch => Ok(Mips4FpuExecution::Retire),
+        Mips4Cp1InstructionClass::IndexedPrefetch => {
+            let instruction = Mips4Cp1Instruction::from_instruction(raw).unwrap();
+            let hint = Mips4PrefetchHint::from_bits(instruction.prefetch_hint());
+            if !hint.is_defined() {
+                return Ok(Mips4FpuExecution::Retire);
+            }
+            let base = read_gpr(state, instruction.base());
+            let index = read_gpr(state, instruction.index());
+            let virtual_address = base.wrapping_add(index);
+            let tlb_entries = state.deterministic_tlb_entries(policy, virtual_address);
+            match Mips4Cp1IndexedPrefetch::prepare(
+                base,
+                index,
+                hint,
+                policy.mmu_config(state.cp0.config()),
+                state.cp0.status(),
+                Mips4TlbAsid::new(state.cp0.entry_hi().address_space_identifier()),
+                tlb_entries,
+            ) {
+                Mips4PrefetchResult::Request(prefetch) => Ok(Mips4FpuExecution::Prefetch(prefetch)),
+                Mips4PrefetchResult::NoOperation => Ok(Mips4FpuExecution::Retire),
+            }
+        }
     }
 }
 
@@ -606,6 +638,7 @@ fn prepare_offset_memory(
         policy,
         operation_is_load_offset(operation),
         target,
+        virtual_address,
         access.access.physical_address(),
         access.access.cache_attribute(),
         operation_is_double_offset(operation),
@@ -645,6 +678,7 @@ fn prepare_indexed_memory(
         policy,
         operation_is_load_indexed(operation),
         target,
+        virtual_address,
         access.access.physical_address(),
         access.access.cache_attribute(),
         operation_is_double_indexed(operation),
@@ -658,6 +692,7 @@ fn prepare_resolved_memory(
     policy: &impl Mips4ExecutionPolicy,
     load: bool,
     target: Mips4Cp1FgrIndex,
+    virtual_address: u64,
     physical_address: u64,
     cache_attribute: Mips4MmuCacheAttribute,
     doubleword: bool,
@@ -669,6 +704,7 @@ fn prepare_resolved_memory(
         Mips4ExecutionTransferSize::Word
     };
     let access_type = policy.resolve_access_type(cache_attribute);
+    let cache_policy = policy.resolve_cache_policy(cache_attribute);
     if load {
         let mode = register_mode(state);
         if doubleword && !doubleword_register_valid(mode, target) {
@@ -686,6 +722,8 @@ fn prepare_resolved_memory(
                 kind: Mips4ExecutionAccessKind::DataLoad,
                 access_type,
             },
+            virtual_address,
+            cache_policy,
         };
     }
     let mode = register_mode(state);
@@ -705,6 +743,8 @@ fn prepare_resolved_memory(
             byte_enable: if doubleword { 0xff } else { 0x0f },
             access_type,
         },
+        virtual_address,
+        cache_policy,
     }
 }
 

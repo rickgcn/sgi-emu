@@ -106,4 +106,60 @@ fn r5000_cca_mapping_has_no_coherent_cache_mode() {
         policy.resolve_access_type(attribute(7)),
         Mips4MemoryAccessType::Uncached
     );
+    assert_eq!(
+        policy.resolve_cache_policy(attribute(0)),
+        Mips4CacheAccessPolicy::WriteThroughNoWriteAllocate
+    );
+    assert_eq!(
+        policy.resolve_cache_policy(attribute(1)),
+        Mips4CacheAccessPolicy::WriteThroughWriteAllocate
+    );
+    assert_eq!(
+        policy.resolve_cache_policy(attribute(2)),
+        Mips4CacheAccessPolicy::Uncached
+    );
+    assert_eq!(
+        policy.resolve_cache_policy(attribute(3)),
+        Mips4CacheAccessPolicy::WriteBackWriteAllocate
+    );
+}
+
+#[test]
+fn cache_validation_rejects_primary_and_secondary_configuration_conflicts() {
+    let invalid_primary = R5000Profile::new(
+        Mips4Endianness::Big,
+        R5000Revision::from_bits(0x21),
+        200_000_000,
+        Mips4CacheConfig::present(16 * 1024, 32),
+        Mips4CacheConfig::present(32 * 1024, 32),
+        Mips4CacheConfig::disabled(),
+    );
+    assert_eq!(
+        R5000ExecutionPolicy::new(invalid_primary, boot_mode()).validate_cache_config(),
+        Err(Mips4CacheConfigError::InvalidR5000PrimaryGeometry)
+    );
+
+    let enabled_boot = R5000BootMode::from_low_bits(1 << 12).unwrap();
+    assert_eq!(
+        R5000ExecutionPolicy::new(
+            profile(Mips4Endianness::Big, Mips4CacheConfig::disabled()),
+            enabled_boot,
+        )
+        .validate_cache_config(),
+        Err(Mips4CacheConfigError::R5000SecondaryBootConflict)
+    );
+    for (size_bits, size_bytes) in [(0, 512 * 1024), (1, 1024 * 1024), (2, 2048 * 1024)] {
+        let boot = R5000BootMode::from_low_bits((1 << 12) | (size_bits << 16)).unwrap();
+        assert_eq!(
+            R5000ExecutionPolicy::new(
+                profile(
+                    Mips4Endianness::Big,
+                    Mips4CacheConfig::present(size_bytes, 32),
+                ),
+                boot,
+            )
+            .validate_cache_config(),
+            Ok(())
+        );
+    }
 }

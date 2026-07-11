@@ -2,6 +2,9 @@ use se_float::backend::native::NativeFloatBackend;
 
 use crate::cpu::execution::functional::FunctionalExecutor;
 use crate::cpu::execution::protocol::{ExecutionAction, ExecutionCompletion};
+use crate::cpu::mips4::cache::hierarchy::{
+    Mips4CacheAccessPolicy, Mips4CacheGeometry, Mips4CacheHierarchyConfig,
+};
 use crate::cpu::mips4::cache::{Mips4CacheCoherenceAlgorithm, Mips4MemoryAccessType};
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::cp0::{Mips4Cp0Config, Mips4Cp0Register};
@@ -21,6 +24,8 @@ const RESET_PC: u64 = 0xffff_ffff_8000_0000;
 const EXCEPTION_VECTOR: u64 = 0xffff_ffff_8000_0180;
 
 struct TestPolicy;
+
+struct CachedTestPolicy;
 
 impl Mips4ExecutionPolicy for TestPolicy {
     fn reset_pc(&self) -> u64 {
@@ -70,6 +75,91 @@ impl Mips4ExecutionPolicy for TestPolicy {
         }
     }
 
+    fn cache_config(&self) -> Mips4CacheHierarchyConfig {
+        Mips4CacheHierarchyConfig::disabled()
+    }
+
+    fn resolve_cache_policy(
+        &self,
+        _cache_attribute: Mips4MmuCacheAttribute,
+    ) -> Mips4CacheAccessPolicy {
+        Mips4CacheAccessPolicy::Uncached
+    }
+
+    fn exception_vector(
+        &self,
+        _status_before_exception: crate::cpu::mips4::cp0::Mips4Cp0Status,
+        _image: Mips4ExceptionImage,
+        _refill_address_mode: Option<Mips4TlbAddressMode>,
+    ) -> u64 {
+        EXCEPTION_VECTOR
+    }
+}
+
+impl Mips4ExecutionPolicy for CachedTestPolicy {
+    fn reset_pc(&self) -> u64 {
+        RESET_PC
+    }
+
+    fn endianness(&self) -> Mips4Endianness {
+        Mips4Endianness::Big
+    }
+
+    fn processor_id(&self) -> u32 {
+        0x2300
+    }
+
+    fn cp0_config(&self) -> u32 {
+        3
+    }
+
+    fn fcr0(&self) -> u32 {
+        0x2300
+    }
+
+    fn tlb_entry_count(&self) -> usize {
+        48
+    }
+
+    fn tlb_random_upper_bound(&self) -> u8 {
+        47
+    }
+
+    fn mmu_config(&self, _config: Mips4Cp0Config) -> Mips4MmuConfig {
+        Mips4MmuConfig::new(Mips4CacheCoherenceAlgorithm::from_bits(3).unwrap())
+    }
+
+    fn cp0_write_value(&self, _register: Mips4Cp0Register, _current: u64, requested: u64) -> u64 {
+        requested
+    }
+
+    fn resolve_access_type(
+        &self,
+        cache_attribute: Mips4MmuCacheAttribute,
+    ) -> Mips4MemoryAccessType {
+        if cache_attribute.is_uncached() {
+            Mips4MemoryAccessType::Uncached
+        } else {
+            Mips4MemoryAccessType::CachedNoncoherent
+        }
+    }
+
+    fn cache_config(&self) -> Mips4CacheHierarchyConfig {
+        let primary = Mips4CacheGeometry::new(32 * 1024, 32, 2);
+        Mips4CacheHierarchyConfig::new(Some(primary), Some(primary), None)
+    }
+
+    fn resolve_cache_policy(
+        &self,
+        cache_attribute: Mips4MmuCacheAttribute,
+    ) -> Mips4CacheAccessPolicy {
+        if cache_attribute.is_uncached() {
+            Mips4CacheAccessPolicy::Uncached
+        } else {
+            Mips4CacheAccessPolicy::WriteBackWriteAllocate
+        }
+    }
+
     fn exception_vector(
         &self,
         _status_before_exception: crate::cpu::mips4::cp0::Mips4Cp0Status,
@@ -81,15 +171,88 @@ impl Mips4ExecutionPolicy for TestPolicy {
 }
 
 fn executor() -> FunctionalExecutor<Mips4ExecutionTarget<TestPolicy, NativeFloatBackend>> {
-    FunctionalExecutor::new(Mips4ExecutionTarget::new(
-        TestPolicy,
-        NativeFloatBackend::new(),
-    ))
+    FunctionalExecutor::new(
+        Mips4ExecutionTarget::new(TestPolicy, NativeFloatBackend::new()).unwrap(),
+    )
 }
 
 fn big_endian_word(bits: u32) -> u64 {
     let bytes = bits.to_be_bytes();
     u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], 0, 0, 0, 0])
+}
+
+#[test]
+fn instruction_cache_fills_four_doublewords_then_hits_without_a_bus_transaction() {
+    let target = Mips4ExecutionTarget::new(CachedTestPolicy, NativeFloatBackend::new()).unwrap();
+    let mut executor = FunctionalExecutor::new(target);
+    for doubleword in 0..4_u64 {
+        let ExecutionAction::Transaction(transaction) = executor.poll().unwrap() else {
+            panic!("expected cache-line fill transaction");
+        };
+        assert_eq!(
+            transaction.payload,
+            Mips4ExecutionTransaction::Read {
+                physical_address: doubleword * 8,
+                size: Mips4ExecutionTransferSize::Doubleword,
+                kind: Mips4ExecutionAccessKind::InstructionFetch,
+                access_type: Mips4MemoryAccessType::CachedNoncoherent,
+            }
+        );
+        executor
+            .complete(ExecutionCompletion {
+                id: transaction.id,
+                payload: Mips4ExecutionCompletion::ReadData(0),
+            })
+            .unwrap();
+    }
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::Retired { .. })
+    ));
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::Retired { .. })
+    ));
+}
+
+#[test]
+fn failed_instruction_fill_does_not_install_a_partial_cache_line() {
+    let target = Mips4ExecutionTarget::new(CachedTestPolicy, NativeFloatBackend::new()).unwrap();
+    let mut executor = FunctionalExecutor::new(target);
+    for doubleword in 0..3 {
+        let ExecutionAction::Transaction(transaction) = executor.poll().unwrap() else {
+            panic!("expected cache-line fill transaction");
+        };
+        let completion = if doubleword == 2 {
+            Mips4ExecutionCompletion::BusError
+        } else {
+            Mips4ExecutionCompletion::ReadData(u64::MAX)
+        };
+        executor
+            .complete(ExecutionCompletion {
+                id: transaction.id,
+                payload: completion,
+            })
+            .unwrap();
+    }
+    assert!(matches!(
+        executor.poll().unwrap(),
+        ExecutionAction::Boundary(Mips4ExecutionBoundary::Exception {
+            image: Mips4ExceptionImage {
+                reason: crate::cpu::mips4::exception::Mips4Exception::InstructionBusError,
+                ..
+            },
+            ..
+        })
+    ));
+    assert!(
+        executor
+            .target()
+            .state()
+            .cache
+            .instruction_lookup(RESET_PC, 0)
+            .is_none()
+    );
 }
 
 fn complete_instruction(

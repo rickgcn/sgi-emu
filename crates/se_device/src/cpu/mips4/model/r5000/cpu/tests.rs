@@ -29,6 +29,7 @@ fn cpu() -> R5000Cpu<NativeFloatBackend> {
         R5000BootMode::from_low_bits(0).unwrap(),
         NativeFloatBackend::new(),
     )
+    .unwrap()
 }
 
 fn big_endian_word(bits: u32) -> u64 {

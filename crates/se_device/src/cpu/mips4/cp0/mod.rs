@@ -789,6 +789,11 @@ impl Mips4Cp0Config {
     pub const fn bits(self) -> u32 {
         self.0
     }
+
+    /// Returns whether ordinary references may use the secondary cache.
+    pub const fn secondary_cache_enabled(self) -> bool {
+        self.0 & (1 << 12) != 0
+    }
 }
 
 /// CP0 `LLAddr` register.

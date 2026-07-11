@@ -54,23 +54,7 @@ pub(super) fn execute_cp0(
     }
 }
 
-pub(super) fn execute_cache(
-    state: &mut Mips4ExecutionState,
-    instruction: Mips4Instruction,
-) -> Mips4Cp0Execution {
-    if let Err(exception) = check_cp0_access(state.cp0.status()) {
-        return Mips4Cp0Execution::Exception(exception);
-    }
-
-    let operation = instruction.rt() >> 2;
-    if operation == 1 {
-        let _ = state.cp0.write(Mips4Cp0Register::TagLo, 0);
-        let _ = state.cp0.write(Mips4Cp0Register::TagHi, 0);
-    }
-    Mips4Cp0Execution::Retire
-}
-
-fn check_cp0_access(status: Mips4Cp0Status) -> Result<(), Mips4Exception> {
+pub(super) fn check_cp0_access(status: Mips4Cp0Status) -> Result<(), Mips4Exception> {
     let kernel = matches!(
         Mips4MmuPrivilegeMode::from_status(status),
         Some(Mips4MmuPrivilegeMode::Kernel)

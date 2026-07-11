@@ -1,5 +1,6 @@
 //! Integer load and store execution.
 
+use crate::cpu::mips4::cache::hierarchy::Mips4CacheAccessPolicy;
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::gpr::{Mips4GprIndex, sign_extend_word};
 use crate::cpu::mips4::instruction::Mips4Instruction;
@@ -7,6 +8,7 @@ use crate::cpu::mips4::instruction::decode::Mips4CpuInstruction;
 use crate::cpu::mips4::memory::ll_sc::Mips4LlBit;
 use crate::cpu::mips4::memory::operation::{Mips4MemoryAccess, Mips4MemoryAccessError};
 use crate::cpu::mips4::memory::{Mips4Memory, Mips4MemoryAccessKind, Mips4MemoryAccessSize};
+use crate::cpu::mips4::mmu::Mips4MmuCacheAttribute;
 use crate::cpu::mips4::tlb::Mips4TlbAsid;
 
 use super::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransaction, Mips4ExecutionTransferSize};
@@ -17,10 +19,14 @@ pub(super) enum Mips4MemoryPlan {
     Read {
         pending: Mips4PendingRead,
         transaction: Mips4ExecutionTransaction,
+        virtual_address: u64,
+        cache_policy: Mips4CacheAccessPolicy,
     },
     Write {
         pending: Mips4PendingWrite,
         transaction: Mips4ExecutionTransaction,
+        virtual_address: u64,
+        cache_policy: Mips4CacheAccessPolicy,
     },
     Retire {
         register_write: Option<(u8, u64)>,
@@ -38,6 +44,38 @@ pub(super) struct Mips4PendingRead {
 
 pub(super) struct Mips4PendingWrite {
     conditional_target: Option<u8>,
+}
+
+pub(super) struct Mips4ResolvedCacheAddress {
+    pub(super) virtual_address: u64,
+    pub(super) physical_address: u64,
+    pub(super) cache_attribute: Mips4MmuCacheAttribute,
+}
+
+pub(super) fn prepare_cache_address(
+    state: &Mips4ExecutionState,
+    policy: &impl Mips4ExecutionPolicy,
+    raw: Mips4Instruction,
+) -> Result<Mips4ResolvedCacheAddress, Mips4MemoryAccessError> {
+    let virtual_address = read(state, raw.rs()).wrapping_add(raw.signed_immediate() as i64 as u64);
+    let tlb_entries = state.deterministic_tlb_entries(policy, virtual_address);
+    let access = Mips4MemoryAccess::prepare(
+        virtual_address,
+        Mips4MemoryAccessKind::Load {
+            size: Mips4MemoryAccessSize::Byte,
+            signed: false,
+        },
+        policy.endianness(),
+        policy.mmu_config(state.cp0.config()),
+        state.cp0.status(),
+        Mips4TlbAsid::new(state.cp0.entry_hi().address_space_identifier()),
+        tlb_entries,
+    )?;
+    Ok(Mips4ResolvedCacheAddress {
+        virtual_address,
+        physical_address: access.physical_address(),
+        cache_attribute: access.cache_attribute(),
+    })
 }
 
 enum Mips4LoadOperation {
@@ -75,6 +113,7 @@ pub(super) fn prepare_memory(
         tlb_entries,
     )?;
     let access_type = policy.resolve_access_type(access.cache_attribute());
+    let cache_policy = policy.resolve_cache_policy(access.cache_attribute());
 
     if let Some(operation) = load_operation(instruction) {
         let (physical_address, size) = load_transfer(access.physical_address(), &operation);
@@ -92,6 +131,8 @@ pub(super) fn prepare_memory(
                 kind: Mips4ExecutionAccessKind::DataLoad,
                 access_type,
             },
+            virtual_address,
+            cache_policy,
         });
     }
 
@@ -125,6 +166,8 @@ pub(super) fn prepare_memory(
             byte_enable,
             access_type,
         },
+        virtual_address,
+        cache_policy,
     })
 }
 
