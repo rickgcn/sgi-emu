@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/se_core", "crates/se_device", "crates/se_float", "crates/se_machine", "crates/se_runtime"]
+members = ["crates/se_core", "crates/se_device", "crates/se_float", "crates/se_machine", "crates/se_runtime", "crates/se_ui"]
 resolver = "3"
 
 [workspace.package]
@@ -10,6 +10,9 @@ authors = ["rickgcn"]
 
 [workspace.dependencies]
 cc = "1"
+cxx = "1"
+cxx-build = "1"
+qt-build-utils = "0.9"
 se_core = { path = "crates/se_core" }
 se_device = { path = "crates/se_device" }
 se_float = { path = "crates/se_float" }
