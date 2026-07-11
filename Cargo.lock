@@ -286,6 +286,7 @@ dependencies = [
  "cxx",
  "cxx-build",
  "qt-build-utils",
+ "se_core",
 ]
 
 [[package]]

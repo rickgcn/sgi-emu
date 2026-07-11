@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 cxx.workspace = true
+se_core.workspace = true
 
 [build-dependencies]
 cxx-build.workspace = true

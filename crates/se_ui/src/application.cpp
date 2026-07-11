@@ -1,4 +1,5 @@
 #include "se_ui/include/application.h"
+#include "se_ui/include/tracing_dock.h"
 
 #include <cstdint>
 #include <vector>
@@ -252,6 +253,12 @@ public:
     add_dock_option(translate(animated_docks_text), QMainWindow::AnimatedDocks);
     add_dock_option(translate(allow_nested_docks_text), QMainWindow::AllowNestedDocks);
     add_dock_option(translate(allow_tabbed_docks_text), QMainWindow::AllowTabbedDocks);
+
+    auto* tracing_dock = create_tracing_dock(this);
+    addDockWidget(Qt::BottomDockWidgetArea, tracing_dock);
+    window_menu->addSeparator();
+    window_menu->addAction(tracing_dock->toggleViewAction());
+    resizeDocks({ tracing_dock }, { 320 }, Qt::Vertical);
 
     auto* about_action = help_menu->addAction(translate(about_text));
     connect(about_action, &QAction::triggered, this, [this] {

@@ -73,4 +73,40 @@
       <translation>About</translation>
     </message>
   </context>
+  <context>
+    <name>TracingDock</name>
+    <message><source>Tracing</source><translation>Tracing</translation></message>
+    <message><source>Error</source><translation>Error</translation></message>
+    <message><source>Warn</source><translation>Warn</translation></message>
+    <message><source>Info</source><translation>Info</translation></message>
+    <message><source>Debug</source><translation>Debug</translation></message>
+    <message><source>Trace</source><translation>Trace</translation></message>
+    <message><source>Runtime</source><translation>Runtime</translation></message>
+    <message><source>Scheduler</source><translation>Scheduler</translation></message>
+    <message><source>Component</source><translation>Component</translation></message>
+    <message><source>Component %1</source><translation>Component %1</translation></message>
+    <message><source>Sequence</source><translation>Sequence</translation></message>
+    <message><source>Sim Time</source><translation>Sim Time</translation></message>
+    <message><source>Level</source><translation>Level</translation></message>
+    <message><source>Source</source><translation>Source</translation></message>
+    <message><source>Target</source><translation>Target</translation></message>
+    <message><source>Event</source><translation>Event</translation></message>
+    <message><source>Summary</source><translation>Summary</translation></message>
+    <message><source>Search trace records</source><translation>Search trace records</translation></message>
+    <message><source>All Levels</source><translation>All Levels</translation></message>
+    <message><source>All Sources</source><translation>All Sources</translation></message>
+    <message><source>All Targets</source><translation>All Targets</translation></message>
+    <message><source>Follow Live</source><translation>Follow Live</translation></message>
+    <message><source>Clear</source><translation>Clear</translation></message>
+    <message><source>No trace records</source><translation>No trace records</translation></message>
+    <message><source>Field</source><translation>Field</translation></message>
+    <message><source>Type</source><translation>Type</translation></message>
+    <message><source>Value</source><translation>Value</translation></message>
+    <message><source>Copy Row</source><translation>Copy Row</translation></message>
+    <message><source>Copy Field</source><translation>Copy Field</translation></message>
+    <message>
+      <source>%1 shown / %2 captured / %3 dropped</source>
+      <translation>%1 shown / %2 captured / %3 dropped</translation>
+    </message>
+  </context>
 </TS>
