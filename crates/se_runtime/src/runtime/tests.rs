@@ -127,6 +127,53 @@ fn run_steps_stops_at_event_limit() {
 }
 
 #[test]
+fn run_steps_with_zero_limit_dispatches_nothing() {
+    let mut runtime = Runtime::new();
+    runtime
+        .schedule_at(SimTime::new(1), TARGET, TestEvent::Record("pending"))
+        .unwrap();
+
+    let status = runtime
+        .run_steps(0, |_event, _registry, _context| {
+            panic!("a zero-sized batch must not dispatch events");
+            #[allow(unreachable_code)]
+            Ok::<(), Infallible>(())
+        })
+        .unwrap();
+
+    assert_eq!(status, RunStatus::StepLimitReached);
+    assert_eq!(runtime.scheduler().len(), 1);
+}
+
+#[test]
+fn run_steps_returns_idle_for_an_empty_queue() {
+    let mut runtime = Runtime::<TestEvent>::new();
+
+    let status = runtime
+        .run_steps(4, |_event, _registry, _context| Ok::<(), Infallible>(()))
+        .unwrap();
+
+    assert_eq!(status, RunStatus::Idle);
+}
+
+#[test]
+fn run_steps_returns_dispatch_errors_without_consuming_later_events() {
+    let mut runtime = Runtime::new();
+    runtime
+        .schedule_at(SimTime::new(1), TARGET, TestEvent::Record("error"))
+        .unwrap();
+    runtime
+        .schedule_at(SimTime::new(2), TARGET, TestEvent::Record("later"))
+        .unwrap();
+
+    let result = runtime.run_steps(4, |_event, _registry, _context| Err("dispatch failed"));
+
+    assert_eq!(result, Err(RunError::Dispatch("dispatch failed")));
+    assert_eq!(runtime.scheduler().len(), 1);
+    assert_eq!(runtime.scheduler().peek_next_time(), Some(SimTime::new(2)));
+}
+
+#[test]
 fn run_until_time_keeps_future_events() {
     let mut runtime = Runtime::new();
     let mut seen = Vec::new();
@@ -286,6 +333,29 @@ fn request_stop_stops_run_loop() {
     assert!(runtime.is_stopped());
     assert!(seen.is_empty());
     assert_eq!(runtime.scheduler().peek_next_time(), Some(SimTime::new(2)));
+}
+
+#[test]
+fn request_stop_stops_a_step_batch() {
+    let mut runtime = Runtime::new();
+    runtime
+        .schedule_at(SimTime::new(1), TARGET, TestEvent::Stop)
+        .unwrap();
+    runtime
+        .schedule_at(SimTime::new(2), TARGET, TestEvent::Record("after_stop"))
+        .unwrap();
+
+    let status = runtime
+        .run_steps(4, |event, _registry, context| {
+            if event.payload == TestEvent::Stop {
+                context.request_stop();
+            }
+            Ok::<(), Infallible>(())
+        })
+        .unwrap();
+
+    assert_eq!(status, RunStatus::Stopped);
+    assert_eq!(runtime.scheduler().len(), 1);
 }
 
 #[test]

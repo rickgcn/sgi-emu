@@ -204,6 +204,47 @@ fn reset_invalidates_cpu_steps_from_the_previous_generation() {
 }
 
 #[test]
+fn run_steps_exposes_the_runtime_event_limit() {
+    let config = config_with_program(&[(0, WAIT)]);
+    let mut machine = Ip32Machine::from_config(config).unwrap();
+    machine.schedule_power_on().unwrap();
+
+    assert_eq!(machine.run_steps(1).unwrap(), RunStatus::StepLimitReached);
+    assert_eq!(machine.control.generation, 1);
+    assert!(!machine.runtime().scheduler().is_empty());
+}
+
+#[derive(Clone, Default)]
+struct SequenceSink(Rc<RefCell<Vec<u64>>>);
+
+impl TraceSink for SequenceSink {
+    fn record(&mut self, record: TraceRecord<'_>) {
+        self.0.borrow_mut().push(record.sequence);
+    }
+}
+
+#[test]
+fn hard_reset_dispatches_its_exact_event_and_preserves_trace_sequence() {
+    let sink = SequenceSink::default();
+    let sequences = Rc::clone(&sink.0);
+    let config = config_with_program(&[(0, WAIT)]);
+    let mut machine = Ip32Machine::from_config_with_trace_sink(config, sink).unwrap();
+    machine.schedule_power_on().unwrap();
+
+    machine.hard_reset().unwrap();
+
+    assert_eq!(machine.runtime().now(), SimTime::ZERO);
+    assert_eq!(machine.control.generation, 2);
+    let captured = sequences.borrow();
+    assert!(!captured.is_empty());
+    assert!(
+        captured
+            .windows(2)
+            .all(|pair| pair[1] == pair[0].checked_add(1).unwrap())
+    );
+}
+
+#[test]
 fn processor_clock_accumulator_has_no_long_term_drift() {
     let mut clock = CpuClock::new(180_000_000);
     let delays: Vec<u64> = (0..18).map(|_| clock.next_pclock_delay().get()).collect();

@@ -341,6 +341,34 @@ where
             .schedule_at(self.runtime.now(), component_ids::MACHINE, Ip32Event::Reset)
     }
 
+    /// Dispatches at most the requested number of IP32 events.
+    pub fn run_steps(
+        &mut self,
+        max_events: usize,
+    ) -> Result<RunStatus, RunError<Ip32MachineDispatchError>> {
+        let control = &mut self.control;
+        self.runtime
+            .run_steps(max_events, |event, registry, context| {
+                dispatch_event(event, registry, context, control)
+            })
+    }
+
+    /// Schedules and completely dispatches a hard-reset event.
+    pub fn hard_reset(&mut self) -> Result<(), RunError<Ip32MachineDispatchError>> {
+        self.runtime.clear_stop();
+        let reset_id = self.schedule_reset()?;
+        let mut reset_dispatched = false;
+
+        while !reset_dispatched {
+            let control = &mut self.control;
+            self.runtime.dispatch_next(|event, registry, context| {
+                reset_dispatched = event.id == reset_id;
+                dispatch_event(event, registry, context, control)
+            })?;
+        }
+        Ok(())
+    }
+
     /// Runs the IP32 machine until the requested simulated-time deadline.
     pub fn run_until_time(
         &mut self,
