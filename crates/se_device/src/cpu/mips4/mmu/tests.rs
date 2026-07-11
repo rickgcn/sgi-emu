@@ -14,7 +14,20 @@ fn cca(bits: u8) -> Mips4CacheCoherenceAlgorithm {
 }
 
 fn config() -> Mips4MmuConfig {
-    Mips4MmuConfig::new(cca(3))
+    Mips4MmuConfig::new(
+        crate::cpu::mips4::config::Mips4AddressConfig::new(36, 40),
+        cca(3),
+    )
+}
+
+fn width_config(physical_address_bits: u8, virtual_address_bits: u8) -> Mips4MmuConfig {
+    Mips4MmuConfig::new(
+        crate::cpu::mips4::config::Mips4AddressConfig::new(
+            physical_address_bits,
+            virtual_address_bits,
+        ),
+        cca(3),
+    )
 }
 
 fn status(bits: u32) -> Mips4Cp0Status {
@@ -149,6 +162,68 @@ fn user_mode_classifies_32_and_64_bit_user_segments() {
     assert_eq!(
         Mips4Mmu::classify_virtual_address(config(), user_status(STATUS_UX), 0x0000_0100_0000_0000),
         Mips4MmuAddressClassification::AddressError { segment: None }
+    );
+}
+
+#[test]
+fn configured_virtual_width_rejects_the_first_unimplemented_address() {
+    let config = width_config(36, 39);
+    assert!(matches!(
+        Mips4Mmu::classify_virtual_address(config, user_status(STATUS_UX), (1_u64 << 39) - 1,),
+        Mips4MmuAddressClassification::Mapped { .. }
+    ));
+    assert_eq!(
+        Mips4Mmu::classify_virtual_address(config, user_status(STATUS_UX), 1_u64 << 39),
+        Mips4MmuAddressClassification::AddressError { segment: None }
+    );
+}
+
+#[test]
+fn configured_physical_width_limits_xkphys_and_tlb_results() {
+    let config = width_config(35, 40);
+    let xkphys_base = 0x9000_0000_0000_0000;
+    assert!(matches!(
+        Mips4Mmu::classify_virtual_address(
+            config,
+            kernel_status(STATUS_KX),
+            xkphys_base | ((1_u64 << 35) - 1),
+        ),
+        Mips4MmuAddressClassification::Unmapped { .. }
+    ));
+    assert_eq!(
+        Mips4Mmu::classify_virtual_address(
+            config,
+            kernel_status(STATUS_KX),
+            xkphys_base | (1_u64 << 35),
+        ),
+        Mips4MmuAddressClassification::AddressError {
+            segment: Some(Mips4MmuSegment::Xkphys),
+        }
+    );
+
+    let address = 0x1000;
+    let out_of_range = entry_lo(1_u64 << 23, 3, true, true);
+    let entries = [entry_for(
+        address,
+        Mips4TlbAddressMode::Bits64,
+        out_of_range,
+        out_of_range,
+    )];
+    assert_eq!(
+        Mips4Mmu::translate(
+            config,
+            user_status(STATUS_UX),
+            ASID,
+            &entries,
+            address,
+            Mips4TlbAccessKind::Load,
+        ),
+        fault_result(
+            Mips4Exception::AddressErrorLoad,
+            address,
+            Some(Mips4MmuSegment::Xuseg),
+            Some(Mips4TlbAddressMode::Bits64),
+        )
     );
 }
 

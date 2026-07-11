@@ -245,6 +245,12 @@ impl Mips4TlbEntryHi {
         self.region_bits
     }
 
+    /// Returns whether the VPN fits an implemented virtual address width.
+    pub const fn fits_virtual_address_bits(self, bits: u8) -> bool {
+        let vpn_bits = bits.saturating_sub(ENTRY_HI_VPN2_SHIFT);
+        vpn_bits >= 64 || self.vpn2 < (1_u64 << vpn_bits)
+    }
+
     /// Returns whether this EntryHi value matches a virtual address.
     pub const fn matches_virtual_address(
         self,
@@ -347,6 +353,12 @@ impl Mips4TlbEntryLo {
     /// Returns whether this EntryLo half has the global bit set.
     pub const fn global(self) -> bool {
         self.global
+    }
+
+    /// Returns whether the PFN fits an implemented physical address width.
+    pub const fn fits_physical_address_bits(self, bits: u8) -> bool {
+        let pfn_bits = bits.saturating_sub(12);
+        pfn_bits >= 64 || self.pfn < (1_u64 << pfn_bits)
     }
 
     /// Returns the physical page base for the supplied page mask.

@@ -119,7 +119,7 @@ impl Mips4ExecutionPolicy for R5000ExecutionPolicy {
 
     fn mmu_config(&self, config: Mips4Cp0Config) -> Mips4MmuConfig {
         let kseg0 = Mips4CacheCoherenceAlgorithm::from_bits((config.bits() & 0x07) as u8).unwrap();
-        Mips4MmuConfig::new(kseg0)
+        Mips4MmuConfig::new(self.profile.to_mips4_config().address, kseg0)
     }
 
     fn cp0_write_value(&self, register: Mips4Cp0Register, current: u64, requested: u64) -> u64 {

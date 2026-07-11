@@ -70,7 +70,10 @@ impl Mips4ExecutionPolicy for TestPolicy {
     }
 
     fn mmu_config(&self, _config: Mips4Cp0Config) -> Mips4MmuConfig {
-        Mips4MmuConfig::new(Mips4CacheCoherenceAlgorithm::from_bits(3).unwrap())
+        Mips4MmuConfig::new(
+            self.architecture_config().address,
+            Mips4CacheCoherenceAlgorithm::from_bits(3).unwrap(),
+        )
     }
 
     fn cp0_write_value(&self, _register: Mips4Cp0Register, _current: u64, requested: u64) -> u64 {
@@ -167,7 +170,10 @@ impl Mips4ExecutionPolicy for CachedTestPolicy {
     }
 
     fn mmu_config(&self, _config: Mips4Cp0Config) -> Mips4MmuConfig {
-        Mips4MmuConfig::new(Mips4CacheCoherenceAlgorithm::from_bits(3).unwrap())
+        Mips4MmuConfig::new(
+            self.architecture_config().address,
+            Mips4CacheCoherenceAlgorithm::from_bits(3).unwrap(),
+        )
     }
 
     fn cp0_write_value(&self, _register: Mips4Cp0Register, _current: u64, requested: u64) -> u64 {

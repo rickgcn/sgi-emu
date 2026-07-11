@@ -229,7 +229,10 @@ mod tests {
     const KSEG0_BASE: u64 = 0xffff_ffff_8000_0000;
 
     fn mmu_config() -> Mips4MmuConfig {
-        Mips4MmuConfig::new(Mips4CacheCoherenceAlgorithm::from_bits(3).unwrap())
+        Mips4MmuConfig::new(
+            crate::cpu::mips4::config::Mips4AddressConfig::new(36, 40),
+            Mips4CacheCoherenceAlgorithm::from_bits(3).unwrap(),
+        )
     }
 
     fn kernel_status() -> Mips4Cp0Status {

@@ -405,7 +405,10 @@ mod tests {
     }
 
     fn mmu_config() -> Mips4MmuConfig {
-        Mips4MmuConfig::new(cca(3))
+        Mips4MmuConfig::new(
+            crate::cpu::mips4::config::Mips4AddressConfig::new(36, 40),
+            cca(3),
+        )
     }
 
     fn status(bits: u32) -> Mips4Cp0Status {

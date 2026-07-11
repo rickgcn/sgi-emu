@@ -7,6 +7,7 @@
 //! transactions.
 
 use crate::cpu::mips4::cache::{Mips4CacheCoherenceAlgorithm, Mips4MemoryAccessType};
+use crate::cpu::mips4::config::Mips4AddressConfig;
 use crate::cpu::mips4::cp0::{Mips4Cp0KernelUserMode, Mips4Cp0Status};
 use crate::cpu::mips4::exception::Mips4Exception;
 use crate::cpu::mips4::tlb::{
@@ -35,14 +36,21 @@ const XKPHYS_CCA_SHIFT: u8 = 59;
 /// Generic MIPS IV MMU configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mips4MmuConfig {
+    /// Implemented virtual and physical address widths.
+    pub address: Mips4AddressConfig,
+
     /// Cache-coherence algorithm used for `kseg0` and `ckseg0` direct maps.
     pub kseg0_cache_coherence_algorithm: Mips4CacheCoherenceAlgorithm,
 }
 
 impl Mips4MmuConfig {
     /// Creates a generic MMU configuration.
-    pub const fn new(kseg0_cache_coherence_algorithm: Mips4CacheCoherenceAlgorithm) -> Self {
+    pub const fn new(
+        address: Mips4AddressConfig,
+        kseg0_cache_coherence_algorithm: Mips4CacheCoherenceAlgorithm,
+    ) -> Self {
         Self {
+            address,
             kseg0_cache_coherence_algorithm,
         }
     }
@@ -315,8 +323,8 @@ impl Mips4Mmu {
         }
 
         match privilege_mode {
-            Mips4MmuPrivilegeMode::User => classify_user(status, address),
-            Mips4MmuPrivilegeMode::Supervisor => classify_supervisor(status, address),
+            Mips4MmuPrivilegeMode::User => classify_user(config, status, address),
+            Mips4MmuPrivilegeMode::Supervisor => classify_supervisor(config, status, address),
             Mips4MmuPrivilegeMode::Kernel => classify_kernel(config, status, address),
         }
     }
@@ -341,6 +349,7 @@ impl Mips4Mmu {
                 tlb_entries,
                 address,
                 access_kind,
+                config.address.physical_address_bits,
             ),
             Mips4MmuAddressClassification::Unmapped {
                 segment,
@@ -362,9 +371,13 @@ impl Mips4Mmu {
     }
 }
 
-const fn classify_user(status: Mips4Cp0Status, address: u64) -> Mips4MmuAddressClassification {
+const fn classify_user(
+    config: Mips4MmuConfig,
+    status: Mips4Cp0Status,
+    address: u64,
+) -> Mips4MmuAddressClassification {
     if status.user_64_bit_addressing() {
-        if address <= XUSEG_END {
+        if address <= XUSEG_END && extended_offset_valid(config, address) {
             mapped(Mips4MmuSegment::Xuseg, Mips4TlbAddressMode::Bits64)
         } else {
             address_error(None)
@@ -377,18 +390,22 @@ const fn classify_user(status: Mips4Cp0Status, address: u64) -> Mips4MmuAddressC
 }
 
 const fn classify_supervisor(
+    config: Mips4MmuConfig,
     status: Mips4Cp0Status,
     address: u64,
 ) -> Mips4MmuAddressClassification {
     if status.user_64_bit_addressing() {
-        if address <= XUSEG_END {
+        if address <= XUSEG_END && extended_offset_valid(config, address) {
             return mapped(Mips4MmuSegment::Xsuseg, Mips4TlbAddressMode::Bits64);
         }
     } else if address <= USEG_END {
         return mapped(Mips4MmuSegment::Suseg, Mips4TlbAddressMode::Bits32);
     }
 
-    if status.supervisor_64_bit_addressing() && in_range(address, XSSEG_START, XSSEG_END) {
+    if status.supervisor_64_bit_addressing()
+        && in_range(address, XSSEG_START, XSSEG_END)
+        && extended_offset_valid(config, address.wrapping_sub(XSSEG_START))
+    {
         return mapped(Mips4MmuSegment::Xsseg, Mips4TlbAddressMode::Bits64);
     }
 
@@ -411,23 +428,28 @@ const fn classify_kernel(
     address: u64,
 ) -> Mips4MmuAddressClassification {
     if status.user_64_bit_addressing() {
-        if address <= XUSEG_END {
+        if address <= XUSEG_END && extended_offset_valid(config, address) {
             return mapped(Mips4MmuSegment::Xkuseg, Mips4TlbAddressMode::Bits64);
         }
     } else if address <= USEG_END {
         return mapped(Mips4MmuSegment::Kuseg, Mips4TlbAddressMode::Bits32);
     }
 
-    if status.supervisor_64_bit_addressing() && in_range(address, XSSEG_START, XSSEG_END) {
+    if status.supervisor_64_bit_addressing()
+        && in_range(address, XSSEG_START, XSSEG_END)
+        && extended_offset_valid(config, address.wrapping_sub(XSSEG_START))
+    {
         return mapped(Mips4MmuSegment::Xksseg, Mips4TlbAddressMode::Bits64);
     }
 
     if status.kernel_64_bit_addressing() {
         if address >> 62 == 2 {
-            return classify_xkphys(address);
+            return classify_xkphys(config, address);
         }
 
-        if in_range(address, XKSEG_START, XKSEG_END) {
+        if in_range(address, XKSEG_START, XKSEG_END)
+            && extended_offset_valid(config, address.wrapping_sub(XKSEG_START))
+        {
             return mapped(Mips4MmuSegment::Xkseg, Mips4TlbAddressMode::Bits64);
         }
     }
@@ -481,8 +503,11 @@ const fn classify_kernel(
     address_error(None)
 }
 
-const fn classify_xkphys(address: u64) -> Mips4MmuAddressClassification {
-    if address & XKPHYS_RESERVED_ADDRESS_BITS != 0 {
+const fn classify_xkphys(config: Mips4MmuConfig, address: u64) -> Mips4MmuAddressClassification {
+    let physical_mask = low_mask(config.address.physical_address_bits);
+    let reserved_mask =
+        XKPHYS_RESERVED_ADDRESS_BITS | (XKPHYS_PHYSICAL_ADDRESS_MASK & !physical_mask);
+    if address & reserved_mask != 0 {
         return address_error(Some(Mips4MmuSegment::Xkphys));
     }
 
@@ -495,7 +520,7 @@ const fn classify_xkphys(address: u64) -> Mips4MmuAddressClassification {
 
     unmapped(
         Mips4MmuSegment::Xkphys,
-        address & XKPHYS_PHYSICAL_ADDRESS_MASK,
+        address & physical_mask,
         Mips4MmuCacheAttribute::CacheCoherenceAlgorithm(cache_coherence_algorithm),
     )
 }
@@ -507,6 +532,7 @@ fn translate_mapped(
     tlb_entries: &[Mips4TlbEntry],
     address: u64,
     access_kind: Mips4TlbAccessKind,
+    physical_address_bits: u8,
 ) -> Mips4MmuTranslationResult {
     match Mips4Tlb::probe(tlb_entries, address, asid, address_mode) {
         Mips4TlbProbeResult::Miss => fault(
@@ -527,6 +553,14 @@ fn translate_mapped(
                     fault(exception, address, Some(segment), Some(address_mode))
                 }
                 Mips4TlbTranslationResult::Hit(translation) => {
+                    if translation.physical_address > low_mask(physical_address_bits) {
+                        return fault(
+                            address_error_exception(access_kind),
+                            address,
+                            Some(segment),
+                            Some(address_mode),
+                        );
+                    }
                     Mips4MmuTranslationResult::Hit(Mips4MmuTranslation {
                         physical_address: translation.physical_address,
                         segment,
@@ -573,6 +607,18 @@ const fn address_error(segment: Option<Mips4MmuSegment>) -> Mips4MmuAddressClass
 
 const fn in_range(address: u64, start: u64, end: u64) -> bool {
     address >= start && address <= end
+}
+
+const fn extended_offset_valid(config: Mips4MmuConfig, offset: u64) -> bool {
+    offset <= low_mask(config.address.virtual_address_bits)
+}
+
+const fn low_mask(bits: u8) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1_u64 << bits) - 1
+    }
 }
 
 const fn address_error_exception(access_kind: Mips4TlbAccessKind) -> Mips4Exception {

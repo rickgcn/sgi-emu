@@ -223,6 +223,13 @@ fn write_tlb_entry(state: &mut Mips4ExecutionState, index: usize) {
     let Some(entry_lo1) = state.cp0.entry_lo1().to_tlb_entry_lo() else {
         return;
     };
+    let address = state.config.address;
+    if !entry_hi.fits_virtual_address_bits(address.virtual_address_bits)
+        || !entry_lo0.fits_physical_address_bits(address.physical_address_bits)
+        || !entry_lo1.fits_physical_address_bits(address.physical_address_bits)
+    {
+        return;
+    }
     *slot = Mips4TlbEntry::new(page_mask, entry_hi, entry_lo0, entry_lo1);
 }
 
