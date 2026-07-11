@@ -229,3 +229,32 @@ fn softfloat3_does_not_leak_flags_between_operations() {
     assert!(divide.flags.contains(FloatExceptionFlags::DIVIDE_BY_ZERO));
     assert!(add.flags.is_empty());
 }
+
+#[test]
+fn softfloat3_supports_square_root_and_fused_multiply_add() {
+    let backend = SoftFloat3Backend::new();
+    let root = backend.sqrt_f64(CONTROL, Float64Bits::new(9.0f64.to_bits()));
+    let fused = backend.mul_add_f32(
+        CONTROL,
+        Float32Bits::new(2.0f32.to_bits()),
+        Float32Bits::new(3.0f32.to_bits()),
+        Float32Bits::new(4.0f32.to_bits()),
+    );
+
+    assert_eq!(root.value.bits(), 3.0f64.to_bits());
+    assert!(root.flags.is_empty());
+    assert_eq!(fused.value.bits(), 10.0f32.to_bits());
+    assert!(fused.flags.is_empty());
+}
+
+#[test]
+fn softfloat3_round_trips_exact_i64_values() {
+    let backend = SoftFloat3Backend::new();
+    let converted = backend.i64_to_f64(CONTROL, 1_i64 << 40);
+    let restored = backend.f64_to_i64(CONTROL, converted.value);
+
+    assert_eq!(converted.value.bits(), ((1_i64 << 40) as f64).to_bits());
+    assert!(converted.flags.is_empty());
+    assert_eq!(restored.value, 1_i64 << 40);
+    assert!(restored.flags.is_empty());
+}

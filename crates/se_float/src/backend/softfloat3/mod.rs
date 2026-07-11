@@ -24,18 +24,26 @@ unsafe extern "C" {
     fn se_softfloat_f32_sub(lhs: u32, rhs: u32) -> u32;
     fn se_softfloat_f32_mul(lhs: u32, rhs: u32) -> u32;
     fn se_softfloat_f32_div(lhs: u32, rhs: u32) -> u32;
+    fn se_softfloat_f32_sqrt(value: u32) -> u32;
+    fn se_softfloat_f32_mul_add(lhs: u32, rhs: u32, addend: u32) -> u32;
 
     fn se_softfloat_f64_add(lhs: u64, rhs: u64) -> u64;
     fn se_softfloat_f64_sub(lhs: u64, rhs: u64) -> u64;
     fn se_softfloat_f64_mul(lhs: u64, rhs: u64) -> u64;
     fn se_softfloat_f64_div(lhs: u64, rhs: u64) -> u64;
+    fn se_softfloat_f64_sqrt(value: u64) -> u64;
+    fn se_softfloat_f64_mul_add(lhs: u64, rhs: u64, addend: u64) -> u64;
 
     fn se_softfloat_f32_to_f64(value: u32) -> u64;
     fn se_softfloat_f64_to_f32(value: u64) -> u32;
     fn se_softfloat_i32_to_f32(value: i32) -> u32;
     fn se_softfloat_i32_to_f64(value: i32) -> u64;
+    fn se_softfloat_i64_to_f32(value: i64) -> u32;
+    fn se_softfloat_i64_to_f64(value: i64) -> u64;
     fn se_softfloat_f32_to_i32(value: u32, rounding_mode: u8, exact: bool) -> i32;
     fn se_softfloat_f64_to_i32(value: u64, rounding_mode: u8, exact: bool) -> i32;
+    fn se_softfloat_f32_to_i64(value: u32, rounding_mode: u8, exact: bool) -> i64;
+    fn se_softfloat_f64_to_i64(value: u64, rounding_mode: u8, exact: bool) -> i64;
 
     fn se_softfloat_f32_eq(lhs: u32, rhs: u32) -> bool;
     fn se_softfloat_f32_eq_signaling(lhs: u32, rhs: u32) -> bool;
@@ -102,6 +110,28 @@ impl FloatBackend for SoftFloat3Backend {
         })
     }
 
+    fn sqrt_f32(&self, control: FloatControl, value: Float32Bits) -> FloatResult<Float32Bits> {
+        run(control, || unsafe {
+            Float32Bits::new(se_softfloat_f32_sqrt(value.bits()))
+        })
+    }
+
+    fn mul_add_f32(
+        &self,
+        control: FloatControl,
+        lhs: Float32Bits,
+        rhs: Float32Bits,
+        addend: Float32Bits,
+    ) -> FloatResult<Float32Bits> {
+        run(control, || unsafe {
+            Float32Bits::new(se_softfloat_f32_mul_add(
+                lhs.bits(),
+                rhs.bits(),
+                addend.bits(),
+            ))
+        })
+    }
+
     fn add_f64(
         &self,
         control: FloatControl,
@@ -146,6 +176,28 @@ impl FloatBackend for SoftFloat3Backend {
         })
     }
 
+    fn sqrt_f64(&self, control: FloatControl, value: Float64Bits) -> FloatResult<Float64Bits> {
+        run(control, || unsafe {
+            Float64Bits::new(se_softfloat_f64_sqrt(value.bits()))
+        })
+    }
+
+    fn mul_add_f64(
+        &self,
+        control: FloatControl,
+        lhs: Float64Bits,
+        rhs: Float64Bits,
+        addend: Float64Bits,
+    ) -> FloatResult<Float64Bits> {
+        run(control, || unsafe {
+            Float64Bits::new(se_softfloat_f64_mul_add(
+                lhs.bits(),
+                rhs.bits(),
+                addend.bits(),
+            ))
+        })
+    }
+
     fn f32_to_f64(&self, control: FloatControl, value: Float32Bits) -> FloatResult<Float64Bits> {
         run(control, || unsafe {
             Float64Bits::new(se_softfloat_f32_to_f64(value.bits()))
@@ -170,6 +222,18 @@ impl FloatBackend for SoftFloat3Backend {
         })
     }
 
+    fn i64_to_f32(&self, control: FloatControl, value: i64) -> FloatResult<Float32Bits> {
+        run(control, || unsafe {
+            Float32Bits::new(se_softfloat_i64_to_f32(value))
+        })
+    }
+
+    fn i64_to_f64(&self, control: FloatControl, value: i64) -> FloatResult<Float64Bits> {
+        run(control, || unsafe {
+            Float64Bits::new(se_softfloat_i64_to_f64(value))
+        })
+    }
+
     fn f32_to_i32(&self, control: FloatControl, value: Float32Bits) -> FloatResult<i32> {
         let rounding_mode = softfloat_rounding_mode(control.rounding_mode);
         run(control, || unsafe {
@@ -181,6 +245,20 @@ impl FloatBackend for SoftFloat3Backend {
         let rounding_mode = softfloat_rounding_mode(control.rounding_mode);
         run(control, || unsafe {
             se_softfloat_f64_to_i32(value.bits(), rounding_mode, true)
+        })
+    }
+
+    fn f32_to_i64(&self, control: FloatControl, value: Float32Bits) -> FloatResult<i64> {
+        let rounding_mode = softfloat_rounding_mode(control.rounding_mode);
+        run(control, || unsafe {
+            se_softfloat_f32_to_i64(value.bits(), rounding_mode, true)
+        })
+    }
+
+    fn f64_to_i64(&self, control: FloatControl, value: Float64Bits) -> FloatResult<i64> {
+        let rounding_mode = softfloat_rounding_mode(control.rounding_mode);
+        run(control, || unsafe {
+            se_softfloat_f64_to_i64(value.bits(), rounding_mode, true)
         })
     }
 
