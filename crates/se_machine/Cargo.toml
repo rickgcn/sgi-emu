@@ -7,4 +7,5 @@ authors.workspace = true
 
 [dependencies]
 se_core = { path = "../se_core" }
+se_device = { path = "../se_device" }
 se_runtime = { path = "../se_runtime" }

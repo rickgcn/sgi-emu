@@ -42,6 +42,7 @@ name = "se_machine"
 version = "0.1.0"
 dependencies = [
  "se_core",
+ "se_device",
  "se_runtime",
 ]
 
