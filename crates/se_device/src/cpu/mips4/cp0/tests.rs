@@ -43,6 +43,12 @@ fn register_numbers_reject_reserved_registers() {
 }
 
 #[test]
+fn r5000_watchpoint_register_numbers_remain_reserved() {
+    assert_eq!(Mips4Cp0Register::from_u8(18), None);
+    assert_eq!(Mips4Cp0Register::from_u8(19), None);
+}
+
+#[test]
 fn mmu_register_wrappers_mask_reserved_bits() {
     let index = Mips4Cp0Index::from_bits(u64::MAX);
     assert_eq!(index.bits(), INDEX_READABLE_MASK as u32);
