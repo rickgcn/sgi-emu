@@ -128,6 +128,20 @@ impl TraceQueue {
         self.dropped.store(0, Ordering::Relaxed);
         self.session.fetch_add(1, Ordering::AcqRel) + 1
     }
+
+    fn enabled(&self, source: TraceSource) -> bool {
+        self.capture_enabled.load(Ordering::Relaxed)
+            && (!matches!(source, TraceSource::Scheduler)
+                || self.scheduler_capture_enabled.load(Ordering::Relaxed))
+    }
+
+    fn enqueue(&self, records: &mut VecDeque<ffi::UiTraceRecord>, record: TraceRecord<'_>) {
+        if records.len() == self.capacity {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        records.push_back(ffi::UiTraceRecord::from(record));
+    }
 }
 
 static APPLICATION_TRACE_QUEUE: LazyLock<Arc<TraceQueue>> =
@@ -136,8 +150,8 @@ static APPLICATION_TRACE_QUEUE: LazyLock<Arc<TraceQueue>> =
 /// Trace sink used by the native application tracing window.
 ///
 /// Recording never waits for the Qt thread. A record is dropped if the queue
-/// is currently locked, and the oldest queued record is dropped if the queue
-/// has reached its fixed capacity.
+/// is currently locked or has reached its fixed capacity. Capacity is checked
+/// before the borrowed record is converted into owned UI data.
 #[derive(Clone)]
 pub struct UiTraceSink {
     queue: Arc<TraceQueue>,
@@ -160,34 +174,32 @@ impl UiTraceSink {
 }
 
 impl TraceSink for UiTraceSink {
+    fn enabled(
+        &self,
+        source: TraceSource,
+        _level: TraceLevel,
+        _target: &str,
+        _event: &str,
+    ) -> bool {
+        self.queue.enabled(source)
+    }
+
     fn record(&mut self, record: TraceRecord<'_>) {
-        if !self.queue.capture_enabled.load(Ordering::Relaxed)
-            || matches!(record.source, TraceSource::Scheduler)
-                && !self.queue.scheduler_capture_enabled.load(Ordering::Relaxed)
-        {
+        if !self.queue.enabled(record.source) {
             return;
         }
         self.queue.captured.fetch_add(1, Ordering::Relaxed);
-        let record = ffi::UiTraceRecord::from(record);
 
         match self.queue.records.try_lock() {
             Ok(mut records) => {
-                if records.len() == self.queue.capacity {
-                    records.pop_front();
-                    self.queue.dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                records.push_back(record);
+                self.queue.enqueue(&mut records, record);
             }
             Err(TryLockError::WouldBlock) => {
                 self.queue.dropped.fetch_add(1, Ordering::Relaxed);
             }
             Err(TryLockError::Poisoned(error)) => {
                 let mut records = error.into_inner();
-                if records.len() == self.queue.capacity {
-                    records.pop_front();
-                    self.queue.dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                records.push_back(record);
+                self.queue.enqueue(&mut records, record);
             }
         }
     }
@@ -297,11 +309,14 @@ pub(crate) fn begin_application_trace_session() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use se_core::{
         component::ComponentId,
         scheduler::SimTime,
         tracing::{TraceField, TraceLevel, TraceRecord, TraceSink, TraceSource},
     };
+    use se_machine::o2::ip32::machine::{Ip32Machine, Ip32MachineConfig};
 
     use super::{Ordering, UiTraceSink, ffi};
 
@@ -352,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_keeps_newest_records_and_counts_overflow() {
+    fn queue_drops_new_records_and_counts_overflow() {
         let mut sink = UiTraceSink::with_capacity(2);
         for sequence in 0..3 {
             let mut trace = record(&[]);
@@ -362,9 +377,25 @@ mod tests {
 
         let records = sink.queue.drain(8);
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].sequence, 1);
-        assert_eq!(records[1].sequence, 2);
+        assert_eq!(records[0].sequence, 0);
+        assert_eq!(records[1].sequence, 1);
         assert_eq!(sink.queue.stats().captured, 3);
+        assert_eq!(sink.queue.stats().dropped, 1);
+    }
+
+    #[test]
+    fn lock_contention_drops_without_modifying_the_queue() {
+        let mut sink = UiTraceSink::with_capacity(2);
+        let queue = sink.queue.clone();
+        let guard = queue
+            .records
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        sink.record(record(&[]));
+
+        assert!(guard.is_empty());
+        assert_eq!(sink.queue.stats().captured, 1);
         assert_eq!(sink.queue.stats().dropped, 1);
     }
 
@@ -389,6 +420,18 @@ mod tests {
             ..record(&[])
         };
 
+        assert!(!sink.enabled(
+            TraceSource::Scheduler,
+            TraceLevel::Trace,
+            "scheduler",
+            "event_dispatched"
+        ));
+        assert!(sink.enabled(
+            TraceSource::Component(ComponentId::new(7)),
+            TraceLevel::Debug,
+            "ip32.sysad",
+            "access"
+        ));
         sink.record(scheduler_record);
         assert!(sink.queue.drain(8).is_empty());
         assert_eq!(sink.queue.stats().captured, 0);
@@ -396,11 +439,23 @@ mod tests {
         sink.queue
             .scheduler_capture_enabled
             .store(true, Ordering::Relaxed);
+        assert!(sink.enabled(
+            TraceSource::Scheduler,
+            TraceLevel::Trace,
+            "scheduler",
+            "event_dispatched"
+        ));
         sink.record(scheduler_record);
         assert_eq!(sink.queue.drain(8).len(), 1);
         assert_eq!(sink.queue.stats().captured, 1);
 
         sink.queue.capture_enabled.store(false, Ordering::Relaxed);
+        assert!(!sink.enabled(
+            TraceSource::Component(ComponentId::new(7)),
+            TraceLevel::Debug,
+            "ip32.sysad",
+            "access"
+        ));
         sink.record(record(&[]));
         assert!(sink.queue.drain(8).is_empty());
         assert_eq!(sink.queue.stats().captured, 1);
@@ -417,5 +472,54 @@ mod tests {
         assert_eq!(sink.queue.stats().session, 1);
         assert_eq!(sink.queue.stats().captured, 0);
         assert_eq!(sink.queue.stats().dropped, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a local proprietary IP32 PROM image"]
+    fn local_ip32_prom_trace_throughput_probe() {
+        let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
+        let prom = std::fs::read(path).expect("the local PROM image must be readable");
+        let max_events = std::env::var("IP32_PROM_EVENTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2_000_000);
+
+        for (label, capture, scheduler_capture) in [
+            ("capture-disabled", false, false),
+            ("component-capture", true, false),
+            ("scheduler-capture", true, true),
+        ] {
+            let sink = UiTraceSink::with_capacity(super::APPLICATION_QUEUE_CAPACITY);
+            sink.queue.capture_enabled.store(capture, Ordering::Relaxed);
+            sink.queue
+                .scheduler_capture_enabled
+                .store(scheduler_capture, Ordering::Relaxed);
+            let queue = sink.queue.clone();
+            let config = Ip32MachineConfig {
+                prom_image: prom.clone(),
+                ..Ip32MachineConfig::default()
+            };
+            let mut machine = Ip32Machine::from_config_with_trace_sink(config, sink)
+                .expect("the local IP32 machine must build");
+            machine
+                .schedule_power_on()
+                .expect("power-on must be scheduled");
+
+            let started = Instant::now();
+            machine
+                .run_steps(max_events)
+                .expect("the local PROM run must not fail");
+            let elapsed = started.elapsed();
+            let stats = queue.stats();
+            let queued = queue
+                .records
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len();
+            eprintln!(
+                "{label}: events={max_events}, elapsed={elapsed:?}, captured={}, dropped={}, queued={queued}",
+                stats.captured, stats.dropped
+            );
+        }
     }
 }
