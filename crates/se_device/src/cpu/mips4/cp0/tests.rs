@@ -21,6 +21,8 @@ fn register_numbers_accept_modeled_mips4_registers() {
         (15, Mips4Cp0Register::ProcessorId),
         (16, Mips4Cp0Register::Config),
         (17, Mips4Cp0Register::LlAddr),
+        (18, Mips4Cp0Register::WatchLo),
+        (19, Mips4Cp0Register::WatchHi),
         (20, Mips4Cp0Register::XContext),
         (26, Mips4Cp0Register::Ecc),
         (27, Mips4Cp0Register::CacheErr),
@@ -37,15 +39,18 @@ fn register_numbers_accept_modeled_mips4_registers() {
 
 #[test]
 fn register_numbers_reject_reserved_registers() {
-    for register in [7, 18, 19, 21, 22, 23, 24, 25, 31] {
+    for register in [7, 21, 22, 23, 24, 25, 31] {
         assert_eq!(Mips4Cp0Register::from_u8(register), None);
     }
 }
 
 #[test]
-fn r5000_watchpoint_register_numbers_remain_reserved() {
-    assert_eq!(Mips4Cp0Register::from_u8(18), None);
-    assert_eq!(Mips4Cp0Register::from_u8(19), None);
+fn r5000_watchpoint_registers_mask_reserved_bits() {
+    let mut cp0 = Mips4Cp0::new(0, 0, 47);
+    cp0.write(Mips4Cp0Register::WatchLo, u64::MAX).unwrap();
+    cp0.write(Mips4Cp0Register::WatchHi, u64::MAX).unwrap();
+    assert_eq!(cp0.watch_lo().bits(), WATCH_LO_READABLE_MASK);
+    assert_eq!(cp0.watch_hi().bits(), WATCH_HI_READABLE_MASK);
 }
 
 #[test]

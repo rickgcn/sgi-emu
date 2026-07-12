@@ -99,6 +99,8 @@ const CAUSE_READABLE_MASK: u32 = CAUSE_BD | CAUSE_CE_MASK | CAUSE_IP_MASK | CAUS
 
 const PROCESSOR_ID_READABLE_MASK: u32 = 0x0000_ffff;
 const ECC_READABLE_MASK: u32 = 0x0000_00ff;
+const WATCH_LO_READABLE_MASK: u32 = 0xffff_fffb;
+const WATCH_HI_READABLE_MASK: u32 = 0x0000_00ff;
 const CACHE_ERR_DATA_REFERENCE: u32 = 1 << 31;
 const CACHE_ERR_CACHE_LEVEL: u32 = 1 << 30;
 const CACHE_ERR_DATA_FIELD: u32 = 1 << 29;
@@ -173,6 +175,12 @@ pub enum Mips4Cp0Register {
     /// Load-linked address register.
     LlAddr,
 
+    /// Physical watchpoint address low register.
+    WatchLo,
+
+    /// Physical watchpoint address high register.
+    WatchHi,
+
     /// Extended TLB refill context register.
     XContext,
 
@@ -213,6 +221,8 @@ impl Mips4Cp0Register {
             15 => Some(Self::ProcessorId),
             16 => Some(Self::Config),
             17 => Some(Self::LlAddr),
+            18 => Some(Self::WatchLo),
+            19 => Some(Self::WatchHi),
             20 => Some(Self::XContext),
             26 => Some(Self::Ecc),
             27 => Some(Self::CacheErr),
@@ -243,6 +253,8 @@ impl Mips4Cp0Register {
             Self::ProcessorId => 15,
             Self::Config => 16,
             Self::LlAddr => 17,
+            Self::WatchLo => 18,
+            Self::WatchHi => 19,
             Self::XContext => 20,
             Self::Ecc => 26,
             Self::CacheErr => 27,
@@ -844,6 +856,38 @@ impl Mips4Cp0LlAddr {
     }
 }
 
+/// CP0 `WatchLo` register.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Mips4Cp0WatchLo(u32);
+
+impl Mips4Cp0WatchLo {
+    /// Creates a `WatchLo` value from its implemented bits.
+    pub const fn from_bits(bits: u64) -> Self {
+        Self((bits as u32) & WATCH_LO_READABLE_MASK)
+    }
+
+    /// Returns the implemented register bits.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// CP0 `WatchHi` register.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Mips4Cp0WatchHi(u32);
+
+impl Mips4Cp0WatchHi {
+    /// Creates a `WatchHi` value from its implemented bits.
+    pub const fn from_bits(bits: u64) -> Self {
+        Self((bits as u32) & WATCH_HI_READABLE_MASK)
+    }
+
+    /// Returns the implemented register bits.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
 /// CP0 `XContext` register.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Mips4Cp0XContext(u64);
@@ -1049,6 +1093,8 @@ pub struct Mips4Cp0 {
     processor_id: Mips4Cp0ProcessorId,
     config: Mips4Cp0Config,
     ll_addr: Mips4Cp0LlAddr,
+    watch_lo: Mips4Cp0WatchLo,
+    watch_hi: Mips4Cp0WatchHi,
     x_context: Mips4Cp0XContext,
     ecc: Mips4Cp0Ecc,
     cache_err: Mips4Cp0CacheErr,
@@ -1081,6 +1127,8 @@ impl Mips4Cp0 {
             processor_id: Mips4Cp0ProcessorId::from_bits(processor_id),
             config: Mips4Cp0Config::from_bits(config),
             ll_addr: Mips4Cp0LlAddr::from_bits(0),
+            watch_lo: Mips4Cp0WatchLo::from_bits(0),
+            watch_hi: Mips4Cp0WatchHi::from_bits(0),
             x_context: Mips4Cp0XContext::from_bits(0),
             ecc: Mips4Cp0Ecc::from_bits(0),
             cache_err: Mips4Cp0CacheErr::from_bits(0),
@@ -1180,6 +1228,16 @@ impl Mips4Cp0 {
         self.ll_addr
     }
 
+    /// Returns the typed `WatchLo` register.
+    pub const fn watch_lo(self) -> Mips4Cp0WatchLo {
+        self.watch_lo
+    }
+
+    /// Returns the typed `WatchHi` register.
+    pub const fn watch_hi(self) -> Mips4Cp0WatchHi {
+        self.watch_hi
+    }
+
     /// Returns the typed `XContext` register.
     pub const fn x_context(self) -> Mips4Cp0XContext {
         self.x_context
@@ -1230,6 +1288,8 @@ impl Mips4Cp0 {
             Mips4Cp0Register::ProcessorId => self.processor_id.bits() as u64,
             Mips4Cp0Register::Config => self.config.bits() as u64,
             Mips4Cp0Register::LlAddr => self.ll_addr.bits() as u64,
+            Mips4Cp0Register::WatchLo => self.watch_lo.bits() as u64,
+            Mips4Cp0Register::WatchHi => self.watch_hi.bits() as u64,
             Mips4Cp0Register::XContext => self.x_context.bits(),
             Mips4Cp0Register::Ecc => self.ecc.bits() as u64,
             Mips4Cp0Register::CacheErr => self.cache_err.bits() as u64,
@@ -1274,6 +1334,8 @@ impl Mips4Cp0 {
             Mips4Cp0Register::Epc => self.epc = Mips4Cp0Epc::from_bits(value),
             Mips4Cp0Register::Config => self.config = Mips4Cp0Config::from_bits(value as u32),
             Mips4Cp0Register::LlAddr => self.ll_addr = Mips4Cp0LlAddr::from_bits(value),
+            Mips4Cp0Register::WatchLo => self.watch_lo = Mips4Cp0WatchLo::from_bits(value),
+            Mips4Cp0Register::WatchHi => self.watch_hi = Mips4Cp0WatchHi::from_bits(value),
             Mips4Cp0Register::XContext => self.x_context = Mips4Cp0XContext::from_bits(value),
             Mips4Cp0Register::Ecc => self.ecc = Mips4Cp0Ecc::from_bits(value as u32),
             Mips4Cp0Register::TagLo => self.tag_lo = Mips4Cp0TagLo::from_bits(value as u32),
