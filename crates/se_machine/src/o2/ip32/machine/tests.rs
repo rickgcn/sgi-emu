@@ -1,5 +1,6 @@
 use se_core::role::BusDeviceRole;
 use se_core::tracing::{TraceRecord, TraceSink, TraceValue};
+use se_device::bus::irq::IrqTransaction;
 use se_device::chipset::crime::config::{CrimeAccessPolicy, CrimeConfigError, CrimeSdramBankSize};
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
@@ -16,9 +17,14 @@ use super::*;
 const LUI_R1_LINEAR_RAM: u32 = 0x3c01_4000;
 const LUI_R1_CRIME: u32 = 0x3c01_1400;
 const ADDIU_R2_1234: u32 = 0x2402_1234;
+const ADDIU_R2_1: u32 = 0x2402_0001;
+const ADDIU_R2_SOFT_RESET: u32 = 0x2402_0400;
 const SW_R2_R1: u32 = 0xac22_0000;
 const LW_R3_R1: u32 = 0x8c23_0000;
 const LD_R3_R1: u32 = 0xdc23_0000;
+const SD_R2_R1_CONTROL: u32 = 0xfc22_0008;
+const SD_R2_R1_INTERRUPT_ENABLE: u32 = 0xfc22_0018;
+const SD_R2_R1_SOFTWARE_INTERRUPT: u32 = 0xfc22_0020;
 const WAIT: u32 = 0x4200_0020;
 
 fn config_with_program(words: &[(usize, u32)]) -> Ip32MachineConfig {
@@ -27,6 +33,22 @@ fn config_with_program(words: &[(usize, u32)]) -> Ip32MachineConfig {
         config.prom_image[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
     }
     config
+}
+
+fn drive_crime_irq(machine: &mut Ip32Machine, asserted: bool) {
+    let registry = machine.runtime_mut().registry_mut();
+    registry
+        .get_typed_mut::<IrqBus>(component_ids::CPU_IRQ_BUS)
+        .unwrap()
+        .route(IrqTransaction {
+            source: IrqSource {
+                component: component_ids::CRIME,
+                output: CRIME_IRQ_OUTPUT,
+            },
+            asserted,
+        })
+        .unwrap();
+    drain_irq_bus(registry).unwrap();
 }
 
 #[test]
@@ -53,8 +75,13 @@ fn construction_registers_the_role_oriented_ip32_topology() {
     let machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
     let registry = machine.runtime().registry();
 
-    assert_eq!(registry.len(), 11);
+    assert_eq!(registry.len(), 12);
     assert!(registry.get_typed::<R5000Cpu>(component_ids::CPU0).is_ok());
+    assert!(
+        registry
+            .get_typed::<IrqBus>(component_ids::CPU_IRQ_BUS)
+            .is_ok()
+    );
     assert!(
         registry
             .get_typed::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)
@@ -93,6 +120,87 @@ fn construction_registers_the_role_oriented_ip32_topology() {
             .is_ok()
     );
     assert!(registry.get_typed::<Rom>(component_ids::PROM).is_ok());
+}
+
+#[test]
+fn crime_irq_output_reaches_r5000_ip2_only_through_the_irq_bus() {
+    let mut machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
+
+    drive_crime_irq(&mut machine, true);
+    let cpu = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    assert_eq!(cpu.state().external_interrupts(), 0x04);
+    assert_eq!(cpu.state().cp0().cause().interrupt_pending() & 0x04, 0x04);
+
+    drive_crime_irq(&mut machine, false);
+    let cpu = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    assert_eq!(cpu.state().external_interrupts(), 0);
+    assert_eq!(cpu.state().cp0().cause().interrupt_pending() & 0x04, 0);
+}
+
+#[test]
+fn hard_reset_clears_cpu_and_irq_bus_levels() {
+    let mut machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
+    drive_crime_irq(&mut machine, true);
+
+    machine.schedule_power_on().unwrap();
+    let _ = machine.run_steps(1).unwrap();
+    let cpu = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    assert_eq!(cpu.state().external_interrupts(), 0);
+
+    drive_crime_irq(&mut machine, true);
+
+    machine.hard_reset().unwrap();
+
+    let cpu = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    assert_eq!(cpu.state().external_interrupts(), 0);
+    drive_crime_irq(&mut machine, true);
+    let cpu = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    assert_eq!(cpu.state().external_interrupts(), 0x04);
+}
+
+#[test]
+fn warm_reset_preserves_the_routed_crime_irq_level() {
+    let config = config_with_program(&[
+        (0, LUI_R1_CRIME),
+        (4, ADDIU_R2_1),
+        (8, SD_R2_R1_INTERRUPT_ENABLE),
+        (12, SD_R2_R1_SOFTWARE_INTERRUPT),
+        (16, ADDIU_R2_SOFT_RESET),
+        (20, SD_R2_R1_CONTROL),
+        (24, WAIT),
+    ]);
+    let mut machine = Ip32Machine::from_config(config).unwrap();
+    machine.schedule_power_on().unwrap();
+
+    let _ = machine.run_steps(100).unwrap();
+
+    assert!(machine.control.cpu_generation > 1);
+    let cpu = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    assert_eq!(cpu.state().external_interrupts(), 0x04);
 }
 
 #[test]

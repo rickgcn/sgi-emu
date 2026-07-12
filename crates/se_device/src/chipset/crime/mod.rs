@@ -23,18 +23,19 @@ use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::scheduler::SimTime;
 use se_core::tracing::TraceLevel;
 
+use crate::bus::irq::{IrqSource, IrqTransaction};
 use crate::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransactionId};
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 
 use self::config::{CrimeAccessPolicy, CrimeConfig, CrimeConfigError};
 use self::piu::{CrimePiu, PiuEffect};
 use self::protocol::{
-    CrimeAction, CrimeBusError, CrimeCgiCompletion, CrimeCgiTransaction, CrimeCmiCompletion,
-    CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal, CrimeDmaRequest, CrimeEvent,
-    CrimeInterruptPost, CrimeLinkDeviceResponse, CrimeLinkOperation, CrimeMemoryClient,
-    CrimeMemoryCompletion, CrimeMemoryTransaction, CrimePioRequest, CrimePoll, CrimeSdramSignal,
-    CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceField, CrimeTraceValue, CrimeTransactionId,
-    CrimeTransfer,
+    CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusError, CrimeCgiCompletion, CrimeCgiTransaction,
+    CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal,
+    CrimeDmaRequest, CrimeEvent, CrimeInterruptPost, CrimeLinkDeviceResponse, CrimeLinkOperation,
+    CrimeMemoryClient, CrimeMemoryCompletion, CrimeMemoryTransaction, CrimePioRequest, CrimePoll,
+    CrimeSdramSignal, CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceField, CrimeTraceValue,
+    CrimeTransactionId, CrimeTransfer,
 };
 use self::render::{CrimeRender, RenderWriteError};
 
@@ -791,11 +792,14 @@ impl Crime {
 
     fn apply_piu_effect(&mut self, effect: PiuEffect) {
         match effect {
-            PiuEffect::InterruptIp2(asserted) => {
-                self.actions
-                    .push_back(CrimeAction::SignalCpu(CrimeCpuSignal::InterruptIp2(
-                        asserted,
-                    )))
+            PiuEffect::InterruptOutput(asserted) => {
+                self.actions.push_back(CrimeAction::SetIrq(IrqTransaction {
+                    source: IrqSource {
+                        component: self.id,
+                        output: CRIME_IRQ_OUTPUT,
+                    },
+                    asserted,
+                }))
             }
             PiuEffect::ArmWatchdog {
                 epoch,

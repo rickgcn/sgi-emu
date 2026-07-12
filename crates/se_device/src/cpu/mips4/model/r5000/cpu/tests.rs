@@ -98,11 +98,73 @@ fn count_uses_half_pclock_remainder_without_drift() {
 }
 
 #[test]
-fn bus_device_signals_update_interrupt_lines() {
+fn irq_bus_deliveries_update_external_interrupt_lines() {
     let mut cpu = cpu();
-    BusDeviceRole::accept(&mut cpu, R5000CpuSignal::ExternalInterrupts(0x24));
-    assert_eq!(cpu.state().external_interrupts(), 0x24);
-    assert_eq!(cpu.state().cp0().cause().interrupt_pending() & 0x24, 0x24);
+    for input in [
+        R5000_IRQ_IP2,
+        R5000_IRQ_IP3,
+        R5000_IRQ_IP4,
+        R5000_IRQ_IP5,
+        R5000_IRQ_IP6,
+    ] {
+        BusDeviceRole::accept(
+            &mut cpu,
+            IrqDelivery {
+                input,
+                asserted: true,
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(cpu.state().external_interrupts(), 0x7c);
+    assert_eq!(cpu.state().cp0().cause().interrupt_pending() & 0x7c, 0x7c);
+
+    BusDeviceRole::accept(
+        &mut cpu,
+        IrqDelivery {
+            input: R5000_IRQ_IP4,
+            asserted: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(cpu.state().external_interrupts(), 0x6c);
+}
+
+#[test]
+fn irq_bus_deliveries_reject_non_external_inputs() {
+    for input in [IrqInput::new(0), IrqInput::new(1), IrqInput::new(7)] {
+        let mut cpu = cpu();
+        assert_eq!(
+            BusDeviceRole::accept(
+                &mut cpu,
+                IrqDelivery {
+                    input,
+                    asserted: true,
+                },
+            ),
+            Err(R5000IrqError::UnsupportedInput(input))
+        );
+        assert_eq!(cpu.state().external_interrupts(), 0);
+    }
+}
+
+#[test]
+fn soft_reset_preserves_irq_inputs_and_component_reset_clears_them() {
+    let mut cpu = cpu();
+    BusDeviceRole::accept(
+        &mut cpu,
+        IrqDelivery {
+            input: R5000_IRQ_IP2,
+            asserted: true,
+        },
+    )
+    .unwrap();
+
+    BusDeviceRole::accept(&mut cpu, R5000CpuSignal::SoftReset);
+    assert_eq!(cpu.state().external_interrupts(), 0x04);
+
+    Component::reset(&mut cpu);
+    assert_eq!(cpu.state().external_interrupts(), 0);
 }
 
 #[test]
@@ -176,7 +238,14 @@ fn wait_idle_does_not_advance_random_or_count() {
     assert_eq!(cpu.state().cp0().random().bits(), random);
     assert_eq!(cpu.state().cp0().count().bits(), count);
 
-    BusDeviceRole::accept(&mut cpu, R5000CpuSignal::ExternalInterrupts(0x04));
+    BusDeviceRole::accept(
+        &mut cpu,
+        IrqDelivery {
+            input: R5000_IRQ_IP2,
+            asserted: true,
+        },
+    )
+    .unwrap();
     assert!(matches!(
         cpu.poll().unwrap(),
         ExecutionAction::Transaction(_)

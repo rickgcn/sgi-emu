@@ -38,6 +38,9 @@ pub const PCI_BUS: ComponentId = ip32_id(0x0104);
 /// MACE-managed ISA island.
 pub const ISA_BUS: ComponentId = ip32_id(0x0105);
 
+/// CPU external interrupt communication domain.
+pub const CPU_IRQ_BUS: ComponentId = ip32_id(0x0106);
+
 /// Primary MIPS CPU core.
 pub const CPU0: ComponentId = ip32_id(0x0200);
 
@@ -117,7 +120,7 @@ pub const VIDEO_OUTPUT: ComponentId = ip32_id(0x050b);
 pub const PCI_SLOT0: ComponentId = ip32_id(0x050c);
 
 /// All IP32 component identifiers in stable definition order.
-pub const ALL_COMPONENT_IDS: [ComponentId; 33] = [
+pub const ALL_COMPONENT_IDS: [ComponentId; 34] = [
     MACHINE,
     CPU_SYSAD_BUS,
     CRIME_MEMORY_DOMAIN,
@@ -125,6 +128,7 @@ pub const ALL_COMPONENT_IDS: [ComponentId; 33] = [
     CRIME_GBE_LINK,
     PCI_BUS,
     ISA_BUS,
+    CPU_IRQ_BUS,
     CPU0,
     FPU0,
     ICACHE0,
@@ -154,13 +158,14 @@ pub const ALL_COMPONENT_IDS: [ComponentId; 33] = [
 ];
 
 /// IP32 bus and communication-domain component identifiers.
-pub const BUS_COMPONENT_IDS: [ComponentId; 6] = [
+pub const BUS_COMPONENT_IDS: [ComponentId; 7] = [
     CPU_SYSAD_BUS,
     CRIME_MEMORY_DOMAIN,
     CRIME_MACE_LINK,
     CRIME_GBE_LINK,
     PCI_BUS,
     ISA_BUS,
+    CPU_IRQ_BUS,
 ];
 
 #[cfg(test)]

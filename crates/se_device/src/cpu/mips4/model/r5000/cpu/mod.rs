@@ -7,6 +7,7 @@ use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_float::backend::FloatBackend;
 use se_float::backend::softfloat3::SoftFloat3Backend;
 
+use crate::bus::irq::{IrqDelivery, IrqInput};
 use crate::cpu::execution::functional::FunctionalExecutor;
 use crate::cpu::execution::protocol::{
     ExecutionAction, ExecutionCompletion, FunctionalExecutorError,
@@ -25,9 +26,6 @@ use super::profile::R5000Profile;
 /// External signal delivered to the R5000 through its bus-device role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum R5000CpuSignal {
-    /// Replaces the external hardware interrupt levels.
-    ExternalInterrupts(u8),
-
     /// Invalidates an outstanding load-linked reservation.
     InvalidateReservation,
 
@@ -40,6 +38,40 @@ pub enum R5000CpuSignal {
     /// Raises a cache-error exception unless cache errors are disabled.
     CacheError(Mips4Cp0CacheErr),
 }
+
+/// R5000 external hardware interrupt input IP2.
+pub const R5000_IRQ_IP2: IrqInput = IrqInput::new(2);
+
+/// R5000 external hardware interrupt input IP3.
+pub const R5000_IRQ_IP3: IrqInput = IrqInput::new(3);
+
+/// R5000 external hardware interrupt input IP4.
+pub const R5000_IRQ_IP4: IrqInput = IrqInput::new(4);
+
+/// R5000 external hardware interrupt input IP5.
+pub const R5000_IRQ_IP5: IrqInput = IrqInput::new(5);
+
+/// R5000 external hardware interrupt input IP6.
+pub const R5000_IRQ_IP6: IrqInput = IrqInput::new(6);
+
+/// R5000 interrupt delivery error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum R5000IrqError {
+    /// The delivery named an input that is not externally driven on this CPU.
+    UnsupportedInput(IrqInput),
+}
+
+impl fmt::Display for R5000IrqError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedInput(input) => {
+                write!(f, "unsupported R5000 IRQ input {}", input.get())
+            }
+        }
+    }
+}
+
+impl std::error::Error for R5000IrqError {}
 
 /// Terminal functional R5000 execution error.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -207,9 +239,6 @@ where
 
     fn accept(&mut self, signal: R5000CpuSignal) {
         let signal = match signal {
-            R5000CpuSignal::ExternalInterrupts(levels) => {
-                Mips4ExecutionSignal::ExternalInterrupts(levels)
-            }
             R5000CpuSignal::InvalidateReservation => Mips4ExecutionSignal::InvalidateReservation,
             R5000CpuSignal::SoftReset => Mips4ExecutionSignal::SoftReset,
             R5000CpuSignal::NonMaskableInterrupt => Mips4ExecutionSignal::NonMaskableInterrupt,
@@ -218,6 +247,30 @@ where
             }
         };
         self.executor.signal(signal);
+    }
+}
+
+impl<F> BusDeviceRole<IrqDelivery> for R5000Cpu<F>
+where
+    F: FloatBackend,
+{
+    type Response = Result<(), R5000IrqError>;
+
+    fn accept(&mut self, delivery: IrqDelivery) -> Self::Response {
+        let input = delivery.input.get();
+        if !(R5000_IRQ_IP2.get()..=R5000_IRQ_IP6.get()).contains(&input) {
+            return Err(R5000IrqError::UnsupportedInput(delivery.input));
+        }
+        let mask = 1_u8 << input;
+        let current = self.state().external_interrupts();
+        let levels = if delivery.asserted {
+            current | mask
+        } else {
+            current & !mask
+        };
+        self.executor
+            .signal(Mips4ExecutionSignal::ExternalInterrupts(levels));
+        Ok(())
     }
 }
 

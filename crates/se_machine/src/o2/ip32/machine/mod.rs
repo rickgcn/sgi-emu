@@ -6,15 +6,18 @@ use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole, BusRole};
 use se_core::scheduler::{ScheduledEvent, ScheduledEventId, SchedulerError, SimDuration, SimTime};
 use se_core::tracing::{NoopTraceSink, TraceField, TraceLevel, TraceSink, TraceSource};
+use se_device::bus::irq::{
+    IrqBus, IrqBusAction, IrqBusBuildError, IrqBusRouteError, IrqRoute, IrqSource, IrqTarget,
+};
 use se_device::chipset::crime::config::CrimeConfig;
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
 use se_device::chipset::crime::memory::bus::CrimeMemoryBus;
 use se_device::chipset::crime::protocol::{
-    CrimeAction, CrimeBusAction, CrimeBusDisposition, CrimeCgiTransaction, CrimeCmiCompletion,
-    CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal, CrimeLinkDeviceResponse,
-    CrimeMemoryTransaction, CrimePoll, CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceValue,
-    CrimeTransfer,
+    CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusAction, CrimeBusDisposition, CrimeCgiTransaction,
+    CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal,
+    CrimeLinkDeviceResponse, CrimeMemoryTransaction, CrimePoll, CrimeSysAdRequest, CrimeTraceEvent,
+    CrimeTraceValue, CrimeTransfer,
 };
 use se_device::chipset::crime::{Crime, CrimeError};
 use se_device::cpu::execution::protocol::{
@@ -23,7 +26,9 @@ use se_device::cpu::execution::protocol::{
 use se_device::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use se_device::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
-use se_device::cpu::mips4::model::r5000::cpu::{R5000Cpu, R5000CpuError, R5000CpuSignal};
+use se_device::cpu::mips4::model::r5000::cpu::{
+    R5000_IRQ_IP2, R5000Cpu, R5000CpuError, R5000CpuSignal, R5000IrqError,
+};
 use se_device::cpu::mips4::model::r5000::profile::R5000Profile;
 use se_device::cpu::mips4::model::r5000::revision::R5000Revision;
 use se_device::memory::{MemoryResponse, MemoryTransaction, Rom};
@@ -88,6 +93,9 @@ pub enum Ip32MachineBuildError {
     /// CRIME configuration is invalid.
     Crime(CrimeError),
 
+    /// The CPU interrupt routing table is invalid.
+    IrqBus(IrqBusBuildError),
+
     /// PROM image does not have the fixed hardware size.
     InvalidPromSize {
         /// Requested image size in bytes.
@@ -111,6 +119,7 @@ impl fmt::Display for Ip32MachineBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Crime(error) => write!(f, "failed to construct CRIME: {error}"),
+            Self::IrqBus(error) => write!(f, "failed to construct IP32 IRQ bus: {error}"),
             Self::InvalidPromSize { size_bytes } => {
                 write!(f, "invalid IP32 PROM size: {size_bytes} bytes")
             }
@@ -137,6 +146,12 @@ pub enum Ip32MachineDispatchError {
     /// CRIME reported an internal protocol error.
     Crime(CrimeError),
 
+    /// The IRQ bus rejected a source transaction.
+    IrqBus(IrqBusRouteError),
+
+    /// The R5000 rejected an IRQ bus delivery.
+    CpuIrq(R5000IrqError),
+
     /// A follow-up event could not be scheduled.
     Scheduler(SchedulerError),
 
@@ -153,6 +168,8 @@ impl fmt::Display for Ip32MachineDispatchError {
             Self::Registry(error) => write!(f, "IP32 component lookup failed: {error}"),
             Self::Cpu(error) => write!(f, "IP32 CPU execution failed: {error}"),
             Self::Crime(error) => write!(f, "CRIME dispatch failed: {error}"),
+            Self::IrqBus(error) => write!(f, "IP32 IRQ routing failed: {error}"),
+            Self::CpuIrq(error) => write!(f, "IP32 CPU IRQ delivery failed: {error}"),
             Self::Scheduler(error) => write!(f, "IP32 event scheduling failed: {error}"),
             Self::GenerationOverflow => write!(f, "IP32 reset generation overflow"),
             Self::UnexpectedController(id) => {
@@ -179,6 +196,18 @@ impl From<R5000CpuError> for Ip32MachineDispatchError {
 impl From<CrimeError> for Ip32MachineDispatchError {
     fn from(error: CrimeError) -> Self {
         Self::Crime(error)
+    }
+}
+
+impl From<IrqBusRouteError> for Ip32MachineDispatchError {
+    fn from(error: IrqBusRouteError) -> Self {
+        Self::IrqBus(error)
+    }
+}
+
+impl From<R5000IrqError> for Ip32MachineDispatchError {
+    fn from(error: R5000IrqError) -> Self {
+        Self::CpuIrq(error)
     }
 }
 
@@ -277,6 +306,21 @@ impl<S> Ip32Machine<S> {
             component_ids::GBE,
         )
         .map_err(Ip32MachineBuildError::Crime)?;
+        let irq_bus = IrqBus::new(
+            component_ids::CPU_IRQ_BUS,
+            "CPU IRQ bus",
+            [IrqRoute {
+                source: IrqSource {
+                    component: component_ids::CRIME,
+                    output: CRIME_IRQ_OUTPUT,
+                },
+                target: IrqTarget {
+                    component: component_ids::CPU0,
+                    input: R5000_IRQ_IP2,
+                },
+            }],
+        )
+        .map_err(Ip32MachineBuildError::IrqBus)?;
 
         let mut runtime = Runtime::with_trace_sink(sink);
         let registry = runtime.registry_mut();
@@ -292,6 +336,7 @@ impl<S> Ip32Machine<S> {
                 66_666_500,
             )),
         )?;
+        insert_component(registry, Box::new(irq_bus))?;
         insert_component(registry, Box::new(crime))?;
         insert_component(
             registry,
@@ -529,6 +574,9 @@ where
         .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
         .reset();
     registry
+        .get_typed_mut::<IrqBus>(component_ids::CPU_IRQ_BUS)?
+        .reset();
+    registry
         .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
         .hard_reset();
     registry
@@ -574,6 +622,9 @@ where
     advance_cpu_generation(control)?;
     registry
         .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
+        .reset();
+    registry
+        .get_typed_mut::<IrqBus>(component_ids::CPU_IRQ_BUS)?
         .reset();
     registry
         .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
@@ -730,10 +781,11 @@ where
                     .accept_device_completion(completion);
                 drain_sysad_bus(registry, context, control)?;
             }
-            CrimeAction::SignalCpu(CrimeCpuSignal::InterruptIp2(asserted)) => {
+            CrimeAction::SetIrq(transaction) => {
                 registry
-                    .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
-                    .accept(R5000CpuSignal::ExternalInterrupts(u8::from(asserted)));
+                    .get_typed_mut::<IrqBus>(component_ids::CPU_IRQ_BUS)?
+                    .route(transaction)?;
+                drain_irq_bus(registry)?;
             }
             CrimeAction::SignalCpu(CrimeCpuSignal::WarmReset) => {
                 warm_reset(registry, context, control)?;
@@ -747,6 +799,25 @@ where
                     .accept(signal);
             }
             CrimeAction::Trace(event) => trace_crime(context, event),
+        }
+    }
+}
+
+fn drain_irq_bus(registry: &mut ComponentRegistry) -> Result<(), Ip32MachineDispatchError> {
+    loop {
+        match registry
+            .get_typed_mut::<IrqBus>(component_ids::CPU_IRQ_BUS)?
+            .poll()
+        {
+            IrqBusAction::Deliver { target, delivery } => {
+                if target != component_ids::CPU0 {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                }
+                registry
+                    .get_typed_mut::<R5000Cpu>(target)?
+                    .accept(delivery)?;
+            }
+            IrqBusAction::Idle => return Ok(()),
         }
     }
 }

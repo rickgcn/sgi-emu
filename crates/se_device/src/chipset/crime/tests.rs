@@ -50,6 +50,19 @@ fn next_non_trace(crime: &mut Crime) -> CrimeAction {
     }
 }
 
+fn enable_interrupt_bit(crime: &mut Crime, bit: u8) {
+    let effects = crime
+        .piu
+        .write(
+            registers::INTERRUPT_ENABLE,
+            1_u64 << bit,
+            SimTime::ZERO,
+            TIMEBASE_HZ,
+        )
+        .effects;
+    crime.apply_piu_effects(effects);
+}
+
 #[test]
 fn crime_implements_all_required_topological_roles() {
     fn sysad_device<T: BusDeviceRole<CrimeSysAdRequest>>() {}
@@ -65,6 +78,74 @@ fn crime_implements_all_required_topological_roles() {
     cgi_controller::<Crime>();
     cmi_device::<Crime>();
     cgi_device::<Crime>();
+}
+
+#[test]
+fn mace_interrupt_posts_drive_the_crime_irq_output() {
+    let mut crime = crime();
+    enable_interrupt_bit(&mut crime, 3);
+    assert!(matches!(
+        BusDeviceRole::accept(
+            &mut crime,
+            CrimeCmiTransaction {
+                id: CrimeTransactionId::new(1),
+                controller: MACE,
+                target: CRIME,
+                operation: CrimeLinkOperation::InterruptPost(CrimeInterruptPost {
+                    interrupt_bit: 3,
+                    asserted: true,
+                }),
+            }
+        ),
+        CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
+            result: Ok(CrimeCompletionPayload::WriteComplete),
+            ..
+        })
+    ));
+    assert_eq!(
+        next_non_trace(&mut crime),
+        CrimeAction::SetIrq(IrqTransaction {
+            source: IrqSource {
+                component: CRIME,
+                output: CRIME_IRQ_OUTPUT,
+            },
+            asserted: true,
+        })
+    );
+}
+
+#[test]
+fn gbe_interrupt_posts_drive_the_crime_irq_output() {
+    let mut crime = crime();
+    enable_interrupt_bit(&mut crime, 7);
+    assert!(matches!(
+        BusDeviceRole::accept(
+            &mut crime,
+            CrimeCgiTransaction {
+                id: CrimeTransactionId::new(2),
+                controller: GBE,
+                target: CRIME,
+                operation: CrimeLinkOperation::InterruptPost(CrimeInterruptPost {
+                    interrupt_bit: 7,
+                    asserted: true,
+                }),
+            }
+        ),
+        CrimeLinkDeviceResponse::Complete(CrimeCgiCompletion {
+            result: Ok(CrimeCompletionPayload::WriteComplete),
+            ..
+        })
+    ));
+    assert_eq!(
+        next_non_trace(&mut crime),
+        CrimeAction::SetIrq(IrqTransaction {
+            source: IrqSource {
+                component: CRIME,
+                output: CRIME_IRQ_OUTPUT,
+            },
+            asserted: true,
+        })
+    );
 }
 
 #[test]

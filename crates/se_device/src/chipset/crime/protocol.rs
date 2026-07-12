@@ -6,8 +6,12 @@ use se_core::component::ComponentId;
 use se_core::scheduler::{SimDuration, SimTime};
 use se_core::tracing::TraceLevel;
 
+use crate::bus::irq::{IrqOutput, IrqTransaction};
 use crate::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransaction};
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
+
+/// CRIME's single processor interrupt output.
+pub const CRIME_IRQ_OUTPUT: IrqOutput = IrqOutput::new(0);
 
 /// Identifier correlating one CRIME transaction and completion.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -376,9 +380,6 @@ pub enum CrimeEvent {
 /// CPU-facing signal emitted by CRIME.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CrimeCpuSignal {
-    /// Replaces the CRIME-driven R5000 IP2 level.
-    InterruptIp2(bool),
-
     /// Requests an R5000 warm reset.
     WarmReset,
 
@@ -454,6 +455,9 @@ pub enum CrimeAction {
 
     /// Completes the outstanding CPU transaction.
     CompleteSysAd(ExecutionCompletion<Mips4ExecutionCompletion>),
+
+    /// Drives CRIME's interrupt output through the attached IRQ bus.
+    SetIrq(IrqTransaction),
 
     /// Delivers an external CPU signal.
     SignalCpu(CrimeCpuSignal),

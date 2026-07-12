@@ -10,8 +10,8 @@ const WATCHDOG_THRESHOLD_CRIME_CYCLES: u64 = (1 << 19) * 64;
 /// Side effect produced by a processor-interface register transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PiuEffect {
-    /// The combined enabled interrupt level changed.
-    InterruptIp2(bool),
+    /// The combined enabled interrupt output changed.
+    InterruptOutput(bool),
 
     /// Arms one watchdog stage.
     ArmWatchdog {
@@ -71,7 +71,7 @@ pub struct CrimePiu {
     timer_base_time: SimTime,
     cpu_error_address: u64,
     cpu_error_status: u64,
-    ip2_asserted: bool,
+    interrupt_output_asserted: bool,
 }
 
 impl CrimePiu {
@@ -88,7 +88,7 @@ impl CrimePiu {
             timer_base_time: SimTime::ZERO,
             cpu_error_address: 0,
             cpu_error_status: 0,
-            ip2_asserted: false,
+            interrupt_output_asserted: false,
         }
     }
 
@@ -104,7 +104,7 @@ impl CrimePiu {
         self.timer_base_time = now;
         self.cpu_error_address = 0;
         self.cpu_error_status = 0;
-        self.ip2_asserted = false;
+        self.interrupt_output_asserted = false;
     }
 
     /// Restores hard-reset PIU state without changing simulated time.
@@ -117,9 +117,9 @@ impl CrimePiu {
         self.hardware_interrupt | self.software_interrupt
     }
 
-    /// Returns whether enabled CRIME interrupts assert R5000 IP2.
-    pub const fn ip2_asserted(&self) -> bool {
-        self.ip2_asserted
+    /// Returns whether enabled CRIME interrupts assert its processor output.
+    pub const fn interrupt_output_asserted(&self) -> bool {
+        self.interrupt_output_asserted
     }
 
     /// Reads a defined PIU register.
@@ -173,18 +173,18 @@ impl CrimePiu {
             }
             registers::INTERRUPT_ENABLE => {
                 self.interrupt_enable = value as u32;
-                self.push_ip2_change(&mut result.effects);
+                self.push_interrupt_output_change(&mut result.effects);
             }
             registers::SOFTWARE_INTERRUPT => {
                 self.software_interrupt = value as u32 & registers::SOFTWARE_INTERRUPT_MASK;
-                self.push_ip2_change(&mut result.effects);
+                self.push_interrupt_output_change(&mut result.effects);
             }
             registers::HARDWARE_INTERRUPT => {
                 let read_only =
                     self.hardware_interrupt & !registers::HARDWARE_INTERRUPT_WRITABLE_MASK;
                 self.hardware_interrupt =
                     read_only | (value as u32 & registers::HARDWARE_INTERRUPT_WRITABLE_MASK);
-                self.push_ip2_change(&mut result.effects);
+                self.push_interrupt_output_change(&mut result.effects);
             }
             registers::WATCHDOG => {
                 self.watchdog = value
@@ -204,7 +204,7 @@ impl CrimePiu {
                 self.cpu_error_status = value & registers::CPU_ERROR_MASK;
                 if self.cpu_error_status == 0 {
                     self.set_hardware_level(registers::INTERRUPT_CPU_ERROR, false);
-                    self.push_ip2_change(&mut result.effects);
+                    self.push_interrupt_output_change(&mut result.effects);
                 }
             }
             _ => return PiuWriteResult::unhandled(),
@@ -219,13 +219,13 @@ impl CrimePiu {
         } else {
             self.hardware_interrupt &= !mask;
         }
-        self.take_ip2_change()
+        self.take_interrupt_output_change()
     }
 
     /// Latches one edge-sensitive hardware source.
     pub fn latch_hardware_edge(&mut self, mask: u32) -> Option<PiuEffect> {
         self.hardware_interrupt |= mask & registers::HARDWARE_INTERRUPT_WRITABLE_MASK;
-        self.take_ip2_change()
+        self.take_interrupt_output_change()
     }
 
     /// Records the first CPU interface error and asserts its interrupt.
@@ -276,19 +276,19 @@ impl CrimePiu {
         }
     }
 
-    fn push_ip2_change(&mut self, effects: &mut Vec<PiuEffect>) {
-        if let Some(effect) = self.take_ip2_change() {
+    fn push_interrupt_output_change(&mut self, effects: &mut Vec<PiuEffect>) {
+        if let Some(effect) = self.take_interrupt_output_change() {
             effects.push(effect);
         }
     }
 
-    fn take_ip2_change(&mut self) -> Option<PiuEffect> {
+    fn take_interrupt_output_change(&mut self) -> Option<PiuEffect> {
         let asserted = self.interrupt_status() & self.interrupt_enable != 0;
-        if asserted == self.ip2_asserted {
+        if asserted == self.interrupt_output_asserted {
             return None;
         }
-        self.ip2_asserted = asserted;
-        Some(PiuEffect::InterruptIp2(asserted))
+        self.interrupt_output_asserted = asserted;
+        Some(PiuEffect::InterruptOutput(asserted))
     }
 }
 

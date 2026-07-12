@@ -362,6 +362,18 @@ fn cause_write_only_updates_software_interrupt_bits() {
 }
 
 #[test]
+fn external_interrupt_updates_preserve_software_and_timer_pending_bits() {
+    let mut cp0 = Mips4Cp0::new(0, 0, 47);
+    cp0.cause = Mips4Cp0Cause::from_bits(CAUSE_TIMER_IP | CAUSE_SOFTWARE_IP_MASK);
+
+    cp0.set_external_interrupts(0x7c);
+    assert_eq!(cp0.cause().interrupt_pending(), 0xff);
+
+    cp0.set_external_interrupts(0);
+    assert_eq!(cp0.cause().interrupt_pending(), 0x83);
+}
+
+#[test]
 fn compare_write_clears_timer_interrupt_pending() {
     let mut cp0 = Mips4Cp0::new(0, 0, 47);
     cp0.cause = Mips4Cp0Cause::from_bits(CAUSE_TIMER_IP | CAUSE_SOFTWARE_IP_MASK);

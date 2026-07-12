@@ -32,7 +32,7 @@ fn crime_timer_uses_the_documented_master_frequency() {
 }
 
 #[test]
-fn enabled_interrupt_changes_ip2_only_when_combined_status_changes() {
+fn enabled_interrupt_changes_output_only_when_combined_status_changes() {
     let mut piu = CrimePiu::new();
     assert_eq!(
         piu.write(
@@ -46,7 +46,7 @@ fn enabled_interrupt_changes_ip2_only_when_combined_status_changes() {
     );
     assert_eq!(
         piu.set_hardware_level(registers::INTERRUPT_MEMORY_ERROR, true),
-        Some(PiuEffect::InterruptIp2(true))
+        Some(PiuEffect::InterruptOutput(true))
     );
     assert_eq!(
         piu.set_hardware_level(registers::INTERRUPT_MEMORY_ERROR, true),
@@ -54,7 +54,7 @@ fn enabled_interrupt_changes_ip2_only_when_combined_status_changes() {
     );
     assert_eq!(
         piu.set_hardware_level(registers::INTERRUPT_MEMORY_ERROR, false),
-        Some(PiuEffect::InterruptIp2(false))
+        Some(PiuEffect::InterruptOutput(false))
     );
 }
 

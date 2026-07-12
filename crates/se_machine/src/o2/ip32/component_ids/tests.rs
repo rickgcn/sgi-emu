@@ -34,6 +34,7 @@ fn bus_component_ids_are_present_and_distinct() {
             CRIME_GBE_LINK,
             PCI_BUS,
             ISA_BUS,
+            CPU_IRQ_BUS,
         ]
     );
 
