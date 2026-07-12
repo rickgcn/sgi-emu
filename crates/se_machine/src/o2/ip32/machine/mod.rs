@@ -1,6 +1,7 @@
 //! Runtime integration for the SGI O2 IP32 machine profile.
 
 use core::fmt;
+use std::collections::VecDeque;
 
 use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole, BusRole};
@@ -13,7 +14,7 @@ use se_device::bus::irq::{
 use se_device::bus::isa::{
     IsaBus, IsaBusAction, IsaBusDisposition, IsaCompletion, IsaDeviceResponse, IsaTransaction,
 };
-use se_device::bus::media::{MediaBus, MediaBusAction, MediaTransaction};
+use se_device::bus::media::{MediaBus, MediaBusAction, MediaPayload, MediaPort, MediaTransaction};
 use se_device::bus::pci::{
     PciBus, PciBusAction, PciCompletion, PciConfigurationEndpoint, PciStatus,
 };
@@ -48,14 +49,18 @@ use se_device::cpu::mips4::model::r5000::revision::R5000Revision;
 use se_device::memory::flash::ReadArrayFlash;
 use se_device::parallel::ieee1284::{IEEE1284_IRQ_OUTPUT, Ieee1284, Ieee1284Action};
 use se_device::rtc::ds1687::{DS1687_IRQ_OUTPUT, Ds1687, Ds1687Action, Ds1687Config, Ds1687Error};
-use se_device::serial::uart16550::{UART16550_IRQ_OUTPUT, Uart16550, Uart16550Action};
+use se_device::serial::uart16550::{
+    UART16550_IRQ_OUTPUT, Uart16550, Uart16550Action, Uart16550Config, Uart16550Error,
+};
 use se_runtime::registry::{ComponentRegistry, RegistryError, RegistryLookupError};
 use se_runtime::runtime::{RunError, RunStatus, Runtime, RuntimeContext};
 
 use super::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
 use super::bus::{Ip32GbeEndpoint, Ip32StubEndpoint, Ip32SysAdBus, Ip32SysAdBusAction};
 use super::component_ids;
-use super::event::{Ip32Event, Ip32HostInput, Ip32HostOutput};
+use super::event::{
+    Ip32Event, Ip32HostInput, Ip32HostIoStats, Ip32HostOutput, Ip32SerialOutput, Ip32SerialPort,
+};
 use super::timing::IP32_TIMEBASE_HZ;
 
 const DEFAULT_PROCESSOR_FREQUENCY_HZ: u64 = 180_000_000;
@@ -67,6 +72,7 @@ const SDRAM_REFRESH_TICKS: u64 = 27_000;
 const SDRAM_INITIALIZATION_TICKS: u64 = 120_000;
 const ISA_CYCLE_TICKS: u64 = 1_000;
 const PCI_CYCLE_TICKS: u64 = 30;
+const UART_INPUT_CLOCK_HZ: u64 = 22_000_000;
 
 /// Complete construction input for one IP32 machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,6 +129,9 @@ pub enum Ip32MachineBuildError {
     /// RTC configuration is invalid.
     Rtc(Ds1687Error),
 
+    /// A UART configuration is invalid.
+    Uart(Uart16550Error),
+
     /// The CPU interrupt routing table is invalid.
     IrqBus(IrqBusBuildError),
 
@@ -151,6 +160,7 @@ impl fmt::Display for Ip32MachineBuildError {
             Self::Crime(error) => write!(f, "failed to construct CRIME: {error}"),
             Self::Mace(error) => write!(f, "failed to construct MACE: {error}"),
             Self::Rtc(error) => write!(f, "failed to construct DS1687: {error}"),
+            Self::Uart(error) => write!(f, "failed to construct IP32 UART: {error}"),
             Self::IrqBus(error) => write!(f, "failed to construct IP32 IRQ bus: {error}"),
             Self::InvalidPromSize { size_bytes } => {
                 write!(f, "invalid IP32 PROM size: {size_bytes} bytes")
@@ -180,6 +190,9 @@ pub enum Ip32MachineDispatchError {
 
     /// MACE reported an internal protocol error.
     Mace(MaceError),
+
+    /// A UART rejected host data.
+    Uart(Uart16550Error),
 
     /// The IRQ bus rejected a source transaction.
     IrqBus(IrqBusRouteError),
@@ -230,6 +243,7 @@ impl fmt::Display for Ip32MachineDispatchError {
             Self::Cpu(error) => write!(f, "IP32 CPU execution failed: {error}"),
             Self::Crime(error) => write!(f, "CRIME dispatch failed: {error}"),
             Self::Mace(error) => write!(f, "MACE dispatch failed: {error}"),
+            Self::Uart(error) => write!(f, "IP32 UART dispatch failed: {error}"),
             Self::IrqBus(error) => write!(f, "IP32 IRQ routing failed: {error}"),
             Self::CpuIrq(error) => write!(f, "IP32 CPU IRQ delivery failed: {error}"),
             Self::Scheduler(error) => write!(f, "IP32 event scheduling failed: {error}"),
@@ -264,6 +278,12 @@ impl From<CrimeError> for Ip32MachineDispatchError {
 impl From<MaceError> for Ip32MachineDispatchError {
     fn from(error: MaceError) -> Self {
         Self::Mace(error)
+    }
+}
+
+impl From<Uart16550Error> for Ip32MachineDispatchError {
+    fn from(error: Uart16550Error) -> Self {
+        Self::Uart(error)
     }
 }
 
@@ -312,12 +332,16 @@ impl CpuClock {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct MachineControl {
     cpu_generation: u64,
     cpu_clock: CpuClock,
+    host_generation: u64,
     host_capacities: MacePortConfig,
     host_reservations: [usize; 12],
+    host_outputs: VecDeque<Ip32HostOutput>,
+    host_output_units: [usize; 12],
+    host_dropped_output_bytes: [u64; 12],
 }
 
 /// SGI O2 IP32 machine with runtime-owned hardware components.
@@ -478,6 +502,15 @@ impl<S> Ip32Machine<S> {
             config.rtc,
         )
         .map_err(Ip32MachineBuildError::Rtc)?;
+        let uart_config = Uart16550Config {
+            input_clock_hz: UART_INPUT_CLOCK_HZ,
+            timebase_hz: IP32_TIMEBASE_HZ,
+            external_queue_capacity: config.mace.ports.byte_stream_bytes,
+        };
+        let serial0 = Uart16550::new(component_ids::SERIAL0, "Serial port 0", uart_config)
+            .map_err(Ip32MachineBuildError::Uart)?;
+        let serial1 = Uart16550::new(component_ids::SERIAL1, "Serial port 1", uart_config)
+            .map_err(Ip32MachineBuildError::Uart)?;
 
         let mut runtime = Runtime::with_trace_sink(sink);
         let registry = runtime.registry_mut();
@@ -583,14 +616,8 @@ impl<S> Ip32Machine<S> {
             )),
         )?;
         insert_component(registry, Box::new(rtc))?;
-        insert_component(
-            registry,
-            Box::new(Uart16550::new(component_ids::SERIAL0, "Serial port 0")),
-        )?;
-        insert_component(
-            registry,
-            Box::new(Uart16550::new(component_ids::SERIAL1, "Serial port 1")),
-        )?;
+        insert_component(registry, Box::new(serial0))?;
+        insert_component(registry, Box::new(serial1))?;
         insert_component(
             registry,
             Box::new(PciConfigurationEndpoint::new(
@@ -615,8 +642,12 @@ impl<S> Ip32Machine<S> {
             control: MachineControl {
                 cpu_generation: 0,
                 cpu_clock: CpuClock::new(processor_frequency_hz),
+                host_generation: 0,
                 host_capacities: config.mace.ports,
                 host_reservations: [0; 12],
+                host_outputs: VecDeque::new(),
+                host_output_units: [0; 12],
+                host_dropped_output_bytes: [0; 12],
             },
         })
     }
@@ -646,35 +677,101 @@ impl<S> Ip32Machine<S> {
         S: TraceSink,
     {
         let index = media_port_index(input.port);
-        let queued = self
-            .runtime
-            .registry()
-            .get_typed::<Mace>(component_ids::MACE)
-            .expect("the IP32 MACE component must remain registered")
-            .host_input_len(input.port);
-        if queued + self.control.host_reservations[index]
-            >= media_port_capacity(self.control.host_capacities, input.port)
+        let units = host_payload_units(&input.payload);
+        let queued = match input.port {
+            MediaPort::Serial0 | MediaPort::Serial1 => self
+                .runtime
+                .registry()
+                .get_typed::<Uart16550>(serial_component(input.port))
+                .expect("the IP32 UART component must remain registered")
+                .external_receive_len(),
+            _ => self
+                .runtime
+                .registry()
+                .get_typed::<Mace>(component_ids::MACE)
+                .expect("the IP32 MACE component must remain registered")
+                .host_input_len(input.port),
+        };
+        if queued + self.control.host_reservations[index] + units
+            > media_port_capacity(self.control.host_capacities, input.port)
         {
             return Err(Ip32HostInputError::QueueFull(input.port));
         }
-        let id = self
-            .runtime
-            .schedule_at(at, component_ids::MACE, Ip32Event::HostInput(input))?;
-        self.control.host_reservations[index] += 1;
+        let id = self.runtime.schedule_at(
+            at,
+            component_ids::MACE_MEDIA_BUS,
+            Ip32Event::HostInput {
+                generation: self.control.host_generation,
+                input,
+            },
+        )?;
+        self.control.host_reservations[index] += units;
         Ok(id)
     }
 
-    /// Removes the oldest host-neutral output produced by MACE.
+    /// Schedules bytes arriving at one physical serial connector.
+    pub fn schedule_serial_input(
+        &mut self,
+        at: SimTime,
+        port: Ip32SerialPort,
+        bytes: Vec<u8>,
+    ) -> Result<ScheduledEventId, Ip32HostInputError>
+    where
+        S: TraceSink,
+    {
+        self.schedule_host_input(
+            at,
+            Ip32HostInput {
+                port: match port {
+                    Ip32SerialPort::Serial1 => MediaPort::Serial0,
+                    Ip32SerialPort::Serial2 => MediaPort::Serial1,
+                },
+                payload: MediaPayload::Bytes(bytes),
+            },
+        )
+    }
+
+    /// Removes the oldest host-neutral output produced by the machine.
     pub fn poll_host_output(&mut self) -> Option<Ip32HostOutput> {
-        self.runtime
-            .registry_mut()
-            .get_typed_mut::<Mace>(component_ids::MACE)
-            .expect("the IP32 MACE component must remain registered")
-            .poll_host_output()
-            .map(|transaction| Ip32HostOutput {
-                port: transaction.port,
-                payload: transaction.payload,
-            })
+        let output = self.control.host_outputs.pop_front()?;
+        let index = media_port_index(output.port);
+        self.control.host_output_units[index] = self.control.host_output_units[index]
+            .saturating_sub(host_payload_units(&output.payload));
+        Some(output)
+    }
+
+    /// Removes the oldest serial output while preserving other host outputs.
+    pub fn poll_serial_output(&mut self) -> Option<Ip32SerialOutput> {
+        let position = self.control.host_outputs.iter().position(|output| {
+            matches!(output.port, MediaPort::Serial0 | MediaPort::Serial1)
+                && matches!(output.payload, MediaPayload::Bytes(_))
+        })?;
+        let output = self
+            .control
+            .host_outputs
+            .remove(position)
+            .expect("located serial output must remain queued");
+        let MediaPayload::Bytes(bytes) = output.payload else {
+            unreachable!("serial output was validated as a byte payload")
+        };
+        let index = media_port_index(output.port);
+        self.control.host_output_units[index] =
+            self.control.host_output_units[index].saturating_sub(bytes.len());
+        Some(Ip32SerialOutput {
+            port: if output.port == MediaPort::Serial0 {
+                Ip32SerialPort::Serial1
+            } else {
+                Ip32SerialPort::Serial2
+            },
+            bytes,
+        })
+    }
+
+    /// Returns host-bound data-loss counters.
+    pub const fn host_io_stats(&self) -> Ip32HostIoStats {
+        Ip32HostIoStats {
+            dropped_output_bytes: self.control.host_dropped_output_bytes,
+        }
     }
 }
 
@@ -832,19 +929,34 @@ where
             registry.get_typed_mut::<I2cBus>(bus_id)?.service();
             drain_i2c_bus(registry, context, control, index)?;
         }
-        Ip32Event::HostInput(input) => {
+        Ip32Event::Uart { port, event } => {
+            let uart_id = serial_port_component(port);
+            registry
+                .get_typed_mut::<Uart16550>(uart_id)?
+                .handle_event(event);
+            drain_uart(registry, context, control, uart_id)?;
+        }
+        Ip32Event::HostInput { generation, input } => {
+            let units = host_payload_units(&input.payload);
             control.host_reservations[media_port_index(input.port)] =
-                control.host_reservations[media_port_index(input.port)].saturating_sub(1);
+                control.host_reservations[media_port_index(input.port)].saturating_sub(units);
+            if generation != control.host_generation {
+                return Ok(());
+            }
+            let target = match input.port {
+                MediaPort::Serial0 | MediaPort::Serial1 => serial_component(input.port),
+                _ => component_ids::MACE,
+            };
             let transaction = MediaTransaction {
-                source: component_ids::MACE_MEDIA_BUS,
-                target: component_ids::MACE,
+                source: component_ids::MACHINE,
+                target,
                 port: input.port,
                 payload: input.payload,
             };
             registry
-                .get_typed_mut::<Mace>(component_ids::MACE)?
-                .accept_host_input(transaction)?;
-            drain_mace(registry, context, control)?;
+                .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
+                .route(transaction);
+            drain_media_bus(registry, context, control)?;
         }
     }
     Ok(())
@@ -865,6 +977,47 @@ fn media_port_index(port: se_device::bus::media::MediaPort) -> usize {
         MediaPort::Serial0 => 9,
         MediaPort::Serial1 => 10,
         MediaPort::Parallel => 11,
+    }
+}
+
+fn host_payload_units(payload: &MediaPayload) -> usize {
+    match payload {
+        MediaPayload::Bytes(bytes) => bytes.len(),
+        MediaPayload::Ethernet(frame) => frame.data.len(),
+        MediaPayload::Audio(block) => block.samples.len(),
+        MediaPayload::Video(field) => field.data.len(),
+        MediaPayload::Sync { .. } => 1,
+    }
+}
+
+fn serial_component(port: MediaPort) -> ComponentId {
+    match port {
+        MediaPort::Serial0 => component_ids::SERIAL0,
+        MediaPort::Serial1 => component_ids::SERIAL1,
+        _ => unreachable!("non-serial media port has no UART component"),
+    }
+}
+
+fn serial_port_component(port: Ip32SerialPort) -> ComponentId {
+    match port {
+        Ip32SerialPort::Serial1 => component_ids::SERIAL0,
+        Ip32SerialPort::Serial2 => component_ids::SERIAL1,
+    }
+}
+
+fn serial_port_for_component(component: ComponentId) -> Ip32SerialPort {
+    if component == component_ids::SERIAL0 {
+        Ip32SerialPort::Serial1
+    } else {
+        Ip32SerialPort::Serial2
+    }
+}
+
+fn media_port_for_serial_component(component: ComponentId) -> MediaPort {
+    if component == component_ids::SERIAL0 {
+        MediaPort::Serial0
+    } else {
+        MediaPort::Serial1
     }
 }
 
@@ -894,6 +1047,10 @@ where
     S: TraceSink,
 {
     advance_cpu_generation(control)?;
+    advance_host_generation(control)?;
+    control.host_outputs.clear();
+    control.host_output_units.fill(0);
+    control.host_dropped_output_bytes.fill(0);
     registry
         .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
         .reset();
@@ -977,6 +1134,7 @@ where
     S: TraceSink,
 {
     advance_cpu_generation(control)?;
+    advance_host_generation(control)?;
     registry
         .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
         .reset();
@@ -1085,6 +1243,15 @@ fn advance_cpu_generation(control: &mut MachineControl) -> Result<(), Ip32Machin
         .checked_add(1)
         .ok_or(Ip32MachineDispatchError::GenerationOverflow)?;
     control.cpu_clock.reset();
+    Ok(())
+}
+
+fn advance_host_generation(control: &mut MachineControl) -> Result<(), Ip32MachineDispatchError> {
+    control.host_generation = control
+        .host_generation
+        .checked_add(1)
+        .ok_or(Ip32MachineDispatchError::GenerationOverflow)?;
+    control.host_reservations.fill(0);
     Ok(())
 }
 
@@ -1288,7 +1455,7 @@ where
                 registry
                     .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
                     .route(transaction);
-                drain_media_bus(registry)?;
+                drain_media_bus(registry, context, control)?;
             }
             MaceAction::CompleteCmiDevice(completion) => {
                 registry
@@ -1422,11 +1589,32 @@ where
 {
     loop {
         match registry.get_typed_mut::<Uart16550>(uart_id)?.poll() {
+            Uart16550Action::Schedule { delay, event } => {
+                context.schedule_after(
+                    delay,
+                    uart_id,
+                    Ip32Event::Uart {
+                        port: serial_port_for_component(uart_id),
+                        event,
+                    },
+                )?;
+            }
             Uart16550Action::SetIrq(transaction) => {
                 registry
                     .get_typed_mut::<IrqBus>(component_ids::MACE_IRQ_BUS)?
                     .route(transaction)?;
                 drain_mace_irq_bus(registry, context, control)?;
+            }
+            Uart16550Action::Transmit { byte } => {
+                registry
+                    .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
+                    .route(MediaTransaction {
+                        source: uart_id,
+                        target: component_ids::MACHINE,
+                        port: media_port_for_serial_component(uart_id),
+                        payload: MediaPayload::Bytes(vec![byte]),
+                    });
+                drain_media_bus(registry, context, control)?;
             }
             Uart16550Action::Idle => return Ok(()),
         }
@@ -1537,20 +1725,81 @@ where
     }
 }
 
-fn drain_media_bus(registry: &mut ComponentRegistry) -> Result<(), Ip32MachineDispatchError> {
+fn drain_media_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
     loop {
         match registry
             .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
             .poll()
         {
-            MediaBusAction::Deliver { transaction, .. } => {
-                registry
-                    .get_typed_mut::<Mace>(component_ids::MACE)?
-                    .record_host_output(transaction)?;
+            MediaBusAction::Deliver {
+                target,
+                transaction,
+            } => {
+                if target == component_ids::MACE {
+                    registry
+                        .get_typed_mut::<Mace>(target)?
+                        .accept_host_input(transaction)?;
+                    drain_mace(registry, context, control)?;
+                } else if matches!(target, component_ids::SERIAL0 | component_ids::SERIAL1) {
+                    let MediaPayload::Bytes(bytes) = transaction.payload else {
+                        return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                    };
+                    registry
+                        .get_typed_mut::<Uart16550>(target)?
+                        .receive_bytes(&bytes)?;
+                    drain_uart(registry, context, control, target)?;
+                } else {
+                    enqueue_host_output(control, transaction);
+                }
             }
             MediaBusAction::Idle => return Ok(()),
         }
     }
+}
+
+fn enqueue_host_output(control: &mut MachineControl, transaction: MediaTransaction) {
+    let port = transaction.port;
+    let index = media_port_index(port);
+    let units = host_payload_units(&transaction.payload);
+    let capacity = media_port_capacity(control.host_capacities, port);
+
+    if units > capacity {
+        control.host_dropped_output_bytes[index] =
+            control.host_dropped_output_bytes[index].saturating_add(units as u64);
+        return;
+    }
+
+    while control.host_output_units[index] + units > capacity {
+        let Some(position) = control
+            .host_outputs
+            .iter()
+            .position(|output| output.port == port)
+        else {
+            break;
+        };
+        let dropped = control
+            .host_outputs
+            .remove(position)
+            .expect("located host output must remain present");
+        let dropped_units = host_payload_units(&dropped.payload);
+        control.host_output_units[index] =
+            control.host_output_units[index].saturating_sub(dropped_units);
+        control.host_dropped_output_bytes[index] =
+            control.host_dropped_output_bytes[index].saturating_add(dropped_units as u64);
+    }
+
+    control.host_output_units[index] += units;
+    control.host_outputs.push_back(Ip32HostOutput {
+        port,
+        payload: transaction.payload,
+    });
 }
 
 fn i2c_bus_id(index: u8) -> Result<ComponentId, Ip32MachineDispatchError> {

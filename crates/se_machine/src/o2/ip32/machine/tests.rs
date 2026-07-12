@@ -14,6 +14,7 @@ use se_device::chipset::crime::registers;
 use se_device::chipset::mace::Mace;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
 use se_device::memory::flash::ReadArrayFlash;
+use se_device::serial::uart16550::Uart16550;
 
 use super::*;
 
@@ -103,6 +104,97 @@ fn host_input_reservations_enforce_configured_capacity() {
     assert_eq!(
         machine.schedule_host_input(SimTime::new(2), input),
         Err(Ip32HostInputError::QueueFull(MediaPort::Keyboard))
+    );
+}
+
+#[test]
+fn serial_host_input_routes_only_to_the_selected_uart() {
+    let mut machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
+    machine
+        .schedule_host_input(
+            SimTime::ZERO,
+            Ip32HostInput {
+                port: MediaPort::Serial0,
+                payload: MediaPayload::Bytes(vec![0x41]),
+            },
+        )
+        .unwrap();
+
+    let _ = machine.run_steps(1).unwrap();
+
+    let registry = machine.runtime().registry();
+    assert_eq!(
+        registry
+            .get_typed::<Uart16550>(component_ids::SERIAL0)
+            .unwrap()
+            .external_receive_len(),
+        1
+    );
+    assert_eq!(
+        registry
+            .get_typed::<Uart16550>(component_ids::SERIAL1)
+            .unwrap()
+            .external_receive_len(),
+        0
+    );
+}
+
+#[test]
+fn hard_reset_invalidates_future_serial_host_input() {
+    let mut machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
+    machine
+        .schedule_host_input(
+            SimTime::new(100),
+            Ip32HostInput {
+                port: MediaPort::Serial1,
+                payload: MediaPayload::Bytes(vec![0x42]),
+            },
+        )
+        .unwrap();
+
+    machine.hard_reset().unwrap();
+    let _ = machine.run_until_time(SimTime::new(100)).unwrap();
+
+    assert_eq!(
+        machine
+            .runtime()
+            .registry()
+            .get_typed::<Uart16550>(component_ids::SERIAL1)
+            .unwrap()
+            .external_receive_len(),
+        0
+    );
+}
+
+#[test]
+fn synthetic_prom_transmits_through_uart_and_media_bus() {
+    let config = config_with_program(&[
+        (0, i_type(0x0f, 0, 1, 0xbf39)),
+        (4, i_type(0x0d, 1, 1, 0x0007)),
+        (8, i_type(0x09, 0, 2, 0x0080)),
+        (12, i_type(0x28, 1, 2, 0x0300)),
+        (16, i_type(0x09, 0, 2, 48)),
+        (20, i_type(0x28, 1, 2, 0x0000)),
+        (24, i_type(0x28, 1, 0, 0x0100)),
+        (28, i_type(0x09, 0, 2, 3)),
+        (32, i_type(0x28, 1, 2, 0x0700)),
+        (36, i_type(0x09, 0, 2, 3)),
+        (40, i_type(0x28, 1, 2, 0x0300)),
+        (44, i_type(0x09, 0, 2, u16::from(b'>'))),
+        (48, i_type(0x28, 1, 2, 0x0000)),
+        (52, WAIT),
+    ]);
+    let mut machine = Ip32Machine::from_config(config).unwrap();
+    machine.schedule_power_on().unwrap();
+
+    let _ = machine.run_until_time(SimTime::new(2_000_000)).unwrap();
+
+    assert_eq!(
+        machine.poll_host_output(),
+        Some(Ip32HostOutput {
+            port: MediaPort::Serial0,
+            payload: MediaPayload::Bytes(vec![b'>']),
+        })
     );
 }
 

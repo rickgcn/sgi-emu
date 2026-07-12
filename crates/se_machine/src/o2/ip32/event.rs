@@ -9,6 +9,7 @@ use se_device::chipset::crime::iou::{CrimeCgiBusEvent, CrimeCmiBusEvent};
 use se_device::chipset::crime::memory::bus::CrimeMemoryBusEvent;
 use se_device::chipset::crime::protocol::CrimeEvent;
 use se_device::chipset::mace::protocol::MaceEvent;
+use se_device::serial::uart16550::Uart16550Event;
 
 use super::bus::Ip32SysAdBusEvent;
 
@@ -57,8 +58,24 @@ pub enum Ip32Event {
         index: u8,
     },
 
+    /// One UART-internal event.
+    Uart {
+        port: Ip32SerialPort,
+        event: Uart16550Event,
+    },
+
     /// One deterministic host-neutral input.
-    HostInput(Ip32HostInput),
+    HostInput {
+        generation: u64,
+        input: Ip32HostInput,
+    },
+}
+
+/// Physical serial connectors exposed by the IP32 profile.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Ip32SerialPort {
+    Serial1,
+    Serial2,
 }
 
 /// Host-neutral input with no implicit wall-clock time.
@@ -73,4 +90,17 @@ pub struct Ip32HostInput {
 pub struct Ip32HostOutput {
     pub port: MediaPort,
     pub payload: MediaPayload,
+}
+
+/// One host-bound byte chunk emitted by a serial connector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ip32SerialOutput {
+    pub port: Ip32SerialPort,
+    pub bytes: Vec<u8>,
+}
+
+/// Host-bound data-loss counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Ip32HostIoStats {
+    pub dropped_output_bytes: [u64; 12],
 }
