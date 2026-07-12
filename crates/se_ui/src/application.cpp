@@ -1,4 +1,5 @@
 #include "se_ui/include/application.h"
+#include "se_ui/include/terminal_dock.h"
 #include "se_ui/include/tracing_dock.h"
 #include "se_ui/src/application.rs.h"
 
@@ -414,9 +415,14 @@ public:
 
     auto* tracing_dock = create_tracing_dock(this);
     addDockWidget(Qt::BottomDockWidgetArea, tracing_dock);
+    auto* terminal_dock = create_terminal_dock(this, controller_);
+    addDockWidget(Qt::BottomDockWidgetArea, terminal_dock);
+    tabifyDockWidget(tracing_dock, terminal_dock);
     window_menu->addSeparator();
     window_menu->addAction(tracing_dock->toggleViewAction());
-    resizeDocks({ tracing_dock }, { 320 }, Qt::Vertical);
+    window_menu->addAction(terminal_dock->toggleViewAction());
+    resizeDocks({ tracing_dock, terminal_dock }, { 320, 320 }, Qt::Vertical);
+    terminal_dock->raise();
 
     auto* about_action = help_menu->addAction(translate(about_text));
     connect(about_action, &QAction::triggered, this, [this] {

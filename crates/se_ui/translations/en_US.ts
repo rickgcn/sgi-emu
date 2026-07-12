@@ -99,6 +99,20 @@
     <message><source>Shutting Down</source><translation>Shutting Down</translation></message>
   </context>
   <context>
+    <name>TerminalDock</name>
+    <message><source>Terminal</source><translation>Terminal</translation></message>
+    <message><source>Serial 1</source><translation>Serial 1</translation></message>
+    <message><source>Serial 2</source><translation>Serial 2</translation></message>
+    <message><source>Clear</source><translation>Clear</translation></message>
+    <message><source>Copy</source><translation>Copy</translation></message>
+    <message><source>Paste</source><translation>Paste</translation></message>
+    <message><source>Select All</source><translation>Select All</translation></message>
+    <message>
+      <source>%1 sent / %2 received / %3 dropped</source>
+      <translation>%1 sent / %2 received / %3 dropped</translation>
+    </message>
+  </context>
+  <context>
     <name>TracingDock</name>
     <message><source>Tracing</source><translation>Tracing</translation></message>
     <message><source>Error</source><translation>Error</translation></message>
