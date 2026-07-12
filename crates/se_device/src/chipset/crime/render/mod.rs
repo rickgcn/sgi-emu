@@ -3,7 +3,10 @@
 use core::fmt;
 use std::collections::{BTreeMap, VecDeque};
 
-use super::protocol::{CrimeBusError, CrimeCompletionPayload, CrimeMemoryOutcome};
+use super::protocol::{
+    CrimeBusError, CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryInhibitReason,
+    CrimeMemoryOutcome,
+};
 use super::registers;
 
 const TLB_BASE: u64 = registers::CRIME_RENDER_BASE + 0x1000;
@@ -15,6 +18,7 @@ const START_OFFSET: u64 = 0x800;
 const INTERFACE_CAPACITY: usize = 64;
 const LINEAR_PAGE_COUNT: usize = 32;
 const LINEAR_PAGE_SIZE: u64 = 4096;
+const LINEAR_PAGE_MASK: u32 = 0x0007_ffff;
 const MAX_MEMORY_CHUNK_BYTES: usize = 512;
 
 const PROM_CLEAR_MODE: u32 = 0x0000_0011;
@@ -65,14 +69,6 @@ pub enum CrimeRenderError {
         end: u32,
     },
 
-    /// Linear-A did not contain a valid mapping for the requested page.
-    InvalidLinearTlb {
-        /// Virtual address being translated.
-        virtual_address: u32,
-        /// Raw TLB entry selected by the address.
-        entry: u32,
-    },
-
     /// A memory completion arrived while no MTE write was outstanding.
     UnexpectedMemoryCompletion,
 
@@ -97,13 +93,6 @@ impl fmt::Display for CrimeRenderError {
             Self::InvalidMteRange { start, end } => {
                 write!(f, "invalid CRIME MTE range {start:#010x}..={end:#010x}")
             }
-            Self::InvalidLinearTlb {
-                virtual_address,
-                entry,
-            } => write!(
-                f,
-                "invalid CRIME Linear-A TLB entry {entry:#010x} for virtual address {virtual_address:#010x}"
-            ),
             Self::UnexpectedMemoryCompletion => {
                 f.write_str("unexpected CRIME MTE memory completion")
             }
@@ -123,7 +112,11 @@ impl std::error::Error for CrimeRenderError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RenderMemoryWrite {
     pub(super) virtual_address: u32,
+    pub(super) raw_entry: u32,
+    pub(super) valid: bool,
+    pub(super) alias_address: u64,
     pub(super) physical_address: u64,
+    pub(super) bank_select: CrimeMemoryBankSelect,
     pub(super) data: Vec<u8>,
     pub(super) byte_enable: Vec<bool>,
 }
@@ -140,6 +133,13 @@ pub(super) enum RenderNotice {
         virtual_address: u32,
         physical_address: u64,
         length: u16,
+    },
+    TlbTranslation {
+        virtual_address: u32,
+        raw_entry: u32,
+        valid: bool,
+        alias_address: u64,
+        physical_address: u64,
     },
     JobCompleted {
         start: u32,
@@ -184,6 +184,19 @@ struct MteJob {
     end: u64,
     linear_a: [u32; LINEAR_PAGE_COUNT],
     pending_length: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinearTlbEntry(u32);
+
+impl LinearTlbEntry {
+    const fn valid(self) -> bool {
+        self.0 & 0x8000_0000 != 0
+    }
+
+    const fn alias_address(self, page_offset: u64) -> u64 {
+        ((self.0 & LINEAR_PAGE_MASK) as u64) * LINEAR_PAGE_SIZE + page_offset
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -362,11 +375,7 @@ impl CrimeRender {
                 progress.schedule_step = self.ensure_step_scheduled();
             } else {
                 let memory_write = self.prepare_memory_write()?;
-                progress.notices.push(RenderNotice::MemoryChunk {
-                    virtual_address: memory_write.virtual_address,
-                    physical_address: memory_write.physical_address,
-                    length: memory_write.data.len() as u16,
-                });
+                append_memory_notices(&mut progress.notices, &memory_write);
                 progress.memory_write = Some(memory_write);
             }
             progress.interrupts = self.update_conditions(previous);
@@ -389,11 +398,7 @@ impl CrimeRender {
             });
             self.active_job = Some(job);
             let memory_write = self.prepare_memory_write()?;
-            progress.notices.push(RenderNotice::MemoryChunk {
-                virtual_address: memory_write.virtual_address,
-                physical_address: memory_write.physical_address,
-                length: memory_write.data.len() as u16,
-            });
+            append_memory_notices(&mut progress.notices, &memory_write);
             progress.memory_write = Some(memory_write);
         } else {
             progress.schedule_step = self.ensure_step_scheduled();
@@ -540,30 +545,51 @@ impl CrimeRender {
         let job = self.active_job.as_ref().expect("active MTE job exists");
         let virtual_address = job.next as u32;
         let page_index = ((job.next >> 12) & 0x1f) as usize;
-        let entry = job.linear_a[page_index];
-        if entry & 0x8000_0000 == 0 || entry & 0x7ffc_0000 != 0 {
-            return Err(CrimeRenderError::InvalidLinearTlb {
-                virtual_address,
-                entry,
-            });
-        }
+        let entry = LinearTlbEntry(job.linear_a[page_index]);
         let in_page = job.next & (LINEAR_PAGE_SIZE - 1);
         let remaining = job.end - job.next + 1;
         let length = remaining
             .min(LINEAR_PAGE_SIZE - in_page)
             .min(MAX_MEMORY_CHUNK_BYTES as u64) as usize;
-        let physical_address = u64::from(entry & 0x0003_ffff) * LINEAR_PAGE_SIZE + in_page;
+        let alias_address = entry.alias_address(in_page);
+        let physical_address = super::normalize_render_memory_alias(alias_address);
+        let bank_select = if entry.valid() {
+            CrimeMemoryBankSelect::Decode
+        } else {
+            CrimeMemoryBankSelect::Inhibited {
+                reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
+            }
+        };
         self.active_job
             .as_mut()
             .expect("active MTE job exists")
             .pending_length = Some(length as u16);
         Ok(RenderMemoryWrite {
             virtual_address,
+            raw_entry: entry.0,
+            valid: entry.valid(),
+            alias_address,
             physical_address,
+            bank_select,
             data: vec![0; length],
             byte_enable: vec![true; length],
         })
     }
+}
+
+fn append_memory_notices(notices: &mut Vec<RenderNotice>, write: &RenderMemoryWrite) {
+    notices.push(RenderNotice::TlbTranslation {
+        virtual_address: write.virtual_address,
+        raw_entry: write.raw_entry,
+        valid: write.valid,
+        alias_address: write.alias_address,
+        physical_address: write.physical_address,
+    });
+    notices.push(RenderNotice::MemoryChunk {
+        virtual_address: write.virtual_address,
+        physical_address: write.physical_address,
+        length: write.data.len() as u16,
+    });
 }
 
 impl Default for CrimeRender {

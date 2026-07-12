@@ -3,7 +3,8 @@ use se_core::role::BusDeviceRole;
 use super::*;
 use crate::chipset::crime::config::{CrimeSdramBankConfig, CrimeSdramBankSize};
 use crate::chipset::crime::protocol::{
-    CrimeMemoryClient, CrimeMemoryFault, CrimeMemoryOutcome, CrimeTransactionId,
+    CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryFault, CrimeMemoryInhibitReason,
+    CrimeMemoryOutcome, CrimeTransactionId,
 };
 
 const RAM: ComponentId = ComponentId::new(1);
@@ -43,6 +44,7 @@ fn transaction(id: u128, address: u64, transfer: CrimeTransfer) -> CrimeMemoryTr
         controller: CRIME,
         client: CrimeMemoryClient::Cpu,
         address,
+        bank_select: CrimeMemoryBankSelect::Decode,
         no_ecc: false,
         transfer,
     }
@@ -50,6 +52,73 @@ fn transaction(id: u128, address: u64, transfer: CrimeTransfer) -> CrimeMemoryTr
 
 fn successful(completion: CrimeMemoryCompletion) -> CrimeMemoryOutcome {
     completion.result.expect("memory transaction must complete")
+}
+
+#[test]
+fn inhibited_bank_select_preserves_storage_and_returns_address_diagnostics() {
+    let mut memory = small_memory();
+    successful(memory.accept(transaction(
+        1,
+        0,
+        CrimeTransfer::Write {
+            data: vec![0xaa; 8],
+            byte_enable: vec![true; 8],
+        },
+    )));
+
+    let mut read = transaction(2, 0, CrimeTransfer::Read { length: 8 });
+    read.bank_select = CrimeMemoryBankSelect::Inhibited {
+        reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
+    };
+    let read = successful(memory.accept(read));
+    assert_eq!(read.payload, CrimeCompletionPayload::ReadData(vec![0; 8]));
+    assert_eq!(read.fault, Some(CrimeMemoryFault::Address));
+    let diagnostic = read.diagnostic.unwrap();
+    assert_eq!(diagnostic.address, 0);
+    assert!(!diagnostic.write);
+    assert!(!diagnostic.read_modify_write);
+
+    let mut write = transaction(
+        3,
+        0,
+        CrimeTransfer::Write {
+            data: vec![0x55; 8],
+            byte_enable: vec![true; 8],
+        },
+    );
+    write.bank_select = CrimeMemoryBankSelect::Inhibited {
+        reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
+    };
+    let write = successful(memory.accept(write));
+    assert_eq!(write.payload, CrimeCompletionPayload::WriteComplete);
+    assert_eq!(write.fault, Some(CrimeMemoryFault::Address));
+    let diagnostic = write.diagnostic.unwrap();
+    assert!(diagnostic.write);
+    assert!(!diagnostic.read_modify_write);
+
+    let stored = successful(memory.accept(transaction(4, 0, CrimeTransfer::Read { length: 8 })));
+    assert_eq!(
+        stored.payload,
+        CrimeCompletionPayload::ReadData(vec![0xaa; 8])
+    );
+
+    let mut partial = transaction(
+        5,
+        2,
+        CrimeTransfer::Write {
+            data: vec![0x11],
+            byte_enable: vec![true],
+        },
+    );
+    partial.bank_select = CrimeMemoryBankSelect::Inhibited {
+        reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
+    };
+    assert!(
+        successful(memory.accept(partial))
+            .diagnostic
+            .unwrap()
+            .read_modify_write
+    );
 }
 
 #[test]

@@ -10,8 +10,9 @@ use se_core::role::BusDeviceRole;
 
 use super::config::{CrimeMemoryConfig, CrimeSdramBankConfig};
 use super::protocol::{
-    CrimeBusError, CrimeCompletionPayload, CrimeMemoryCompletion, CrimeMemoryDiagnostic,
-    CrimeMemoryFault, CrimeMemoryOutcome, CrimeMemoryTransaction, CrimeSdramSignal, CrimeTransfer,
+    CrimeBusError, CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryCompletion,
+    CrimeMemoryDiagnostic, CrimeMemoryFault, CrimeMemoryOutcome, CrimeMemoryTransaction,
+    CrimeSdramSignal, CrimeTransfer,
 };
 use super::registers;
 
@@ -179,14 +180,21 @@ impl CrimeSdram {
             return Err(CrimeBusError::Access);
         }
         match &transaction.transfer {
-            CrimeTransfer::Read { .. } => {
+            CrimeTransfer::Read { .. }
+                if matches!(transaction.bank_select, CrimeMemoryBankSelect::Decode) =>
+            {
                 self.read(transaction.address, length, transaction.no_ecc)
             }
+            CrimeTransfer::Read { .. } => Ok(inhibited_read(transaction.address, length)),
             CrimeTransfer::Write { data, byte_enable } => {
                 if byte_enable.len() != data.len() {
                     return Err(CrimeBusError::Access);
                 }
-                self.write(transaction.address, data, byte_enable)
+                if matches!(transaction.bank_select, CrimeMemoryBankSelect::Decode) {
+                    self.write(transaction.address, data, byte_enable)
+                } else {
+                    Ok(inhibited_write(transaction.address, data, byte_enable))
+                }
             }
         }
     }
@@ -471,6 +479,26 @@ fn address_diagnostic(address: u64, write: bool, read_modify_write: bool) -> Cri
         corrected: false,
         write,
         read_modify_write,
+    }
+}
+
+fn inhibited_read(address: u64, length: usize) -> CrimeMemoryOutcome {
+    CrimeMemoryOutcome {
+        payload: CrimeCompletionPayload::ReadData(vec![0; length]),
+        fault: Some(CrimeMemoryFault::Address),
+        diagnostic: Some(address_diagnostic(address, false, false)),
+    }
+}
+
+fn inhibited_write(address: u64, data: &[u8], byte_enable: &[bool]) -> CrimeMemoryOutcome {
+    let in_lane = address as usize & 7;
+    let count = (8 - in_lane).min(data.len());
+    let read_modify_write =
+        in_lane != 0 || count != 8 || byte_enable[..count].iter().any(|enabled| !enabled);
+    CrimeMemoryOutcome {
+        payload: CrimeCompletionPayload::WriteComplete,
+        fault: Some(CrimeMemoryFault::Address),
+        diagnostic: Some(address_diagnostic(address, true, read_modify_write)),
     }
 }
 

@@ -89,6 +89,26 @@ impl CrimeTransfer {
     }
 }
 
+/// Reason an otherwise valid memory request must not assert SDRAM bank selects.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CrimeMemoryInhibitReason {
+    /// The Rendering Engine generated a request from an invalid TLB entry.
+    InvalidRenderTlb,
+}
+
+/// Bank-selection behavior attached to one CRIME memory request.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CrimeMemoryBankSelect {
+    /// Decode the request through the programmable MIU bank controls.
+    Decode,
+
+    /// Preserve arbitration and completion ordering without selecting SDRAM.
+    Inhibited {
+        /// Hardware reason for suppressing all external bank selects.
+        reason: CrimeMemoryInhibitReason,
+    },
+}
+
 /// Request routed through the CRIME memory domain.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrimeMemoryTransaction {
@@ -106,6 +126,9 @@ pub struct CrimeMemoryTransaction {
 
     /// CRIME memory-domain byte address.
     pub address: u64,
+
+    /// Whether the MIU may decode and assert an external SDRAM bank select.
+    pub bank_select: CrimeMemoryBankSelect,
 
     /// Whether read-side ECC checking is bypassed.
     pub no_ecc: bool,

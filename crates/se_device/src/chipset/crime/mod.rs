@@ -34,9 +34,10 @@ use self::protocol::{
     CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusError, CrimeCgiCompletion, CrimeCgiTransaction,
     CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal,
     CrimeDmaRequest, CrimeEvent, CrimeInterruptPost, CrimeLinkDeviceResponse, CrimeLinkOperation,
-    CrimeMemoryClient, CrimeMemoryCompletion, CrimeMemoryFault, CrimeMemoryOutcome,
-    CrimeMemoryTransaction, CrimePioRequest, CrimePoll, CrimeSdramSignal, CrimeSysAdRequest,
-    CrimeTraceEvent, CrimeTraceField, CrimeTraceValue, CrimeTransactionId, CrimeTransfer,
+    CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryCompletion, CrimeMemoryFault,
+    CrimeMemoryInhibitReason, CrimeMemoryOutcome, CrimeMemoryTransaction, CrimePioRequest,
+    CrimePoll, CrimeSdramSignal, CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceField,
+    CrimeTraceValue, CrimeTransactionId, CrimeTransfer,
 };
 use self::render::{
     CrimeRender, CrimeRenderError, RenderInterruptEffect, RenderMemoryWrite, RenderNotice,
@@ -391,6 +392,7 @@ impl Crime {
                     controller: self.id,
                     client: CrimeMemoryClient::Cpu,
                     address: memory_address,
+                    bank_select: CrimeMemoryBankSelect::Decode,
                     no_ecc,
                     transfer: transfer_from_cpu(transaction),
                 }));
@@ -672,6 +674,29 @@ impl Crime {
     fn start_render_memory(&mut self, write: RenderMemoryWrite) -> Result<(), CrimeError> {
         let id = self.allocate_transaction_id()?;
         self.pending_memory.insert(id, PendingMemoryOrigin::Render);
+        if let CrimeMemoryBankSelect::Inhibited { reason } = write.bank_select {
+            self.actions.push_back(CrimeAction::Trace(CrimeTraceEvent {
+                level: TraceLevel::Debug,
+                target: trace::RENDER_TARGET,
+                event: "bank_select_inhibited",
+                fields: vec![
+                    CrimeTraceField {
+                        key: "reason",
+                        value: CrimeTraceValue::String(match reason {
+                            CrimeMemoryInhibitReason::InvalidRenderTlb => "invalid_render_tlb",
+                        }),
+                    },
+                    CrimeTraceField {
+                        key: "physical_address",
+                        value: CrimeTraceValue::Hex64(write.physical_address),
+                    },
+                    CrimeTraceField {
+                        key: "operation",
+                        value: CrimeTraceValue::String("write"),
+                    },
+                ],
+            }));
+        }
         self.actions
             .push_back(CrimeAction::StartMemory(CrimeMemoryTransaction {
                 id,
@@ -679,6 +704,7 @@ impl Crime {
                 controller: self.id,
                 client: CrimeMemoryClient::Render,
                 address: write.physical_address,
+                bank_select: write.bank_select,
                 no_ecc: false,
                 transfer: CrimeTransfer::Write {
                     data: write.data,
@@ -764,6 +790,37 @@ impl Crime {
                     CrimeTraceField {
                         key: "length",
                         value: CrimeTraceValue::U64(u64::from(length)),
+                    },
+                ],
+            ),
+            RenderNotice::TlbTranslation {
+                virtual_address,
+                raw_entry,
+                valid,
+                alias_address,
+                physical_address,
+            } => (
+                "tlb_translate",
+                vec![
+                    CrimeTraceField {
+                        key: "virtual_address",
+                        value: CrimeTraceValue::Hex64(u64::from(virtual_address)),
+                    },
+                    CrimeTraceField {
+                        key: "raw_entry",
+                        value: CrimeTraceValue::Hex64(u64::from(raw_entry)),
+                    },
+                    CrimeTraceField {
+                        key: "valid",
+                        value: CrimeTraceValue::Bool(valid),
+                    },
+                    CrimeTraceField {
+                        key: "alias_address",
+                        value: CrimeTraceValue::Hex64(alias_address),
+                    },
+                    CrimeTraceField {
+                        key: "physical_address",
+                        value: CrimeTraceValue::Hex64(physical_address),
                     },
                 ],
             ),
@@ -962,6 +1019,7 @@ impl Crime {
                 controller: self.id,
                 client,
                 address: request.address,
+                bank_select: CrimeMemoryBankSelect::Decode,
                 no_ecc: false,
                 transfer: request.transfer,
             }));
@@ -1193,23 +1251,6 @@ impl Crime {
                 CrimeTraceField {
                     key: "end",
                     value: CrimeTraceValue::Hex64(u64::from(*end)),
-                },
-            ],
-            CrimeRenderError::InvalidLinearTlb {
-                virtual_address,
-                entry,
-            } => vec![
-                CrimeTraceField {
-                    key: "kind",
-                    value: CrimeTraceValue::String("invalid_linear_tlb"),
-                },
-                CrimeTraceField {
-                    key: "virtual_address",
-                    value: CrimeTraceValue::Hex64(u64::from(*virtual_address)),
-                },
-                CrimeTraceField {
-                    key: "entry",
-                    value: CrimeTraceValue::Hex64(u64::from(*entry)),
                 },
             ],
             CrimeRenderError::UnexpectedMemoryCompletion => vec![CrimeTraceField {
@@ -1446,6 +1487,17 @@ fn decode_memory(address: u64, size: u8) -> Option<(u64, bool)> {
         return Some((address - NO_ECC_MEMORY_START, true));
     }
     None
+}
+
+/// Converts a Rendering Engine physical alias into the 30-bit MIU address domain.
+///
+/// RE TLB entries can name the CPU-visible linear-memory alias. Addresses outside
+/// the CPU memory windows still reach the MIU request pipe, where programmable
+/// bank controls determine whether any external bank is selected.
+pub(super) fn normalize_render_memory_alias(address: u64) -> u64 {
+    decode_memory(address, 1)
+        .map(|(memory_address, _)| memory_address)
+        .unwrap_or(address & 0x3fff_ffff)
 }
 
 fn in_window(address: u64, size: u8, start: u64, end: u64) -> bool {

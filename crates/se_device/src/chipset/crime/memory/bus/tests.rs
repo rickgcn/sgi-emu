@@ -1,7 +1,9 @@
 use se_core::role::BusRole;
 
 use super::*;
-use crate::chipset::crime::protocol::{CrimeTransactionId, CrimeTransfer};
+use crate::chipset::crime::protocol::{
+    CrimeMemoryBankSelect, CrimeMemoryInhibitReason, CrimeTransactionId, CrimeTransfer,
+};
 
 const BUS: ComponentId = ComponentId::new(1);
 const CRIME: ComponentId = ComponentId::new(2);
@@ -14,6 +16,7 @@ fn request(id: u128, client: CrimeMemoryClient) -> CrimeMemoryTransaction {
         controller: CRIME,
         client,
         address: 0,
+        bank_select: CrimeMemoryBankSelect::Decode,
         no_ecc: false,
         transfer: CrimeTransfer::Read { length: 8 },
     }
@@ -32,6 +35,28 @@ fn first_request_schedules_service_and_later_requests_merge() {
     assert_eq!(
         bus.route(request(2, CrimeMemoryClient::Gbe)),
         CrimeBusDisposition::Queued
+    );
+}
+
+#[test]
+fn inhibited_requests_follow_normal_arbitration_and_delivery() {
+    let mut bus = CrimeMemoryBus::new(BUS, "memory", RAM, 1_000_000_000, SimDuration::new(27_000));
+    let mut inhibited = request(1, CrimeMemoryClient::Render);
+    inhibited.bank_select = CrimeMemoryBankSelect::Inhibited {
+        reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
+    };
+
+    assert!(matches!(
+        bus.route(inhibited.clone()),
+        CrimeBusDisposition::QueuedAndNeedsService { .. }
+    ));
+    bus.handle_event(bus.next_scheduled_event());
+    assert_eq!(
+        bus.poll(),
+        CrimeBusAction::Deliver {
+            target: RAM,
+            transaction: inhibited,
+        }
     );
 }
 

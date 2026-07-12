@@ -1,6 +1,7 @@
 use se_core::role::{BusControllerRole, BusDeviceRole};
 
 use super::*;
+use crate::chipset::crime::memory::CrimeSdram;
 use crate::chipset::crime::protocol::CrimeMemoryDiagnostic;
 use crate::cpu::execution::protocol::{ExecutionTransaction, ExecutionTransactionId};
 use crate::cpu::mips4::cache::Mips4MemoryAccessType;
@@ -99,6 +100,19 @@ fn enable_interrupt_bit(crime: &mut Crime, bit: u8) {
         )
         .effects;
     crime.apply_piu_effects(effects);
+}
+
+fn memory_transaction(id: u128, address: u64, transfer: CrimeTransfer) -> CrimeMemoryTransaction {
+    CrimeMemoryTransaction {
+        id: CrimeTransactionId::new(id),
+        time: SimTime::ZERO,
+        controller: CRIME,
+        client: CrimeMemoryClient::Render,
+        address,
+        bank_select: CrimeMemoryBankSelect::Decode,
+        no_ecc: false,
+        transfer,
+    }
 }
 
 #[test]
@@ -276,7 +290,7 @@ fn render_memory_fault_uses_the_miu_re_source_without_cpu_bus_error() {
         &mut crime,
         render_base + 0x1700,
         8,
-        u64::from(0x8000_0001_u32) << 32,
+        u64::from(0x0000_0001_u32) << 32,
     );
     retire_render_write(&mut crime, render_base + 0x3008, 4, u32::MAX.into());
     retire_render_write(&mut crime, render_base + 0x3018, 4, 0);
@@ -301,6 +315,12 @@ fn render_memory_fault_uses_the_miu_re_source_without_cpu_bus_error() {
         .expect("the MTE must issue a memory transaction");
     assert_eq!(memory.client, CrimeMemoryClient::Render);
     assert_eq!(memory.address, 0x1000);
+    assert_eq!(
+        memory.bank_select,
+        CrimeMemoryBankSelect::Inhibited {
+            reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
+        }
+    );
     assert!(matches!(
         memory.transfer,
         CrimeTransfer::Write {
@@ -336,6 +356,111 @@ fn render_memory_fault_uses_the_miu_re_source_without_cpu_bus_error() {
         Some(0)
     );
     assert!(crime.terminal_error.is_none());
+}
+
+#[test]
+fn prom_linear_tlb_sequence_completes_through_miu_faults() {
+    let config = CrimeConfig::default();
+    let mut crime = Crime::new(CRIME, "CRIME", config, TIMEBASE_HZ, RAM, MACE, GBE).unwrap();
+    let mut memory = CrimeSdram::new(RAM, "RAM", config.memory);
+
+    for (index, address) in [0x1000, 0x3000, 0x5000, 0x7000].into_iter().enumerate() {
+        let completion = memory.accept(memory_transaction(
+            0x100 + index as u128,
+            address,
+            CrimeTransfer::Write {
+                data: vec![0xa5; 8],
+                byte_enable: vec![true; 8],
+            },
+        ));
+        assert_eq!(completion.result.unwrap().fault, None);
+    }
+
+    let render_base = registers::CRIME_RENDER_BASE;
+    for (index, entry) in [
+        0xffff_ffff_8004_0001,
+        0xffff_ffff_8004_0003,
+        0xffff_ffff_8004_0005,
+        0xffff_ffff_8004_0007,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        retire_render_write(
+            &mut crime,
+            render_base + 0x1700 + index as u64 * 8,
+            8,
+            entry,
+        );
+    }
+    retire_render_write(&mut crime, render_base + 0x3008, 4, u32::MAX.into());
+    retire_render_write(&mut crime, render_base + 0x3018, 4, 0);
+    retire_render_write(&mut crime, render_base + 0x3030, 4, 0x4000_0000);
+    retire_render_write(&mut crime, render_base + 0x3038, 4, 0x4000_7fff);
+    enable_interrupt_bit(&mut crime, 21);
+
+    let progress = crime.render.write(render_base + 0x3800, 4, 0x11).unwrap();
+    crime.apply_render_progress(progress).unwrap();
+    crime.handle_event(
+        SimTime::new(1),
+        CrimeEvent::RenderStep {
+            epoch: crime.render.epoch(),
+        },
+    );
+
+    for step in 0..1024 {
+        let Some(action) = crime.actions.pop_front() else {
+            assert_ne!(
+                crime.render.read(render_base + 0x4000, 4).unwrap() as u32 & 0x1000_0000,
+                0
+            );
+            break;
+        };
+        match action {
+            CrimeAction::StartMemory(transaction) => {
+                let completion = memory.accept(transaction);
+                crime.complete(completion);
+            }
+            CrimeAction::Schedule { event, .. } => {
+                crime.handle_event(SimTime::new(step + 2), event);
+            }
+            CrimeAction::Trace(_) | CrimeAction::SetIrq(_) => {}
+            action => panic!("unexpected CRIME action while driving MTE: {action:?}"),
+        }
+    }
+
+    assert!(crime.terminal_error.is_none());
+    assert_eq!(
+        crime.memory_error_status,
+        (1 << 15) | registers::MEMORY_ERROR_INVALID_WRITE
+    );
+    assert_eq!(crime.memory_error_address, 0x3fff_f000);
+    assert_eq!(
+        crime
+            .piu
+            .read(registers::CPU_ERROR_STATUS, SimTime::ZERO, TIMEBASE_HZ),
+        Some(0)
+    );
+    assert_ne!(
+        crime
+            .piu
+            .read(registers::INTERRUPT_STATUS, SimTime::ZERO, TIMEBASE_HZ)
+            .unwrap()
+            & u64::from(registers::INTERRUPT_MEMORY_ERROR),
+        0
+    );
+
+    for (index, address) in [0x1000, 0x3000, 0x5000, 0x7000].into_iter().enumerate() {
+        let completion = memory.accept(memory_transaction(
+            0x200 + index as u128,
+            address,
+            CrimeTransfer::Read { length: 8 },
+        ));
+        assert_eq!(
+            completion.result.unwrap().payload,
+            CrimeCompletionPayload::ReadData(vec![0; 8])
+        );
+    }
 }
 
 #[test]

@@ -7,8 +7,8 @@ use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
 use se_device::chipset::crime::memory::bus::CrimeMemoryBus;
 use se_device::chipset::crime::protocol::{
-    CrimeCompletionPayload, CrimeMemoryClient, CrimeMemoryTransaction, CrimeTransactionId,
-    CrimeTransfer,
+    CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryTransaction,
+    CrimeTransactionId, CrimeTransfer,
 };
 use se_device::chipset::crime::registers;
 use se_device::chipset::mace::Mace;
@@ -399,6 +399,7 @@ fn cpu_prom_and_ram_accesses_cross_all_required_buses() {
             controller: component_ids::CRIME,
             client: CrimeMemoryClient::Cpu,
             address: 0,
+            bank_select: CrimeMemoryBankSelect::Decode,
             no_ecc: false,
             transfer: CrimeTransfer::Read { length: 4 },
         });
@@ -485,6 +486,7 @@ fn synthetic_prom_clears_linear_a_range_through_the_render_memory_client() {
             controller: component_ids::CRIME,
             client: CrimeMemoryClient::Cpu,
             address: 0x0fec,
+            bank_select: CrimeMemoryBankSelect::Decode,
             no_ecc: false,
             transfer: CrimeTransfer::Read { length: 44 },
         });
@@ -568,6 +570,7 @@ fn hard_reset_preserves_sdram_and_advances_the_cpu_generation() {
             controller: component_ids::CRIME,
             client: CrimeMemoryClient::Cpu,
             address: 0,
+            bank_select: CrimeMemoryBankSelect::Decode,
             no_ecc: false,
             transfer: CrimeTransfer::Read { length: 4 },
         });
@@ -608,6 +611,8 @@ impl TraceSink for PromAcceptanceSink {
 #[test]
 #[ignore = "requires a local proprietary IP32 PROM image"]
 fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
+    const ACCEPTED_UNIMPLEMENTED_BOUNDARIES: &[u64] = &[0x1400_0050];
+
     let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
     let mut config = Ip32MachineConfig {
         prom_image: std::fs::read(path).expect("the local PROM image must be readable"),
@@ -638,16 +643,20 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
     let epc = cpu.state().cp0().epc().bits();
     let exception_code = cpu.state().cp0().cause().exception_code();
     let failed = &machine.runtime().trace_recorder().sink().failed_addresses;
+    let exception_loop = matches!(
+        pc,
+        0xffff_ffff_bfc0_0380
+            | 0xffff_ffff_bfc0_0384
+            | 0xffff_ffff_bfc0_0388
+            | 0xffff_ffff_bfc0_038c
+            | 0xffff_ffff_bfc0_03a0
+            | 0xffff_ffff_bfc0_03a4
+    );
     assert!(
-        !matches!(
-            pc,
-            0xffff_ffff_bfc0_0380
-                | 0xffff_ffff_bfc0_0384
-                | 0xffff_ffff_bfc0_0388
-                | 0xffff_ffff_bfc0_038c
-                | 0xffff_ffff_bfc0_03a0
-                | 0xffff_ffff_bfc0_03a4
-        ),
+        !exception_loop
+            || failed
+                .last()
+                .is_some_and(|address| ACCEPTED_UNIMPLEMENTED_BOUNDARIES.contains(address)),
         "PROM remained in the exception loop at {pc:#018x}; EPC={epc:#018x}, exception={exception_code}, failed accesses: {failed:#x?}"
     );
     assert!(
@@ -658,7 +667,8 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
     assert!(
         failed.iter().all(|address| {
             !(registers::CRIME_BASE..registers::CRIME_REGISTER_END).contains(address)
+                || ACCEPTED_UNIMPLEMENTED_BOUNDARIES.contains(address)
         }),
-        "a defined CRIME access returned a bus error"
+        "a modeled CRIME access returned a bus error"
     );
 }

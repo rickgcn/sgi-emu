@@ -144,21 +144,41 @@ fn mte_chunks_are_bounded_to_five_hundred_twelve_bytes() {
 }
 
 #[test]
-fn linear_a_rejects_invalid_and_reserved_entries() {
-    for entry in [0_u32, 0x8004_0000] {
-        let mut render = CrimeRender::new();
-        configure_prom_clear(&mut render, u64::from(entry) << 32, 0, 0);
-        render
-            .write(MTE_BASE + START_OFFSET, 4, u64::from(PROM_CLEAR_MODE))
-            .unwrap();
-        assert_eq!(
-            render.step(),
-            Err(CrimeRenderError::InvalidLinearTlb {
-                virtual_address: 0,
-                entry,
-            })
-        );
-    }
+fn linear_a_uses_the_valid_bit_and_nineteen_page_bits() {
+    let mut invalid = CrimeRender::new();
+    configure_prom_clear(&mut invalid, 0, 0, 0);
+    invalid
+        .write(MTE_BASE + START_OFFSET, 4, u64::from(PROM_CLEAR_MODE))
+        .unwrap();
+    let write = invalid.step().unwrap().memory_write.unwrap();
+    assert_eq!(write.alias_address, 0);
+    assert_eq!(write.physical_address, 0);
+    assert_eq!(
+        write.bank_select,
+        CrimeMemoryBankSelect::Inhibited {
+            reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
+        }
+    );
+
+    let mut linear_alias = CrimeRender::new();
+    configure_prom_clear(&mut linear_alias, u64::from(0x8004_0001_u32) << 32, 0, 0);
+    linear_alias
+        .write(MTE_BASE + START_OFFSET, 4, u64::from(PROM_CLEAR_MODE))
+        .unwrap();
+    let write = linear_alias.step().unwrap().memory_write.unwrap();
+    assert_eq!(write.alias_address, 0x4000_1000);
+    assert_eq!(write.physical_address, 0x1000);
+    assert_eq!(write.bank_select, CrimeMemoryBankSelect::Decode);
+
+    let mut reserved_bits = CrimeRender::new();
+    configure_prom_clear(&mut reserved_bits, u64::from(u32::MAX) << 32, 0, 0);
+    reserved_bits
+        .write(MTE_BASE + START_OFFSET, 4, u64::from(PROM_CLEAR_MODE))
+        .unwrap();
+    let write = reserved_bits.step().unwrap().memory_write.unwrap();
+    assert_eq!(write.alias_address, 0x7fff_f000);
+    assert_eq!(write.physical_address, 0x3fff_f000);
+    assert_eq!(write.bank_select, CrimeMemoryBankSelect::Decode);
 }
 
 #[test]
