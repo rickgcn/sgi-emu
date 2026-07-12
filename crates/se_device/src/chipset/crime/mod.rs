@@ -33,9 +33,9 @@ use self::protocol::{
     CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusError, CrimeCgiCompletion, CrimeCgiTransaction,
     CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal,
     CrimeDmaRequest, CrimeEvent, CrimeInterruptPost, CrimeLinkDeviceResponse, CrimeLinkOperation,
-    CrimeMemoryClient, CrimeMemoryCompletion, CrimeMemoryTransaction, CrimePioRequest, CrimePoll,
-    CrimeSdramSignal, CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceField, CrimeTraceValue,
-    CrimeTransactionId, CrimeTransfer,
+    CrimeMemoryClient, CrimeMemoryCompletion, CrimeMemoryFault, CrimeMemoryOutcome,
+    CrimeMemoryTransaction, CrimePioRequest, CrimePoll, CrimeSdramSignal, CrimeSysAdRequest,
+    CrimeTraceEvent, CrimeTraceField, CrimeTraceValue, CrimeTransactionId, CrimeTransfer,
 };
 use self::render::{CrimeRender, RenderWriteError};
 
@@ -620,30 +620,36 @@ impl Crime {
                 transaction_id: completion.id,
             });
         };
-        self.record_memory_diagnostic(&origin, &completion);
+        if let Ok(outcome) = &completion.result {
+            self.record_memory_diagnostic(&origin, outcome);
+        }
         match origin {
             PendingMemoryOrigin::SysAd {
                 execution_id,
                 request,
             } => {
-                let payload = cpu_completion(completion.result);
+                let payload = cpu_memory_completion(completion.result);
                 if matches!(payload, Mips4ExecutionCompletion::BusError) {
                     self.record_cpu_error(transaction_shape(request).0);
                 }
                 self.finish_sysad(execution_id, payload);
             }
             PendingMemoryOrigin::CmiDma { link_id } => {
+                let (result, memory_fault) = link_memory_completion(completion.result);
                 self.actions
                     .push_back(CrimeAction::CompleteCmiDevice(CrimeCmiCompletion {
                         id: link_id,
-                        result: completion.result,
+                        result,
+                        memory_fault,
                     }));
             }
             PendingMemoryOrigin::CgiDma { link_id } => {
+                let (result, memory_fault) = link_memory_completion(completion.result);
                 self.actions
                     .push_back(CrimeAction::CompleteCgiDevice(CrimeCgiCompletion {
                         id: link_id,
-                        result: completion.result,
+                        result,
+                        memory_fault,
                     }));
             }
         }
@@ -659,7 +665,7 @@ impl Crime {
                 transaction_id: completion.id,
             });
         };
-        let payload = cpu_completion(completion.result);
+        let payload = cpu_link_completion(completion.result);
         if matches!(payload, Mips4ExecutionCompletion::BusError) {
             self.record_cpu_error(transaction_shape(pending.request).0);
         }
@@ -676,7 +682,7 @@ impl Crime {
                 transaction_id: completion.id,
             });
         };
-        let payload = cpu_completion(completion.result);
+        let payload = cpu_link_completion(completion.result);
         if matches!(payload, Mips4ExecutionCompletion::BusError) {
             self.record_cpu_error(transaction_shape(pending.request).0);
         }
@@ -727,19 +733,21 @@ impl Crime {
     fn record_memory_diagnostic(
         &mut self,
         origin: &PendingMemoryOrigin,
-        completion: &CrimeMemoryCompletion,
+        outcome: &CrimeMemoryOutcome,
     ) {
-        let Some(diagnostic) = completion.diagnostic else {
+        let Some(diagnostic) = outcome.diagnostic else {
             return;
         };
-        let hard = completion.result.is_err() && !diagnostic.corrected;
+        let hard = outcome.fault == Some(CrimeMemoryFault::UncorrectableEcc);
+        let address_error = outcome.fault == Some(CrimeMemoryFault::Address);
+        let soft = diagnostic.corrected;
         let mut status = match origin {
             PendingMemoryOrigin::SysAd { .. } => registers::MEMORY_ERROR_CPU_ACCESS,
             PendingMemoryOrigin::CmiDma { .. } => 1 << 7,
             PendingMemoryOrigin::CgiDma { .. } => 1 << 16,
         };
-        if diagnostic.syndrome != 0 {
-            status |= if diagnostic.corrected {
+        if hard || soft {
+            status |= if soft {
                 registers::MEMORY_ERROR_SOFT
             } else {
                 registers::MEMORY_ERROR_HARD
@@ -756,10 +764,28 @@ impl Crime {
         } else {
             status |= registers::MEMORY_ERROR_INVALID_READ;
         }
-        if hard && self.memory_error_status & registers::MEMORY_ERROR_HARD != 0 {
-            status |= registers::MEMORY_ERROR_MULTIPLE;
-        }
-        if self.memory_error_status == 0 || hard {
+        let existing_hard = self.memory_error_status & registers::MEMORY_ERROR_HARD != 0;
+        let existing_soft = self.memory_error_status & registers::MEMORY_ERROR_SOFT != 0;
+        let existing_address = self.memory_error_status
+            & (registers::MEMORY_ERROR_INVALID_READ
+                | registers::MEMORY_ERROR_INVALID_WRITE
+                | registers::MEMORY_ERROR_INVALID_RMW)
+            != 0;
+        let capture = if hard {
+            if existing_hard {
+                status |= registers::MEMORY_ERROR_MULTIPLE;
+                false
+            } else {
+                true
+            }
+        } else if soft {
+            !existing_hard && !existing_soft
+        } else if address_error {
+            !existing_hard && !existing_soft && !existing_address
+        } else {
+            false
+        };
+        if capture {
             self.memory_error_address = diagnostic.address & 0x3fff_ffff;
             self.memory_ecc_syndrome = diagnostic.syndrome;
             self.memory_ecc_check = diagnostic.check;
@@ -947,11 +973,13 @@ impl BusDeviceRole<CrimeCmiTransaction> for Crime {
                     result: self
                         .accept_interrupt(post)
                         .map(|()| CrimeCompletionPayload::WriteComplete),
+                    memory_fault: None,
                 })
             }
             CrimeLinkOperation::Pio(_) => CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
                 id: transaction.id,
                 result: Err(CrimeBusError::Unsupported),
+                memory_fault: None,
             }),
         }
     }
@@ -976,11 +1004,13 @@ impl BusDeviceRole<CrimeCgiTransaction> for Crime {
                     result: self
                         .accept_interrupt(post)
                         .map(|()| CrimeCompletionPayload::WriteComplete),
+                    memory_fault: None,
                 })
             }
             CrimeLinkOperation::Pio(_) => CrimeLinkDeviceResponse::Complete(CrimeCgiCompletion {
                 id: transaction.id,
                 result: Err(CrimeBusError::Unsupported),
+                memory_fault: None,
             }),
         }
     }
@@ -1023,7 +1053,7 @@ fn transfer_from_cpu(transaction: Mips4ExecutionTransaction) -> CrimeTransfer {
     }
 }
 
-fn cpu_completion(
+fn cpu_link_completion(
     result: Result<CrimeCompletionPayload, CrimeBusError>,
 ) -> Mips4ExecutionCompletion {
     match result {
@@ -1034,6 +1064,27 @@ fn cpu_completion(
         }
         Ok(CrimeCompletionPayload::WriteComplete) => Mips4ExecutionCompletion::WriteComplete,
         Ok(CrimeCompletionPayload::ReadData(_)) | Err(_) => Mips4ExecutionCompletion::BusError,
+    }
+}
+
+fn cpu_memory_completion(
+    result: Result<CrimeMemoryOutcome, CrimeBusError>,
+) -> Mips4ExecutionCompletion {
+    match result {
+        Ok(outcome) => cpu_link_completion(Ok(outcome.payload)),
+        Err(error) => cpu_link_completion(Err(error)),
+    }
+}
+
+fn link_memory_completion(
+    result: Result<CrimeMemoryOutcome, CrimeBusError>,
+) -> (
+    Result<CrimeCompletionPayload, CrimeBusError>,
+    Option<CrimeMemoryFault>,
+) {
+    match result {
+        Ok(outcome) => (Ok(outcome.payload), outcome.fault),
+        Err(error) => (Err(error), None),
     }
 }
 

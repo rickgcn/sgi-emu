@@ -133,14 +133,34 @@ pub enum CrimeBusError {
     /// Transfer width or alignment is invalid.
     Access,
 
-    /// Target reported an uncorrectable data error.
-    UncorrectableEcc,
-
     /// Target is mapped but unsupported under the selected policy.
     Unsupported,
 
     /// A correlated transaction timed out.
     Timeout,
+}
+
+/// Hardware-visible fault reported by the CRIME memory controller.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CrimeMemoryFault {
+    /// No programmed bank-control register selected the request address.
+    Address,
+
+    /// Read data contained an ECC error that could not be corrected.
+    UncorrectableEcc,
+}
+
+/// Data and diagnostic state produced by one CRIME memory operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrimeMemoryOutcome {
+    /// Data or write acknowledgement returned to the requesting client.
+    pub payload: CrimeCompletionPayload,
+
+    /// Hardware-visible fault reported independently of bus transport.
+    pub fault: Option<CrimeMemoryFault>,
+
+    /// ECC or address information captured while servicing the request.
+    pub diagnostic: Option<CrimeMemoryDiagnostic>,
 }
 
 /// Completion returned through the CRIME memory domain.
@@ -149,11 +169,8 @@ pub struct CrimeMemoryCompletion {
     /// Correlation identifier.
     pub id: CrimeTransactionId,
 
-    /// Completion result.
-    pub result: Result<CrimeCompletionPayload, CrimeBusError>,
-
-    /// ECC or address information observed while servicing the request.
-    pub diagnostic: Option<CrimeMemoryDiagnostic>,
+    /// Completion result. Hardware memory faults are carried by the outcome.
+    pub result: Result<CrimeMemoryOutcome, CrimeBusError>,
 }
 
 /// Software-visible memory diagnostic associated with a completion.
@@ -276,6 +293,9 @@ pub struct CrimeCmiCompletion {
 
     /// Completion result.
     pub result: Result<CrimeCompletionPayload, CrimeBusError>,
+
+    /// Memory fault associated with a peer-initiated DMA operation.
+    pub memory_fault: Option<CrimeMemoryFault>,
 }
 
 /// CGI transaction between CRIME and GBE.
@@ -302,6 +322,9 @@ pub struct CrimeCgiCompletion {
 
     /// Completion result.
     pub result: Result<CrimeCompletionPayload, CrimeBusError>,
+
+    /// Memory fault associated with a peer-initiated DMA operation.
+    pub memory_fault: Option<CrimeMemoryFault>,
 }
 
 /// Immediate response from a link device.

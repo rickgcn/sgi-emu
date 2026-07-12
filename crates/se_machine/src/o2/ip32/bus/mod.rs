@@ -307,6 +307,7 @@ impl BusDeviceRole<CrimeCgiTransaction> for Ip32GbeEndpoint {
         CrimeLinkDeviceResponse::Complete(CrimeCgiCompletion {
             id: transaction.id,
             result,
+            memory_fault: None,
         })
     }
 }

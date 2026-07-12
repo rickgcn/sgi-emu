@@ -41,6 +41,7 @@ fn cmi_preserves_controller_and_transaction_identity() {
     bus.accept_device_completion(CrimeCmiCompletion {
         id: CrimeTransactionId::new(7),
         result: Ok(CrimeCompletionPayload::ReadData(vec![0; 8])),
+        memory_fault: None,
     });
     assert!(matches!(bus.poll(), CrimeBusAction::ScheduleService { .. }));
     bus.handle_event(CrimeCmiBusEvent::Complete { epoch });

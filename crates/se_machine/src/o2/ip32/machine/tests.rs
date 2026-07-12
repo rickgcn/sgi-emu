@@ -299,8 +299,8 @@ fn cpu_prom_and_ram_accesses_cross_all_required_buses() {
             transfer: CrimeTransfer::Read { length: 4 },
         });
     assert_eq!(
-        completion.result,
-        Ok(CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34]))
+        completion.result.unwrap().payload,
+        CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34])
     );
 }
 
@@ -380,8 +380,8 @@ fn hard_reset_preserves_sdram_and_advances_the_cpu_generation() {
             transfer: CrimeTransfer::Read { length: 4 },
         });
     assert_eq!(
-        completion.result,
-        Ok(CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34]))
+        completion.result.unwrap().payload,
+        CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34])
     );
 }
 
@@ -447,8 +447,20 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
     let exception_code = cpu.state().cp0().cause().exception_code();
     let failed = &machine.runtime().trace_recorder().sink().failed_addresses;
     assert!(
-        !matches!(pc, 0xffff_ffff_bfc0_03a0 | 0xffff_ffff_bfc0_03a4),
+        !matches!(
+            pc,
+            0xffff_ffff_bfc0_0380
+                | 0xffff_ffff_bfc0_0384
+                | 0xffff_ffff_bfc0_0388
+                | 0xffff_ffff_bfc0_038c
+                | 0xffff_ffff_bfc0_03a0
+                | 0xffff_ffff_bfc0_03a4
+        ),
         "PROM remained in the exception loop at {pc:#018x}; EPC={epc:#018x}, exception={exception_code}, failed accesses: {failed:#x?}"
+    );
+    assert!(
+        !failed.contains(&0x5000_0000),
+        "PROM bank probing incorrectly received a SysAD bus error at 0x50000000"
     );
 
     assert!(

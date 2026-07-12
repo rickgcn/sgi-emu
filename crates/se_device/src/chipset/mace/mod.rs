@@ -369,6 +369,7 @@ impl Mace {
             return CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
                 id,
                 result: Err(CrimeBusError::Unsupported),
+                memory_fault: None,
             });
         };
         let Some(resolution) = system::resolve(request.address, request.transfer.length()) else {
@@ -429,6 +430,7 @@ impl Mace {
             target => CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
                 id,
                 result: self.access_internal(target, resolution.offset, request.transfer),
+                memory_fault: None,
             }),
         }
     }
@@ -1031,6 +1033,7 @@ impl Mace {
             .push_back(MaceAction::CompleteCmiDevice(CrimeCmiCompletion {
                 id: pending.cmi_id,
                 result: from_isa_result(completion.result),
+                memory_fault: None,
             }));
     }
 }
@@ -1092,6 +1095,7 @@ impl BusControllerRole<PciCompletion> for Mace {
             .push_back(MaceAction::CompleteCmiDevice(CrimeCmiCompletion {
                 id,
                 result,
+                memory_fault: None,
             }));
     }
 }
@@ -1160,6 +1164,7 @@ fn complete_cmi_error(
     CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
         id,
         result: Err(error),
+        memory_fault: None,
     })
 }
 

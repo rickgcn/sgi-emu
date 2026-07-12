@@ -11,7 +11,7 @@ use se_core::role::BusDeviceRole;
 use super::config::{CrimeMemoryConfig, CrimeSdramBankConfig};
 use super::protocol::{
     CrimeBusError, CrimeCompletionPayload, CrimeMemoryCompletion, CrimeMemoryDiagnostic,
-    CrimeMemoryTransaction, CrimeSdramSignal, CrimeTransfer,
+    CrimeMemoryFault, CrimeMemoryOutcome, CrimeMemoryTransaction, CrimeSdramSignal, CrimeTransfer,
 };
 use super::registers;
 
@@ -20,6 +20,14 @@ mod tests;
 
 const PAGE_SIZE: usize = 4096;
 const MAX_TRANSFER_BYTES: usize = 16 * 32;
+const BANK_32_MIB_ADDRESS_SHIFT: u32 = 25;
+const BANK_128_MIB_ADDRESS_SHIFT: u32 = 27;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BankSelection {
+    Populated { index: usize, offset: u64 },
+    Unpopulated,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SparseBank {
@@ -85,6 +93,10 @@ impl SparseBank {
 }
 
 /// CRIME-attached sparse SDRAM with eight physical external banks.
+///
+/// Reads from a bank selected by its control register but lacking physical
+/// DIMMs return zero-filled data. This is a deterministic functional-model
+/// convention and does not claim to reproduce undriven electrical bus levels.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrimeSdram {
     id: ComponentId,
@@ -130,7 +142,13 @@ impl CrimeSdram {
         if bit >= 64 {
             return Err(CrimeBusError::Access);
         }
-        let (bank, offset) = self.decode(address)?;
+        let Some(BankSelection::Populated {
+            index: bank,
+            offset,
+        }) = self.decode(address)
+        else {
+            return Err(CrimeBusError::Address);
+        };
         let (data, _) = self.banks[bank]
             .as_ref()
             .expect("decoded bank exists")
@@ -146,31 +164,19 @@ impl CrimeSdram {
     }
 
     fn accept_transaction(&mut self, transaction: CrimeMemoryTransaction) -> CrimeMemoryCompletion {
-        let result = self.transfer(&transaction);
-        match result {
-            Ok((payload, diagnostic)) => CrimeMemoryCompletion {
-                id: transaction.id,
-                result: Ok(payload),
-                diagnostic,
-            },
-            Err((error, diagnostic)) => CrimeMemoryCompletion {
-                id: transaction.id,
-                result: Err(error),
-                diagnostic,
-            },
+        CrimeMemoryCompletion {
+            id: transaction.id,
+            result: self.transfer(&transaction),
         }
     }
 
     fn transfer(
         &mut self,
         transaction: &CrimeMemoryTransaction,
-    ) -> Result<
-        (CrimeCompletionPayload, Option<CrimeMemoryDiagnostic>),
-        (CrimeBusError, Option<CrimeMemoryDiagnostic>),
-    > {
+    ) -> Result<CrimeMemoryOutcome, CrimeBusError> {
         let length = transaction.transfer.length();
         if length == 0 || length > MAX_TRANSFER_BYTES {
-            return Err((CrimeBusError::Access, None));
+            return Err(CrimeBusError::Access);
         }
         match &transaction.transfer {
             CrimeTransfer::Read { .. } => {
@@ -178,7 +184,7 @@ impl CrimeSdram {
             }
             CrimeTransfer::Write { data, byte_enable } => {
                 if byte_enable.len() != data.len() {
-                    return Err((CrimeBusError::Access, None));
+                    return Err(CrimeBusError::Access);
                 }
                 self.write(transaction.address, data, byte_enable)
             }
@@ -190,18 +196,29 @@ impl CrimeSdram {
         address: u64,
         length: usize,
         no_ecc: bool,
-    ) -> Result<
-        (CrimeCompletionPayload, Option<CrimeMemoryDiagnostic>),
-        (CrimeBusError, Option<CrimeMemoryDiagnostic>),
-    > {
+    ) -> Result<CrimeMemoryOutcome, CrimeBusError> {
         let mut output = vec![0; length];
         let mut diagnostic = None;
+        let mut fault = None;
         let mut position = 0;
         while position < length {
             let current = address + position as u64;
-            let (bank_index, bank_offset) = self
-                .decode(current)
-                .map_err(|error| (error, address_diagnostic(current, false, false)))?;
+            let Some(selection) = self.decode(current) else {
+                diagnostic.get_or_insert_with(|| address_diagnostic(current, false, false));
+                fault.get_or_insert(CrimeMemoryFault::Address);
+                position += (8 - (current as usize & 7)).min(length - position);
+                continue;
+            };
+            let BankSelection::Populated {
+                index: bank_index,
+                offset: bank_offset,
+            } = selection
+            else {
+                // An electrically undriven memory data bus is represented by
+                // zeroes so the functional model remains deterministic.
+                position += (8 - (current as usize & 7)).min(length - position);
+                continue;
+            };
             let lane_offset = bank_offset & !7;
             let in_lane = bank_offset as usize & 7;
             let count = (8 - in_lane).min(length - position);
@@ -229,15 +246,22 @@ impl CrimeSdram {
                     data
                 }
                 ecc::EccCheck::Uncorrectable { syndrome, check } => {
-                    let diagnostic = ecc_diagnostic(current, syndrome, check, false, false, false);
-                    return Err((CrimeBusError::UncorrectableEcc, Some(diagnostic)));
+                    diagnostic.get_or_insert_with(|| {
+                        ecc_diagnostic(current, syndrome, check, false, false, false)
+                    });
+                    fault.get_or_insert(CrimeMemoryFault::UncorrectableEcc);
+                    data
                 }
             };
             let bytes = readable.to_le_bytes();
             output[position..position + count].copy_from_slice(&bytes[in_lane..in_lane + count]);
             position += count;
         }
-        Ok((CrimeCompletionPayload::ReadData(output), diagnostic))
+        Ok(CrimeMemoryOutcome {
+            payload: CrimeCompletionPayload::ReadData(output),
+            fault,
+            diagnostic,
+        })
     }
 
     fn write(
@@ -245,11 +269,9 @@ impl CrimeSdram {
         address: u64,
         data: &[u8],
         byte_enable: &[bool],
-    ) -> Result<
-        (CrimeCompletionPayload, Option<CrimeMemoryDiagnostic>),
-        (CrimeBusError, Option<CrimeMemoryDiagnostic>),
-    > {
+    ) -> Result<CrimeMemoryOutcome, CrimeBusError> {
         let mut diagnostic = None;
+        let mut fault = None;
         let mut position = 0;
         while position < data.len() {
             let current = address + position as u64;
@@ -260,9 +282,23 @@ impl CrimeSdram {
                 || byte_enable[position..position + count]
                     .iter()
                     .any(|enabled| !enabled);
-            let (bank_index, bank_offset) = self
-                .decode(current)
-                .map_err(|error| (error, address_diagnostic(current, true, read_modify_write)))?;
+            let Some(selection) = self.decode(current) else {
+                diagnostic
+                    .get_or_insert_with(|| address_diagnostic(current, true, read_modify_write));
+                fault.get_or_insert(CrimeMemoryFault::Address);
+                position += count;
+                continue;
+            };
+            let BankSelection::Populated {
+                index: bank_index,
+                offset: bank_offset,
+            } = selection
+            else {
+                // Writes to a selected but unpopulated external bank have no
+                // storage side effect and still complete normally.
+                position += count;
+                continue;
+            };
             let lane_offset = bank_offset & !7;
             let mut bytes = if read_modify_write {
                 let (old_data, stored_check) = self.banks[bank_index]
@@ -288,9 +324,11 @@ impl CrimeSdram {
                         data
                     }
                     ecc::EccCheck::Uncorrectable { syndrome, check } => {
-                        let diagnostic =
-                            ecc_diagnostic(current, syndrome, check, false, true, true);
-                        return Err((CrimeBusError::UncorrectableEcc, Some(diagnostic)));
+                        diagnostic.get_or_insert_with(|| {
+                            ecc_diagnostic(current, syndrome, check, false, true, true)
+                        });
+                        fault.get_or_insert(CrimeMemoryFault::UncorrectableEcc);
+                        old_data
                     }
                 };
                 old_data.to_le_bytes()
@@ -313,26 +351,38 @@ impl CrimeSdram {
             }
             position += count;
         }
-        Ok((CrimeCompletionPayload::WriteComplete, diagnostic))
+        Ok(CrimeMemoryOutcome {
+            payload: CrimeCompletionPayload::WriteComplete,
+            fault,
+            diagnostic,
+        })
     }
 
-    fn decode(&self, address: u64) -> Result<(usize, u64), CrimeBusError> {
+    fn decode(&self, address: u64) -> Option<BankSelection> {
         for (index, control) in self.bank_control.iter().copied().enumerate() {
-            let base = u64::from(control & registers::MEMORY_BANK_ADDRESS_MASK) << 25;
-            let decode_size = if control & registers::MEMORY_BANK_SIZE_128_MIB != 0 {
-                128 * 1024 * 1024
+            let programmed = u64::from(control & registers::MEMORY_BANK_ADDRESS_MASK);
+            let address_field = (address >> BANK_32_MIB_ADDRESS_SHIFT)
+                & u64::from(registers::MEMORY_BANK_ADDRESS_MASK);
+            let offset = if control & registers::MEMORY_BANK_SIZE_128_MIB != 0 {
+                if address_field >> 2 != programmed >> 2 {
+                    continue;
+                }
+                address & ((1_u64 << BANK_128_MIB_ADDRESS_SHIFT) - 1)
             } else {
-                32 * 1024 * 1024
+                if address_field != programmed {
+                    continue;
+                }
+                address & ((1_u64 << BANK_32_MIB_ADDRESS_SHIFT) - 1)
             };
-            if address < base || address >= base + decode_size {
-                continue;
-            }
             let Some(bank) = &self.banks[index] else {
-                return Err(CrimeBusError::Address);
+                return Some(BankSelection::Unpopulated);
             };
-            return Ok((index, (address - base) % bank.config.size.bytes()));
+            return Some(BankSelection::Populated {
+                index,
+                offset: offset % bank.config.size.bytes(),
+            });
         }
-        Err(CrimeBusError::Address)
+        None
     }
 }
 
@@ -413,19 +463,15 @@ fn ecc_diagnostic(
     }
 }
 
-fn address_diagnostic(
-    address: u64,
-    write: bool,
-    read_modify_write: bool,
-) -> Option<CrimeMemoryDiagnostic> {
-    Some(CrimeMemoryDiagnostic {
+fn address_diagnostic(address: u64, write: bool, read_modify_write: bool) -> CrimeMemoryDiagnostic {
+    CrimeMemoryDiagnostic {
         address,
         syndrome: 0,
         check: 0,
         corrected: false,
         write,
         read_modify_write,
-    })
+    }
 }
 
 const fn reset_bank_control(config: CrimeMemoryConfig) -> [u16; 8] {

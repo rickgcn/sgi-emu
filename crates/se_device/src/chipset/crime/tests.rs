@@ -1,6 +1,7 @@
 use se_core::role::{BusControllerRole, BusDeviceRole};
 
 use super::*;
+use crate::chipset::crime::protocol::CrimeMemoryDiagnostic;
 use crate::cpu::execution::protocol::{ExecutionTransaction, ExecutionTransactionId};
 use crate::cpu::mips4::cache::Mips4MemoryAccessType;
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
@@ -201,8 +202,11 @@ fn memory_request_is_deferred_until_the_matching_bus_completion() {
 
     crime.complete(CrimeMemoryCompletion {
         id: transaction.id,
-        result: Ok(CrimeCompletionPayload::ReadData(vec![1, 2, 3, 4])),
-        diagnostic: None,
+        result: Ok(CrimeMemoryOutcome {
+            payload: CrimeCompletionPayload::ReadData(vec![1, 2, 3, 4]),
+            fault: None,
+            diagnostic: None,
+        }),
     });
     assert_eq!(
         next_non_trace(&mut crime),
@@ -210,5 +214,192 @@ fn memory_request_is_deferred_until_the_matching_bus_completion() {
             id: ExecutionTransactionId::new(9),
             payload: Mips4ExecutionCompletion::ReadData(0x0403_0201),
         })
+    );
+}
+
+#[test]
+fn memory_address_fault_updates_miu_and_completes_sysad_without_cpu_error() {
+    let mut crime = crime();
+    enable_interrupt_bit(&mut crime, 21);
+    crime
+        .accept(read(
+            11,
+            LINEAR_MEMORY_START,
+            Mips4ExecutionTransferSize::Doubleword,
+        ))
+        .unwrap();
+    let CrimeAction::StartMemory(transaction) = next_non_trace(&mut crime) else {
+        panic!("expected a memory transaction");
+    };
+    crime.complete(CrimeMemoryCompletion {
+        id: transaction.id,
+        result: Ok(CrimeMemoryOutcome {
+            payload: CrimeCompletionPayload::ReadData(vec![0; 8]),
+            fault: Some(CrimeMemoryFault::Address),
+            diagnostic: Some(CrimeMemoryDiagnostic {
+                address: 0x1000_0000,
+                syndrome: 0,
+                check: 0,
+                corrected: false,
+                write: false,
+                read_modify_write: false,
+            }),
+        }),
+    });
+
+    assert!(matches!(next_non_trace(&mut crime), CrimeAction::SetIrq(_)));
+    assert_eq!(
+        next_non_trace(&mut crime),
+        CrimeAction::CompleteSysAd(ExecutionCompletion {
+            id: ExecutionTransactionId::new(11),
+            payload: Mips4ExecutionCompletion::ReadData(0),
+        })
+    );
+    assert_eq!(
+        crime.memory_error_status,
+        registers::MEMORY_ERROR_CPU_ACCESS | registers::MEMORY_ERROR_INVALID_READ
+    );
+    assert_eq!(crime.memory_error_address, 0x1000_0000);
+    assert_eq!(
+        crime
+            .piu
+            .read(registers::CPU_ERROR_STATUS, SimTime::ZERO, TIMEBASE_HZ),
+        Some(0)
+    );
+    assert_eq!(
+        crime
+            .piu
+            .read(registers::CPU_ERROR_ADDRESS, SimTime::ZERO, TIMEBASE_HZ),
+        Some(0)
+    );
+}
+
+#[test]
+fn dma_memory_faults_are_separate_from_cmi_and_cgi_transport_results() {
+    let mut crime = crime();
+    let request = CrimeDmaRequest {
+        address: 0x2000_0000,
+        transfer: CrimeTransfer::Read { length: 8 },
+    };
+
+    assert_eq!(
+        BusDeviceRole::accept(
+            &mut crime,
+            CrimeCmiTransaction {
+                id: CrimeTransactionId::new(21),
+                controller: MACE,
+                target: CRIME,
+                operation: CrimeLinkOperation::Dma(request.clone()),
+            }
+        ),
+        CrimeLinkDeviceResponse::Deferred
+    );
+    let CrimeAction::StartMemory(cmi_memory) = next_non_trace(&mut crime) else {
+        panic!("expected CMI memory transaction");
+    };
+    crime.complete(CrimeMemoryCompletion {
+        id: cmi_memory.id,
+        result: Ok(CrimeMemoryOutcome {
+            payload: CrimeCompletionPayload::ReadData(vec![0; 8]),
+            fault: Some(CrimeMemoryFault::Address),
+            diagnostic: Some(CrimeMemoryDiagnostic {
+                address: request.address,
+                syndrome: 0,
+                check: 0,
+                corrected: false,
+                write: false,
+                read_modify_write: false,
+            }),
+        }),
+    });
+    assert!(matches!(
+        next_non_trace(&mut crime),
+        CrimeAction::CompleteCmiDevice(CrimeCmiCompletion {
+            id,
+            result: Ok(CrimeCompletionPayload::ReadData(data)),
+            memory_fault: Some(CrimeMemoryFault::Address),
+        }) if id == CrimeTransactionId::new(21) && data == vec![0; 8]
+    ));
+
+    assert_eq!(
+        BusDeviceRole::accept(
+            &mut crime,
+            CrimeCgiTransaction {
+                id: CrimeTransactionId::new(22),
+                controller: GBE,
+                target: CRIME,
+                operation: CrimeLinkOperation::Dma(request.clone()),
+            }
+        ),
+        CrimeLinkDeviceResponse::Deferred
+    );
+    let CrimeAction::StartMemory(cgi_memory) = next_non_trace(&mut crime) else {
+        panic!("expected CGI memory transaction");
+    };
+    crime.complete(CrimeMemoryCompletion {
+        id: cgi_memory.id,
+        result: Ok(CrimeMemoryOutcome {
+            payload: CrimeCompletionPayload::ReadData(vec![0; 8]),
+            fault: Some(CrimeMemoryFault::UncorrectableEcc),
+            diagnostic: Some(CrimeMemoryDiagnostic {
+                address: request.address,
+                syndrome: 1,
+                check: 2,
+                corrected: false,
+                write: false,
+                read_modify_write: false,
+            }),
+        }),
+    });
+    assert!(matches!(
+        next_non_trace(&mut crime),
+        CrimeAction::CompleteCgiDevice(CrimeCgiCompletion {
+            id,
+            result: Ok(CrimeCompletionPayload::ReadData(data)),
+            memory_fault: Some(CrimeMemoryFault::UncorrectableEcc),
+        }) if id == CrimeTransactionId::new(22) && data == vec![0; 8]
+    ));
+}
+
+#[test]
+fn memory_error_latching_preserves_first_hard_error_and_priority() {
+    let mut crime = crime();
+    let origin = PendingMemoryOrigin::CmiDma {
+        link_id: CrimeTransactionId::new(1),
+    };
+    let outcome = |address, fault, corrected, syndrome| CrimeMemoryOutcome {
+        payload: CrimeCompletionPayload::ReadData(vec![0; 8]),
+        fault,
+        diagnostic: Some(CrimeMemoryDiagnostic {
+            address,
+            syndrome,
+            check: syndrome,
+            corrected,
+            write: false,
+            read_modify_write: false,
+        }),
+    };
+
+    crime.record_memory_diagnostic(
+        &origin,
+        &outcome(0x100, Some(CrimeMemoryFault::Address), false, 0),
+    );
+    assert_eq!(crime.memory_error_address, 0x100);
+    crime.record_memory_diagnostic(&origin, &outcome(0x200, None, true, 1));
+    assert_eq!(crime.memory_error_address, 0x200);
+    crime.record_memory_diagnostic(
+        &origin,
+        &outcome(0x300, Some(CrimeMemoryFault::UncorrectableEcc), false, 2),
+    );
+    assert_eq!(crime.memory_error_address, 0x300);
+    crime.record_memory_diagnostic(
+        &origin,
+        &outcome(0x400, Some(CrimeMemoryFault::UncorrectableEcc), false, 3),
+    );
+    assert_eq!(crime.memory_error_address, 0x300);
+    assert_eq!(crime.memory_ecc_syndrome, 2);
+    assert_ne!(
+        crime.memory_error_status & registers::MEMORY_ERROR_MULTIPLE,
+        0
     );
 }
