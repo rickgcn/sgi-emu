@@ -1,18 +1,37 @@
-//! CRIME Rendering Engine register front end and fixed-point helpers.
+//! CRIME Rendering Engine register front end and PROM MTE path.
 
+use core::fmt;
 use std::collections::{BTreeMap, VecDeque};
 
+use super::protocol::{CrimeBusError, CrimeCompletionPayload, CrimeMemoryOutcome};
 use super::registers;
 
+const TLB_BASE: u64 = registers::CRIME_RENDER_BASE + 0x1000;
+const LINEAR_A_BASE: u64 = TLB_BASE + 0x700;
 const PIXEL_PIPE_BASE: u64 = registers::CRIME_RENDER_BASE + 0x2000;
 const MTE_BASE: u64 = registers::CRIME_RENDER_BASE + 0x3000;
 const STATUS_BASE: u64 = registers::CRIME_RENDER_BASE + 0x4000;
-const INTERFACE_CAPACITY: usize = 128;
+const START_OFFSET: u64 = 0x800;
+const INTERFACE_CAPACITY: usize = 64;
+const LINEAR_PAGE_COUNT: usize = 32;
+const LINEAR_PAGE_SIZE: u64 = 4096;
+const MAX_MEMORY_CHUNK_BYTES: usize = 512;
+
+const PROM_CLEAR_MODE: u32 = 0x0000_0011;
+
+const STATUS_IDLE: u32 = 0x1000_0000;
+const STATUS_SETUP_IDLE: u32 = 0x0800_0000;
+const STATUS_PIXEL_PIPE_IDLE: u32 = 0x0400_0000;
+const STATUS_MTE_IDLE: u32 = 0x0200_0000;
+const STATUS_LEVEL_SHIFT: u32 = 18;
+const STATUS_READ_POINTER_SHIFT: u32 = 12;
+const STATUS_WRITE_POINTER_SHIFT: u32 = 6;
+const STATUS_BUFFER_START: u32 = 0x3f;
 
 /// One host register write retained by the Rendering Engine interface buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderRegisterWrite {
-    /// Register address without commit tagging.
+    /// Canonical register address without the start tag.
     pub address: u64,
 
     /// Register value.
@@ -20,6 +39,158 @@ pub struct RenderRegisterWrite {
 
     /// Access width in bytes.
     pub size: u8,
+
+    /// Whether this write commits the current operation.
+    pub commit: bool,
+}
+
+/// Rendering Engine execution failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CrimeRenderError {
+    /// The committed MTE state is outside the behavior confirmed by the PROM.
+    UnsupportedMteJob {
+        /// MTE mode value.
+        mode: u32,
+        /// MTE byte mask.
+        byte_mask: u32,
+        /// MTE foreground value.
+        foreground: u32,
+    },
+
+    /// The inclusive MTE destination range is reversed.
+    InvalidMteRange {
+        /// Inclusive start address.
+        start: u32,
+        /// Inclusive end address.
+        end: u32,
+    },
+
+    /// Linear-A did not contain a valid mapping for the requested page.
+    InvalidLinearTlb {
+        /// Virtual address being translated.
+        virtual_address: u32,
+        /// Raw TLB entry selected by the address.
+        entry: u32,
+    },
+
+    /// A memory completion arrived while no MTE write was outstanding.
+    UnexpectedMemoryCompletion,
+
+    /// The memory target returned a payload incompatible with an MTE write.
+    UnexpectedMemoryPayload,
+
+    /// The memory domain failed to transport the MTE request.
+    MemoryTransport(CrimeBusError),
+}
+
+impl fmt::Display for CrimeRenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedMteJob {
+                mode,
+                byte_mask,
+                foreground,
+            } => write!(
+                f,
+                "unsupported CRIME MTE job mode {mode:#010x}, byte mask {byte_mask:#010x}, foreground {foreground:#010x}"
+            ),
+            Self::InvalidMteRange { start, end } => {
+                write!(f, "invalid CRIME MTE range {start:#010x}..={end:#010x}")
+            }
+            Self::InvalidLinearTlb {
+                virtual_address,
+                entry,
+            } => write!(
+                f,
+                "invalid CRIME Linear-A TLB entry {entry:#010x} for virtual address {virtual_address:#010x}"
+            ),
+            Self::UnexpectedMemoryCompletion => {
+                f.write_str("unexpected CRIME MTE memory completion")
+            }
+            Self::UnexpectedMemoryPayload => {
+                f.write_str("CRIME MTE memory completion returned an unexpected payload")
+            }
+            Self::MemoryTransport(error) => {
+                write!(f, "CRIME MTE memory transport failed: {error:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CrimeRenderError {}
+
+/// One memory write requested by the MTE state machine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RenderMemoryWrite {
+    pub(super) virtual_address: u32,
+    pub(super) physical_address: u64,
+    pub(super) data: Vec<u8>,
+    pub(super) byte_enable: Vec<bool>,
+}
+
+/// A software-visible Rendering Engine transition used for tracing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RenderNotice {
+    RegisterRetired(RenderRegisterWrite),
+    JobCommitted {
+        start: u32,
+        end: u32,
+    },
+    MemoryChunk {
+        virtual_address: u32,
+        physical_address: u64,
+        length: u16,
+    },
+    JobCompleted {
+        start: u32,
+        end: u32,
+    },
+}
+
+/// One PIU interrupt-source transition generated by the RE.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RenderInterruptEffect {
+    pub(super) mask: u32,
+    pub(super) asserted: bool,
+}
+
+/// Effects produced by one RE state transition.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct RenderProgress {
+    pub(super) schedule_step: bool,
+    pub(super) memory_write: Option<RenderMemoryWrite>,
+    pub(super) interrupts: Vec<RenderInterruptEffect>,
+    pub(super) notices: Vec<RenderNotice>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MteRegisters {
+    mode: u32,
+    byte_mask: u32,
+    stipple_mask: u32,
+    foreground: u32,
+    source_start: u32,
+    source_end: u32,
+    destination_start: u32,
+    destination_end: u32,
+    source_y_step: u32,
+    destination_y_step: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MteJob {
+    start: u32,
+    next: u64,
+    end: u64,
+    linear_a: [u32; LINEAR_PAGE_COUNT],
+    pending_length: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderConditions {
+    empty: bool,
+    full: bool,
+    idle: bool,
 }
 
 /// CRIME Rendering Engine front-end state.
@@ -27,6 +198,13 @@ pub struct RenderRegisterWrite {
 pub struct CrimeRender {
     interface: VecDeque<RenderRegisterWrite>,
     registers: BTreeMap<u64, u64>,
+    linear_a: [u32; LINEAR_PAGE_COUNT],
+    mte: MteRegisters,
+    active_job: Option<MteJob>,
+    read_pointer: u8,
+    write_pointer: u8,
+    step_scheduled: bool,
+    conditions: RenderConditions,
     epoch: u64,
 }
 
@@ -36,15 +214,62 @@ impl CrimeRender {
         Self {
             interface: VecDeque::new(),
             registers: BTreeMap::new(),
+            linear_a: [0; LINEAR_PAGE_COUNT],
+            mte: MteRegisters {
+                mode: 0,
+                byte_mask: 0,
+                stipple_mask: 0,
+                foreground: 0,
+                source_start: 0,
+                source_end: 0,
+                destination_start: 0,
+                destination_end: 0,
+                source_y_step: 0,
+                destination_y_step: 0,
+            },
+            active_job: None,
+            read_pointer: 0,
+            write_pointer: 0,
+            step_scheduled: false,
+            conditions: RenderConditions {
+                empty: true,
+                full: false,
+                idle: true,
+            },
             epoch: 0,
         }
     }
 
     /// Resets the front end and invalidates old render events.
-    pub fn reset(&mut self) {
+    pub(super) fn reset(&mut self) -> Vec<RenderInterruptEffect> {
         self.interface.clear();
         self.registers.clear();
+        self.linear_a = [0; LINEAR_PAGE_COUNT];
+        self.mte = MteRegisters::default();
+        self.active_job = None;
+        self.read_pointer = 0;
+        self.write_pointer = 0;
+        self.step_scheduled = false;
+        self.conditions = RenderConditions {
+            empty: true,
+            full: false,
+            idle: true,
+        };
         self.epoch = self.epoch.wrapping_add(1);
+        vec![
+            RenderInterruptEffect {
+                mask: registers::INTERRUPT_RE_EMPTY_LEVEL,
+                asserted: true,
+            },
+            RenderInterruptEffect {
+                mask: registers::INTERRUPT_RE_FULL_LEVEL,
+                asserted: false,
+            },
+            RenderInterruptEffect {
+                mask: registers::INTERRUPT_RE_IDLE_LEVEL,
+                asserted: true,
+            },
+        ]
     }
 
     /// Returns the active Rendering Engine epoch.
@@ -52,9 +277,14 @@ impl CrimeRender {
         self.epoch
     }
 
-    /// Returns the number of host writes waiting in the 128-entry interface buffer.
+    /// Returns the number of host writes waiting in the 64-entry interface buffer.
     pub fn interface_level(&self) -> usize {
         self.interface.len()
+    }
+
+    /// Returns whether another host register write can be accepted.
+    pub(super) fn has_interface_space(&self) -> bool {
+        self.interface.len() < INTERFACE_CAPACITY
     }
 
     /// Reads a software-visible Rendering Engine register.
@@ -64,35 +294,275 @@ impl CrimeRender {
             return None;
         }
         if address == STATUS_BASE {
-            return Some(self.interface.len() as u64);
+            return Some(u64::from(self.status()));
         }
         Some(self.registers.get(&address).copied().unwrap_or(0))
     }
 
     /// Queues one software-visible Rendering Engine register write.
-    pub fn write(&mut self, address: u64, size: u8, value: u64) -> Result<(), RenderWriteError> {
+    pub(super) fn write(
+        &mut self,
+        address: u64,
+        size: u8,
+        value: u64,
+    ) -> Result<RenderProgress, RenderWriteError> {
+        let (address, commit) = canonical_write_address(address);
         let Some(access) = register_access(address, size) else {
             return Err(RenderWriteError::UndefinedRegister);
         };
-        if !access.writable {
+        if !access.writable || commit && !(MTE_BASE..=MTE_BASE + 0x78).contains(&address) {
             return Err(RenderWriteError::UndefinedRegister);
         }
-        if self.interface.len() == INTERFACE_CAPACITY {
+        if !self.has_interface_space() {
             return Err(RenderWriteError::InterfaceFull);
         }
+
+        let previous = self.conditions;
         self.interface.push_back(RenderRegisterWrite {
             address,
             value,
             size,
+            commit,
         });
-        Ok(())
+        self.write_pointer = self.write_pointer.wrapping_add(1) & 0x3f;
+        let schedule_step = self.ensure_step_scheduled();
+        let interrupts = self.update_conditions(previous);
+        Ok(RenderProgress {
+            schedule_step,
+            interrupts,
+            ..RenderProgress::default()
+        })
     }
 
-    /// Retires at most one host write into the active register file.
-    pub fn retire_one(&mut self) -> Option<RenderRegisterWrite> {
-        let write = self.interface.pop_front()?;
+    /// Advances one bounded RE state-machine step.
+    pub(super) fn step(&mut self) -> Result<RenderProgress, CrimeRenderError> {
+        let previous = self.conditions;
+        self.step_scheduled = false;
+        let mut progress = RenderProgress::default();
+
+        if self.active_job.is_some() {
+            if self
+                .active_job
+                .as_ref()
+                .is_some_and(|job| job.pending_length.is_some())
+            {
+                progress.interrupts = self.update_conditions(previous);
+                return Ok(progress);
+            }
+            if self
+                .active_job
+                .as_ref()
+                .is_some_and(|job| job.next > job.end)
+            {
+                let job = self.active_job.take().expect("active job exists");
+                progress.notices.push(RenderNotice::JobCompleted {
+                    start: job.start,
+                    end: job.end as u32,
+                });
+                progress.schedule_step = self.ensure_step_scheduled();
+            } else {
+                let memory_write = self.prepare_memory_write()?;
+                progress.notices.push(RenderNotice::MemoryChunk {
+                    virtual_address: memory_write.virtual_address,
+                    physical_address: memory_write.physical_address,
+                    length: memory_write.data.len() as u16,
+                });
+                progress.memory_write = Some(memory_write);
+            }
+            progress.interrupts = self.update_conditions(previous);
+            return Ok(progress);
+        }
+
+        let Some(write) = self.interface.pop_front() else {
+            progress.interrupts = self.update_conditions(previous);
+            return Ok(progress);
+        };
+        self.read_pointer = self.read_pointer.wrapping_add(1) & 0x3f;
+        self.apply_register_write(write);
+        progress.notices.push(RenderNotice::RegisterRetired(write));
+
+        if write.commit {
+            let job = self.snapshot_prom_clear_job()?;
+            progress.notices.push(RenderNotice::JobCommitted {
+                start: job.start,
+                end: job.end as u32,
+            });
+            self.active_job = Some(job);
+            let memory_write = self.prepare_memory_write()?;
+            progress.notices.push(RenderNotice::MemoryChunk {
+                virtual_address: memory_write.virtual_address,
+                physical_address: memory_write.physical_address,
+                length: memory_write.data.len() as u16,
+            });
+            progress.memory_write = Some(memory_write);
+        } else {
+            progress.schedule_step = self.ensure_step_scheduled();
+        }
+        progress.interrupts = self.update_conditions(previous);
+        Ok(progress)
+    }
+
+    /// Completes the outstanding MTE memory write.
+    pub(super) fn complete_memory(
+        &mut self,
+        result: Result<CrimeMemoryOutcome, CrimeBusError>,
+    ) -> Result<RenderProgress, CrimeRenderError> {
+        let previous = self.conditions;
+        let Some(job) = self.active_job.as_mut() else {
+            return Err(CrimeRenderError::UnexpectedMemoryCompletion);
+        };
+        let Some(length) = job.pending_length.take() else {
+            return Err(CrimeRenderError::UnexpectedMemoryCompletion);
+        };
+        let outcome = result.map_err(CrimeRenderError::MemoryTransport)?;
+        if !matches!(outcome.payload, CrimeCompletionPayload::WriteComplete) {
+            return Err(CrimeRenderError::UnexpectedMemoryPayload);
+        }
+        job.next += u64::from(length);
+        let schedule_step = self.ensure_step_scheduled();
+        Ok(RenderProgress {
+            schedule_step,
+            interrupts: self.update_conditions(previous),
+            ..RenderProgress::default()
+        })
+    }
+
+    fn status(&self) -> u32 {
+        let setup_idle = self.interface.is_empty();
+        let mte_idle = self.active_job.is_none();
+        let idle = setup_idle && mte_idle;
+        (if idle { STATUS_IDLE } else { 0 })
+            | (if setup_idle { STATUS_SETUP_IDLE } else { 0 })
+            | STATUS_PIXEL_PIPE_IDLE
+            | (if mte_idle { STATUS_MTE_IDLE } else { 0 })
+            | (self.interface.len() as u32) << STATUS_LEVEL_SHIFT
+            | u32::from(self.read_pointer) << STATUS_READ_POINTER_SHIFT
+            | u32::from(self.write_pointer) << STATUS_WRITE_POINTER_SHIFT
+            | STATUS_BUFFER_START
+    }
+
+    fn ensure_step_scheduled(&mut self) -> bool {
+        let work_ready = match &self.active_job {
+            Some(job) => job.pending_length.is_none(),
+            None => !self.interface.is_empty(),
+        };
+        if !work_ready || self.step_scheduled {
+            return false;
+        }
+        self.step_scheduled = true;
+        true
+    }
+
+    fn update_conditions(&mut self, previous: RenderConditions) -> Vec<RenderInterruptEffect> {
+        let current = RenderConditions {
+            empty: self.interface.is_empty(),
+            full: self.interface.len() == INTERFACE_CAPACITY,
+            idle: self.interface.is_empty() && self.active_job.is_none(),
+        };
+        self.conditions = current;
+        let mut effects = Vec::new();
+        append_condition_effects(
+            &mut effects,
+            previous.empty,
+            current.empty,
+            registers::INTERRUPT_RE_EMPTY_EDGE,
+            registers::INTERRUPT_RE_EMPTY_LEVEL,
+        );
+        append_condition_effects(
+            &mut effects,
+            previous.full,
+            current.full,
+            registers::INTERRUPT_RE_FULL_EDGE,
+            registers::INTERRUPT_RE_FULL_LEVEL,
+        );
+        append_condition_effects(
+            &mut effects,
+            previous.idle,
+            current.idle,
+            registers::INTERRUPT_RE_IDLE_EDGE,
+            registers::INTERRUPT_RE_IDLE_LEVEL,
+        );
+        effects
+    }
+
+    fn apply_register_write(&mut self, write: RenderRegisterWrite) {
         self.registers.insert(write.address, write.value);
-        Some(write)
+        if (LINEAR_A_BASE..LINEAR_A_BASE + 0x80).contains(&write.address) {
+            let register = ((write.address - LINEAR_A_BASE) / 8) as usize;
+            self.linear_a[register * 2] = (write.value >> 32) as u32;
+            self.linear_a[register * 2 + 1] = write.value as u32;
+        }
+        let value = write.value as u32;
+        if (MTE_BASE..=MTE_BASE + 0x78).contains(&write.address) {
+            match write.address - MTE_BASE {
+                0x00 => self.mte.mode = value,
+                0x08 => self.mte.byte_mask = value,
+                0x10 => self.mte.stipple_mask = value,
+                0x18 => self.mte.foreground = value,
+                0x20 => self.mte.source_start = value,
+                0x28 => self.mte.source_end = value,
+                0x30 => self.mte.destination_start = value,
+                0x38 => self.mte.destination_end = value,
+                0x40 => self.mte.source_y_step = value,
+                0x48 => self.mte.destination_y_step = value,
+                _ => {}
+            }
+        }
+    }
+
+    fn snapshot_prom_clear_job(&self) -> Result<MteJob, CrimeRenderError> {
+        if self.mte.mode != PROM_CLEAR_MODE
+            || self.mte.byte_mask != u32::MAX
+            || self.mte.foreground != 0
+        {
+            return Err(CrimeRenderError::UnsupportedMteJob {
+                mode: self.mte.mode,
+                byte_mask: self.mte.byte_mask,
+                foreground: self.mte.foreground,
+            });
+        }
+        if self.mte.destination_end < self.mte.destination_start {
+            return Err(CrimeRenderError::InvalidMteRange {
+                start: self.mte.destination_start,
+                end: self.mte.destination_end,
+            });
+        }
+        Ok(MteJob {
+            start: self.mte.destination_start,
+            next: u64::from(self.mte.destination_start),
+            end: u64::from(self.mte.destination_end),
+            linear_a: self.linear_a,
+            pending_length: None,
+        })
+    }
+
+    fn prepare_memory_write(&mut self) -> Result<RenderMemoryWrite, CrimeRenderError> {
+        let job = self.active_job.as_ref().expect("active MTE job exists");
+        let virtual_address = job.next as u32;
+        let page_index = ((job.next >> 12) & 0x1f) as usize;
+        let entry = job.linear_a[page_index];
+        if entry & 0x8000_0000 == 0 || entry & 0x7ffc_0000 != 0 {
+            return Err(CrimeRenderError::InvalidLinearTlb {
+                virtual_address,
+                entry,
+            });
+        }
+        let in_page = job.next & (LINEAR_PAGE_SIZE - 1);
+        let remaining = job.end - job.next + 1;
+        let length = remaining
+            .min(LINEAR_PAGE_SIZE - in_page)
+            .min(MAX_MEMORY_CHUNK_BYTES as u64) as usize;
+        let physical_address = u64::from(entry & 0x0003_ffff) * LINEAR_PAGE_SIZE + in_page;
+        self.active_job
+            .as_mut()
+            .expect("active MTE job exists")
+            .pending_length = Some(length as u16);
+        Ok(RenderMemoryWrite {
+            virtual_address,
+            physical_address,
+            data: vec![0; length],
+            byte_enable: vec![true; length],
+        })
     }
 }
 
@@ -108,7 +578,7 @@ pub enum RenderWriteError {
     /// Address or access width is not defined by the register map.
     UndefinedRegister,
 
-    /// The 128-entry host interface buffer has no free entry.
+    /// The 64-entry host interface buffer has no free entry.
     InterfaceFull,
 }
 
@@ -131,10 +601,16 @@ const READ_ONLY: RegisterAccess = RegisterAccess {
     writable: false,
 };
 
+const fn canonical_write_address(address: u64) -> (u64, bool) {
+    if address >= MTE_BASE + START_OFFSET && address <= MTE_BASE + START_OFFSET + 0x78 {
+        (address - START_OFFSET, true)
+    } else {
+        (address, false)
+    }
+}
+
 const fn register_access(address: u64, size: u8) -> Option<RegisterAccess> {
-    if address >= registers::CRIME_RENDER_BASE + 0x1000
-        && address <= registers::CRIME_RENDER_BASE + 0x17f8
-    {
+    if address >= TLB_BASE && address <= TLB_BASE + 0x7f8 {
         return if size == 8 && address & 7 == 0 {
             Some(READ_WRITE)
         } else {
@@ -181,6 +657,28 @@ const fn register_access(address: u64, size: u8) -> Option<RegisterAccess> {
         return Some(READ_ONLY);
     }
     None
+}
+
+fn append_condition_effects(
+    effects: &mut Vec<RenderInterruptEffect>,
+    previous: bool,
+    current: bool,
+    edge_mask: u32,
+    level_mask: u32,
+) {
+    if previous == current {
+        return;
+    }
+    effects.push(RenderInterruptEffect {
+        mask: level_mask,
+        asserted: current,
+    });
+    if current {
+        effects.push(RenderInterruptEffect {
+            mask: edge_mask,
+            asserted: true,
+        });
+    }
 }
 
 /// Applies one CRIME bitwise logic operation.

@@ -27,6 +27,7 @@ use crate::bus::irq::{IrqSource, IrqTransaction};
 use crate::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransactionId};
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 
+use self::clock::CrimeClock;
 use self::config::{CrimeAccessPolicy, CrimeConfig, CrimeConfigError};
 use self::piu::{CrimePiu, PiuEffect};
 use self::protocol::{
@@ -37,7 +38,10 @@ use self::protocol::{
     CrimeMemoryTransaction, CrimePioRequest, CrimePoll, CrimeSdramSignal, CrimeSysAdRequest,
     CrimeTraceEvent, CrimeTraceField, CrimeTraceValue, CrimeTransactionId, CrimeTransfer,
 };
-use self::render::{CrimeRender, RenderWriteError};
+use self::render::{
+    CrimeRender, CrimeRenderError, RenderInterruptEffect, RenderMemoryWrite, RenderNotice,
+    RenderProgress, RenderWriteError,
+};
 
 const LOW_MEMORY_END: u64 = 0x1000_0000;
 const FRAMEBUFFER_START: u64 = 0x1000_0000;
@@ -69,12 +73,25 @@ enum PendingMemoryOrigin {
     CgiDma {
         link_id: CrimeTransactionId,
     },
+    Render,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingLink {
     execution_id: ExecutionTransactionId,
     request: Mips4ExecutionTransaction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingRenderWrite {
+    execution_id: ExecutionTransactionId,
+    transaction: Mips4ExecutionTransaction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderAccessResult {
+    Complete(Mips4ExecutionCompletion),
+    Deferred,
 }
 
 /// Terminal CRIME protocol or configuration error.
@@ -100,6 +117,9 @@ pub enum CrimeError {
         /// Completion identifier.
         transaction_id: CrimeTransactionId,
     },
+
+    /// The Rendering Engine rejected or could not complete a submitted job.
+    Render(CrimeRenderError),
 }
 
 impl fmt::Display for CrimeError {
@@ -117,6 +137,7 @@ impl fmt::Display for CrimeError {
             Self::UnexpectedCompletion { transaction_id } => {
                 write!(f, "unexpected CRIME completion {transaction_id}")
             }
+            Self::Render(error) => write!(f, "CRIME Rendering Engine failed: {error}"),
         }
     }
 }
@@ -135,6 +156,7 @@ pub struct Crime {
     gbe_target: ComponentId,
     piu: CrimePiu,
     render: CrimeRender,
+    render_clock: CrimeClock,
     memory_control: u64,
     bank_control: [u16; 8],
     refresh_counter: u16,
@@ -145,6 +167,7 @@ pub struct Crime {
     memory_ecc_replacement: u8,
     next_transaction_id: u128,
     pending_sysad: Option<ExecutionTransactionId>,
+    pending_render_write: Option<PendingRenderWrite>,
     pending_memory: BTreeMap<CrimeTransactionId, PendingMemoryOrigin>,
     pending_cmi: BTreeMap<CrimeTransactionId, PendingLink>,
     pending_cgi: BTreeMap<CrimeTransactionId, PendingLink>,
@@ -181,6 +204,7 @@ impl Crime {
             gbe_target,
             piu: CrimePiu::new(),
             render: CrimeRender::new(),
+            render_clock: CrimeClock::new(timebase_hz),
             memory_control: 0,
             bank_control: reset_bank_control(config.memory),
             refresh_counter: 0,
@@ -191,6 +215,7 @@ impl Crime {
             memory_ecc_replacement: 0,
             next_transaction_id: 0,
             pending_sysad: None,
+            pending_render_write: None,
             pending_memory: BTreeMap::new(),
             pending_cmi: BTreeMap::new(),
             pending_cgi: BTreeMap::new(),
@@ -232,6 +257,7 @@ impl Crime {
     /// Cancels the processor-side transaction while preserving chipset state.
     pub fn warm_reset(&mut self) {
         self.pending_sysad = None;
+        self.pending_render_write = None;
         let cancelled_memory = self
             .pending_memory
             .iter()
@@ -260,7 +286,16 @@ impl Crime {
                 self.apply_piu_effects(effects);
             }
             CrimeEvent::RenderStep { epoch } if epoch == self.render.epoch() => {
-                self.render.retire_one();
+                match self.render.step() {
+                    Ok(progress) => {
+                        if let Err(error) = self.apply_render_progress(progress) {
+                            self.latch_error(error);
+                        } else if let Err(error) = self.retry_pending_render_write() {
+                            self.latch_error(error);
+                        }
+                    }
+                    Err(error) => self.latch_render_error(error),
+                }
             }
             CrimeEvent::RenderStep { .. } => {}
         }
@@ -268,18 +303,19 @@ impl Crime {
 
     /// Polls one pending chipset action.
     pub fn poll(&mut self) -> Result<CrimePoll, CrimeError> {
+        if let Some(action) = self.actions.pop_front() {
+            return Ok(CrimePoll::Action(action));
+        }
         if let Some(error) = &self.terminal_error {
             return Err(error.clone());
         }
-        Ok(self
-            .actions
-            .pop_front()
-            .map_or(CrimePoll::Idle, CrimePoll::Action))
+        Ok(CrimePoll::Idle)
     }
 
     fn reset_logic(&mut self, now: SimTime) {
         self.piu.power_on(now);
-        self.render.reset();
+        let render_interrupts = self.render.reset();
+        self.render_clock.reset();
         self.memory_control = 0;
         self.bank_control = reset_bank_control(self.config.memory);
         self.refresh_counter = 0;
@@ -289,6 +325,7 @@ impl Crime {
         self.memory_ecc_check = 0;
         self.memory_ecc_replacement = 0;
         self.pending_sysad = None;
+        self.pending_render_write = None;
         self.pending_memory.clear();
         self.pending_cmi.clear();
         self.pending_cgi.clear();
@@ -298,6 +335,7 @@ impl Crime {
         self.actions.clear();
         self.terminal_error = None;
         self.current_time = now;
+        self.apply_render_interrupts(render_interrupts);
     }
 
     fn push_memory_configuration(&mut self) {
@@ -359,7 +397,7 @@ impl Crime {
             return Ok(());
         }
         if (registers::CRIME_BASE..registers::CRIME_REGISTER_END).contains(&address) {
-            self.access_internal_register(execution_id, transaction, request.time);
+            self.access_internal_register(execution_id, transaction, request.time)?;
             return Ok(());
         }
         if in_window(address, size, GBE_START, GBE_END) {
@@ -418,7 +456,7 @@ impl Crime {
         execution_id: ExecutionTransactionId,
         transaction: Mips4ExecutionTransaction,
         now: SimTime,
-    ) {
+    ) -> Result<(), CrimeError> {
         let (address, size) = transaction_shape(transaction);
         let completion = if address < registers::CRIME_RENDER_BASE {
             if size != 8 || address & 7 != 0 {
@@ -427,8 +465,22 @@ impl Crime {
                 self.access_control_register(transaction, now)
             }
         } else {
-            self.access_render_register(transaction)
+            match self.access_render_register(execution_id, transaction)? {
+                RenderAccessResult::Complete(completion) => completion,
+                RenderAccessResult::Deferred => return Ok(()),
+            }
         };
+        self.complete_internal_register_access(execution_id, transaction, completion);
+        Ok(())
+    }
+
+    fn complete_internal_register_access(
+        &mut self,
+        execution_id: ExecutionTransactionId,
+        transaction: Mips4ExecutionTransaction,
+        completion: Mips4ExecutionCompletion,
+    ) {
+        let (address, size) = transaction_shape(transaction);
         let target = if address < registers::CRIME_BASE + 0x0200 {
             trace::PIU_TARGET
         } else if address < registers::CRIME_RENDER_BASE {
@@ -514,37 +566,227 @@ impl Crime {
 
     fn access_render_register(
         &mut self,
+        execution_id: ExecutionTransactionId,
         transaction: Mips4ExecutionTransaction,
-    ) -> Mips4ExecutionCompletion {
+    ) -> Result<RenderAccessResult, CrimeError> {
         let (address, size) = transaction_shape(transaction);
-        match transaction {
+        let result = match transaction {
             Mips4ExecutionTransaction::Read { .. } => match self.render.read(address, size) {
-                Some(value) => Mips4ExecutionCompletion::ReadData(encode_big_endian(value, size)),
-                None => self.unsupported_read_completion(),
+                Some(value) => RenderAccessResult::Complete(Mips4ExecutionCompletion::ReadData(
+                    encode_big_endian(value, size),
+                )),
+                None => RenderAccessResult::Complete(self.unsupported_read_completion()),
             },
             Mips4ExecutionTransaction::Write {
                 data, byte_enable, ..
             } => {
                 let expected_enable = ((1_u16 << size) - 1) as u8;
                 if byte_enable != expected_enable {
-                    return Mips4ExecutionCompletion::BusError;
+                    return Ok(RenderAccessResult::Complete(
+                        Mips4ExecutionCompletion::BusError,
+                    ));
                 }
                 let value = decode_big_endian(data, size);
                 match self.render.write(address, size, value) {
-                    Ok(()) => {
-                        self.actions.push_back(CrimeAction::Schedule {
-                            delay: se_core::scheduler::SimDuration::new(1),
-                            event: CrimeEvent::RenderStep {
-                                epoch: self.render.epoch(),
-                            },
-                        });
-                        Mips4ExecutionCompletion::WriteComplete
+                    Ok(progress) => {
+                        self.trace_render_register_write(address, size, value);
+                        self.apply_render_progress(progress)?;
+                        RenderAccessResult::Complete(Mips4ExecutionCompletion::WriteComplete)
                     }
-                    Err(RenderWriteError::InterfaceFull) => Mips4ExecutionCompletion::BusError,
-                    Err(RenderWriteError::UndefinedRegister) => self.unsupported_write_completion(),
+                    Err(RenderWriteError::InterfaceFull) => {
+                        self.pending_sysad = Some(execution_id);
+                        self.pending_render_write = Some(PendingRenderWrite {
+                            execution_id,
+                            transaction,
+                        });
+                        RenderAccessResult::Deferred
+                    }
+                    Err(RenderWriteError::UndefinedRegister) => {
+                        RenderAccessResult::Complete(self.unsupported_write_completion())
+                    }
                 }
             }
+        };
+        Ok(result)
+    }
+
+    fn retry_pending_render_write(&mut self) -> Result<(), CrimeError> {
+        if !self.render.has_interface_space() {
+            return Ok(());
         }
+        let Some(pending) = self.pending_render_write.take() else {
+            return Ok(());
+        };
+        let (address, size) = transaction_shape(pending.transaction);
+        let Mips4ExecutionTransaction::Write { data, .. } = pending.transaction else {
+            unreachable!("only RE writes can be deferred")
+        };
+        let value = decode_big_endian(data, size);
+        let progress = self
+            .render
+            .write(address, size, value)
+            .map_err(|error| match error {
+                RenderWriteError::InterfaceFull => {
+                    unreachable!("the RE interface space was checked before retry")
+                }
+                RenderWriteError::UndefinedRegister => {
+                    unreachable!("the deferred RE write was validated before retry")
+                }
+            })?;
+        self.trace_render_register_write(address, size, value);
+        self.apply_render_progress(progress)?;
+        self.complete_internal_register_access(
+            pending.execution_id,
+            pending.transaction,
+            Mips4ExecutionCompletion::WriteComplete,
+        );
+        Ok(())
+    }
+
+    fn apply_render_progress(&mut self, progress: RenderProgress) -> Result<(), CrimeError> {
+        self.apply_render_interrupts(progress.interrupts);
+        for notice in progress.notices {
+            self.trace_render_notice(notice);
+        }
+        if let Some(write) = progress.memory_write {
+            self.start_render_memory(write)?;
+        }
+        if progress.schedule_step {
+            self.actions.push_back(CrimeAction::Schedule {
+                delay: self.render_clock.next_cycle(),
+                event: CrimeEvent::RenderStep {
+                    epoch: self.render.epoch(),
+                },
+            });
+        }
+        Ok(())
+    }
+
+    fn apply_render_interrupts(&mut self, effects: Vec<RenderInterruptEffect>) {
+        for effect in effects {
+            let piu_effect = self.piu.set_hardware_level(effect.mask, effect.asserted);
+            self.push_piu_effect(piu_effect);
+        }
+    }
+
+    fn start_render_memory(&mut self, write: RenderMemoryWrite) -> Result<(), CrimeError> {
+        let id = self.allocate_transaction_id()?;
+        self.pending_memory.insert(id, PendingMemoryOrigin::Render);
+        self.actions
+            .push_back(CrimeAction::StartMemory(CrimeMemoryTransaction {
+                id,
+                time: self.current_time,
+                controller: self.id,
+                client: CrimeMemoryClient::Render,
+                address: write.physical_address,
+                no_ecc: false,
+                transfer: CrimeTransfer::Write {
+                    data: write.data,
+                    byte_enable: write.byte_enable,
+                },
+            }));
+        Ok(())
+    }
+
+    fn trace_render_register_write(&mut self, address: u64, size: u8, value: u64) {
+        self.actions.push_back(CrimeAction::Trace(CrimeTraceEvent {
+            level: TraceLevel::Trace,
+            target: trace::RENDER_TARGET,
+            event: "register_write",
+            fields: vec![
+                CrimeTraceField {
+                    key: "physical_address",
+                    value: CrimeTraceValue::Hex64(address),
+                },
+                CrimeTraceField {
+                    key: "size",
+                    value: CrimeTraceValue::U64(u64::from(size)),
+                },
+                CrimeTraceField {
+                    key: "value",
+                    value: CrimeTraceValue::Hex64(value),
+                },
+                CrimeTraceField {
+                    key: "commit",
+                    value: CrimeTraceValue::Bool(
+                        (registers::CRIME_RENDER_BASE + 0x3800
+                            ..=registers::CRIME_RENDER_BASE + 0x3878)
+                            .contains(&address),
+                    ),
+                },
+            ],
+        }));
+    }
+
+    fn trace_render_notice(&mut self, notice: RenderNotice) {
+        let (event, fields) = match notice {
+            RenderNotice::RegisterRetired(write) => (
+                "register_retired",
+                vec![
+                    CrimeTraceField {
+                        key: "physical_address",
+                        value: CrimeTraceValue::Hex64(write.address),
+                    },
+                    CrimeTraceField {
+                        key: "commit",
+                        value: CrimeTraceValue::Bool(write.commit),
+                    },
+                ],
+            ),
+            RenderNotice::JobCommitted { start, end } => (
+                "job_commit",
+                vec![
+                    CrimeTraceField {
+                        key: "start",
+                        value: CrimeTraceValue::Hex64(u64::from(start)),
+                    },
+                    CrimeTraceField {
+                        key: "end",
+                        value: CrimeTraceValue::Hex64(u64::from(end)),
+                    },
+                ],
+            ),
+            RenderNotice::MemoryChunk {
+                virtual_address,
+                physical_address,
+                length,
+            } => (
+                "mte_chunk",
+                vec![
+                    CrimeTraceField {
+                        key: "virtual_address",
+                        value: CrimeTraceValue::Hex64(u64::from(virtual_address)),
+                    },
+                    CrimeTraceField {
+                        key: "physical_address",
+                        value: CrimeTraceValue::Hex64(physical_address),
+                    },
+                    CrimeTraceField {
+                        key: "length",
+                        value: CrimeTraceValue::U64(u64::from(length)),
+                    },
+                ],
+            ),
+            RenderNotice::JobCompleted { start, end } => (
+                "job_complete",
+                vec![
+                    CrimeTraceField {
+                        key: "start",
+                        value: CrimeTraceValue::Hex64(u64::from(start)),
+                    },
+                    CrimeTraceField {
+                        key: "end",
+                        value: CrimeTraceValue::Hex64(u64::from(end)),
+                    },
+                ],
+            ),
+        };
+        self.actions.push_back(CrimeAction::Trace(CrimeTraceEvent {
+            level: TraceLevel::Debug,
+            target: trace::RENDER_TARGET,
+            event,
+            fields,
+        }));
     }
 
     fn read_memory_register(&self, address: u64) -> Option<u64> {
@@ -652,6 +894,13 @@ impl Crime {
                         memory_fault,
                     }));
             }
+            PendingMemoryOrigin::Render => {
+                let progress = self
+                    .render
+                    .complete_memory(completion.result)
+                    .map_err(CrimeError::Render)?;
+                self.apply_render_progress(progress)?;
+            }
         }
         Ok(())
     }
@@ -745,6 +994,7 @@ impl Crime {
             PendingMemoryOrigin::SysAd { .. } => registers::MEMORY_ERROR_CPU_ACCESS,
             PendingMemoryOrigin::CmiDma { .. } => 1 << 7,
             PendingMemoryOrigin::CgiDma { .. } => 1 << 16,
+            PendingMemoryOrigin::Render => 1 << 15,
         };
         if hard || soft {
             status |= if soft {
@@ -906,6 +1156,94 @@ impl Crime {
             self.terminal_error = Some(error);
         }
     }
+
+    fn latch_render_error(&mut self, error: CrimeRenderError) {
+        let fields = match &error {
+            CrimeRenderError::UnsupportedMteJob {
+                mode,
+                byte_mask,
+                foreground,
+            } => vec![
+                CrimeTraceField {
+                    key: "kind",
+                    value: CrimeTraceValue::String("unsupported_mte_job"),
+                },
+                CrimeTraceField {
+                    key: "mode",
+                    value: CrimeTraceValue::Hex64(u64::from(*mode)),
+                },
+                CrimeTraceField {
+                    key: "byte_mask",
+                    value: CrimeTraceValue::Hex64(u64::from(*byte_mask)),
+                },
+                CrimeTraceField {
+                    key: "foreground",
+                    value: CrimeTraceValue::Hex64(u64::from(*foreground)),
+                },
+            ],
+            CrimeRenderError::InvalidMteRange { start, end } => vec![
+                CrimeTraceField {
+                    key: "kind",
+                    value: CrimeTraceValue::String("invalid_mte_range"),
+                },
+                CrimeTraceField {
+                    key: "start",
+                    value: CrimeTraceValue::Hex64(u64::from(*start)),
+                },
+                CrimeTraceField {
+                    key: "end",
+                    value: CrimeTraceValue::Hex64(u64::from(*end)),
+                },
+            ],
+            CrimeRenderError::InvalidLinearTlb {
+                virtual_address,
+                entry,
+            } => vec![
+                CrimeTraceField {
+                    key: "kind",
+                    value: CrimeTraceValue::String("invalid_linear_tlb"),
+                },
+                CrimeTraceField {
+                    key: "virtual_address",
+                    value: CrimeTraceValue::Hex64(u64::from(*virtual_address)),
+                },
+                CrimeTraceField {
+                    key: "entry",
+                    value: CrimeTraceValue::Hex64(u64::from(*entry)),
+                },
+            ],
+            CrimeRenderError::UnexpectedMemoryCompletion => vec![CrimeTraceField {
+                key: "kind",
+                value: CrimeTraceValue::String("unexpected_memory_completion"),
+            }],
+            CrimeRenderError::UnexpectedMemoryPayload => vec![CrimeTraceField {
+                key: "kind",
+                value: CrimeTraceValue::String("unexpected_memory_payload"),
+            }],
+            CrimeRenderError::MemoryTransport(error) => vec![
+                CrimeTraceField {
+                    key: "kind",
+                    value: CrimeTraceValue::String("memory_transport"),
+                },
+                CrimeTraceField {
+                    key: "transport_error",
+                    value: CrimeTraceValue::String(match error {
+                        CrimeBusError::Address => "address",
+                        CrimeBusError::Access => "access",
+                        CrimeBusError::Unsupported => "unsupported",
+                        CrimeBusError::Timeout => "timeout",
+                    }),
+                },
+            ],
+        };
+        self.actions.push_back(CrimeAction::Trace(CrimeTraceEvent {
+            level: TraceLevel::Error,
+            target: trace::RENDER_TARGET,
+            event: "render_error",
+            fields,
+        }));
+        self.latch_error(CrimeError::Render(error));
+    }
 }
 
 impl Component for Crime {
@@ -933,7 +1271,10 @@ impl BusDeviceRole<CrimeSysAdRequest> for Crime {
 impl BusControllerRole<CrimeMemoryCompletion> for Crime {
     fn complete(&mut self, completion: CrimeMemoryCompletion) {
         if let Err(error) = self.complete_memory(completion) {
-            self.latch_error(error);
+            match error {
+                CrimeError::Render(error) => self.latch_render_error(error),
+                error => self.latch_error(error),
+            }
         }
     }
 }

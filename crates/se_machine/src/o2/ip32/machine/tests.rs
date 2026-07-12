@@ -33,6 +33,18 @@ const SD_R2_R1_INTERRUPT_ENABLE: u32 = 0xfc22_0018;
 const SD_R2_R1_SOFTWARE_INTERRUPT: u32 = 0xfc22_0020;
 const WAIT: u32 = 0x4200_0020;
 
+const fn i_type(opcode: u8, rs: u8, rt: u8, immediate: u16) -> u32 {
+    (opcode as u32) << 26 | (rs as u32) << 21 | (rt as u32) << 16 | immediate as u32
+}
+
+const fn r_type(rs: u8, rt: u8, rd: u8, shift: u8, function: u8) -> u32 {
+    (rs as u32) << 21
+        | (rt as u32) << 16
+        | (rd as u32) << 11
+        | (shift as u32) << 6
+        | function as u32
+}
+
 fn config_with_program(words: &[(usize, u32)]) -> Ip32MachineConfig {
     let mut config = Ip32MachineConfig::default();
     for &(offset, word) in words {
@@ -302,6 +314,94 @@ fn cpu_prom_and_ram_accesses_cross_all_required_buses() {
         completion.result.unwrap().payload,
         CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34])
     );
+}
+
+#[test]
+fn synthetic_prom_clears_linear_a_range_through_the_render_memory_client() {
+    let lui = |rt, immediate| i_type(0x0f, 0, rt, immediate);
+    let ori = |rt, rs, immediate| i_type(0x0d, rs, rt, immediate);
+    let addiu = |rt, rs, immediate| i_type(0x09, rs, rt, immediate);
+    let sw = |rt, offset, base| i_type(0x2b, base, rt, offset);
+    let lw = |rt, offset, base| i_type(0x23, base, rt, offset);
+    let sd = |rt, offset, base| i_type(0x3f, base, rt, offset);
+    let program = [
+        lui(1, 0x1500),
+        lui(3, 0x8000),
+        r_type(0, 3, 3, 0, 0x3c),
+        lui(4, 0x8000),
+        r_type(0, 4, 4, 0, 0x3c),
+        r_type(0, 4, 4, 0, 0x3e),
+        ori(4, 4, 1),
+        r_type(3, 4, 3, 0, 0x25),
+        sd(3, 0x1700, 1),
+        lui(5, 0x4000),
+        lui(6, 0xa5a5),
+        ori(6, 6, 0xa5a5),
+        sw(6, 0x0fec, 5),
+        sw(6, 0x0ff0, 5),
+        sw(6, 0x1000, 5),
+        sw(6, 0x1010, 5),
+        sw(6, 0x1014, 5),
+        addiu(2, 0, 0xffff),
+        sw(2, 0x3008, 1),
+        sw(0, 0x3018, 1),
+        ori(2, 0, 0x0ff0),
+        sw(2, 0x3030, 1),
+        ori(2, 0, 0x1010),
+        sw(2, 0x3038, 1),
+        ori(2, 0, 0x0011),
+        sw(2, 0x3800, 1),
+        lui(8, 0x1000),
+        lw(7, 0x4000, 1),
+        r_type(7, 8, 9, 0, 0x24),
+        i_type(0x04, 9, 0, 0xfffd),
+        0,
+        WAIT,
+    ];
+    let words = program
+        .into_iter()
+        .enumerate()
+        .map(|(index, word)| (index * 4, word))
+        .collect::<Vec<_>>();
+    let mut machine = Ip32Machine::from_config(config_with_program(&words)).unwrap();
+
+    machine.schedule_power_on().unwrap();
+    assert_eq!(
+        machine.run_until_time(SimTime::new(1_000_000)).unwrap(),
+        RunStatus::Idle
+    );
+
+    let cpu = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    assert_ne!(
+        cpu.state().gpr().read(Mips4GprIndex::from_u8(7).unwrap()) & 0x1000_0000,
+        0
+    );
+
+    let now = machine.runtime().now();
+    let completion = machine
+        .runtime_mut()
+        .registry_mut()
+        .get_typed_mut::<CrimeSdram>(component_ids::RAM)
+        .unwrap()
+        .accept(CrimeMemoryTransaction {
+            id: CrimeTransactionId::new(0x102),
+            time: now,
+            controller: component_ids::CRIME,
+            client: CrimeMemoryClient::Cpu,
+            address: 0x0fec,
+            no_ecc: false,
+            transfer: CrimeTransfer::Read { length: 44 },
+        });
+    let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap().payload else {
+        panic!("expected SDRAM read data");
+    };
+    assert_eq!(&data[..4], &[0xa5; 4]);
+    assert_eq!(&data[4..=36], &[0; 33]);
+    assert_eq!(&data[37..], &[0xa5; 7]);
 }
 
 #[test]
