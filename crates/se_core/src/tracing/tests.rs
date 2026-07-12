@@ -1,6 +1,7 @@
 use super::*;
 use crate::component::ComponentId;
 use crate::scheduler::SimTime;
+use core::cell::Cell;
 
 #[derive(Debug, Eq, PartialEq)]
 struct CapturedRecord {
@@ -185,4 +186,58 @@ fn noop_recorder_discards_records_but_keeps_sequence() {
         0
     );
     assert_eq!(recorder.next_sequence(), 1);
+}
+
+#[derive(Default)]
+struct SchedulerDisabledSink {
+    records: Vec<(u64, String)>,
+}
+
+impl TraceSink for SchedulerDisabledSink {
+    fn enabled(
+        &self,
+        source: TraceSource,
+        _level: TraceLevel,
+        _target: &str,
+        _event: &str,
+    ) -> bool {
+        !matches!(source, TraceSource::Scheduler)
+    }
+
+    fn record(&mut self, record: TraceRecord<'_>) {
+        self.records
+            .push((record.sequence, record.event.to_owned()));
+    }
+}
+
+#[test]
+fn lazy_recording_skips_field_construction_and_preserves_sequence_space() {
+    let mut recorder = TraceRecorder::new(SchedulerDisabledSink::default());
+    let fields_built = Cell::new(false);
+
+    let disabled = recorder.record_lazy(
+        SimTime::new(3),
+        TraceSource::Scheduler,
+        TraceLevel::Trace,
+        "scheduler",
+        "event_dispatched",
+        || {
+            fields_built.set(true);
+            [TraceField::u64("event_id", 1)]
+        },
+    );
+    let enabled = recorder.record_lazy(
+        SimTime::new(4),
+        TraceSource::Runtime,
+        TraceLevel::Info,
+        "runtime",
+        "continued",
+        || [TraceField::bool("running", true)],
+    );
+
+    assert_eq!(disabled, 0);
+    assert_eq!(enabled, 1);
+    assert!(!fields_built.get());
+    assert_eq!(recorder.next_sequence(), 2);
+    assert_eq!(recorder.sink().records, vec![(1, "continued".to_owned())]);
 }

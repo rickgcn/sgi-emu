@@ -421,6 +421,29 @@ where
         self.trace
             .record(self.scheduler.now(), source, level, target, event, fields)
     }
+
+    /// Lazily constructs and records one trace fact at the current time.
+    pub fn trace_lazy<'field, F, T>(
+        &mut self,
+        source: TraceSource,
+        level: TraceLevel,
+        target: &'field str,
+        event: &'field str,
+        build_fields: F,
+    ) -> u64
+    where
+        F: FnOnce() -> T,
+        T: AsRef<[TraceField<'field>]>,
+    {
+        self.trace.record_lazy(
+            self.scheduler.now(),
+            source,
+            level,
+            target,
+            event,
+            build_fields,
+        )
+    }
 }
 
 fn trace_event_scheduled<S>(
@@ -432,18 +455,19 @@ fn trace_event_scheduled<S>(
 ) where
     S: TraceSink,
 {
-    let fields = [
-        TraceField::u64("event_id", id.get()),
-        TraceField::u64("target_component", target.get()),
-        TraceField::u64("delivery_time", delivery_time.get()),
-    ];
-    trace.record(
+    trace.record_lazy(
         now,
         TraceSource::Scheduler,
         TraceLevel::Trace,
         "scheduler",
         "event_scheduled",
-        &fields,
+        || {
+            [
+                TraceField::u64("event_id", id.get()),
+                TraceField::u64("target_component", target.get()),
+                TraceField::u64("delivery_time", delivery_time.get()),
+            ]
+        },
     );
 }
 
@@ -456,18 +480,19 @@ fn trace_event_dispatched<S>(
 ) where
     S: TraceSink,
 {
-    let fields = [
-        TraceField::u64("event_id", id.get()),
-        TraceField::u64("target_component", target.get()),
-        TraceField::u64("event_time", event_time.get()),
-    ];
-    trace.record(
+    trace.record_lazy(
         now,
         TraceSource::Scheduler,
         TraceLevel::Trace,
         "scheduler",
         "event_dispatched",
-        &fields,
+        || {
+            [
+                TraceField::u64("event_id", id.get()),
+                TraceField::u64("target_component", target.get()),
+                TraceField::u64("event_time", event_time.get()),
+            ]
+        },
     );
 }
 

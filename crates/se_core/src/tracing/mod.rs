@@ -140,6 +140,17 @@ pub struct TraceRecord<'a> {
 
 /// Destination for trace records.
 pub trait TraceSink {
+    /// Returns whether a record with the given metadata should be constructed.
+    fn enabled(
+        &self,
+        _source: TraceSource,
+        _level: TraceLevel,
+        _target: &str,
+        _event: &str,
+    ) -> bool {
+        true
+    }
+
     /// Records one complete trace record.
     fn record(&mut self, record: TraceRecord<'_>);
 }
@@ -149,6 +160,16 @@ pub trait TraceSink {
 pub struct NoopTraceSink;
 
 impl TraceSink for NoopTraceSink {
+    fn enabled(
+        &self,
+        _source: TraceSource,
+        _level: TraceLevel,
+        _target: &str,
+        _event: &str,
+    ) -> bool {
+        false
+    }
+
     fn record(&mut self, _record: TraceRecord<'_>) {}
 }
 
@@ -217,6 +238,43 @@ impl<S> TraceRecorder<S> {
             target,
             event,
             fields,
+        });
+        sequence
+    }
+
+    /// Lazily constructs and records one structured simulation fact.
+    ///
+    /// The sequence number is allocated before the sink gate is evaluated, so
+    /// disabled records preserve the recorder's global sequence space without
+    /// paying the cost of constructing their fields.
+    pub fn record_lazy<'a, F, T>(
+        &mut self,
+        time: SimTime,
+        source: TraceSource,
+        level: TraceLevel,
+        target: &'a str,
+        event: &'a str,
+        build_fields: F,
+    ) -> u64
+    where
+        S: TraceSink,
+        F: FnOnce() -> T,
+        T: AsRef<[TraceField<'a>]>,
+    {
+        let sequence = self.allocate_sequence();
+        if !self.sink.enabled(source, level, target, event) {
+            return sequence;
+        }
+
+        let fields = build_fields();
+        self.sink.record(TraceRecord {
+            sequence,
+            time,
+            source,
+            level,
+            target,
+            event,
+            fields: fields.as_ref(),
         });
         sequence
     }

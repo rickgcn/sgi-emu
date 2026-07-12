@@ -2154,28 +2154,29 @@ where
         .get_typed::<R5000Cpu>(component_ids::CPU0)?
         .state()
         .pc();
-    let fields = [
-        TraceField::u64("transaction_id", transaction.id.get() as u64),
-        TraceField::hex64("physical_address", address),
-        TraceField::u64("width", u64::from(width)),
-        TraceField::string("operation", operation),
-        TraceField::bool(
-            "bus_error",
-            matches!(completion.payload, Mips4ExecutionCompletion::BusError),
-        ),
-        TraceField::hex64("cpu_pc", cpu_pc),
-    ];
     let level = if matches!(completion.payload, Mips4ExecutionCompletion::BusError) {
         TraceLevel::Warn
     } else {
         TraceLevel::Trace
     };
-    context.trace(
+    context.trace_lazy(
         TraceSource::Component(component_ids::CPU_SYSAD_BUS),
         level,
         "ip32.sysad",
         "access",
-        &fields,
+        || {
+            [
+                TraceField::u64("transaction_id", transaction.id.get() as u64),
+                TraceField::hex64("physical_address", address),
+                TraceField::u64("width", u64::from(width)),
+                TraceField::string("operation", operation),
+                TraceField::bool(
+                    "bus_error",
+                    matches!(completion.payload, Mips4ExecutionCompletion::BusError),
+                ),
+                TraceField::hex64("cpu_pc", cpu_pc),
+            ]
+        },
     );
     Ok(())
 }
@@ -2184,22 +2185,23 @@ fn trace_crime<S>(context: &mut RuntimeContext<'_, Ip32Event, S>, event: CrimeTr
 where
     S: TraceSink,
 {
-    let fields = event
-        .fields
-        .iter()
-        .map(|field| match field.value {
-            CrimeTraceValue::Bool(value) => TraceField::bool(field.key, value),
-            CrimeTraceValue::U64(value) => TraceField::u64(field.key, value),
-            CrimeTraceValue::Hex64(value) => TraceField::hex64(field.key, value),
-            CrimeTraceValue::String(value) => TraceField::string(field.key, value),
-        })
-        .collect::<Vec<_>>();
-    context.trace(
+    context.trace_lazy(
         TraceSource::Component(component_ids::CRIME),
         event.level,
         event.target,
         event.event,
-        &fields,
+        || {
+            event
+                .fields
+                .iter()
+                .map(|field| match field.value {
+                    CrimeTraceValue::Bool(value) => TraceField::bool(field.key, value),
+                    CrimeTraceValue::U64(value) => TraceField::u64(field.key, value),
+                    CrimeTraceValue::Hex64(value) => TraceField::hex64(field.key, value),
+                    CrimeTraceValue::String(value) => TraceField::string(field.key, value),
+                })
+                .collect::<Vec<_>>()
+        },
     );
 }
 
@@ -2207,22 +2209,23 @@ fn trace_mace<S>(context: &mut RuntimeContext<'_, Ip32Event, S>, event: MaceTrac
 where
     S: TraceSink,
 {
-    let fields = event
-        .fields
-        .iter()
-        .map(|field| match field.value {
-            MaceTraceValue::Bool(value) => TraceField::bool(field.key, value),
-            MaceTraceValue::U64(value) => TraceField::u64(field.key, value),
-            MaceTraceValue::Hex64(value) => TraceField::hex64(field.key, value),
-            MaceTraceValue::String(value) => TraceField::string(field.key, value),
-        })
-        .collect::<Vec<_>>();
-    context.trace(
+    context.trace_lazy(
         TraceSource::Component(component_ids::MACE),
         event.level,
         event.target,
         event.event,
-        &fields,
+        || {
+            event
+                .fields
+                .iter()
+                .map(|field| match field.value {
+                    MaceTraceValue::Bool(value) => TraceField::bool(field.key, value),
+                    MaceTraceValue::U64(value) => TraceField::u64(field.key, value),
+                    MaceTraceValue::Hex64(value) => TraceField::hex64(field.key, value),
+                    MaceTraceValue::String(value) => TraceField::string(field.key, value),
+                })
+                .collect::<Vec<_>>()
+        },
     );
 }
 
