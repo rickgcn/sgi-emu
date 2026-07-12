@@ -41,6 +41,18 @@ pub const ISA_BUS: ComponentId = ip32_id(0x0105);
 /// CPU external interrupt communication domain.
 pub const CPU_IRQ_BUS: ComponentId = ip32_id(0x0106);
 
+/// External-device interrupt domain feeding MACE.
+pub const MACE_IRQ_BUS: ComponentId = ip32_id(0x0107);
+
+/// First MACE I2C communication domain.
+pub const I2C_BUS0: ComponentId = ip32_id(0x0108);
+
+/// Second MACE I2C communication domain.
+pub const I2C_BUS1: ComponentId = ip32_id(0x0109);
+
+/// Host-neutral MACE media communication domain.
+pub const MACE_MEDIA_BUS: ComponentId = ip32_id(0x010a);
+
 /// Primary MIPS CPU core.
 pub const CPU0: ComponentId = ip32_id(0x0200);
 
@@ -120,7 +132,7 @@ pub const VIDEO_OUTPUT: ComponentId = ip32_id(0x050b);
 pub const PCI_SLOT0: ComponentId = ip32_id(0x050c);
 
 /// All IP32 component identifiers in stable definition order.
-pub const ALL_COMPONENT_IDS: [ComponentId; 34] = [
+pub const ALL_COMPONENT_IDS: [ComponentId; 38] = [
     MACHINE,
     CPU_SYSAD_BUS,
     CRIME_MEMORY_DOMAIN,
@@ -129,6 +141,10 @@ pub const ALL_COMPONENT_IDS: [ComponentId; 34] = [
     PCI_BUS,
     ISA_BUS,
     CPU_IRQ_BUS,
+    MACE_IRQ_BUS,
+    I2C_BUS0,
+    I2C_BUS1,
+    MACE_MEDIA_BUS,
     CPU0,
     FPU0,
     ICACHE0,
@@ -158,7 +174,7 @@ pub const ALL_COMPONENT_IDS: [ComponentId; 34] = [
 ];
 
 /// IP32 bus and communication-domain component identifiers.
-pub const BUS_COMPONENT_IDS: [ComponentId; 7] = [
+pub const BUS_COMPONENT_IDS: [ComponentId; 11] = [
     CPU_SYSAD_BUS,
     CRIME_MEMORY_DOMAIN,
     CRIME_MACE_LINK,
@@ -166,6 +182,10 @@ pub const BUS_COMPONENT_IDS: [ComponentId; 7] = [
     PCI_BUS,
     ISA_BUS,
     CPU_IRQ_BUS,
+    MACE_IRQ_BUS,
+    I2C_BUS0,
+    I2C_BUS1,
+    MACE_MEDIA_BUS,
 ];
 
 #[cfg(test)]

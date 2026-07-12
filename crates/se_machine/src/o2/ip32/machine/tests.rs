@@ -1,6 +1,7 @@
 use se_core::role::BusDeviceRole;
 use se_core::tracing::{TraceRecord, TraceSink, TraceValue};
 use se_device::bus::irq::IrqTransaction;
+use se_device::bus::media::{MediaPayload, MediaPort};
 use se_device::chipset::crime::config::{CrimeAccessPolicy, CrimeConfigError, CrimeSdramBankSize};
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
@@ -10,12 +11,17 @@ use se_device::chipset::crime::protocol::{
     CrimeTransfer,
 };
 use se_device::chipset::crime::registers;
+use se_device::chipset::mace::Mace;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
+use se_device::memory::flash::ReadArrayFlash;
 
 use super::*;
 
 const LUI_R1_LINEAR_RAM: u32 = 0x3c01_4000;
 const LUI_R1_CRIME: u32 = 0x3c01_1400;
+const LUI_R1_MACE_ISA: u32 = 0x3c01_1f3a;
+const ORI_R1_RTC_37: u32 = 0x3421_3707;
+const LBU_R3_R1: u32 = 0x9023_0000;
 const ADDIU_R2_1234: u32 = 0x2402_1234;
 const ADDIU_R2_1: u32 = 0x2402_0001;
 const ADDIU_R2_SOFT_RESET: u32 = 0x2402_0400;
@@ -71,11 +77,29 @@ fn default_config_matches_the_o2_r5000sc_and_crime_baseline() {
 }
 
 #[test]
+fn host_input_reservations_enforce_configured_capacity() {
+    let mut config = Ip32MachineConfig::default();
+    config.mace.ports.byte_stream_bytes = 1;
+    let mut machine = Ip32Machine::from_config(config).unwrap();
+    let input = Ip32HostInput {
+        port: MediaPort::Keyboard,
+        payload: MediaPayload::Bytes(vec![0xaa]),
+    };
+    machine
+        .schedule_host_input(SimTime::new(1), input.clone())
+        .unwrap();
+    assert_eq!(
+        machine.schedule_host_input(SimTime::new(2), input),
+        Err(Ip32HostInputError::QueueFull(MediaPort::Keyboard))
+    );
+}
+
+#[test]
 fn construction_registers_the_role_oriented_ip32_topology() {
     let machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
     let registry = machine.runtime().registry();
 
-    assert_eq!(registry.len(), 12);
+    assert_eq!(registry.len(), 23);
     assert!(registry.get_typed::<R5000Cpu>(component_ids::CPU0).is_ok());
     assert!(
         registry
@@ -104,11 +128,7 @@ fn construction_registers_the_role_oriented_ip32_topology() {
             .is_ok()
     );
     assert!(registry.get_typed::<CrimeSdram>(component_ids::RAM).is_ok());
-    assert!(
-        registry
-            .get_typed::<Ip32MaceEndpoint>(component_ids::MACE)
-            .is_ok()
-    );
+    assert!(registry.get_typed::<Mace>(component_ids::MACE).is_ok());
     assert!(
         registry
             .get_typed::<Ip32GbeEndpoint>(component_ids::GBE)
@@ -119,7 +139,11 @@ fn construction_registers_the_role_oriented_ip32_topology() {
             .get_typed::<Ip32StubEndpoint>(component_ids::VICE)
             .is_ok()
     );
-    assert!(registry.get_typed::<Rom>(component_ids::PROM).is_ok());
+    assert!(
+        registry
+            .get_typed::<ReadArrayFlash>(component_ids::PROM)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -281,6 +305,31 @@ fn cpu_prom_and_ram_accesses_cross_all_required_buses() {
 }
 
 #[test]
+fn dallas_nvram_access_crosses_cmi_and_isa() {
+    let mut config = config_with_program(&[
+        (0, LUI_R1_MACE_ISA),
+        (4, ORI_R1_RTC_37),
+        (8, LBU_R3_R1),
+        (12, WAIT),
+    ]);
+    config.rtc.nvram[0x37] = 0xa5;
+    let mut machine = Ip32Machine::from_config(config).unwrap();
+
+    machine.schedule_power_on().unwrap();
+    let _ = machine.run_steps(100).unwrap();
+
+    let cpu = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    assert_eq!(
+        cpu.state().gpr().read(Mips4GprIndex::from_u8(3).unwrap()),
+        0xa5
+    );
+}
+
+#[test]
 fn crime_piu_requires_doubleword_access_through_the_cpu_path() {
     let config = config_with_program(&[(0, LUI_R1_CRIME), (4, LD_R3_R1), (8, WAIT)]);
     let mut machine = Ip32Machine::from_config(config).unwrap();
@@ -376,9 +425,32 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
     let mut machine =
         Ip32Machine::from_config_with_trace_sink(config, PromAcceptanceSink::default()).unwrap();
     machine.schedule_power_on().unwrap();
-    let _ = machine.run_steps(200_000).unwrap();
+    let max_events = std::env::var("IP32_PROM_EVENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200_000);
+    let _ = machine.run_steps(max_events).unwrap();
 
+    let pc = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap()
+        .state()
+        .pc();
+    let cpu = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let epc = cpu.state().cp0().epc().bits();
+    let exception_code = cpu.state().cp0().cause().exception_code();
     let failed = &machine.runtime().trace_recorder().sink().failed_addresses;
+    assert!(
+        !matches!(pc, 0xffff_ffff_bfc0_03a0 | 0xffff_ffff_bfc0_03a4),
+        "PROM remained in the exception loop at {pc:#018x}; EPC={epc:#018x}, exception={exception_code}, failed accesses: {failed:#x?}"
+    );
+
     assert!(
         failed.iter().all(|address| {
             !(registers::CRIME_BASE..registers::CRIME_REGISTER_END).contains(address)

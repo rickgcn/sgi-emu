@@ -49,29 +49,6 @@ fn sysad_bus_only_delivers_cpu_traffic_to_crime() {
 }
 
 #[test]
-fn mace_endpoint_decodes_prom_and_preserves_link_identity() {
-    let mut mace = Ip32MaceEndpoint::new(component_ids::MACE, "MACE", CrimeAccessPolicy::Strict);
-    let transaction = CrimeCmiTransaction {
-        id: CrimeTransactionId::new(9),
-        controller: component_ids::CRIME,
-        target: component_ids::MACE,
-        operation: CrimeLinkOperation::Pio(CrimePioRequest {
-            address: PROM_START + 0x20,
-            transfer: CrimeTransfer::Read { length: 8 },
-        }),
-    };
-
-    assert_eq!(
-        mace.accept(transaction),
-        Ip32MaceDeviceResponse::Prom {
-            id: CrimeTransactionId::new(9),
-            offset: 0x20,
-            transfer: CrimeTransfer::Read { length: 8 },
-        }
-    );
-}
-
-#[test]
 fn peer_policy_never_bypasses_the_link_protocol() {
     let transaction = CrimeCgiTransaction {
         id: CrimeTransactionId::new(1),

@@ -6,8 +6,16 @@ use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole, BusRole};
 use se_core::scheduler::{ScheduledEvent, ScheduledEventId, SchedulerError, SimDuration, SimTime};
 use se_core::tracing::{NoopTraceSink, TraceField, TraceLevel, TraceSink, TraceSource};
+use se_device::bus::i2c::{I2cBus, I2cBusAction, I2cCompletion};
 use se_device::bus::irq::{
     IrqBus, IrqBusAction, IrqBusBuildError, IrqBusRouteError, IrqRoute, IrqSource, IrqTarget,
+};
+use se_device::bus::isa::{
+    IsaBus, IsaBusAction, IsaBusDisposition, IsaCompletion, IsaDeviceResponse, IsaTransaction,
+};
+use se_device::bus::media::{MediaBus, MediaBusAction, MediaTransaction};
+use se_device::bus::pci::{
+    PciBus, PciBusAction, PciCompletion, PciConfigurationEndpoint, PciStatus,
 };
 use se_device::chipset::crime::config::CrimeConfig;
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
@@ -15,11 +23,17 @@ use se_device::chipset::crime::memory::CrimeSdram;
 use se_device::chipset::crime::memory::bus::CrimeMemoryBus;
 use se_device::chipset::crime::protocol::{
     CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusAction, CrimeBusDisposition, CrimeCgiTransaction,
-    CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal,
-    CrimeLinkDeviceResponse, CrimeMemoryTransaction, CrimePoll, CrimeSysAdRequest, CrimeTraceEvent,
-    CrimeTraceValue, CrimeTransfer,
+    CrimeCmiTransaction, CrimeCpuSignal, CrimeLinkDeviceResponse, CrimeMemoryTransaction,
+    CrimePoll, CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceValue,
 };
 use se_device::chipset::crime::{Crime, CrimeError};
+use se_device::chipset::mace::config::{MaceConfig, MacePortConfig};
+use se_device::chipset::mace::protocol::{
+    MaceAction, MaceExternalLinks, MacePoll, MaceTraceEvent, MaceTraceValue, MaceWiring,
+};
+use se_device::chipset::mace::{
+    MACE_IRQ_PARALLEL, MACE_IRQ_RTC, MACE_IRQ_SERIAL0, MACE_IRQ_SERIAL1, Mace, MaceError,
+};
 use se_device::cpu::execution::protocol::{
     ExecutionAction, ExecutionCompletion, ExecutionTransaction,
 };
@@ -31,17 +45,17 @@ use se_device::cpu::mips4::model::r5000::cpu::{
 };
 use se_device::cpu::mips4::model::r5000::profile::R5000Profile;
 use se_device::cpu::mips4::model::r5000::revision::R5000Revision;
-use se_device::memory::{MemoryResponse, MemoryTransaction, Rom};
+use se_device::memory::flash::ReadArrayFlash;
+use se_device::parallel::ieee1284::{IEEE1284_IRQ_OUTPUT, Ieee1284, Ieee1284Action};
+use se_device::rtc::ds1687::{DS1687_IRQ_OUTPUT, Ds1687, Ds1687Action, Ds1687Config, Ds1687Error};
+use se_device::serial::uart16550::{UART16550_IRQ_OUTPUT, Uart16550, Uart16550Action};
 use se_runtime::registry::{ComponentRegistry, RegistryError, RegistryLookupError};
 use se_runtime::runtime::{RunError, RunStatus, Runtime, RuntimeContext};
 
 use super::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
-use super::bus::{
-    Ip32GbeEndpoint, Ip32MaceDeviceResponse, Ip32MaceEndpoint, Ip32StubEndpoint, Ip32SysAdBus,
-    Ip32SysAdBusAction,
-};
+use super::bus::{Ip32GbeEndpoint, Ip32StubEndpoint, Ip32SysAdBus, Ip32SysAdBusAction};
 use super::component_ids;
-use super::event::Ip32Event;
+use super::event::{Ip32Event, Ip32HostInput, Ip32HostOutput};
 use super::timing::IP32_TIMEBASE_HZ;
 
 const DEFAULT_PROCESSOR_FREQUENCY_HZ: u64 = 180_000_000;
@@ -51,6 +65,8 @@ const CACHE_LINE_SIZE_BYTES: u32 = 32;
 const SECONDARY_CACHE_ENABLE_BIT: u64 = 1 << 12;
 const SDRAM_REFRESH_TICKS: u64 = 27_000;
 const SDRAM_INITIALIZATION_TICKS: u64 = 120_000;
+const ISA_CYCLE_TICKS: u64 = 1_000;
+const PCI_CYCLE_TICKS: u64 = 30;
 
 /// Complete construction input for one IP32 machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +79,12 @@ pub struct Ip32MachineConfig {
 
     /// CRIME chipset and physical SDRAM topology.
     pub crime: CrimeConfig,
+
+    /// MACE I/O ASIC configuration.
+    pub mace: MaceConfig,
+
+    /// Deterministic RTC time and battery-backed NVRAM image.
+    pub rtc: Ds1687Config,
 
     /// Exact 512 KiB System PROM image.
     pub prom_image: Vec<u8>,
@@ -82,6 +104,8 @@ impl Default for Ip32MachineConfig {
             boot_mode: R5000BootMode::from_low_bits(SECONDARY_CACHE_ENABLE_BIT)
                 .expect("the default R5000 boot mode must be valid"),
             crime: CrimeConfig::default(),
+            mace: MaceConfig::default(),
+            rtc: Ds1687Config::default(),
             prom_image: vec![0; IP32_PROM_IMAGE_SIZE_BYTES],
         }
     }
@@ -92,6 +116,12 @@ impl Default for Ip32MachineConfig {
 pub enum Ip32MachineBuildError {
     /// CRIME configuration is invalid.
     Crime(CrimeError),
+
+    /// MACE configuration is invalid.
+    Mace(MaceError),
+
+    /// RTC configuration is invalid.
+    Rtc(Ds1687Error),
 
     /// The CPU interrupt routing table is invalid.
     IrqBus(IrqBusBuildError),
@@ -119,6 +149,8 @@ impl fmt::Display for Ip32MachineBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Crime(error) => write!(f, "failed to construct CRIME: {error}"),
+            Self::Mace(error) => write!(f, "failed to construct MACE: {error}"),
+            Self::Rtc(error) => write!(f, "failed to construct DS1687: {error}"),
             Self::IrqBus(error) => write!(f, "failed to construct IP32 IRQ bus: {error}"),
             Self::InvalidPromSize { size_bytes } => {
                 write!(f, "invalid IP32 PROM size: {size_bytes} bytes")
@@ -146,6 +178,9 @@ pub enum Ip32MachineDispatchError {
     /// CRIME reported an internal protocol error.
     Crime(CrimeError),
 
+    /// MACE reported an internal protocol error.
+    Mace(MaceError),
+
     /// The IRQ bus rejected a source transaction.
     IrqBus(IrqBusRouteError),
 
@@ -162,12 +197,39 @@ pub enum Ip32MachineDispatchError {
     UnexpectedController(ComponentId),
 }
 
+/// Error returned while scheduling deterministic host input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Ip32HostInputError {
+    QueueFull(se_device::bus::media::MediaPort),
+    Scheduler(SchedulerError),
+}
+
+impl fmt::Display for Ip32HostInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueFull(port) => write!(formatter, "IP32 host input queue is full: {port:?}"),
+            Self::Scheduler(error) => {
+                write!(formatter, "failed to schedule IP32 host input: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Ip32HostInputError {}
+
+impl From<SchedulerError> for Ip32HostInputError {
+    fn from(error: SchedulerError) -> Self {
+        Self::Scheduler(error)
+    }
+}
+
 impl fmt::Display for Ip32MachineDispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Registry(error) => write!(f, "IP32 component lookup failed: {error}"),
             Self::Cpu(error) => write!(f, "IP32 CPU execution failed: {error}"),
             Self::Crime(error) => write!(f, "CRIME dispatch failed: {error}"),
+            Self::Mace(error) => write!(f, "MACE dispatch failed: {error}"),
             Self::IrqBus(error) => write!(f, "IP32 IRQ routing failed: {error}"),
             Self::CpuIrq(error) => write!(f, "IP32 CPU IRQ delivery failed: {error}"),
             Self::Scheduler(error) => write!(f, "IP32 event scheduling failed: {error}"),
@@ -196,6 +258,12 @@ impl From<R5000CpuError> for Ip32MachineDispatchError {
 impl From<CrimeError> for Ip32MachineDispatchError {
     fn from(error: CrimeError) -> Self {
         Self::Crime(error)
+    }
+}
+
+impl From<MaceError> for Ip32MachineDispatchError {
+    fn from(error: MaceError) -> Self {
+        Self::Mace(error)
     }
 }
 
@@ -248,6 +316,8 @@ impl CpuClock {
 struct MachineControl {
     cpu_generation: u64,
     cpu_clock: CpuClock,
+    host_capacities: MacePortConfig,
+    host_reservations: [usize; 12],
 }
 
 /// SGI O2 IP32 machine with runtime-owned hardware components.
@@ -321,6 +391,93 @@ impl<S> Ip32Machine<S> {
             }],
         )
         .map_err(Ip32MachineBuildError::IrqBus)?;
+        let mace_irq_bus = IrqBus::new(
+            component_ids::MACE_IRQ_BUS,
+            "MACE IRQ bus",
+            [
+                IrqRoute {
+                    source: IrqSource {
+                        component: component_ids::RTC,
+                        output: DS1687_IRQ_OUTPUT,
+                    },
+                    target: IrqTarget {
+                        component: component_ids::MACE,
+                        input: MACE_IRQ_RTC,
+                    },
+                },
+                IrqRoute {
+                    source: IrqSource {
+                        component: component_ids::SERIAL0,
+                        output: UART16550_IRQ_OUTPUT,
+                    },
+                    target: IrqTarget {
+                        component: component_ids::MACE,
+                        input: MACE_IRQ_SERIAL0,
+                    },
+                },
+                IrqRoute {
+                    source: IrqSource {
+                        component: component_ids::SERIAL1,
+                        output: UART16550_IRQ_OUTPUT,
+                    },
+                    target: IrqTarget {
+                        component: component_ids::MACE,
+                        input: MACE_IRQ_SERIAL1,
+                    },
+                },
+                IrqRoute {
+                    source: IrqSource {
+                        component: component_ids::PARALLEL_PORT,
+                        output: IEEE1284_IRQ_OUTPUT,
+                    },
+                    target: IrqTarget {
+                        component: component_ids::MACE,
+                        input: MACE_IRQ_PARALLEL,
+                    },
+                },
+            ],
+        )
+        .map_err(Ip32MachineBuildError::IrqBus)?;
+        let mace = Mace::new(
+            component_ids::MACE,
+            "MACE 2.0",
+            config.mace,
+            MaceWiring {
+                crime: component_ids::CRIME,
+                pci_bus: component_ids::PCI_BUS,
+                pci_devices: [
+                    component_ids::SCSI_CONTROLLER,
+                    component_ids::PCI_SLOT0,
+                    component_ids::PCI_SLOT0,
+                    component_ids::PCI_SLOT0,
+                    component_ids::PCI_SLOT0,
+                ],
+                isa_bus: component_ids::ISA_BUS,
+                prom: component_ids::PROM,
+                rtc: component_ids::RTC,
+                serial: [component_ids::SERIAL0, component_ids::SERIAL1],
+                parallel: component_ids::PARALLEL_PORT,
+                external_links: MaceExternalLinks {
+                    i2c: [component_ids::VIDEO_INPUT0, component_ids::VIDEO_INPUT1],
+                    audio: component_ids::AUDIO_SUBSYSTEM,
+                    video_input_ab: component_ids::VIDEO_INPUT0,
+                    video_input_cd: component_ids::VIDEO_INPUT1,
+                    video_output: component_ids::VIDEO_OUTPUT,
+                    ethernet: component_ids::ETHERNET_CONTROLLER,
+                    keyboard: component_ids::KEYBOARD,
+                    mouse: component_ids::MOUSE,
+                },
+            },
+            IP32_TIMEBASE_HZ,
+        )
+        .map_err(Ip32MachineBuildError::Mace)?;
+        let rtc = Ds1687::new(
+            component_ids::RTC,
+            "DS1687 RTC/NVRAM",
+            IP32_TIMEBASE_HZ,
+            config.rtc,
+        )
+        .map_err(Ip32MachineBuildError::Rtc)?;
 
         let mut runtime = Runtime::with_trace_sink(sink);
         let registry = runtime.registry_mut();
@@ -337,6 +494,7 @@ impl<S> Ip32Machine<S> {
             )),
         )?;
         insert_component(registry, Box::new(irq_bus))?;
+        insert_component(registry, Box::new(mace_irq_bus))?;
         insert_component(registry, Box::new(crime))?;
         insert_component(
             registry,
@@ -374,12 +532,36 @@ impl<S> Ip32Machine<S> {
         )?;
         insert_component(
             registry,
-            Box::new(Ip32MaceEndpoint::new(
-                component_ids::MACE,
-                "MACE endpoint",
-                config.crime.unimplemented_access_policy,
+            Box::new(IsaBus::new(
+                component_ids::ISA_BUS,
+                "MACE ISA bus",
+                SimDuration::new(ISA_CYCLE_TICKS),
             )),
         )?;
+        insert_component(
+            registry,
+            Box::new(PciBus::new(
+                component_ids::PCI_BUS,
+                "MACE PCI bus",
+                SimDuration::new(PCI_CYCLE_TICKS),
+            )),
+        )?;
+        insert_component(
+            registry,
+            Box::new(I2cBus::new(component_ids::I2C_BUS0, "MACE I2C bus 0")),
+        )?;
+        insert_component(
+            registry,
+            Box::new(I2cBus::new(component_ids::I2C_BUS1, "MACE I2C bus 1")),
+        )?;
+        insert_component(
+            registry,
+            Box::new(MediaBus::new(
+                component_ids::MACE_MEDIA_BUS,
+                "MACE media bus",
+            )),
+        )?;
+        insert_component(registry, Box::new(mace))?;
         insert_component(
             registry,
             Box::new(Ip32GbeEndpoint::new(
@@ -394,10 +576,37 @@ impl<S> Ip32Machine<S> {
         )?;
         insert_component(
             registry,
-            Box::new(Rom::new(
+            Box::new(ReadArrayFlash::new(
                 component_ids::PROM,
-                "System PROM",
+                "System flash",
                 config.prom_image,
+            )),
+        )?;
+        insert_component(registry, Box::new(rtc))?;
+        insert_component(
+            registry,
+            Box::new(Uart16550::new(component_ids::SERIAL0, "Serial port 0")),
+        )?;
+        insert_component(
+            registry,
+            Box::new(Uart16550::new(component_ids::SERIAL1, "Serial port 1")),
+        )?;
+        insert_component(
+            registry,
+            Box::new(PciConfigurationEndpoint::new(
+                component_ids::SCSI_CONTROLLER,
+                "PCI SCSI configuration endpoint",
+                0x9004,
+                0x8078,
+                0x010000,
+                0,
+            )),
+        )?;
+        insert_component(
+            registry,
+            Box::new(Ieee1284::new(
+                component_ids::PARALLEL_PORT,
+                "IEEE 1284 parallel port",
             )),
         )?;
 
@@ -406,6 +615,8 @@ impl<S> Ip32Machine<S> {
             control: MachineControl {
                 cpu_generation: 0,
                 cpu_clock: CpuClock::new(processor_frequency_hz),
+                host_capacities: config.mace.ports,
+                host_reservations: [0; 12],
             },
         })
     }
@@ -423,6 +634,47 @@ impl<S> Ip32Machine<S> {
     /// Consumes the machine and returns the owned runtime.
     pub fn into_runtime(self) -> Runtime<Ip32Event, S> {
         self.runtime
+    }
+
+    /// Schedules one host-neutral input at an explicit simulation time.
+    pub fn schedule_host_input(
+        &mut self,
+        at: SimTime,
+        input: Ip32HostInput,
+    ) -> Result<ScheduledEventId, Ip32HostInputError>
+    where
+        S: TraceSink,
+    {
+        let index = media_port_index(input.port);
+        let queued = self
+            .runtime
+            .registry()
+            .get_typed::<Mace>(component_ids::MACE)
+            .expect("the IP32 MACE component must remain registered")
+            .host_input_len(input.port);
+        if queued + self.control.host_reservations[index]
+            >= media_port_capacity(self.control.host_capacities, input.port)
+        {
+            return Err(Ip32HostInputError::QueueFull(input.port));
+        }
+        let id = self
+            .runtime
+            .schedule_at(at, component_ids::MACE, Ip32Event::HostInput(input))?;
+        self.control.host_reservations[index] += 1;
+        Ok(id)
+    }
+
+    /// Removes the oldest host-neutral output produced by MACE.
+    pub fn poll_host_output(&mut self) -> Option<Ip32HostOutput> {
+        self.runtime
+            .registry_mut()
+            .get_typed_mut::<Mace>(component_ids::MACE)
+            .expect("the IP32 MACE component must remain registered")
+            .poll_host_output()
+            .map(|transaction| Ip32HostOutput {
+                port: transaction.port,
+                payload: transaction.payload,
+            })
     }
 }
 
@@ -557,8 +809,80 @@ where
                 .handle_event(event);
             drain_cgi_bus(registry, context, control)?;
         }
+        Ip32Event::Mace(event) => {
+            registry
+                .get_typed_mut::<Mace>(component_ids::MACE)?
+                .handle_event(context.now(), event);
+            drain_mace(registry, context, control)?;
+        }
+        Ip32Event::IsaBus(event) => {
+            registry
+                .get_typed_mut::<IsaBus>(component_ids::ISA_BUS)?
+                .handle_event(event);
+            drain_isa_bus(registry, context, control)?;
+        }
+        Ip32Event::PciBusService => {
+            registry
+                .get_typed_mut::<PciBus>(component_ids::PCI_BUS)?
+                .service();
+            drain_pci_bus(registry, context, control)?;
+        }
+        Ip32Event::I2cBusService { index } => {
+            let bus_id = i2c_bus_id(index)?;
+            registry.get_typed_mut::<I2cBus>(bus_id)?.service();
+            drain_i2c_bus(registry, context, control, index)?;
+        }
+        Ip32Event::HostInput(input) => {
+            control.host_reservations[media_port_index(input.port)] =
+                control.host_reservations[media_port_index(input.port)].saturating_sub(1);
+            let transaction = MediaTransaction {
+                source: component_ids::MACE_MEDIA_BUS,
+                target: component_ids::MACE,
+                port: input.port,
+                payload: input.payload,
+            };
+            registry
+                .get_typed_mut::<Mace>(component_ids::MACE)?
+                .accept_host_input(transaction)?;
+            drain_mace(registry, context, control)?;
+        }
     }
     Ok(())
+}
+
+fn media_port_index(port: se_device::bus::media::MediaPort) -> usize {
+    use se_device::bus::media::MediaPort;
+    match port {
+        MediaPort::VideoInputAb => 0,
+        MediaPort::VideoInputCd => 1,
+        MediaPort::VideoOutput => 2,
+        MediaPort::AudioInput => 3,
+        MediaPort::AudioOutput1 => 4,
+        MediaPort::AudioOutput2 => 5,
+        MediaPort::Ethernet => 6,
+        MediaPort::Keyboard => 7,
+        MediaPort::Mouse => 8,
+        MediaPort::Serial0 => 9,
+        MediaPort::Serial1 => 10,
+        MediaPort::Parallel => 11,
+    }
+}
+
+fn media_port_capacity(
+    capacities: MacePortConfig,
+    port: se_device::bus::media::MediaPort,
+) -> usize {
+    use se_device::bus::media::MediaPort;
+    match port {
+        MediaPort::Ethernet => capacities.ethernet_frames,
+        MediaPort::AudioInput | MediaPort::AudioOutput1 | MediaPort::AudioOutput2 => {
+            capacities.audio_sample_pairs
+        }
+        MediaPort::VideoInputAb | MediaPort::VideoInputCd | MediaPort::VideoOutput => {
+            capacities.video_fields
+        }
+        _ => capacities.byte_stream_bytes,
+    }
 }
 
 fn power_on<S>(
@@ -577,6 +901,9 @@ where
         .get_typed_mut::<IrqBus>(component_ids::CPU_IRQ_BUS)?
         .reset();
     registry
+        .get_typed_mut::<IrqBus>(component_ids::MACE_IRQ_BUS)?
+        .reset();
+    registry
         .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
         .hard_reset();
     registry
@@ -586,7 +913,37 @@ where
         .get_typed_mut::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
         .hard_reset();
     registry
-        .get_typed_mut::<Ip32MaceEndpoint>(component_ids::MACE)?
+        .get_typed_mut::<IsaBus>(component_ids::ISA_BUS)?
+        .hard_reset();
+    registry
+        .get_typed_mut::<PciBus>(component_ids::PCI_BUS)?
+        .reset();
+    registry
+        .get_typed_mut::<I2cBus>(component_ids::I2C_BUS0)?
+        .reset();
+    registry
+        .get_typed_mut::<I2cBus>(component_ids::I2C_BUS1)?
+        .reset();
+    registry
+        .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
+        .reset();
+    registry
+        .get_typed_mut::<Mace>(component_ids::MACE)?
+        .power_on(context.now());
+    registry
+        .get_typed_mut::<Ds1687>(component_ids::RTC)?
+        .power_on(context.now());
+    registry
+        .get_typed_mut::<Uart16550>(component_ids::SERIAL0)?
+        .reset();
+    registry
+        .get_typed_mut::<Uart16550>(component_ids::SERIAL1)?
+        .reset();
+    registry
+        .get_typed_mut::<PciConfigurationEndpoint>(component_ids::SCSI_CONTROLLER)?
+        .reset();
+    registry
+        .get_typed_mut::<Ieee1284>(component_ids::PARALLEL_PORT)?
         .reset();
     registry
         .get_typed_mut::<Ip32GbeEndpoint>(component_ids::GBE)?
@@ -627,6 +984,9 @@ where
         .get_typed_mut::<IrqBus>(component_ids::CPU_IRQ_BUS)?
         .reset();
     registry
+        .get_typed_mut::<IrqBus>(component_ids::MACE_IRQ_BUS)?
+        .reset();
+    registry
         .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
         .hard_reset();
     registry
@@ -636,7 +996,37 @@ where
         .get_typed_mut::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
         .hard_reset();
     registry
-        .get_typed_mut::<Ip32MaceEndpoint>(component_ids::MACE)?
+        .get_typed_mut::<IsaBus>(component_ids::ISA_BUS)?
+        .hard_reset();
+    registry
+        .get_typed_mut::<PciBus>(component_ids::PCI_BUS)?
+        .reset();
+    registry
+        .get_typed_mut::<I2cBus>(component_ids::I2C_BUS0)?
+        .reset();
+    registry
+        .get_typed_mut::<I2cBus>(component_ids::I2C_BUS1)?
+        .reset();
+    registry
+        .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
+        .reset();
+    registry
+        .get_typed_mut::<Mace>(component_ids::MACE)?
+        .hard_reset(context.now());
+    registry
+        .get_typed_mut::<Ds1687>(component_ids::RTC)?
+        .hard_reset(context.now());
+    registry
+        .get_typed_mut::<Uart16550>(component_ids::SERIAL0)?
+        .reset();
+    registry
+        .get_typed_mut::<Uart16550>(component_ids::SERIAL1)?
+        .reset();
+    registry
+        .get_typed_mut::<PciConfigurationEndpoint>(component_ids::SCSI_CONTROLLER)?
+        .reset();
+    registry
+        .get_typed_mut::<Ieee1284>(component_ids::PARALLEL_PORT)?
         .reset();
     registry
         .get_typed_mut::<Ip32GbeEndpoint>(component_ids::GBE)?
@@ -819,6 +1209,357 @@ fn drain_irq_bus(registry: &mut ComponentRegistry) -> Result<(), Ip32MachineDisp
             }
             IrqBusAction::Idle => return Ok(()),
         }
+    }
+}
+
+fn drain_mace_irq_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry
+            .get_typed_mut::<IrqBus>(component_ids::MACE_IRQ_BUS)?
+            .poll()
+        {
+            IrqBusAction::Deliver { target, delivery } => {
+                if target != component_ids::MACE {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                }
+                registry.get_typed_mut::<Mace>(target)?.accept(delivery)?;
+                drain_mace(registry, context, control)?;
+            }
+            IrqBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_mace<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        let poll = registry
+            .get_typed_mut::<Mace>(component_ids::MACE)?
+            .poll()?;
+        let MacePoll::Action(action) = poll else {
+            return Ok(());
+        };
+        match action {
+            MaceAction::Schedule { delay, event } => {
+                context.schedule_after(delay, component_ids::MACE, Ip32Event::Mace(event))?;
+            }
+            MaceAction::StartCmi(transaction) => route_cmi(registry, context, transaction)?,
+            MaceAction::StartIsa(transaction) => route_isa(registry, context, transaction)?,
+            MaceAction::StartPci(transaction) => {
+                let disposition = registry
+                    .get_typed_mut::<PciBus>(component_ids::PCI_BUS)?
+                    .route(transaction);
+                if let se_device::bus::pci::PciBusDisposition::QueuedAndNeedsService { delay } =
+                    disposition
+                {
+                    context.schedule_after(
+                        delay,
+                        component_ids::PCI_BUS,
+                        Ip32Event::PciBusService,
+                    )?;
+                }
+            }
+            MaceAction::StartI2c(transaction) => {
+                let index = if transaction.target == component_ids::VIDEO_INPUT0 {
+                    0
+                } else {
+                    1
+                };
+                let bus_id = i2c_bus_id(index)?;
+                let duration = I2cBus::duration(&transaction, IP32_TIMEBASE_HZ);
+                if registry.get_typed_mut::<I2cBus>(bus_id)?.route(transaction) {
+                    context.schedule_after(duration, bus_id, Ip32Event::I2cBusService { index })?;
+                }
+            }
+            MaceAction::StartExternal(transaction) => {
+                registry
+                    .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
+                    .route(transaction);
+                drain_media_bus(registry)?;
+            }
+            MaceAction::CompleteCmiDevice(completion) => {
+                registry
+                    .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
+                    .accept_device_completion(completion);
+                drain_cmi_bus(registry, context, control)?;
+            }
+            MaceAction::Trace(event) => trace_mace(context, event),
+        }
+    }
+}
+
+fn route_isa<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    transaction: IsaTransaction,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    let disposition = registry
+        .get_typed_mut::<IsaBus>(component_ids::ISA_BUS)?
+        .route(transaction);
+    if let IsaBusDisposition::QueuedAndNeedsService { delay } = disposition {
+        let event = registry
+            .get_typed::<IsaBus>(component_ids::ISA_BUS)?
+            .next_service_event();
+        context.schedule_after(delay, component_ids::ISA_BUS, Ip32Event::IsaBus(event))?;
+    }
+    Ok(())
+}
+
+fn drain_isa_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry
+            .get_typed_mut::<IsaBus>(component_ids::ISA_BUS)?
+            .poll()
+        {
+            IsaBusAction::Deliver {
+                target,
+                transaction,
+            } => {
+                let response = if target == component_ids::PROM {
+                    registry
+                        .get_typed_mut::<ReadArrayFlash>(target)?
+                        .accept(transaction)
+                } else if target == component_ids::RTC {
+                    let rtc = registry.get_typed_mut::<Ds1687>(target)?;
+                    rtc.observe_time(context.now());
+                    rtc.accept(transaction)
+                } else if matches!(target, component_ids::SERIAL0 | component_ids::SERIAL1) {
+                    registry
+                        .get_typed_mut::<Uart16550>(target)?
+                        .accept(transaction)
+                } else if target == component_ids::PARALLEL_PORT {
+                    registry
+                        .get_typed_mut::<Ieee1284>(target)?
+                        .accept(transaction)
+                } else {
+                    IsaDeviceResponse::Complete(IsaCompletion {
+                        id: transaction.id,
+                        result: Err(se_device::bus::isa::IsaBusError::Address),
+                    })
+                };
+                if let IsaDeviceResponse::Complete(completion) = response {
+                    registry
+                        .get_typed_mut::<IsaBus>(component_ids::ISA_BUS)?
+                        .accept_device_completion(completion);
+                }
+                drain_rtc(registry, context, control)?;
+                drain_uart(registry, context, control, component_ids::SERIAL0)?;
+                drain_uart(registry, context, control, component_ids::SERIAL1)?;
+                drain_parallel(registry, context, control)?;
+            }
+            IsaBusAction::Complete {
+                controller,
+                completion,
+            } => {
+                if controller != component_ids::MACE {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
+                }
+                registry
+                    .get_typed_mut::<Mace>(controller)?
+                    .complete(completion);
+                drain_mace(registry, context, control)?;
+            }
+            IsaBusAction::Schedule { delay, event } => {
+                context.schedule_after(delay, component_ids::ISA_BUS, Ip32Event::IsaBus(event))?;
+            }
+            IsaBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_rtc<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry.get_typed_mut::<Ds1687>(component_ids::RTC)?.poll() {
+            Ds1687Action::SetIrq(transaction) => {
+                registry
+                    .get_typed_mut::<IrqBus>(component_ids::MACE_IRQ_BUS)?
+                    .route(transaction)?;
+                drain_mace_irq_bus(registry, context, control)?;
+            }
+            Ds1687Action::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_uart<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+    uart_id: ComponentId,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry.get_typed_mut::<Uart16550>(uart_id)?.poll() {
+            Uart16550Action::SetIrq(transaction) => {
+                registry
+                    .get_typed_mut::<IrqBus>(component_ids::MACE_IRQ_BUS)?
+                    .route(transaction)?;
+                drain_mace_irq_bus(registry, context, control)?;
+            }
+            Uart16550Action::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_parallel<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry
+            .get_typed_mut::<Ieee1284>(component_ids::PARALLEL_PORT)?
+            .poll()
+        {
+            Ieee1284Action::SetIrq(transaction) => {
+                registry
+                    .get_typed_mut::<IrqBus>(component_ids::MACE_IRQ_BUS)?
+                    .route(transaction)?;
+                drain_mace_irq_bus(registry, context, control)?;
+            }
+            Ieee1284Action::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_pci_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry
+            .get_typed_mut::<PciBus>(component_ids::PCI_BUS)?
+            .poll()
+        {
+            PciBusAction::Deliver { transaction, .. } => {
+                let completion = if transaction.target == component_ids::SCSI_CONTROLLER {
+                    registry
+                        .get_typed_mut::<PciConfigurationEndpoint>(transaction.target)?
+                        .accept(transaction)
+                } else {
+                    PciCompletion {
+                        id: transaction.id,
+                        status: PciStatus::MasterAbort,
+                        data: vec![],
+                    }
+                };
+                registry
+                    .get_typed_mut::<PciBus>(component_ids::PCI_BUS)?
+                    .complete(completion);
+            }
+            PciBusAction::Complete {
+                controller,
+                completion,
+            } => {
+                if controller != component_ids::MACE {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
+                }
+                registry
+                    .get_typed_mut::<Mace>(controller)?
+                    .complete(completion);
+                drain_mace(registry, context, control)?;
+            }
+            PciBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_i2c_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+    index: u8,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    let bus_id = i2c_bus_id(index)?;
+    loop {
+        match registry.get_typed_mut::<I2cBus>(bus_id)?.poll() {
+            I2cBusAction::Deliver { transaction, .. } => {
+                registry
+                    .get_typed_mut::<I2cBus>(bus_id)?
+                    .complete(I2cCompletion::Nack { id: transaction.id });
+            }
+            I2cBusAction::Complete {
+                controller,
+                completion,
+            } => {
+                if controller != component_ids::MACE {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
+                }
+                registry
+                    .get_typed_mut::<Mace>(controller)?
+                    .complete(completion);
+                drain_mace(registry, context, control)?;
+            }
+            I2cBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_media_bus(registry: &mut ComponentRegistry) -> Result<(), Ip32MachineDispatchError> {
+    loop {
+        match registry
+            .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
+            .poll()
+        {
+            MediaBusAction::Deliver { transaction, .. } => {
+                registry
+                    .get_typed_mut::<Mace>(component_ids::MACE)?
+                    .record_host_output(transaction)?;
+            }
+            MediaBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn i2c_bus_id(index: u8) -> Result<ComponentId, Ip32MachineDispatchError> {
+    match index {
+        0 => Ok(component_ids::I2C_BUS0),
+        1 => Ok(component_ids::I2C_BUS1),
+        _ => Err(Ip32MachineDispatchError::UnexpectedController(
+            ComponentId::new(u64::from(index)),
+        )),
     }
 }
 
@@ -1026,7 +1767,9 @@ where
                 transaction,
             } => {
                 let response = if target == component_ids::MACE {
-                    accept_mace(registry, transaction)?
+                    let mace = registry.get_typed_mut::<Mace>(target)?;
+                    mace.observe_time(context.now());
+                    mace.accept(transaction)
                 } else if target == component_ids::CRIME {
                     let crime = registry.get_typed_mut::<Crime>(target)?;
                     crime.observe_time(context.now());
@@ -1039,19 +1782,26 @@ where
                         .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
                         .accept_device_completion(completion);
                 }
+                drain_mace(registry, context, control)?;
                 drain_crime(registry, context, control)?;
             }
             CrimeBusAction::Complete {
                 controller,
                 completion,
             } => {
-                if controller != component_ids::CRIME {
+                if controller == component_ids::CRIME {
+                    registry
+                        .get_typed_mut::<Crime>(controller)?
+                        .complete(completion);
+                    drain_crime(registry, context, control)?;
+                } else if controller == component_ids::MACE {
+                    registry
+                        .get_typed_mut::<Mace>(controller)?
+                        .complete(completion);
+                    drain_mace(registry, context, control)?;
+                } else {
                     return Err(Ip32MachineDispatchError::UnexpectedController(controller));
                 }
-                registry
-                    .get_typed_mut::<Crime>(controller)?
-                    .complete(completion);
-                drain_crime(registry, context, control)?;
             }
             CrimeBusAction::ScheduleService { delay } => {
                 let event = registry
@@ -1130,75 +1880,6 @@ where
     }
 }
 
-fn accept_mace(
-    registry: &mut ComponentRegistry,
-    transaction: CrimeCmiTransaction,
-) -> Result<CrimeLinkDeviceResponse<CrimeCmiCompletion>, Ip32MachineDispatchError> {
-    match registry
-        .get_typed_mut::<Ip32MaceEndpoint>(component_ids::MACE)?
-        .accept(transaction)
-    {
-        Ip32MaceDeviceResponse::Complete(completion) => {
-            Ok(CrimeLinkDeviceResponse::Complete(completion))
-        }
-        Ip32MaceDeviceResponse::Prom {
-            id,
-            offset,
-            transfer,
-        } => {
-            let response = registry
-                .get_typed_mut::<Rom>(component_ids::PROM)?
-                .accept(to_memory_transaction(offset, &transfer));
-            Ok(CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
-                id,
-                result: from_memory_response(response, transfer.length()),
-            }))
-        }
-    }
-}
-
-fn to_memory_transaction(offset: u64, transfer: &CrimeTransfer) -> MemoryTransaction {
-    match transfer {
-        CrimeTransfer::Read { length } => MemoryTransaction::Read {
-            offset,
-            size: *length as u8,
-        },
-        CrimeTransfer::Write { data, byte_enable } => {
-            let mut lanes = [0; 8];
-            let length = data.len().min(lanes.len());
-            lanes[..length].copy_from_slice(&data[..length]);
-            let enable = byte_enable
-                .iter()
-                .take(8)
-                .enumerate()
-                .fold(0_u8, |mask, (lane, enabled)| {
-                    mask | (u8::from(*enabled) << lane)
-                });
-            MemoryTransaction::Write {
-                offset,
-                size: data.len() as u8,
-                data: u64::from_le_bytes(lanes),
-                byte_enable: enable,
-            }
-        }
-    }
-}
-
-fn from_memory_response(
-    response: MemoryResponse,
-    length: usize,
-) -> Result<CrimeCompletionPayload, se_device::chipset::crime::protocol::CrimeBusError> {
-    match response {
-        MemoryResponse::ReadData(data) if length <= 8 => Ok(CrimeCompletionPayload::ReadData(
-            data.to_le_bytes()[..length].to_vec(),
-        )),
-        MemoryResponse::WriteComplete => Ok(CrimeCompletionPayload::WriteComplete),
-        MemoryResponse::ReadData(_) | MemoryResponse::AccessError => {
-            Err(se_device::chipset::crime::protocol::CrimeBusError::Access)
-        }
-    }
-}
-
 fn trace_sysad_access<S>(
     registry: &ComponentRegistry,
     context: &mut RuntimeContext<'_, Ip32Event, S>,
@@ -1266,6 +1947,29 @@ where
         .collect::<Vec<_>>();
     context.trace(
         TraceSource::Component(component_ids::CRIME),
+        event.level,
+        event.target,
+        event.event,
+        &fields,
+    );
+}
+
+fn trace_mace<S>(context: &mut RuntimeContext<'_, Ip32Event, S>, event: MaceTraceEvent)
+where
+    S: TraceSink,
+{
+    let fields = event
+        .fields
+        .iter()
+        .map(|field| match field.value {
+            MaceTraceValue::Bool(value) => TraceField::bool(field.key, value),
+            MaceTraceValue::U64(value) => TraceField::u64(field.key, value),
+            MaceTraceValue::Hex64(value) => TraceField::hex64(field.key, value),
+            MaceTraceValue::String(value) => TraceField::string(field.key, value),
+        })
+        .collect::<Vec<_>>();
+    context.trace(
+        TraceSource::Component(component_ids::MACE),
         event.level,
         event.target,
         event.event,

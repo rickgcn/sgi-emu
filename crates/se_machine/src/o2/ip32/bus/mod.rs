@@ -1,4 +1,4 @@
-//! SGI O2 IP32 SysAD domain and deterministic peer endpoints.
+//! SGI O2 IP32 SysAD domain and deterministic non-MACE peer endpoints.
 
 use std::collections::VecDeque;
 
@@ -8,16 +8,10 @@ use se_core::scheduler::SimDuration;
 use se_device::chipset::crime::config::CrimeAccessPolicy;
 use se_device::chipset::crime::protocol::{
     CrimeBusDisposition, CrimeBusError, CrimeCgiCompletion, CrimeCgiTransaction,
-    CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeLinkDeviceResponse,
-    CrimeLinkOperation, CrimeTransfer,
+    CrimeCompletionPayload, CrimeLinkDeviceResponse, CrimeLinkOperation, CrimeTransfer,
 };
 use se_device::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransaction};
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
-
-use super::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
-
-const PROM_START: u64 = 0x1fc0_0000;
-const PROM_END: u64 = 0x2000_0000;
 
 /// Scheduled SysAD bus event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,81 +263,6 @@ impl BusRole<ExecutionTransaction<Mips4ExecutionTransaction>> for Ip32SysAdBus {
     }
 }
 
-/// MACE response that may require a separate PROM component access.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Ip32MaceDeviceResponse {
-    /// CMI request completed within the endpoint.
-    Complete(CrimeCmiCompletion),
-
-    /// The endpoint decoded the System PROM backend.
-    Prom {
-        /// CMI transaction identifier.
-        id: se_device::chipset::crime::protocol::CrimeTransactionId,
-
-        /// Device-local PROM offset.
-        offset: u64,
-
-        /// Requested transfer.
-        transfer: CrimeTransfer,
-    },
-}
-
-/// Minimal MACE endpoint that preserves the real PROM path.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Ip32MaceEndpoint {
-    id: ComponentId,
-    name: String,
-    policy: CrimeAccessPolicy,
-}
-
-impl Ip32MaceEndpoint {
-    /// Creates a deterministic MACE endpoint.
-    pub fn new(id: ComponentId, name: impl Into<String>, policy: CrimeAccessPolicy) -> Self {
-        Self {
-            id,
-            name: name.into(),
-            policy,
-        }
-    }
-}
-
-impl Component for Ip32MaceEndpoint {
-    fn id(&self) -> ComponentId {
-        self.id
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn reset(&mut self) {}
-}
-
-impl BusDeviceRole<CrimeCmiTransaction> for Ip32MaceEndpoint {
-    type Response = Ip32MaceDeviceResponse;
-
-    fn accept(&mut self, transaction: CrimeCmiTransaction) -> Self::Response {
-        let id = transaction.id;
-        let CrimeLinkOperation::Pio(request) = transaction.operation else {
-            return Ip32MaceDeviceResponse::Complete(CrimeCmiCompletion {
-                id,
-                result: Err(CrimeBusError::Unsupported),
-            });
-        };
-        if transfer_in_window(&request.transfer, request.address, PROM_START, PROM_END) {
-            return Ip32MaceDeviceResponse::Prom {
-                id,
-                offset: (request.address - PROM_START) % IP32_PROM_IMAGE_SIZE_BYTES as u64,
-                transfer: request.transfer,
-            };
-        }
-        Ip32MaceDeviceResponse::Complete(CrimeCmiCompletion {
-            id,
-            result: policy_result(self.policy, request.transfer),
-        })
-    }
-}
-
 /// Minimal GBE endpoint retaining CGI protocol semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ip32GbeEndpoint {
@@ -437,14 +356,6 @@ fn policy_result(
             }
         }
     }
-}
-
-fn transfer_in_window(transfer: &CrimeTransfer, address: u64, start: u64, end: u64) -> bool {
-    address >= start
-        && address < end
-        && address
-            .checked_add(transfer.length() as u64)
-            .is_some_and(|transfer_end| transfer_end <= end)
 }
 
 #[cfg(test)]

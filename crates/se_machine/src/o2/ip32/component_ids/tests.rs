@@ -35,6 +35,10 @@ fn bus_component_ids_are_present_and_distinct() {
             PCI_BUS,
             ISA_BUS,
             CPU_IRQ_BUS,
+            MACE_IRQ_BUS,
+            I2C_BUS0,
+            I2C_BUS1,
+            MACE_MEDIA_BUS,
         ]
     );
 
