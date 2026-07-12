@@ -7,6 +7,8 @@
 use se_core::component::{Component, ComponentId};
 use se_core::role::BusDeviceRole;
 
+pub mod flash;
+
 /// Transaction accepted by a byte-addressed memory component.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryTransaction {
