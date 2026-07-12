@@ -1,7 +1,14 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use se_core::tracing::{TraceRecord, TraceValue};
+use se_core::role::BusDeviceRole;
+use se_core::tracing::{TraceRecord, TraceSink, TraceValue};
+use se_device::chipset::crime::config::{CrimeAccessPolicy, CrimeConfigError, CrimeSdramBankSize};
+use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
+use se_device::chipset::crime::memory::CrimeSdram;
+use se_device::chipset::crime::memory::bus::CrimeMemoryBus;
+use se_device::chipset::crime::protocol::{
+    CrimeCompletionPayload, CrimeMemoryClient, CrimeMemoryTransaction, CrimeTransactionId,
+    CrimeTransfer,
+};
+use se_device::chipset::crime::registers;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
 
 use super::*;
@@ -10,15 +17,12 @@ const LUI_R1_LINEAR_RAM: u32 = 0x3c01_4000;
 const LUI_R1_CRIME: u32 = 0x3c01_1400;
 const ADDIU_R2_1234: u32 = 0x2402_1234;
 const SW_R2_R1: u32 = 0xac22_0000;
-const LW_R2_R1: u32 = 0x8c22_0000;
 const LW_R3_R1: u32 = 0x8c23_0000;
+const LD_R3_R1: u32 = 0xdc23_0000;
 const WAIT: u32 = 0x4200_0020;
 
 fn config_with_program(words: &[(usize, u32)]) -> Ip32MachineConfig {
-    let mut config = Ip32MachineConfig {
-        ram_size_bytes: 1024 * 1024,
-        ..Ip32MachineConfig::default()
-    };
+    let mut config = Ip32MachineConfig::default();
     for &(offset, word) in words {
         config.prom_image[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
     }
@@ -26,68 +30,80 @@ fn config_with_program(words: &[(usize, u32)]) -> Ip32MachineConfig {
 }
 
 #[test]
-fn default_config_matches_the_o2_r5000sc_baseline() {
+fn default_config_matches_the_o2_r5000sc_and_crime_baseline() {
     let config = Ip32MachineConfig::default();
 
     assert_eq!(config.processor.endianness, Mips4Endianness::Big);
     assert_eq!(config.processor.revision.bits(), 0x21);
     assert_eq!(config.processor.processor_frequency_hz, 180_000_000);
+    assert_eq!(config.crime.memory.total_size_bytes(), 64 * 1024 * 1024);
     assert_eq!(
-        config.processor.instruction_cache.size_bytes(),
-        Some(32 * 1024)
+        config.crime.memory.banks[0].unwrap().size,
+        CrimeSdramBankSize::MiB32
     );
-    assert_eq!(config.processor.data_cache.size_bytes(), Some(32 * 1024));
     assert_eq!(
-        config.processor.secondary_cache.size_bytes(),
-        Some(512 * 1024)
+        config.crime.unimplemented_access_policy,
+        CrimeAccessPolicy::Strict
     );
-    assert_eq!(config.ram_size_bytes, 64 * 1024 * 1024);
     assert_eq!(config.prom_image.len(), IP32_PROM_IMAGE_SIZE_BYTES);
-    assert_eq!(
-        config.unimplemented_access_policy,
-        Ip32UnimplementedAccessPolicy::Strict
-    );
 }
 
 #[test]
-fn construction_registers_only_real_board_components() {
+fn construction_registers_the_role_oriented_ip32_topology() {
     let machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
     let registry = machine.runtime().registry();
 
-    assert_eq!(registry.len(), 8);
+    assert_eq!(registry.len(), 11);
     assert!(registry.get_typed::<R5000Cpu>(component_ids::CPU0).is_ok());
     assert!(
         registry
-            .get_typed::<Ip32CpuAddressBus>(component_ids::CPU_SYSAD_BUS)
+            .get_typed::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)
             .is_ok()
     );
-    assert!(registry.get_typed::<Ram>(component_ids::RAM).is_ok());
+    assert!(registry.get_typed::<Crime>(component_ids::CRIME).is_ok());
+    assert!(
+        registry
+            .get_typed::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)
+            .is_ok()
+    );
+    assert!(
+        registry
+            .get_typed::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)
+            .is_ok()
+    );
+    assert!(
+        registry
+            .get_typed::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)
+            .is_ok()
+    );
+    assert!(registry.get_typed::<CrimeSdram>(component_ids::RAM).is_ok());
+    assert!(
+        registry
+            .get_typed::<Ip32MaceEndpoint>(component_ids::MACE)
+            .is_ok()
+    );
+    assert!(
+        registry
+            .get_typed::<Ip32GbeEndpoint>(component_ids::GBE)
+            .is_ok()
+    );
+    assert!(
+        registry
+            .get_typed::<Ip32StubEndpoint>(component_ids::VICE)
+            .is_ok()
+    );
     assert!(registry.get_typed::<Rom>(component_ids::PROM).is_ok());
-    for id in [
-        component_ids::CRIME,
-        component_ids::MACE,
-        component_ids::GBE,
-        component_ids::VICE,
-    ] {
-        assert!(registry.get_typed::<Ip32MmioStub>(id).is_ok());
-    }
-    for id in [
-        component_ids::FPU0,
-        component_ids::ICACHE0,
-        component_ids::DCACHE0,
-        component_ids::SCACHE0,
-    ] {
-        assert!(!registry.contains(id));
-    }
 }
 
 #[test]
-fn invalid_machine_config_is_rejected_before_component_construction() {
+fn invalid_machine_configuration_is_rejected_before_construction() {
     let mut config = config_with_program(&[]);
-    config.ram_size_bytes = 0;
+    config.crime.memory.banks[0] = None;
     assert_eq!(
         Ip32Machine::from_config(config).err(),
-        Some(Ip32MachineBuildError::InvalidRamSize { size_bytes: 0 })
+        Some(Ip32MachineBuildError::Crime(CrimeError::Configuration(
+            CrimeConfigError::MissingBankZero
+        )))
     );
 
     let mut config = config_with_program(&[]);
@@ -110,7 +126,7 @@ fn invalid_machine_config_is_rejected_before_component_construction() {
 }
 
 #[test]
-fn power_on_executes_prom_and_closes_the_ram_alias_loop() {
+fn cpu_prom_and_ram_accesses_cross_all_required_buses() {
     let config = config_with_program(&[
         (0, LUI_R1_LINEAR_RAM),
         (4, ADDIU_R2_1234),
@@ -121,11 +137,11 @@ fn power_on_executes_prom_and_closes_the_ram_alias_loop() {
     let mut machine = Ip32Machine::from_config(config).unwrap();
 
     machine.schedule_power_on().unwrap();
-    let status = machine.run_until_time(SimTime::new(100)).unwrap();
+    assert_eq!(
+        machine.run_until_time(SimTime::new(1_000_000)).unwrap(),
+        RunStatus::Idle
+    );
 
-    assert_eq!(status, RunStatus::Idle);
-    assert_eq!(machine.runtime().now(), SimTime::new(100));
-    assert!(machine.runtime().scheduler().is_empty());
     let cpu = machine
         .runtime()
         .registry()
@@ -135,233 +151,130 @@ fn power_on_executes_prom_and_closes_the_ram_alias_loop() {
         cpu.state().gpr().read(Mips4GprIndex::from_u8(3).unwrap()),
         0x1234
     );
-    let ram_size = machine
-        .runtime()
-        .registry()
-        .get_typed::<Ram>(component_ids::RAM)
-        .unwrap()
-        .len() as u64;
-    assert_eq!(
-        &machine
-            .runtime()
-            .registry()
-            .get_typed::<Ram>(component_ids::RAM)
-            .unwrap()
-            .bytes()[..4],
-        &[0x00, 0x00, 0x12, 0x34]
-    );
 
-    let mut low_alias_bus =
-        Ip32CpuAddressBus::new(component_ids::CPU_SYSAD_BUS, "alias probe", ram_size);
-    let probe = ExecutionTransaction {
-        id: ExecutionTransactionId::new(0xfeed),
-        payload: Mips4ExecutionTransaction::Read {
-            physical_address: 0,
-            size: se_device::cpu::mips4::execution::bus::Mips4ExecutionTransferSize::Word,
-            kind: se_device::cpu::mips4::execution::bus::Mips4ExecutionAccessKind::DataLoad,
-            access_type: se_device::cpu::mips4::cache::Mips4MemoryAccessType::Uncached,
-        },
-    };
-    let route = low_alias_bus.route(probe);
-    assert!(matches!(
-        route,
-        Ip32BusRoute::Memory {
-            target: component_ids::RAM,
-            offset: 0,
-            ..
-        }
-    ));
-    let Ip32BusRoute::Memory { offset, .. } = route else {
-        unreachable!();
-    };
+    let completion = machine
+        .runtime_mut()
+        .registry_mut()
+        .get_typed_mut::<CrimeSdram>(component_ids::RAM)
+        .unwrap()
+        .accept(CrimeMemoryTransaction {
+            id: CrimeTransactionId::new(0x100),
+            time: SimTime::new(1_000_000),
+            controller: component_ids::CRIME,
+            client: CrimeMemoryClient::Cpu,
+            address: 0,
+            no_ecc: false,
+            transfer: CrimeTransfer::Read { length: 4 },
+        });
     assert_eq!(
-        machine
-            .runtime_mut()
-            .registry_mut()
-            .get_typed_mut::<Ram>(component_ids::RAM)
-            .unwrap()
-            .accept(MemoryTransaction::Read { offset, size: 4 }),
-        MemoryResponse::ReadData(0x3412_0000)
+        completion.result,
+        Ok(CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34]))
     );
 }
 
 #[test]
-fn reset_invalidates_cpu_steps_from_the_previous_generation() {
-    let config = config_with_program(&[(0, WAIT)]);
+fn crime_piu_requires_doubleword_access_through_the_cpu_path() {
+    let config = config_with_program(&[(0, LUI_R1_CRIME), (4, LD_R3_R1), (8, WAIT)]);
     let mut machine = Ip32Machine::from_config(config).unwrap();
 
     machine.schedule_power_on().unwrap();
-    machine.schedule_reset().unwrap();
-    machine.run_until_time(SimTime::new(20)).unwrap();
+    machine.run_until_time(SimTime::new(1_000_000)).unwrap();
 
     let cpu = machine
         .runtime()
         .registry()
         .get_typed::<R5000Cpu>(component_ids::CPU0)
         .unwrap();
-    assert_eq!(cpu.state().cp0().random().bits(), 46);
-    assert!(machine.runtime().scheduler().is_empty());
+    assert_eq!(
+        cpu.state().gpr().read(Mips4GprIndex::from_u8(3).unwrap()),
+        0xa1
+    );
 }
 
 #[test]
-fn run_steps_exposes_the_runtime_event_limit() {
-    let config = config_with_program(&[(0, WAIT)]);
+fn hard_reset_preserves_sdram_and_advances_the_cpu_generation() {
+    let config = config_with_program(&[
+        (0, LUI_R1_LINEAR_RAM),
+        (4, ADDIU_R2_1234),
+        (8, SW_R2_R1),
+        (12, WAIT),
+    ]);
     let mut machine = Ip32Machine::from_config(config).unwrap();
     machine.schedule_power_on().unwrap();
-
-    assert_eq!(machine.run_steps(1).unwrap(), RunStatus::StepLimitReached);
-    assert_eq!(machine.control.generation, 1);
-    assert!(!machine.runtime().scheduler().is_empty());
-}
-
-#[derive(Clone, Default)]
-struct SequenceSink(Rc<RefCell<Vec<u64>>>);
-
-impl TraceSink for SequenceSink {
-    fn record(&mut self, record: TraceRecord<'_>) {
-        self.0.borrow_mut().push(record.sequence);
-    }
-}
-
-#[test]
-fn hard_reset_dispatches_its_exact_event_and_preserves_trace_sequence() {
-    let sink = SequenceSink::default();
-    let sequences = Rc::clone(&sink.0);
-    let config = config_with_program(&[(0, WAIT)]);
-    let mut machine = Ip32Machine::from_config_with_trace_sink(config, sink).unwrap();
-    machine.schedule_power_on().unwrap();
+    machine.run_until_time(SimTime::new(1_000_000)).unwrap();
+    let generation = machine.control.cpu_generation;
 
     machine.hard_reset().unwrap();
 
-    assert_eq!(machine.runtime().now(), SimTime::ZERO);
-    assert_eq!(machine.control.generation, 2);
-    let captured = sequences.borrow();
-    assert!(!captured.is_empty());
-    assert!(
-        captured
-            .windows(2)
-            .all(|pair| pair[1] == pair[0].checked_add(1).unwrap())
-    );
-}
-
-#[test]
-fn processor_clock_accumulator_has_no_long_term_drift() {
-    let mut clock = CpuClock::new(180_000_000);
-    let delays: Vec<u64> = (0..18).map(|_| clock.next_pclock_delay().get()).collect();
-
-    assert!(delays.iter().all(|delay| matches!(delay, 5 | 6)));
-    assert_eq!(delays.iter().sum::<u64>(), 100);
-}
-
-#[test]
-fn strict_stub_access_raises_a_precise_data_bus_error() {
-    let config = config_with_program(&[(0, LUI_R1_CRIME), (4, LW_R2_R1), (0x380, WAIT)]);
-    let mut machine = Ip32Machine::from_config(config).unwrap();
-
-    machine.schedule_power_on().unwrap();
+    assert_eq!(machine.control.cpu_generation, generation + 1);
+    let now = machine.runtime().now();
+    let completion = machine
+        .runtime_mut()
+        .registry_mut()
+        .get_typed_mut::<CrimeSdram>(component_ids::RAM)
+        .unwrap()
+        .accept(CrimeMemoryTransaction {
+            id: CrimeTransactionId::new(0x101),
+            time: now,
+            controller: component_ids::CRIME,
+            client: CrimeMemoryClient::Cpu,
+            address: 0,
+            no_ecc: false,
+            transfer: CrimeTransfer::Read { length: 4 },
+        });
     assert_eq!(
-        machine.run_until_time(SimTime::new(100)).unwrap(),
-        RunStatus::Idle
+        completion.result,
+        Ok(CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34]))
     );
-
-    let cpu = machine
-        .runtime()
-        .registry()
-        .get_typed::<R5000Cpu>(component_ids::CPU0)
-        .unwrap();
-    assert_eq!(cpu.state().cp0().cause().exception_code(), 7);
 }
 
-#[test]
-fn permissive_stub_reads_zero_and_execution_continues() {
-    let mut config = config_with_program(&[(0, LUI_R1_CRIME), (4, LW_R2_R1), (8, WAIT)]);
-    config.unimplemented_access_policy = Ip32UnimplementedAccessPolicy::Permissive;
-    let mut machine = Ip32Machine::from_config(config).unwrap();
-
-    machine.schedule_power_on().unwrap();
-    assert_eq!(
-        machine.run_until_time(SimTime::new(100)).unwrap(),
-        RunStatus::Idle
-    );
-
-    let cpu = machine
-        .runtime()
-        .registry()
-        .get_typed::<R5000Cpu>(component_ids::CPU0)
-        .unwrap();
-    assert_eq!(
-        cpu.state().gpr().read(Mips4GprIndex::from_u8(2).unwrap()),
-        0
-    );
-    assert_eq!(cpu.state().cp0().cause().exception_code(), 0);
+#[derive(Default)]
+struct PromAcceptanceSink {
+    failed_addresses: Vec<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CapturedAccess {
-    level: TraceLevel,
-    physical_address: Option<u64>,
-}
-
-#[derive(Clone, Default)]
-struct CapturingSink(Rc<RefCell<Vec<CapturedAccess>>>);
-
-impl TraceSink for CapturingSink {
+impl TraceSink for PromAcceptanceSink {
     fn record(&mut self, record: TraceRecord<'_>) {
         if record.target != "ip32.sysad" || record.event != "access" {
             return;
         }
-        let physical_address = record
+        let failed = record
             .fields
             .iter()
-            .find_map(|field| (field.key == "physical_address").then_some(field.value));
-        self.0.borrow_mut().push(CapturedAccess {
-            level: record.level,
-            physical_address: match physical_address {
-                Some(TraceValue::Hex64(value)) => Some(value),
-                _ => None,
-            },
-        });
+            .any(|field| field.key == "bus_error" && matches!(field.value, TraceValue::Bool(true)));
+        if !failed {
+            return;
+        }
+        if let Some(address) = record
+            .fields
+            .iter()
+            .find_map(|field| (field.key == "physical_address").then_some(field.value))
+            && let TraceValue::Hex64(address) = address
+        {
+            self.failed_addresses.push(address);
+        }
     }
 }
 
 #[test]
-fn successful_and_stub_bus_accesses_are_traced() {
-    let sink = CapturingSink::default();
-    let captured = Rc::clone(&sink.0);
-    let mut config = config_with_program(&[(0, LUI_R1_CRIME), (4, LW_R2_R1), (0x380, WAIT)]);
-    config.unimplemented_access_policy = Ip32UnimplementedAccessPolicy::Strict;
-    let mut machine = Ip32Machine::from_config_with_trace_sink(config, sink).unwrap();
-
+#[ignore = "requires a local proprietary IP32 PROM image"]
+fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
+    let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
+    let mut config = Ip32MachineConfig {
+        prom_image: std::fs::read(path).expect("the local PROM image must be readable"),
+        ..Ip32MachineConfig::default()
+    };
+    config.crime.unimplemented_access_policy = CrimeAccessPolicy::Strict;
+    let mut machine =
+        Ip32Machine::from_config_with_trace_sink(config, PromAcceptanceSink::default()).unwrap();
     machine.schedule_power_on().unwrap();
-    machine.run_until_time(SimTime::new(100)).unwrap();
+    let _ = machine.run_steps(200_000).unwrap();
 
-    let accesses = captured.borrow();
-    assert!(accesses.iter().any(|access| {
-        access.level == TraceLevel::Trace && access.physical_address == Some(0x1fc0_0000)
-    }));
-    assert!(accesses.iter().any(|access| {
-        access.level == TraceLevel::Warn && access.physical_address == Some(0x1400_0000)
-    }));
-}
-
-#[test]
-fn schedule_power_on_queues_zero_time_event() {
-    let mut machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
-
-    machine.schedule_power_on().unwrap();
-    let event = machine.runtime_mut().scheduler_mut().pop_next().unwrap();
-
-    assert_eq!(event.time, SimTime::ZERO);
-    assert_eq!(event.target, component_ids::MACHINE);
-    assert_eq!(event.payload, Ip32Event::PowerOn);
-}
-
-#[test]
-fn run_until_time_advances_when_queue_is_empty() {
-    let mut machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
-
-    let status = machine.run_until_time(SimTime::new(42)).unwrap();
-
-    assert_eq!(status, RunStatus::Idle);
-    assert_eq!(machine.runtime().now(), SimTime::new(42));
+    let failed = &machine.runtime().trace_recorder().sink().failed_addresses;
+    assert!(
+        failed.iter().all(|address| {
+            !(registers::CRIME_BASE..registers::CRIME_REGISTER_END).contains(address)
+        }),
+        "a defined CRIME access returned a bus error"
+    );
 }

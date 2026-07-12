@@ -2,34 +2,50 @@
 
 use core::fmt;
 
+use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole, BusRole};
 use se_core::scheduler::{ScheduledEvent, ScheduledEventId, SchedulerError, SimDuration, SimTime};
 use se_core::tracing::{NoopTraceSink, TraceField, TraceLevel, TraceSink, TraceSource};
+use se_device::chipset::crime::config::CrimeConfig;
+use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
+use se_device::chipset::crime::memory::CrimeSdram;
+use se_device::chipset::crime::memory::bus::CrimeMemoryBus;
+use se_device::chipset::crime::protocol::{
+    CrimeAction, CrimeBusAction, CrimeBusDisposition, CrimeCgiTransaction, CrimeCmiCompletion,
+    CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal, CrimeLinkDeviceResponse,
+    CrimeMemoryTransaction, CrimePoll, CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceValue,
+    CrimeTransfer,
+};
+use se_device::chipset::crime::{Crime, CrimeError};
 use se_device::cpu::execution::protocol::{
-    ExecutionAction, ExecutionCompletion, ExecutionTransaction, ExecutionTransactionId,
+    ExecutionAction, ExecutionCompletion, ExecutionTransaction,
 };
 use se_device::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use se_device::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
-use se_device::cpu::mips4::model::r5000::cpu::{R5000Cpu, R5000CpuError};
+use se_device::cpu::mips4::model::r5000::cpu::{R5000Cpu, R5000CpuError, R5000CpuSignal};
 use se_device::cpu::mips4::model::r5000::profile::R5000Profile;
 use se_device::cpu::mips4::model::r5000::revision::R5000Revision;
-use se_device::memory::{MemoryResponse, MemoryTransaction, Ram, Rom};
+use se_device::memory::{MemoryResponse, MemoryTransaction, Rom};
 use se_runtime::registry::{ComponentRegistry, RegistryError, RegistryLookupError};
 use se_runtime::runtime::{RunError, RunStatus, Runtime, RuntimeContext};
 
-use super::address_map::{IP32_MAX_RAM_SIZE_BYTES, IP32_PROM_IMAGE_SIZE_BYTES, Ip32PhysicalRegion};
-use super::bus::{Ip32BusRoute, Ip32CpuAddressBus, Ip32MmioStub, Ip32UnimplementedAccessPolicy};
+use super::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
+use super::bus::{
+    Ip32GbeEndpoint, Ip32MaceDeviceResponse, Ip32MaceEndpoint, Ip32StubEndpoint, Ip32SysAdBus,
+    Ip32SysAdBusAction,
+};
 use super::component_ids;
 use super::event::Ip32Event;
 use super::timing::IP32_TIMEBASE_HZ;
 
 const DEFAULT_PROCESSOR_FREQUENCY_HZ: u64 = 180_000_000;
-const DEFAULT_RAM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const PRIMARY_CACHE_SIZE_BYTES: u32 = 32 * 1024;
 const SECONDARY_CACHE_SIZE_BYTES: u32 = 512 * 1024;
 const CACHE_LINE_SIZE_BYTES: u32 = 32;
 const SECONDARY_CACHE_ENABLE_BIT: u64 = 1 << 12;
+const SDRAM_REFRESH_TICKS: u64 = 27_000;
+const SDRAM_INITIALIZATION_TICKS: u64 = 120_000;
 
 /// Complete construction input for one IP32 machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,14 +56,11 @@ pub struct Ip32MachineConfig {
     /// R5000 boot-mode serial stream sampled at reset.
     pub boot_mode: R5000BootMode,
 
-    /// Installed RAM capacity in bytes.
-    pub ram_size_bytes: u64,
+    /// CRIME chipset and physical SDRAM topology.
+    pub crime: CrimeConfig,
 
     /// Exact 512 KiB System PROM image.
     pub prom_image: Vec<u8>,
-
-    /// Behavior for mapped ASIC registers without implemented semantics.
-    pub unimplemented_access_policy: Ip32UnimplementedAccessPolicy,
 }
 
 impl Default for Ip32MachineConfig {
@@ -63,9 +76,8 @@ impl Default for Ip32MachineConfig {
             ),
             boot_mode: R5000BootMode::from_low_bits(SECONDARY_CACHE_ENABLE_BIT)
                 .expect("the default R5000 boot mode must be valid"),
-            ram_size_bytes: DEFAULT_RAM_SIZE_BYTES,
+            crime: CrimeConfig::default(),
             prom_image: vec![0; IP32_PROM_IMAGE_SIZE_BYTES],
-            unimplemented_access_policy: Ip32UnimplementedAccessPolicy::Strict,
         }
     }
 }
@@ -73,11 +85,8 @@ impl Default for Ip32MachineConfig {
 /// Error returned while constructing an IP32 machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Ip32MachineBuildError {
-    /// Installed RAM is outside the supported range.
-    InvalidRamSize {
-        /// Requested capacity in bytes.
-        size_bytes: u64,
-    },
+    /// CRIME configuration is invalid.
+    Crime(CrimeError),
 
     /// PROM image does not have the fixed hardware size.
     InvalidPromSize {
@@ -101,9 +110,7 @@ pub enum Ip32MachineBuildError {
 impl fmt::Display for Ip32MachineBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRamSize { size_bytes } => {
-                write!(f, "invalid IP32 RAM size: {size_bytes} bytes")
-            }
+            Self::Crime(error) => write!(f, "failed to construct CRIME: {error}"),
             Self::InvalidPromSize { size_bytes } => {
                 write!(f, "invalid IP32 PROM size: {size_bytes} bytes")
             }
@@ -127,17 +134,17 @@ pub enum Ip32MachineDispatchError {
     /// The R5000 execution model failed.
     Cpu(R5000CpuError),
 
+    /// CRIME reported an internal protocol error.
+    Crime(CrimeError),
+
     /// A follow-up event could not be scheduled.
     Scheduler(SchedulerError),
 
     /// The reset generation counter was exhausted.
     GenerationOverflow,
 
-    /// A zero-latency synchronous transaction remained incomplete.
-    IncompleteSynchronousTransaction {
-        /// Outstanding CPU transaction.
-        transaction_id: ExecutionTransactionId,
-    },
+    /// A completion named a controller not implemented by the current topology.
+    UnexpectedController(ComponentId),
 }
 
 impl fmt::Display for Ip32MachineDispatchError {
@@ -145,13 +152,11 @@ impl fmt::Display for Ip32MachineDispatchError {
         match self {
             Self::Registry(error) => write!(f, "IP32 component lookup failed: {error}"),
             Self::Cpu(error) => write!(f, "IP32 CPU execution failed: {error}"),
+            Self::Crime(error) => write!(f, "CRIME dispatch failed: {error}"),
             Self::Scheduler(error) => write!(f, "IP32 event scheduling failed: {error}"),
             Self::GenerationOverflow => write!(f, "IP32 reset generation overflow"),
-            Self::IncompleteSynchronousTransaction { transaction_id } => {
-                write!(
-                    f,
-                    "IP32 synchronous transaction {transaction_id} did not complete"
-                )
+            Self::UnexpectedController(id) => {
+                write!(f, "unsupported IP32 bus controller {id}")
             }
         }
     }
@@ -168,6 +173,12 @@ impl From<RegistryLookupError> for Ip32MachineDispatchError {
 impl From<R5000CpuError> for Ip32MachineDispatchError {
     fn from(error: R5000CpuError) -> Self {
         Self::Cpu(error)
+    }
+}
+
+impl From<CrimeError> for Ip32MachineDispatchError {
+    fn from(error: CrimeError) -> Self {
+        Self::Crime(error)
     }
 }
 
@@ -206,7 +217,7 @@ impl CpuClock {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MachineControl {
-    generation: u64,
+    cpu_generation: u64,
     cpu_clock: CpuClock,
 }
 
@@ -256,25 +267,85 @@ impl<S> Ip32Machine<S> {
             config.boot_mode,
         )
         .map_err(Ip32MachineBuildError::Cpu)?;
+        let crime = Crime::new(
+            component_ids::CRIME,
+            "CRIME 1.1",
+            config.crime,
+            IP32_TIMEBASE_HZ,
+            component_ids::RAM,
+            component_ids::MACE,
+            component_ids::GBE,
+        )
+        .map_err(Ip32MachineBuildError::Crime)?;
 
         let mut runtime = Runtime::with_trace_sink(sink);
         let registry = runtime.registry_mut();
         insert_component(registry, Box::new(cpu))?;
         insert_component(
             registry,
-            Box::new(Ip32CpuAddressBus::new(
+            Box::new(Ip32SysAdBus::new(
                 component_ids::CPU_SYSAD_BUS,
                 "CPU SysAD bus",
-                config.ram_size_bytes,
+                component_ids::CPU0,
+                component_ids::CRIME,
+                IP32_TIMEBASE_HZ,
+                66_666_500,
+            )),
+        )?;
+        insert_component(registry, Box::new(crime))?;
+        insert_component(
+            registry,
+            Box::new(CrimeMemoryBus::new(
+                component_ids::CRIME_MEMORY_DOMAIN,
+                "CRIME memory domain",
+                component_ids::RAM,
+                IP32_TIMEBASE_HZ,
+                SimDuration::new(SDRAM_REFRESH_TICKS),
             )),
         )?;
         insert_component(
             registry,
-            Box::new(Ram::new(
-                component_ids::RAM,
-                "System RAM",
-                config.ram_size_bytes as usize,
+            Box::new(CrimeCmiBus::new(
+                component_ids::CRIME_MACE_LINK,
+                "CRIME CMI link",
+                IP32_TIMEBASE_HZ,
             )),
+        )?;
+        insert_component(
+            registry,
+            Box::new(CrimeCgiBus::new(
+                component_ids::CRIME_GBE_LINK,
+                "CRIME CGI link",
+                IP32_TIMEBASE_HZ,
+            )),
+        )?;
+        insert_component(
+            registry,
+            Box::new(CrimeSdram::new(
+                component_ids::RAM,
+                "CRIME SDRAM",
+                config.crime.memory,
+            )),
+        )?;
+        insert_component(
+            registry,
+            Box::new(Ip32MaceEndpoint::new(
+                component_ids::MACE,
+                "MACE endpoint",
+                config.crime.unimplemented_access_policy,
+            )),
+        )?;
+        insert_component(
+            registry,
+            Box::new(Ip32GbeEndpoint::new(
+                component_ids::GBE,
+                "GBE endpoint",
+                config.crime.unimplemented_access_policy,
+            )),
+        )?;
+        insert_component(
+            registry,
+            Box::new(Ip32StubEndpoint::new(component_ids::VICE, "VICE endpoint")),
         )?;
         insert_component(
             registry,
@@ -284,26 +355,11 @@ impl<S> Ip32Machine<S> {
                 config.prom_image,
             )),
         )?;
-        for (id, name) in [
-            (component_ids::CRIME, "CRIME"),
-            (component_ids::MACE, "MACE"),
-            (component_ids::GBE, "GBE"),
-            (component_ids::VICE, "VICE"),
-        ] {
-            insert_component(
-                registry,
-                Box::new(Ip32MmioStub::new(
-                    id,
-                    name,
-                    config.unimplemented_access_policy,
-                )),
-            )?;
-        }
 
         Ok(Self {
             runtime,
             control: MachineControl {
-                generation: 0,
+                cpu_generation: 0,
                 cpu_clock: CpuClock::new(processor_frequency_hz),
             },
         })
@@ -335,10 +391,13 @@ where
             .schedule_at(SimTime::ZERO, component_ids::MACHINE, Ip32Event::PowerOn)
     }
 
-    /// Schedules a reset event at the current simulated time.
+    /// Schedules a hard-reset event at the current simulated time.
     pub fn schedule_reset(&mut self) -> Result<ScheduledEventId, SchedulerError> {
-        self.runtime
-            .schedule_at(self.runtime.now(), component_ids::MACHINE, Ip32Event::Reset)
+        self.runtime.schedule_at(
+            self.runtime.now(),
+            component_ids::MACHINE,
+            Ip32Event::HardReset,
+        )
     }
 
     /// Dispatches at most the requested number of IP32 events.
@@ -358,7 +417,6 @@ where
         self.runtime.clear_stop();
         let reset_id = self.schedule_reset()?;
         let mut reset_dispatched = false;
-
         while !reset_dispatched {
             let control = &mut self.control;
             self.runtime.dispatch_next(|event, registry, context| {
@@ -383,11 +441,10 @@ where
 }
 
 fn validate_config(config: &Ip32MachineConfig) -> Result<(), Ip32MachineBuildError> {
-    if !(1..=IP32_MAX_RAM_SIZE_BYTES).contains(&config.ram_size_bytes) {
-        return Err(Ip32MachineBuildError::InvalidRamSize {
-            size_bytes: config.ram_size_bytes,
-        });
-    }
+    config
+        .crime
+        .validate()
+        .map_err(|error| Ip32MachineBuildError::Crime(CrimeError::Configuration(error)))?;
     if config.prom_image.len() != IP32_PROM_IMAGE_SIZE_BYTES {
         return Err(Ip32MachineBuildError::InvalidPromSize {
             size_bytes: config.prom_image.len(),
@@ -402,7 +459,7 @@ fn validate_config(config: &Ip32MachineConfig) -> Result<(), Ip32MachineBuildErr
 
 fn insert_component(
     registry: &mut ComponentRegistry,
-    component: Box<dyn se_core::component::Component>,
+    component: Box<dyn Component>,
 ) -> Result<(), Ip32MachineBuildError> {
     registry
         .insert(component)
@@ -419,26 +476,174 @@ where
     S: TraceSink,
 {
     match event.payload {
-        Ip32Event::PowerOn | Ip32Event::Reset => {
-            registry.reset_all();
-            control.generation = control
-                .generation
-                .checked_add(1)
-                .ok_or(Ip32MachineDispatchError::GenerationOverflow)?;
-            control.cpu_clock.reset();
-            context.schedule_at(
-                context.now(),
-                component_ids::CPU0,
-                Ip32Event::CpuStep {
-                    generation: control.generation,
-                },
-            )?;
-        }
-        Ip32Event::CpuStep { generation } if generation == control.generation => {
+        Ip32Event::PowerOn => power_on(registry, context, control)?,
+        Ip32Event::HardReset => hard_reset(registry, context, control)?,
+        Ip32Event::CpuStep { generation } if generation == control.cpu_generation => {
             dispatch_cpu_step(registry, context, control)?;
         }
         Ip32Event::CpuStep { .. } => {}
+        Ip32Event::Crime(event) => {
+            registry
+                .get_typed_mut::<Crime>(component_ids::CRIME)?
+                .handle_event(context.now(), event);
+            drain_crime(registry, context, control)?;
+        }
+        Ip32Event::SysAdBus(event) => {
+            registry
+                .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
+                .handle_event(event);
+            drain_sysad_bus(registry, context, control)?;
+        }
+        Ip32Event::CrimeMemoryBus(event) => {
+            registry
+                .get_typed_mut::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)?
+                .handle_event(event);
+            drain_memory_bus(registry, context, control)?;
+        }
+        Ip32Event::CrimeCmiBus(event) => {
+            registry
+                .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
+                .handle_event(event);
+            drain_cmi_bus(registry, context, control)?;
+        }
+        Ip32Event::CrimeCgiBus(event) => {
+            registry
+                .get_typed_mut::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
+                .handle_event(event);
+            drain_cgi_bus(registry, context, control)?;
+        }
     }
+    Ok(())
+}
+
+fn power_on<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    advance_cpu_generation(control)?;
+    registry
+        .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
+        .reset();
+    registry
+        .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
+        .hard_reset();
+    registry
+        .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
+        .hard_reset();
+    registry
+        .get_typed_mut::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
+        .hard_reset();
+    registry
+        .get_typed_mut::<Ip32MaceEndpoint>(component_ids::MACE)?
+        .reset();
+    registry
+        .get_typed_mut::<Ip32GbeEndpoint>(component_ids::GBE)?
+        .reset();
+    registry
+        .get_typed_mut::<Ip32StubEndpoint>(component_ids::VICE)?
+        .reset();
+    registry
+        .get_typed_mut::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)?
+        .power_on(context.now());
+    registry
+        .get_typed_mut::<Crime>(component_ids::CRIME)?
+        .power_on(context.now());
+    drain_crime(registry, context, control)?;
+    context.schedule_after(
+        SimDuration::new(SDRAM_INITIALIZATION_TICKS),
+        component_ids::CPU0,
+        Ip32Event::CpuStep {
+            generation: control.cpu_generation,
+        },
+    )?;
+    Ok(())
+}
+
+fn hard_reset<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    advance_cpu_generation(control)?;
+    registry
+        .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
+        .reset();
+    registry
+        .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
+        .hard_reset();
+    registry
+        .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
+        .hard_reset();
+    registry
+        .get_typed_mut::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
+        .hard_reset();
+    registry
+        .get_typed_mut::<Ip32MaceEndpoint>(component_ids::MACE)?
+        .reset();
+    registry
+        .get_typed_mut::<Ip32GbeEndpoint>(component_ids::GBE)?
+        .reset();
+    registry
+        .get_typed_mut::<Ip32StubEndpoint>(component_ids::VICE)?
+        .reset();
+    registry
+        .get_typed_mut::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)?
+        .hard_reset(context.now());
+    registry
+        .get_typed_mut::<Crime>(component_ids::CRIME)?
+        .hard_reset(context.now());
+    drain_crime(registry, context, control)?;
+    context.schedule_at(
+        context.now(),
+        component_ids::CPU0,
+        Ip32Event::CpuStep {
+            generation: control.cpu_generation,
+        },
+    )?;
+    Ok(())
+}
+
+fn warm_reset<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    advance_cpu_generation(control)?;
+    registry
+        .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
+        .accept(R5000CpuSignal::SoftReset);
+    registry
+        .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
+        .hard_reset();
+    registry
+        .get_typed_mut::<Crime>(component_ids::CRIME)?
+        .warm_reset();
+    context.schedule_at(
+        context.now(),
+        component_ids::CPU0,
+        Ip32Event::CpuStep {
+            generation: control.cpu_generation,
+        },
+    )?;
+    Ok(())
+}
+
+fn advance_cpu_generation(control: &mut MachineControl) -> Result<(), Ip32MachineDispatchError> {
+    control.cpu_generation = control
+        .cpu_generation
+        .checked_add(1)
+        .ok_or(Ip32MachineDispatchError::GenerationOverflow)?;
+    control.cpu_clock.reset();
     Ok(())
 }
 
@@ -450,223 +655,520 @@ fn dispatch_cpu_step<S>(
 where
     S: TraceSink,
 {
-    loop {
-        let action = registry
-            .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
-            .poll()?;
-        match action {
-            ExecutionAction::Transaction(transaction) => {
-                let completion = dispatch_cpu_transaction(registry, context, transaction)?;
-                registry
-                    .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
-                    .complete(completion);
-            }
-            ExecutionAction::Boundary(_) => {
+    let action = registry
+        .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
+        .poll()?;
+    match action {
+        ExecutionAction::Transaction(transaction) => {
+            let disposition = registry
+                .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
+                .route(transaction);
+            if let CrimeBusDisposition::QueuedAndNeedsService { delay } = disposition {
+                let generation = registry
+                    .get_typed::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
+                    .generation();
                 context.schedule_after(
-                    control.cpu_clock.next_pclock_delay(),
-                    component_ids::CPU0,
-                    Ip32Event::CpuStep {
-                        generation: control.generation,
-                    },
+                    delay,
+                    component_ids::CPU_SYSAD_BUS,
+                    Ip32Event::SysAdBus(super::bus::Ip32SysAdBusEvent::Service { generation }),
                 )?;
-                return Ok(());
-            }
-            ExecutionAction::Idle => return Ok(()),
-            ExecutionAction::Waiting { transaction_id } => {
-                return Err(Ip32MachineDispatchError::IncompleteSynchronousTransaction {
-                    transaction_id,
-                });
             }
         }
+        ExecutionAction::Boundary(_) => {
+            context.schedule_after(
+                control.cpu_clock.next_pclock_delay(),
+                component_ids::CPU0,
+                Ip32Event::CpuStep {
+                    generation: control.cpu_generation,
+                },
+            )?;
+        }
+        ExecutionAction::Idle | ExecutionAction::Waiting { .. } => {}
     }
+    Ok(())
 }
 
-fn dispatch_cpu_transaction<S>(
+fn drain_crime<S>(
     registry: &mut ComponentRegistry,
     context: &mut RuntimeContext<'_, Ip32Event, S>,
-    transaction: ExecutionTransaction<Mips4ExecutionTransaction>,
-) -> Result<ExecutionCompletion<Mips4ExecutionCompletion>, Ip32MachineDispatchError>
-where
-    S: TraceSink,
-{
-    let route = registry
-        .get_typed_mut::<Ip32CpuAddressBus>(component_ids::CPU_SYSAD_BUS)?
-        .route(transaction);
-    let (id, request, payload, target, region, no_ecc) = match route {
-        Ip32BusRoute::Memory {
-            region,
-            target,
-            offset,
-            no_ecc,
-            transaction,
-        } => {
-            let memory_transaction = to_memory_transaction(transaction.payload, offset);
-            let response = if target == component_ids::RAM {
-                registry
-                    .get_typed_mut::<Ram>(target)?
-                    .accept(memory_transaction)
-            } else {
-                registry
-                    .get_typed_mut::<Rom>(target)?
-                    .accept(memory_transaction)
-            };
-            (
-                transaction.id,
-                transaction.payload,
-                from_memory_response(response),
-                Some(target),
-                Some(region),
-                no_ecc,
-            )
-        }
-        Ip32BusRoute::Stub {
-            region,
-            target,
-            transaction,
-        } => {
-            let response = registry
-                .get_typed_mut::<Ip32MmioStub>(target)?
-                .accept(transaction.payload);
-            (
-                transaction.id,
-                transaction.payload,
-                response,
-                Some(target),
-                Some(region),
-                false,
-            )
-        }
-        Ip32BusRoute::Unmapped {
-            region,
-            transaction,
-        } => (
-            transaction.id,
-            transaction.payload,
-            Mips4ExecutionCompletion::BusError,
-            None,
-            region,
-            false,
-        ),
-    };
-
-    trace_bus_access(
-        registry,
-        context,
-        CompletedBusAccess {
-            transaction_id: id,
-            request,
-            completion: payload,
-            target,
-            region,
-            no_ecc,
-        },
-    )?;
-    Ok(ExecutionCompletion { id, payload })
-}
-
-const fn to_memory_transaction(
-    transaction: Mips4ExecutionTransaction,
-    offset: u64,
-) -> MemoryTransaction {
-    match transaction {
-        Mips4ExecutionTransaction::Read { size, .. } => MemoryTransaction::Read {
-            offset,
-            size: size.bytes(),
-        },
-        Mips4ExecutionTransaction::Write {
-            size,
-            data,
-            byte_enable,
-            ..
-        } => MemoryTransaction::Write {
-            offset,
-            size: size.bytes(),
-            data,
-            byte_enable,
-        },
-    }
-}
-
-const fn from_memory_response(response: MemoryResponse) -> Mips4ExecutionCompletion {
-    match response {
-        MemoryResponse::ReadData(data) => Mips4ExecutionCompletion::ReadData(data),
-        MemoryResponse::WriteComplete => Mips4ExecutionCompletion::WriteComplete,
-        MemoryResponse::AccessError => Mips4ExecutionCompletion::BusError,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CompletedBusAccess {
-    transaction_id: ExecutionTransactionId,
-    request: Mips4ExecutionTransaction,
-    completion: Mips4ExecutionCompletion,
-    target: Option<se_core::component::ComponentId>,
-    region: Option<Ip32PhysicalRegion>,
-    no_ecc: bool,
-}
-
-fn trace_bus_access<S>(
-    registry: &ComponentRegistry,
-    context: &mut RuntimeContext<'_, Ip32Event, S>,
-    access: CompletedBusAccess,
+    control: &mut MachineControl,
 ) -> Result<(), Ip32MachineDispatchError>
 where
     S: TraceSink,
 {
-    let cpu = registry.get_typed::<R5000Cpu>(component_ids::CPU0)?;
-    let target_id = access
-        .target
-        .map_or(u64::MAX, se_core::component::ComponentId::get);
-    let target_name = access
-        .target
-        .and_then(|id| registry.get(id))
-        .map_or("unmapped", |component| component.name());
-    let region_name = access
-        .region
-        .map_or("unmapped", Ip32PhysicalRegion::trace_name);
-    let level = if matches!(access.completion, Mips4ExecutionCompletion::BusError) {
-        TraceLevel::Warn
-    } else {
-        TraceLevel::Trace
-    };
-    let (physical_address, size, operation, request_data, byte_enable) = match access.request {
+    loop {
+        let poll = registry
+            .get_typed_mut::<Crime>(component_ids::CRIME)?
+            .poll()?;
+        let CrimePoll::Action(action) = poll else {
+            return Ok(());
+        };
+        match action {
+            CrimeAction::Schedule { delay, event } => {
+                context.schedule_after(delay, component_ids::CRIME, Ip32Event::Crime(event))?;
+            }
+            CrimeAction::StartMemory(transaction) => {
+                route_memory(registry, context, transaction)?;
+            }
+            CrimeAction::StartCmi(transaction) => route_cmi(registry, context, transaction)?,
+            CrimeAction::StartCgi(transaction) => route_cgi(registry, context, transaction)?,
+            CrimeAction::CompleteCmiDevice(completion) => {
+                registry
+                    .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
+                    .accept_device_completion(completion);
+                drain_cmi_bus(registry, context, control)?;
+            }
+            CrimeAction::CompleteCgiDevice(completion) => {
+                registry
+                    .get_typed_mut::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
+                    .accept_device_completion(completion);
+                drain_cgi_bus(registry, context, control)?;
+            }
+            CrimeAction::CompleteSysAd(completion) => {
+                registry
+                    .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
+                    .accept_device_completion(completion);
+                drain_sysad_bus(registry, context, control)?;
+            }
+            CrimeAction::SignalCpu(CrimeCpuSignal::InterruptIp2(asserted)) => {
+                registry
+                    .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
+                    .accept(R5000CpuSignal::ExternalInterrupts(u8::from(asserted)));
+            }
+            CrimeAction::SignalCpu(CrimeCpuSignal::WarmReset) => {
+                warm_reset(registry, context, control)?;
+            }
+            CrimeAction::SignalCpu(CrimeCpuSignal::HardReset) => {
+                context.schedule_at(context.now(), component_ids::MACHINE, Ip32Event::HardReset)?;
+            }
+            CrimeAction::SignalMemory(signal) => {
+                registry
+                    .get_typed_mut::<CrimeSdram>(component_ids::RAM)?
+                    .accept(signal);
+            }
+            CrimeAction::Trace(event) => trace_crime(context, event),
+        }
+    }
+}
+
+fn route_memory<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    transaction: CrimeMemoryTransaction,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    let disposition = registry
+        .get_typed_mut::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)?
+        .route(transaction);
+    if let CrimeBusDisposition::QueuedAndNeedsService { delay } = disposition {
+        let event = registry
+            .get_typed::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)?
+            .next_scheduled_event();
+        context.schedule_after(
+            delay,
+            component_ids::CRIME_MEMORY_DOMAIN,
+            Ip32Event::CrimeMemoryBus(event),
+        )?;
+    }
+    Ok(())
+}
+
+fn route_cmi<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    transaction: CrimeCmiTransaction,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    let disposition = registry
+        .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
+        .route(transaction);
+    if let CrimeBusDisposition::QueuedAndNeedsService { delay } = disposition {
+        let event = registry
+            .get_typed::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
+            .next_scheduled_event();
+        context.schedule_after(
+            delay,
+            component_ids::CRIME_MACE_LINK,
+            Ip32Event::CrimeCmiBus(event),
+        )?;
+    }
+    Ok(())
+}
+
+fn route_cgi<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    transaction: CrimeCgiTransaction,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    let disposition = registry
+        .get_typed_mut::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
+        .route(transaction);
+    if let CrimeBusDisposition::QueuedAndNeedsService { delay } = disposition {
+        let event = registry
+            .get_typed::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
+            .next_scheduled_event();
+        context.schedule_after(
+            delay,
+            component_ids::CRIME_GBE_LINK,
+            Ip32Event::CrimeCgiBus(event),
+        )?;
+    }
+    Ok(())
+}
+
+fn drain_sysad_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        let action = registry
+            .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
+            .poll();
+        match action {
+            Ip32SysAdBusAction::Deliver {
+                target,
+                transaction,
+            } => {
+                if target != component_ids::CRIME {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                }
+                registry
+                    .get_typed_mut::<Crime>(target)?
+                    .accept(CrimeSysAdRequest {
+                        time: context.now(),
+                        transaction,
+                    })?;
+                drain_crime(registry, context, control)?;
+            }
+            Ip32SysAdBusAction::Complete {
+                controller,
+                transaction,
+                completion,
+            } => {
+                if controller != component_ids::CPU0 {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
+                }
+                trace_sysad_access(registry, context, &transaction, &completion)?;
+                registry
+                    .get_typed_mut::<R5000Cpu>(controller)?
+                    .complete(completion);
+                context.schedule_at(
+                    context.now(),
+                    component_ids::CPU0,
+                    Ip32Event::CpuStep {
+                        generation: control.cpu_generation,
+                    },
+                )?;
+            }
+            Ip32SysAdBusAction::Schedule { delay, event } => {
+                context.schedule_after(
+                    delay,
+                    component_ids::CPU_SYSAD_BUS,
+                    Ip32Event::SysAdBus(event),
+                )?;
+            }
+            Ip32SysAdBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_memory_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        let action = registry
+            .get_typed_mut::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)?
+            .poll();
+        match action {
+            CrimeBusAction::Deliver {
+                target,
+                transaction,
+            } => {
+                if target != component_ids::RAM {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                }
+                let completion = registry
+                    .get_typed_mut::<CrimeSdram>(target)?
+                    .accept(transaction);
+                registry
+                    .get_typed_mut::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)?
+                    .accept_device_completion(completion);
+            }
+            CrimeBusAction::Complete {
+                controller,
+                completion,
+            } => {
+                if controller != component_ids::CRIME {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
+                }
+                registry
+                    .get_typed_mut::<Crime>(controller)?
+                    .complete(completion);
+                drain_crime(registry, context, control)?;
+            }
+            CrimeBusAction::ScheduleService { delay } => {
+                let event = registry
+                    .get_typed::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)?
+                    .next_scheduled_event();
+                context.schedule_after(
+                    delay,
+                    component_ids::CRIME_MEMORY_DOMAIN,
+                    Ip32Event::CrimeMemoryBus(event),
+                )?;
+            }
+            CrimeBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_cmi_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        let action = registry
+            .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
+            .poll();
+        match action {
+            CrimeBusAction::Deliver {
+                target,
+                transaction,
+            } => {
+                let response = if target == component_ids::MACE {
+                    accept_mace(registry, transaction)?
+                } else if target == component_ids::CRIME {
+                    let crime = registry.get_typed_mut::<Crime>(target)?;
+                    crime.observe_time(context.now());
+                    crime.accept(transaction)
+                } else {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                };
+                if let CrimeLinkDeviceResponse::Complete(completion) = response {
+                    registry
+                        .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
+                        .accept_device_completion(completion);
+                }
+                drain_crime(registry, context, control)?;
+            }
+            CrimeBusAction::Complete {
+                controller,
+                completion,
+            } => {
+                if controller != component_ids::CRIME {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
+                }
+                registry
+                    .get_typed_mut::<Crime>(controller)?
+                    .complete(completion);
+                drain_crime(registry, context, control)?;
+            }
+            CrimeBusAction::ScheduleService { delay } => {
+                let event = registry
+                    .get_typed::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
+                    .next_scheduled_event();
+                context.schedule_after(
+                    delay,
+                    component_ids::CRIME_MACE_LINK,
+                    Ip32Event::CrimeCmiBus(event),
+                )?;
+            }
+            CrimeBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_cgi_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        let action = registry
+            .get_typed_mut::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
+            .poll();
+        match action {
+            CrimeBusAction::Deliver {
+                target,
+                transaction,
+            } => {
+                let response = if target == component_ids::GBE {
+                    registry
+                        .get_typed_mut::<Ip32GbeEndpoint>(target)?
+                        .accept(transaction)
+                } else if target == component_ids::CRIME {
+                    let crime = registry.get_typed_mut::<Crime>(target)?;
+                    crime.observe_time(context.now());
+                    crime.accept(transaction)
+                } else {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                };
+                if let CrimeLinkDeviceResponse::Complete(completion) = response {
+                    registry
+                        .get_typed_mut::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
+                        .accept_device_completion(completion);
+                }
+                drain_crime(registry, context, control)?;
+            }
+            CrimeBusAction::Complete {
+                controller,
+                completion,
+            } => {
+                if controller != component_ids::CRIME {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
+                }
+                registry
+                    .get_typed_mut::<Crime>(controller)?
+                    .complete(completion);
+                drain_crime(registry, context, control)?;
+            }
+            CrimeBusAction::ScheduleService { delay } => {
+                let event = registry
+                    .get_typed::<CrimeCgiBus>(component_ids::CRIME_GBE_LINK)?
+                    .next_scheduled_event();
+                context.schedule_after(
+                    delay,
+                    component_ids::CRIME_GBE_LINK,
+                    Ip32Event::CrimeCgiBus(event),
+                )?;
+            }
+            CrimeBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn accept_mace(
+    registry: &mut ComponentRegistry,
+    transaction: CrimeCmiTransaction,
+) -> Result<CrimeLinkDeviceResponse<CrimeCmiCompletion>, Ip32MachineDispatchError> {
+    match registry
+        .get_typed_mut::<Ip32MaceEndpoint>(component_ids::MACE)?
+        .accept(transaction)
+    {
+        Ip32MaceDeviceResponse::Complete(completion) => {
+            Ok(CrimeLinkDeviceResponse::Complete(completion))
+        }
+        Ip32MaceDeviceResponse::Prom {
+            id,
+            offset,
+            transfer,
+        } => {
+            let response = registry
+                .get_typed_mut::<Rom>(component_ids::PROM)?
+                .accept(to_memory_transaction(offset, &transfer));
+            Ok(CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
+                id,
+                result: from_memory_response(response, transfer.length()),
+            }))
+        }
+    }
+}
+
+fn to_memory_transaction(offset: u64, transfer: &CrimeTransfer) -> MemoryTransaction {
+    match transfer {
+        CrimeTransfer::Read { length } => MemoryTransaction::Read {
+            offset,
+            size: *length as u8,
+        },
+        CrimeTransfer::Write { data, byte_enable } => {
+            let mut lanes = [0; 8];
+            let length = data.len().min(lanes.len());
+            lanes[..length].copy_from_slice(&data[..length]);
+            let enable = byte_enable
+                .iter()
+                .take(8)
+                .enumerate()
+                .fold(0_u8, |mask, (lane, enabled)| {
+                    mask | (u8::from(*enabled) << lane)
+                });
+            MemoryTransaction::Write {
+                offset,
+                size: data.len() as u8,
+                data: u64::from_le_bytes(lanes),
+                byte_enable: enable,
+            }
+        }
+    }
+}
+
+fn from_memory_response(
+    response: MemoryResponse,
+    length: usize,
+) -> Result<CrimeCompletionPayload, se_device::chipset::crime::protocol::CrimeBusError> {
+    match response {
+        MemoryResponse::ReadData(data) if length <= 8 => Ok(CrimeCompletionPayload::ReadData(
+            data.to_le_bytes()[..length].to_vec(),
+        )),
+        MemoryResponse::WriteComplete => Ok(CrimeCompletionPayload::WriteComplete),
+        MemoryResponse::ReadData(_) | MemoryResponse::AccessError => {
+            Err(se_device::chipset::crime::protocol::CrimeBusError::Access)
+        }
+    }
+}
+
+fn trace_sysad_access<S>(
+    registry: &ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    transaction: &ExecutionTransaction<Mips4ExecutionTransaction>,
+    completion: &ExecutionCompletion<Mips4ExecutionCompletion>,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    let (address, width, operation) = match transaction.payload {
         Mips4ExecutionTransaction::Read {
             physical_address,
             size,
             ..
-        } => (
-            physical_address,
-            size.bytes(),
-            "read",
-            0,
-            ((1_u16 << size.bytes()) - 1) as u8,
-        ),
+        } => (physical_address, size.bytes(), "read"),
         Mips4ExecutionTransaction::Write {
             physical_address,
             size,
-            data,
-            byte_enable,
             ..
-        } => (physical_address, size.bytes(), "write", data, byte_enable),
+        } => (physical_address, size.bytes(), "write"),
     };
-    let data = match (access.request, access.completion) {
-        (_, Mips4ExecutionCompletion::ReadData(data)) => data,
-        (Mips4ExecutionTransaction::Write { .. }, _) => request_data,
-        (_, Mips4ExecutionCompletion::WriteComplete | Mips4ExecutionCompletion::BusError) => 0,
-    };
+    let cpu_pc = registry
+        .get_typed::<R5000Cpu>(component_ids::CPU0)?
+        .state()
+        .pc();
     let fields = [
-        TraceField::u64("transaction_id", access.transaction_id.get() as u64),
-        TraceField::hex64("physical_address", physical_address),
-        TraceField::u64("width", u64::from(size)),
+        TraceField::u64("transaction_id", transaction.id.get() as u64),
+        TraceField::hex64("physical_address", address),
+        TraceField::u64("width", u64::from(width)),
         TraceField::string("operation", operation),
-        TraceField::hex64("data", data),
-        TraceField::hex64("byte_enable", u64::from(byte_enable)),
-        TraceField::u64("target_component", target_id),
-        TraceField::string("target_name", target_name),
-        TraceField::string("region", region_name),
-        TraceField::bool("no_ecc", access.no_ecc),
-        TraceField::hex64("cpu_pc", cpu.state().pc()),
+        TraceField::bool(
+            "bus_error",
+            matches!(completion.payload, Mips4ExecutionCompletion::BusError),
+        ),
+        TraceField::hex64("cpu_pc", cpu_pc),
     ];
+    let level = if matches!(completion.payload, Mips4ExecutionCompletion::BusError) {
+        TraceLevel::Warn
+    } else {
+        TraceLevel::Trace
+    };
     context.trace(
         TraceSource::Component(component_ids::CPU_SYSAD_BUS),
         level,
@@ -675,6 +1177,29 @@ where
         &fields,
     );
     Ok(())
+}
+
+fn trace_crime<S>(context: &mut RuntimeContext<'_, Ip32Event, S>, event: CrimeTraceEvent)
+where
+    S: TraceSink,
+{
+    let fields = event
+        .fields
+        .iter()
+        .map(|field| match field.value {
+            CrimeTraceValue::Bool(value) => TraceField::bool(field.key, value),
+            CrimeTraceValue::U64(value) => TraceField::u64(field.key, value),
+            CrimeTraceValue::Hex64(value) => TraceField::hex64(field.key, value),
+            CrimeTraceValue::String(value) => TraceField::string(field.key, value),
+        })
+        .collect::<Vec<_>>();
+    context.trace(
+        TraceSource::Component(component_ids::CRIME),
+        event.level,
+        event.target,
+        event.event,
+        &fields,
+    );
 }
 
 #[cfg(test)]

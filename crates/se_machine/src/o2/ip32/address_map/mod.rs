@@ -1,7 +1,8 @@
 //! SGI O2 IP32 CPU physical address classification.
 //!
-//! This module owns the board-level address ABI. Device models receive offsets
-//! only after this classifier has selected a target and resolved memory aliases.
+//! This module describes the board-level address ABI for diagnostics and tests.
+//! The SysAD bus does not use it for routing: CRIME receives the original CPU
+//! physical address and performs chipset-local decoding itself.
 
 use se_core::component::ComponentId;
 

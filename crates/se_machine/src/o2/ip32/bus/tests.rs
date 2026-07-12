@@ -1,19 +1,19 @@
 use se_core::role::{BusDeviceRole, BusRole};
+use se_device::chipset::crime::protocol::{
+    CrimeLinkOperation, CrimePioRequest, CrimeTransactionId,
+};
 use se_device::cpu::execution::protocol::{ExecutionTransaction, ExecutionTransactionId};
 use se_device::cpu::mips4::cache::Mips4MemoryAccessType;
-use se_device::cpu::mips4::execution::bus::{
-    Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransaction,
-    Mips4ExecutionTransferSize,
-};
+use se_device::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
 
 use super::*;
 use crate::o2::ip32::component_ids;
 
-fn read(id: u128, address: u64) -> ExecutionTransaction<Mips4ExecutionTransaction> {
+fn cpu_read(id: u128) -> ExecutionTransaction<Mips4ExecutionTransaction> {
     ExecutionTransaction {
         id: ExecutionTransactionId::new(id),
         payload: Mips4ExecutionTransaction::Read {
-            physical_address: address,
+            physical_address: 0x4000_0000,
             size: Mips4ExecutionTransferSize::Word,
             kind: Mips4ExecutionAccessKind::DataLoad,
             access_type: Mips4MemoryAccessType::Uncached,
@@ -22,66 +22,82 @@ fn read(id: u128, address: u64) -> ExecutionTransaction<Mips4ExecutionTransactio
 }
 
 #[test]
-fn bus_preserves_transaction_identity_and_original_address() {
-    let mut bus = Ip32CpuAddressBus::new(component_ids::CPU_SYSAD_BUS, "bus", 64 * 1024 * 1024);
-    let transaction = read(0x1234, 0x4000_0020);
-
-    assert_eq!(
+fn sysad_bus_only_delivers_cpu_traffic_to_crime() {
+    let mut bus = Ip32SysAdBus::new(
+        component_ids::CPU_SYSAD_BUS,
+        "SysAD",
+        component_ids::CPU0,
+        component_ids::CRIME,
+        1_000_000_000,
+        66_666_500,
+    );
+    let transaction = cpu_read(7);
+    assert!(matches!(
         bus.route(transaction.clone()),
-        Ip32BusRoute::Memory {
-            region: Ip32PhysicalRegion::LinearMemory,
-            target: component_ids::RAM,
-            offset: 0x20,
-            no_ecc: false,
+        CrimeBusDisposition::QueuedAndNeedsService { .. }
+    ));
+    bus.handle_event(Ip32SysAdBusEvent::Service {
+        generation: bus.generation(),
+    });
+    assert_eq!(
+        bus.poll(),
+        Ip32SysAdBusAction::Deliver {
+            target: component_ids::CRIME,
             transaction,
         }
     );
 }
 
 #[test]
-fn strict_and_permissive_stub_policies_are_distinct() {
-    let transaction = read(1, 0x1400_0000).payload;
-    let mut strict = Ip32MmioStub::new(
-        component_ids::CRIME,
-        "CRIME",
-        Ip32UnimplementedAccessPolicy::Strict,
-    );
-    let mut permissive = Ip32MmioStub::new(
-        component_ids::CRIME,
-        "CRIME",
-        Ip32UnimplementedAccessPolicy::Permissive,
-    );
-
-    assert_eq!(
-        strict.accept(transaction),
-        Mips4ExecutionCompletion::BusError
-    );
-    assert_eq!(
-        permissive.accept(transaction),
-        Mips4ExecutionCompletion::ReadData(0)
-    );
-    assert_eq!(
-        permissive.accept(Mips4ExecutionTransaction::Write {
-            physical_address: 0x1400_0000,
-            size: Mips4ExecutionTransferSize::Word,
-            data: 0x4433_2211,
-            byte_enable: 0x0f,
-            access_type: Mips4MemoryAccessType::Uncached,
+fn mace_endpoint_decodes_prom_and_preserves_link_identity() {
+    let mut mace = Ip32MaceEndpoint::new(component_ids::MACE, "MACE", CrimeAccessPolicy::Strict);
+    let transaction = CrimeCmiTransaction {
+        id: CrimeTransactionId::new(9),
+        controller: component_ids::CRIME,
+        target: component_ids::MACE,
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address: PROM_START + 0x20,
+            transfer: CrimeTransfer::Read { length: 8 },
         }),
-        Mips4ExecutionCompletion::WriteComplete
+    };
+
+    assert_eq!(
+        mace.accept(transaction),
+        Ip32MaceDeviceResponse::Prom {
+            id: CrimeTransactionId::new(9),
+            offset: 0x20,
+            transfer: CrimeTransfer::Read { length: 8 },
+        }
     );
 }
 
 #[test]
-fn unmapped_addresses_never_reach_a_stub() {
-    let mut bus = Ip32CpuAddressBus::new(component_ids::CPU_SYSAD_BUS, "bus", 64 * 1024 * 1024);
-    let transaction = read(9, 0x2000_0000);
+fn peer_policy_never_bypasses_the_link_protocol() {
+    let transaction = CrimeCgiTransaction {
+        id: CrimeTransactionId::new(1),
+        controller: component_ids::CRIME,
+        target: component_ids::GBE,
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address: 0x1600_0000,
+            transfer: CrimeTransfer::Read { length: 4 },
+        }),
+    };
+    let mut strict = Ip32GbeEndpoint::new(component_ids::GBE, "GBE", CrimeAccessPolicy::Strict);
+    let mut permissive =
+        Ip32GbeEndpoint::new(component_ids::GBE, "GBE", CrimeAccessPolicy::Permissive);
 
-    assert_eq!(
-        bus.route(transaction.clone()),
-        Ip32BusRoute::Unmapped {
-            region: Some(Ip32PhysicalRegion::HighMemoryUnconfirmed),
-            transaction,
-        }
-    );
+    assert!(matches!(
+        strict.accept(transaction.clone()),
+        CrimeLinkDeviceResponse::Complete(CrimeCgiCompletion {
+            result: Err(CrimeBusError::Unsupported),
+            ..
+        })
+    ));
+    assert!(matches!(
+        permissive.accept(transaction),
+        CrimeLinkDeviceResponse::Complete(CrimeCgiCompletion {
+            result: Ok(CrimeCompletionPayload::ReadData(data)),
+            ..
+        }) if data == vec![0; 4]
+    ));
 }
