@@ -215,13 +215,15 @@ fn r5000_executes_only_confirmed_not_word_value_instruction_behavior() {
         boot_mode(),
     );
 
-    assert_eq!(
-        policy.not_word_value_policy(Mips4CpuInstruction::Addiu),
-        Mips4NotWordValuePolicy::ExecuteLowWord
-    );
+    for instruction in [Mips4CpuInstruction::Addiu, Mips4CpuInstruction::Addu] {
+        assert_eq!(
+            policy.not_word_value_policy(instruction),
+            Mips4NotWordValuePolicy::ExecuteLowWord,
+            "instruction {instruction:?}"
+        );
+    }
     for instruction in [
         Mips4CpuInstruction::Add,
-        Mips4CpuInstruction::Addu,
         Mips4CpuInstruction::Subu,
         Mips4CpuInstruction::Sll,
         Mips4CpuInstruction::Mult,

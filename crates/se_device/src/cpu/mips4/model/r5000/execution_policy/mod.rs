@@ -172,7 +172,9 @@ impl Mips4ExecutionPolicy for R5000ExecutionPolicy {
 
     fn not_word_value_policy(&self, instruction: Mips4CpuInstruction) -> Mips4NotWordValuePolicy {
         match instruction {
-            Mips4CpuInstruction::Addiu => Mips4NotWordValuePolicy::ExecuteLowWord,
+            Mips4CpuInstruction::Addiu | Mips4CpuInstruction::Addu => {
+                Mips4NotWordValuePolicy::ExecuteLowWord
+            }
             _ => Mips4NotWordValuePolicy::NoOperation,
         }
     }

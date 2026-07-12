@@ -457,6 +457,49 @@ fn r5000_addiu_not_word_value_builds_the_prom_crime_address() {
 }
 
 #[test]
+fn r5000_addu_not_word_value_builds_the_prom_crime_pointer() {
+    let mut machine = ConformanceMachine::new(Mips4Endianness::Big);
+    machine.write_gpr(14, 0xffff_ffff_b500_0000);
+    machine.write_gpr(23, 0x700);
+
+    let execute = |machine: &mut ConformanceMachine, bits| {
+        let pc = machine.state().pc();
+        assert_eq!(
+            machine.execute(bits),
+            super::super::target::Mips4ExecutionBoundary::Retired {
+                pc,
+                instruction: bits,
+            }
+        );
+    };
+
+    execute(&mut machine, r_type(0, 14, 14, 0, 0x3c));
+    execute(&mut machine, r_type(0, 14, 14, 0, 0x3e));
+    assert_eq!(machine.read_gpr(14), 0x0000_0000_b500_0000);
+
+    execute(&mut machine, r_type(14, 23, 24, 0, 0x21));
+    assert_eq!(machine.read_gpr(24), 0xffff_ffff_b500_0700);
+
+    execute(&mut machine, r_type(24, 9, 6, 0, 0x21));
+    execute(&mut machine, i_type(0x09, 6, 6, 0x1000));
+    assert_eq!(machine.read_gpr(6), 0xffff_ffff_b500_1700);
+
+    let sd = i_type(0x3f, 6, 4, 0);
+    let ExecutionAction::Transaction(transaction) = machine.begin(sd) else {
+        panic!("expected the PROM SD to start a CRIME transaction");
+    };
+    assert!(matches!(
+        transaction.payload,
+        Mips4ExecutionTransaction::Write {
+            physical_address: 0x1500_1700,
+            size: Mips4ExecutionTransferSize::Doubleword,
+            access_type: Mips4MemoryAccessType::Uncached,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn multiply_divide_and_hilo_transfers_commit_architectural_pairs() {
     let mut multiply = ConformanceMachine::new(Mips4Endianness::Big);
     multiply.write_gpr(1, (-7_i64) as u64);
