@@ -1,0 +1,59 @@
+//! MACE 2.0 physical register addresses and access masks.
+
+pub const BASE: u64 = 0x1f00_0000;
+pub const FUTURE_BASE: u64 = BASE;
+pub const PCI_BASE: u64 = BASE + 0x080000;
+pub const VIDEO_INPUT1_BASE: u64 = BASE + 0x100000;
+pub const VIDEO_INPUT2_BASE: u64 = BASE + 0x180000;
+pub const VIDEO_OUTPUT_BASE: u64 = BASE + 0x200000;
+pub const ETHERNET_BASE: u64 = BASE + 0x280000;
+pub const PERIPHERAL_BASE: u64 = BASE + 0x300000;
+pub const EXTERNAL_ISA_BASE: u64 = BASE + 0x380000;
+pub const PRIMARY_END: u64 = BASE + 0x400000;
+
+pub const AUDIO_BASE: u64 = PERIPHERAL_BASE;
+pub const ISA_DMA_BASE: u64 = PERIPHERAL_BASE + 0x10000;
+pub const PS2_BASE: u64 = PERIPHERAL_BASE + 0x20000;
+pub const I2C_BASE: u64 = PERIPHERAL_BASE + 0x30000;
+pub const TIMER_BASE: u64 = PERIPHERAL_BASE + 0x40000;
+
+pub const PCI_ERROR_ADDRESS: u64 = PCI_BASE;
+pub const PCI_ERROR_FLAGS: u64 = PCI_BASE + 0x04;
+pub const PCI_CONTROL: u64 = PCI_BASE + 0x08;
+pub const PCI_REVISION: u64 = PCI_BASE + 0x0c;
+pub const PCI_CONFIG_ADDRESS: u64 = PCI_BASE + 0x0cf8;
+pub const PCI_CONFIG_DATA: u64 = PCI_BASE + 0x0cfc;
+
+pub const ISA_RING_BASE_RESET: u64 = ISA_DMA_BASE;
+pub const ISA_MISC: u64 = ISA_DMA_BASE + 0x08;
+pub const ISA_INTERRUPT_STATUS: u64 = ISA_DMA_BASE + 0x10;
+pub const ISA_INTERRUPT_MASK: u64 = ISA_DMA_BASE + 0x18;
+pub const ISA_DP_RAM_START: u64 = ISA_DMA_BASE + 0x2000;
+pub const ISA_DP_RAM_END: u64 = ISA_DMA_BASE + 0x4000;
+
+pub const UST: u64 = TIMER_BASE;
+pub const COMPARE1: u64 = TIMER_BASE + 0x08;
+pub const COMPARE2: u64 = TIMER_BASE + 0x10;
+pub const COMPARE3: u64 = TIMER_BASE + 0x18;
+
+pub const PROM_START: u64 = 0x1fc0_0000;
+pub const PROM_END: u64 = 0x2000_0000;
+pub const PROM_IMAGE_SIZE: u64 = 512 * 1024;
+
+pub const PCI_LOW_IO_START: u64 = 0x1800_0000;
+pub const PCI_LOW_IO_END: u64 = 0x1a00_0000;
+pub const PCI_LOW_MEMORY_START: u64 = 0x1a00_0000;
+pub const PCI_LOW_MEMORY_END: u64 = 0x1c00_0000;
+pub const PCI_CONFIG_START: u64 = 0x1c00_0000;
+pub const PCI_CONFIG_END: u64 = 0x1c40_0000;
+pub const PCI_HIGH_IO_START: u64 = 0x1_0000_0000;
+pub const PCI_HIGH_IO_END: u64 = 0x2_0000_0000;
+pub const PCI_HIGH_MEMORY_START: u64 = 0x2_0000_0000;
+pub const PCI_HIGH_MEMORY_END: u64 = 0x3_0000_0000;
+
+pub const RTC_EXTERNAL_OFFSET: u64 = 0x20000;
+pub const RTC_EXTERNAL_END: u64 = 0x30000;
+pub const EXTERNAL_REGISTER_STRIDE: u64 = 0x100;
+pub const EXTERNAL_VALID_BYTE_LANE: u64 = 0x07;
+
+pub const MACE_REVISION: u32 = 1;
