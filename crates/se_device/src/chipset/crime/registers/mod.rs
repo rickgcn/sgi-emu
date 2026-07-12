@@ -27,6 +27,13 @@ pub const TIMER: u64 = CRIME_BASE + 0x0038;
 pub const CPU_ERROR_ADDRESS: u64 = CRIME_BASE + 0x0040;
 /// CRIME 1.1 CPU error status address.
 pub const CPU_ERROR_STATUS: u64 = CRIME_BASE + 0x0048;
+/// Reserved CRIME 1.1 write sink used by the IP32 PROM.
+///
+/// The CRIME register specification and operating-system ABI assign no state
+/// to this address, while IP32 PROM revisions 4.3 and 4.18 issue an aligned
+/// doubleword write during initialization. Writes are accepted without
+/// storing data or producing hardware effects; reads remain unsupported.
+pub const CPU_RESERVED_WRITE_SINK: u64 = CRIME_BASE + 0x0050;
 
 /// Memory-controller status and control.
 pub const MEMORY_CONTROL: u64 = CRIME_BASE + 0x0200;

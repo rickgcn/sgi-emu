@@ -149,7 +149,10 @@ impl CrimePiu {
     ) -> PiuWriteResult {
         let mut result = PiuWriteResult::handled();
         match address {
-            registers::ID | registers::INTERRUPT_STATUS | registers::CPU_ERROR_ADDRESS => {}
+            registers::ID
+            | registers::INTERRUPT_STATUS
+            | registers::CPU_ERROR_ADDRESS
+            | registers::CPU_RESERVED_WRITE_SINK => {}
             registers::CONTROL => {
                 let old_watchdog_enabled = self.watchdog_enabled();
                 let read_only = self.control & registers::CONTROL_BIG_ENDIAN;

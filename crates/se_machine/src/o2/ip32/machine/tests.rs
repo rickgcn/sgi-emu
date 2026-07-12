@@ -611,8 +611,6 @@ impl TraceSink for PromAcceptanceSink {
 #[test]
 #[ignore = "requires a local proprietary IP32 PROM image"]
 fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
-    const ACCEPTED_UNIMPLEMENTED_BOUNDARIES: &[u64] = &[0x1400_0050];
-
     let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
     let mut config = Ip32MachineConfig {
         prom_image: std::fs::read(path).expect("the local PROM image must be readable"),
@@ -653,22 +651,22 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
             | 0xffff_ffff_bfc0_03a4
     );
     assert!(
-        !exception_loop
-            || failed
-                .last()
-                .is_some_and(|address| ACCEPTED_UNIMPLEMENTED_BOUNDARIES.contains(address)),
+        !exception_loop,
         "PROM remained in the exception loop at {pc:#018x}; EPC={epc:#018x}, exception={exception_code}, failed accesses: {failed:#x?}"
     );
     assert!(
         !failed.contains(&0x5000_0000),
         "PROM bank probing incorrectly received a SysAD bus error at 0x50000000"
     );
+    assert!(
+        !failed.contains(&registers::CPU_RESERVED_WRITE_SINK),
+        "the PROM-compatible CRIME reserved write sink returned a SysAD bus error"
+    );
 
     assert!(
-        failed.iter().all(|address| {
-            !(registers::CRIME_BASE..registers::CRIME_REGISTER_END).contains(address)
-                || ACCEPTED_UNIMPLEMENTED_BOUNDARIES.contains(address)
-        }),
+        failed.iter().all(
+            |address| !(registers::CRIME_BASE..registers::CRIME_REGISTER_END).contains(address)
+        ),
         "a modeled CRIME access returned a bus error"
     );
 }

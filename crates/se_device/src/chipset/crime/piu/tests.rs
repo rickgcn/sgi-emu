@@ -21,6 +21,33 @@ fn id_control_and_timer_reset_values_match_crime_11() {
 }
 
 #[test]
+fn reserved_prom_write_sink_accepts_writes_without_state_or_effects() {
+    let mut piu = CrimePiu::new();
+    let initial = piu.clone();
+
+    for value in [0, u64::MAX, 0x1234_5678_9abc_def0] {
+        let result = piu.write(
+            registers::CPU_RESERVED_WRITE_SINK,
+            value,
+            SimTime::ZERO,
+            TIMEBASE_HZ,
+        );
+        assert!(result.handled);
+        assert!(result.effects.is_empty());
+        assert_eq!(piu, initial);
+    }
+
+    assert_eq!(
+        piu.read(
+            registers::CPU_RESERVED_WRITE_SINK,
+            SimTime::ZERO,
+            TIMEBASE_HZ,
+        ),
+        None
+    );
+}
+
+#[test]
 fn crime_timer_uses_the_documented_master_frequency() {
     let mut piu = CrimePiu::new();
     piu.write(registers::TIMER, 10, SimTime::new(100), TIMEBASE_HZ);

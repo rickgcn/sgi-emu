@@ -237,6 +237,150 @@ fn word_access_to_piu_is_a_precise_bus_error() {
 }
 
 #[test]
+fn reserved_prom_write_sink_accepts_only_complete_aligned_doubleword_writes() {
+    let mut device = crime();
+    device
+        .accept(write(
+            1,
+            registers::CPU_RESERVED_WRITE_SINK,
+            Mips4ExecutionTransferSize::Doubleword,
+            u64::MAX,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        next_non_trace(&mut device),
+        CrimeAction::CompleteSysAd(ExecutionCompletion {
+            id: ExecutionTransactionId::new(1),
+            payload: Mips4ExecutionCompletion::WriteComplete,
+        })
+    );
+    assert_eq!(
+        device
+            .piu
+            .read(registers::CPU_ERROR_ADDRESS, SimTime::ZERO, TIMEBASE_HZ),
+        Some(0)
+    );
+    assert_eq!(
+        device
+            .piu
+            .read(registers::CPU_ERROR_STATUS, SimTime::ZERO, TIMEBASE_HZ),
+        Some(0)
+    );
+    assert!(!device.piu.interrupt_output_asserted());
+
+    for request in [
+        read(
+            2,
+            registers::CPU_RESERVED_WRITE_SINK,
+            Mips4ExecutionTransferSize::Doubleword,
+        ),
+        write(
+            3,
+            registers::CPU_RESERVED_WRITE_SINK,
+            Mips4ExecutionTransferSize::Word,
+            0,
+        ),
+        write(
+            4,
+            registers::CPU_RESERVED_WRITE_SINK + 4,
+            Mips4ExecutionTransferSize::Doubleword,
+            0,
+        ),
+        write(
+            5,
+            registers::CPU_RESERVED_WRITE_SINK + 8,
+            Mips4ExecutionTransferSize::Doubleword,
+            0,
+        ),
+    ] {
+        let mut candidate = crime();
+        candidate.accept(request).unwrap();
+        assert!(matches!(
+            next_non_trace(&mut candidate),
+            CrimeAction::CompleteSysAd(ExecutionCompletion {
+                payload: Mips4ExecutionCompletion::BusError,
+                ..
+            })
+        ));
+    }
+
+    let mut request = write(
+        6,
+        registers::CPU_RESERVED_WRITE_SINK,
+        Mips4ExecutionTransferSize::Doubleword,
+        0,
+    );
+    let Mips4ExecutionTransaction::Write { byte_enable, .. } = &mut request.transaction.payload
+    else {
+        unreachable!("the helper always creates a write transaction")
+    };
+    *byte_enable = 0x0f;
+    let mut candidate = crime();
+    candidate.accept(request).unwrap();
+    assert!(matches!(
+        next_non_trace(&mut candidate),
+        CrimeAction::CompleteSysAd(ExecutionCompletion {
+            payload: Mips4ExecutionCompletion::BusError,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn cpu_error_status_clear_semantics_are_not_aliased_to_the_reserved_write_sink() {
+    let mut crime = crime();
+    enable_interrupt_bit(&mut crime, 20);
+    crime.record_cpu_error(0x1234_5678);
+    clear_actions(&mut crime);
+
+    crime
+        .accept(write(
+            1,
+            registers::CPU_RESERVED_WRITE_SINK,
+            Mips4ExecutionTransferSize::Doubleword,
+            0,
+        ))
+        .unwrap();
+    assert!(matches!(
+        next_non_trace(&mut crime),
+        CrimeAction::CompleteSysAd(ExecutionCompletion {
+            payload: Mips4ExecutionCompletion::WriteComplete,
+            ..
+        })
+    ));
+    assert_eq!(
+        crime
+            .piu
+            .read(registers::CPU_ERROR_STATUS, SimTime::ZERO, TIMEBASE_HZ),
+        Some(registers::CPU_ERROR_ILLEGAL_ADDRESS)
+    );
+
+    crime
+        .accept(write(
+            2,
+            registers::CPU_ERROR_STATUS,
+            Mips4ExecutionTransferSize::Doubleword,
+            0,
+        ))
+        .unwrap();
+    assert!(matches!(
+        next_non_trace(&mut crime),
+        CrimeAction::CompleteSysAd(ExecutionCompletion {
+            payload: Mips4ExecutionCompletion::WriteComplete,
+            ..
+        })
+    ));
+    assert_eq!(
+        crime
+            .piu
+            .read(registers::CPU_ERROR_STATUS, SimTime::ZERO, TIMEBASE_HZ),
+        Some(0)
+    );
+    assert!(!crime.piu.interrupt_output_asserted());
+}
+
+#[test]
 fn full_render_fifo_defers_sysad_until_a_slot_is_retired() {
     let mut crime = crime();
     for _ in 0..64 {
