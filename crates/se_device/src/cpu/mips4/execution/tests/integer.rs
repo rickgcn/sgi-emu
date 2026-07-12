@@ -1,5 +1,10 @@
+use crate::cpu::execution::protocol::ExecutionAction;
+use crate::cpu::mips4::cache::Mips4MemoryAccessType;
 use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::exception::Mips4Exception;
+use crate::cpu::mips4::execution::bus::{
+    Mips4ExecutionAccessKind, Mips4ExecutionTransaction, Mips4ExecutionTransferSize,
+};
 use crate::cpu::mips4::instruction::Mips4Instruction;
 use crate::cpu::mips4::instruction::decode::{
     Mips4CpuInstruction, Mips4InstructionClass, Mips4InstructionDecode, decode_instruction,
@@ -407,6 +412,48 @@ fn immediate_alu_instructions_apply_signed_or_zero_extended_operands() {
             case.bits
         );
     }
+}
+
+#[test]
+fn r5000_addiu_not_word_value_builds_the_prom_crime_address() {
+    let mut machine = ConformanceMachine::new(Mips4Endianness::Big);
+    machine.write_gpr(14, 0xffff_ffff_b500_0000);
+
+    let execute = |machine: &mut ConformanceMachine, bits| {
+        let pc = machine.state().pc();
+        assert_eq!(
+            machine.execute(bits),
+            super::super::target::Mips4ExecutionBoundary::Retired {
+                pc,
+                instruction: bits,
+            }
+        );
+    };
+
+    execute(&mut machine, r_type(0, 14, 14, 0, 0x3c));
+    execute(&mut machine, r_type(0, 14, 14, 0, 0x3e));
+    assert_eq!(machine.read_gpr(14), 0x0000_0000_b500_0000);
+
+    execute(&mut machine, i_type(0x09, 14, 24, 0x4000));
+    assert_eq!(machine.read_gpr(24), 0xffff_ffff_b500_4000);
+
+    execute(&mut machine, r_type(0, 24, 24, 0, 0x3c));
+    execute(&mut machine, r_type(0, 24, 25, 0, 0x3f));
+    assert_eq!(machine.read_gpr(25), 0xffff_ffff_b500_4000);
+
+    let lwu = i_type(0x27, 25, 8, 0);
+    let ExecutionAction::Transaction(transaction) = machine.begin(lwu) else {
+        panic!("expected the PROM LWU to start a CRIME transaction");
+    };
+    assert_eq!(
+        transaction.payload,
+        Mips4ExecutionTransaction::Read {
+            physical_address: 0x1500_4000,
+            size: Mips4ExecutionTransferSize::Word,
+            kind: Mips4ExecutionAccessKind::DataLoad,
+            access_type: Mips4MemoryAccessType::Uncached,
+        }
+    );
 }
 
 #[test]

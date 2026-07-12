@@ -619,7 +619,7 @@ where
                 ) {
                     return self.execute_prefetch(instruction);
                 }
-                match execute_cpu(&mut self.state, instruction, decoded) {
+                match execute_cpu(&mut self.state, &self.policy, instruction, decoded) {
                     Mips4CpuExecution::Retire => Ok(self.retire_sequential(instruction)),
                     Mips4CpuExecution::Branch(decision) => {
                         Ok(self.retire_branch(instruction, decision))

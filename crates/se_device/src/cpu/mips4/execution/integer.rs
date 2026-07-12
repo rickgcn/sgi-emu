@@ -10,6 +10,7 @@ use crate::cpu::mips4::gpr::{Mips4GprIndex, is_sign_extended_word};
 use crate::cpu::mips4::instruction::Mips4Instruction;
 use crate::cpu::mips4::instruction::decode::Mips4CpuInstruction;
 
+use super::policy::{Mips4ExecutionPolicy, Mips4NotWordValuePolicy};
 use super::state::Mips4ExecutionState;
 
 pub(super) enum Mips4CpuExecution {
@@ -21,10 +22,16 @@ pub(super) enum Mips4CpuExecution {
 
 pub(super) fn execute_cpu(
     state: &mut Mips4ExecutionState,
+    policy: &impl Mips4ExecutionPolicy,
     raw: Mips4Instruction,
     instruction: Mips4CpuInstruction,
 ) -> Mips4CpuExecution {
-    if !word_operands_valid(state, raw, instruction) {
+    if !word_operands_valid(state, raw, instruction)
+        && matches!(
+            policy.not_word_value_policy(instruction),
+            Mips4NotWordValuePolicy::NoOperation
+        )
+    {
         return Mips4CpuExecution::Retire;
     }
 

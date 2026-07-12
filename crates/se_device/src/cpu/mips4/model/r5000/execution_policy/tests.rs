@@ -209,6 +209,33 @@ fn r5000_cp0_wait_enters_standby() {
 }
 
 #[test]
+fn r5000_executes_only_confirmed_not_word_value_instruction_behavior() {
+    let policy = R5000ExecutionPolicy::new(
+        profile(Mips4Endianness::Big, Mips4CacheConfig::disabled()),
+        boot_mode(),
+    );
+
+    assert_eq!(
+        policy.not_word_value_policy(Mips4CpuInstruction::Addiu),
+        Mips4NotWordValuePolicy::ExecuteLowWord
+    );
+    for instruction in [
+        Mips4CpuInstruction::Add,
+        Mips4CpuInstruction::Addu,
+        Mips4CpuInstruction::Subu,
+        Mips4CpuInstruction::Sll,
+        Mips4CpuInstruction::Mult,
+        Mips4CpuInstruction::Div,
+    ] {
+        assert_eq!(
+            policy.not_word_value_policy(instruction),
+            Mips4NotWordValuePolicy::NoOperation,
+            "instruction {instruction:?}"
+        );
+    }
+}
+
+#[test]
 fn r5000_cp0_doubleword_transfer_checks_effective_mode() {
     let policy = R5000ExecutionPolicy::new(
         profile(Mips4Endianness::Big, Mips4CacheConfig::disabled()),

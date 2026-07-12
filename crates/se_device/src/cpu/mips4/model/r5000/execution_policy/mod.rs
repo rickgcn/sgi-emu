@@ -10,8 +10,9 @@ use crate::cpu::mips4::cp0::{Mips4Cp0Config, Mips4Cp0Register, Mips4Cp0Status};
 use crate::cpu::mips4::exception::{Mips4ErrorException, Mips4ExceptionImage};
 use crate::cpu::mips4::execution::policy::{
     Mips4Cp0DoublewordTransferDirection, Mips4Cp0DoublewordTransferPolicy, Mips4Cp0WaitPolicy,
-    Mips4ExecutionPolicy, Mips4PrefetchPolicy,
+    Mips4ExecutionPolicy, Mips4NotWordValuePolicy, Mips4PrefetchPolicy,
 };
+use crate::cpu::mips4::instruction::decode::Mips4CpuInstruction;
 use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig, Mips4MmuPrivilegeMode};
 use crate::cpu::mips4::tlb::Mips4TlbAddressMode;
 
@@ -167,6 +168,13 @@ impl Mips4ExecutionPolicy for R5000ExecutionPolicy {
 
     fn prefetch_policy(&self) -> Mips4PrefetchPolicy {
         Mips4PrefetchPolicy::NoOperation
+    }
+
+    fn not_word_value_policy(&self, instruction: Mips4CpuInstruction) -> Mips4NotWordValuePolicy {
+        match instruction {
+            Mips4CpuInstruction::Addiu => Mips4NotWordValuePolicy::ExecuteLowWord,
+            _ => Mips4NotWordValuePolicy::NoOperation,
+        }
     }
 
     fn resolve_access_type(

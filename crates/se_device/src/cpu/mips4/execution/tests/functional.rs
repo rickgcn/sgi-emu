@@ -12,6 +12,7 @@ use crate::cpu::mips4::config::{
 use crate::cpu::mips4::cp0::{Mips4Cp0CacheErr, Mips4Cp0Config, Mips4Cp0Register};
 use crate::cpu::mips4::exception::{Mips4ErrorException, Mips4Exception, Mips4ExceptionImage};
 use crate::cpu::mips4::gpr::Mips4GprIndex;
+use crate::cpu::mips4::instruction::decode::Mips4CpuInstruction;
 use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig};
 use crate::cpu::mips4::tlb::Mips4TlbAddressMode;
 
@@ -21,7 +22,7 @@ use super::super::bus::{
 };
 use super::super::policy::{
     Mips4Cp0DoublewordTransferDirection, Mips4Cp0DoublewordTransferPolicy, Mips4Cp0WaitPolicy,
-    Mips4ExecutionPolicy,
+    Mips4ExecutionPolicy, Mips4NotWordValuePolicy,
 };
 use super::super::target::{Mips4ExecutionBoundary, Mips4ExecutionSignal, Mips4ExecutionTarget};
 
@@ -142,6 +143,14 @@ impl Mips4ExecutionPolicy for TestPolicy {
             }
         }
     }
+}
+
+#[test]
+fn generic_execution_policy_defaults_not_word_value_to_no_operation() {
+    assert_eq!(
+        TestPolicy.not_word_value_policy(Mips4CpuInstruction::Addiu),
+        Mips4NotWordValuePolicy::NoOperation
+    );
 }
 
 impl Mips4ExecutionPolicy for CachedTestPolicy {

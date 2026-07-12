@@ -5,6 +5,7 @@ use crate::cpu::mips4::cache::hierarchy::{Mips4CacheAccessPolicy, Mips4CacheHier
 use crate::cpu::mips4::config::Mips4Config;
 use crate::cpu::mips4::cp0::{Mips4Cp0Config, Mips4Cp0Register, Mips4Cp0Status};
 use crate::cpu::mips4::exception::{Mips4ErrorException, Mips4ExceptionImage};
+use crate::cpu::mips4::instruction::decode::Mips4CpuInstruction;
 use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig};
 use crate::cpu::mips4::tlb::Mips4TlbAddressMode;
 
@@ -48,6 +49,15 @@ pub enum Mips4PrefetchPolicy {
     NoOperation,
 }
 
+/// Processor decision for a word instruction with a `NotWordValue` operand.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Mips4NotWordValuePolicy {
+    /// Execute the instruction using the low 32 bits of each word operand.
+    ExecuteLowWord,
+    /// Retire the instruction without modifying architectural state.
+    NoOperation,
+}
+
 /// Processor implementation policy used by the generic MIPS IV execution target.
 pub trait Mips4ExecutionPolicy {
     /// Returns the reset program counter.
@@ -88,6 +98,11 @@ pub trait Mips4ExecutionPolicy {
     /// Selects processor behavior for `PREF` and `PREFX`.
     fn prefetch_policy(&self) -> Mips4PrefetchPolicy {
         Mips4PrefetchPolicy::Execute
+    }
+
+    /// Selects processor behavior for an instruction with a `NotWordValue` operand.
+    fn not_word_value_policy(&self, _instruction: Mips4CpuInstruction) -> Mips4NotWordValuePolicy {
+        Mips4NotWordValuePolicy::NoOperation
     }
 
     /// Resolves an architecture cache attribute to a processor access type.
