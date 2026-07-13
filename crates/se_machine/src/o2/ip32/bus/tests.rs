@@ -1,7 +1,4 @@
-use se_core::role::{BusDeviceRole, BusRole};
-use se_device::chipset::crime::protocol::{
-    CrimeLinkOperation, CrimePioRequest, CrimeTransactionId,
-};
+use se_core::role::BusRole;
 use se_device::cpu::execution::protocol::{ExecutionTransaction, ExecutionTransactionId};
 use se_device::cpu::mips4::cache::Mips4MemoryAccessType;
 use se_device::cpu::mips4::execution::bus::{
@@ -105,35 +102,4 @@ fn sysad_queue_preserves_order_and_rejects_mismatched_completion() {
         bus.queue.front().unwrap().id,
         ExecutionTransactionId::new(2)
     );
-}
-
-#[test]
-fn peer_policy_never_bypasses_the_link_protocol() {
-    let transaction = CrimeCgiTransaction {
-        id: CrimeTransactionId::new(1),
-        controller: component_ids::CRIME,
-        target: component_ids::GBE,
-        operation: CrimeLinkOperation::Pio(CrimePioRequest {
-            address: 0x1600_0000,
-            transfer: CrimeTransfer::read(4),
-        }),
-    };
-    let mut strict = Ip32GbeEndpoint::new(component_ids::GBE, "GBE", CrimeAccessPolicy::Strict);
-    let mut permissive =
-        Ip32GbeEndpoint::new(component_ids::GBE, "GBE", CrimeAccessPolicy::Permissive);
-
-    assert!(matches!(
-        strict.accept(transaction.clone()),
-        CrimeLinkDeviceResponse::Complete(CrimeCgiCompletion {
-            result: Err(CrimeBusError::Unsupported),
-            ..
-        })
-    ));
-    assert!(matches!(
-        permissive.accept(transaction),
-        CrimeLinkDeviceResponse::Complete(CrimeCgiCompletion {
-            result: Ok(CrimeCompletionPayload::ReadData(data)),
-            ..
-        }) if data == vec![0; 4]
-    ));
 }

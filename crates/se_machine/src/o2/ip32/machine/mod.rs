@@ -35,6 +35,7 @@ use se_device::chipset::crime::protocol::{
     CrimePoll, CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceValue,
 };
 use se_device::chipset::crime::{Crime, CrimeError};
+use se_device::chipset::gbe::Gbe;
 use se_device::chipset::mace::config::{MaceConfig, MacePortConfig};
 use se_device::chipset::mace::protocol::{
     MaceAction, MaceExternalLinks, MacePoll, MaceTraceEvent, MaceTraceValue, MaceWiring,
@@ -66,7 +67,7 @@ use se_runtime::runtime::event_chain::EventChainError;
 use se_runtime::runtime::{RunError, RunStatus, Runtime, RuntimeContext, RuntimeStatistics};
 
 use super::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
-use super::bus::{Ip32GbeEndpoint, Ip32StubEndpoint, Ip32SysAdBus, Ip32SysAdBusAction};
+use super::bus::{Ip32StubEndpoint, Ip32SysAdBus, Ip32SysAdBusAction};
 use super::component_ids;
 #[cfg(test)]
 use super::dispatch::LogicalTransition;
@@ -417,6 +418,7 @@ struct HotComponentSlots {
     sdram: ComponentSlot<CrimeSdram>,
     cmi: ComponentSlot<CrimeCmiBus>,
     cgi: ComponentSlot<CrimeCgiBus>,
+    gbe: ComponentSlot<Gbe>,
     mace: ComponentSlot<Mace>,
     isa: ComponentSlot<IsaBus>,
     prom: ComponentSlot<ReadArrayFlash>,
@@ -437,6 +439,7 @@ impl HotComponentSlots {
             sdram: registry.resolve(component_ids::RAM)?,
             cmi: registry.resolve(component_ids::CRIME_MACE_LINK)?,
             cgi: registry.resolve(component_ids::CRIME_GBE_LINK)?,
+            gbe: registry.resolve(component_ids::GBE)?,
             mace: registry.resolve(component_ids::MACE)?,
             isa: registry.resolve(component_ids::ISA_BUS)?,
             prom: registry.resolve(component_ids::PROM)?,
@@ -745,10 +748,10 @@ impl<S> Ip32Machine<S> {
         insert_component(registry, Box::new(mace))?;
         insert_component(
             registry,
-            Box::new(Ip32GbeEndpoint::new(
+            Box::new(Gbe::new(
                 component_ids::GBE,
-                "GBE endpoint",
-                config.crime.unimplemented_access_policy,
+                "Graphics Back End",
+                IP32_TIMEBASE_HZ,
             )),
         )?;
         insert_component(
@@ -1337,9 +1340,7 @@ where
         .get_typed_mut::<PciConfigurationEndpoint>(component_ids::SCSI_CONTROLLER)?
         .reset();
     registry.get_resolved_mut(control.slots.parallel)?.reset();
-    registry
-        .get_typed_mut::<Ip32GbeEndpoint>(component_ids::GBE)?
-        .reset();
+    registry.get_resolved_mut(control.slots.gbe)?.reset();
     registry
         .get_typed_mut::<Ip32StubEndpoint>(component_ids::VICE)?
         .reset();
@@ -1414,9 +1415,7 @@ where
         .get_typed_mut::<PciConfigurationEndpoint>(component_ids::SCSI_CONTROLLER)?
         .reset();
     registry.get_resolved_mut(control.slots.parallel)?.reset();
-    registry
-        .get_typed_mut::<Ip32GbeEndpoint>(component_ids::GBE)?
-        .reset();
+    registry.get_resolved_mut(control.slots.gbe)?.reset();
     registry
         .get_typed_mut::<Ip32StubEndpoint>(component_ids::VICE)?
         .reset();
@@ -2444,9 +2443,9 @@ where
                 transaction,
             } => {
                 let response = if target == component_ids::GBE {
-                    registry
-                        .get_typed_mut::<Ip32GbeEndpoint>(target)?
-                        .accept(transaction)
+                    let gbe = registry.get_resolved_mut(control.slots.gbe)?;
+                    gbe.observe_time(context.now());
+                    gbe.accept(transaction)
                 } else if target == component_ids::CRIME {
                     let crime = crime_with_trace_interest(registry, context, control.slots.crime)?;
                     crime.observe_time(context.now());

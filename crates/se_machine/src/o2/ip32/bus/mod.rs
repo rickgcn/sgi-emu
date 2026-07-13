@@ -3,13 +3,9 @@
 use std::collections::VecDeque;
 
 use se_core::component::{Component, ComponentId};
-use se_core::role::{BusDeviceRole, BusRole};
+use se_core::role::BusRole;
 use se_core::scheduler::SimDuration;
-use se_device::chipset::crime::config::CrimeAccessPolicy;
-use se_device::chipset::crime::protocol::{
-    CrimeBusDisposition, CrimeBusError, CrimeCgiCompletion, CrimeCgiTransaction,
-    CrimeCompletionPayload, CrimeLinkDeviceResponse, CrimeLinkOperation, CrimeTransfer,
-};
+use se_device::chipset::crime::protocol::CrimeBusDisposition;
 use se_device::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransaction};
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 
@@ -264,55 +260,6 @@ impl BusRole<ExecutionTransaction<Mips4ExecutionTransaction>> for Ip32SysAdBus {
     }
 }
 
-/// Minimal GBE endpoint retaining CGI protocol semantics.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Ip32GbeEndpoint {
-    id: ComponentId,
-    name: String,
-    policy: CrimeAccessPolicy,
-}
-
-impl Ip32GbeEndpoint {
-    /// Creates a deterministic GBE endpoint.
-    pub fn new(id: ComponentId, name: impl Into<String>, policy: CrimeAccessPolicy) -> Self {
-        Self {
-            id,
-            name: name.into(),
-            policy,
-        }
-    }
-}
-
-impl Component for Ip32GbeEndpoint {
-    fn id(&self) -> ComponentId {
-        self.id
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn reset(&mut self) {}
-}
-
-impl BusDeviceRole<CrimeCgiTransaction> for Ip32GbeEndpoint {
-    type Response = CrimeLinkDeviceResponse<CrimeCgiCompletion>;
-
-    fn accept(&mut self, transaction: CrimeCgiTransaction) -> Self::Response {
-        let result = match transaction.operation {
-            CrimeLinkOperation::Pio(request) => policy_result(self.policy, request.transfer),
-            CrimeLinkOperation::Dma(_) | CrimeLinkOperation::InterruptPost(_) => {
-                Err(CrimeBusError::Unsupported)
-            }
-        };
-        CrimeLinkDeviceResponse::Complete(CrimeCgiCompletion {
-            id: transaction.id,
-            result,
-            memory_fault: None,
-        })
-    }
-}
-
 /// Identity-only endpoint for an unimplemented board device.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ip32StubEndpoint {
@@ -340,23 +287,6 @@ impl Component for Ip32StubEndpoint {
     }
 
     fn reset(&mut self) {}
-}
-
-fn policy_result(
-    policy: CrimeAccessPolicy,
-    transfer: CrimeTransfer,
-) -> Result<CrimeCompletionPayload, CrimeBusError> {
-    match policy {
-        CrimeAccessPolicy::Strict => Err(CrimeBusError::Unsupported),
-        CrimeAccessPolicy::Permissive => match transfer.view() {
-            se_device::chipset::crime::protocol::CrimeTransferView::Read { length } => Ok(
-                CrimeCompletionPayload::ReadData(vec![0; usize::from(length)].into()),
-            ),
-            se_device::chipset::crime::protocol::CrimeTransferView::Write { .. } => {
-                Ok(CrimeCompletionPayload::WriteComplete)
-            }
-        },
-    }
 }
 
 #[cfg(test)]

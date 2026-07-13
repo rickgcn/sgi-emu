@@ -12,6 +12,7 @@ use se_device::chipset::crime::protocol::{
     CrimeTransactionId, CrimeTransfer,
 };
 use se_device::chipset::crime::registers;
+use se_device::chipset::gbe::Gbe;
 use se_device::chipset::mace::Mace;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
 use se_device::memory::ds2502::Ds2502;
@@ -388,11 +389,7 @@ fn construction_registers_the_role_oriented_ip32_topology() {
             .get_typed::<Ds2502>(component_ids::NIC_IDENTITY)
             .is_ok()
     );
-    assert!(
-        registry
-            .get_typed::<Ip32GbeEndpoint>(component_ids::GBE)
-            .is_ok()
-    );
+    assert!(registry.get_typed::<Gbe>(component_ids::GBE).is_ok());
     assert!(
         registry
             .get_typed::<Ip32StubEndpoint>(component_ids::VICE)
