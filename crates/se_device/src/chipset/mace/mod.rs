@@ -276,9 +276,9 @@ impl Mace {
             MaceEvent::I2cComplete { port, .. } if port < 2 => {
                 self.i2c[port as usize].complete(false, false)
             }
+            MaceEvent::EthernetStep { .. } => self.ethernet.complete_phy_operation(),
             MaceEvent::DmaStep { .. }
             | MaceEvent::VideoLine { .. }
-            | MaceEvent::EthernetStep { .. }
             | MaceEvent::TimerCompare { .. }
             | MaceEvent::Ps2Transmit { .. }
             | MaceEvent::I2cComplete { .. } => {}
@@ -699,6 +699,9 @@ impl Mace {
             0x30 | 0x38 => u64::from(self.ethernet.tx_info),
             0x40 | 0x48 | 0x50 => self.ethernet.rx_clusters.len() as u64,
             0x58 => self.ethernet.last_tx_vector,
+            0x60 => u64::from(self.ethernet.phy_data()),
+            0x68 => u64::from(self.ethernet.phy_address()),
+            0x70 => 0,
             0xa0 => bytes_to_u64(&self.ethernet.station_address),
             0xa8 => bytes_to_u64(&self.ethernet.secondary_address),
             0xb0 => self.ethernet.multicast_filter,
@@ -729,7 +732,16 @@ impl Mace {
                     self.ethernet.interrupt_status & !0xe0 | value as u32 & 0xe0
             }
             0x58 => self.ethernet.interrupt_status |= value as u32 & 0xff,
-            0x78 => {}
+            0x60 => {
+                self.ethernet.start_phy_write(value as u16);
+                self.schedule_ethernet_step();
+            }
+            0x68 => self.ethernet.set_phy_address(value as u16),
+            0x70 => {
+                self.ethernet.start_phy_read();
+                self.schedule_ethernet_step();
+            }
+            0x78 => self.ethernet.seed_backoff(value as u16),
             0xa0 => self.ethernet.station_address = u64_to_six_bytes(value),
             0xa8 => self.ethernet.secondary_address = u64_to_six_bytes(value),
             0xb0 => self.ethernet.multicast_filter = value,
@@ -748,6 +760,13 @@ impl Mace {
             .set_group(MaceInterruptGroup::Ethernet, self.ethernet.interrupt());
         self.push_interrupt_posts();
         Ok(())
+    }
+
+    fn schedule_ethernet_step(&mut self) {
+        self.actions.push_back(MaceAction::Schedule {
+            delay: se_core::scheduler::SimDuration::new((self.timebase_hz / 40_000).max(1)),
+            event: MaceEvent::EthernetStep { epoch: self.epoch },
+        });
     }
 
     fn read_peripheral(&mut self, offset: u64) -> Result<u64, CrimeBusError> {

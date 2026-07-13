@@ -90,6 +90,20 @@ fn component_reset_restores_revision_register() {
 }
 
 #[test]
+fn phy_read_start_has_the_prom_observed_zero_readback() {
+    let mace = Mace::new(
+        component(15),
+        "MACE",
+        MaceConfig::default(),
+        wiring(),
+        1_000_000_000,
+    )
+    .expect("MACE must build");
+
+    assert_eq!(mace.read_ethernet(0x70), Ok(0));
+}
+
+#[test]
 fn rtc_lane_access_is_forwarded_to_isa() {
     let mut mace = Mace::new(
         component(15),

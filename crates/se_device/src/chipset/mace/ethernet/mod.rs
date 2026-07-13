@@ -5,6 +5,17 @@ use std::collections::VecDeque;
 /// MAC implementation revision reported by MACE 2.0.
 pub const MAC_IMPLEMENTATION_REVISION: u32 = 1;
 
+const DEFAULT_PHY_ADDRESS: u8 = 0;
+const ICS1890_ID1: u16 = 0x0015;
+const ICS1890_ID2: u16 = 0xf420;
+const PHY_BUSY: u32 = 1 << 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhyOperation {
+    Read,
+    Write(u16),
+}
+
 /// Receive metadata used to form a MACE status vector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiveStatus {
@@ -33,11 +44,19 @@ pub struct MaceEthernet {
     pub rx_clusters: VecDeque<u32>,
     pub sequence: u8,
     pub last_tx_vector: u64,
+    phy_address: u16,
+    phy_data: u16,
+    phy_busy: bool,
+    phy_operation: Option<PhyOperation>,
+    phy_registers: [u16; 32],
     backoff_state: u16,
 }
 
 impl MaceEthernet {
     pub fn new() -> Self {
+        let mut phy_registers = [0; 32];
+        phy_registers[2] = ICS1890_ID1;
+        phy_registers[3] = ICS1890_ID2;
         Self {
             mac_control: 1 | MAC_IMPLEMENTATION_REVISION << 29,
             interrupt_status: 0,
@@ -51,6 +70,11 @@ impl MaceEthernet {
             rx_clusters: VecDeque::with_capacity(16),
             sequence: 0,
             last_tx_vector: 0,
+            phy_address: 0,
+            phy_data: 0,
+            phy_busy: false,
+            phy_operation: None,
+            phy_registers,
             backoff_state: 1,
         }
     }
@@ -64,6 +88,63 @@ impl MaceEthernet {
 
     pub fn clear_interrupts(&mut self, mask: u32) {
         self.interrupt_status &= !(mask & 0xff);
+    }
+
+    pub const fn phy_data(&self) -> u32 {
+        self.phy_data as u32 | if self.phy_busy { PHY_BUSY } else { 0 }
+    }
+
+    pub const fn phy_address(&self) -> u16 {
+        self.phy_address
+    }
+
+    pub fn set_phy_address(&mut self, value: u16) {
+        self.phy_address = value & 0x03ff;
+    }
+
+    pub fn start_phy_read(&mut self) {
+        self.phy_busy = true;
+        self.phy_operation = Some(PhyOperation::Read);
+    }
+
+    pub fn start_phy_write(&mut self, value: u16) {
+        self.phy_data = value;
+        self.phy_busy = true;
+        self.phy_operation = Some(PhyOperation::Write(value));
+    }
+
+    pub fn complete_phy_operation(&mut self) {
+        let Some(operation) = self.phy_operation.take() else {
+            self.phy_busy = false;
+            return;
+        };
+        let device = (self.phy_address >> 5) as u8;
+        let register = usize::from(self.phy_address & 0x1f);
+        match operation {
+            PhyOperation::Read => {
+                self.phy_data = if device == DEFAULT_PHY_ADDRESS {
+                    self.phy_registers[register]
+                } else {
+                    u16::MAX
+                };
+            }
+            PhyOperation::Write(value) if device == DEFAULT_PHY_ADDRESS => {
+                if register == 0 && value & 0x8000 != 0 {
+                    let mut registers = [0; 32];
+                    registers[2] = ICS1890_ID1;
+                    registers[3] = ICS1890_ID2;
+                    self.phy_registers = registers;
+                } else if !matches!(register, 2 | 3) {
+                    self.phy_registers[register] = value;
+                }
+            }
+            PhyOperation::Write(_) => {}
+        }
+        self.phy_busy = false;
+    }
+
+    pub fn seed_backoff(&mut self, value: u16) {
+        self.backoff_state = value & 0x07ff;
     }
 
     pub fn push_receive_cluster(&mut self, address: u32) -> bool {
@@ -185,5 +266,25 @@ mod tests {
     #[test]
     fn checksum_folds_carries() {
         assert_eq!(internet_checksum(&[0xff, 0xff, 0, 1]), 1);
+    }
+
+    #[test]
+    fn mdio_reports_a_link_down_ics1890_and_absent_addresses() {
+        let mut ethernet = MaceEthernet::new();
+        ethernet.set_phy_address(2);
+        ethernet.start_phy_read();
+        assert_eq!(ethernet.phy_data(), PHY_BUSY);
+        ethernet.complete_phy_operation();
+        assert_eq!(ethernet.phy_data(), u32::from(ICS1890_ID1));
+
+        ethernet.set_phy_address(3);
+        ethernet.start_phy_read();
+        ethernet.complete_phy_operation();
+        assert_eq!(ethernet.phy_data(), u32::from(ICS1890_ID2));
+
+        ethernet.set_phy_address((1 << 5) | 2);
+        ethernet.start_phy_read();
+        ethernet.complete_phy_operation();
+        assert_eq!(ethernet.phy_data(), u32::from(u16::MAX));
     }
 }
