@@ -16,12 +16,12 @@ pub mod render;
 pub mod trace;
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
 use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::scheduler::SimTime;
-use se_core::tracing::TraceLevel;
+use se_core::tracing::{TraceInterest, TraceLevel};
 
 use crate::bus::irq::{IrqSource, IrqTransaction};
 use crate::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransactionId};
@@ -37,12 +37,13 @@ use self::protocol::{
     CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryCompletion, CrimeMemoryFault,
     CrimeMemoryInhibitReason, CrimeMemoryOutcome, CrimeMemoryTransaction, CrimePioRequest,
     CrimePoll, CrimeSdramSignal, CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceField,
-    CrimeTraceValue, CrimeTransactionId, CrimeTransfer,
+    CrimeTraceFields, CrimeTraceValue, CrimeTransactionId, CrimeTransfer,
 };
 use self::render::{
     CrimeRender, CrimeRenderError, RenderInterruptEffect, RenderMemoryWrite, RenderNotice,
     RenderProgress, RenderWriteError,
 };
+use crate::common::pending::InlineMap8;
 
 const LOW_MEMORY_END: u64 = 0x1000_0000;
 const FRAMEBUFFER_START: u64 = 0x1000_0000;
@@ -88,6 +89,9 @@ struct PendingRenderWrite {
     execution_id: ExecutionTransactionId,
     transaction: Mips4ExecutionTransaction,
 }
+
+type PendingMemoryTable = InlineMap8<CrimeTransactionId, PendingMemoryOrigin>;
+type PendingLinkTable = InlineMap8<CrimeTransactionId, PendingLink>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RenderAccessResult {
@@ -169,13 +173,14 @@ pub struct Crime {
     next_transaction_id: u128,
     pending_sysad: Option<ExecutionTransactionId>,
     pending_render_write: Option<PendingRenderWrite>,
-    pending_memory: BTreeMap<CrimeTransactionId, PendingMemoryOrigin>,
-    pending_cmi: BTreeMap<CrimeTransactionId, PendingLink>,
-    pending_cgi: BTreeMap<CrimeTransactionId, PendingLink>,
+    pending_memory: PendingMemoryTable,
+    pending_cmi: PendingLinkTable,
+    pending_cgi: PendingLinkTable,
     cancelled_memory: BTreeSet<CrimeTransactionId>,
     cancelled_cmi: BTreeSet<CrimeTransactionId>,
     cancelled_cgi: BTreeSet<CrimeTransactionId>,
     actions: VecDeque<CrimeAction>,
+    trace_interest: TraceInterest,
     terminal_error: Option<CrimeError>,
     current_time: SimTime,
 }
@@ -217,13 +222,14 @@ impl Crime {
             next_transaction_id: 0,
             pending_sysad: None,
             pending_render_write: None,
-            pending_memory: BTreeMap::new(),
-            pending_cmi: BTreeMap::new(),
-            pending_cgi: BTreeMap::new(),
+            pending_memory: PendingMemoryTable::new(),
+            pending_cmi: PendingLinkTable::new(),
+            pending_cgi: PendingLinkTable::new(),
             cancelled_memory: BTreeSet::new(),
             cancelled_cmi: BTreeSet::new(),
             cancelled_cgi: BTreeSet::new(),
             actions: VecDeque::new(),
+            trace_interest: TraceInterest::All,
             terminal_error: None,
             current_time: SimTime::ZERO,
         })
@@ -237,6 +243,11 @@ impl Crime {
     /// Observes machine time before accepting an untimed peer-link request.
     pub fn observe_time(&mut self, now: SimTime) {
         self.current_time = now;
+    }
+
+    /// Updates the coarse trace interest supplied by the machine runtime.
+    pub fn set_trace_interest(&mut self, interest: TraceInterest) {
+        self.trace_interest = interest;
     }
 
     /// Restores power-on state and requests SDRAM clearing.
@@ -270,10 +281,8 @@ impl Crime {
             self.pending_memory.remove(&id);
             self.cancelled_memory.insert(id);
         }
-        self.cancelled_cmi
-            .extend(core::mem::take(&mut self.pending_cmi).into_keys());
-        self.cancelled_cgi
-            .extend(core::mem::take(&mut self.pending_cgi).into_keys());
+        self.cancelled_cmi.extend(self.pending_cmi.drain_keys());
+        self.cancelled_cgi.extend(self.pending_cgi.drain_keys());
         self.actions
             .retain(|action| !matches!(action, CrimeAction::CompleteSysAd(_)));
     }
@@ -351,6 +360,16 @@ impl Crime {
         self.push_ecc_control();
     }
 
+    fn push_trace<F>(&mut self, build: F)
+    where
+        F: FnOnce() -> CrimeTraceEvent,
+    {
+        if self.trace_interest != TraceInterest::None {
+            self.actions
+                .push_back(CrimeAction::Trace(Box::new(build())));
+        }
+    }
+
     fn accept_sysad(&mut self, request: CrimeSysAdRequest) -> Result<(), CrimeError> {
         if let Some(transaction_id) = self.pending_sysad {
             return Err(CrimeError::SysAdBusy { transaction_id });
@@ -359,11 +378,11 @@ impl Crime {
         let execution_id = request.transaction.id;
         let transaction = request.transaction.payload;
         let (address, size) = transaction_shape(transaction);
-        self.actions.push_back(CrimeAction::Trace(CrimeTraceEvent {
+        self.push_trace(|| CrimeTraceEvent {
             level: TraceLevel::Trace,
             target: trace::PIU_TARGET,
             event: "sysad_request",
-            fields: vec![
+            fields: [
                 CrimeTraceField {
                     key: "physical_address",
                     value: CrimeTraceValue::Hex64(address),
@@ -372,8 +391,9 @@ impl Crime {
                     key: "size",
                     value: CrimeTraceValue::U64(u64::from(size)),
                 },
-            ],
-        }));
+            ]
+            .into(),
+        });
 
         if let Some((memory_address, no_ecc)) = decode_memory(address, size) {
             let id = self.allocate_transaction_id()?;
@@ -490,7 +510,7 @@ impl Crime {
         } else {
             trace::RENDER_TARGET
         };
-        self.actions.push_back(CrimeAction::Trace(CrimeTraceEvent {
+        self.push_trace(|| CrimeTraceEvent {
             level: if matches!(completion, Mips4ExecutionCompletion::BusError) {
                 TraceLevel::Warn
             } else {
@@ -498,7 +518,7 @@ impl Crime {
             },
             target,
             event: "register_access",
-            fields: vec![
+            fields: [
                 CrimeTraceField {
                     key: "physical_address",
                     value: CrimeTraceValue::Hex64(address),
@@ -521,8 +541,9 @@ impl Crime {
                         Mips4ExecutionCompletion::BusError
                     )),
                 },
-            ],
-        }));
+            ]
+            .into(),
+        });
         if matches!(completion, Mips4ExecutionCompletion::BusError) {
             self.record_cpu_error(address);
         }
@@ -675,11 +696,11 @@ impl Crime {
         let id = self.allocate_transaction_id()?;
         self.pending_memory.insert(id, PendingMemoryOrigin::Render);
         if let CrimeMemoryBankSelect::Inhibited { reason } = write.bank_select {
-            self.actions.push_back(CrimeAction::Trace(CrimeTraceEvent {
+            self.push_trace(|| CrimeTraceEvent {
                 level: TraceLevel::Debug,
                 target: trace::RENDER_TARGET,
                 event: "bank_select_inhibited",
-                fields: vec![
+                fields: [
                     CrimeTraceField {
                         key: "reason",
                         value: CrimeTraceValue::String(match reason {
@@ -694,8 +715,9 @@ impl Crime {
                         key: "operation",
                         value: CrimeTraceValue::String("write"),
                     },
-                ],
-            }));
+                ]
+                .into(),
+            });
         }
         self.actions
             .push_back(CrimeAction::StartMemory(CrimeMemoryTransaction {
@@ -706,20 +728,17 @@ impl Crime {
                 address: write.physical_address,
                 bank_select: write.bank_select,
                 no_ecc: false,
-                transfer: CrimeTransfer::Write {
-                    data: write.data,
-                    byte_enable: write.byte_enable,
-                },
+                transfer: CrimeTransfer::write(write.data, write.byte_enable),
             }));
         Ok(())
     }
 
     fn trace_render_register_write(&mut self, address: u64, size: u8, value: u64) {
-        self.actions.push_back(CrimeAction::Trace(CrimeTraceEvent {
+        self.push_trace(|| CrimeTraceEvent {
             level: TraceLevel::Trace,
             target: trace::RENDER_TARGET,
             event: "register_write",
-            fields: vec![
+            fields: [
                 CrimeTraceField {
                     key: "physical_address",
                     value: CrimeTraceValue::Hex64(address),
@@ -740,15 +759,16 @@ impl Crime {
                             .contains(&address),
                     ),
                 },
-            ],
-        }));
+            ]
+            .into(),
+        });
     }
 
     fn trace_render_notice(&mut self, notice: RenderNotice) {
-        let (event, fields) = match notice {
+        let (event, fields): (&'static str, CrimeTraceFields) = match notice {
             RenderNotice::RegisterRetired(write) => (
                 "register_retired",
-                vec![
+                [
                     CrimeTraceField {
                         key: "physical_address",
                         value: CrimeTraceValue::Hex64(write.address),
@@ -757,11 +777,12 @@ impl Crime {
                         key: "commit",
                         value: CrimeTraceValue::Bool(write.commit),
                     },
-                ],
+                ]
+                .into(),
             ),
             RenderNotice::JobCommitted { start, end } => (
                 "job_commit",
-                vec![
+                [
                     CrimeTraceField {
                         key: "start",
                         value: CrimeTraceValue::Hex64(u64::from(start)),
@@ -770,7 +791,8 @@ impl Crime {
                         key: "end",
                         value: CrimeTraceValue::Hex64(u64::from(end)),
                     },
-                ],
+                ]
+                .into(),
             ),
             RenderNotice::MemoryChunk {
                 virtual_address,
@@ -778,7 +800,7 @@ impl Crime {
                 length,
             } => (
                 "mte_chunk",
-                vec![
+                [
                     CrimeTraceField {
                         key: "virtual_address",
                         value: CrimeTraceValue::Hex64(u64::from(virtual_address)),
@@ -791,7 +813,8 @@ impl Crime {
                         key: "length",
                         value: CrimeTraceValue::U64(u64::from(length)),
                     },
-                ],
+                ]
+                .into(),
             ),
             RenderNotice::TlbTranslation {
                 virtual_address,
@@ -801,7 +824,7 @@ impl Crime {
                 physical_address,
             } => (
                 "tlb_translate",
-                vec![
+                [
                     CrimeTraceField {
                         key: "virtual_address",
                         value: CrimeTraceValue::Hex64(u64::from(virtual_address)),
@@ -822,11 +845,12 @@ impl Crime {
                         key: "physical_address",
                         value: CrimeTraceValue::Hex64(physical_address),
                     },
-                ],
+                ]
+                .into(),
             ),
             RenderNotice::JobCompleted { start, end } => (
                 "job_complete",
-                vec![
+                [
                     CrimeTraceField {
                         key: "start",
                         value: CrimeTraceValue::Hex64(u64::from(start)),
@@ -835,15 +859,16 @@ impl Crime {
                         key: "end",
                         value: CrimeTraceValue::Hex64(u64::from(end)),
                     },
-                ],
+                ]
+                .into(),
             ),
         };
-        self.actions.push_back(CrimeAction::Trace(CrimeTraceEvent {
+        self.push_trace(|| CrimeTraceEvent {
             level: TraceLevel::Debug,
             target: trace::RENDER_TARGET,
             event,
             fields,
-        }));
+        });
     }
 
     fn read_memory_register(&self, address: u64) -> Option<u64> {
@@ -1042,7 +1067,7 @@ impl Crime {
         origin: &PendingMemoryOrigin,
         outcome: &CrimeMemoryOutcome,
     ) {
-        let Some(diagnostic) = outcome.diagnostic else {
+        let Some(diagnostic) = outcome.diagnostic() else {
             return;
         };
         let hard = outcome.fault == Some(CrimeMemoryFault::UncorrectableEcc);
@@ -1216,12 +1241,12 @@ impl Crime {
     }
 
     fn latch_render_error(&mut self, error: CrimeRenderError) {
-        let fields = match &error {
+        let fields: CrimeTraceFields = match &error {
             CrimeRenderError::UnsupportedMteJob {
                 mode,
                 byte_mask,
                 foreground,
-            } => vec![
+            } => [
                 CrimeTraceField {
                     key: "kind",
                     value: CrimeTraceValue::String("unsupported_mte_job"),
@@ -1238,8 +1263,9 @@ impl Crime {
                     key: "foreground",
                     value: CrimeTraceValue::Hex64(u64::from(*foreground)),
                 },
-            ],
-            CrimeRenderError::InvalidMteRange { start, end } => vec![
+            ]
+            .into(),
+            CrimeRenderError::InvalidMteRange { start, end } => [
                 CrimeTraceField {
                     key: "kind",
                     value: CrimeTraceValue::String("invalid_mte_range"),
@@ -1252,16 +1278,19 @@ impl Crime {
                     key: "end",
                     value: CrimeTraceValue::Hex64(u64::from(*end)),
                 },
-            ],
-            CrimeRenderError::UnexpectedMemoryCompletion => vec![CrimeTraceField {
+            ]
+            .into(),
+            CrimeRenderError::UnexpectedMemoryCompletion => [CrimeTraceField {
                 key: "kind",
                 value: CrimeTraceValue::String("unexpected_memory_completion"),
-            }],
-            CrimeRenderError::UnexpectedMemoryPayload => vec![CrimeTraceField {
+            }]
+            .into(),
+            CrimeRenderError::UnexpectedMemoryPayload => [CrimeTraceField {
                 key: "kind",
                 value: CrimeTraceValue::String("unexpected_memory_payload"),
-            }],
-            CrimeRenderError::MemoryTransport(error) => vec![
+            }]
+            .into(),
+            CrimeRenderError::MemoryTransport(error) => [
                 CrimeTraceField {
                     key: "kind",
                     value: CrimeTraceValue::String("memory_transport"),
@@ -1275,14 +1304,15 @@ impl Crime {
                         CrimeBusError::Timeout => "timeout",
                     }),
                 },
-            ],
+            ]
+            .into(),
         };
-        self.actions.push_back(CrimeAction::Trace(CrimeTraceEvent {
+        self.push_trace(|| CrimeTraceEvent {
             level: TraceLevel::Error,
             target: trace::RENDER_TARGET,
             event: "render_error",
             fields,
-        }));
+        });
         self.latch_error(CrimeError::Render(error));
     }
 }
@@ -1415,9 +1445,9 @@ fn transaction_shape(transaction: Mips4ExecutionTransaction) -> (u64, u8) {
 
 fn transfer_from_cpu(transaction: Mips4ExecutionTransaction) -> CrimeTransfer {
     match transaction {
-        Mips4ExecutionTransaction::Read { size, .. } => CrimeTransfer::Read {
-            length: u16::from(size.bytes()),
-        },
+        Mips4ExecutionTransaction::Read { size, .. } => {
+            CrimeTransfer::read(u16::from(size.bytes()))
+        }
         Mips4ExecutionTransaction::Write {
             size,
             data,
@@ -1425,12 +1455,12 @@ fn transfer_from_cpu(transaction: Mips4ExecutionTransaction) -> CrimeTransfer {
             ..
         } => {
             let length = usize::from(size.bytes());
-            CrimeTransfer::Write {
-                data: data.to_le_bytes()[..length].to_vec(),
-                byte_enable: (0..length)
+            CrimeTransfer::write(
+                data.to_le_bytes()[..length].iter().copied().collect(),
+                (0..length)
                     .map(|lane| byte_enable & (1 << lane) != 0)
                     .collect(),
-            }
+            )
         }
     }
 }

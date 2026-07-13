@@ -1,10 +1,140 @@
 //! Deterministic byte-oriented ISA communication domain.
 
+use core::ops::{Deref, DerefMut};
 use std::collections::VecDeque;
 
+use super::transfer::{
+    CompactByteEnable, CompactByteEnableView, CompactData, CompactTransfer, CompactTransferView,
+};
 use se_core::component::{Component, ComponentId};
 use se_core::role::BusRole;
 use se_core::scheduler::{SimDuration, SimTime};
+
+/// Owned byte payload optimized for common ISA transfers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IsaData(CompactData);
+
+impl IsaData {
+    /// Returns whether the payload spilled beyond inline storage.
+    pub fn spilled(&self) -> bool {
+        self.0.spilled()
+    }
+
+    pub(crate) fn into_compact(self) -> CompactData {
+        self.0
+    }
+}
+
+impl Deref for IsaData {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for IsaData {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl AsRef<[u8]> for IsaData {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl From<Vec<u8>> for IsaData {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for IsaData {
+    fn from(value: [u8; N]) -> Self {
+        Self(value.into_iter().collect())
+    }
+}
+
+impl FromIterator<u8> for IsaData {
+    fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl PartialEq<Vec<u8>> for IsaData {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_ref() == other.as_slice()
+    }
+}
+
+impl<const N: usize> PartialEq<[u8; N]> for IsaData {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        self.as_ref() == other
+    }
+}
+
+/// Owned byte-enable payload optimized for common ISA transfers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IsaByteEnable(CompactByteEnable);
+
+impl IsaByteEnable {
+    /// Returns whether the payload spilled beyond inline storage.
+    pub fn spilled(&self) -> bool {
+        self.0.spilled()
+    }
+
+    /// Returns the number of represented byte lanes.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether no byte lanes are represented.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns one enable bit, or `None` when the lane is out of range.
+    pub fn is_enabled(&self, index: usize) -> Option<bool> {
+        self.0.is_enabled(index)
+    }
+
+    /// Iterates over enable bits in ascending lane order.
+    pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
+        self.0.iter()
+    }
+}
+
+impl From<Vec<bool>> for IsaByteEnable {
+    fn from(value: Vec<bool>) -> Self {
+        Self(value.into_iter().collect())
+    }
+}
+
+impl<const N: usize> From<[bool; N]> for IsaByteEnable {
+    fn from(value: [bool; N]) -> Self {
+        Self(value.into_iter().collect())
+    }
+}
+
+impl FromIterator<bool> for IsaByteEnable {
+    fn from_iter<T: IntoIterator<Item = bool>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl PartialEq<Vec<bool>> for IsaByteEnable {
+    fn eq(&self, other: &Vec<bool>) -> bool {
+        self.iter().eq(other.iter().copied())
+    }
+}
+
+impl<const N: usize> PartialEq<[bool; N]> for IsaByteEnable {
+    fn eq(&self, other: &[bool; N]) -> bool {
+        self.iter().eq(other.iter().copied())
+    }
+}
 
 /// Correlation identifier for an ISA transaction.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -24,23 +154,80 @@ impl IsaTransactionId {
 
 /// Byte-oriented ISA transfer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum IsaTransfer {
-    /// Reads one or more consecutive bytes.
-    Read { length: u8 },
-    /// Writes consecutive bytes with one enable per byte.
+pub struct IsaTransfer(CompactTransfer);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Borrowed byte-enable view for an ISA write transfer.
+pub struct IsaByteEnableView<'a>(CompactByteEnableView<'a>);
+
+impl<'a> IsaByteEnableView<'a> {
+    /// Returns the number of represented byte lanes.
+    pub fn len(self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether no byte lanes are represented.
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns one enable bit, or `None` when the lane is out of range.
+    pub fn is_enabled(self, index: usize) -> Option<bool> {
+        self.0.is_enabled(index)
+    }
+
+    /// Iterates over enable bits in ascending lane order.
+    pub fn iter(self) -> impl Iterator<Item = bool> + 'a {
+        self.0.iter()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Borrowed view of an ISA byte transfer.
+pub enum IsaTransferView<'a> {
+    /// Read request with a byte length.
+    Read {
+        /// Requested byte count.
+        length: u16,
+    },
+    /// Write request with independent data and byte-enable lengths.
     Write {
-        data: Vec<u8>,
-        byte_enable: Vec<bool>,
+        /// Bytes in ascending address order.
+        data: &'a [u8],
+        /// Per-byte write enables.
+        byte_enable: IsaByteEnableView<'a>,
     },
 }
 
 impl IsaTransfer {
+    /// Creates a read transfer without write-side storage.
+    pub const fn read(length: u16) -> Self {
+        Self(CompactTransfer::read(length))
+    }
+
+    /// Creates a write transfer while preserving independent payload lengths.
+    pub fn write(data: IsaData, byte_enable: IsaByteEnable) -> Self {
+        Self(CompactTransfer::write(data.0, byte_enable.0))
+    }
+
     /// Returns the transfer length.
     pub fn length(&self) -> usize {
-        match self {
-            Self::Read { length } => usize::from(*length),
-            Self::Write { data, .. } => data.len(),
+        self.0.length()
+    }
+
+    /// Borrows the strongly typed transfer contents.
+    pub fn view(&self) -> IsaTransferView<'_> {
+        match self.0.view() {
+            CompactTransferView::Read { length } => IsaTransferView::Read { length },
+            CompactTransferView::Write { data, byte_enable } => IsaTransferView::Write {
+                data,
+                byte_enable: IsaByteEnableView(byte_enable),
+            },
         }
+    }
+
+    pub(crate) fn from_compact(value: CompactTransfer) -> Self {
+        Self(value)
     }
 }
 
@@ -65,7 +252,7 @@ pub struct IsaTransaction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IsaCompletionPayload {
     /// Bytes in ascending address order.
-    ReadData(Vec<u8>),
+    ReadData(IsaData),
     /// A write completed.
     WriteComplete,
 }
@@ -107,7 +294,10 @@ pub enum IsaBusDisposition {
     /// The bus was already active.
     Queued,
     /// The idle bus needs a service event.
-    QueuedAndNeedsService { delay: SimDuration },
+    QueuedAndNeedsService {
+        delay: SimDuration,
+        event: IsaBusEvent,
+    },
 }
 
 /// Scheduled ISA bus transition.
@@ -275,7 +465,10 @@ impl BusRole<IsaTransaction> for IsaBus {
             IsaBusDisposition::Queued
         } else {
             self.service_scheduled = true;
-            IsaBusDisposition::QueuedAndNeedsService { delay: self.cycle }
+            IsaBusDisposition::QueuedAndNeedsService {
+                delay: self.cycle,
+                event: self.next_service_event(),
+            }
         }
     }
 }

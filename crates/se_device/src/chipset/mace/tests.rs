@@ -1,14 +1,15 @@
 use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole};
+use se_core::tracing::TraceInterest;
 
 use crate::bus::i2c::I2cCompletion;
 use crate::bus::irq::IrqDelivery;
-use crate::bus::isa::IsaCompletion;
+use crate::bus::isa::{IsaCompletion, IsaCompletionPayload, IsaTransferView};
 use crate::bus::media::{EthernetFrame, MediaPayload, MediaPort, MediaTransaction};
 use crate::bus::pci::PciCompletion;
 use crate::chipset::crime::protocol::{
-    CrimeCmiCompletion, CrimeCmiTransaction, CrimeLinkOperation, CrimePioRequest,
-    CrimeTransactionId, CrimeTransfer,
+    CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeLinkOperation,
+    CrimePioRequest, CrimeTransactionId, CrimeTransfer,
 };
 
 use super::config::MaceConfig;
@@ -102,12 +103,42 @@ fn rtc_lane_access_is_forwarded_to_isa() {
         target: component(15),
         operation: CrimeLinkOperation::Pio(CrimePioRequest {
             address: 0x1f3a_3707,
-            transfer: CrimeTransfer::Read { length: 1 },
+            transfer: CrimeTransfer::read(1),
         }),
     };
 
     BusDeviceRole::<CrimeCmiTransaction>::accept(&mut mace, request);
     assert!(matches!(mace.poll(), Ok(MacePoll::Action(_))));
+}
+
+#[test]
+fn uninterested_mace_does_not_construct_trace_actions() {
+    let mut mace = Mace::new(
+        component(15),
+        "MACE",
+        MaceConfig::default(),
+        wiring(),
+        1_000_000_000,
+    )
+    .expect("MACE must build");
+    mace.set_trace_interest(TraceInterest::None);
+    let request = CrimeCmiTransaction {
+        id: CrimeTransactionId::new(1),
+        controller: component(1),
+        target: component(15),
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address: 0x1fc0_0000,
+            transfer: CrimeTransfer::read(4),
+        }),
+    };
+
+    BusDeviceRole::<CrimeCmiTransaction>::accept(&mut mace, request);
+    let mut saw_hardware_action = false;
+    while let Ok(MacePoll::Action(action)) = mace.poll() {
+        assert!(!matches!(action, super::protocol::MaceAction::Trace(_)));
+        saw_hardware_action = true;
+    }
+    assert!(saw_hardware_action);
 }
 
 #[test]
@@ -129,4 +160,22 @@ fn host_queue_reports_capacity() {
         })
         .expect_err("zero-capacity host queue must reject input");
     assert_eq!(error, MaceError::HostPortFull(MediaPort::Ethernet));
+}
+
+#[test]
+fn hardware_actions_are_not_sized_by_inline_trace_fields() {
+    assert!(core::mem::size_of::<super::protocol::MaceAction>() <= 128);
+}
+
+#[test]
+fn crime_isa_conversions_move_compact_storage_without_length_loss() {
+    let read = super::to_isa_transfer(CrimeTransfer::read(512));
+    assert_eq!(read.view(), IsaTransferView::Read { length: 512 });
+
+    let result = super::from_isa_result(Ok(IsaCompletionPayload::ReadData(vec![0; 32].into())));
+    let Ok(CrimeCompletionPayload::ReadData(data)) = result else {
+        panic!("ISA read did not remain a CRIME read completion");
+    };
+    assert_eq!(data.len(), 32);
+    assert!(data.spilled());
 }

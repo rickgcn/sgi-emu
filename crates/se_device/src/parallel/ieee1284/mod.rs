@@ -8,7 +8,7 @@ use se_core::role::BusDeviceRole;
 use crate::bus::irq::{IrqOutput, IrqSource, IrqTransaction};
 use crate::bus::isa::{
     IsaBusError, IsaCompletion, IsaCompletionPayload, IsaDeviceResponse, IsaTransaction,
-    IsaTransfer,
+    IsaTransferView,
 };
 
 /// Parallel-port interrupt output.
@@ -96,19 +96,20 @@ impl BusDeviceRole<IsaTransaction> for Ieee1284 {
 
     fn accept(&mut self, transaction: IsaTransaction) -> Self::Response {
         let register = transaction.address as u8 & 7;
-        let result = match transaction.transfer {
-            IsaTransfer::Read { length: 1 } => {
-                Ok(IsaCompletionPayload::ReadData(vec![match register {
+        let result = match transaction.transfer.view() {
+            IsaTransferView::Read { length: 1 } => Ok(IsaCompletionPayload::ReadData(
+                [match register {
                     0 => self.data,
                     1 => self.status,
                     2 => self.control,
                     3 => self.epp_address,
                     4 => self.epp_data,
                     _ => 0xff,
-                }]))
-            }
-            IsaTransfer::Write { data, byte_enable }
-                if data.len() == 1 && byte_enable == [true] =>
+                }]
+                .into(),
+            )),
+            IsaTransferView::Write { data, byte_enable }
+                if data.len() == 1 && byte_enable.iter().eq([true]) =>
             {
                 match register {
                     0 => self.data = data[0],

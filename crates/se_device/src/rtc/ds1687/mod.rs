@@ -10,7 +10,7 @@ use se_core::scheduler::SimTime;
 use crate::bus::irq::{IrqOutput, IrqSource, IrqTransaction};
 use crate::bus::isa::{
     IsaBusError, IsaCompletion, IsaCompletionPayload, IsaDeviceResponse, IsaTransaction,
-    IsaTransfer,
+    IsaTransferView,
 };
 
 /// DS1687 interrupt output.
@@ -326,12 +326,12 @@ impl BusDeviceRole<IsaTransaction> for Ds1687 {
     type Response = IsaDeviceResponse;
 
     fn accept(&mut self, transaction: IsaTransaction) -> Self::Response {
-        let result = match transaction.transfer {
-            IsaTransfer::Read { length: 1 } => self
+        let result = match transaction.transfer.view() {
+            IsaTransferView::Read { length: 1 } => self
                 .read_register(transaction.address as usize, transaction.time)
-                .map(|value| IsaCompletionPayload::ReadData(vec![value])),
-            IsaTransfer::Write { data, byte_enable }
-                if data.len() == 1 && byte_enable.as_slice() == [true] =>
+                .map(|value| IsaCompletionPayload::ReadData([value].into())),
+            IsaTransferView::Write { data, byte_enable }
+                if data.len() == 1 && byte_enable.iter().eq([true]) =>
             {
                 self.write_register(transaction.address as usize, data[0], transaction.time)
                     .map(|()| IsaCompletionPayload::WriteComplete)
@@ -448,6 +448,7 @@ fn civil_from_days(days: i64) -> (i32, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::isa::IsaTransfer;
 
     #[test]
     fn default_epoch_is_2000_01_01() {
@@ -487,7 +488,7 @@ mod tests {
             controller: ComponentId::new(2),
             target: ComponentId::new(1),
             address,
-            transfer: IsaTransfer::Read { length: 1 },
+            transfer: IsaTransfer::read(1),
         }) {
             IsaDeviceResponse::Complete(IsaCompletion {
                 result: Ok(IsaCompletionPayload::ReadData(data)),

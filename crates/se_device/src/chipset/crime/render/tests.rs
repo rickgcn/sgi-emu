@@ -1,11 +1,11 @@
 use super::*;
 
 fn write_completion() -> Result<CrimeMemoryOutcome, CrimeBusError> {
-    Ok(CrimeMemoryOutcome {
-        payload: CrimeCompletionPayload::WriteComplete,
-        fault: None,
-        diagnostic: None,
-    })
+    Ok(CrimeMemoryOutcome::new(
+        CrimeCompletionPayload::WriteComplete,
+        None,
+        None,
+    ))
 }
 
 fn retire(render: &mut CrimeRender) -> RenderProgress {
@@ -117,7 +117,7 @@ fn linear_a_uses_high_then_low_entries_and_splits_at_page_boundaries() {
     assert_eq!(first.virtual_address, 0x0ff0);
     assert_eq!(first.physical_address, 0x2ff0);
     assert_eq!(first.data, vec![0; 16]);
-    assert!(first.byte_enable.into_iter().all(|enabled| enabled));
+    assert!(first.byte_enable.iter().all(|enabled| enabled));
 
     render.complete_memory(write_completion()).unwrap();
     let second = retire(&mut render).memory_write.unwrap();
@@ -277,11 +277,11 @@ fn unexpected_memory_results_are_explicit_errors() {
         .unwrap();
     retire(&mut render);
     assert_eq!(
-        render.complete_memory(Ok(CrimeMemoryOutcome {
-            payload: CrimeCompletionPayload::ReadData(vec![0]),
-            fault: None,
-            diagnostic: None,
-        })),
+        render.complete_memory(Ok(CrimeMemoryOutcome::new(
+            CrimeCompletionPayload::ReadData(vec![0].into()),
+            None,
+            None,
+        ))),
         Err(CrimeRenderError::UnexpectedMemoryPayload)
     );
 }

@@ -5,7 +5,7 @@ use se_core::role::BusDeviceRole;
 
 use crate::bus::isa::{
     IsaBusError, IsaCompletion, IsaCompletionPayload, IsaDeviceResponse, IsaTransaction,
-    IsaTransfer,
+    IsaTransferView,
 };
 
 /// System flash endpoint whose programming command set is intentionally absent.
@@ -51,8 +51,8 @@ impl BusDeviceRole<IsaTransaction> for ReadArrayFlash {
     type Response = IsaDeviceResponse;
 
     fn accept(&mut self, transaction: IsaTransaction) -> Self::Response {
-        let result = match transaction.transfer {
-            IsaTransfer::Read { length } if !self.bytes.is_empty() => {
+        let result = match transaction.transfer.view() {
+            IsaTransferView::Read { length } if !self.bytes.is_empty() => {
                 let start = transaction.address as usize % self.bytes.len();
                 let length = usize::from(length);
                 if start
@@ -60,14 +60,14 @@ impl BusDeviceRole<IsaTransaction> for ReadArrayFlash {
                     .is_some_and(|end| end <= self.bytes.len())
                 {
                     Ok(IsaCompletionPayload::ReadData(
-                        self.bytes[start..start + length].to_vec(),
+                        self.bytes[start..start + length].iter().copied().collect(),
                     ))
                 } else {
                     Err(IsaBusError::Address)
                 }
             }
-            IsaTransfer::Read { .. } => Err(IsaBusError::Address),
-            IsaTransfer::Write { .. } => Err(IsaBusError::ReadOnly),
+            IsaTransferView::Read { .. } => Err(IsaBusError::Address),
+            IsaTransferView::Write { .. } => Err(IsaBusError::ReadOnly),
         };
         IsaDeviceResponse::Complete(IsaCompletion {
             id: transaction.id,
@@ -79,7 +79,7 @@ impl BusDeviceRole<IsaTransaction> for ReadArrayFlash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::isa::IsaTransactionId;
+    use crate::bus::isa::{IsaTransactionId, IsaTransfer};
     use se_core::scheduler::SimTime;
 
     #[test]
@@ -91,10 +91,35 @@ mod tests {
             controller: ComponentId::new(2),
             target: ComponentId::new(1),
             address: 1,
-            transfer: IsaTransfer::Read { length: 2 },
+            transfer: IsaTransfer::read(2),
         });
         assert!(
             matches!(response, IsaDeviceResponse::Complete(IsaCompletion { result: Ok(IsaCompletionPayload::ReadData(data)), .. }) if data == [2, 3])
         );
+    }
+
+    #[test]
+    fn payloads_beyond_eight_bytes_use_block_storage() {
+        let mut flash = ReadArrayFlash::new(
+            ComponentId::new(1),
+            "flash",
+            (0..64).map(|value| value as u8).collect(),
+        );
+        let IsaDeviceResponse::Complete(IsaCompletion {
+            result: Ok(IsaCompletionPayload::ReadData(data)),
+            ..
+        }) = flash.accept(IsaTransaction {
+            id: IsaTransactionId::new(1),
+            time: SimTime::ZERO,
+            controller: ComponentId::new(2),
+            target: ComponentId::new(1),
+            address: 0,
+            transfer: IsaTransfer::read(32),
+        })
+        else {
+            panic!("flash read did not complete with data");
+        };
+        assert!(data.spilled());
+        assert_eq!(data.len(), 32);
     }
 }

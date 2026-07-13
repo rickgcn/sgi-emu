@@ -6,12 +6,12 @@
 //! component.
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
 
 use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::scheduler::SimTime;
-use se_core::tracing::TraceLevel;
+use se_core::tracing::{TraceInterest, TraceLevel};
 
 use crate::bus::i2c::{I2cCompletion, I2cRate, I2cTransaction};
 use crate::bus::irq::{IrqDelivery, IrqInput};
@@ -21,9 +21,9 @@ use crate::bus::isa::{
 use crate::bus::media::{MediaPayload, MediaPort, MediaTransaction};
 use crate::bus::pci::{PciCommand, PciCompletion, PciStatus, PciTransaction};
 use crate::chipset::crime::protocol::{
-    CrimeBusError, CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload,
+    CrimeBusError, CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeData,
     CrimeInterruptPost, CrimeLinkDeviceResponse, CrimeLinkOperation, CrimePioRequest,
-    CrimeTransactionId, CrimeTransfer,
+    CrimeTransactionId, CrimeTransfer, CrimeTransferView,
 };
 
 use self::audio::MaceAudio;
@@ -37,6 +37,7 @@ use self::protocol::{
 };
 use self::system::{MaceAddressTarget, MaceExternalIsaTarget};
 use self::video::VideoChannel;
+use crate::common::pending::{InlineMap16, InlineSet16};
 
 pub mod audio;
 pub mod config;
@@ -100,6 +101,9 @@ struct PendingIsa {
     cmi_id: CrimeTransactionId,
 }
 
+type PendingIsaTable = InlineMap16<IsaTransactionId, PendingIsa>;
+type PendingCmiSet = InlineSet16<CrimeTransactionId>;
+
 /// MACE 2.0 component.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mace {
@@ -112,8 +116,9 @@ pub struct Mace {
     epoch: u64,
     next_transaction_id: u128,
     actions: VecDeque<MaceAction>,
-    pending_isa: BTreeMap<IsaTransactionId, PendingIsa>,
-    pending_cmi: BTreeSet<CrimeTransactionId>,
+    trace_interest: TraceInterest,
+    pending_isa: PendingIsaTable,
+    pending_cmi: PendingCmiSet,
     terminal_error: Option<MaceError>,
     interrupts: MaceInterruptController,
     timers: MaceTimers,
@@ -150,8 +155,9 @@ impl Mace {
             epoch: 0,
             next_transaction_id: 0,
             actions: VecDeque::new(),
-            pending_isa: BTreeMap::new(),
-            pending_cmi: BTreeSet::new(),
+            trace_interest: TraceInterest::All,
+            pending_isa: PendingIsaTable::new(),
+            pending_cmi: PendingCmiSet::new(),
             terminal_error: None,
             interrupts: MaceInterruptController::new(),
             timers: MaceTimers::new(timebase_hz),
@@ -174,6 +180,20 @@ impl Mace {
     /// Observes the current simulation time before accepting work.
     pub fn observe_time(&mut self, now: SimTime) {
         self.now = now;
+    }
+
+    /// Updates the coarse trace interest supplied by the machine runtime.
+    pub fn set_trace_interest(&mut self, interest: TraceInterest) {
+        self.trace_interest = interest;
+    }
+
+    fn push_trace<F>(&mut self, build: F)
+    where
+        F: FnOnce() -> MaceTraceEvent,
+    {
+        if self.trace_interest != TraceInterest::None {
+            self.actions.push_back(MaceAction::Trace(Box::new(build())));
+        }
     }
 
     /// Applies power-on reset to volatile MACE state.
@@ -307,15 +327,16 @@ impl Mace {
         }
         let port = transaction.port;
         self.host_inputs.push_back(transaction);
-        self.actions.push_back(MaceAction::Trace(MaceTraceEvent {
+        self.push_trace(|| MaceTraceEvent {
             level: TraceLevel::Debug,
             target: trace::MEDIA,
             event: "host_input",
-            fields: vec![MaceTraceField {
+            fields: [MaceTraceField {
                 key: "port",
                 value: MaceTraceValue::String(media_port_name(port)),
-            }],
-        }));
+            }]
+            .into(),
+        });
         Ok(())
     }
 
@@ -375,11 +396,11 @@ impl Mace {
         let Some(resolution) = system::resolve(request.address, request.transfer.length()) else {
             return complete_cmi_error(id, CrimeBusError::Address);
         };
-        self.actions.push_back(MaceAction::Trace(MaceTraceEvent {
+        self.push_trace(|| MaceTraceEvent {
             level: TraceLevel::Trace,
             target: trace::CMI,
             event: "pio",
-            fields: vec![
+            fields: [
                 MaceTraceField {
                     key: "address",
                     value: MaceTraceValue::Hex64(request.address),
@@ -391,12 +412,13 @@ impl Mace {
                 MaceTraceField {
                     key: "write",
                     value: MaceTraceValue::Bool(matches!(
-                        &request.transfer,
-                        CrimeTransfer::Write { .. }
+                        request.transfer.view(),
+                        CrimeTransferView::Write { .. }
                     )),
                 },
-            ],
-        }));
+            ]
+            .into(),
+        });
         match resolution.target {
             MaceAddressTarget::SystemFlash => self.start_isa(
                 id,
@@ -464,15 +486,19 @@ impl Mace {
         address: u64,
         request: CrimePioRequest,
     ) -> CrimeLinkDeviceResponse<CrimeCmiCompletion> {
-        let command = match (&request.transfer, target) {
-            (CrimeTransfer::Read { .. }, MaceAddressTarget::PciIo) => PciCommand::IoRead,
-            (CrimeTransfer::Write { .. }, MaceAddressTarget::PciIo) => PciCommand::IoWrite,
-            (CrimeTransfer::Read { .. }, MaceAddressTarget::PciMemory) => PciCommand::MemoryRead,
-            (CrimeTransfer::Write { .. }, MaceAddressTarget::PciMemory) => PciCommand::MemoryWrite,
-            (CrimeTransfer::Read { .. }, MaceAddressTarget::PciConfiguration) => {
+        let command = match (request.transfer.view(), target) {
+            (CrimeTransferView::Read { .. }, MaceAddressTarget::PciIo) => PciCommand::IoRead,
+            (CrimeTransferView::Write { .. }, MaceAddressTarget::PciIo) => PciCommand::IoWrite,
+            (CrimeTransferView::Read { .. }, MaceAddressTarget::PciMemory) => {
+                PciCommand::MemoryRead
+            }
+            (CrimeTransferView::Write { .. }, MaceAddressTarget::PciMemory) => {
+                PciCommand::MemoryWrite
+            }
+            (CrimeTransferView::Read { .. }, MaceAddressTarget::PciConfiguration) => {
                 PciCommand::ConfigurationRead
             }
-            (CrimeTransfer::Write { .. }, MaceAddressTarget::PciConfiguration) => {
+            (CrimeTransferView::Write { .. }, MaceAddressTarget::PciConfiguration) => {
                 PciCommand::ConfigurationWrite
             }
             _ => return complete_cmi_error(cmi_id, CrimeBusError::Address),
@@ -508,7 +534,7 @@ impl Mace {
         let Some(&target) = self.wiring.pci_devices.get(usize::from(device)) else {
             return complete_cmi_error(cmi_id, CrimeBusError::Address);
         };
-        let command = if matches!(&request.transfer, CrimeTransfer::Read { .. }) {
+        let command = if matches!(request.transfer.view(), CrimeTransferView::Read { .. }) {
             PciCommand::ConfigurationRead
         } else {
             PciCommand::ConfigurationWrite
@@ -552,25 +578,25 @@ impl Mace {
         }
         let aligned_offset = if pci { offset } else { offset & !7 };
         let lane = if pci { 0 } else { (offset & 7) as usize };
-        match transfer {
-            CrimeTransfer::Read { .. } => {
+        match transfer.view() {
+            CrimeTransferView::Read { .. } => {
                 let value = self.read_internal(target, aligned_offset, width)?;
                 let encoded = encode_value(value, if pci { width } else { 8 });
                 Ok(CrimeCompletionPayload::ReadData(
-                    encoded[lane..lane + width].to_vec(),
+                    encoded[lane..lane + width].to_vec().into(),
                 ))
             }
-            CrimeTransfer::Write { data, byte_enable } => {
+            CrimeTransferView::Write { data, byte_enable } => {
                 if data.len() != byte_enable.len() || byte_enable.iter().any(|enabled| !enabled) {
                     return Err(CrimeBusError::Access);
                 }
                 let value = if pci || width == 8 {
-                    decode_value(&data)
+                    decode_value(data)
                 } else {
                     let current = self.read_internal(target, aligned_offset, 8)?;
                     let shift = (8 - lane - width) * 8;
                     let mask = ((1_u64 << (width * 8)) - 1) << shift;
-                    current & !mask | (decode_value(&data) << shift)
+                    current & !mask | (decode_value(data) << shift)
                 };
                 self.write_internal(target, aligned_offset, if pci { width } else { 8 }, value)?;
                 Ok(CrimeCompletionPayload::WriteComplete)
@@ -978,11 +1004,11 @@ impl Mace {
                 return;
             };
             self.pending_cmi.insert(id);
-            self.actions.push_back(MaceAction::Trace(MaceTraceEvent {
+            self.push_trace(|| MaceTraceEvent {
                 level: TraceLevel::Debug,
                 target: trace::INTERRUPT,
                 event: "post",
-                fields: vec![
+                fields: [
                     MaceTraceField {
                         key: "slot",
                         value: MaceTraceValue::U64(u64::from(bit)),
@@ -991,8 +1017,9 @@ impl Mace {
                         key: "asserted",
                         value: MaceTraceValue::Bool(asserted),
                     },
-                ],
-            }));
+                ]
+                .into(),
+            });
             self.actions
                 .push_back(MaceAction::StartCmi(CrimeCmiTransaction {
                     id,
@@ -1083,7 +1110,7 @@ impl BusControllerRole<PciCompletion> for Mace {
                 } else {
                     let mut data = completion.data;
                     data.reverse();
-                    Ok(CrimeCompletionPayload::ReadData(data))
+                    Ok(CrimeCompletionPayload::ReadData(data.into()))
                 }
             }
             PciStatus::Retry => Err(CrimeBusError::Timeout),
@@ -1169,19 +1196,16 @@ fn complete_cmi_error(
 }
 
 fn to_isa_transfer(transfer: CrimeTransfer) -> IsaTransfer {
-    match transfer {
-        CrimeTransfer::Read { length } => IsaTransfer::Read {
-            length: length as u8,
-        },
-        CrimeTransfer::Write { data, byte_enable } => IsaTransfer::Write { data, byte_enable },
-    }
+    IsaTransfer::from_compact(transfer.into_compact())
 }
 
 fn from_isa_result(
     result: Result<IsaCompletionPayload, IsaBusError>,
 ) -> Result<CrimeCompletionPayload, CrimeBusError> {
     match result {
-        Ok(IsaCompletionPayload::ReadData(data)) => Ok(CrimeCompletionPayload::ReadData(data)),
+        Ok(IsaCompletionPayload::ReadData(data)) => Ok(CrimeCompletionPayload::ReadData(
+            CrimeData::from_compact(data.into_compact()),
+        )),
         Ok(IsaCompletionPayload::WriteComplete) => Ok(CrimeCompletionPayload::WriteComplete),
         Err(IsaBusError::Address) => Err(CrimeBusError::Address),
         Err(IsaBusError::Access) => Err(CrimeBusError::Access),
@@ -1190,12 +1214,14 @@ fn from_isa_result(
 }
 
 fn crime_transfer_parts(transfer: &CrimeTransfer) -> (Vec<u8>, Vec<bool>) {
-    match transfer {
-        CrimeTransfer::Read { length } => (
-            vec![0; usize::from(*length)],
-            vec![true; usize::from(*length)],
+    match transfer.view() {
+        CrimeTransferView::Read { length } => (
+            vec![0; usize::from(length)],
+            vec![true; usize::from(length)],
         ),
-        CrimeTransfer::Write { data, byte_enable } => (data.clone(), byte_enable.clone()),
+        CrimeTransferView::Write { data, byte_enable } => {
+            (data.to_vec(), byte_enable.iter().collect())
+        }
     }
 }
 

@@ -2,7 +2,8 @@ use se_core::role::BusRole;
 
 use super::*;
 use crate::chipset::crime::protocol::{
-    CrimeMemoryBankSelect, CrimeMemoryInhibitReason, CrimeTransactionId, CrimeTransfer,
+    CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryInhibitReason, CrimeMemoryOutcome,
+    CrimeTransactionId, CrimeTransfer,
 };
 
 const BUS: ComponentId = ComponentId::new(1);
@@ -18,7 +19,7 @@ fn request(id: u128, client: CrimeMemoryClient) -> CrimeMemoryTransaction {
         address: 0,
         bank_select: CrimeMemoryBankSelect::Decode,
         no_ecc: false,
-        transfer: CrimeTransfer::Read { length: 8 },
+        transfer: CrimeTransfer::read(8),
     }
 }
 
@@ -29,7 +30,8 @@ fn first_request_schedules_service_and_later_requests_merge() {
     assert_eq!(
         bus.route(request(1, CrimeMemoryClient::Cpu)),
         CrimeBusDisposition::QueuedAndNeedsService {
-            delay: SimDuration::new(15)
+            delay: SimDuration::new(15),
+            epoch: 0,
         }
     );
     assert_eq!(
@@ -98,4 +100,26 @@ fn refresh_periods_are_accounted_lazily_when_work_arrives() {
 
     assert_eq!(bus.refresh_debt, 3);
     assert_eq!(bus.next_refresh_time, SimTime::new(108_000));
+}
+
+#[test]
+fn mismatched_completion_does_not_clear_in_flight_correlation() {
+    let mut bus = CrimeMemoryBus::new(BUS, "memory", RAM, 1_000_000_000, SimDuration::new(27_000));
+    bus.route(request(1, CrimeMemoryClient::Cpu));
+    bus.handle_event(bus.next_scheduled_event());
+    let _ = bus.poll();
+
+    let completion = |id| CrimeMemoryCompletion {
+        id: CrimeTransactionId::new(id),
+        result: Ok(CrimeMemoryOutcome::new(
+            CrimeCompletionPayload::WriteComplete,
+            None,
+            None,
+        )),
+    };
+    bus.accept_device_completion(completion(2));
+    assert_eq!(bus.poll(), CrimeBusAction::Idle);
+
+    bus.accept_device_completion(completion(1));
+    assert!(matches!(bus.poll(), CrimeBusAction::ScheduleService { .. }));
 }

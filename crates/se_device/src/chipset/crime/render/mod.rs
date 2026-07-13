@@ -4,8 +4,8 @@ use core::fmt;
 use std::collections::{BTreeMap, VecDeque};
 
 use super::protocol::{
-    CrimeBusError, CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryInhibitReason,
-    CrimeMemoryOutcome,
+    CrimeBusError, CrimeByteEnable, CrimeCompletionPayload, CrimeData, CrimeMemoryBankSelect,
+    CrimeMemoryInhibitReason, CrimeMemoryOutcome,
 };
 use super::registers;
 
@@ -117,8 +117,8 @@ pub(super) struct RenderMemoryWrite {
     pub(super) alias_address: u64,
     pub(super) physical_address: u64,
     pub(super) bank_select: CrimeMemoryBankSelect,
-    pub(super) data: Vec<u8>,
-    pub(super) byte_enable: Vec<bool>,
+    pub(super) data: CrimeData,
+    pub(super) byte_enable: CrimeByteEnable,
 }
 
 /// A software-visible Rendering Engine transition used for tracing.
@@ -571,8 +571,8 @@ impl CrimeRender {
             alias_address,
             physical_address,
             bank_select,
-            data: vec![0; length],
-            byte_enable: vec![true; length],
+            data: CrimeData::zeroed(length),
+            byte_enable: CrimeByteEnable::enabled(length),
         })
     }
 }

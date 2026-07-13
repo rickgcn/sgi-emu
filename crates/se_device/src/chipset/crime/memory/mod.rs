@@ -3,16 +3,14 @@
 pub mod bus;
 mod ecc;
 
-use std::collections::BTreeMap;
-
 use se_core::component::{Component, ComponentId};
 use se_core::role::BusDeviceRole;
 
 use super::config::{CrimeMemoryConfig, CrimeSdramBankConfig};
 use super::protocol::{
-    CrimeBusError, CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryCompletion,
-    CrimeMemoryDiagnostic, CrimeMemoryFault, CrimeMemoryOutcome, CrimeMemoryTransaction,
-    CrimeSdramSignal, CrimeTransfer,
+    CrimeBusError, CrimeByteEnableView, CrimeCompletionPayload, CrimeData, CrimeMemoryBankSelect,
+    CrimeMemoryCompletion, CrimeMemoryDiagnostic, CrimeMemoryFault, CrimeMemoryOutcome,
+    CrimeMemoryTransaction, CrimeSdramSignal, CrimeTransferView,
 };
 use super::registers;
 
@@ -33,63 +31,73 @@ enum BankSelection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SparseBank {
     config: CrimeSdramBankConfig,
-    pages: BTreeMap<u64, Box<[u8; PAGE_SIZE]>>,
-    ecc: BTreeMap<u64, u8>,
+    pages: Vec<Option<Box<SparsePage>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SparsePage {
+    data: [u8; PAGE_SIZE],
+    ecc: [u8; PAGE_SIZE / 8],
 }
 
 impl SparseBank {
     fn new(config: CrimeSdramBankConfig) -> Self {
         Self {
             config,
-            pages: BTreeMap::new(),
-            ecc: BTreeMap::new(),
+            pages: vec![None; config.size.bytes() as usize / PAGE_SIZE],
         }
     }
 
+    #[cfg(test)]
     fn read_byte(&self, offset: u64) -> u8 {
-        let page = offset / PAGE_SIZE as u64;
+        let page = offset as usize / PAGE_SIZE;
         let in_page = offset as usize % PAGE_SIZE;
-        self.pages.get(&page).map_or(0, |bytes| bytes[in_page])
-    }
-
-    fn write_byte(&mut self, offset: u64, value: u8) {
-        let page = offset / PAGE_SIZE as u64;
-        let in_page = offset as usize % PAGE_SIZE;
-        if value == 0 && !self.pages.contains_key(&page) {
-            return;
-        }
-        self.pages
-            .entry(page)
-            .or_insert_with(|| Box::new([0; PAGE_SIZE]))[in_page] = value;
+        self.pages[page]
+            .as_ref()
+            .map_or(0, |contents| contents.data[in_page])
     }
 
     fn read_lane(&self, offset: u64) -> (u64, u8) {
         let aligned = offset & !7;
+        let aligned = aligned as usize;
+        let page = aligned / PAGE_SIZE;
+        let in_page = aligned % PAGE_SIZE;
+        let lane = in_page / 8;
+        let Some(contents) = self.pages[page].as_ref() else {
+            return (0, 0);
+        };
         let mut bytes = [0; 8];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = self.read_byte(aligned + index as u64);
-        }
-        let data = u64::from_le_bytes(bytes);
-        let check = self.ecc.get(&(aligned / 8)).copied().unwrap_or(0);
-        (data, check)
+        bytes.copy_from_slice(&contents.data[in_page..in_page + 8]);
+        (u64::from_le_bytes(bytes), contents.ecc[lane])
     }
 
-    fn write_lane(&mut self, offset: u64, data: u64) {
+    fn write_lane(&mut self, offset: u64, data: u64, check: u8) {
         let aligned = offset & !7;
-        for (index, byte) in data.to_le_bytes().into_iter().enumerate() {
-            self.write_byte(aligned + index as u64, byte);
+        let aligned = aligned as usize;
+        let page = aligned / PAGE_SIZE;
+        let in_page = aligned % PAGE_SIZE;
+        let lane = in_page / 8;
+        if data == 0 && check == 0 && self.pages[page].is_none() {
+            return;
         }
-        let check = ecc::generate(data);
-        if check == 0 {
-            self.ecc.remove(&(aligned / 8));
-        } else {
-            self.ecc.insert(aligned / 8, check);
-        }
+        let contents = self.page_mut(page);
+        contents.data[in_page..in_page + 8].copy_from_slice(&data.to_le_bytes());
+        contents.ecc[lane] = check;
+    }
+
+    fn page_mut(&mut self, page: usize) -> &mut SparsePage {
+        self.pages[page]
+            .get_or_insert_with(|| {
+                Box::new(SparsePage {
+                    data: [0; PAGE_SIZE],
+                    ecc: [0; PAGE_SIZE / 8],
+                })
+            })
+            .as_mut()
     }
 
     fn clear(&mut self) {
-        self.pages.clear();
-        self.ecc.clear();
+        self.pages.fill(None);
     }
 }
 
@@ -150,17 +158,13 @@ impl CrimeSdram {
         else {
             return Err(CrimeBusError::Address);
         };
-        let (data, _) = self.banks[bank]
+        let (data, check) = self.banks[bank]
             .as_ref()
             .expect("decoded bank exists")
             .read_lane(offset);
         let corrupted = data ^ (1_u64 << bit);
-        let bytes = corrupted.to_le_bytes();
         let bank = self.banks[bank].as_mut().expect("decoded bank exists");
-        let aligned = offset & !7;
-        for (index, byte) in bytes.into_iter().enumerate() {
-            bank.write_byte(aligned + index as u64, byte);
-        }
+        bank.write_lane(offset, corrupted, check);
         Ok(())
     }
 
@@ -179,14 +183,14 @@ impl CrimeSdram {
         if length == 0 || length > MAX_TRANSFER_BYTES {
             return Err(CrimeBusError::Access);
         }
-        match &transaction.transfer {
-            CrimeTransfer::Read { .. }
+        match transaction.transfer.view() {
+            CrimeTransferView::Read { .. }
                 if matches!(transaction.bank_select, CrimeMemoryBankSelect::Decode) =>
             {
                 self.read(transaction.address, length, transaction.no_ecc)
             }
-            CrimeTransfer::Read { .. } => Ok(inhibited_read(transaction.address, length)),
-            CrimeTransfer::Write { data, byte_enable } => {
+            CrimeTransferView::Read { .. } => Ok(inhibited_read(transaction.address, length)),
+            CrimeTransferView::Write { data, byte_enable } => {
                 if byte_enable.len() != data.len() {
                     return Err(CrimeBusError::Access);
                 }
@@ -205,7 +209,7 @@ impl CrimeSdram {
         length: usize,
         no_ecc: bool,
     ) -> Result<CrimeMemoryOutcome, CrimeBusError> {
-        let mut output = vec![0; length];
+        let mut output = CrimeData::zeroed(length);
         let mut diagnostic = None;
         let mut fault = None;
         let mut position = 0;
@@ -234,49 +238,46 @@ impl CrimeSdram {
                 .as_ref()
                 .expect("decoded bank exists")
                 .read_lane(lane_offset);
-            let checked = if no_ecc || !self.ecc_enabled {
-                ecc::EccCheck::Clean {
-                    check: ecc::generate(data),
-                }
+            let readable = if no_ecc || !self.ecc_enabled {
+                data
             } else {
-                ecc::check(data, stored_check)
-            };
-            let readable = match checked {
-                ecc::EccCheck::Clean { .. } => data,
-                ecc::EccCheck::Corrected {
-                    data,
-                    syndrome,
-                    check,
-                } => {
-                    diagnostic.get_or_insert_with(|| {
-                        ecc_diagnostic(current, syndrome, check, true, false, false)
-                    });
-                    data
-                }
-                ecc::EccCheck::Uncorrectable { syndrome, check } => {
-                    diagnostic.get_or_insert_with(|| {
-                        ecc_diagnostic(current, syndrome, check, false, false, false)
-                    });
-                    fault.get_or_insert(CrimeMemoryFault::UncorrectableEcc);
-                    data
+                match ecc::check(data, stored_check) {
+                    ecc::EccCheck::Clean { .. } => data,
+                    ecc::EccCheck::Corrected {
+                        data,
+                        syndrome,
+                        check,
+                    } => {
+                        diagnostic.get_or_insert_with(|| {
+                            ecc_diagnostic(current, syndrome, check, true, false, false)
+                        });
+                        data
+                    }
+                    ecc::EccCheck::Uncorrectable { syndrome, check } => {
+                        diagnostic.get_or_insert_with(|| {
+                            ecc_diagnostic(current, syndrome, check, false, false, false)
+                        });
+                        fault.get_or_insert(CrimeMemoryFault::UncorrectableEcc);
+                        data
+                    }
                 }
             };
             let bytes = readable.to_le_bytes();
             output[position..position + count].copy_from_slice(&bytes[in_lane..in_lane + count]);
             position += count;
         }
-        Ok(CrimeMemoryOutcome {
-            payload: CrimeCompletionPayload::ReadData(output),
+        Ok(CrimeMemoryOutcome::new(
+            CrimeCompletionPayload::ReadData(output),
             fault,
             diagnostic,
-        })
+        ))
     }
 
     fn write(
         &mut self,
         address: u64,
         data: &[u8],
-        byte_enable: &[bool],
+        byte_enable: CrimeByteEnableView<'_>,
     ) -> Result<CrimeMemoryOutcome, CrimeBusError> {
         let mut diagnostic = None;
         let mut fault = None;
@@ -287,9 +288,11 @@ impl CrimeSdram {
             let count = (8 - in_lane).min(data.len() - position);
             let read_modify_write = in_lane != 0
                 || count != 8
-                || byte_enable[position..position + count]
-                    .iter()
-                    .any(|enabled| !enabled);
+                || (position..position + count).any(|index| {
+                    !byte_enable
+                        .is_enabled(index)
+                        .expect("validated byte-enable length covers write data")
+                });
             let Some(selection) = self.decode(current) else {
                 diagnostic
                     .get_or_insert_with(|| address_diagnostic(current, true, read_modify_write));
@@ -313,57 +316,59 @@ impl CrimeSdram {
                     .as_ref()
                     .expect("decoded bank exists")
                     .read_lane(lane_offset);
-                let old_data = match if self.ecc_enabled {
-                    ecc::check(old_data, stored_check)
+                let old_data = if self.ecc_enabled {
+                    match ecc::check(old_data, stored_check) {
+                        ecc::EccCheck::Clean { .. } => old_data,
+                        ecc::EccCheck::Corrected {
+                            data,
+                            syndrome,
+                            check,
+                        } => {
+                            diagnostic.get_or_insert_with(|| {
+                                ecc_diagnostic(current, syndrome, check, true, true, true)
+                            });
+                            data
+                        }
+                        ecc::EccCheck::Uncorrectable { syndrome, check } => {
+                            diagnostic.get_or_insert_with(|| {
+                                ecc_diagnostic(current, syndrome, check, false, true, true)
+                            });
+                            fault.get_or_insert(CrimeMemoryFault::UncorrectableEcc);
+                            old_data
+                        }
+                    }
                 } else {
-                    ecc::EccCheck::Clean {
-                        check: ecc::generate(old_data),
-                    }
-                } {
-                    ecc::EccCheck::Clean { .. } => old_data,
-                    ecc::EccCheck::Corrected {
-                        data,
-                        syndrome,
-                        check,
-                    } => {
-                        diagnostic.get_or_insert_with(|| {
-                            ecc_diagnostic(current, syndrome, check, true, true, true)
-                        });
-                        data
-                    }
-                    ecc::EccCheck::Uncorrectable { syndrome, check } => {
-                        diagnostic.get_or_insert_with(|| {
-                            ecc_diagnostic(current, syndrome, check, false, true, true)
-                        });
-                        fault.get_or_insert(CrimeMemoryFault::UncorrectableEcc);
-                        old_data
-                    }
+                    old_data
                 };
                 old_data.to_le_bytes()
             } else {
                 [0; 8]
             };
             for index in 0..count {
-                if byte_enable[position + index] {
+                if byte_enable
+                    .is_enabled(position + index)
+                    .expect("validated byte-enable length covers write data")
+                {
                     bytes[in_lane + index] = data[position + index];
                 }
             }
             let data = u64::from_le_bytes(bytes);
-            let replacement = self.use_replacement.then_some(self.replacement);
+            let check = if self.use_replacement {
+                self.replacement
+            } else {
+                ecc::generate(data)
+            };
             let bank = self.banks[bank_index]
                 .as_mut()
                 .expect("decoded bank exists");
-            bank.write_lane(lane_offset, data);
-            if let Some(check) = replacement {
-                bank.ecc.insert(lane_offset / 8, check);
-            }
+            bank.write_lane(lane_offset, data, check);
             position += count;
         }
-        Ok(CrimeMemoryOutcome {
-            payload: CrimeCompletionPayload::WriteComplete,
+        Ok(CrimeMemoryOutcome::new(
+            CrimeCompletionPayload::WriteComplete,
             fault,
             diagnostic,
-        })
+        ))
     }
 
     fn decode(&self, address: u64) -> Option<BankSelection> {
@@ -483,23 +488,32 @@ fn address_diagnostic(address: u64, write: bool, read_modify_write: bool) -> Cri
 }
 
 fn inhibited_read(address: u64, length: usize) -> CrimeMemoryOutcome {
-    CrimeMemoryOutcome {
-        payload: CrimeCompletionPayload::ReadData(vec![0; length]),
-        fault: Some(CrimeMemoryFault::Address),
-        diagnostic: Some(address_diagnostic(address, false, false)),
-    }
+    CrimeMemoryOutcome::new(
+        CrimeCompletionPayload::ReadData(CrimeData::zeroed(length)),
+        Some(CrimeMemoryFault::Address),
+        Some(address_diagnostic(address, false, false)),
+    )
 }
 
-fn inhibited_write(address: u64, data: &[u8], byte_enable: &[bool]) -> CrimeMemoryOutcome {
+fn inhibited_write(
+    address: u64,
+    data: &[u8],
+    byte_enable: CrimeByteEnableView<'_>,
+) -> CrimeMemoryOutcome {
     let in_lane = address as usize & 7;
     let count = (8 - in_lane).min(data.len());
-    let read_modify_write =
-        in_lane != 0 || count != 8 || byte_enable[..count].iter().any(|enabled| !enabled);
-    CrimeMemoryOutcome {
-        payload: CrimeCompletionPayload::WriteComplete,
-        fault: Some(CrimeMemoryFault::Address),
-        diagnostic: Some(address_diagnostic(address, true, read_modify_write)),
-    }
+    let read_modify_write = in_lane != 0
+        || count != 8
+        || (0..count).any(|index| {
+            !byte_enable
+                .is_enabled(index)
+                .expect("validated byte-enable length covers inhibited write")
+        });
+    CrimeMemoryOutcome::new(
+        CrimeCompletionPayload::WriteComplete,
+        Some(CrimeMemoryFault::Address),
+        Some(address_diagnostic(address, true, read_modify_write)),
+    )
 }
 
 const fn reset_bank_control(config: CrimeMemoryConfig) -> [u16; 8] {

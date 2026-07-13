@@ -5,3 +5,4 @@ pub mod irq;
 pub mod isa;
 pub mod media;
 pub mod pci;
+pub(crate) mod transfer;

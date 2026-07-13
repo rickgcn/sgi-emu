@@ -9,7 +9,7 @@ use se_core::scheduler::{SimDuration, SimTime};
 use super::super::clock::CrimeClock;
 use super::super::protocol::{
     CrimeBusAction, CrimeBusDisposition, CrimeMemoryClient, CrimeMemoryCompletion,
-    CrimeMemoryTransaction,
+    CrimeMemoryTransaction, CrimeTransactionId,
 };
 
 /// Scheduled event interpreted by the CRIME memory bus.
@@ -40,6 +40,12 @@ struct PendingCompletion {
     completion: CrimeMemoryCompletion,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InFlightMemory {
+    controller: ComponentId,
+    transaction_id: CrimeTransactionId,
+}
+
 /// CRIME MIU arbitration and ordering domain.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrimeMemoryBus {
@@ -58,7 +64,7 @@ pub struct CrimeMemoryBus {
     vice: VecDeque<CrimeMemoryTransaction>,
     render: VecDeque<CrimeMemoryTransaction>,
     cpu: VecDeque<CrimeMemoryTransaction>,
-    in_flight: Option<(ComponentId, CrimeMemoryTransaction)>,
+    in_flight: Option<InFlightMemory>,
     pending_completion: Option<PendingCompletion>,
     actions: VecDeque<CrimeBusAction<CrimeMemoryTransaction, CrimeMemoryCompletion>>,
 }
@@ -134,15 +140,15 @@ impl CrimeMemoryBus {
 
     /// Accepts the immediate response of the current SDRAM delivery.
     pub fn accept_device_completion(&mut self, completion: CrimeMemoryCompletion) {
-        let Some((controller, transaction)) = self.in_flight.take() else {
+        let Some(in_flight) = self.in_flight else {
             return;
         };
-        if transaction.id != completion.id {
-            self.in_flight = Some((controller, transaction));
+        if in_flight.transaction_id != completion.id {
             return;
         }
+        self.in_flight = None;
         self.pending_completion = Some(PendingCompletion {
-            controller,
+            controller: in_flight.controller,
             completion,
         });
         self.actions.push_back(CrimeBusAction::ScheduleService {
@@ -197,7 +203,11 @@ impl CrimeMemoryBus {
             return;
         };
         let controller = transaction.controller;
-        self.in_flight = Some((controller, transaction.clone()));
+        let transaction_id = transaction.id;
+        self.in_flight = Some(InFlightMemory {
+            controller,
+            transaction_id,
+        });
         self.actions.push_back(CrimeBusAction::Deliver {
             target: self.target,
             transaction,
@@ -303,6 +313,7 @@ impl BusRole<CrimeMemoryTransaction> for CrimeMemoryBus {
             self.service_scheduled = true;
             CrimeBusDisposition::QueuedAndNeedsService {
                 delay: self.clock.next_cycle(),
+                epoch: self.epoch,
             }
         }
     }

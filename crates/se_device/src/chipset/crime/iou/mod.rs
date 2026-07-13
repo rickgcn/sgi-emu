@@ -88,6 +88,7 @@ where
             self.service_scheduled = true;
             CrimeBusDisposition::QueuedAndNeedsService {
                 delay: self.clock.next_cycle(),
+                epoch: self.epoch,
             }
         }
     }

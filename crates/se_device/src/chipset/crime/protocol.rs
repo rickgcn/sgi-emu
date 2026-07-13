@@ -1,12 +1,18 @@
 //! Owned protocols used by CRIME and its communication domains.
 
 use core::fmt;
+use core::ops::{Deref, DerefMut};
+
+use smallvec::SmallVec;
 
 use se_core::component::ComponentId;
 use se_core::scheduler::{SimDuration, SimTime};
 use se_core::tracing::TraceLevel;
 
 use crate::bus::irq::{IrqOutput, IrqTransaction};
+use crate::bus::transfer::{
+    CompactByteEnable, CompactByteEnableView, CompactData, CompactTransfer, CompactTransferView,
+};
 use crate::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransaction};
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 
@@ -60,32 +66,208 @@ pub enum CrimeMemoryClient {
     Cpu,
 }
 
+/// Owned byte payload optimized for CRIME's common subblock transfers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CrimeData(CompactData);
+
+impl CrimeData {
+    /// Creates zero-filled data of the requested length.
+    pub fn zeroed(length: usize) -> Self {
+        Self(CompactData::zeroed(length))
+    }
+
+    /// Returns whether the payload spilled beyond inline storage.
+    pub fn spilled(&self) -> bool {
+        self.0.spilled()
+    }
+
+    pub(crate) fn from_compact(value: CompactData) -> Self {
+        Self(value)
+    }
+}
+
+impl Deref for CrimeData {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for CrimeData {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl AsRef<[u8]> for CrimeData {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl From<Vec<u8>> for CrimeData {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for CrimeData {
+    fn from(value: [u8; N]) -> Self {
+        Self(value.into_iter().collect())
+    }
+}
+
+impl FromIterator<u8> for CrimeData {
+    fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl PartialEq<Vec<u8>> for CrimeData {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_ref() == other.as_slice()
+    }
+}
+
+/// Owned byte-enable payload optimized for CRIME's common subblock transfers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CrimeByteEnable(CompactByteEnable);
+
+impl CrimeByteEnable {
+    /// Creates a payload with every lane enabled.
+    pub fn enabled(length: usize) -> Self {
+        Self(CompactByteEnable::enabled(length))
+    }
+
+    /// Returns whether the payload spilled beyond inline storage.
+    pub fn spilled(&self) -> bool {
+        self.0.spilled()
+    }
+}
+
+impl CrimeByteEnable {
+    /// Returns the number of represented byte lanes.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether no byte lanes are represented.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns one enable bit, or `None` when the lane is out of range.
+    pub fn is_enabled(&self, index: usize) -> Option<bool> {
+        self.0.is_enabled(index)
+    }
+
+    /// Iterates over enable bits in ascending lane order.
+    pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
+        self.0.iter()
+    }
+}
+
+impl From<Vec<bool>> for CrimeByteEnable {
+    fn from(value: Vec<bool>) -> Self {
+        Self(value.into_iter().collect())
+    }
+}
+
+impl<const N: usize> From<[bool; N]> for CrimeByteEnable {
+    fn from(value: [bool; N]) -> Self {
+        Self(value.into_iter().collect())
+    }
+}
+
+impl FromIterator<bool> for CrimeByteEnable {
+    fn from_iter<T: IntoIterator<Item = bool>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl PartialEq<Vec<bool>> for CrimeByteEnable {
+    fn eq(&self, other: &Vec<bool>) -> bool {
+        self.iter().eq(other.iter().copied())
+    }
+}
+
 /// Byte-oriented operation transported through a CRIME bus.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CrimeTransfer {
-    /// Reads a contiguous range of bytes.
+pub struct CrimeTransfer(CompactTransfer);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Borrowed byte-enable view for a CRIME write transfer.
+pub struct CrimeByteEnableView<'a>(CompactByteEnableView<'a>);
+
+impl<'a> CrimeByteEnableView<'a> {
+    /// Returns the number of represented byte lanes.
+    pub fn len(self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether no byte lanes are represented.
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns one enable bit, or `None` when the lane is out of range.
+    pub fn is_enabled(self, index: usize) -> Option<bool> {
+        self.0.is_enabled(index)
+    }
+
+    /// Iterates over enable bits in ascending lane order.
+    pub fn iter(self) -> impl Iterator<Item = bool> + 'a {
+        self.0.iter()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Borrowed view of a CRIME byte transfer.
+pub enum CrimeTransferView<'a> {
+    /// Read request with a byte length.
     Read {
         /// Requested byte count.
         length: u16,
     },
-
-    /// Writes selected bytes from a contiguous payload.
+    /// Write request with independent data and byte-enable lengths.
     Write {
-        /// Physical byte-lane data in ascending address order.
-        data: Vec<u8>,
-
-        /// One bit per payload byte; set bits enable their byte lanes.
-        byte_enable: Vec<bool>,
+        /// Bytes in ascending address order.
+        data: &'a [u8],
+        /// Per-byte write enables.
+        byte_enable: CrimeByteEnableView<'a>,
     },
 }
 
 impl CrimeTransfer {
+    /// Creates a read transfer without write-side storage.
+    pub const fn read(length: u16) -> Self {
+        Self(CompactTransfer::read(length))
+    }
+
+    /// Creates a write transfer while preserving independent payload lengths.
+    pub fn write(data: CrimeData, byte_enable: CrimeByteEnable) -> Self {
+        Self(CompactTransfer::write(data.0, byte_enable.0))
+    }
+
     /// Returns the transfer length in bytes.
     pub fn length(&self) -> usize {
-        match self {
-            Self::Read { length } => usize::from(*length),
-            Self::Write { data, .. } => data.len(),
+        self.0.length()
+    }
+
+    /// Borrows the strongly typed transfer contents.
+    pub fn view(&self) -> CrimeTransferView<'_> {
+        match self.0.view() {
+            CompactTransferView::Read { length } => CrimeTransferView::Read { length },
+            CompactTransferView::Write { data, byte_enable } => CrimeTransferView::Write {
+                data,
+                byte_enable: CrimeByteEnableView(byte_enable),
+            },
         }
+    }
+
+    pub(crate) fn into_compact(self) -> CompactTransfer {
+        self.0
     }
 }
 
@@ -141,7 +323,7 @@ pub struct CrimeMemoryTransaction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CrimeCompletionPayload {
     /// Read data in ascending physical byte-address order.
-    ReadData(Vec<u8>),
+    ReadData(CrimeData),
 
     /// A write completed.
     WriteComplete,
@@ -183,7 +365,47 @@ pub struct CrimeMemoryOutcome {
     pub fault: Option<CrimeMemoryFault>,
 
     /// ECC or address information captured while servicing the request.
-    pub diagnostic: Option<CrimeMemoryDiagnostic>,
+    diagnostic: Option<Box<CrimeMemoryDiagnostic>>,
+}
+
+impl CrimeMemoryOutcome {
+    /// Creates a memory outcome without exposing its cold-path storage.
+    pub fn new(
+        payload: CrimeCompletionPayload,
+        fault: Option<CrimeMemoryFault>,
+        diagnostic: Option<CrimeMemoryDiagnostic>,
+    ) -> Self {
+        Self {
+            payload,
+            fault,
+            diagnostic: diagnostic.map(Box::new),
+        }
+    }
+
+    /// Borrows the optional hardware diagnostic.
+    pub fn diagnostic(&self) -> Option<&CrimeMemoryDiagnostic> {
+        self.diagnostic.as_deref()
+    }
+
+    /// Removes and returns the optional hardware diagnostic.
+    pub fn take_diagnostic(&mut self) -> Option<CrimeMemoryDiagnostic> {
+        self.diagnostic.take().map(|diagnostic| *diagnostic)
+    }
+
+    /// Splits the outcome into its public protocol values.
+    pub fn into_parts(
+        self,
+    ) -> (
+        CrimeCompletionPayload,
+        Option<CrimeMemoryFault>,
+        Option<CrimeMemoryDiagnostic>,
+    ) {
+        (
+            self.payload,
+            self.fault,
+            self.diagnostic.map(|value| *value),
+        )
+    }
 }
 
 /// Completion returned through the CRIME memory domain.
@@ -370,6 +592,9 @@ pub enum CrimeBusDisposition {
     QueuedAndNeedsService {
         /// Delay before the first arbitration opportunity.
         delay: SimDuration,
+
+        /// Reset epoch used by the corresponding service event.
+        epoch: u64,
     },
 }
 
@@ -456,6 +681,43 @@ pub struct CrimeTraceField {
     pub value: CrimeTraceValue,
 }
 
+/// Ordered trace fields with inline storage for common CRIME events.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CrimeTraceFields(SmallVec<[CrimeTraceField; 8]>);
+
+impl CrimeTraceFields {
+    /// Returns whether the fields spilled beyond inline storage.
+    pub fn spilled(&self) -> bool {
+        self.0.spilled()
+    }
+}
+
+impl Deref for CrimeTraceFields {
+    type Target = [CrimeTraceField];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Vec<CrimeTraceField>> for CrimeTraceFields {
+    fn from(value: Vec<CrimeTraceField>) -> Self {
+        Self(SmallVec::from_vec(value))
+    }
+}
+
+impl<const N: usize> From<[CrimeTraceField; N]> for CrimeTraceFields {
+    fn from(value: [CrimeTraceField; N]) -> Self {
+        Self(value.into_iter().collect())
+    }
+}
+
+impl FromIterator<CrimeTraceField> for CrimeTraceFields {
+    fn from_iter<T: IntoIterator<Item = CrimeTraceField>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 /// Structured trace event generated by CRIME.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrimeTraceEvent {
@@ -469,11 +731,12 @@ pub struct CrimeTraceEvent {
     pub event: &'static str,
 
     /// Ordered fields.
-    pub fields: Vec<CrimeTraceField>,
+    pub fields: CrimeTraceFields,
 }
 
 /// Action emitted while polling CRIME.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum CrimeAction {
     /// Schedules an internal CRIME event.
     Schedule {
@@ -512,15 +775,127 @@ pub enum CrimeAction {
     SignalMemory(CrimeSdramSignal),
 
     /// Emits a structured trace fact.
-    Trace(CrimeTraceEvent),
+    Trace(Box<CrimeTraceEvent>),
 }
 
 /// Result of polling CRIME.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum CrimePoll {
     /// One pending action.
     Action(CrimeAction),
 
     /// No action is pending.
     Idle,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_payloads_inline_eight_bytes_and_spill_larger_transfers() {
+        for length in [0, 1, 4, 8, 9, 32, 33, 256, 512] {
+            let data = CrimeData::zeroed(length);
+            let enables = CrimeByteEnable::enabled(length);
+            assert_eq!(data.len(), length);
+            assert_eq!(enables.len(), length);
+            assert_eq!(data.spilled(), length > 8);
+            assert_eq!(enables.spilled(), length > 8);
+        }
+        for length in [0, 1, 4, 8, 9, 32, 33, 256, 512] {
+            let data = CrimeData::from(vec![0; length]);
+            assert_eq!(data.spilled(), length > 8);
+        }
+    }
+
+    #[test]
+    fn transfer_views_preserve_data_enable_lengths_and_bits() {
+        for length in [0, 1, 4, 8, 9, 32, 33, 256, 512] {
+            let data: CrimeData = (0..length).map(|index| index as u8).collect();
+            let enables: CrimeByteEnable = (0..length + 1).map(|index| index % 3 != 0).collect();
+            let transfer = CrimeTransfer::write(data, enables);
+            let CrimeTransferView::Write { data, byte_enable } = transfer.view() else {
+                panic!("write transfer changed variant");
+            };
+            assert_eq!(data.len(), length);
+            assert_eq!(byte_enable.len(), length + 1);
+            assert_eq!(
+                byte_enable.iter().collect::<Vec<_>>(),
+                (0..length + 1)
+                    .map(|index| index % 3 != 0)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn compact_crime_protocols_meet_hot_path_size_limits() {
+        assert!(core::mem::size_of::<CrimeMemoryTransaction>() <= 64);
+        assert!(core::mem::size_of::<CrimeMemoryCompletion>() <= 64);
+        assert!(core::mem::size_of::<CrimeCmiTransaction>() <= 64);
+        assert!(core::mem::size_of::<CrimeCgiTransaction>() <= 64);
+        assert!(
+            core::mem::size_of::<CrimeBusAction<CrimeMemoryTransaction, CrimeMemoryCompletion>>()
+                <= 96
+        );
+    }
+
+    #[test]
+    fn memory_outcome_hides_and_recovers_cold_diagnostics() {
+        let diagnostic = CrimeMemoryDiagnostic {
+            address: 0x1234,
+            syndrome: 1,
+            check: 2,
+            corrected: true,
+            write: false,
+            read_modify_write: false,
+        };
+        let mut outcome = CrimeMemoryOutcome::new(
+            CrimeCompletionPayload::WriteComplete,
+            None,
+            Some(diagnostic),
+        );
+        assert_eq!(outcome.diagnostic(), Some(&diagnostic));
+        assert_eq!(outcome.take_diagnostic(), Some(diagnostic));
+        assert_eq!(outcome.diagnostic(), None);
+
+        let outcome = CrimeMemoryOutcome::new(
+            CrimeCompletionPayload::WriteComplete,
+            Some(CrimeMemoryFault::Address),
+            Some(diagnostic),
+        );
+        assert_eq!(
+            outcome.into_parts(),
+            (
+                CrimeCompletionPayload::WriteComplete,
+                Some(CrimeMemoryFault::Address),
+                Some(diagnostic)
+            )
+        );
+    }
+
+    #[test]
+    fn trace_fields_inline_eight_entries() {
+        let fields: CrimeTraceFields = (0..8)
+            .map(|_| CrimeTraceField {
+                key: "field",
+                value: CrimeTraceValue::U64(0),
+            })
+            .collect();
+        assert!(!fields.spilled());
+
+        let fields: CrimeTraceFields = (0..9)
+            .map(|_| CrimeTraceField {
+                key: "field",
+                value: CrimeTraceValue::U64(0),
+            })
+            .collect();
+        assert!(fields.spilled());
+    }
+
+    #[test]
+    fn hardware_actions_are_not_sized_by_inline_trace_fields() {
+        assert!(core::mem::size_of::<CrimeAction>() <= 96);
+    }
 }

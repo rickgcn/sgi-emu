@@ -9,7 +9,7 @@ use se_core::scheduler::SimDuration;
 use crate::bus::irq::{IrqOutput, IrqSource, IrqTransaction};
 use crate::bus::isa::{
     IsaBusError, IsaCompletion, IsaCompletionPayload, IsaDeviceResponse, IsaTransaction,
-    IsaTransfer,
+    IsaTransferView,
 };
 
 /// Interrupt output driven by a UART.
@@ -589,12 +589,12 @@ impl BusDeviceRole<IsaTransaction> for Uart16550 {
     type Response = IsaDeviceResponse;
 
     fn accept(&mut self, transaction: IsaTransaction) -> Self::Response {
-        let result = match transaction.transfer {
-            IsaTransfer::Read { length: 1 } => self
+        let result = match transaction.transfer.view() {
+            IsaTransferView::Read { length: 1 } => self
                 .read(transaction.address as u8)
-                .map(|value| IsaCompletionPayload::ReadData(vec![value])),
-            IsaTransfer::Write { data, byte_enable }
-                if data.len() == 1 && byte_enable == [true] =>
+                .map(|value| IsaCompletionPayload::ReadData([value].into())),
+            IsaTransferView::Write { data, byte_enable }
+                if data.len() == 1 && byte_enable.iter().eq([true]) =>
             {
                 self.write(transaction.address as u8, data[0])
                     .map(|()| IsaCompletionPayload::WriteComplete)
@@ -611,7 +611,7 @@ impl BusDeviceRole<IsaTransaction> for Uart16550 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::isa::IsaTransactionId;
+    use crate::bus::isa::{IsaTransactionId, IsaTransfer};
     use se_core::scheduler::SimTime;
 
     const UART: ComponentId = ComponentId::new(1);
@@ -637,10 +637,7 @@ mod tests {
             controller: CONTROLLER,
             target: UART,
             address: register,
-            transfer: IsaTransfer::Write {
-                data: vec![value],
-                byte_enable: vec![true],
-            },
+            transfer: IsaTransfer::write([value].into(), [true].into()),
         });
         assert!(matches!(
             response,
@@ -661,7 +658,7 @@ mod tests {
             controller: CONTROLLER,
             target: UART,
             address: register,
-            transfer: IsaTransfer::Read { length: 1 },
+            transfer: IsaTransfer::read(1),
         })
         else {
             panic!("UART read must complete")
