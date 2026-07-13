@@ -42,6 +42,40 @@ fn interface_buffer_enforces_sixty_four_entry_capacity() {
 }
 
 #[test]
+fn interface_control_is_prom_readable_and_reserved_sink_remains_write_only() {
+    let mut render = CrimeRender::new();
+    assert_eq!(render.read(INTERFACE_CONTROL, 4), Some(0));
+
+    render.write(INTERFACE_CONTROL, 4, 1).unwrap();
+    assert_eq!(render.interface_level(), 1);
+    assert_eq!(render.read(INTERFACE_CONTROL, 4), Some(0));
+
+    retire(&mut render);
+    assert_eq!(render.interface_level(), 0);
+    assert_eq!(render.read(INTERFACE_CONTROL, 4), Some(1));
+
+    render.write(INTERFACE_RESERVED_WRITE_SINK, 4, 0).unwrap();
+    assert_eq!(render.read(INTERFACE_RESERVED_WRITE_SINK, 4), None);
+}
+
+#[test]
+fn window_offsets_accept_the_prom_doubleword_initialization() {
+    let mut render = CrimeRender::new();
+    for offset in [0x50, 0x58] {
+        queue_and_retire(
+            &mut render,
+            PIXEL_PIPE_BASE + offset,
+            8,
+            0x1234_5678_9abc_def0,
+        );
+        assert_eq!(
+            render.read(PIXEL_PIPE_BASE + offset, 8),
+            Some(0x1234_5678_9abc_def0)
+        );
+    }
+}
+
+#[test]
 fn tagged_mte_write_is_canonicalized_and_tagged_reads_are_rejected() {
     let mut render = CrimeRender::new();
     render
@@ -61,6 +95,18 @@ fn tagged_mte_write_is_canonicalized_and_tagged_reads_are_rejected() {
         render.write(PIXEL_PIPE_BASE + START_OFFSET, 4, 0),
         Err(RenderWriteError::UndefinedRegister)
     );
+}
+
+#[test]
+fn tagged_pixel_null_and_flush_retire_without_starting_an_mte_job() {
+    let mut render = CrimeRender::new();
+    for address in [PIXEL_PIPE_NULL, PIXEL_PIPE_FLUSH] {
+        render.write(address + START_OFFSET, 4, 0).unwrap();
+        let progress = retire(&mut render);
+        assert!(progress.memory_write.is_none());
+        assert!(render.active_job.is_none());
+        assert_eq!(render.registers.get(&address), Some(&0));
+    }
 }
 
 #[test]

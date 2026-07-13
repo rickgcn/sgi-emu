@@ -242,10 +242,43 @@ fn doubleword_id_read_returns_crime_11_identity_in_big_endian_lanes() {
 }
 
 #[test]
-fn word_access_to_piu_is_a_precise_bus_error() {
+fn word_reads_select_big_endian_lanes_from_the_sysad_doubleword() {
     let mut crime = crime();
     crime
         .accept(read(1, registers::ID, Mips4ExecutionTransferSize::Word))
+        .unwrap();
+
+    assert_eq!(
+        next_non_trace(&mut crime),
+        CrimeAction::CompleteSysAd(ExecutionCompletion {
+            id: ExecutionTransactionId::new(1),
+            payload: Mips4ExecutionCompletion::ReadData(0),
+        })
+    );
+
+    crime
+        .accept(read(2, registers::ID + 4, Mips4ExecutionTransferSize::Word))
+        .unwrap();
+
+    assert_eq!(
+        next_non_trace(&mut crime),
+        CrimeAction::CompleteSysAd(ExecutionCompletion {
+            id: ExecutionTransactionId::new(2),
+            payload: Mips4ExecutionCompletion::ReadData(0xa100_0000),
+        })
+    );
+}
+
+#[test]
+fn word_writes_to_piu_remain_precise_bus_errors() {
+    let mut crime = crime();
+    crime
+        .accept(write(
+            1,
+            registers::CONTROL + 4,
+            Mips4ExecutionTransferSize::Word,
+            0,
+        ))
         .unwrap();
 
     assert!(matches!(

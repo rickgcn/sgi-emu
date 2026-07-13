@@ -31,7 +31,7 @@ const ADDIU_R2_1: u32 = 0x2402_0001;
 const ADDIU_R2_SOFT_RESET: u32 = 0x2402_0400;
 const SW_R2_R1: u32 = 0xac22_0000;
 const LW_R3_R1: u32 = 0x8c23_0000;
-const LD_R3_R1: u32 = 0xdc23_0000;
+const LW_R3_R1_LOW_WORD: u32 = 0x8c23_0004;
 const SD_R2_R1_CONTROL: u32 = 0xfc22_0008;
 const SD_R2_R1_INTERRUPT_ENABLE: u32 = 0xfc22_0018;
 const SD_R2_R1_SOFTWARE_INTERRUPT: u32 = 0xfc22_0020;
@@ -848,8 +848,8 @@ fn dallas_nvram_access_crosses_cmi_and_isa() {
 }
 
 #[test]
-fn crime_piu_requires_doubleword_access_through_the_cpu_path() {
-    let config = config_with_program(&[(0, LUI_R1_CRIME), (4, LD_R3_R1), (8, WAIT)]);
+fn crime_piu_read_supports_prom_word_lane_selection_through_the_cpu_path() {
+    let config = config_with_program(&[(0, LUI_R1_CRIME), (4, LW_R3_R1_LOW_WORD), (8, WAIT)]);
     let mut machine = Ip32Machine::from_config(config).unwrap();
 
     machine.schedule_power_on().unwrap();

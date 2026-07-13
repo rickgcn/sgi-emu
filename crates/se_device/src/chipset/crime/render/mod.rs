@@ -10,8 +10,12 @@ use super::protocol::{
 use super::registers;
 
 const TLB_BASE: u64 = registers::CRIME_RENDER_BASE + 0x1000;
+const INTERFACE_CONTROL: u64 = registers::CRIME_RENDER_BASE + 0x400;
+const INTERFACE_RESERVED_WRITE_SINK: u64 = registers::CRIME_RENDER_BASE + 0x408;
 const LINEAR_A_BASE: u64 = TLB_BASE + 0x700;
 const PIXEL_PIPE_BASE: u64 = registers::CRIME_RENDER_BASE + 0x2000;
+const PIXEL_PIPE_NULL: u64 = PIXEL_PIPE_BASE + 0x1f0;
+const PIXEL_PIPE_FLUSH: u64 = PIXEL_PIPE_BASE + 0x1f8;
 const MTE_BASE: u64 = registers::CRIME_RENDER_BASE + 0x3000;
 const STATUS_BASE: u64 = registers::CRIME_RENDER_BASE + 0x4000;
 const START_OFFSET: u64 = 0x800;
@@ -323,7 +327,11 @@ impl CrimeRender {
         let Some(access) = register_access(address, size) else {
             return Err(RenderWriteError::UndefinedRegister);
         };
-        if !access.writable || commit && !(MTE_BASE..=MTE_BASE + 0x78).contains(&address) {
+        if !access.writable
+            || commit
+                && !(MTE_BASE..=MTE_BASE + 0x78).contains(&address)
+                && !matches!(address, PIXEL_PIPE_NULL | PIXEL_PIPE_FLUSH)
+        {
             return Err(RenderWriteError::UndefinedRegister);
         }
         if !self.has_interface_space() {
@@ -391,15 +399,19 @@ impl CrimeRender {
         progress.notices.push(RenderNotice::RegisterRetired(write));
 
         if write.commit {
-            let job = self.snapshot_prom_clear_job()?;
-            progress.notices.push(RenderNotice::JobCommitted {
-                start: job.start,
-                end: job.end as u32,
-            });
-            self.active_job = Some(job);
-            let memory_write = self.prepare_memory_write()?;
-            append_memory_notices(&mut progress.notices, &memory_write);
-            progress.memory_write = Some(memory_write);
+            if (MTE_BASE..=MTE_BASE + 0x78).contains(&write.address) {
+                let job = self.snapshot_prom_clear_job()?;
+                progress.notices.push(RenderNotice::JobCommitted {
+                    start: job.start,
+                    end: job.end as u32,
+                });
+                self.active_job = Some(job);
+                let memory_write = self.prepare_memory_write()?;
+                append_memory_notices(&mut progress.notices, &memory_write);
+                progress.memory_write = Some(memory_write);
+            } else {
+                progress.schedule_step = self.ensure_step_scheduled();
+            }
         } else {
             progress.schedule_step = self.ensure_step_scheduled();
         }
@@ -628,7 +640,10 @@ const READ_ONLY: RegisterAccess = RegisterAccess {
 };
 
 const fn canonical_write_address(address: u64) -> (u64, bool) {
-    if address >= MTE_BASE + START_OFFSET && address <= MTE_BASE + START_OFFSET + 0x78 {
+    if (address >= MTE_BASE + START_OFFSET && address <= MTE_BASE + START_OFFSET + 0x78)
+        || address == PIXEL_PIPE_NULL + START_OFFSET
+        || address == PIXEL_PIPE_FLUSH + START_OFFSET
+    {
         (address - START_OFFSET, true)
     } else {
         (address, false)
@@ -636,6 +651,12 @@ const fn canonical_write_address(address: u64) -> (u64, bool) {
 }
 
 const fn register_access(address: u64, size: u8) -> Option<RegisterAccess> {
+    if address == INTERFACE_CONTROL && size == 4 {
+        return Some(READ_WRITE);
+    }
+    if address == INTERFACE_RESERVED_WRITE_SINK && size == 4 {
+        return Some(WRITE_ONLY);
+    }
     if address >= TLB_BASE && address <= TLB_BASE + 0x7f8 {
         return if size == 8 && address & 7 == 0 {
             Some(READ_WRITE)
@@ -646,13 +667,13 @@ const fn register_access(address: u64, size: u8) -> Option<RegisterAccess> {
     if address >= PIXEL_PIPE_BASE && address <= PIXEL_PIPE_BASE + 0x1f8 {
         let offset = address - PIXEL_PIPE_BASE;
         let access = match offset {
-            0x000 | 0x008 | 0x010 | 0x018 | 0x050 | 0x058 | 0x0c0 | 0x0c4 | 0x0d8 | 0x110
-            | 0x160 | 0x168 | 0x170 | 0x198 | 0x1a0 | 0x1a8 | 0x1b0 | 0x1b8 | 0x1c0 | 0x1e0
-            | 0x1e8
+            0x000 | 0x008 | 0x010 | 0x018 | 0x0c0 | 0x0c4 | 0x0d8 | 0x110 | 0x160 | 0x168
+            | 0x170 | 0x198 | 0x1a0 | 0x1a8 | 0x1b0 | 0x1b8 | 0x1c0 | 0x1e0 | 0x1e8
                 if size == 4 =>
             {
                 READ_WRITE
             }
+            0x050 | 0x058 if size == 4 || size == 8 => READ_WRITE,
             0x020 | 0x028 | 0x030 | 0x038 | 0x040 | 0x048 | 0x118 if size == 8 => READ_WRITE,
             0x060 | 0x070 | 0x074 | 0x078 | 0x080 | 0x084 | 0x088 | 0x08c | 0x090 | 0x094
             | 0x0a0 | 0x0a8 | 0x0ac | 0x0b0 | 0x0b4 | 0x0d0 | 0x0e0 | 0x0e4 | 0x0e8 | 0x0ec

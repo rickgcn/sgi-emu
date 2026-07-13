@@ -481,10 +481,14 @@ impl Crime {
     ) -> Result<(), CrimeError> {
         let (address, size) = transaction_shape(transaction);
         let completion = if address < registers::CRIME_RENDER_BASE {
-            if size != 8 || address & 7 != 0 {
-                Mips4ExecutionCompletion::BusError
-            } else {
-                self.access_control_register(transaction, now)
+            match transaction {
+                Mips4ExecutionTransaction::Read { .. } if size == 4 && address & 3 == 0 => {
+                    self.access_control_register_word(address, now)
+                }
+                _ if size == 8 && address & 7 == 0 => {
+                    self.access_control_register(transaction, now)
+                }
+                _ => Mips4ExecutionCompletion::BusError,
             }
         } else {
             match self.access_render_register(execution_id, transaction)? {
@@ -558,11 +562,7 @@ impl Crime {
         let (address, _) = transaction_shape(transaction);
         match transaction {
             Mips4ExecutionTransaction::Read { .. } => {
-                let value = self
-                    .piu
-                    .read(address, now, self.timebase_hz)
-                    .or_else(|| self.read_memory_register(address));
-                match value {
+                match self.read_control_register(address, now) {
                     Some(value) => Mips4ExecutionCompletion::ReadData(value.swap_bytes()),
                     None => self.unsupported_read_completion(),
                 }
@@ -585,6 +585,29 @@ impl Crime {
                 }
             }
         }
+    }
+
+    fn access_control_register_word(&self, address: u64, now: SimTime) -> Mips4ExecutionCompletion {
+        let register_address = address & !7;
+        let Some(value) = self.read_control_register(register_address, now) else {
+            return self.unsupported_read_completion();
+        };
+
+        // The execution request retains the CPU load width, while R5000 SysAD
+        // obtains the complete aligned doubleword and selects the requested
+        // big-endian word lane inside the processor.
+        let word = if address & 4 == 0 {
+            (value >> 32) as u32
+        } else {
+            value as u32
+        };
+        Mips4ExecutionCompletion::ReadData(encode_big_endian(u64::from(word), 4))
+    }
+
+    fn read_control_register(&self, address: u64, now: SimTime) -> Option<u64> {
+        self.piu
+            .read(address, now, self.timebase_hz)
+            .or_else(|| self.read_memory_register(address))
     }
 
     fn access_render_register(
