@@ -17,7 +17,7 @@ use super::event::Ip32Event;
 pub(super) const DEFAULT_EVENT_CHAIN_BUDGET: u8 = 16;
 
 /// Event class controlled by the IP32 event-chain policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) enum Ip32EventChainClass {
     SysAd,
     Memory,
@@ -27,14 +27,14 @@ pub(super) enum Ip32EventChainClass {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) enum LogicalTransitionPhase {
     Service,
     Complete,
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct LogicalTransition {
     pub(super) time: SimTime,
     pub(super) target: ComponentId,
@@ -43,7 +43,7 @@ pub(super) struct LogicalTransition {
 }
 
 /// Machine-private policy selecting inline IP32 bus transitions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct Ip32EventChainPolicy {
     pub(super) sysad: bool,
     pub(super) memory: bool,
@@ -88,13 +88,13 @@ impl Ip32EventChainPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum CompactBusPhase {
     Service,
     Complete,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct CompactIp32BusEvent {
     epoch: u64,
     class: Ip32EventChainClass,

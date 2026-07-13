@@ -58,6 +58,7 @@ use se_device::cpu::mips4::model::r5000::revision::R5000Revision;
 use se_device::memory::ds2502::{Ds2502, Ds2502Action, Ds2502Config, Ds2502Error};
 use se_device::memory::flash::ReadArrayFlash;
 use se_device::parallel::ieee1284::{IEEE1284_IRQ_OUTPUT, Ieee1284, Ieee1284Action};
+use se_device::rtc::ds1687::state::{Ds1687PersistentState, Ds1687StateError};
 use se_device::rtc::ds1687::{DS1687_IRQ_OUTPUT, Ds1687, Ds1687Action, Ds1687Config, Ds1687Error};
 use se_device::serial::uart16550::{
     UART16550_IRQ_OUTPUT, Uart16550, Uart16550Action, Uart16550Config, Uart16550Error,
@@ -75,6 +76,10 @@ use super::dispatch::{Ip32DispatchContext, Ip32EventChainPolicy};
 use super::event::{
     Ip32Event, Ip32HostInput, Ip32HostIoStats, Ip32HostOutput, Ip32SerialOutput, Ip32SerialPort,
 };
+use super::state::{
+    IP32_STATE_SCHEMA_VERSION, Ip32MachineState, Ip32PersistentConfig, Ip32StateError,
+    MachineControlState,
+};
 use super::timing::IP32_TIMEBASE_HZ;
 
 const DEFAULT_PROCESSOR_FREQUENCY_HZ: u64 = 180_000_000;
@@ -90,7 +95,7 @@ const UART_INPUT_CLOCK_HZ: u64 = 22_000_000;
 const DEFAULT_CPU_CONTINUATION_QUANTUM: usize = 256;
 
 /// Complete construction input for one IP32 machine.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ip32MachineConfig {
     /// R5000 processor identity, byte order, clocks, and cache geometry.
     pub processor: R5000Profile,
@@ -390,6 +395,7 @@ impl CpuClock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MachineControl {
     slots: HotComponentSlots,
+    persistent_config: Ip32PersistentConfig,
     cpu_generation: u64,
     cpu_clock: CpuClock,
     host_generation: u64,
@@ -456,7 +462,7 @@ impl HotComponentSlots {
 }
 
 /// Cumulative performance counters for one IP32 machine.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ip32PerformanceSnapshot {
     /// Current internal simulated time.
     pub sim_time: SimTime,
@@ -518,6 +524,7 @@ impl<S> Ip32Machine<S> {
         sink: S,
     ) -> Result<Self, Ip32MachineBuildError> {
         validate_config(&config)?;
+        let persistent_config = Ip32PersistentConfig::from_machine_config(&config);
         let processor_frequency_hz = config.processor.processor_frequency_hz;
         let cpu = R5000Cpu::new(
             component_ids::CPU0,
@@ -796,6 +803,7 @@ impl<S> Ip32Machine<S> {
             runtime,
             control: MachineControl {
                 slots,
+                persistent_config,
                 cpu_generation: 0,
                 cpu_clock: CpuClock::new(processor_frequency_hz),
                 host_generation: 0,
@@ -956,6 +964,385 @@ impl<S> Ip32Machine<S> {
             cgi_transactions: self.control.cgi_transactions,
         }
     }
+
+    /// Captures the battery-backed RTC and NVRAM image at the current simulated time.
+    pub fn rtc_persistent_state(&self) -> Result<Ds1687PersistentState, RegistryLookupError> {
+        self.runtime
+            .registry()
+            .get_typed::<Ds1687>(component_ids::RTC)
+            .map(|rtc| rtc.persistent_state(self.runtime.now()))
+    }
+
+    /// Applies battery-backed RTC and NVRAM data to a newly constructed machine.
+    pub fn restore_rtc_persistent_state(
+        &mut self,
+        state: &Ds1687PersistentState,
+    ) -> Result<(), RestoreRtcPersistentStateError> {
+        let now = self.runtime.now();
+        self.runtime
+            .registry_mut()
+            .get_typed_mut::<Ds1687>(component_ids::RTC)
+            .map_err(RestoreRtcPersistentStateError::Registry)?
+            .restore_persistent_state(state, now)
+            .map_err(RestoreRtcPersistentStateError::Rtc)
+    }
+
+    /// Captures the complete deterministic machine state at an outer event boundary.
+    pub fn save_state(&self) -> Result<Ip32MachineState, Ip32StateError>
+    where
+        Ip32Event: Clone,
+    {
+        let registry = self.runtime.registry();
+        let component = |id| {
+            registry
+                .get(id)
+                .ok_or(RegistryLookupError::MissingComponent { id })
+        };
+        let _ = component(component_ids::CPU0).map_err(Ip32StateError::Registry)?;
+        Ok(Ip32MachineState {
+            schema_version: IP32_STATE_SCHEMA_VERSION,
+            config: self.control.persistent_config.clone(),
+            runtime: self.runtime.save_state(),
+            control: MachineControlState {
+                cpu_generation: self.control.cpu_generation,
+                cpu_clock_remainder: self.control.cpu_clock.remainder,
+                host_generation: self.control.host_generation,
+                host_capacities: self.control.host_capacities,
+                host_reservations: self.control.host_reservations,
+                host_outputs: self.control.host_outputs.iter().cloned().collect(),
+                host_output_units: self.control.host_output_units,
+                host_dropped_output_bytes: self.control.host_dropped_output_bytes,
+                sysad_transactions: self.control.sysad_transactions,
+                memory_transactions: self.control.memory_transactions,
+                cmi_transactions: self.control.cmi_transactions,
+                cgi_transactions: self.control.cgi_transactions,
+                cpu_continuation_quantum: self.control.cpu_continuation_quantum,
+                inline_sysad_completion: self.control.inline_sysad_completion,
+                fusion_sysad: self.control.event_chain_policy.sysad,
+                fusion_memory: self.control.event_chain_policy.memory,
+                fusion_cmi: self.control.event_chain_policy.cmi,
+                fusion_cgi: self.control.event_chain_policy.cgi,
+                fusion_isa: self.control.event_chain_policy.isa,
+                fusion_budget: self.control.event_chain_policy.budget,
+            },
+            cpu: save_component(registry, component_ids::CPU0, R5000Cpu::save_state)?,
+            sysad: save_component(
+                registry,
+                component_ids::CPU_SYSAD_BUS,
+                Ip32SysAdBus::save_state,
+            )?,
+            cpu_irq: save_component(registry, component_ids::CPU_IRQ_BUS, IrqBus::save_state)?,
+            mace_irq: save_component(registry, component_ids::MACE_IRQ_BUS, IrqBus::save_state)?,
+            one_wire: save_component(
+                registry,
+                component_ids::ONE_WIRE_BUS,
+                OneWireBus::save_state,
+            )?,
+            crime: save_component(registry, component_ids::CRIME, Crime::save_state)?,
+            memory_bus: save_component(
+                registry,
+                component_ids::CRIME_MEMORY_DOMAIN,
+                CrimeMemoryBus::save_state,
+            )?,
+            cmi: save_component(
+                registry,
+                component_ids::CRIME_MACE_LINK,
+                CrimeCmiBus::save_state,
+            )?,
+            cgi: save_component(
+                registry,
+                component_ids::CRIME_GBE_LINK,
+                CrimeCgiBus::save_state,
+            )?,
+            sdram: save_component(registry, component_ids::RAM, CrimeSdram::save_state)?,
+            isa: save_component(registry, component_ids::ISA_BUS, IsaBus::save_state)?,
+            pci: save_component(registry, component_ids::PCI_BUS, PciBus::save_state)?,
+            i2c: [
+                save_component(registry, component_ids::I2C_BUS0, I2cBus::save_state)?,
+                save_component(registry, component_ids::I2C_BUS1, I2cBus::save_state)?,
+            ],
+            media: save_component(
+                registry,
+                component_ids::MACE_MEDIA_BUS,
+                MediaBus::save_state,
+            )?,
+            mace: save_component(registry, component_ids::MACE, Mace::save_state)?,
+            gbe: save_component(registry, component_ids::GBE, Gbe::save_state)?,
+            vice: save_component(registry, component_ids::VICE, Ip32StubEndpoint::save_state)?,
+            rtc: registry
+                .get_typed::<Ds1687>(component_ids::RTC)
+                .map_err(Ip32StateError::Registry)?
+                .save_state(),
+            nic_identity: save_component(
+                registry,
+                component_ids::NIC_IDENTITY,
+                Ds2502::save_state,
+            )?,
+            serial: [
+                save_component(registry, component_ids::SERIAL0, Uart16550::save_state)?,
+                save_component(registry, component_ids::SERIAL1, Uart16550::save_state)?,
+            ],
+            scsi: save_component(
+                registry,
+                component_ids::SCSI_CONTROLLER,
+                PciConfigurationEndpoint::save_state,
+            )?,
+            parallel: save_component(registry, component_ids::PARALLEL_PORT, Ieee1284::save_state)?,
+        })
+    }
+
+    /// Rebuilds a complete IP32 machine around a caller-provided trace sink.
+    pub fn from_state_with_trace_sink(
+        config: Ip32MachineConfig,
+        state: Ip32MachineState,
+        sink: S,
+    ) -> Result<Self, Ip32StateError> {
+        if state.schema_version != IP32_STATE_SCHEMA_VERSION {
+            return Err(Ip32StateError::UnsupportedSchema {
+                version: state.schema_version,
+            });
+        }
+        if Ip32PersistentConfig::from_machine_config(&config) != state.config {
+            return Err(Ip32StateError::ConfigurationMismatch);
+        }
+        let mut machine =
+            Self::from_config_with_trace_sink(config, sink).map_err(Ip32StateError::Build)?;
+        machine.restore_complete_state(state)?;
+        Ok(machine)
+    }
+
+    fn restore_complete_state(&mut self, state: Ip32MachineState) -> Result<(), Ip32StateError> {
+        let registry = self.runtime.registry_mut();
+        restore_component(
+            registry,
+            component_ids::CPU0,
+            state.cpu,
+            R5000Cpu::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::CPU_SYSAD_BUS,
+            state.sysad,
+            Ip32SysAdBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::CPU_IRQ_BUS,
+            state.cpu_irq,
+            IrqBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::MACE_IRQ_BUS,
+            state.mace_irq,
+            IrqBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::ONE_WIRE_BUS,
+            state.one_wire,
+            OneWireBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::CRIME,
+            state.crime,
+            Crime::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::CRIME_MEMORY_DOMAIN,
+            state.memory_bus,
+            CrimeMemoryBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::CRIME_MACE_LINK,
+            state.cmi,
+            CrimeCmiBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::CRIME_GBE_LINK,
+            state.cgi,
+            CrimeCgiBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::RAM,
+            state.sdram,
+            CrimeSdram::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::ISA_BUS,
+            state.isa,
+            IsaBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::PCI_BUS,
+            state.pci,
+            PciBus::restore_state,
+        )?;
+        let [i2c0, i2c1] = state.i2c;
+        restore_component(
+            registry,
+            component_ids::I2C_BUS0,
+            i2c0,
+            I2cBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::I2C_BUS1,
+            i2c1,
+            I2cBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::MACE_MEDIA_BUS,
+            state.media,
+            MediaBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::MACE,
+            state.mace,
+            Mace::restore_state,
+        )?;
+        restore_component(registry, component_ids::GBE, state.gbe, Gbe::restore_state)?;
+        restore_component(
+            registry,
+            component_ids::VICE,
+            state.vice,
+            Ip32StubEndpoint::restore_state,
+        )?;
+        registry
+            .get_typed_mut::<Ds1687>(component_ids::RTC)
+            .map_err(Ip32StateError::Registry)?
+            .restore_state(state.rtc)
+            .map_err(Ip32StateError::Rtc)?;
+        restore_component(
+            registry,
+            component_ids::NIC_IDENTITY,
+            state.nic_identity,
+            Ds2502::restore_state,
+        )?;
+        let [serial0, serial1] = state.serial;
+        restore_component(
+            registry,
+            component_ids::SERIAL0,
+            serial0,
+            Uart16550::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::SERIAL1,
+            serial1,
+            Uart16550::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::SCSI_CONTROLLER,
+            state.scsi,
+            PciConfigurationEndpoint::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::PARALLEL_PORT,
+            state.parallel,
+            Ieee1284::restore_state,
+        )?;
+
+        self.runtime
+            .restore_state(state.runtime)
+            .map_err(Ip32StateError::Scheduler)?;
+        self.control = MachineControl {
+            slots: HotComponentSlots::resolve(self.runtime.registry())
+                .map_err(Ip32StateError::Registry)?,
+            persistent_config: state.config,
+            cpu_generation: state.control.cpu_generation,
+            cpu_clock: CpuClock {
+                frequency_hz: self.control.cpu_clock.frequency_hz,
+                remainder: state.control.cpu_clock_remainder,
+            },
+            host_generation: state.control.host_generation,
+            host_capacities: state.control.host_capacities,
+            host_reservations: state.control.host_reservations,
+            host_outputs: state.control.host_outputs.into(),
+            host_output_units: state.control.host_output_units,
+            host_dropped_output_bytes: state.control.host_dropped_output_bytes,
+            sysad_transactions: state.control.sysad_transactions,
+            memory_transactions: state.control.memory_transactions,
+            cmi_transactions: state.control.cmi_transactions,
+            cgi_transactions: state.control.cgi_transactions,
+            cpu_continuation_quantum: state.control.cpu_continuation_quantum,
+            inline_sysad_completion: state.control.inline_sysad_completion,
+            event_chain_policy: Ip32EventChainPolicy {
+                sysad: state.control.fusion_sysad,
+                memory: state.control.fusion_memory,
+                cmi: state.control.fusion_cmi,
+                cgi: state.control.fusion_cgi,
+                isa: state.control.fusion_isa,
+                budget: state.control.fusion_budget,
+            },
+            #[cfg(test)]
+            logical_transitions: Vec::new(),
+        };
+        Ok(())
+    }
+}
+
+/// Failure while applying battery-backed RTC data to an IP32 machine.
+#[derive(Debug)]
+pub enum RestoreRtcPersistentStateError {
+    /// The fixed RTC component was missing or had an unexpected type.
+    Registry(RegistryLookupError),
+    /// The saved RTC image was malformed.
+    Rtc(Ds1687StateError),
+}
+
+impl fmt::Display for RestoreRtcPersistentStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(error) => error.fmt(formatter),
+            Self::Rtc(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RestoreRtcPersistentStateError {}
+
+fn save_component<T, State>(
+    registry: &ComponentRegistry,
+    id: ComponentId,
+    save: fn(&T) -> State,
+) -> Result<State, Ip32StateError>
+where
+    T: Component,
+{
+    registry
+        .get_typed::<T>(id)
+        .map(save)
+        .map_err(Ip32StateError::Registry)
+}
+
+fn restore_component<T, State>(
+    registry: &mut ComponentRegistry,
+    id: ComponentId,
+    state: State,
+    restore: fn(&mut T, State) -> Result<(), se_device::state::DeviceStateError>,
+) -> Result<(), Ip32StateError>
+where
+    T: Component,
+{
+    restore(
+        registry
+            .get_typed_mut::<T>(id)
+            .map_err(Ip32StateError::Registry)?,
+        state,
+    )
+    .map_err(Ip32StateError::Device)
 }
 
 impl<S> Ip32Machine<S>

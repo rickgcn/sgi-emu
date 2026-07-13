@@ -57,7 +57,7 @@ pub const IP32_PROM_IMAGE_SIZE_BYTES: usize = 512 * 1024;
 pub const IP32_MAX_RAM_SIZE_BYTES: u64 = LINEAR_MEMORY_END - LINEAR_MEMORY_START;
 
 /// Named physical region in the IP32 CPU address map.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ip32PhysicalRegion {
     /// Low 256 MiB RAM alias.
     LowMemory,
@@ -127,7 +127,7 @@ impl Ip32PhysicalRegion {
 }
 
 /// Result of classifying one complete CPU transfer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ip32AddressResolution {
     /// The transfer resolves to byte-addressed memory.
     Memory {

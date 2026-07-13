@@ -10,4 +10,5 @@ pub mod component_ids;
 mod dispatch;
 pub mod event;
 pub mod machine;
+pub mod state;
 pub mod timing;

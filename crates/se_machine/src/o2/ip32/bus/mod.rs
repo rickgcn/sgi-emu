@@ -9,8 +9,40 @@ use se_device::chipset::crime::protocol::CrimeBusDisposition;
 use se_device::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransaction};
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 
+macro_rules! component_state {
+    ($state:ident, $component:ty) => {
+        #[doc = "Serializable deterministic component state."]
+        #[derive(Clone, serde::Deserialize, serde::Serialize)]
+        pub struct $state($component);
+
+        impl $component {
+            #[doc = "Captures all hardware-visible and in-flight component state."]
+            pub fn save_state(&self) -> $state {
+                $state(self.clone())
+            }
+
+            #[doc = "Restores validated component state without changing topology identity."]
+            pub fn restore_state(
+                &mut self,
+                state: $state,
+            ) -> Result<(), se_device::state::DeviceStateError> {
+                let expected = Component::id(self);
+                let actual = Component::id(&state.0);
+                if actual != expected {
+                    return Err(se_device::state::DeviceStateError::ComponentIdMismatch {
+                        expected,
+                        actual,
+                    });
+                }
+                *self = state.0;
+                Ok(())
+            }
+        }
+    };
+}
+
 /// Scheduled SysAD bus event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ip32SysAdBusEvent {
     /// Delivers the queued CPU transaction to CRIME.
     Service {
@@ -26,7 +58,7 @@ pub enum Ip32SysAdBusEvent {
 }
 
 /// Action emitted by the IP32 SysAD domain.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ip32SysAdBusAction {
     /// Delivers one CPU request to CRIME.
     Deliver {
@@ -62,7 +94,7 @@ pub enum Ip32SysAdBusAction {
     Idle,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct BusClock {
     timebase_hz: u64,
     frequency_hz: u64,
@@ -94,7 +126,7 @@ impl BusClock {
 }
 
 /// CPU-facing IP32 SysAD communication domain.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ip32SysAdBus {
     id: ComponentId,
     name: String,
@@ -111,6 +143,8 @@ pub struct Ip32SysAdBus {
     )>,
     actions: VecDeque<Ip32SysAdBusAction>,
 }
+
+component_state!(Ip32SysAdBusState, Ip32SysAdBus);
 
 impl Ip32SysAdBus {
     /// Creates a SysAD domain connecting one CPU controller to CRIME.
@@ -261,11 +295,13 @@ impl BusRole<ExecutionTransaction<Mips4ExecutionTransaction>> for Ip32SysAdBus {
 }
 
 /// Identity-only endpoint for an unimplemented board device.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ip32StubEndpoint {
     id: ComponentId,
     name: String,
 }
+
+component_state!(Ip32StubEndpointState, Ip32StubEndpoint);
 
 impl Ip32StubEndpoint {
     /// Creates an identity-only endpoint.

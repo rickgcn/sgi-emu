@@ -38,7 +38,7 @@ const SD_R2_R1_INTERRUPT_ENABLE: u32 = 0xfc22_0018;
 const SD_R2_R1_SOFTWARE_INTERRUPT: u32 = 0xfc22_0020;
 const WAIT: u32 = 0x4200_0020;
 
-#[derive(Default)]
+#[derive(Default, serde::Deserialize, serde::Serialize)]
 struct SchedulerCaptureSink {
     records: Vec<(u64, SimTime, String)>,
 }
@@ -901,7 +901,7 @@ fn hard_reset_preserves_sdram_and_advances_the_cpu_generation() {
     );
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Deserialize, serde::Serialize)]
 struct PromAcceptanceSink {
     failed_addresses: Vec<u64>,
 }
@@ -1029,7 +1029,7 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
 #[test]
 #[ignore = "requires a local proprietary IP32 PROM image"]
 fn local_ip32_prom_core_throughput_probe() {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
     enum Limit {
         Events(usize),
         SimTime(SimTime),

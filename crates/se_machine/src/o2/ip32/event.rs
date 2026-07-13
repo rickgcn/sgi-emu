@@ -15,7 +15,7 @@ use se_device::serial::uart16550::Uart16550Event;
 use super::bus::Ip32SysAdBusEvent;
 
 /// IP32 machine-level event payload.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ip32Event {
     /// Initial board power-on event.
     PowerOn,
@@ -76,35 +76,35 @@ pub enum Ip32Event {
 }
 
 /// Physical serial connectors exposed by the IP32 profile.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ip32SerialPort {
     Serial1,
     Serial2,
 }
 
 /// Host-neutral input with no implicit wall-clock time.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ip32HostInput {
     pub port: MediaPort,
     pub payload: MediaPayload,
 }
 
 /// Host-neutral output produced in deterministic simulation order.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ip32HostOutput {
     pub port: MediaPort,
     pub payload: MediaPayload,
 }
 
 /// One host-bound byte chunk emitted by a serial connector.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ip32SerialOutput {
     pub port: Ip32SerialPort,
     pub bytes: Vec<u8>,
 }
 
 /// Host-bound data-loss counters.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ip32HostIoStats {
     pub dropped_output_bytes: [u64; 12],
 }
