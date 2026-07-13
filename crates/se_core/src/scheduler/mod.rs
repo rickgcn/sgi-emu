@@ -18,6 +18,8 @@
 //! This separation keeps hardware behavior event-driven and prevents implicit
 //! time advancement through nested direct calls between components.
 
+pub mod state;
+
 use core::cmp::Ordering;
 use core::fmt;
 use std::collections::BinaryHeap;
@@ -29,7 +31,19 @@ use crate::component::ComponentId;
 /// The scheduler treats this value as an opaque integer tick. A machine model
 /// may define what one tick means for its own timing domain. The unit is part
 /// of the machine timing ABI, not a runtime scheduler setting.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct SimTime(u64);
 
 impl SimTime {
@@ -59,7 +73,19 @@ impl fmt::Display for SimTime {
 }
 
 /// Relative simulated time.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct SimDuration(u64);
 
 impl SimDuration {
@@ -88,7 +114,9 @@ impl fmt::Display for SimDuration {
 /// Event identifiers are assigned by the scheduler in insertion order. They are
 /// also used as the deterministic tie-breaker for events scheduled at the same
 /// simulated time.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct ScheduledEventId(u64);
 
 impl ScheduledEventId {
@@ -110,7 +138,7 @@ impl fmt::Display for ScheduledEventId {
 }
 
 /// Event stored by the scheduler.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ScheduledEvent<E> {
     /// Stable event identifier.
     pub id: ScheduledEventId,

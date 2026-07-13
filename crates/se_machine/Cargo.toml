@@ -9,3 +9,7 @@ authors.workspace = true
 se_core.workspace = true
 se_device.workspace = true
 se_runtime.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+postcard.workspace = true

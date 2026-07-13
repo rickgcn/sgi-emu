@@ -19,7 +19,9 @@ use core::any::Any;
 use core::fmt;
 
 /// Stable identifier for a component.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct ComponentId(u64);
 
 impl ComponentId {

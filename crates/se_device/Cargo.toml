@@ -8,4 +8,5 @@ authors.workspace = true
 [dependencies]
 se_core.workspace = true
 se_float.workspace = true
+serde.workspace = true
 smallvec.workspace = true

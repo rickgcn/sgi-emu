@@ -6,6 +6,7 @@
 //! payloads and may schedule more events through [`RuntimeContext`].
 
 pub mod event_chain;
+pub mod state;
 
 use core::fmt;
 
@@ -22,7 +23,7 @@ use crate::registry::ComponentRegistry;
 const UNBOUNDED_DEADLINE: SimTime = SimTime::new(u64::MAX);
 
 /// Cumulative runtime event counters.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct RuntimeStatistics {
     /// Events accepted by the scheduler since runtime construction.
     pub scheduled_events: u64,
