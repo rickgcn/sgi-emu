@@ -70,6 +70,7 @@ pub enum MaceError {
     TransactionIdOverflow,
     UnexpectedCmiCompletion(CrimeTransactionId),
     UnexpectedIsaCompletion(IsaTransactionId),
+    UnexpectedPciCompletion(CrimeTransactionId),
     UnsupportedIrqInput(IrqInput),
     HostPortFull(MediaPort),
 }
@@ -87,6 +88,9 @@ impl fmt::Display for MaceError {
             Self::UnexpectedIsaCompletion(id) => {
                 write!(formatter, "unexpected MACE ISA completion {}", id.get())
             }
+            Self::UnexpectedPciCompletion(id) => {
+                write!(formatter, "unexpected MACE PCI completion {id}")
+            }
             Self::UnsupportedIrqInput(input) => {
                 write!(formatter, "unsupported MACE IRQ input {}", input.get())
             }
@@ -102,7 +106,16 @@ struct PendingIsa {
     cmi_id: CrimeTransactionId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingPci {
+    command: PciCommand,
+    address: u32,
+    transfer_length: usize,
+    configuration_cycle: bool,
+}
+
 type PendingIsaTable = InlineMap16<IsaTransactionId, PendingIsa>;
+type PendingPciTable = InlineMap16<CrimeTransactionId, PendingPci>;
 type PendingCmiSet = InlineSet16<CrimeTransactionId>;
 
 /// MACE 2.0 component.
@@ -119,6 +132,7 @@ pub struct Mace {
     actions: VecDeque<MaceAction>,
     trace_interest: TraceInterest,
     pending_isa: PendingIsaTable,
+    pending_pci: PendingPciTable,
     pending_cmi: PendingCmiSet,
     terminal_error: Option<MaceError>,
     interrupts: MaceInterruptController,
@@ -158,6 +172,7 @@ impl Mace {
             actions: VecDeque::new(),
             trace_interest: TraceInterest::All,
             pending_isa: PendingIsaTable::new(),
+            pending_pci: PendingPciTable::new(),
             pending_cmi: PendingCmiSet::new(),
             terminal_error: None,
             interrupts: MaceInterruptController::new(),
@@ -204,6 +219,7 @@ impl Mace {
         self.next_transaction_id = 0;
         self.actions.clear();
         self.pending_isa.clear();
+        self.pending_pci.clear();
         self.pending_cmi.clear();
         self.terminal_error = None;
         self.interrupts.reset();
@@ -522,7 +538,15 @@ impl Mace {
             data,
             byte_enable,
         }));
-        self.pending_cmi.insert(cmi_id);
+        self.pending_pci.insert(
+            cmi_id,
+            PendingPci {
+                command,
+                address: address as u32,
+                transfer_length: request.transfer.length(),
+                configuration_cycle: false,
+            },
+        );
         CrimeLinkDeviceResponse::Deferred
     }
 
@@ -532,14 +556,21 @@ impl Mace {
         offset: u64,
         request: CrimePioRequest,
     ) -> CrimeLinkDeviceResponse<CrimeCmiCompletion> {
+        let transfer_length = request.transfer.length();
+        if !(1..=4).contains(&transfer_length) || offset + transfer_length as u64 > 0x0d00 {
+            return complete_cmi_error(cmi_id, CrimeBusError::Access);
+        }
         let bus = ((self.pci.config_address >> 16) & 0xff) as u8;
         let devfn = ((self.pci.config_address >> 8) & 0xff) as u8;
         let device = devfn >> 3;
         let function = devfn & 7;
         let register = (self.pci.config_address & 0xfc) as u8;
-        let Some(&target) = self.wiring.pci_devices.get(usize::from(device)) else {
-            return complete_cmi_error(cmi_id, CrimeBusError::Address);
-        };
+        let target = self
+            .wiring
+            .pci_devices
+            .get(usize::from(device))
+            .copied()
+            .unwrap_or(self.wiring.pci_absent);
         let command = if matches!(request.transfer.view(), CrimeTransferView::Read { .. }) {
             PciCommand::ConfigurationRead
         } else {
@@ -563,7 +594,15 @@ impl Mace {
             data,
             byte_enable,
         }));
-        self.pending_cmi.insert(cmi_id);
+        self.pending_pci.insert(
+            cmi_id,
+            PendingPci {
+                command,
+                address: pci_configuration_cycle_address(self.pci.config_address),
+                transfer_length,
+                configuration_cycle: true,
+            },
+        );
         CrimeLinkDeviceResponse::Deferred
     }
 
@@ -1135,10 +1174,10 @@ impl BusControllerRole<IsaCompletion> for Mace {
 impl BusControllerRole<PciCompletion> for Mace {
     fn complete(&mut self, completion: PciCompletion) {
         let id = CrimeTransactionId::new(completion.id);
-        if !self.pending_cmi.remove(&id) {
-            self.terminal_error = Some(MaceError::UnexpectedCmiCompletion(id));
+        let Some(pending) = self.pending_pci.remove(&id) else {
+            self.terminal_error = Some(MaceError::UnexpectedPciCompletion(id));
             return;
-        }
+        };
         let result = match completion.status {
             PciStatus::Complete => {
                 if completion.data.is_empty() {
@@ -1147,6 +1186,23 @@ impl BusControllerRole<PciCompletion> for Mace {
                     let mut data = completion.data;
                     data.reverse();
                     Ok(CrimeCompletionPayload::ReadData(data.into()))
+                }
+            }
+            PciStatus::MasterAbort if pending.configuration_cycle => {
+                self.pci.record_error(
+                    pending.address,
+                    pci::error::MASTER_ABORT,
+                    pci::error::MASTER_ABORT_ADDRESS | pci::error::CONFIG_ADDRESS,
+                );
+                self.interrupts
+                    .set_group(MaceInterruptGroup::PciError, self.pci.error_interrupt());
+                self.push_interrupt_posts();
+                if matches!(pending.command, PciCommand::ConfigurationRead) {
+                    Ok(CrimeCompletionPayload::ReadData(
+                        vec![0xff; pending.transfer_length].into(),
+                    ))
+                } else {
+                    Ok(CrimeCompletionPayload::WriteComplete)
                 }
             }
             PciStatus::Retry => Err(CrimeBusError::Timeout),
@@ -1267,6 +1323,17 @@ fn crime_transfer_parts(transfer: &CrimeTransfer) -> (Vec<u8>, Vec<bool>) {
         CrimeTransferView::Write { data, byte_enable } => {
             (data.to_vec(), byte_enable.iter().collect())
         }
+    }
+}
+
+fn pci_configuration_cycle_address(config_address: u32) -> u32 {
+    let bus = (config_address >> 16) & 0xff;
+    if bus == 0 {
+        let device = (config_address >> 11) & 0x1f;
+        let idsel = 1_u32.checked_shl(device + 11).unwrap_or(0);
+        idsel | (config_address & 0x7fc)
+    } else {
+        config_address & 0x00ff_fffc
     }
 }
 

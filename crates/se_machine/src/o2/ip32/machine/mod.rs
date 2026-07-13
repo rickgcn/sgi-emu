@@ -618,6 +618,7 @@ impl<S> Ip32Machine<S> {
                     component_ids::PCI_SLOT0,
                     component_ids::PCI_SLOT0,
                 ],
+                pci_absent: component_ids::PCI_SLOT0,
                 isa_bus: component_ids::ISA_BUS,
                 prom: component_ids::PROM,
                 rtc: component_ids::RTC,

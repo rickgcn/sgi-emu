@@ -19,6 +19,9 @@ pub mod error {
     pub const DATA_PARITY: u32 = 1 << 29;
     pub const TARGET_ABORT: u32 = 1 << 30;
     pub const MASTER_ABORT: u32 = 1 << 31;
+    pub const ERROR_ADDRESS_VALID: u32 =
+        RETRY_ADDRESS | PARITY_ADDRESS | TARGET_ABORT_ADDRESS | MASTER_ABORT_ADDRESS;
+    pub const ERROR_ADDRESS_SPACE: u32 = CONFIG_ADDRESS | MEMORY_ADDRESS;
     pub const CLEARABLE: u32 = SIGNALED_TARGET_ABORT
         | OVERRUN
         | PARITY
@@ -71,8 +74,9 @@ impl MacePci {
         self.error_flags &= !clear;
     }
     pub fn record_error(&mut self, address: u32, flag: u32, address_flag: u32) {
-        if self.error_flags & 0xffff_0000 == 0 {
+        if self.error_flags & error::ERROR_ADDRESS_VALID == 0 {
             self.error_address = address;
+            self.error_flags &= !error::ERROR_ADDRESS_SPACE;
             self.error_flags |= address_flag;
         }
         self.error_flags |= flag;
@@ -105,5 +109,14 @@ mod tests {
         assert_eq!(pci.error_address, 0x1234);
         pci.write_error_flags(!error::MASTER_ABORT);
         assert_eq!(pci.error_flags & error::MASTER_ABORT_ADDRESS, 0);
+
+        pci.record_error(
+            0x9abc,
+            error::TARGET_ABORT,
+            error::TARGET_ABORT_ADDRESS | error::MEMORY_ADDRESS,
+        );
+        assert_eq!(pci.error_address, 0x9abc);
+        assert_eq!(pci.error_flags & error::CONFIG_ADDRESS, 0);
+        assert_ne!(pci.error_flags & error::MEMORY_ADDRESS, 0);
     }
 }

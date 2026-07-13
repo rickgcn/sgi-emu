@@ -32,6 +32,7 @@ pub struct MaceWiring {
     pub crime: ComponentId,
     pub pci_bus: ComponentId,
     pub pci_devices: [ComponentId; 5],
+    pub pci_absent: ComponentId,
     pub isa_bus: ComponentId,
     pub prom: ComponentId,
     pub rtc: ComponentId,

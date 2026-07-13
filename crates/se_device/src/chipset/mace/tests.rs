@@ -7,10 +7,10 @@ use crate::bus::irq::IrqDelivery;
 use crate::bus::isa::{IsaCompletion, IsaCompletionPayload, IsaTransferView};
 use crate::bus::media::{EthernetFrame, MediaPayload, MediaPort, MediaTransaction};
 use crate::bus::one_wire::OneWireLineDelivery;
-use crate::bus::pci::PciCompletion;
+use crate::bus::pci::{PciCompletion, PciStatus};
 use crate::chipset::crime::protocol::{
-    CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeLinkOperation,
-    CrimePioRequest, CrimeTransactionId, CrimeTransfer,
+    CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeLinkDeviceResponse,
+    CrimeLinkOperation, CrimePioRequest, CrimeTransactionId, CrimeTransfer,
 };
 
 use super::config::MaceConfig;
@@ -32,6 +32,7 @@ fn wiring() -> MaceWiring {
             component(22),
             component(23),
         ],
+        pci_absent: component(25),
         isa_bus: component(3),
         prom: component(4),
         rtc: component(5),
@@ -101,6 +102,80 @@ fn phy_read_start_has_the_prom_observed_zero_readback() {
     .expect("MACE must build");
 
     assert_eq!(mace.read_ethernet(0x70), Ok(0));
+}
+
+#[test]
+fn absent_pci_configuration_read_returns_ones_and_latches_master_abort() {
+    let mut mace = Mace::new(
+        component(15),
+        "MACE",
+        MaceConfig::default(),
+        wiring(),
+        1_000_000_000,
+    )
+    .expect("MACE must build");
+    mace.set_trace_interest(TraceInterest::None);
+    mace.write_pci(0x0cf8, 4, 7 << 11).unwrap();
+
+    let response = BusDeviceRole::<CrimeCmiTransaction>::accept(
+        &mut mace,
+        CrimeCmiTransaction {
+            id: CrimeTransactionId::new(9),
+            controller: component(1),
+            target: component(15),
+            operation: CrimeLinkOperation::Pio(CrimePioRequest {
+                address: 0x1f08_0cfc,
+                transfer: CrimeTransfer::read(4),
+            }),
+        },
+    );
+    assert!(matches!(response, CrimeLinkDeviceResponse::Deferred));
+    let transaction = match mace.poll().unwrap() {
+        MacePoll::Action(MaceAction::StartPci(transaction)) => transaction,
+        other => panic!("expected PCI configuration transaction, got {other:?}"),
+    };
+    assert_eq!(transaction.target, component(25));
+    assert_eq!(transaction.configuration.unwrap().device, 7);
+
+    BusControllerRole::<PciCompletion>::complete(
+        &mut mace,
+        PciCompletion {
+            id: transaction.id,
+            status: PciStatus::MasterAbort,
+            data: vec![],
+        },
+    );
+    let completion = match mace.poll().unwrap() {
+        MacePoll::Action(MaceAction::CompleteCmiDevice(completion)) => completion,
+        other => panic!("expected CMI completion, got {other:?}"),
+    };
+    assert_eq!(
+        completion.result,
+        Ok(CrimeCompletionPayload::ReadData(
+            vec![0xff, 0xff, 0xff, 0xff].into()
+        ))
+    );
+    assert_eq!(mace.read_pci(0x0000, 4), Ok(1 << 18));
+    assert_eq!(
+        mace.read_pci(0x0004, 4).unwrap() as u32
+            & (super::pci::error::MASTER_ABORT
+                | super::pci::error::MASTER_ABORT_ADDRESS
+                | super::pci::error::CONFIG_ADDRESS),
+        super::pci::error::MASTER_ABORT
+            | super::pci::error::MASTER_ABORT_ADDRESS
+            | super::pci::error::CONFIG_ADDRESS
+    );
+
+    mace.write_pci(0x0004, 4, 0x7fff_ffff).unwrap();
+    assert_eq!(
+        mace.read_pci(0x0004, 4).unwrap() as u32
+            & (super::pci::error::MASTER_ABORT | super::pci::error::MASTER_ABORT_ADDRESS),
+        0
+    );
+    assert_ne!(
+        mace.read_pci(0x0004, 4).unwrap() as u32 & super::pci::error::CONFIG_ADDRESS,
+        0
+    );
 }
 
 #[test]
