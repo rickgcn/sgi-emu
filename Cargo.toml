@@ -20,3 +20,7 @@ se_machine = { path = "crates/se_machine" }
 se_runtime = { path = "crates/se_runtime" }
 smallvec = "1"
 vt100 = "0.16.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
