@@ -19,6 +19,7 @@ use crate::bus::isa::{
     IsaBusError, IsaCompletion, IsaCompletionPayload, IsaTransaction, IsaTransactionId, IsaTransfer,
 };
 use crate::bus::media::{MediaPayload, MediaPort, MediaTransaction};
+use crate::bus::one_wire::{OneWireDrive, OneWireLineDelivery};
 use crate::bus::pci::{PciCommand, PciCompletion, PciStatus, PciTransaction};
 use crate::chipset::crime::protocol::{
     CrimeBusError, CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeData,
@@ -208,6 +209,11 @@ impl Mace {
         self.interrupts.reset();
         self.timers.power_on(now);
         self.isa.reset();
+        self.actions.push_back(MaceAction::SetOneWire(OneWireDrive {
+            source: self.id,
+            time: now,
+            drive_low: self.isa.nic_drive_low(),
+        }));
         self.ps2 = [Ps2Port::new(), Ps2Port::new()];
         self.i2c = [I2cPort::new(), I2cPort::new()];
         self.audio.reset();
@@ -747,7 +753,7 @@ impl Mace {
     fn read_peripheral(&mut self, offset: u64) -> Result<u64, CrimeBusError> {
         match offset {
             0x10000 => Ok(u64::from(self.isa.ring_base_reset)),
-            0x10008 => Ok(u64::from(self.isa.misc)),
+            0x10008 => Ok(u64::from(self.isa.read_misc())),
             0x10010 => Ok(u64::from(self.interrupts.peripheral_status())),
             0x10018 => Ok(u64::from(self.interrupts.peripheral_mask())),
             0x12000..=0x13fff => Ok(bytes_to_u64(
@@ -775,7 +781,18 @@ impl Mace {
     fn write_peripheral(&mut self, offset: u64, value: u64) -> Result<(), CrimeBusError> {
         match offset {
             0x10000 => self.isa.ring_base_reset = value as u32 & 0xffff_8001,
-            0x10008 => self.isa.misc = value as u16 & 0x01fd,
+            0x10008 => {
+                let previous = self.isa.nic_drive_low();
+                self.isa.write_misc(value as u16);
+                let drive_low = self.isa.nic_drive_low();
+                if previous != drive_low {
+                    self.actions.push_back(MaceAction::SetOneWire(OneWireDrive {
+                        source: self.id,
+                        time: self.now,
+                        drive_low,
+                    }));
+                }
+            }
             0x10010 => self.interrupts.clear_edge_sources(value as u32),
             0x10018 => self.interrupts.set_peripheral_mask(value as u32),
             0x12000..=0x13ff8 if offset & 7 == 0 => {
@@ -1174,6 +1191,15 @@ impl BusDeviceRole<IrqDelivery> for Mace {
         }
         self.push_interrupt_posts();
         Ok(())
+    }
+}
+
+impl BusDeviceRole<OneWireLineDelivery> for Mace {
+    type Response = ();
+
+    fn accept(&mut self, delivery: OneWireLineDelivery) -> Self::Response {
+        self.now = delivery.time;
+        self.isa.set_nic_line_low(delivery.line_low);
     }
 }
 

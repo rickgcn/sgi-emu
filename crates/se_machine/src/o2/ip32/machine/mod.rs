@@ -17,6 +17,9 @@ use se_device::bus::isa::{
     IsaBus, IsaBusAction, IsaBusDisposition, IsaCompletion, IsaDeviceResponse, IsaTransaction,
 };
 use se_device::bus::media::{MediaBus, MediaBusAction, MediaPayload, MediaPort, MediaTransaction};
+use se_device::bus::one_wire::{
+    OneWireBus, OneWireBusAction, OneWireBusBuildError, OneWireBusRouteError,
+};
 use se_device::bus::pci::{
     PciBus, PciBusAction, PciCompletion, PciConfigurationEndpoint, PciStatus,
 };
@@ -51,6 +54,7 @@ use se_device::cpu::mips4::model::r5000::cpu::{
 };
 use se_device::cpu::mips4::model::r5000::profile::R5000Profile;
 use se_device::cpu::mips4::model::r5000::revision::R5000Revision;
+use se_device::memory::ds2502::{Ds2502, Ds2502Action, Ds2502Config, Ds2502Error};
 use se_device::memory::flash::ReadArrayFlash;
 use se_device::parallel::ieee1284::{IEEE1284_IRQ_OUTPUT, Ieee1284, Ieee1284Action};
 use se_device::rtc::ds1687::{DS1687_IRQ_OUTPUT, Ds1687, Ds1687Action, Ds1687Config, Ds1687Error};
@@ -102,6 +106,9 @@ pub struct Ip32MachineConfig {
     /// Deterministic RTC time and battery-backed NVRAM image.
     pub rtc: Ds1687Config,
 
+    /// Deterministic board-identity ROM and EPROM image.
+    pub nic_identity: Ds2502Config,
+
     /// Exact 512 KiB System PROM image.
     pub prom_image: Vec<u8>,
 }
@@ -122,6 +129,7 @@ impl Default for Ip32MachineConfig {
             crime: CrimeConfig::default(),
             mace: MaceConfig::default(),
             rtc: Ds1687Config::default(),
+            nic_identity: Ds2502Config::default(),
             prom_image: vec![0; IP32_PROM_IMAGE_SIZE_BYTES],
         }
     }
@@ -139,11 +147,17 @@ pub enum Ip32MachineBuildError {
     /// RTC configuration is invalid.
     Rtc(Ds1687Error),
 
+    /// Board-identity memory configuration is invalid.
+    NicIdentity(Ds2502Error),
+
     /// A UART configuration is invalid.
     Uart(Uart16550Error),
 
     /// The CPU interrupt routing table is invalid.
     IrqBus(IrqBusBuildError),
+
+    /// The board-identity 1-Wire topology is invalid.
+    OneWireBus(OneWireBusBuildError),
 
     /// PROM image does not have the fixed hardware size.
     InvalidPromSize {
@@ -173,8 +187,12 @@ impl fmt::Display for Ip32MachineBuildError {
             Self::Crime(error) => write!(f, "failed to construct CRIME: {error}"),
             Self::Mace(error) => write!(f, "failed to construct MACE: {error}"),
             Self::Rtc(error) => write!(f, "failed to construct DS1687: {error}"),
+            Self::NicIdentity(error) => write!(f, "failed to construct DS2502: {error}"),
             Self::Uart(error) => write!(f, "failed to construct IP32 UART: {error}"),
             Self::IrqBus(error) => write!(f, "failed to construct IP32 IRQ bus: {error}"),
+            Self::OneWireBus(error) => {
+                write!(f, "failed to construct IP32 1-Wire bus: {error}")
+            }
             Self::InvalidPromSize { size_bytes } => {
                 write!(f, "invalid IP32 PROM size: {size_bytes} bytes")
             }
@@ -212,6 +230,9 @@ pub enum Ip32MachineDispatchError {
 
     /// The IRQ bus rejected a source transaction.
     IrqBus(IrqBusRouteError),
+
+    /// The 1-Wire bus rejected a source transition.
+    OneWireBus(OneWireBusRouteError),
 
     /// The R5000 rejected an IRQ bus delivery.
     CpuIrq(R5000IrqError),
@@ -264,6 +285,7 @@ impl fmt::Display for Ip32MachineDispatchError {
             Self::Mace(error) => write!(f, "MACE dispatch failed: {error}"),
             Self::Uart(error) => write!(f, "IP32 UART dispatch failed: {error}"),
             Self::IrqBus(error) => write!(f, "IP32 IRQ routing failed: {error}"),
+            Self::OneWireBus(error) => write!(f, "IP32 1-Wire routing failed: {error}"),
             Self::CpuIrq(error) => write!(f, "IP32 CPU IRQ delivery failed: {error}"),
             Self::Scheduler(error) => write!(f, "IP32 event scheduling failed: {error}"),
             Self::EventChain(error) => write!(f, "IP32 event chain failed: {error}"),
@@ -310,6 +332,12 @@ impl From<Uart16550Error> for Ip32MachineDispatchError {
 impl From<IrqBusRouteError> for Ip32MachineDispatchError {
     fn from(error: IrqBusRouteError) -> Self {
         Self::IrqBus(error)
+    }
+}
+
+impl From<OneWireBusRouteError> for Ip32MachineDispatchError {
+    fn from(error: OneWireBusRouteError) -> Self {
+        Self::OneWireBus(error)
     }
 }
 
@@ -395,6 +423,8 @@ struct HotComponentSlots {
     rtc: ComponentSlot<Ds1687>,
     serial: [ComponentSlot<Uart16550>; 2],
     parallel: ComponentSlot<Ieee1284>,
+    one_wire: ComponentSlot<OneWireBus>,
+    nic_identity: ComponentSlot<Ds2502>,
 }
 
 impl HotComponentSlots {
@@ -416,6 +446,8 @@ impl HotComponentSlots {
                 registry.resolve(component_ids::SERIAL1)?,
             ],
             parallel: registry.resolve(component_ids::PARALLEL_PORT)?,
+            one_wire: registry.resolve(component_ids::ONE_WIRE_BUS)?,
+            nic_identity: registry.resolve(component_ids::NIC_IDENTITY)?,
         })
     }
 }
@@ -563,6 +595,12 @@ impl<S> Ip32Machine<S> {
             ],
         )
         .map_err(Ip32MachineBuildError::IrqBus)?;
+        let one_wire_bus = OneWireBus::new(
+            component_ids::ONE_WIRE_BUS,
+            "MACE board-identity 1-Wire bus",
+            [component_ids::MACE, component_ids::NIC_IDENTITY],
+        )
+        .map_err(Ip32MachineBuildError::OneWireBus)?;
         let mace = Mace::new(
             component_ids::MACE,
             "MACE 2.0",
@@ -603,6 +641,14 @@ impl<S> Ip32Machine<S> {
             config.rtc,
         )
         .map_err(Ip32MachineBuildError::Rtc)?;
+        let nic_identity = Ds2502::new(
+            component_ids::NIC_IDENTITY,
+            "DS2502 board identity",
+            component_ids::MACE,
+            IP32_TIMEBASE_HZ,
+            config.nic_identity,
+        )
+        .map_err(Ip32MachineBuildError::NicIdentity)?;
         let uart_config = Uart16550Config {
             input_clock_hz: UART_INPUT_CLOCK_HZ,
             timebase_hz: IP32_TIMEBASE_HZ,
@@ -629,6 +675,7 @@ impl<S> Ip32Machine<S> {
         )?;
         insert_component(registry, Box::new(irq_bus))?;
         insert_component(registry, Box::new(mace_irq_bus))?;
+        insert_component(registry, Box::new(one_wire_bus))?;
         insert_component(registry, Box::new(crime))?;
         insert_component(
             registry,
@@ -717,6 +764,7 @@ impl<S> Ip32Machine<S> {
             )),
         )?;
         insert_component(registry, Box::new(rtc))?;
+        insert_component(registry, Box::new(nic_identity))?;
         insert_component(registry, Box::new(serial0))?;
         insert_component(registry, Box::new(serial1))?;
         insert_component(
@@ -1094,6 +1142,13 @@ where
                 .handle_event(context.now(), event);
             drain_mace(registry, context, control)?;
         }
+        Ip32Event::Ds2502(event) => {
+            registry
+                .get_resolved_mut(control.slots.nic_identity)?
+                .handle_event(context.now(), event);
+            drain_ds2502_actions(registry, context, control)?;
+            drain_one_wire_bus(registry, context, control)?;
+        }
         Ip32Event::IsaBus(event) => {
             registry
                 .get_resolved_mut(control.slots.isa)?
@@ -1268,6 +1323,10 @@ where
     registry
         .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
         .reset();
+    registry.get_resolved_mut(control.slots.one_wire)?.reset();
+    registry
+        .get_resolved_mut(control.slots.nic_identity)?
+        .power_on(context.now());
     mace_with_trace_interest(registry, context, control.slots.mace)?.power_on(context.now());
     registry
         .get_resolved_mut(control.slots.rtc)?
@@ -1289,6 +1348,7 @@ where
         .power_on(context.now());
     crime_with_trace_interest(registry, context, control.slots.crime)?.power_on(context.now());
     drain_crime(registry, context, control)?;
+    drain_mace(registry, context, control)?;
     context.schedule_after(
         SimDuration::new(SDRAM_INITIALIZATION_TICKS),
         component_ids::CPU0,
@@ -1340,6 +1400,10 @@ where
     registry
         .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
         .reset();
+    registry.get_resolved_mut(control.slots.one_wire)?.reset();
+    registry
+        .get_resolved_mut(control.slots.nic_identity)?
+        .hard_reset(context.now());
     mace_with_trace_interest(registry, context, control.slots.mace)?.hard_reset(context.now());
     registry
         .get_resolved_mut(control.slots.rtc)?
@@ -1361,6 +1425,7 @@ where
         .hard_reset(context.now());
     crime_with_trace_interest(registry, context, control.slots.crime)?.hard_reset(context.now());
     drain_crime(registry, context, control)?;
+    drain_mace(registry, context, control)?;
     context.schedule_at(
         context.now(),
         component_ids::CPU0,
@@ -1678,6 +1743,13 @@ where
                     .route(transaction);
                 drain_media_bus(registry, context, control)?;
             }
+            MaceAction::SetOneWire(drive) => {
+                context.request_barrier();
+                registry
+                    .get_resolved_mut(control.slots.one_wire)?
+                    .route(drive)?;
+                drain_one_wire_bus(registry, context, control)?;
+            }
             MaceAction::CompleteCmiDevice(completion) => {
                 registry
                     .get_resolved_mut(control.slots.cmi)?
@@ -1685,6 +1757,65 @@ where
                 drain_cmi_bus(registry, context, control)?;
             }
             MaceAction::Trace(event) => trace_mace(context, *event),
+        }
+    }
+}
+
+fn drain_ds2502_actions<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut Ip32DispatchContext<'_, '_, S>,
+    control: &MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry
+            .get_resolved_mut(control.slots.nic_identity)?
+            .poll()
+        {
+            Ds2502Action::Schedule { delay, event } => {
+                context.schedule_after(
+                    delay,
+                    component_ids::NIC_IDENTITY,
+                    Ip32Event::Ds2502(event),
+                )?;
+            }
+            Ds2502Action::Drive(drive) => {
+                registry
+                    .get_resolved_mut(control.slots.one_wire)?
+                    .route(drive)?;
+            }
+            Ds2502Action::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_one_wire_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut Ip32DispatchContext<'_, '_, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry.get_resolved_mut(control.slots.one_wire)?.poll() {
+            OneWireBusAction::Deliver { target, delivery } if target == component_ids::MACE => {
+                mace_with_trace_interest(registry, context, control.slots.mace)?.accept(delivery);
+            }
+            OneWireBusAction::Deliver { target, delivery }
+                if target == component_ids::NIC_IDENTITY =>
+            {
+                registry
+                    .get_resolved_mut(control.slots.nic_identity)?
+                    .accept(delivery);
+                drain_ds2502_actions(registry, context, control)?;
+            }
+            OneWireBusAction::Deliver { target, .. } => {
+                return Err(Ip32MachineDispatchError::UnexpectedController(target));
+            }
+            OneWireBusAction::Idle => return Ok(()),
         }
     }
 }

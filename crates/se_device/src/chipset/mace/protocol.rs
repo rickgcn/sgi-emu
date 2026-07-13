@@ -9,6 +9,7 @@ use smallvec::SmallVec;
 use crate::bus::i2c::I2cTransaction;
 use crate::bus::isa::IsaTransaction;
 use crate::bus::media::{MediaPayload, MediaPort, MediaTransaction};
+use crate::bus::one_wire::OneWireDrive;
 use crate::bus::pci::PciTransaction;
 use crate::chipset::crime::protocol::{CrimeCmiCompletion, CrimeCmiTransaction};
 
@@ -149,6 +150,7 @@ pub enum MaceAction {
     StartIsa(IsaTransaction),
     StartI2c(I2cTransaction),
     StartExternal(MediaTransaction),
+    SetOneWire(OneWireDrive),
     CompleteCmiDevice(CrimeCmiCompletion),
     Trace(Box<MaceTraceEvent>),
 }

@@ -53,6 +53,9 @@ pub const I2C_BUS1: ComponentId = ip32_id(0x0109);
 /// Host-neutral MACE media communication domain.
 pub const MACE_MEDIA_BUS: ComponentId = ip32_id(0x010a);
 
+/// MACE board-identity 1-Wire communication domain.
+pub const ONE_WIRE_BUS: ComponentId = ip32_id(0x010b);
+
 /// Primary MIPS CPU core.
 pub const CPU0: ComponentId = ip32_id(0x0200);
 
@@ -91,6 +94,9 @@ pub const NVRAM: ComponentId = ip32_id(0x0402);
 
 /// Real-time clock.
 pub const RTC: ComponentId = ip32_id(0x0403);
+
+/// Board-identity DS2502 memory.
+pub const NIC_IDENTITY: ComponentId = ip32_id(0x0404);
 
 /// Board-level PCI SCSI controller.
 pub const SCSI_CONTROLLER: ComponentId = ip32_id(0x0500);
@@ -132,7 +138,7 @@ pub const VIDEO_OUTPUT: ComponentId = ip32_id(0x050b);
 pub const PCI_SLOT0: ComponentId = ip32_id(0x050c);
 
 /// All IP32 component identifiers in stable definition order.
-pub const ALL_COMPONENT_IDS: [ComponentId; 38] = [
+pub const ALL_COMPONENT_IDS: [ComponentId; 40] = [
     MACHINE,
     CPU_SYSAD_BUS,
     CRIME_MEMORY_DOMAIN,
@@ -145,6 +151,7 @@ pub const ALL_COMPONENT_IDS: [ComponentId; 38] = [
     I2C_BUS0,
     I2C_BUS1,
     MACE_MEDIA_BUS,
+    ONE_WIRE_BUS,
     CPU0,
     FPU0,
     ICACHE0,
@@ -158,6 +165,7 @@ pub const ALL_COMPONENT_IDS: [ComponentId; 38] = [
     PROM,
     NVRAM,
     RTC,
+    NIC_IDENTITY,
     SCSI_CONTROLLER,
     SCSI_BUS,
     ETHERNET_CONTROLLER,
@@ -174,7 +182,7 @@ pub const ALL_COMPONENT_IDS: [ComponentId; 38] = [
 ];
 
 /// IP32 bus and communication-domain component identifiers.
-pub const BUS_COMPONENT_IDS: [ComponentId; 11] = [
+pub const BUS_COMPONENT_IDS: [ComponentId; 12] = [
     CPU_SYSAD_BUS,
     CRIME_MEMORY_DOMAIN,
     CRIME_MACE_LINK,
@@ -186,6 +194,7 @@ pub const BUS_COMPONENT_IDS: [ComponentId; 11] = [
     I2C_BUS0,
     I2C_BUS1,
     MACE_MEDIA_BUS,
+    ONE_WIRE_BUS,
 ];
 
 #[cfg(test)]

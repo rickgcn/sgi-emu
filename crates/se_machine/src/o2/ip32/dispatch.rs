@@ -220,6 +220,7 @@ impl EventChainPolicy<Ip32Event> for Ip32EventChainPolicy {
                 | Ip32Event::Crime(_)
                 | Ip32Event::CrimeMemoryBus(CrimeMemoryBusEvent::Refresh { .. })
                 | Ip32Event::Mace(_)
+                | Ip32Event::Ds2502(_)
                 | Ip32Event::PciBusService
                 | Ip32Event::I2cBusService { .. }
                 | Ip32Event::Uart { .. }

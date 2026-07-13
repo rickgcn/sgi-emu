@@ -2,6 +2,7 @@ use se_core::role::BusDeviceRole;
 use se_core::tracing::{TraceInterest, TraceRecord, TraceSink, TraceSource, TraceValue};
 use se_device::bus::irq::{IrqBus, IrqTransaction};
 use se_device::bus::media::{MediaPayload, MediaPort};
+use se_device::bus::one_wire::OneWireBus;
 use se_device::chipset::crime::config::{CrimeAccessPolicy, CrimeConfigError, CrimeSdramBankSize};
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
@@ -13,6 +14,7 @@ use se_device::chipset::crime::protocol::{
 use se_device::chipset::crime::registers;
 use se_device::chipset::mace::Mace;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
+use se_device::memory::ds2502::Ds2502;
 use se_device::memory::flash::ReadArrayFlash;
 use se_device::serial::uart16550::Uart16550;
 use std::time::{Duration, Instant};
@@ -127,6 +129,8 @@ fn assert_machine_architecture_equal<A, B>(reference: &Ip32Machine<A>, optimized
     assert_component_eq!(Mace, component_ids::MACE);
     assert_component_eq!(IrqBus, component_ids::CPU_IRQ_BUS);
     assert_component_eq!(IrqBus, component_ids::MACE_IRQ_BUS);
+    assert_component_eq!(OneWireBus, component_ids::ONE_WIRE_BUS);
+    assert_component_eq!(Ds2502, component_ids::NIC_IDENTITY);
     assert_eq!(
         reference.control.cpu_generation,
         optimized.control.cpu_generation
@@ -344,7 +348,7 @@ fn construction_registers_the_role_oriented_ip32_topology() {
     let machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
     let registry = machine.runtime().registry();
 
-    assert_eq!(registry.len(), 23);
+    assert_eq!(registry.len(), 25);
     assert!(registry.get_typed::<R5000Cpu>(component_ids::CPU0).is_ok());
     assert!(
         registry
@@ -374,6 +378,16 @@ fn construction_registers_the_role_oriented_ip32_topology() {
     );
     assert!(registry.get_typed::<CrimeSdram>(component_ids::RAM).is_ok());
     assert!(registry.get_typed::<Mace>(component_ids::MACE).is_ok());
+    assert!(
+        registry
+            .get_typed::<OneWireBus>(component_ids::ONE_WIRE_BUS)
+            .is_ok()
+    );
+    assert!(
+        registry
+            .get_typed::<Ds2502>(component_ids::NIC_IDENTITY)
+            .is_ok()
+    );
     assert!(
         registry
             .get_typed::<Ip32GbeEndpoint>(component_ids::GBE)
@@ -904,6 +918,16 @@ impl TraceSink for PromAcceptanceSink {
         }
     }
 
+    fn enabled(
+        &self,
+        _source: TraceSource,
+        _level: se_core::tracing::TraceLevel,
+        target: &str,
+        event: &str,
+    ) -> bool {
+        target == "ip32.sysad" && event == "access"
+    }
+
     fn record(&mut self, record: TraceRecord<'_>) {
         if record.target != "ip32.sysad" || record.event != "access" {
             return;
@@ -943,6 +967,22 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(200_000);
     let _ = machine.run_steps(max_events).unwrap();
+
+    let mut terminal = Vec::new();
+    while let Some(output) = machine.poll_serial_output() {
+        if output.port == Ip32SerialPort::Serial1 {
+            terminal.extend(output.bytes);
+        }
+    }
+    let terminal = String::from_utf8_lossy(&terminal);
+    assert!(
+        !terminal.contains("ds2502_read_rom failed"),
+        "the PROM could not read the configured DS2502 identity"
+    );
+    assert!(
+        !terminal.contains("PANIC: Unexpected exception"),
+        "the PROM entered its unexpected-exception panic path"
+    );
 
     let pc = machine
         .runtime()

@@ -9,6 +9,7 @@ use se_device::chipset::crime::iou::{CrimeCgiBusEvent, CrimeCmiBusEvent};
 use se_device::chipset::crime::memory::bus::CrimeMemoryBusEvent;
 use se_device::chipset::crime::protocol::CrimeEvent;
 use se_device::chipset::mace::protocol::MaceEvent;
+use se_device::memory::ds2502::Ds2502Event;
 use se_device::serial::uart16550::Uart16550Event;
 
 use super::bus::Ip32SysAdBusEvent;
@@ -45,6 +46,9 @@ pub enum Ip32Event {
 
     /// MACE-internal event.
     Mace(MaceEvent),
+
+    /// Board-identity DS2502 transition.
+    Ds2502(Ds2502Event),
 
     /// MACE ISA-domain event.
     IsaBus(IsaBusEvent),

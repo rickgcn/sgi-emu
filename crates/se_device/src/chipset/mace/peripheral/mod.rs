@@ -207,7 +207,8 @@ impl Default for I2cPort {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IsaController {
     pub ring_base_reset: u32,
-    pub misc: u16,
+    misc: u16,
+    nic_line_high: bool,
     pub dp_ram: Vec<u8>,
     pub parallel: ParallelDma,
     pub serial_dma: [PeripheralDmaChannel; 4],
@@ -218,6 +219,7 @@ impl IsaController {
         Self {
             ring_base_reset: 1,
             misc: 1 << 5,
+            nic_line_high: false,
             dp_ram: vec![0; 8192],
             parallel: ParallelDma::new(),
             serial_dma: [PeripheralDmaChannel::new(); 4],
@@ -226,6 +228,7 @@ impl IsaController {
     pub fn reset(&mut self) {
         self.ring_base_reset = 1;
         self.misc = 1 << 5;
+        self.nic_line_high = false;
         self.dp_ram.fill(0);
         self.parallel.reset();
         self.serial_dma.fill(PeripheralDmaChannel::new());
@@ -235,6 +238,18 @@ impl IsaController {
     }
     pub const fn flash_write_enabled(&self) -> bool {
         self.misc & 1 != 0
+    }
+    pub const fn read_misc(&self) -> u16 {
+        self.misc | (self.nic_line_high as u16) << 3
+    }
+    pub fn write_misc(&mut self, value: u16) {
+        self.misc = value & 0x01f5;
+    }
+    pub const fn nic_drive_low(&self) -> bool {
+        self.misc & (1 << 2) == 0
+    }
+    pub fn set_nic_line_low(&mut self, line_low: bool) {
+        self.nic_line_high = !line_low;
     }
     pub const fn dp_ram_write_enabled(&self) -> bool {
         self.misc & (1 << 6) != 0

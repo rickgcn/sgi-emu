@@ -6,6 +6,7 @@ use crate::bus::i2c::I2cCompletion;
 use crate::bus::irq::IrqDelivery;
 use crate::bus::isa::{IsaCompletion, IsaCompletionPayload, IsaTransferView};
 use crate::bus::media::{EthernetFrame, MediaPayload, MediaPort, MediaTransaction};
+use crate::bus::one_wire::OneWireLineDelivery;
 use crate::bus::pci::PciCompletion;
 use crate::chipset::crime::protocol::{
     CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeLinkOperation,
@@ -13,7 +14,7 @@ use crate::chipset::crime::protocol::{
 };
 
 use super::config::MaceConfig;
-use super::protocol::{MaceExternalLinks, MacePoll, MaceWiring};
+use super::protocol::{MaceAction, MaceExternalLinks, MacePoll, MaceWiring};
 use super::{Mace, MaceError};
 
 fn component(value: u64) -> ComponentId {
@@ -67,6 +68,7 @@ fn mace_implements_every_topological_role() {
     assert_device::<Mace, CrimeCmiTransaction>();
     assert_device::<Mace, IrqDelivery>();
     assert_device::<Mace, MediaTransaction>();
+    assert_device::<Mace, OneWireLineDelivery>();
     assert_controller::<Mace, CrimeCmiCompletion>();
     assert_controller::<Mace, IsaCompletion>();
     assert_controller::<Mace, PciCompletion>();
@@ -165,6 +167,53 @@ fn host_queue_reports_capacity() {
 #[test]
 fn hardware_actions_are_not_sized_by_inline_trace_fields() {
     assert!(core::mem::size_of::<super::protocol::MaceAction>() <= 128);
+}
+
+#[test]
+fn isa_misc_routes_the_open_drain_nic_line_and_keeps_input_read_only() {
+    let mut mace = Mace::new(
+        component(15),
+        "MACE",
+        MaceConfig::default(),
+        wiring(),
+        1_000_000_000,
+    )
+    .expect("MACE must build");
+    mace.power_on(se_core::scheduler::SimTime::new(10));
+    assert_eq!(
+        mace.poll(),
+        Ok(MacePoll::Action(MaceAction::SetOneWire(
+            crate::bus::one_wire::OneWireDrive {
+                source: component(15),
+                time: se_core::scheduler::SimTime::new(10),
+                drive_low: true,
+            }
+        )))
+    );
+
+    BusDeviceRole::<OneWireLineDelivery>::accept(
+        &mut mace,
+        OneWireLineDelivery {
+            source: component(24),
+            time: se_core::scheduler::SimTime::new(20),
+            source_drive_low: false,
+            line_low: false,
+        },
+    );
+    assert_eq!(mace.read_peripheral(0x10008).unwrap() & (1 << 3), 1 << 3);
+
+    mace.write_peripheral(0x10008, (1 << 2) | (1 << 3)).unwrap();
+    assert_eq!(
+        mace.poll(),
+        Ok(MacePoll::Action(MaceAction::SetOneWire(
+            crate::bus::one_wire::OneWireDrive {
+                source: component(15),
+                time: se_core::scheduler::SimTime::new(20),
+                drive_low: false,
+            }
+        )))
+    );
+    assert_eq!(mace.read_peripheral(0x10008).unwrap() & (1 << 3), 1 << 3);
 }
 
 #[test]

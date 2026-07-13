@@ -39,6 +39,7 @@ fn bus_component_ids_are_present_and_distinct() {
             I2C_BUS0,
             I2C_BUS1,
             MACE_MEDIA_BUS,
+            ONE_WIRE_BUS,
         ]
     );
 
