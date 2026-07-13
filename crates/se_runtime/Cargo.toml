@@ -7,3 +7,4 @@ authors.workspace = true
 
 [dependencies]
 se_core.workspace = true
+smallvec.workspace = true

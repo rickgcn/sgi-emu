@@ -534,6 +534,11 @@ mod tests {
                 .run_steps(max_events)
                 .expect("the local PROM run must not fail");
             let elapsed = started.elapsed();
+            let performance = machine.performance_snapshot();
+            let elapsed_seconds = elapsed.as_secs_f64();
+            let simulated_seconds = performance.sim_time.get() as f64 / 1_000_000_000.0;
+            let retired = performance.cpu.retired_instructions;
+            let dispatched = performance.runtime.dispatched_events;
             let stats = queue.stats();
             let queued = queue
                 .records
@@ -541,8 +546,17 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .len();
             eprintln!(
-                "{label}: events={max_events}, elapsed={elapsed:?}, captured={}, dropped={}, queued={queued}",
-                stats.captured, stats.dropped
+                "{label}: events={max_events}, elapsed={elapsed:?}, simulated={simulated_seconds:.6}s, rtf={:.3}, instructions/s={:.0}, events/s={:.0}, events/instruction={:.3}, sysad={}, memory={}, cmi={}, cgi={}, captured={}, dropped={}, queued={queued}",
+                simulated_seconds / elapsed_seconds,
+                retired as f64 / elapsed_seconds,
+                dispatched as f64 / elapsed_seconds,
+                dispatched as f64 / retired.max(1) as f64,
+                performance.sysad_transactions,
+                performance.memory_transactions,
+                performance.cmi_transactions,
+                performance.cgi_transactions,
+                stats.captured,
+                stats.dropped
             );
         }
     }

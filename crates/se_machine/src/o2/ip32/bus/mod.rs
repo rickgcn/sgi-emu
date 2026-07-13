@@ -258,6 +258,7 @@ impl BusRole<ExecutionTransaction<Mips4ExecutionTransaction>> for Ip32SysAdBus {
             self.service_scheduled = true;
             CrimeBusDisposition::QueuedAndNeedsService {
                 delay: self.clock.next_cycle(),
+                epoch: self.generation,
             }
         }
     }
@@ -347,15 +348,14 @@ fn policy_result(
 ) -> Result<CrimeCompletionPayload, CrimeBusError> {
     match policy {
         CrimeAccessPolicy::Strict => Err(CrimeBusError::Unsupported),
-        CrimeAccessPolicy::Permissive => {
-            match transfer {
-                CrimeTransfer::Read { length } => Ok(CrimeCompletionPayload::ReadData(vec![
-                    0;
-                    usize::from(length)
-                ])),
-                CrimeTransfer::Write { .. } => Ok(CrimeCompletionPayload::WriteComplete),
+        CrimeAccessPolicy::Permissive => match transfer.view() {
+            se_device::chipset::crime::protocol::CrimeTransferView::Read { length } => Ok(
+                CrimeCompletionPayload::ReadData(vec![0; usize::from(length)].into()),
+            ),
+            se_device::chipset::crime::protocol::CrimeTransferView::Write { .. } => {
+                Ok(CrimeCompletionPayload::WriteComplete)
             }
-        }
+        },
     }
 }
 

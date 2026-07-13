@@ -7,6 +7,7 @@
 pub mod address_map;
 pub mod bus;
 pub mod component_ids;
+mod dispatch;
 pub mod event;
 pub mod machine;
 pub mod timing;

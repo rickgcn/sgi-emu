@@ -4,7 +4,9 @@ use se_device::chipset::crime::protocol::{
 };
 use se_device::cpu::execution::protocol::{ExecutionTransaction, ExecutionTransactionId};
 use se_device::cpu::mips4::cache::Mips4MemoryAccessType;
-use se_device::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
+use se_device::cpu::mips4::execution::bus::{
+    Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransferSize,
+};
 
 use super::*;
 use crate::o2::ip32::component_ids;
@@ -49,6 +51,63 @@ fn sysad_bus_only_delivers_cpu_traffic_to_crime() {
 }
 
 #[test]
+fn sysad_queue_preserves_order_and_rejects_mismatched_completion() {
+    let mut bus = Ip32SysAdBus::new(
+        component_ids::CPU_SYSAD_BUS,
+        "SysAD",
+        component_ids::CPU0,
+        component_ids::CRIME,
+        1_000_000_000,
+        66_666_500,
+    );
+    assert!(matches!(
+        bus.route(cpu_read(1)),
+        CrimeBusDisposition::QueuedAndNeedsService { .. }
+    ));
+    assert_eq!(bus.route(cpu_read(2)), CrimeBusDisposition::Queued);
+    assert_eq!(bus.queue.len(), 2);
+
+    bus.handle_event(Ip32SysAdBusEvent::Service {
+        generation: bus.generation(),
+    });
+    assert!(matches!(
+        bus.poll(),
+        Ip32SysAdBusAction::Deliver { transaction, .. }
+            if transaction.id == ExecutionTransactionId::new(1)
+    ));
+    bus.accept_device_completion(ExecutionCompletion {
+        id: ExecutionTransactionId::new(99),
+        payload: Mips4ExecutionCompletion::ReadData(0),
+    });
+    assert_eq!(bus.poll(), Ip32SysAdBusAction::Idle);
+    assert_eq!(
+        bus.in_flight.as_ref().unwrap().id,
+        ExecutionTransactionId::new(1)
+    );
+
+    bus.accept_device_completion(ExecutionCompletion {
+        id: ExecutionTransactionId::new(1),
+        payload: Mips4ExecutionCompletion::ReadData(0x1234),
+    });
+    assert!(matches!(bus.poll(), Ip32SysAdBusAction::Schedule { .. }));
+    bus.handle_event(Ip32SysAdBusEvent::Complete {
+        generation: bus.generation(),
+    });
+    assert!(matches!(
+        bus.poll(),
+        Ip32SysAdBusAction::Complete {
+            transaction,
+            ..
+        } if transaction.id == ExecutionTransactionId::new(1)
+    ));
+    assert!(matches!(bus.poll(), Ip32SysAdBusAction::Schedule { .. }));
+    assert_eq!(
+        bus.queue.front().unwrap().id,
+        ExecutionTransactionId::new(2)
+    );
+}
+
+#[test]
 fn peer_policy_never_bypasses_the_link_protocol() {
     let transaction = CrimeCgiTransaction {
         id: CrimeTransactionId::new(1),
@@ -56,7 +115,7 @@ fn peer_policy_never_bypasses_the_link_protocol() {
         target: component_ids::GBE,
         operation: CrimeLinkOperation::Pio(CrimePioRequest {
             address: 0x1600_0000,
-            transfer: CrimeTransfer::Read { length: 4 },
+            transfer: CrimeTransfer::read(4),
         }),
     };
     let mut strict = Ip32GbeEndpoint::new(component_ids::GBE, "GBE", CrimeAccessPolicy::Strict);

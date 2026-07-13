@@ -1,6 +1,6 @@
 use se_core::role::BusDeviceRole;
-use se_core::tracing::{TraceRecord, TraceSink, TraceValue};
-use se_device::bus::irq::IrqTransaction;
+use se_core::tracing::{TraceInterest, TraceRecord, TraceSink, TraceSource, TraceValue};
+use se_device::bus::irq::{IrqBus, IrqTransaction};
 use se_device::bus::media::{MediaPayload, MediaPort};
 use se_device::chipset::crime::config::{CrimeAccessPolicy, CrimeConfigError, CrimeSdramBankSize};
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
@@ -15,6 +15,7 @@ use se_device::chipset::mace::Mace;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
 use se_device::memory::flash::ReadArrayFlash;
 use se_device::serial::uart16550::Uart16550;
+use std::time::{Duration, Instant};
 
 use super::*;
 
@@ -33,6 +34,146 @@ const SD_R2_R1_CONTROL: u32 = 0xfc22_0008;
 const SD_R2_R1_INTERRUPT_ENABLE: u32 = 0xfc22_0018;
 const SD_R2_R1_SOFTWARE_INTERRUPT: u32 = 0xfc22_0020;
 const WAIT: u32 = 0x4200_0020;
+
+#[derive(Default)]
+struct SchedulerCaptureSink {
+    records: Vec<(u64, SimTime, String)>,
+}
+
+impl TraceSink for SchedulerCaptureSink {
+    fn interest(&self, source: TraceSource) -> TraceInterest {
+        if matches!(source, TraceSource::Scheduler) {
+            TraceInterest::All
+        } else {
+            TraceInterest::None
+        }
+    }
+
+    fn record(&mut self, record: TraceRecord<'_>) {
+        self.records
+            .push((record.sequence, record.time, record.event.to_owned()));
+    }
+}
+
+#[derive(Default)]
+struct ComponentCaptureSink {
+    records: Vec<(u64, SimTime, TraceSource, String, String)>,
+}
+
+impl TraceSink for ComponentCaptureSink {
+    fn interest(&self, source: TraceSource) -> TraceInterest {
+        if matches!(source, TraceSource::Component(_)) {
+            TraceInterest::All
+        } else {
+            TraceInterest::None
+        }
+    }
+
+    fn record(&mut self, record: TraceRecord<'_>) {
+        self.records.push((
+            record.sequence,
+            record.time,
+            record.source,
+            record.target.to_owned(),
+            record.event.to_owned(),
+        ));
+    }
+}
+
+fn assert_machine_architecture_equal<A, B>(reference: &Ip32Machine<A>, optimized: &Ip32Machine<B>) {
+    macro_rules! assert_component_eq {
+        ($type:ty, $id:expr) => {
+            assert_eq!(
+                reference
+                    .runtime()
+                    .registry()
+                    .get_typed::<$type>($id)
+                    .unwrap(),
+                optimized
+                    .runtime()
+                    .registry()
+                    .get_typed::<$type>($id)
+                    .unwrap()
+            );
+        };
+    }
+
+    assert_eq!(reference.runtime().now(), optimized.runtime().now());
+    assert_eq!(
+        reference.runtime().scheduler().peek_next_time(),
+        optimized.runtime().scheduler().peek_next_time()
+    );
+    assert_eq!(
+        reference
+            .runtime()
+            .registry()
+            .get_typed::<R5000Cpu>(component_ids::CPU0)
+            .unwrap()
+            .state(),
+        optimized
+            .runtime()
+            .registry()
+            .get_typed::<R5000Cpu>(component_ids::CPU0)
+            .unwrap()
+            .state()
+    );
+    assert_component_eq!(Ip32SysAdBus, component_ids::CPU_SYSAD_BUS);
+    assert_component_eq!(CrimeMemoryBus, component_ids::CRIME_MEMORY_DOMAIN);
+    assert_component_eq!(CrimeCmiBus, component_ids::CRIME_MACE_LINK);
+    assert_component_eq!(CrimeCgiBus, component_ids::CRIME_GBE_LINK);
+    assert_component_eq!(IsaBus, component_ids::ISA_BUS);
+    assert_component_eq!(CrimeSdram, component_ids::RAM);
+    assert_component_eq!(Crime, component_ids::CRIME);
+    assert_component_eq!(Mace, component_ids::MACE);
+    assert_component_eq!(IrqBus, component_ids::CPU_IRQ_BUS);
+    assert_component_eq!(IrqBus, component_ids::MACE_IRQ_BUS);
+    assert_eq!(
+        reference.control.cpu_generation,
+        optimized.control.cpu_generation
+    );
+    assert_eq!(reference.control.cpu_clock, optimized.control.cpu_clock);
+    assert_eq!(
+        reference.control.host_generation,
+        optimized.control.host_generation
+    );
+    assert_eq!(
+        reference.control.host_reservations,
+        optimized.control.host_reservations
+    );
+    assert_eq!(
+        reference.control.host_outputs,
+        optimized.control.host_outputs
+    );
+    assert_eq!(
+        reference.control.host_output_units,
+        optimized.control.host_output_units
+    );
+    assert_eq!(
+        reference.control.host_dropped_output_bytes,
+        optimized.control.host_dropped_output_bytes
+    );
+}
+
+#[test]
+fn isa_post_delivery_drains_only_the_addressed_peripheral() {
+    assert_eq!(
+        isa_post_delivery(component_ids::PROM),
+        IsaPostDelivery::None
+    );
+    assert_eq!(isa_post_delivery(component_ids::RTC), IsaPostDelivery::Rtc);
+    assert_eq!(
+        isa_post_delivery(component_ids::SERIAL0),
+        IsaPostDelivery::Serial(component_ids::SERIAL0)
+    );
+    assert_eq!(
+        isa_post_delivery(component_ids::SERIAL1),
+        IsaPostDelivery::Serial(component_ids::SERIAL1)
+    );
+    assert_eq!(
+        isa_post_delivery(component_ids::PARALLEL_PORT),
+        IsaPostDelivery::Parallel
+    );
+}
 
 const fn i_type(opcode: u8, rs: u8, rt: u8, immediate: u16) -> u32 {
     (opcode as u32) << 26 | (rs as u32) << 21 | (rt as u32) << 16 | immediate as u32
@@ -401,11 +542,180 @@ fn cpu_prom_and_ram_accesses_cross_all_required_buses() {
             address: 0,
             bank_select: CrimeMemoryBankSelect::Decode,
             no_ecc: false,
-            transfer: CrimeTransfer::Read { length: 4 },
+            transfer: CrimeTransfer::read(4),
         });
     assert_eq!(
         completion.result.unwrap().payload,
-        CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34])
+        CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34].into())
+    );
+}
+
+#[test]
+fn inline_cpu_continuation_matches_single_step_reference_execution() {
+    let config = config_with_program(&[
+        (0, ADDIU_R2_1),
+        (4, i_type(0x09, 2, 2, 1)),
+        (8, LUI_R1_LINEAR_RAM),
+        (12, SW_R2_R1),
+        (16, LW_R3_R1),
+        (20, WAIT),
+    ]);
+    let mut reference = Ip32Machine::from_config(config.clone()).unwrap();
+    reference.control.cpu_continuation_quantum = 1;
+    reference.control.inline_sysad_completion = false;
+    reference.control.event_chain_policy = Ip32EventChainPolicy::disabled();
+    let mut optimized = Ip32Machine::from_config(config).unwrap();
+    reference.schedule_power_on().unwrap();
+    optimized.schedule_power_on().unwrap();
+
+    assert_eq!(
+        reference.run_until_time(SimTime::new(1_000_000)).unwrap(),
+        RunStatus::Idle
+    );
+    assert_eq!(
+        optimized.run_until_time(SimTime::new(1_000_000)).unwrap(),
+        RunStatus::Idle
+    );
+    assert_machine_architecture_equal(&reference, &optimized);
+    assert_eq!(
+        reference.control.logical_transitions,
+        optimized.control.logical_transitions
+    );
+    assert_eq!(reference.poll_host_output(), optimized.poll_host_output());
+}
+
+#[test]
+fn fusion_budget_materializes_the_next_logical_transition() {
+    let config = config_with_program(&[(0, ADDIU_R2_1), (4, WAIT)]);
+    let mut machine = Ip32Machine::from_config(config).unwrap();
+    machine.control.event_chain_policy = Ip32EventChainPolicy {
+        budget: 1,
+        ..Ip32EventChainPolicy::all()
+    };
+    machine.schedule_power_on().unwrap();
+
+    assert_eq!(machine.run_steps(2).unwrap(), RunStatus::StepLimitReached);
+    assert_eq!(machine.control.logical_transitions.len(), 1);
+    assert!(machine.runtime().scheduler().peek_next_time().is_some());
+    assert_eq!(
+        machine.run_until_time(SimTime::new(1_000_000)).unwrap(),
+        RunStatus::Idle
+    );
+}
+
+#[test]
+fn fusion_respects_deadlines_and_same_time_global_events() {
+    for deadline in [119_999, 120_000, 120_014, 120_015, 120_016, 120_030] {
+        let config = config_with_program(&[(0, ADDIU_R2_1), (4, WAIT)]);
+        let mut reference = Ip32Machine::from_config(config.clone()).unwrap();
+        reference.control.event_chain_policy = Ip32EventChainPolicy::disabled();
+        let mut optimized = Ip32Machine::from_config(config).unwrap();
+        reference.schedule_power_on().unwrap();
+        optimized.schedule_power_on().unwrap();
+
+        reference.run_until_time(SimTime::new(deadline)).unwrap();
+        optimized.run_until_time(SimTime::new(deadline)).unwrap();
+        assert_machine_architecture_equal(&reference, &optimized);
+        assert_eq!(
+            reference.control.logical_transitions,
+            optimized.control.logical_transitions
+        );
+    }
+
+    let config = config_with_program(&[(0, ADDIU_R2_1), (4, WAIT)]);
+    let mut reference = Ip32Machine::from_config(config.clone()).unwrap();
+    reference.control.event_chain_policy = Ip32EventChainPolicy::disabled();
+    let mut optimized = Ip32Machine::from_config(config).unwrap();
+    for machine in [&mut reference, &mut optimized] {
+        machine.schedule_power_on().unwrap();
+        machine
+            .schedule_host_input(
+                SimTime::new(120_015),
+                Ip32HostInput {
+                    port: MediaPort::Serial0,
+                    payload: MediaPayload::Bytes(vec![0x41]),
+                },
+            )
+            .unwrap();
+        machine.run_until_time(SimTime::new(120_030)).unwrap();
+    }
+    assert_machine_architecture_equal(&reference, &optimized);
+    assert_eq!(
+        reference.control.logical_transitions,
+        optimized.control.logical_transitions
+    );
+}
+
+#[test]
+fn scheduler_capture_forces_reference_dispatch_and_component_trace_order_is_preserved() {
+    let config = config_with_program(&[
+        (0, LUI_R1_LINEAR_RAM),
+        (4, ADDIU_R2_1234),
+        (8, SW_R2_R1),
+        (12, LW_R3_R1),
+        (16, WAIT),
+    ]);
+    let mut scheduler_reference =
+        Ip32Machine::from_config_with_trace_sink(config.clone(), SchedulerCaptureSink::default())
+            .unwrap();
+    scheduler_reference.control.event_chain_policy = Ip32EventChainPolicy::disabled();
+    let mut scheduler_optimized =
+        Ip32Machine::from_config_with_trace_sink(config.clone(), SchedulerCaptureSink::default())
+            .unwrap();
+    scheduler_reference.schedule_power_on().unwrap();
+    scheduler_optimized.schedule_power_on().unwrap();
+    scheduler_reference
+        .run_until_time(SimTime::new(1_000_000))
+        .unwrap();
+    scheduler_optimized
+        .run_until_time(SimTime::new(1_000_000))
+        .unwrap();
+
+    assert_machine_architecture_equal(&scheduler_reference, &scheduler_optimized);
+    assert_eq!(
+        scheduler_reference.runtime().statistics(),
+        scheduler_optimized.runtime().statistics()
+    );
+    assert_eq!(
+        scheduler_reference
+            .runtime()
+            .trace_recorder()
+            .sink()
+            .records,
+        scheduler_optimized
+            .runtime()
+            .trace_recorder()
+            .sink()
+            .records
+    );
+
+    let mut component_reference =
+        Ip32Machine::from_config_with_trace_sink(config.clone(), ComponentCaptureSink::default())
+            .unwrap();
+    component_reference.control.event_chain_policy = Ip32EventChainPolicy::disabled();
+    let mut component_optimized =
+        Ip32Machine::from_config_with_trace_sink(config, ComponentCaptureSink::default()).unwrap();
+    component_reference.schedule_power_on().unwrap();
+    component_optimized.schedule_power_on().unwrap();
+    component_reference
+        .run_until_time(SimTime::new(1_000_000))
+        .unwrap();
+    component_optimized
+        .run_until_time(SimTime::new(1_000_000))
+        .unwrap();
+
+    assert_machine_architecture_equal(&component_reference, &component_optimized);
+    assert_eq!(
+        component_reference
+            .runtime()
+            .trace_recorder()
+            .sink()
+            .records,
+        component_optimized
+            .runtime()
+            .trace_recorder()
+            .sink()
+            .records
     );
 }
 
@@ -488,7 +798,7 @@ fn synthetic_prom_clears_linear_a_range_through_the_render_memory_client() {
             address: 0x0fec,
             bank_select: CrimeMemoryBankSelect::Decode,
             no_ecc: false,
-            transfer: CrimeTransfer::Read { length: 44 },
+            transfer: CrimeTransfer::read(44),
         });
     let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap().payload else {
         panic!("expected SDRAM read data");
@@ -572,11 +882,11 @@ fn hard_reset_preserves_sdram_and_advances_the_cpu_generation() {
             address: 0,
             bank_select: CrimeMemoryBankSelect::Decode,
             no_ecc: false,
-            transfer: CrimeTransfer::Read { length: 4 },
+            transfer: CrimeTransfer::read(4),
         });
     assert_eq!(
         completion.result.unwrap().payload,
-        CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34])
+        CrimeCompletionPayload::ReadData(vec![0, 0, 0x12, 0x34].into())
     );
 }
 
@@ -586,6 +896,14 @@ struct PromAcceptanceSink {
 }
 
 impl TraceSink for PromAcceptanceSink {
+    fn interest(&self, source: TraceSource) -> TraceInterest {
+        if matches!(source, TraceSource::Scheduler) {
+            TraceInterest::None
+        } else {
+            TraceInterest::Filtered
+        }
+    }
+
     fn record(&mut self, record: TraceRecord<'_>) {
         if record.target != "ip32.sysad" || record.event != "access" {
             return;
@@ -669,4 +987,160 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
         ),
         "a modeled CRIME access returned a bus error"
     );
+}
+
+#[test]
+#[ignore = "requires a local proprietary IP32 PROM image"]
+fn local_ip32_prom_core_throughput_probe() {
+    #[derive(Clone, Copy)]
+    enum Limit {
+        Events(usize),
+        SimTime(SimTime),
+        Instructions(u64),
+    }
+
+    struct Sample {
+        elapsed: Duration,
+        performance: Ip32PerformanceSnapshot,
+    }
+
+    fn run_sample(
+        prom: &[u8],
+        quantum: usize,
+        inline: bool,
+        event_chain_policy: Ip32EventChainPolicy,
+        limit: Limit,
+    ) -> Sample {
+        let mut machine = Ip32Machine::from_config(Ip32MachineConfig {
+            prom_image: prom.to_vec(),
+            ..Ip32MachineConfig::default()
+        })
+        .unwrap();
+        machine.control.cpu_continuation_quantum = quantum;
+        machine.control.inline_sysad_completion = inline;
+        machine.control.event_chain_policy = event_chain_policy;
+        machine.schedule_power_on().unwrap();
+
+        let started = Instant::now();
+        match limit {
+            Limit::Events(max_events) => {
+                machine.run_steps(max_events).unwrap();
+            }
+            Limit::SimTime(deadline) => {
+                machine.run_until_time(deadline).unwrap();
+            }
+            Limit::Instructions(target) => {
+                while machine.performance_snapshot().cpu.retired_instructions < target {
+                    match machine.run_steps(4_096).unwrap() {
+                        RunStatus::Dispatched | RunStatus::StepLimitReached => {}
+                        status => panic!(
+                            "PROM became inactive before reaching {target} instructions: {status:?}"
+                        ),
+                    }
+                }
+            }
+        }
+        Sample {
+            elapsed: started.elapsed(),
+            performance: machine.performance_snapshot(),
+        }
+    }
+
+    fn print_median(label: &str, mode: &str, mut samples: Vec<Sample>) {
+        samples.sort_by_key(|sample| sample.elapsed);
+        let sample = &samples[samples.len() / 2];
+        let host_seconds = sample.elapsed.as_secs_f64();
+        let simulated_seconds = sample.performance.sim_time.get() as f64 / IP32_TIMEBASE_HZ as f64;
+        let instructions = sample.performance.cpu.retired_instructions;
+        let events = sample.performance.runtime.dispatched_events;
+        eprintln!(
+            "{label}/{mode}: median_elapsed={:?}, simulated_seconds={simulated_seconds:.6}, rtf={:.4}, instructions/s={:.0}, events/s={:.0}, events/instruction={:.3}, sysad={}, memory={}, cmi={}, cgi={}",
+            sample.elapsed,
+            simulated_seconds / host_seconds,
+            instructions as f64 / host_seconds,
+            events as f64 / host_seconds,
+            events as f64 / instructions.max(1) as f64,
+            sample.performance.sysad_transactions,
+            sample.performance.memory_transactions,
+            sample.performance.cmi_transactions,
+            sample.performance.cgi_transactions,
+        );
+    }
+
+    let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
+    let prom = std::fs::read(path).expect("the local PROM image must be readable");
+    let max_events = std::env::var("IP32_PROM_EVENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_000_000);
+    let simulated_ticks = std::env::var("IP32_PROM_SIM_TICKS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000_000);
+    let retired_instructions = std::env::var("IP32_PROM_INSTRUCTIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_000_000);
+    let requested_runs = std::env::var("IP32_PROM_BENCH_RUNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5)
+        .max(1);
+    let runs = if requested_runs.is_multiple_of(2) {
+        requested_runs + 1
+    } else {
+        requested_runs
+    };
+    let selected_mode = std::env::var("IP32_PROM_BENCH_MODE").ok();
+
+    for (label, quantum, inline, event_chain_policy) in [
+        ("reference", 1, false, Ip32EventChainPolicy::disabled()),
+        (
+            "optimized-no-fusion",
+            DEFAULT_CPU_CONTINUATION_QUANTUM,
+            true,
+            Ip32EventChainPolicy::disabled(),
+        ),
+        (
+            "sysad-fusion",
+            DEFAULT_CPU_CONTINUATION_QUANTUM,
+            true,
+            Ip32EventChainPolicy {
+                sysad: true,
+                budget: 16,
+                ..Ip32EventChainPolicy::disabled()
+            },
+        ),
+        (
+            "sysad-memory-fusion",
+            DEFAULT_CPU_CONTINUATION_QUANTUM,
+            true,
+            Ip32EventChainPolicy {
+                sysad: true,
+                memory: true,
+                budget: 16,
+                ..Ip32EventChainPolicy::disabled()
+            },
+        ),
+        (
+            "all-fusion",
+            DEFAULT_CPU_CONTINUATION_QUANTUM,
+            true,
+            Ip32EventChainPolicy::all(),
+        ),
+    ] {
+        if selected_mode.as_deref().is_some_and(|mode| mode != label) {
+            continue;
+        }
+        for (mode, limit) in [
+            ("sim-time", Limit::SimTime(SimTime::new(simulated_ticks))),
+            ("instructions", Limit::Instructions(retired_instructions)),
+            ("events", Limit::Events(max_events)),
+        ] {
+            let samples = (0..runs)
+                .map(|_| run_sample(&prom, quantum, inline, event_chain_policy, limit))
+                .collect();
+            print_median(label, mode, samples);
+        }
+    }
 }
