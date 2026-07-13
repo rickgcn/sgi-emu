@@ -83,6 +83,41 @@ fn component_identity_and_reset_image_are_visible() {
 }
 
 #[test]
+fn performance_statistics_are_cumulative_across_reset() {
+    let mut cpu = cpu();
+    retire_nop(&mut cpu);
+    assert_eq!(
+        cpu.statistics(),
+        R5000CpuStatistics {
+            retired_instructions: 1,
+            exceptions: 0,
+            transactions: 1,
+        }
+    );
+
+    cpu.reset();
+    assert_eq!(cpu.statistics().retired_instructions, 1);
+    assert_eq!(cpu.statistics().transactions, 1);
+}
+
+#[test]
+fn decode_cache_keys_include_raw_bits_and_do_not_skip_uncached_fetches() {
+    let mut cpu = cpu();
+    retire_nop(&mut cpu);
+    cpu.reset();
+
+    let boundary = retire_instruction(&mut cpu, 0x2408_0001);
+    assert!(matches!(boundary, Mips4ExecutionBoundary::Retired { .. }));
+    assert_eq!(
+        cpu.state()
+            .gpr()
+            .read(crate::cpu::mips4::gpr::Mips4GprIndex::from_u8(8).unwrap()),
+        1
+    );
+    assert_eq!(cpu.statistics().transactions, 2);
+}
+
+#[test]
 fn count_uses_half_pclock_remainder_without_drift() {
     let mut cpu = cpu();
     assert_eq!(cpu.state().cp0().count().bits(), 0);

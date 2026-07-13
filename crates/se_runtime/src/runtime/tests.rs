@@ -101,6 +101,48 @@ fn dispatch_next_dispatches_one_event() {
 }
 
 #[test]
+fn context_advances_only_without_crossing_an_event() {
+    let mut runtime = Runtime::new();
+    runtime
+        .schedule_at(SimTime::new(1), TARGET, TestEvent::Record("dispatch"))
+        .unwrap();
+    runtime
+        .schedule_at(SimTime::new(5), TARGET, TestEvent::Record("future"))
+        .unwrap();
+
+    runtime
+        .dispatch_next(|_event, _registry, context| {
+            assert!(context.try_advance_to(SimTime::new(4)).unwrap());
+            assert!(!context.try_advance_to(SimTime::new(5)).unwrap());
+            assert_eq!(context.now(), SimTime::new(4));
+            Ok::<(), Infallible>(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn runtime_statistics_include_context_scheduling() {
+    let mut runtime = Runtime::new();
+    runtime
+        .schedule_at(SimTime::new(1), TARGET, TestEvent::Record("first"))
+        .unwrap();
+    runtime
+        .dispatch_next(|_event, _registry, context| {
+            context.schedule_after(SimDuration::new(1), TARGET, TestEvent::Record("second"))?;
+            Ok::<(), SchedulerError>(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        runtime.statistics(),
+        RuntimeStatistics {
+            scheduled_events: 2,
+            dispatched_events: 1,
+        }
+    );
+}
+
+#[test]
 fn run_steps_stops_at_event_limit() {
     let mut runtime = Runtime::new();
     let mut seen = Vec::new();

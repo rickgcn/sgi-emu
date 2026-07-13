@@ -176,6 +176,7 @@ impl std::error::Error for SchedulerError {}
 pub struct Scheduler<E> {
     now: SimTime,
     next_event_id: u64,
+    next: Option<QueuedEvent<E>>,
     queue: BinaryHeap<QueuedEvent<E>>,
 }
 
@@ -185,6 +186,7 @@ impl<E> Scheduler<E> {
         Self {
             now: SimTime::ZERO,
             next_event_id: 0,
+            next: None,
             queue: BinaryHeap::new(),
         }
     }
@@ -196,22 +198,23 @@ impl<E> Scheduler<E> {
 
     /// Returns the number of pending events.
     pub fn len(&self) -> usize {
-        self.queue.len()
+        self.queue.len() + usize::from(self.next.is_some())
     }
 
     /// Returns whether the scheduler has no pending events.
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.next.is_none()
     }
 
     /// Removes all pending events without changing the current time.
     pub fn clear(&mut self) {
         self.queue.clear();
+        self.next = None;
     }
 
     /// Returns the delivery time of the next event without removing it.
     pub fn peek_next_time(&self) -> Option<SimTime> {
-        self.queue.peek().map(|event| event.inner.time)
+        self.next.as_ref().map(|event| event.inner.time)
     }
 
     /// Advances simulated time without delivering events.
@@ -246,14 +249,25 @@ impl<E> Scheduler<E> {
         }
 
         let id = self.allocate_event_id()?;
-        self.queue.push(QueuedEvent {
+        let queued = QueuedEvent {
             inner: ScheduledEvent {
                 id,
                 time,
                 target,
                 payload,
             },
-        });
+        };
+        match self.next.take() {
+            None => self.next = Some(queued),
+            Some(next) if queued.precedes(&next) => {
+                self.queue.push(next);
+                self.next = Some(queued);
+            }
+            Some(next) => {
+                self.queue.push(queued);
+                self.next = Some(next);
+            }
+        }
 
         Ok(id)
     }
@@ -278,7 +292,8 @@ impl<E> Scheduler<E> {
 
     /// Pops the next pending event and advances simulated time to its time.
     pub fn pop_next(&mut self) -> Option<ScheduledEvent<E>> {
-        let event = self.queue.pop()?.inner;
+        let event = self.next.take()?.inner;
+        self.next = self.queue.pop();
         self.now = event.time;
         Some(event)
     }
@@ -301,6 +316,12 @@ impl<E> Default for Scheduler<E> {
 
 struct QueuedEvent<E> {
     inner: ScheduledEvent<E>,
+}
+
+impl<E> QueuedEvent<E> {
+    fn precedes(&self, other: &Self) -> bool {
+        (self.inner.time, self.inner.id) < (other.inner.time, other.inner.id)
+    }
 }
 
 impl<E> Ord for QueuedEvent<E> {

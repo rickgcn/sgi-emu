@@ -39,6 +39,19 @@ pub enum R5000CpuSignal {
     CacheError(Mips4Cp0CacheErr),
 }
 
+/// Cumulative R5000 execution counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct R5000CpuStatistics {
+    /// Instructions that retired normally.
+    pub retired_instructions: u64,
+
+    /// Architectural and error-level exception boundaries entered.
+    pub exceptions: u64,
+
+    /// Bus transactions published by the CPU.
+    pub transactions: u64,
+}
+
 /// R5000 external hardware interrupt input IP2.
 pub const R5000_IRQ_IP2: IrqInput = IrqInput::new(2);
 
@@ -108,6 +121,7 @@ where
     executor: FunctionalExecutor<Mips4ExecutionTarget<R5000ExecutionPolicy, F>>,
     half_pclock_remainder: u8,
     terminal_error: Option<R5000CpuError>,
+    statistics: R5000CpuStatistics,
 }
 
 impl R5000Cpu<SoftFloat3Backend> {
@@ -148,6 +162,7 @@ where
             executor: FunctionalExecutor::new(target),
             half_pclock_remainder: 0,
             terminal_error: None,
+            statistics: R5000CpuStatistics::default(),
         })
     }
 
@@ -166,6 +181,11 @@ where
         self.executor.target().state()
     }
 
+    /// Returns cumulative execution counters.
+    pub const fn statistics(&self) -> R5000CpuStatistics {
+        self.statistics
+    }
+
     /// Polls the next transaction, instruction boundary, idle state, or wait state.
     pub fn poll(
         &mut self,
@@ -175,6 +195,22 @@ where
             return Err(error.clone());
         }
         let action = self.executor.poll().map_err(R5000CpuError::Execution)?;
+        match &action {
+            ExecutionAction::Transaction(_) => {
+                self.statistics.transactions = self.statistics.transactions.saturating_add(1);
+            }
+            ExecutionAction::Boundary(Mips4ExecutionBoundary::Retired { .. }) => {
+                self.statistics.retired_instructions =
+                    self.statistics.retired_instructions.saturating_add(1);
+            }
+            ExecutionAction::Boundary(
+                Mips4ExecutionBoundary::Exception { .. }
+                | Mips4ExecutionBoundary::ErrorException { .. },
+            ) => {
+                self.statistics.exceptions = self.statistics.exceptions.saturating_add(1);
+            }
+            ExecutionAction::Idle | ExecutionAction::Waiting { .. } => {}
+        }
         if matches!(action, ExecutionAction::Boundary(_)) {
             self.executor.target_mut().advance_random(1);
             self.advance_pclocks(1);

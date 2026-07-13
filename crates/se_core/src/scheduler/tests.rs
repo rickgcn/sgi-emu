@@ -1,5 +1,7 @@
 use super::*;
 
+use std::collections::BinaryHeap;
+
 const TARGET: ComponentId = ComponentId::new(1);
 
 #[test]
@@ -120,4 +122,45 @@ fn reports_time_overflow() {
             duration: SimDuration::new(1),
         })
     );
+}
+
+#[test]
+fn next_event_fast_lane_matches_binary_heap_reference() {
+    let mut scheduler = Scheduler::new();
+    let mut reference = BinaryHeap::new();
+    let mut next_id = 0;
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+
+    for step in 0..10_000_u64 {
+        state ^= state << 7;
+        state ^= state >> 9;
+        state ^= state << 8;
+        if reference.is_empty() || state & 3 != 0 {
+            let time = scheduler.now().get() + state % 64;
+            let payload = step;
+            let id = scheduler
+                .schedule_at(SimTime::new(time), TARGET, payload)
+                .unwrap();
+            assert_eq!(id, ScheduledEventId::new(next_id));
+            reference.push(QueuedEvent {
+                inner: ScheduledEvent {
+                    id,
+                    time: SimTime::new(time),
+                    target: TARGET,
+                    payload,
+                },
+            });
+            next_id += 1;
+        } else {
+            let expected = reference.pop().unwrap().inner;
+            assert_eq!(scheduler.peek_next_time(), Some(expected.time));
+            assert_eq!(scheduler.pop_next(), Some(expected));
+        }
+        assert_eq!(scheduler.len(), reference.len());
+    }
+
+    while let Some(expected) = reference.pop() {
+        assert_eq!(scheduler.pop_next(), Some(expected.inner));
+    }
+    assert!(scheduler.is_empty());
 }

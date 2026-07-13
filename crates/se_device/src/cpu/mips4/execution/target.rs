@@ -135,7 +135,9 @@ impl fmt::Display for Mips4ExecutionTargetError {
 impl std::error::Error for Mips4ExecutionTargetError {}
 
 enum PendingOperation {
-    InstructionFetch,
+    InstructionFetch {
+        physical_address: u64,
+    },
     DataRead {
         instruction: Mips4Instruction,
         pending: Mips4PendingRead,
@@ -165,7 +167,9 @@ struct PendingErrorException {
 }
 
 enum Mips4CachedClient {
-    InstructionFetch,
+    InstructionFetch {
+        physical_address: u64,
+    },
     DataRead {
         instruction: Mips4Instruction,
         pending: Mips4PendingRead,
@@ -247,6 +251,14 @@ pub struct Mips4ExecutionTarget<P, F> {
     state: Mips4ExecutionState,
     pending: Option<PendingOperation>,
     pending_error_exception: Option<PendingErrorException>,
+    decode_cache: [Option<DecodeCacheEntry>; 4096],
+}
+
+#[derive(Clone, Copy)]
+struct DecodeCacheEntry {
+    physical_address: u64,
+    instruction: u32,
+    decoded: Mips4InstructionDecode,
 }
 
 impl<P, F> Mips4ExecutionTarget<P, F>
@@ -263,6 +275,7 @@ where
             state,
             pending: None,
             pending_error_exception: None,
+            decode_cache: [None; 4096],
         })
     }
 
@@ -320,7 +333,9 @@ where
                 let access_type = self.policy.resolve_access_type(fetch.cache_attribute());
                 let cache_policy = self.policy.resolve_cache_policy(fetch.cache_attribute());
                 self.start_memory_access(
-                    Mips4CachedClient::InstructionFetch,
+                    Mips4CachedClient::InstructionFetch {
+                        physical_address: fetch.physical_address(),
+                    },
                     self.state.pc,
                     cache_policy,
                     Mips4ExecutionTransaction::Read {
@@ -347,7 +362,7 @@ where
     > {
         let instruction = matches!(
             client,
-            Mips4CachedClient::InstructionFetch | Mips4CachedClient::CacheRetire { .. }
+            Mips4CachedClient::InstructionFetch { .. } | Mips4CachedClient::CacheRetire { .. }
         );
         let (physical_address, size, is_write) = transaction_shape(request);
         let cache_exists = if instruction {
@@ -498,7 +513,7 @@ where
     fn install_primary_line(&mut self, pending: &Mips4PendingCachedAccess, line: Mips4CacheLine) {
         if matches!(
             pending.client,
-            Mips4CachedClient::InstructionFetch | Mips4CachedClient::CacheRetire { .. }
+            Mips4CachedClient::InstructionFetch { .. } | Mips4CachedClient::CacheRetire { .. }
         ) {
             self.state
                 .cache
@@ -550,7 +565,9 @@ where
         Mips4ExecutionTargetError,
     > {
         match client {
-            Mips4CachedClient::InstructionFetch => self.complete_fetch(completion),
+            Mips4CachedClient::InstructionFetch { physical_address } => {
+                self.complete_fetch(physical_address, completion)
+            }
             Mips4CachedClient::DataRead {
                 instruction,
                 pending,
@@ -580,6 +597,7 @@ where
 
     fn complete_fetch(
         &mut self,
+        physical_address: u64,
         completion: Mips4ExecutionCompletion,
     ) -> Result<
         ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
@@ -588,7 +606,7 @@ where
         match completion {
             Mips4ExecutionCompletion::ReadData(data) => {
                 let instruction = Mips4Instruction::from_bits(self.instruction_word(data));
-                self.execute_instruction(instruction)
+                self.execute_instruction(physical_address, instruction)
             }
             Mips4ExecutionCompletion::BusError => {
                 Ok(self.exception_boundary(Mips4Exception::InstructionBusError, None))
@@ -601,12 +619,31 @@ where
 
     fn execute_instruction(
         &mut self,
+        physical_address: u64,
         instruction: Mips4Instruction,
     ) -> Result<
         ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
         Mips4ExecutionTargetError,
     > {
-        match decode_instruction(instruction) {
+        let index = (physical_address as usize >> 2) & (self.decode_cache.len() - 1);
+        let decoded = match self.decode_cache[index] {
+            Some(entry)
+                if entry.physical_address == physical_address
+                    && entry.instruction == instruction.bits() =>
+            {
+                entry.decoded
+            }
+            _ => {
+                let decoded = decode_instruction(instruction);
+                self.decode_cache[index] = Some(DecodeCacheEntry {
+                    physical_address,
+                    instruction: instruction.bits(),
+                    decoded,
+                });
+                decoded
+            }
+        };
+        match decoded {
             Mips4InstructionDecode::Instruction(Mips4InstructionClass::Cpu(decoded)) => {
                 if let Mips4InstructionAccess::Exception(exception) =
                     check_architecture_level(self.state.cp0.status(), cpu_requirements(decoded))
@@ -1534,7 +1571,8 @@ where
             if matches!(pending.client, Mips4CachedClient::Prefetch { .. }) {
                 return self.finish_cached_client(pending.client, completion);
             }
-            let exception = if matches!(pending.client, Mips4CachedClient::InstructionFetch) {
+            let exception = if matches!(pending.client, Mips4CachedClient::InstructionFetch { .. })
+            {
                 Mips4Exception::InstructionBusError
             } else {
                 Mips4Exception::DataBusError
@@ -1683,7 +1721,9 @@ where
 
 fn direct_pending(client: Mips4CachedClient) -> PendingOperation {
     match client {
-        Mips4CachedClient::InstructionFetch => PendingOperation::InstructionFetch,
+        Mips4CachedClient::InstructionFetch { physical_address } => {
+            PendingOperation::InstructionFetch { physical_address }
+        }
         Mips4CachedClient::DataRead {
             instruction,
             pending,
@@ -1739,7 +1779,7 @@ fn cache_fill_transaction(
     let (physical_address, _, _) = transaction_shape(pending.request);
     let kind = if matches!(
         pending.client,
-        Mips4CachedClient::InstructionFetch | Mips4CachedClient::CacheRetire { .. }
+        Mips4CachedClient::InstructionFetch { .. } | Mips4CachedClient::CacheRetire { .. }
     ) {
         Mips4ExecutionAccessKind::InstructionFetch
     } else {
@@ -1896,7 +1936,9 @@ where
         completion: Self::Completion,
     ) -> Result<ExecutionTargetAction<Self::Transaction, Self::Boundary>, Self::Error> {
         match self.pending.take() {
-            Some(PendingOperation::InstructionFetch) => self.complete_fetch(completion),
+            Some(PendingOperation::InstructionFetch { physical_address }) => {
+                self.complete_fetch(physical_address, completion)
+            }
             Some(PendingOperation::DataRead {
                 instruction,
                 pending,

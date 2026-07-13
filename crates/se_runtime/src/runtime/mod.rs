@@ -19,6 +19,16 @@ use crate::registry::ComponentRegistry;
 
 const UNBOUNDED_DEADLINE: SimTime = SimTime::new(u64::MAX);
 
+/// Cumulative runtime event counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeStatistics {
+    /// Events accepted by the scheduler since runtime construction.
+    pub scheduled_events: u64,
+
+    /// Events removed from the scheduler and delivered since construction.
+    pub dispatched_events: u64,
+}
+
 /// Runtime loop status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunStatus {
@@ -74,6 +84,7 @@ pub struct Runtime<E, S = NoopTraceSink> {
     registry: ComponentRegistry,
     trace: TraceRecorder<S>,
     stopped: bool,
+    statistics: RuntimeStatistics,
 }
 
 impl<E> Runtime<E, NoopTraceSink> {
@@ -102,6 +113,10 @@ impl<E, S> Runtime<E, S> {
             registry: ComponentRegistry::new(),
             trace: TraceRecorder::new(sink),
             stopped: false,
+            statistics: RuntimeStatistics {
+                scheduled_events: 0,
+                dispatched_events: 0,
+            },
         }
     }
 
@@ -116,6 +131,10 @@ impl<E, S> Runtime<E, S> {
             registry,
             trace,
             stopped: false,
+            statistics: RuntimeStatistics {
+                scheduled_events: 0,
+                dispatched_events: 0,
+            },
         }
     }
 
@@ -127,6 +146,11 @@ impl<E, S> Runtime<E, S> {
     /// Returns whether the runtime is stopped.
     pub const fn is_stopped(&self) -> bool {
         self.stopped
+    }
+
+    /// Returns cumulative event counters.
+    pub const fn statistics(&self) -> RuntimeStatistics {
+        self.statistics
     }
 
     /// Clears the stopped state.
@@ -182,6 +206,7 @@ where
         payload: E,
     ) -> Result<ScheduledEventId, SchedulerError> {
         let id = self.scheduler.schedule_at(time, target, payload)?;
+        self.statistics.scheduled_events = self.statistics.scheduled_events.saturating_add(1);
         trace_event_scheduled(&mut self.trace, self.scheduler.now(), id, target, time);
         Ok(id)
     }
@@ -307,6 +332,7 @@ where
         let Some(event) = self.scheduler.pop_next() else {
             return Ok(RunStatus::Idle);
         };
+        self.statistics.dispatched_events = self.statistics.dispatched_events.saturating_add(1);
 
         trace_event_dispatched(
             &mut self.trace,
@@ -320,6 +346,7 @@ where
             scheduler: &mut self.scheduler,
             trace: &mut self.trace,
             stopped: &mut self.stopped,
+            statistics: &mut self.statistics,
             deadline,
         };
 
@@ -338,6 +365,7 @@ pub struct RuntimeContext<'a, E, S> {
     scheduler: &'a mut Scheduler<E>,
     trace: &'a mut TraceRecorder<S>,
     stopped: &'a mut bool,
+    statistics: &'a mut RuntimeStatistics,
     deadline: SimTime,
 }
 
@@ -361,6 +389,26 @@ impl<E, S> RuntimeContext<'_, E, S> {
     pub fn time_horizon(&self) -> SimTime {
         self.next_event_time()
             .map_or(self.deadline, |time| time.min(self.deadline))
+    }
+
+    /// Advances to a component-selected time only when no event or deadline is crossed.
+    pub fn try_advance_to(&mut self, time: SimTime) -> Result<bool, SchedulerError> {
+        if time < self.scheduler.now() {
+            return Err(SchedulerError::EventInPast {
+                now: self.scheduler.now(),
+                time,
+            });
+        }
+        if time > self.deadline
+            || self
+                .scheduler
+                .peek_next_time()
+                .is_some_and(|event_time| event_time <= time)
+        {
+            return Ok(false);
+        }
+        self.scheduler.advance_to(time)?;
+        Ok(true)
     }
 
     /// Returns whether the runtime has been requested to stop.
@@ -391,6 +439,7 @@ where
         payload: E,
     ) -> Result<ScheduledEventId, SchedulerError> {
         let id = self.scheduler.schedule_at(time, target, payload)?;
+        self.statistics.scheduled_events = self.statistics.scheduled_events.saturating_add(1);
         trace_event_scheduled(self.trace, self.scheduler.now(), id, target, time);
         Ok(id)
     }

@@ -7,7 +7,7 @@
 
 use core::any::type_name;
 use core::fmt;
-use std::collections::BTreeMap;
+use core::marker::PhantomData;
 
 use se_core::component::{Component, ComponentId};
 
@@ -48,6 +48,12 @@ pub enum RegistryLookupError {
         /// Requested concrete Rust type.
         expected: &'static str,
     },
+
+    /// The registry topology changed after a slot was resolved.
+    StaleSlot {
+        /// Component identifier held by the stale slot.
+        id: ComponentId,
+    },
 }
 
 impl fmt::Display for RegistryLookupError {
@@ -57,6 +63,7 @@ impl fmt::Display for RegistryLookupError {
             Self::TypeMismatch { id, expected } => {
                 write!(f, "component {id} is not of type {expected}")
             }
+            Self::StaleSlot { id } => write!(f, "component slot for {id} is stale"),
         }
     }
 }
@@ -64,16 +71,65 @@ impl fmt::Display for RegistryLookupError {
 impl std::error::Error for RegistryLookupError {}
 
 /// Ordered component storage owned by the runtime.
-#[derive(Default)]
 pub struct ComponentRegistry {
-    components: BTreeMap<ComponentId, Box<dyn Component>>,
+    components: Vec<Box<dyn Component>>,
+    topology_generation: u64,
+}
+
+impl Default for ComponentRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Type-checked position in one immutable registry topology.
+pub struct ComponentSlot<T> {
+    index: usize,
+    id: ComponentId,
+    generation: u64,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T> Copy for ComponentSlot<T> {}
+
+impl<T> Clone for ComponentSlot<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> fmt::Debug for ComponentSlot<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ComponentSlot")
+            .field("index", &self.index)
+            .field("id", &self.id)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl<T> PartialEq for ComponentSlot<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && self.id == other.id && self.generation == other.generation
+    }
+}
+
+impl<T> Eq for ComponentSlot<T> {}
+
+impl<T> ComponentSlot<T> {
+    /// Returns the stable component identifier represented by this slot.
+    pub const fn id(self) -> ComponentId {
+        self.id
+    }
 }
 
 impl ComponentRegistry {
     /// Creates an empty component registry.
     pub const fn new() -> Self {
         Self {
-            components: BTreeMap::new(),
+            components: Vec::new(),
+            topology_generation: 0,
         }
     }
 
@@ -84,25 +140,28 @@ impl ComponentRegistry {
     /// rejected.
     pub fn insert(&mut self, component: Box<dyn Component>) -> Result<(), RegistryError> {
         let id = component.id();
-        if self.components.contains_key(&id) {
-            return Err(RegistryError::DuplicateComponent { id });
-        }
-
-        self.components.insert(id, component);
+        let index = match self
+            .components
+            .binary_search_by_key(&id, |component| component.id())
+        {
+            Ok(_) => return Err(RegistryError::DuplicateComponent { id }),
+            Err(index) => index,
+        };
+        self.components.insert(index, component);
+        self.topology_generation = self.topology_generation.wrapping_add(1);
         Ok(())
     }
 
     /// Returns an immutable component reference.
     pub fn get(&self, id: ComponentId) -> Option<&dyn Component> {
-        self.components.get(&id).map(Box::as_ref)
+        self.index_of(id)
+            .map(|index| self.components[index].as_ref())
     }
 
     /// Returns a mutable component reference.
     pub fn get_mut(&mut self, id: ComponentId) -> Option<&mut dyn Component> {
-        match self.components.get_mut(&id) {
-            Some(component) => Some(component.as_mut()),
-            None => None,
-        }
+        let index = self.index_of(id)?;
+        Some(self.components[index].as_mut())
     }
 
     /// Returns an immutable component reference with its concrete type checked.
@@ -110,10 +169,10 @@ impl ComponentRegistry {
     where
         T: Component,
     {
-        let component = self
-            .components
-            .get(&id)
+        let index = self
+            .index_of(id)
             .ok_or(RegistryLookupError::MissingComponent { id })?;
+        let component = &self.components[index];
         let component: &dyn core::any::Any = component.as_ref();
         component
             .downcast_ref::<T>()
@@ -128,10 +187,10 @@ impl ComponentRegistry {
     where
         T: Component,
     {
-        let component = self
-            .components
-            .get_mut(&id)
+        let index = self
+            .index_of(id)
             .ok_or(RegistryLookupError::MissingComponent { id })?;
+        let component = &mut self.components[index];
         let component: &mut dyn core::any::Any = component.as_mut();
         component
             .downcast_mut::<T>()
@@ -143,17 +202,19 @@ impl ComponentRegistry {
 
     /// Removes and returns a component.
     pub fn remove(&mut self, id: ComponentId) -> Option<Box<dyn Component>> {
-        self.components.remove(&id)
+        let index = self.index_of(id)?;
+        self.topology_generation = self.topology_generation.wrapping_add(1);
+        Some(self.components.remove(index))
     }
 
     /// Returns whether the registry contains a component.
     pub fn contains(&self, id: ComponentId) -> bool {
-        self.components.contains_key(&id)
+        self.index_of(id).is_some()
     }
 
     /// Resets all components in stable component identifier order.
     pub fn reset_all(&mut self) {
-        for component in self.components.values_mut() {
+        for component in &mut self.components {
             component.reset();
         }
     }
@@ -166,6 +227,80 @@ impl ComponentRegistry {
     /// Returns whether the registry contains no components.
     pub fn is_empty(&self) -> bool {
         self.components.is_empty()
+    }
+
+    /// Resolves a typed component into a topology-checked slot.
+    pub fn resolve<T>(&self, id: ComponentId) -> Result<ComponentSlot<T>, RegistryLookupError>
+    where
+        T: Component,
+    {
+        let index = self
+            .index_of(id)
+            .ok_or(RegistryLookupError::MissingComponent { id })?;
+        let component: &dyn core::any::Any = self.components[index].as_ref();
+        if !component.is::<T>() {
+            return Err(RegistryLookupError::TypeMismatch {
+                id,
+                expected: type_name::<T>(),
+            });
+        }
+        Ok(ComponentSlot {
+            index,
+            id,
+            generation: self.topology_generation,
+            marker: PhantomData,
+        })
+    }
+
+    /// Returns an immutable component through a resolved slot.
+    pub fn get_resolved<T>(&self, slot: ComponentSlot<T>) -> Result<&T, RegistryLookupError>
+    where
+        T: Component,
+    {
+        self.validate_slot(slot)?;
+        let component: &dyn core::any::Any = self.components[slot.index].as_ref();
+        component
+            .downcast_ref::<T>()
+            .ok_or(RegistryLookupError::TypeMismatch {
+                id: slot.id,
+                expected: type_name::<T>(),
+            })
+    }
+
+    /// Returns a mutable component through a resolved slot.
+    pub fn get_resolved_mut<T>(
+        &mut self,
+        slot: ComponentSlot<T>,
+    ) -> Result<&mut T, RegistryLookupError>
+    where
+        T: Component,
+    {
+        self.validate_slot(slot)?;
+        let component: &mut dyn core::any::Any = self.components[slot.index].as_mut();
+        component
+            .downcast_mut::<T>()
+            .ok_or(RegistryLookupError::TypeMismatch {
+                id: slot.id,
+                expected: type_name::<T>(),
+            })
+    }
+
+    fn index_of(&self, id: ComponentId) -> Option<usize> {
+        self.components
+            .binary_search_by_key(&id, |component| component.id())
+            .ok()
+    }
+
+    fn validate_slot<T>(&self, slot: ComponentSlot<T>) -> Result<(), RegistryLookupError> {
+        if slot.generation != self.topology_generation
+            || self
+                .components
+                .get(slot.index)
+                .is_none_or(|component| component.id() != slot.id)
+        {
+            return Err(RegistryLookupError::StaleSlot { id: slot.id });
+        }
+        Ok(())
     }
 }
 

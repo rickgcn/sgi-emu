@@ -152,3 +152,27 @@ fn typed_lookups_distinguish_missing_components_and_type_mismatches() {
         }
     );
 }
+
+#[test]
+fn resolved_slots_are_typed_and_invalidated_by_topology_changes() {
+    let resets = Rc::new(RefCell::new(Vec::new()));
+    let mut registry = ComponentRegistry::new();
+    let id = ComponentId::new(20);
+    registry
+        .insert(Box::new(TestComponent::new(20, "slotted", resets.clone())))
+        .unwrap();
+
+    let slot = registry.resolve::<TestComponent>(id).unwrap();
+    assert_eq!(slot.id(), id);
+    assert_eq!(registry.get_resolved(slot).unwrap().name(), "slotted");
+    registry.get_resolved_mut(slot).unwrap().name = "changed";
+    assert_eq!(registry.get_resolved(slot).unwrap().name(), "changed");
+
+    registry
+        .insert(Box::new(TestComponent::new(10, "inserted", resets)))
+        .unwrap();
+    assert_eq!(
+        registry.get_resolved(slot).err().unwrap(),
+        RegistryLookupError::StaleSlot { id }
+    );
+}
