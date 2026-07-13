@@ -350,6 +350,23 @@ fn cp1_transfers_and_ctc1_write_before_trapping() {
 }
 
 #[test]
+fn r5000_reserved_cp1_control_transfers_use_deterministic_undefined_values() {
+    let mut read = cp1_machine();
+    read.write_gpr(2, u64::MAX);
+
+    let cfc1_fcr30 = cop1_transfer(0x02, 2, 30);
+    assert_retired(read.execute(cfc1_fcr30), cfc1_fcr30);
+    assert_eq!(read.read_gpr(2), 0);
+    assert_eq!(read.state().cp1().fcsr().bits(), 0);
+
+    let mut write = cp1_machine();
+    write.write_gpr(2, 0xfeed_face);
+    let ctc1_fcr30 = cop1_transfer(0x06, 2, 30);
+    assert_retired(write.execute(ctc1_fcr30), ctc1_fcr30);
+    assert_eq!(write.state().cp1().fcsr().bits(), 0);
+}
+
+#[test]
 fn floating_to_fixed_limits_and_signaling_nan_use_distinct_exception_causes() {
     let mut out_of_range = cp1_machine();
     write_f64(&mut out_of_range, 2, 2_f64.powi(53));

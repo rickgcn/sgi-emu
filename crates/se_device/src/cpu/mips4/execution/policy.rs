@@ -58,6 +58,15 @@ pub enum Mips4NotWordValuePolicy {
     NoOperation,
 }
 
+/// Processor decision for transfers involving a reserved CP1 control register.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Mips4ReservedCp1ControlPolicy {
+    /// Return zero from `CFC1` and ignore `CTC1` writes.
+    ReadZeroWriteIgnore,
+    /// Raise the floating-point Unimplemented Operation exception.
+    FloatingPointUnimplemented,
+}
+
 /// Processor implementation policy used by the generic MIPS IV execution target.
 pub trait Mips4ExecutionPolicy {
     /// Returns the reset program counter.
@@ -103,6 +112,11 @@ pub trait Mips4ExecutionPolicy {
     /// Selects processor behavior for an instruction with a `NotWordValue` operand.
     fn not_word_value_policy(&self, _instruction: Mips4CpuInstruction) -> Mips4NotWordValuePolicy {
         Mips4NotWordValuePolicy::NoOperation
+    }
+
+    /// Selects behavior for `CFC1` and `CTC1` naming a reserved control register.
+    fn reserved_cp1_control_policy(&self, _register: u8) -> Mips4ReservedCp1ControlPolicy {
+        Mips4ReservedCp1ControlPolicy::FloatingPointUnimplemented
     }
 
     /// Resolves an architecture cache attribute to a processor access type.

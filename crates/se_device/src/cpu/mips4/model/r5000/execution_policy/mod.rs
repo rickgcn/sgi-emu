@@ -11,6 +11,7 @@ use crate::cpu::mips4::exception::{Mips4ErrorException, Mips4ExceptionImage};
 use crate::cpu::mips4::execution::policy::{
     Mips4Cp0DoublewordTransferDirection, Mips4Cp0DoublewordTransferPolicy, Mips4Cp0WaitPolicy,
     Mips4ExecutionPolicy, Mips4NotWordValuePolicy, Mips4PrefetchPolicy,
+    Mips4ReservedCp1ControlPolicy,
 };
 use crate::cpu::mips4::instruction::decode::Mips4CpuInstruction;
 use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig, Mips4MmuPrivilegeMode};
@@ -177,6 +178,10 @@ impl Mips4ExecutionPolicy for R5000ExecutionPolicy {
             }
             _ => Mips4NotWordValuePolicy::NoOperation,
         }
+    }
+
+    fn reserved_cp1_control_policy(&self, _register: u8) -> Mips4ReservedCp1ControlPolicy {
+        Mips4ReservedCp1ControlPolicy::ReadZeroWriteIgnore
     }
 
     fn resolve_access_type(

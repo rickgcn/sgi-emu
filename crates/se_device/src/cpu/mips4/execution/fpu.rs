@@ -39,7 +39,7 @@ use super::access::{
 };
 use super::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransaction, Mips4ExecutionTransferSize};
 use super::memory::{decode_u32, decode_u64, encode_lanes};
-use super::policy::{Mips4ExecutionPolicy, Mips4PrefetchPolicy};
+use super::policy::{Mips4ExecutionPolicy, Mips4PrefetchPolicy, Mips4ReservedCp1ControlPolicy};
 use super::state::Mips4ExecutionState;
 
 pub(super) enum Mips4FpuExecution {
@@ -96,7 +96,7 @@ pub(super) fn execute_fpu<F: FloatBackend>(
     };
     match class {
         Mips4Cp1InstructionClass::RegisterTransfer(operation) => {
-            Ok(execute_transfer(state, raw, operation))
+            Ok(execute_transfer(state, policy, raw, operation))
         }
         Mips4Cp1InstructionClass::Branch(operation) => Ok(execute_branch(state, raw, operation)),
         Mips4Cp1InstructionClass::Formatted { operation, format } => {
@@ -244,6 +244,7 @@ pub(super) fn complete_fpu_read(
 
 fn execute_transfer(
     state: &mut Mips4ExecutionState,
+    policy: &impl Mips4ExecutionPolicy,
     raw: Mips4Instruction,
     operation: Mips4Cp1RegisterTransferOperation,
 ) -> Mips4FpuExecution {
@@ -264,14 +265,16 @@ fn execute_transfer(
             write_gpr(state, raw.rt(), value);
         }
         Mips4Cp1RegisterTransferOperation::MoveControlFrom => {
-            let Some(register) = Mips4Cp1ControlRegister::from_u8(raw.rd()) else {
-                return unimplemented(state);
+            let value = match Mips4Cp1ControlRegister::from_u8(raw.rd()) {
+                Some(register) => state.cp1.read_control(register),
+                None => match policy.reserved_cp1_control_policy(raw.rd()) {
+                    Mips4ReservedCp1ControlPolicy::ReadZeroWriteIgnore => 0,
+                    Mips4ReservedCp1ControlPolicy::FloatingPointUnimplemented => {
+                        return unimplemented(state);
+                    }
+                },
             };
-            write_gpr(
-                state,
-                raw.rt(),
-                sign_extend_word(state.cp1.read_control(register)),
-            );
+            write_gpr(state, raw.rt(), sign_extend_word(value));
         }
         Mips4Cp1RegisterTransferOperation::MoveWordTo => {
             let value = read_gpr(state, raw.rt()) as u32;
@@ -289,8 +292,16 @@ fn execute_transfer(
             }
         }
         Mips4Cp1RegisterTransferOperation::MoveControlTo => {
-            let Some(register) = Mips4Cp1ControlRegister::from_u8(raw.rd()) else {
-                return unimplemented(state);
+            let register = match Mips4Cp1ControlRegister::from_u8(raw.rd()) {
+                Some(register) => register,
+                None => match policy.reserved_cp1_control_policy(raw.rd()) {
+                    Mips4ReservedCp1ControlPolicy::ReadZeroWriteIgnore => {
+                        return Mips4FpuExecution::Retire;
+                    }
+                    Mips4ReservedCp1ControlPolicy::FloatingPointUnimplemented => {
+                        return unimplemented(state);
+                    }
+                },
             };
             let value = read_gpr(state, raw.rt()) as u32;
             let _ = state.cp1.write_control(register, value);
