@@ -10,7 +10,9 @@
 #include <QtCore/QCoreApplication>
 #include <QtCore/QEvent>
 #include <QtCore/QFile>
+#include <QtCore/QFileInfo>
 #include <QtCore/QLocale>
+#include <QtCore/QSettings>
 #include <QtCore/QSignalBlocker>
 #include <QtCore/QSize>
 #include <QtCore/QString>
@@ -19,6 +21,7 @@
 #include <QtCore/QtGlobal>
 #include <QtCore/QtResource>
 #include <QtGui/QAction>
+#include <QtGui/QCloseEvent>
 #include <QtGui/QIcon>
 #include <QtGui/QPainter>
 #include <QtGui/QPalette>
@@ -61,6 +64,21 @@ constexpr auto help_text = QT_TRANSLATE_NOOP("MainWindow", "Help");
 constexpr auto run_text = QT_TRANSLATE_NOOP("MainWindow", "Run");
 constexpr auto pause_text = QT_TRANSLATE_NOOP("MainWindow", "Pause");
 constexpr auto hard_reset_text = QT_TRANSLATE_NOOP("MainWindow", "Hard Reset");
+constexpr auto save_state_text = QT_TRANSLATE_NOOP("MainWindow", "Save State...");
+constexpr auto load_state_text = QT_TRANSLATE_NOOP("MainWindow", "Load State...");
+constexpr auto save_state_title_text = QT_TRANSLATE_NOOP("MainWindow", "Save Emulator State");
+constexpr auto load_state_title_text = QT_TRANSLATE_NOOP("MainWindow", "Load Emulator State");
+constexpr auto state_filter_text = QT_TRANSLATE_NOOP("MainWindow", "sgi-emu states (*.sestate)");
+constexpr auto replace_machine_text = QT_TRANSLATE_NOOP(
+  "MainWindow",
+  "Loading this state will replace the current machine session. Continue?");
+constexpr auto select_matching_prom_text = QT_TRANSLATE_NOOP(
+  "MainWindow",
+  "Select the 512 KiB System PROM matching this state file.");
+constexpr auto persistence_failed_text = QT_TRANSLATE_NOOP("MainWindow", "Persistence Error");
+constexpr auto persistence_warning_text = QT_TRANSLATE_NOOP("MainWindow", "Persistence Warning");
+constexpr auto state_saved_text = QT_TRANSLATE_NOOP("MainWindow", "State saved.");
+constexpr auto state_loaded_text = QT_TRANSLATE_NOOP("MainWindow", "State loaded.");
 constexpr auto hide_toolbar_text = QT_TRANSLATE_NOOP("MainWindow", "Hide Toolbar");
 constexpr auto toolbar_text = QT_TRANSLATE_NOOP("MainWindow", "Toolbar");
 constexpr auto hide_status_bar_text = QT_TRANSLATE_NOOP("MainWindow", "Hide Status Bar");
@@ -79,6 +97,11 @@ constexpr auto ip32_machine_text =
   QT_TRANSLATE_NOOP("MainWindow", "SGI O2 (IP32)");
 constexpr auto system_prom_text =
   QT_TRANSLATE_NOOP("MainWindow", "System PROM");
+constexpr auto rtc_mode_text = QT_TRANSLATE_NOOP("MainWindow", "RTC Persistence");
+constexpr auto rtc_real_time_text = QT_TRANSLATE_NOOP("MainWindow", "Real Time");
+constexpr auto rtc_frozen_text = QT_TRANSLATE_NOOP("MainWindow", "Frozen");
+constexpr auto rtc_sync_host_text =
+  QT_TRANSLATE_NOOP("MainWindow", "Synchronize with Host");
 constexpr auto browse_text = QT_TRANSLATE_NOOP("MainWindow", "Browse...");
 constexpr auto select_prom_text =
   QT_TRANSLATE_NOOP("MainWindow", "Select System PROM");
@@ -100,6 +123,8 @@ constexpr auto ip32_status_text = QT_TRANSLATE_NOOP("MainWindow", "IP32: %1");
 constexpr auto unconfigured_text =
   QT_TRANSLATE_NOOP("MainWindow", "Unconfigured");
 constexpr auto building_text = QT_TRANSLATE_NOOP("MainWindow", "Building");
+constexpr auto saving_text = QT_TRANSLATE_NOOP("MainWindow", "Saving");
+constexpr auto loading_text = QT_TRANSLATE_NOOP("MainWindow", "Loading");
 constexpr auto paused_text = QT_TRANSLATE_NOOP("MainWindow", "Paused");
 constexpr auto running_text = QT_TRANSLATE_NOOP("MainWindow", "Running");
 constexpr auto idle_text = QT_TRANSLATE_NOOP("MainWindow", "Idle");
@@ -112,6 +137,7 @@ constexpr auto pause_icon_path = ":/icons/pause.svg";
 constexpr auto hard_reset_icon_path = ":/icons/hard-reset.svg";
 constexpr auto emulation_settings_icon_path =
   ":/icons/emulation-settings.svg";
+constexpr auto ui_settings_schema = 1;
 
 QString translate(const char* source)
 {
@@ -174,6 +200,10 @@ QString emulation_state_text(EmulationState state)
     return translate(unconfigured_text);
   case EmulationState::Building:
     return translate(building_text);
+  case EmulationState::Saving:
+    return translate(saving_text);
+  case EmulationState::Loading:
+    return translate(loading_text);
   case EmulationState::Paused:
     return translate(paused_text);
   case EmulationState::Running:
@@ -219,6 +249,8 @@ void show_settings_dialog(QWidget* parent)
 
   if (dialog.exec() == QDialog::Accepted) {
     QApplication::setStyle(style_selector->currentText());
+    QSettings settings;
+    settings.setValue(QStringLiteral("ui/style"), style_selector->currentText());
   }
 }
 
@@ -238,16 +270,29 @@ void show_emulation_settings_dialog(
   auto* prom_layout = new QHBoxLayout(prom_row);
   prom_layout->setContentsMargins(0, 0, 0, 0);
   auto* prom_path = new QLineEdit(prom_row);
+  const auto snapshot = controller.snapshot();
+  prom_path->setText(from_rust_string(snapshot.prom_path));
   auto* browse = new QPushButton(translate(browse_text), prom_row);
   prom_layout->addWidget(prom_path, 1);
   prom_layout->addWidget(browse);
   layout->addRow(translate(system_prom_text), prom_row);
 
+  auto* rtc_mode = new QComboBox(&dialog);
+  rtc_mode->addItem(translate(rtc_real_time_text), 0);
+  rtc_mode->addItem(translate(rtc_frozen_text), 1);
+  rtc_mode->addItem(translate(rtc_sync_host_text), 2);
+  const auto saved_rtc_index = rtc_mode->findData(snapshot.rtc_mode);
+  if (saved_rtc_index >= 0) {
+    rtc_mode->setCurrentIndex(saved_rtc_index);
+  }
+  layout->addRow(translate(rtc_mode_text), rtc_mode);
+
   QObject::connect(browse, &QPushButton::clicked, &dialog, [&dialog, prom_path] {
+    QSettings settings;
     const auto path = QFileDialog::getOpenFileName(
       &dialog,
       translate(select_prom_text),
-      {},
+      settings.value(QStringLiteral("recent/promDirectory")).toString(),
       translate(prom_filter_text));
     if (!path.isEmpty()) {
       prom_path->setText(path);
@@ -262,7 +307,7 @@ void show_emulation_settings_dialog(
     buttons,
     &QDialogButtonBox::accepted,
     &dialog,
-    [&dialog, prom_path, &controller] {
+    [&dialog, prom_path, rtc_mode, &controller] {
       if (prom_path->text().isEmpty()) {
         QMessageBox::warning(
           &dialog,
@@ -289,16 +334,24 @@ void show_emulation_settings_dialog(
       }
 
       const auto* data = reinterpret_cast<const std::uint8_t*>(prom.constData());
-      if (!controller.configure_prom(
+      const auto absolute_path = QFileInfo(prom_path->text()).absoluteFilePath();
+      const auto path_utf8 = absolute_path.toUtf8();
+      if (!controller.configure_machine(
+            rust::Str(path_utf8.constData(), static_cast<std::size_t>(path_utf8.size())),
             rust::Slice<const std::uint8_t>(
               data,
-              static_cast<std::size_t>(prom.size())))) {
+              static_cast<std::size_t>(prom.size())),
+            static_cast<std::uint8_t>(rtc_mode->currentData().toUInt()))) {
         QMessageBox::warning(
           &dialog,
           translate(emulation_settings_text),
           translate(configure_failed_text));
         return;
       }
+      QSettings settings;
+      settings.setValue(
+        QStringLiteral("recent/promDirectory"),
+        QFileInfo(absolute_path).absolutePath());
       dialog.accept();
     });
   layout->addRow(buttons);
@@ -342,6 +395,63 @@ public:
     hard_reset_action_ = action_menu->addAction(translate(hard_reset_text));
     connect(hard_reset_action_, &QAction::triggered, this, [this] {
       controller_.request_hard_reset();
+      update_emulation_state();
+    });
+    action_menu->addSeparator();
+    save_state_action_ = action_menu->addAction(translate(save_state_text));
+    connect(save_state_action_, &QAction::triggered, this, [this] {
+      QSettings settings;
+      const auto path = QFileDialog::getSaveFileName(
+        this,
+        translate(save_state_title_text),
+        settings.value(QStringLiteral("recent/stateSaveDirectory")).toString(),
+        translate(state_filter_text));
+      if (path.isEmpty()) {
+        return;
+      }
+      auto state_path = path;
+      if (QFileInfo(state_path).suffix().isEmpty()) {
+        state_path += QStringLiteral(".sestate");
+      }
+      const auto absolute_path = QFileInfo(state_path).absoluteFilePath();
+      const auto utf8 = absolute_path.toUtf8();
+      if (controller_.request_save_state(
+            rust::Str(utf8.constData(), static_cast<std::size_t>(utf8.size())))) {
+        settings.setValue(
+          QStringLiteral("recent/stateSaveDirectory"),
+          QFileInfo(absolute_path).absolutePath());
+      }
+      update_emulation_state();
+    });
+    load_state_action_ = action_menu->addAction(translate(load_state_text));
+    connect(load_state_action_, &QAction::triggered, this, [this] {
+      const auto snapshot = controller_.snapshot();
+      if (snapshot.has_machine
+          && QMessageBox::question(
+               this,
+               translate(load_state_title_text),
+               translate(replace_machine_text))
+            != QMessageBox::Yes) {
+        return;
+      }
+      QSettings settings;
+      const auto path = QFileDialog::getOpenFileName(
+        this,
+        translate(load_state_title_text),
+        settings.value(QStringLiteral("recent/stateLoadDirectory")).toString(),
+        translate(state_filter_text));
+      if (path.isEmpty()) {
+        return;
+      }
+      pending_load_path_ = QFileInfo(path).absoluteFilePath();
+      const auto utf8 = pending_load_path_.toUtf8();
+      if (controller_.request_load_state(
+            rust::Str(utf8.constData(), static_cast<std::size_t>(utf8.size())),
+            rust::Str())) {
+        settings.setValue(
+          QStringLiteral("recent/stateLoadDirectory"),
+          QFileInfo(pending_load_path_).absolutePath());
+      }
       update_emulation_state();
     });
     auto* settings_action = tools_menu->addAction(translate(settings_text));
@@ -424,6 +534,12 @@ public:
     resizeDocks({ tracing_dock, terminal_dock }, { 320, 320 }, Qt::Vertical);
     terminal_dock->raise();
 
+    QSettings settings;
+    if (settings.value(QStringLiteral("ui/schema"), 0).toInt() == ui_settings_schema) {
+      restoreGeometry(settings.value(QStringLiteral("ui/geometry")).toByteArray());
+      restoreState(settings.value(QStringLiteral("ui/windowState")).toByteArray());
+    }
+
     auto* about_action = help_menu->addAction(translate(about_text));
     connect(about_action, &QAction::triggered, this, [this] {
       QMessageBox::about(
@@ -445,6 +561,16 @@ public:
   }
 
 protected:
+  void closeEvent(QCloseEvent* event) override
+  {
+    QSettings settings;
+    settings.setValue(QStringLiteral("ui/schema"), ui_settings_schema);
+    settings.setValue(QStringLiteral("ui/geometry"), saveGeometry());
+    settings.setValue(QStringLiteral("ui/windowState"), saveState());
+    settings.sync();
+    QMainWindow::closeEvent(event);
+  }
+
   void changeEvent(QEvent* event) override
   {
     QMainWindow::changeEvent(event);
@@ -489,6 +615,17 @@ private:
           || snapshot.state == EmulationState::Running
           || snapshot.state == EmulationState::Idle
           || snapshot.state == EmulationState::Faulted));
+    save_state_action_->setEnabled(
+      snapshot.has_machine
+      && (snapshot.state == EmulationState::Paused
+          || snapshot.state == EmulationState::Running
+          || snapshot.state == EmulationState::Idle));
+    load_state_action_->setEnabled(
+      snapshot.state == EmulationState::Unconfigured
+      || snapshot.state == EmulationState::Paused
+      || snapshot.state == EmulationState::Running
+      || snapshot.state == EmulationState::Idle
+      || snapshot.state == EmulationState::Faulted);
     emulation_settings_action_->setEnabled(
       snapshot.state == EmulationState::Unconfigured
       || snapshot.state == EmulationState::Paused
@@ -504,15 +641,76 @@ private:
         translate(emulation_error_text),
         from_rust_string(snapshot.error_message));
     }
+
+    if (snapshot.persistence_id > last_persistence_id_) {
+      last_persistence_id_ = snapshot.persistence_id;
+      const auto detail = from_rust_string(snapshot.persistence_message);
+      switch (snapshot.persistence_outcome) {
+      case PersistenceOutcome::Saved:
+        statusBar()->showMessage(translate(state_saved_text), 5000);
+        break;
+      case PersistenceOutcome::Loaded:
+        statusBar()->showMessage(translate(state_loaded_text), 5000);
+        break;
+      case PersistenceOutcome::PromRequired:
+        retry_load_with_prom(detail);
+        break;
+      case PersistenceOutcome::Warning:
+        QMessageBox::warning(
+          this,
+          translate(persistence_warning_text),
+          detail);
+        break;
+      case PersistenceOutcome::Failed:
+        QMessageBox::critical(
+          this,
+          translate(persistence_failed_text),
+          detail);
+        break;
+      case PersistenceOutcome::None:
+        break;
+      }
+    }
+  }
+
+  void retry_load_with_prom(const QString& detail)
+  {
+    QMessageBox::information(
+      this,
+      translate(load_state_title_text),
+      QStringLiteral("%1\n\n%2").arg(translate(select_matching_prom_text), detail));
+    QSettings settings;
+    const auto prom = QFileDialog::getOpenFileName(
+      this,
+      translate(select_prom_text),
+      settings.value(QStringLiteral("recent/promDirectory")).toString(),
+      translate(prom_filter_text));
+    if (prom.isEmpty() || pending_load_path_.isEmpty()) {
+      return;
+    }
+    const auto absolute_prom = QFileInfo(prom).absoluteFilePath();
+    const auto state_utf8 = pending_load_path_.toUtf8();
+    const auto prom_utf8 = absolute_prom.toUtf8();
+    if (controller_.request_load_state(
+          rust::Str(state_utf8.constData(), static_cast<std::size_t>(state_utf8.size())),
+          rust::Str(prom_utf8.constData(), static_cast<std::size_t>(prom_utf8.size())))) {
+      settings.setValue(
+        QStringLiteral("recent/promDirectory"),
+        QFileInfo(absolute_prom).absolutePath());
+    }
   }
 
   const EmulationController& controller_;
   QAction* run_pause_action_ = nullptr;
   QAction* hard_reset_action_ = nullptr;
+  QAction* save_state_action_ = nullptr;
+  QAction* load_state_action_ = nullptr;
   QAction* emulation_settings_action_ = nullptr;
   QLabel* emulation_status_ = nullptr;
   bool run_icon_running_ = false;
   std::uint64_t last_error_id_ = 0;
+  std::uint64_t last_persistence_id_ = 0;
+  QString pending_load_path_;
 };
 
 std::vector<QByteArray> make_argument_storage(
@@ -562,11 +760,19 @@ std::int32_t run_application(
   QApplication application(argument_count, argument_pointers.data());
 
   QCoreApplication::setApplicationName(QStringLiteral("sgi-emu"));
+  QCoreApplication::setOrganizationName(QStringLiteral("rickgcn"));
+  QCoreApplication::setOrganizationDomain(QStringLiteral("rickgcn"));
   QApplication::setApplicationDisplayName(QStringLiteral("sgi-emu"));
   QCoreApplication::setApplicationVersion(QString::fromUtf8(
     version.data(),
     static_cast<qsizetype>(version.size())));
   QLocale::setDefault(QLocale(QStringLiteral("en_US")));
+
+  QSettings settings;
+  const auto saved_style = settings.value(QStringLiteral("ui/style")).toString();
+  if (!saved_style.isEmpty()) {
+    QApplication::setStyle(saved_style);
+  }
 
   QTranslator translator;
   if (!translator.load(QStringLiteral(":/i18n/sgi-emu_en_US.qm"))) {

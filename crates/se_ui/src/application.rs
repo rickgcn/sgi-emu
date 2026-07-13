@@ -7,11 +7,23 @@ pub(crate) mod ffi {
     enum EmulationState {
         Unconfigured,
         Building,
+        Saving,
+        Loading,
         Paused,
         Running,
         Idle,
         Faulted,
         ShuttingDown,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PersistenceOutcome {
+        None,
+        Saved,
+        Loaded,
+        PromRequired,
+        Warning,
+        Failed,
     }
 
     struct EmulationSnapshot {
@@ -21,6 +33,11 @@ pub(crate) mod ffi {
         has_machine: bool,
         error_id: u64,
         error_message: String,
+        persistence_id: u64,
+        persistence_outcome: PersistenceOutcome,
+        persistence_message: String,
+        prom_path: String,
+        rtc_mode: u8,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +131,14 @@ pub(crate) mod ffi {
         fn request_pause(self: &EmulationController) -> bool;
         fn request_hard_reset(self: &EmulationController) -> bool;
         fn configure_prom(self: &EmulationController, prom: &[u8]) -> bool;
+        fn configure_machine(
+            self: &EmulationController,
+            prom_path: &str,
+            prom: &[u8],
+            rtc_mode: u8,
+        ) -> bool;
+        fn request_save_state(self: &EmulationController, path: &str) -> bool;
+        fn request_load_state(self: &EmulationController, path: &str, prom_override: &str) -> bool;
         fn snapshot(self: &EmulationController) -> EmulationSnapshot;
         fn submit_terminal_input(
             self: &EmulationController,
@@ -166,7 +191,7 @@ pub(crate) mod ffi {
 
 /// Runs the native Qt application.
 pub fn run(version: &str, arguments: Vec<String>) -> i32 {
-    let controller = EmulationController::new();
+    let controller = EmulationController::new_with_version(version);
     let exit_code = ffi::run_application(version, arguments, &controller);
     controller.shutdown();
     exit_code
