@@ -11,7 +11,7 @@ pub mod ds2502;
 pub mod flash;
 
 /// Transaction accepted by a byte-addressed memory component.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MemoryTransaction {
     /// Reads physical byte lanes beginning at a device offset.
     Read {
@@ -39,7 +39,7 @@ pub enum MemoryTransaction {
 }
 
 /// Response returned by a byte-addressed memory component.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MemoryResponse {
     /// Read data in physical byte-lane order.
     ReadData(u64),
@@ -52,7 +52,7 @@ pub enum MemoryResponse {
 }
 
 /// Writable byte-addressed memory.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ram {
     id: ComponentId,
     name: String,
@@ -116,7 +116,7 @@ impl BusDeviceRole<MemoryTransaction> for Ram {
 }
 
 /// Read-only byte-addressed memory.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Rom {
     id: ComponentId,
     name: String,

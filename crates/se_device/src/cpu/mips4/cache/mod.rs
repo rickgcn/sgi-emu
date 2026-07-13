@@ -13,7 +13,9 @@ pub mod hierarchy;
 pub const MIPS4_CACHE_OPCODE: u8 = 0x2f;
 
 /// Architecture-level memory access type.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4MemoryAccessType {
     /// Physical memory resolves each reference without cache lookup or update.
     Uncached,
@@ -70,7 +72,9 @@ impl Mips4MemoryAccessType {
 }
 
 /// Raw 3-bit cache-coherence algorithm value.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct Mips4CacheCoherenceAlgorithm(u8);
 
 impl Mips4CacheCoherenceAlgorithm {
@@ -86,7 +90,9 @@ impl Mips4CacheCoherenceAlgorithm {
 }
 
 /// Raw fields of a MIPS IV `CACHE` instruction.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct Mips4CacheInstruction {
     instruction: Mips4Instruction,
 }
@@ -148,7 +154,9 @@ impl Mips4CacheInstruction {
 }
 
 /// Cache-line address geometry.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct Mips4CacheLineGeometry {
     /// Cache line size in bytes.
     pub line_size_bytes: u64,

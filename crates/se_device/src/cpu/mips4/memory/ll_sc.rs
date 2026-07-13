@@ -10,7 +10,9 @@
 //! would no longer be atomic (including by exception return instructions).
 
 /// Value of the `LLbit` virtual state.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4LlBit {
     /// No active read-modify-write sequence.
     #[default]
@@ -21,7 +23,7 @@ pub enum Mips4LlBit {
 }
 
 /// An event that transitions `LLbit`.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4LlBitEvent {
     /// A linked load (`LL`/`LLD`) begins a read-modify-write sequence and sets `LLbit`.
     LinkedLoad,
@@ -35,7 +37,7 @@ pub enum Mips4LlBitEvent {
 }
 
 /// Result of an `LLbit` transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4LlBitTransition {
     /// New `LLbit` value after the event.
     pub state: Mips4LlBit,

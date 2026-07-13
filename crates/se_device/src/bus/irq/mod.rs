@@ -7,7 +7,9 @@ use se_core::component::{Component, ComponentId};
 use se_core::role::BusRole;
 
 /// Device-local interrupt output identifier.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct IrqOutput(u16);
 
 impl IrqOutput {
@@ -23,7 +25,9 @@ impl IrqOutput {
 }
 
 /// Device-local interrupt input identifier.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct IrqInput(u16);
 
 impl IrqInput {
@@ -39,7 +43,9 @@ impl IrqInput {
 }
 
 /// Interrupt source endpoint.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct IrqSource {
     /// Source component.
     pub component: ComponentId,
@@ -49,7 +55,9 @@ pub struct IrqSource {
 }
 
 /// Interrupt target endpoint.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct IrqTarget {
     /// Target component.
     pub component: ComponentId,
@@ -59,7 +67,9 @@ pub struct IrqTarget {
 }
 
 /// Configured interrupt connection.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct IrqRoute {
     /// Source endpoint.
     pub source: IrqSource,
@@ -69,7 +79,7 @@ pub struct IrqRoute {
 }
 
 /// Source-driven interrupt level update.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IrqTransaction {
     /// Source endpoint changing level.
     pub source: IrqSource,
@@ -79,7 +89,7 @@ pub struct IrqTransaction {
 }
 
 /// Aggregated interrupt level delivered to a target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IrqDelivery {
     /// Target-local input.
     pub input: IrqInput,
@@ -89,7 +99,7 @@ pub struct IrqDelivery {
 }
 
 /// Action emitted by an interrupt bus.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IrqBusAction {
     /// Delivers one changed input level.
     Deliver {
@@ -105,7 +115,7 @@ pub enum IrqBusAction {
 }
 
 /// Interrupt bus construction error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IrqBusBuildError {
     /// The routing table contains the same connection more than once.
     DuplicateRoute(IrqRoute),
@@ -129,7 +139,7 @@ impl fmt::Display for IrqBusBuildError {
 impl std::error::Error for IrqBusBuildError {}
 
 /// Interrupt transaction routing error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IrqBusRouteError {
     /// No configured route begins at the transaction source.
     UnroutedSource(IrqSource),
@@ -150,14 +160,14 @@ impl fmt::Display for IrqBusRouteError {
 
 impl std::error::Error for IrqBusRouteError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RouteState {
     route: IrqRoute,
     asserted: bool,
 }
 
 /// Combinational level-sensitive interrupt routing domain.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IrqBus {
     id: ComponentId,
     name: String,
@@ -165,6 +175,8 @@ pub struct IrqBus {
     target_levels: BTreeMap<IrqTarget, bool>,
     actions: VecDeque<IrqBusAction>,
 }
+
+crate::component_state!(IrqBusState, IrqBus);
 
 impl IrqBus {
     /// Creates an interrupt bus with a fixed routing table.

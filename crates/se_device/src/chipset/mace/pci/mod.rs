@@ -35,7 +35,7 @@ pub mod error {
 }
 
 /// MACE PCI host bridge state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MacePci {
     pub error_address: u32,
     pub error_flags: u32,

@@ -3,7 +3,7 @@
 use super::registers;
 
 /// Internal destination selected by the MACE primary decoder.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MaceAddressTarget {
     Future,
     PciRegisters,
@@ -20,14 +20,14 @@ pub enum MaceAddressTarget {
 }
 
 /// Complete decoded address with a target-local byte offset.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceAddressResolution {
     pub target: MaceAddressTarget,
     pub offset: u64,
 }
 
 /// External ISA target selected by the MACE decoder.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MaceExternalIsaTarget {
     Parallel,
     Serial1,
@@ -36,7 +36,7 @@ pub enum MaceExternalIsaTarget {
 }
 
 /// Decoded byte-register access on the external ISA island.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceExternalIsaResolution {
     pub target: MaceExternalIsaTarget,
     pub register: u32,

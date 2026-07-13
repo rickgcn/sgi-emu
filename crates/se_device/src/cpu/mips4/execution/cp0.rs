@@ -30,7 +30,7 @@ const COP0_TLBP: u8 = 0x08;
 const COP0_ERET: u8 = 0x18;
 const COP0_WAIT: u8 = 0x20;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) enum Mips4Cp0Execution {
     Retire,
     Standby,

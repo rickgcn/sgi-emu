@@ -35,7 +35,9 @@ const LOW_RESERVED_MASK: u64 =
     (1u64 << BIT_RESERVED_0) | (1u64 << 19) | (0x0fffu64 << 21) | (0x07u64 << 34);
 
 /// Boot-mode field used in reserved-value diagnostics.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum R5000BootModeField {
     /// System interface data rate for block writes.
     TransmitDataPattern,
@@ -51,7 +53,9 @@ pub enum R5000BootModeField {
 }
 
 /// Boot-mode stream validation error.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum R5000BootModeError {
     /// A reserved stream bit was set.
     ReservedBitSet {
@@ -76,7 +80,9 @@ pub enum R5000BootModeError {
 }
 
 /// System interface data rate for block writes.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum R5000TransmitDataPattern {
     /// `DDDD`.
     Dddd,
@@ -140,7 +146,9 @@ impl R5000TransmitDataPattern {
 }
 
 /// PClock to SysClock multiplier selected by boot mode.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum R5000ClockMultiplier {
     /// 2x SysClock.
     Times2,
@@ -206,7 +214,9 @@ impl R5000ClockMultiplier {
 }
 
 /// Non-block write handling selected by boot mode.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum R5000NonBlockWriteMode {
     /// VR4x00-compatible handling.
     Vr4x00Compatible,
@@ -240,7 +250,9 @@ impl R5000NonBlockWriteMode {
 }
 
 /// Output driver slew rate selected by boot mode.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum R5000DriverSlewRate {
     /// 100%, fastest.
     Percent100,
@@ -278,7 +290,9 @@ impl R5000DriverSlewRate {
 }
 
 /// Secondary cache SRAM protocol selected by boot mode.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum R5000SecondaryCacheSramProtocol {
     /// Pipelined SRAM protocol.
     Pipelined,
@@ -288,7 +302,9 @@ pub enum R5000SecondaryCacheSramProtocol {
 }
 
 /// Secondary cache size selected by boot mode.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum R5000SecondaryCacheSize {
     /// 512 KiB secondary cache.
     Size512Kib,
@@ -331,7 +347,9 @@ impl R5000SecondaryCacheSize {
 }
 
 /// CP0 Count register update rate selected by boot mode.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum R5000CountUpdateRate {
     /// Count updates at one half of PClock.
     HalfPClock,
@@ -341,7 +359,9 @@ pub enum R5000CountUpdateRate {
 }
 
 /// Validated R5000 boot-mode serial stream.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct R5000BootMode {
     words_le: [u64; 4],
 }

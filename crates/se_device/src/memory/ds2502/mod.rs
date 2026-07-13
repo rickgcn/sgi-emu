@@ -24,12 +24,13 @@ const READ_DATA_VALID_MICROSECONDS: u64 = 15;
 const EPROM_SIZE_BYTES: usize = 128;
 
 /// Deterministic DS2502 identity and EPROM contents.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ds2502Config {
     /// Six ROM serial-number bytes transmitted after the family code.
     pub rom_serial_number: [u8; 6],
 
     /// Complete 128-byte add-only EPROM image.
+    #[serde(with = "crate::common::serde_array")]
     pub eprom: [u8; EPROM_SIZE_BYTES],
 }
 
@@ -45,7 +46,7 @@ impl Default for Ds2502Config {
 }
 
 /// DS2502 construction error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ds2502Error {
     /// The supplied machine timebase is zero.
     InvalidTimebase,
@@ -62,7 +63,7 @@ impl fmt::Display for Ds2502Error {
 impl std::error::Error for Ds2502Error {}
 
 /// Scheduled DS2502 line transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ds2502Event {
     /// Begins the presence pulse after a valid reset.
     PresenceAssert { epoch: u64 },
@@ -75,7 +76,7 @@ pub enum Ds2502Event {
 }
 
 /// Observable DS2502 action.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ds2502Action {
     /// Schedules a protocol timing transition.
     Schedule {
@@ -90,7 +91,7 @@ pub enum Ds2502Action {
     Idle,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum ProtocolPhase {
     AwaitRomCommand,
     TransmitRom {
@@ -139,14 +140,14 @@ impl ProtocolPhase {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct MasterLowSlot {
     start: SimTime,
     receive_on_release: bool,
 }
 
 /// Read-only DS2502 device attached to one 1-Wire master.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ds2502 {
     id: ComponentId,
     name: String,
@@ -162,6 +163,8 @@ pub struct Ds2502 {
     driving_low: bool,
     actions: VecDeque<Ds2502Action>,
 }
+
+crate::component_state!(Ds2502State, Ds2502);
 
 impl Ds2502 {
     /// Creates a DS2502 with immutable ROM and EPROM data.

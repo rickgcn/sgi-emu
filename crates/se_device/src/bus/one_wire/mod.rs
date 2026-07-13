@@ -11,7 +11,7 @@ use se_core::role::BusRole;
 use se_core::scheduler::SimTime;
 
 /// One participant's open-drain output transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct OneWireDrive {
     /// Component changing its output.
     pub source: ComponentId,
@@ -24,7 +24,7 @@ pub struct OneWireDrive {
 }
 
 /// One observed participant transition and resulting aggregate line level.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct OneWireLineDelivery {
     /// Component whose output changed.
     pub source: ComponentId,
@@ -40,7 +40,7 @@ pub struct OneWireLineDelivery {
 }
 
 /// Action emitted by a 1-Wire bus.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum OneWireBusAction {
     /// Delivers one source transition to a participant.
     Deliver {
@@ -56,7 +56,7 @@ pub enum OneWireBusAction {
 }
 
 /// 1-Wire bus construction error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum OneWireBusBuildError {
     /// The participant list contains the same component more than once.
     DuplicateParticipant(ComponentId),
@@ -75,7 +75,7 @@ impl fmt::Display for OneWireBusBuildError {
 impl std::error::Error for OneWireBusBuildError {}
 
 /// 1-Wire routing error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum OneWireBusRouteError {
     /// A component not attached to the bus attempted to drive it.
     UnroutedSource(ComponentId),
@@ -93,20 +93,22 @@ impl fmt::Display for OneWireBusRouteError {
 
 impl std::error::Error for OneWireBusRouteError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct ParticipantState {
     component: ComponentId,
     drive_low: bool,
 }
 
 /// Combinational open-drain 1-Wire bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct OneWireBus {
     id: ComponentId,
     name: String,
     participants: Vec<ParticipantState>,
     actions: VecDeque<OneWireBusAction>,
 }
+
+crate::component_state!(OneWireBusState, OneWireBus);
 
 impl OneWireBus {
     /// Creates a bus with a fixed participant list.

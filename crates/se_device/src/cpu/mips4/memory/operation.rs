@@ -28,7 +28,7 @@ use crate::cpu::mips4::tlb::{
 /// defined by the architecture are preserved as [`Self::Undefined`] so the raw
 /// field round-trips; the manual recommends implementations treat an undefined
 /// hint as the `load` action or as a no-op.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4PrefetchHint {
     /// `load` (0): data is expected to be loaded, not modified.
     Load,
@@ -86,7 +86,7 @@ impl Mips4PrefetchHint {
 }
 
 /// Failure of a memory operation before the execution layer receives it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4MemoryAccessError {
     /// Architectural alignment or address-space error before translation.
     AddressError {
@@ -116,7 +116,7 @@ pub enum Mips4MemoryAccessError {
 /// address calculation, architectural alignment, and address translation. It
 /// carries the translated physical address, the cache attribute, the access
 /// kind, and the effective endianness, but does not perform the memory access.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4MemoryAccess {
     /// Effective virtual address of the access.
     pub virtual_address: u64,
@@ -210,7 +210,7 @@ impl Mips4MemoryAccess {
 /// attribute. Prefetch is advisory and never changes architecturally-visible
 /// state, so the result only describes the request; whether the implementation
 /// acts on it is implementation-specific.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Prefetch {
     /// Effective virtual address of the prefetch.
     pub virtual_address: u64,
@@ -235,7 +235,7 @@ pub struct Mips4Prefetch {
 /// request's cache attribute to a [`Mips4MemoryAccessType`] using a
 /// processor-specific CCA policy and skip the prefetch when that resolves to
 /// uncached.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4PrefetchResult {
     /// Translation succeeded. The caller resolves the cache attribute to a
     /// memory access type and performs the advisory prefetch only when the
@@ -298,7 +298,7 @@ impl Mips4Prefetch {
 /// then translated with the `InstructionFetch` access kind. It carries the
 /// translated physical address and cache attribute but does not fetch the
 /// instruction word; the caller handles instruction byte selection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4InstructionFetch {
     /// Effective virtual address of the fetch (the program counter).
     pub virtual_address: u64,

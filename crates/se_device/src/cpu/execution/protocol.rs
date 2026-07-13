@@ -3,7 +3,9 @@
 use core::fmt;
 
 /// Identifier correlating one external transaction with its completion.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct ExecutionTransactionId(u128);
 
 impl ExecutionTransactionId {
@@ -25,7 +27,7 @@ impl fmt::Display for ExecutionTransactionId {
 }
 
 /// External transaction emitted by a functional executor.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ExecutionTransaction<T> {
     /// Correlation identifier.
     pub id: ExecutionTransactionId,
@@ -35,7 +37,7 @@ pub struct ExecutionTransaction<T> {
 }
 
 /// External completion delivered to a functional executor.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ExecutionCompletion<C> {
     /// Identifier copied from the completed transaction.
     pub id: ExecutionTransactionId,
@@ -45,7 +47,7 @@ pub struct ExecutionCompletion<C> {
 }
 
 /// Observable functional executor state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum FunctionalExecutorState {
     /// The executor may begin or continue an instruction.
     Ready,
@@ -61,7 +63,7 @@ pub enum FunctionalExecutorState {
 }
 
 /// Result of polling a functional executor.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ExecutionAction<T, B> {
     /// Route this transaction through the CPU's bus controller role.
     Transaction(ExecutionTransaction<T>),
@@ -80,7 +82,7 @@ pub enum ExecutionAction<T, B> {
 }
 
 /// Internal functional executor failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum FunctionalExecutorError<E> {
     /// A completion arrived while no transaction was outstanding.
     UnexpectedCompletion {

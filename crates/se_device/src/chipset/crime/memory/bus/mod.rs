@@ -13,7 +13,7 @@ use super::super::protocol::{
 };
 
 /// Scheduled event interpreted by the CRIME memory bus.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeMemoryBusEvent {
     /// Selects and delivers the next arbitration winner.
     Service {
@@ -34,20 +34,20 @@ pub enum CrimeMemoryBusEvent {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingCompletion {
     controller: ComponentId,
     completion: CrimeMemoryCompletion,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct InFlightMemory {
     controller: ComponentId,
     transaction_id: CrimeTransactionId,
 }
 
 /// CRIME MIU arbitration and ordering domain.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeMemoryBus {
     id: ComponentId,
     name: String,
@@ -68,6 +68,8 @@ pub struct CrimeMemoryBus {
     pending_completion: Option<PendingCompletion>,
     actions: VecDeque<CrimeBusAction<CrimeMemoryTransaction, CrimeMemoryCompletion>>,
 }
+
+crate::component_state!(CrimeMemoryBusState, CrimeMemoryBus);
 
 impl CrimeMemoryBus {
     /// Creates a memory domain with machine-calculated CRIME timing.

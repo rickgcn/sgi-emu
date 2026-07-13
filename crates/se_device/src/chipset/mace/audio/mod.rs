@@ -1,14 +1,14 @@
 //! MACE audio TDM control and stereo DMA rings.
 
 /// Direction of an audio DMA channel.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum AudioDirection {
     Input,
     Output,
 }
 
 /// One fixed 4 KiB stereo DMA ring.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct AudioDmaChannel {
     pub direction: AudioDirection,
     pub control: u16,
@@ -63,7 +63,7 @@ impl AudioDmaChannel {
 }
 
 /// Complete MACE audio interface state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceAudio {
     pub control: u32,
     pub codec_control: u32,

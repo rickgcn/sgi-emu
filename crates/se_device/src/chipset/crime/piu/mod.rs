@@ -8,7 +8,7 @@ const CRIME_MASTER_FREQUENCY_HZ: u64 = 66_666_500;
 const WATCHDOG_THRESHOLD_CRIME_CYCLES: u64 = (1 << 19) * 64;
 
 /// Side effect produced by a processor-interface register transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum PiuEffect {
     /// The combined enabled interrupt output changed.
     InterruptOutput(bool),
@@ -33,7 +33,7 @@ pub enum PiuEffect {
 }
 
 /// Result of a processor-interface register write.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PiuWriteResult {
     /// Whether the address is a defined processor-interface register.
     pub handled: bool,
@@ -59,7 +59,7 @@ impl PiuWriteResult {
 }
 
 /// CRIME 1.1 processor-interface state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimePiu {
     control: u64,
     interrupt_enable: u32,

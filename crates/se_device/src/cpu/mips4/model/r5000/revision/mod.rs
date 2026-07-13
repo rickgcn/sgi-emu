@@ -8,7 +8,19 @@
 pub const R5000_IMPLEMENTATION_ID: u8 = 0x23;
 
 /// R5000 processor or FPU revision encoded as `y.x`.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct R5000Revision(u8);
 
 impl R5000Revision {

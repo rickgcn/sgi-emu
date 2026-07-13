@@ -31,7 +31,7 @@ pub const R5000_PRIMARY_DATA_CACHE_SIZE_BYTES: u32 = 32 * 1024;
 pub const R5000_PRIMARY_CACHE_LINE_SIZE_BYTES: u32 = 32;
 
 /// Configurable R5000-compatible processor profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct R5000Profile {
     /// Processor memory byte order.
     pub endianness: Mips4Endianness,

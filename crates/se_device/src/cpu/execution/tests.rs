@@ -9,14 +9,14 @@ use super::target::{
     ExecutionBoundary, ExecutionTarget, ExecutionTargetAction, ExecutionTargetSignalAction,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum TestBoundary {
     Retired(u32),
 }
 
 impl ExecutionBoundary for TestBoundary {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum TestAction {
     Transaction(u32),
     Boundary(u32),
@@ -24,7 +24,7 @@ enum TestAction {
     Failure,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct TestError;
 
 impl core::fmt::Display for TestError {

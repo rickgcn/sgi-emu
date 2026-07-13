@@ -1,5 +1,7 @@
 //! Dallas DS1687 real-time clock and battery-backed NVRAM.
 
+pub mod state;
+
 use core::fmt;
 use std::collections::VecDeque;
 
@@ -44,7 +46,7 @@ const REGISTER_C_ALARM: u8 = 1 << 5;
 const REGISTER_C_UPDATE: u8 = 1 << 4;
 
 /// Complete deterministic DS1687 construction input.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ds1687Config {
     /// Initial UTC time as Unix seconds.
     pub initial_unix_seconds: i64,
@@ -62,7 +64,7 @@ impl Default for Ds1687Config {
 }
 
 /// DS1687 construction error.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ds1687Error {
     InvalidNvramSize { size: usize },
     InvalidTimebase,
@@ -82,7 +84,7 @@ impl fmt::Display for Ds1687Error {
 impl std::error::Error for Ds1687Error {}
 
 /// Observable action emitted by the RTC.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ds1687Action {
     /// Drives the alarm/periodic/update IRQ line.
     SetIrq(IrqTransaction),
@@ -102,6 +104,7 @@ pub struct Ds1687 {
     last_observed_second: i64,
     irq_asserted: bool,
     actions: VecDeque<Ds1687Action>,
+    persistence_revision: u64,
 }
 
 impl Ds1687 {
@@ -129,6 +132,7 @@ impl Ds1687 {
             last_observed_second: config.initial_unix_seconds,
             irq_asserted: false,
             actions: VecDeque::new(),
+            persistence_revision: 0,
         };
         rtc.registers[REGISTER_A] &= 0x7f;
         rtc.registers[REGISTER_D] |= 0x80;
@@ -179,6 +183,11 @@ impl Ds1687 {
         &self.registers
     }
 
+    /// Returns the revision of guest-visible battery-backed state.
+    pub const fn persistence_revision(&self) -> u64 {
+        self.persistence_revision
+    }
+
     fn read_register(&mut self, address: usize, now: SimTime) -> Result<u8, IsaBusError> {
         if address >= self.registers.len() {
             return Err(IsaBusError::Address);
@@ -219,6 +228,8 @@ impl Ds1687 {
             return Err(IsaBusError::Address);
         }
         self.observe_time(now);
+        let previous_register = self.registers[address];
+        let previous_time = self.initial_unix_seconds;
         match address {
             REGISTER_C | REGISTER_D => {}
             REGISTER_A => self.registers[address] = value & 0x7f,
@@ -234,6 +245,11 @@ impl Ds1687 {
                 }
             }
             _ => self.registers[address] = value,
+        }
+        if self.registers[address] != previous_register
+            || self.initial_unix_seconds != previous_time
+        {
+            self.persistence_revision = self.persistence_revision.wrapping_add(1);
         }
         Ok(())
     }
@@ -345,7 +361,7 @@ impl BusDeviceRole<IsaTransaction> for Ds1687 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct DateTimeFields {
     year: i32,
     month: u8,

@@ -1,7 +1,7 @@
 //! MACE interrupt source aggregation and CRIME posting.
 
 /// CRIME interrupt slot assigned to a MACE group.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[repr(u8)]
 pub enum MaceInterruptGroup {
     VideoInput1 = 0,
@@ -23,7 +23,7 @@ pub enum MaceInterruptGroup {
 }
 
 /// Internal interrupt state and last values posted to CRIME.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceInterruptController {
     peripheral_status: u32,
     peripheral_mask: u32,

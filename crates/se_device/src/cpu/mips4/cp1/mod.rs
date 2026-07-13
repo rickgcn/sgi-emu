@@ -63,7 +63,7 @@ const CP1_FMT_WORD: u8 = 0x14;
 const CP1_FMT_LONG: u8 = 0x15;
 
 /// CP1 floating-point register model selected by privileged CPU state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1RegisterMode {
     /// 32-bit FGR model with 16 doubleword operand registers.
     ThirtyTwoBit,
@@ -73,7 +73,9 @@ pub enum Mips4Cp1RegisterMode {
 }
 
 /// CP1 floating-point general register index.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct Mips4Cp1FgrIndex(u8);
 
 impl Mips4Cp1FgrIndex {
@@ -97,7 +99,9 @@ impl Mips4Cp1FgrIndex {
 }
 
 /// CP1 condition code index.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct Mips4Cp1ConditionCode(u8);
 
 impl Mips4Cp1ConditionCode {
@@ -120,7 +124,7 @@ impl Mips4Cp1ConditionCode {
 /// `MOVN.fmt`/`MOVZ.fmt` instructions copy `fs` to `fd` when the GPR test value
 /// is nonzero or zero respectively (MIPS IV manual section B.6). The execution
 /// layer applies the decision to the floating-point register file.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1MoveDecision {
     /// Copy the source value into the destination register.
     Move,
@@ -173,7 +177,7 @@ impl Mips4Cp1MoveDecision {
 }
 
 /// CP1 formatted operand type.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1Format {
     /// Single-precision floating-point format.
     Single,
@@ -212,7 +216,7 @@ impl Mips4Cp1Format {
 }
 
 /// CP1 FGR access error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1FgrAccessError {
     /// A doubleword operand register used an odd FGR in 32-bit register mode.
     OddRegisterInThirtyTwoBitMode {
@@ -222,7 +226,7 @@ pub enum Mips4Cp1FgrAccessError {
 }
 
 /// Raw CP1 floating-point general register file.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Cp1FgrFile {
     registers: [u64; MIPS4_CP1_FGR_COUNT],
 }
@@ -312,7 +316,9 @@ impl Default for Mips4Cp1FgrFile {
 }
 
 /// CP1 control register number.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4Cp1ControlRegister {
     /// FPU implementation and revision register.
     ImplementationRevision,
@@ -341,7 +347,7 @@ impl Mips4Cp1ControlRegister {
 }
 
 /// CP1 control register write error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1WriteError {
     /// Public writes cannot modify this CP1 control register.
     ReadOnlyControlRegister {
@@ -351,7 +357,19 @@ pub enum Mips4Cp1WriteError {
 }
 
 /// CP1 implementation and revision register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp1Fcr0(u32);
 
 impl Mips4Cp1Fcr0 {
@@ -377,7 +395,7 @@ impl Mips4Cp1Fcr0 {
 }
 
 /// MIPS IV FCSR rounding mode.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1RoundingMode {
     /// Round to nearest representable value, choosing an even low bit on ties.
     #[default]
@@ -435,7 +453,7 @@ impl Mips4Cp1RoundingMode {
 }
 
 /// Rounding source for MIPS IV floating-point conversion operations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1ConversionRoundingMode {
     /// Use the active FCSR rounding mode.
     Fcsr,
@@ -472,7 +490,19 @@ impl Mips4Cp1ConversionRoundingMode {
 }
 
 /// CP1 floating-point control and status register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp1Fcsr(u32);
 
 impl Mips4Cp1Fcsr {
@@ -614,7 +644,7 @@ impl Mips4Cp1Fcsr {
 /// so [`Mips4Cp1ExceptionDecision::flag_flags`] holds the existing flags when the
 /// decision traps and the union of existing and new cause flags otherwise. This
 /// type does not mutate the FCSR; the caller applies the decision.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Cp1ExceptionDecision {
     /// Whether a floating-point trap is generated by this operation.
     pub traps: bool,
@@ -651,7 +681,7 @@ pub const fn decide_unimplemented_operation(fcsr: Mips4Cp1Fcsr) -> Mips4Cp1Excep
 }
 
 /// CP1 register file and control state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Cp1 {
     fgr: Mips4Cp1FgrFile,
     fcr0: Mips4Cp1Fcr0,
@@ -720,7 +750,7 @@ impl Mips4Cp1 {
 }
 
 /// Raw fields of a MIPS IV CP1-related instruction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Cp1Instruction {
     instruction: Mips4Instruction,
 }

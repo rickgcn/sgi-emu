@@ -4,7 +4,7 @@
 //! alter payload bits, or interpret values through host floating-point state.
 
 /// NaN quiet/signaling interpretation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum FloatNanMode {
     /// The most significant fraction bit marks a quiet NaN when set.
     #[default]
@@ -15,7 +15,7 @@ pub enum FloatNanMode {
 }
 
 /// IEEE-754 floating-point class.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum FloatClass {
     /// Positive zero.
     PositiveZero,
@@ -61,7 +61,7 @@ impl FloatClass {
 }
 
 /// Ordered or unordered relation between two floating-point values.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum FloatRelation {
     /// Left operand is less than the right operand.
     Less,
@@ -77,7 +77,7 @@ pub enum FloatRelation {
 }
 
 /// Floating-point compare exception behavior.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum FloatCompareMode {
     /// Raise invalid only for signaling NaN operands.
     Quiet,
@@ -87,7 +87,19 @@ pub enum FloatCompareMode {
 }
 
 /// Raw single-precision IEEE-754 bits.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Float32Bits(u32);
 
 impl Float32Bits {
@@ -178,7 +190,19 @@ impl Float32Bits {
 }
 
 /// Raw double-precision IEEE-754 bits.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Float64Bits(u64);
 
 impl Float64Bits {

@@ -8,7 +8,7 @@
 use crate::cpu::mips1::exception::Mips1Exception;
 
 /// Result destined for the MIPS I `HI` and `LO` registers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips1HiLoResult {
     /// Value written to `HI`.
     pub hi: u32,
@@ -27,7 +27,7 @@ impl Mips1HiLoResult {
 }
 
 /// Stateless MIPS I integer ALU helper.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips1Alu;
 
 impl Mips1Alu {

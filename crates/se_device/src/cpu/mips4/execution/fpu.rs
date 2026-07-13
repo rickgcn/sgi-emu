@@ -60,6 +60,7 @@ pub(super) enum Mips4FpuExecution {
     Exception(Mips4Exception),
 }
 
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
 pub(super) struct Mips4PendingFpuRead {
     target: Mips4Cp1FgrIndex,
     size: Mips4ExecutionTransferSize,

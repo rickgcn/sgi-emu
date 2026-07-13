@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 
 const INLINE_BYTES: usize = 8;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct CompactData(SmallVec<[u8; INLINE_BYTES]>);
 
 impl CompactData {
@@ -54,7 +54,7 @@ impl FromIterator<u8> for CompactData {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct CompactByteEnable {
     length: usize,
     words: SmallVec<[u64; 1]>,
@@ -105,13 +105,13 @@ impl FromIterator<bool> for CompactByteEnable {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct CompactBlockWrite {
     data: CompactData,
     byte_enable: CompactByteEnable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) enum CompactTransfer {
     Read {
         length: u16,

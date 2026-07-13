@@ -3,7 +3,7 @@
 use se_core::scheduler::{SimDuration, SimTime};
 
 /// MACE 32-bit UST and three compare registers.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceTimers {
     timebase_hz: u64,
     base_time: SimTime,
@@ -88,7 +88,7 @@ impl MaceTimers {
 }
 
 /// One integrated PS/2 controller.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ps2Port {
     transmit: Option<u8>,
     receive: Option<u8>,
@@ -158,7 +158,7 @@ impl Default for Ps2Port {
 }
 
 /// One MACE I2C controller register set.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct I2cPort {
     pub config: u8,
     pub control: u8,
@@ -204,7 +204,7 @@ impl Default for I2cPort {
 }
 
 /// ISA control, DP-RAM, and DMA ring base state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IsaController {
     pub ring_base_reset: u32,
     misc: u16,
@@ -257,7 +257,7 @@ impl IsaController {
 }
 
 /// One 4 KiB serial DMA ring channel.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PeripheralDmaChannel {
     pub control: u16,
     pub read_pointer: u16,
@@ -291,7 +291,7 @@ impl Default for PeripheralDmaChannel {
 }
 
 /// Parallel DMA double-buffered context state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ParallelDma {
     pub context: [u64; 2],
     pub control: u8,

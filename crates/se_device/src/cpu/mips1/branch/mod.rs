@@ -7,7 +7,7 @@
 use crate::cpu::mips1::exception::Mips1Exception;
 
 /// Result of evaluating a branch or jump.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips1BranchDecision {
     /// Control continues through the delay slot without taking the branch.
     NotTaken,
@@ -43,7 +43,7 @@ impl Mips1BranchDecision {
 }
 
 /// Result of evaluating a branch or jump that writes a link register.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips1LinkedBranchDecision {
     /// Branch or jump decision.
     pub decision: Mips1BranchDecision,
@@ -53,7 +53,7 @@ pub struct Mips1LinkedBranchDecision {
 }
 
 /// Stateless MIPS I branch helper.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips1Branch;
 
 impl Mips1Branch {

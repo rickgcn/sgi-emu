@@ -63,7 +63,7 @@ const NO_ECC_MEMORY_END: u64 = 0xc000_0000;
 const PCI_HIGH_START: u64 = 0x1_0000_0000;
 const PCI_HIGH_END: u64 = 0x3_0000_0000;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum PendingMemoryOrigin {
     SysAd {
         execution_id: ExecutionTransactionId,
@@ -78,13 +78,13 @@ enum PendingMemoryOrigin {
     Render,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingLink {
     execution_id: ExecutionTransactionId,
     request: Mips4ExecutionTransaction,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingRenderWrite {
     execution_id: ExecutionTransactionId,
     transaction: Mips4ExecutionTransaction,
@@ -93,14 +93,14 @@ struct PendingRenderWrite {
 type PendingMemoryTable = InlineMap8<CrimeTransactionId, PendingMemoryOrigin>;
 type PendingLinkTable = InlineMap8<CrimeTransactionId, PendingLink>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum RenderAccessResult {
     Complete(Mips4ExecutionCompletion),
     Deferred,
 }
 
 /// Terminal CRIME protocol or configuration error.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeError {
     /// Chipset construction input is invalid.
     Configuration(CrimeConfigError),
@@ -150,7 +150,7 @@ impl fmt::Display for CrimeError {
 impl std::error::Error for CrimeError {}
 
 /// SGI CRIME 1.1 chipset component.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Crime {
     id: ComponentId,
     name: String,
@@ -179,10 +179,18 @@ pub struct Crime {
     cancelled_memory: BTreeSet<CrimeTransactionId>,
     cancelled_cmi: BTreeSet<CrimeTransactionId>,
     cancelled_cgi: BTreeSet<CrimeTransactionId>,
+    #[serde(skip)]
     actions: VecDeque<CrimeAction>,
+    #[serde(skip, default = "default_trace_interest")]
     trace_interest: TraceInterest,
     terminal_error: Option<CrimeError>,
     current_time: SimTime,
+}
+
+crate::component_state!(CrimeState, Crime);
+
+const fn default_trace_interest() -> TraceInterest {
+    TraceInterest::All
 }
 
 impl Crime {

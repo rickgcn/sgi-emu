@@ -10,7 +10,9 @@ use super::Mips4Instruction;
 use super::decode::Mips4CpuInstruction;
 
 /// Architecture level in which an instruction was introduced.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4ArchitectureLevel {
     /// MIPS I.
     Mips1,
@@ -23,7 +25,9 @@ pub enum Mips4ArchitectureLevel {
 }
 
 /// Architectural result when an instruction's ISA level is disabled.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4DisabledInstructionAction {
     /// Raise a Reserved Instruction exception.
     ReservedInstruction,
@@ -32,7 +36,7 @@ pub enum Mips4DisabledInstructionAction {
 }
 
 /// Static architecture requirements of one decoded instruction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4InstructionRequirements {
     /// Architecture level in which the instruction was introduced.
     pub architecture_level: Mips4ArchitectureLevel,

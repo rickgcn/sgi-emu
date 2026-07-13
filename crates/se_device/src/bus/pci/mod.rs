@@ -7,7 +7,7 @@ use se_core::role::{BusDeviceRole, BusRole};
 use se_core::scheduler::SimDuration;
 
 /// PCI command transported by the bus model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum PciCommand {
     IoRead,
     IoWrite,
@@ -21,7 +21,7 @@ pub enum PciCommand {
 }
 
 /// PCI configuration-space selector.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PciConfigurationAddress {
     pub bus: u8,
     pub device: u8,
@@ -30,7 +30,7 @@ pub struct PciConfigurationAddress {
 }
 
 /// PCI transaction.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PciTransaction {
     pub id: u128,
     pub controller: ComponentId,
@@ -43,7 +43,7 @@ pub struct PciTransaction {
 }
 
 /// PCI completion status.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum PciStatus {
     Complete,
     Retry,
@@ -53,7 +53,7 @@ pub enum PciStatus {
 }
 
 /// PCI completion.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PciCompletion {
     pub id: u128,
     pub status: PciStatus,
@@ -61,14 +61,14 @@ pub struct PciCompletion {
 }
 
 /// Result of routing a PCI request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum PciBusDisposition {
     Queued,
     QueuedAndNeedsService { delay: SimDuration },
 }
 
 /// Action emitted by the PCI bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum PciBusAction {
     Deliver {
         target: ComponentId,
@@ -82,7 +82,7 @@ pub enum PciBusAction {
 }
 
 /// Deterministic PCI arbiter with fixed-priority and round-robin clients.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PciBus {
     id: ComponentId,
     name: String,
@@ -95,13 +95,18 @@ pub struct PciBus {
     actions: VecDeque<PciBusAction>,
 }
 
+crate::component_state!(PciBusState, PciBus);
+
 /// Protocol-correct PCI configuration endpoint with no device engine.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PciConfigurationEndpoint {
     id: ComponentId,
     name: String,
+    #[serde(with = "crate::common::serde_array")]
     configuration: [u8; 256],
 }
+
+crate::component_state!(PciConfigurationEndpointState, PciConfigurationEndpoint);
 
 impl PciConfigurationEndpoint {
     /// Creates an enumerable PCI function.

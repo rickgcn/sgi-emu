@@ -10,14 +10,14 @@ const ICS1890_ID1: u16 = 0x0015;
 const ICS1890_ID2: u16 = 0xf420;
 const PHY_BUSY: u32 = 1 << 16;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum PhyOperation {
     Read,
     Write(u16),
 }
 
 /// Receive metadata used to form a MACE status vector.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ReceiveStatus {
     pub code_violation: bool,
     pub dribble: bool,
@@ -30,7 +30,7 @@ pub struct ReceiveStatus {
 }
 
 /// MACE Fast Ethernet interface.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceEthernet {
     pub mac_control: u32,
     pub interrupt_status: u32,

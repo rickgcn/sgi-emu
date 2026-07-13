@@ -2,6 +2,7 @@
 
 use core::fmt;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smallvec::{Array, SmallVec};
 
 pub(crate) struct InlineMap<A>(SmallVec<A>)
@@ -43,6 +44,32 @@ where
     A: Array,
     SmallVec<A>: Eq,
 {
+}
+
+impl<A> Serialize for InlineMap<A>
+where
+    A: Array,
+    SmallVec<A>: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, A> Deserialize<'de> for InlineMap<A>
+where
+    A: Array,
+    SmallVec<A>: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        SmallVec::deserialize(deserializer).map(Self)
+    }
 }
 
 impl<A> InlineMap<A>
@@ -137,6 +164,32 @@ where
     A: Array,
     SmallVec<A>: Eq,
 {
+}
+
+impl<A> Serialize for InlineSet<A>
+where
+    A: Array,
+    SmallVec<A>: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, A> Deserialize<'de> for InlineSet<A>
+where
+    A: Array,
+    SmallVec<A>: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        SmallVec::deserialize(deserializer).map(Self)
+    }
 }
 
 impl<A> InlineSet<A>

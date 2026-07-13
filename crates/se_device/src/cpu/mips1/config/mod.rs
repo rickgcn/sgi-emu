@@ -6,7 +6,7 @@
 //! coprocessor availability without assigning board-specific meanings to them.
 
 /// Byte order used by memory-facing MIPS I operations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips1Endianness {
     /// Most significant byte is stored at the lowest address.
     Big,
@@ -16,7 +16,7 @@ pub enum Mips1Endianness {
 }
 
 /// Cache configuration visible to a MIPS I processor model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips1CacheConfig {
     /// The cache is not present.
     Disabled,
@@ -70,7 +70,7 @@ impl Mips1CacheConfig {
 }
 
 /// Coprocessor availability for a MIPS I processor model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips1CoprocessorConfig {
     /// Whether coprocessor 1 is available.
     pub cp1: bool,
@@ -95,7 +95,7 @@ impl Mips1CoprocessorConfig {
 }
 
 /// Configurable MIPS I processor parameters.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips1Config {
     /// Processor memory byte order.
     pub endianness: Mips1Endianness,

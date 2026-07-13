@@ -18,7 +18,7 @@ use crate::cpu::mips4::tlb::{
 use super::policy::Mips4ExecutionPolicy;
 
 /// Invalid configuration supplied to functional MIPS IV execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4ExecutionConfigError {
     /// The implemented physical address width is outside the MIPS IV range.
     InvalidPhysicalAddressWidth {
@@ -53,7 +53,7 @@ impl fmt::Display for Mips4ExecutionConfigError {
 impl std::error::Error for Mips4ExecutionConfigError {}
 
 /// Complete architectural state required by functional MIPS IV execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4ExecutionState {
     pub(super) config: Mips4Config,
     pub(super) pc: u64,

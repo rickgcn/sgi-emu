@@ -9,7 +9,7 @@ use crate::cpu::mips1::config::Mips1Endianness;
 use crate::cpu::mips1::exception::Mips1Exception;
 
 /// MIPS I memory access size.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips1MemoryAccessSize {
     /// One byte.
     Byte,
@@ -22,7 +22,7 @@ pub enum Mips1MemoryAccessSize {
 }
 
 /// MIPS I memory access kind.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips1MemoryAccessKind {
     /// Load from memory.
     Load {
@@ -53,7 +53,7 @@ pub enum Mips1MemoryAccessKind {
 }
 
 /// Result of applying a partial-word store to an aligned memory word.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips1MaskedMemoryWord {
     /// Memory word after applying the partial-word store.
     pub value: u32,
@@ -63,7 +63,7 @@ pub struct Mips1MaskedMemoryWord {
 }
 
 /// Stateless MIPS I memory helper.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips1Memory;
 
 impl Mips1Memory {

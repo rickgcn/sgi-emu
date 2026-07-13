@@ -5,7 +5,9 @@
 //! vectors, or manage exception restart state.
 
 /// MIPS I coprocessor number.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips1CoprocessorNumber {
     /// System control coprocessor.
     Cp0,
@@ -44,7 +46,7 @@ impl Mips1CoprocessorNumber {
 }
 
 /// MIPS I exception reason.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips1Exception {
     /// External, software, or coprocessor interrupt.
     Interrupt,

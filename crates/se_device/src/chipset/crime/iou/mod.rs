@@ -12,7 +12,7 @@ use super::protocol::{
 };
 
 /// Scheduled CMI bus event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeCmiBusEvent {
     /// Delivers the next request.
     Service {
@@ -28,7 +28,7 @@ pub enum CrimeCmiBusEvent {
 }
 
 /// Scheduled CGI bus event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeCgiBusEvent {
     /// Delivers the next request.
     Service {
@@ -43,7 +43,7 @@ pub enum CrimeCgiBusEvent {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct LinkBus<T, C> {
     clock: CrimeClock,
     epoch: u64,
@@ -150,12 +150,14 @@ where
 }
 
 /// CRIME-to-MACE CMI bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeCmiBus {
     id: ComponentId,
     name: String,
     inner: LinkBus<CrimeCmiTransaction, CrimeCmiCompletion>,
 }
+
+crate::component_state!(CrimeCmiBusState, CrimeCmiBus);
 
 impl CrimeCmiBus {
     /// Creates a CMI domain.
@@ -244,12 +246,14 @@ impl BusRole<CrimeCmiTransaction> for CrimeCmiBus {
 }
 
 /// CRIME-to-GBE CGI bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeCgiBus {
     id: ComponentId,
     name: String,
     inner: LinkBus<CrimeCgiTransaction, CrimeCgiCompletion>,
 }
+
+crate::component_state!(CrimeCgiBusState, CrimeCgiBus);
 
 impl CrimeCgiBus {
     /// Creates a CGI domain.

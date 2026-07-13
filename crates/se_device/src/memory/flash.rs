@@ -9,7 +9,7 @@ use crate::bus::isa::{
 };
 
 /// System flash endpoint whose programming command set is intentionally absent.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ReadArrayFlash {
     id: ComponentId,
     name: String,

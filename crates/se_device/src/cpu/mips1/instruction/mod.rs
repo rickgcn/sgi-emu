@@ -4,7 +4,19 @@
 //! word. It does not classify opcodes or assign instruction semantics.
 
 /// Raw 32-bit MIPS I instruction word.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips1Instruction(u32);
 
 impl Mips1Instruction {

@@ -8,7 +8,7 @@ use crate::cpu::mips4::instruction::requirements::{
 use crate::cpu::mips4::mmu::Mips4MmuPrivilegeMode;
 
 /// Result of checking dynamic instruction access requirements.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4InstructionAccess {
     /// The instruction may execute.
     Execute,

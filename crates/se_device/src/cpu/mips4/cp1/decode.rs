@@ -23,7 +23,7 @@ const CP1_FMT_CTC1: u8 = 0x06;
 const CP1_FMT_BRANCH: u8 = 0x08;
 
 /// Decode result for a CP1-related MIPS IV instruction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1Decode {
     /// The encoding is a defined CP1 instruction or instruction class.
     Instruction(Mips4Cp1InstructionClass),
@@ -33,7 +33,7 @@ pub enum Mips4Cp1Decode {
 }
 
 /// CP1 instruction class after generic decode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1InstructionClass {
     /// CP1 base+offset load or store.
     OffsetMemory(Mips4Cp1OffsetMemoryOperation),
@@ -64,7 +64,7 @@ pub enum Mips4Cp1InstructionClass {
 }
 
 /// CP1 base+offset load/store operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1OffsetMemoryOperation {
     /// `LWC1`.
     LoadWord,
@@ -77,7 +77,7 @@ pub enum Mips4Cp1OffsetMemoryOperation {
 }
 
 /// CP1 CPU/FPU register transfer operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1RegisterTransferOperation {
     /// `MFC1`.
     MoveWordFrom,
@@ -94,7 +94,7 @@ pub enum Mips4Cp1RegisterTransferOperation {
 }
 
 /// CP1 condition-code branch operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1BranchOperation {
     /// `BC1F`.
     BranchFalse,
@@ -107,7 +107,7 @@ pub enum Mips4Cp1BranchOperation {
 }
 
 /// COP1X indexed load/store operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1IndexedMemoryOperation {
     /// `LWXC1`.
     LoadWordIndexed,
@@ -120,7 +120,7 @@ pub enum Mips4Cp1IndexedMemoryOperation {
 }
 
 /// SPECIAL/MOVCI CPU conditional move operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1MovciOperation {
     /// `MOVF`.
     MoveFalse,
@@ -129,7 +129,7 @@ pub enum Mips4Cp1MovciOperation {
 }
 
 /// Validity of a formatted operand type for one CP1 operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1OperandFormatStatus {
     /// The operation and operand format combination is architecturally valid.
     Valid,
@@ -142,7 +142,7 @@ pub enum Mips4Cp1OperandFormatStatus {
 }
 
 /// CP1 formatted operation selected by COP1 or COP1X decode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1Operation {
     /// `ABS.fmt`.
     Absolute,
@@ -261,7 +261,7 @@ impl Mips4Cp1Operation {
 }
 
 /// CP1 compare condition encoded by the COP1 function field.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp1CompareCondition {
     /// `C.F`.
     False,

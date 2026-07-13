@@ -1,7 +1,7 @@
 //! MACE 2.0 construction configuration.
 
 /// Bounded host-neutral port capacities.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MacePortConfig {
     pub ethernet_frames: usize,
     pub audio_sample_pairs: usize,
@@ -21,7 +21,7 @@ impl Default for MacePortConfig {
 }
 
 /// Complete MACE 2.0 configuration.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceConfig {
     pub ports: MacePortConfig,
 }

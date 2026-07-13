@@ -52,7 +52,7 @@ use super::state::Mips4ExecutionConfigError;
 use super::state::Mips4ExecutionState;
 
 /// Asynchronous input accepted by functional MIPS IV execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4ExecutionSignal {
     /// Replace external Cause IP line levels.
     ExternalInterrupts(u8),
@@ -71,7 +71,7 @@ pub enum Mips4ExecutionSignal {
 }
 
 /// Architectural boundary produced by functional MIPS IV execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4ExecutionBoundary {
     /// One instruction committed normally.
     Retired {
@@ -110,7 +110,7 @@ pub enum Mips4ExecutionBoundary {
 impl ExecutionBoundary for Mips4ExecutionBoundary {}
 
 /// Internal functional MIPS IV target failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4ExecutionTargetError {
     /// A completion arrived without a matching target-side operation.
     MissingPendingOperation,
@@ -134,6 +134,7 @@ impl fmt::Display for Mips4ExecutionTargetError {
 
 impl std::error::Error for Mips4ExecutionTargetError {}
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 enum PendingOperation {
     InstructionFetch {
         physical_address: u64,
@@ -160,12 +161,13 @@ enum PendingOperation {
     CacheWriteback(Mips4PendingCacheWriteback),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
 struct PendingErrorException {
     reason: Mips4ErrorException,
     cache_error: Option<Mips4Cp0CacheErr>,
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 enum Mips4CachedClient {
     InstructionFetch {
         physical_address: u64,
@@ -193,6 +195,7 @@ enum Mips4CachedClient {
     },
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 enum Mips4CachedStage {
     Writeback {
         doubleword: u8,
@@ -204,6 +207,7 @@ enum Mips4CachedStage {
     WriteThrough,
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct Mips4PendingCachedAccess {
     client: Mips4CachedClient,
     virtual_address: u64,
@@ -217,6 +221,7 @@ struct Mips4PendingCachedAccess {
     stage: Mips4CachedStage,
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 enum Mips4CacheWritebackTarget {
     PrimaryIndex {
         instruction_cache: bool,
@@ -237,6 +242,7 @@ enum Mips4CacheWritebackTarget {
     },
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct Mips4PendingCacheWriteback {
     instruction: Mips4Instruction,
     line: Mips4CacheLine,
@@ -245,16 +251,22 @@ struct Mips4PendingCacheWriteback {
 }
 
 /// Functional MIPS IV execution target parameterized by processor policy and FPU backend.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct Mips4ExecutionTarget<P, F> {
     policy: P,
     float_backend: F,
     state: Mips4ExecutionState,
     pending: Option<PendingOperation>,
     pending_error_exception: Option<PendingErrorException>,
-    decode_cache: [Option<DecodeCacheEntry>; 4096],
+    #[serde(skip, default = "empty_decode_cache")]
+    decode_cache: Box<[Option<DecodeCacheEntry>]>,
 }
 
-#[derive(Clone, Copy)]
+fn empty_decode_cache() -> Box<[Option<DecodeCacheEntry>]> {
+    vec![None; 4096].into_boxed_slice()
+}
+
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
 struct DecodeCacheEntry {
     physical_address: u64,
     instruction: u32,
@@ -275,7 +287,7 @@ where
             state,
             pending: None,
             pending_error_exception: None,
-            decode_cache: [None; 4096],
+            decode_cache: empty_decode_cache(),
         })
     }
 

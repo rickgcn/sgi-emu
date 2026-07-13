@@ -64,7 +64,7 @@ pub const MACE_IRQ_PARALLEL: IrqInput = IrqInput::new(3);
 pub const MACE_IRQ_PCI0: IrqInput = IrqInput::new(8);
 
 /// MACE model error.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MaceError {
     InvalidTimebase,
     TransactionIdOverflow,
@@ -101,12 +101,12 @@ impl fmt::Display for MaceError {
 
 impl std::error::Error for MaceError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingIsa {
     cmi_id: CrimeTransactionId,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingPci {
     command: PciCommand,
     address: u32,
@@ -119,7 +119,7 @@ type PendingPciTable = InlineMap16<CrimeTransactionId, PendingPci>;
 type PendingCmiSet = InlineSet16<CrimeTransactionId>;
 
 /// MACE 2.0 component.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mace {
     id: ComponentId,
     name: String,
@@ -129,7 +129,9 @@ pub struct Mace {
     now: SimTime,
     epoch: u64,
     next_transaction_id: u128,
+    #[serde(skip)]
     actions: VecDeque<MaceAction>,
+    #[serde(skip, default = "default_trace_interest")]
     trace_interest: TraceInterest,
     pending_isa: PendingIsaTable,
     pending_pci: PendingPciTable,
@@ -146,6 +148,12 @@ pub struct Mace {
     pci: MacePci,
     host_inputs: VecDeque<MediaTransaction>,
     host_outputs: VecDeque<MediaTransaction>,
+}
+
+crate::component_state!(MaceState, Mace);
+
+const fn default_trace_interest() -> TraceInterest {
+    TraceInterest::All
 }
 
 impl Mace {

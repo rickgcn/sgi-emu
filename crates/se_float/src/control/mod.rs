@@ -8,7 +8,7 @@
 use core::ops::{BitOr, BitOrAssign};
 
 /// IEEE-754 rounding mode.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum FloatRoundingMode {
     /// Round to nearest representable value, choosing an even low bit on ties.
     #[default]
@@ -25,7 +25,7 @@ pub enum FloatRoundingMode {
 }
 
 /// IEEE-754 tininess detection timing.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum FloatTininessMode {
     /// Detect underflow before rounding.
     BeforeRounding,
@@ -36,7 +36,7 @@ pub enum FloatTininessMode {
 }
 
 /// Per-operation floating-point control.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct FloatControl {
     /// Rounding mode used by the operation.
     pub rounding_mode: FloatRoundingMode,
@@ -64,7 +64,7 @@ impl FloatControl {
 }
 
 /// IEEE-754 exception flags.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct FloatExceptionFlags(u8);
 
 impl FloatExceptionFlags {

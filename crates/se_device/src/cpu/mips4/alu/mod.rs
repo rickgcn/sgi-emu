@@ -10,7 +10,7 @@ use crate::cpu::mips4::exception::Mips4Exception;
 use crate::cpu::mips4::gpr::sign_extend_word;
 
 /// Result destined for the MIPS IV `HI` and `LO` registers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4HiLoResult {
     /// Value written to `HI`.
     pub hi: u64,
@@ -36,7 +36,7 @@ impl Mips4HiLoResult {
 }
 
 /// Stateless MIPS IV integer ALU helper.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Alu;
 
 impl Mips4Alu {
@@ -362,7 +362,7 @@ impl Mips4Alu {
 /// (conditional move) by operation kind. The exact helper is selected by the
 /// `Mips4CpuInstruction` variant the caller holds; this enum identifies the
 /// family, and the operand width selects the word or doubleword helper form.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4AluOperation {
     /// 2's-complement add/subtract (immediate, unsigned, and doubleword forms).
     Arithmetic,
@@ -391,7 +391,7 @@ pub enum Mips4AluOperation {
 /// operates on the full 64-bit register with no `NotWordValue` guard.
 /// `WidthInsensitive` covers logical, comparison, `LUI`, and `HI`/`LO` transfer
 /// operations, which the manual states are not sensitive to register width.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4AluOperandWidth {
     /// 32-bit word operation; word sources must be sign-extended words.
     Word,
@@ -406,7 +406,7 @@ pub enum Mips4AluOperandWidth {
 /// Word divide combines this with the `NotWordValue` guard encoded by
 /// [`Mips4AluOperandWidth::Word`]; doubleword divide has no `NotWordValue` guard,
 /// so only this condition applies.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4AluDivideUndefined {
     /// The result is always defined (non-divide operations).
     None,
@@ -427,7 +427,7 @@ pub enum Mips4AluDivideUndefined {
 /// the helper return type (`Result<_, Mips4Exception>` for trapping operations,
 /// `u64` for wrapping ones), and `divide_undefined` matches the `Option::None`
 /// conditions of the divide helpers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4AluClassification {
     /// The ALU helper family.
     pub operation: Mips4AluOperation,

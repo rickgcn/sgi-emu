@@ -27,7 +27,9 @@ const REGION_BITS_SHIFT: u8 = 62;
 const REGION_BITS_MASK: u8 = 0x03;
 
 /// TLB address comparison mode.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4TlbAddressMode {
     /// 32-bit virtual address comparison.
     Bits32,
@@ -50,7 +52,19 @@ impl Mips4TlbAddressMode {
 }
 
 /// TLB ASID field.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4TlbAsid(u8);
 
 impl Mips4TlbAsid {
@@ -66,7 +80,9 @@ impl Mips4TlbAsid {
 }
 
 /// MIPS IV TLB page size.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4TlbPageSize {
     /// 4 KiB page.
     Size4KiB,
@@ -132,7 +148,9 @@ impl Mips4TlbPageSize {
 }
 
 /// MIPS IV PageMask register value for a defined page size.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct Mips4TlbPageMask {
     bits: u32,
     page_size: Mips4TlbPageSize,
@@ -187,7 +205,9 @@ impl Mips4TlbPageMask {
 }
 
 /// MIPS IV TLB EntryHi fields.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct Mips4TlbEntryHi {
     vpn2: u64,
     asid: Mips4TlbAsid,
@@ -269,7 +289,9 @@ impl Mips4TlbEntryHi {
 }
 
 /// MIPS IV TLB EntryLo fields.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct Mips4TlbEntryLo {
     pfn: u64,
     cache_coherence_algorithm: Mips4CacheCoherenceAlgorithm,
@@ -368,7 +390,9 @@ impl Mips4TlbEntryLo {
 }
 
 /// Page half selected within a TLB odd/even page pair.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4TlbPageHalf {
     /// Even virtual page.
     Even,
@@ -378,7 +402,9 @@ pub enum Mips4TlbPageHalf {
 }
 
 /// TLB access type for exception classification.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4TlbAccessKind {
     /// Instruction fetch.
     InstructionFetch,
@@ -400,7 +426,7 @@ impl Mips4TlbAccessKind {
 }
 
 /// Successful TLB translation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4TlbTranslation {
     /// Translated physical address.
     pub physical_address: u64,
@@ -416,7 +442,7 @@ pub struct Mips4TlbTranslation {
 }
 
 /// Pure TLB translation result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4TlbTranslationResult {
     /// No matching TLB entry was found.
     Miss {
@@ -441,7 +467,7 @@ pub enum Mips4TlbTranslationResult {
 }
 
 /// MIPS IV odd/even TLB entry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4TlbEntry {
     page_mask: Mips4TlbPageMask,
     entry_hi: Mips4TlbEntryHi,
@@ -555,7 +581,7 @@ impl Mips4TlbEntry {
 }
 
 /// Result of probing a TLB entry slice.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4TlbProbeResult {
     /// No matching entry was found.
     Miss,
@@ -571,7 +597,7 @@ pub enum Mips4TlbProbeResult {
 }
 
 /// Stateless TLB helper.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Tlb;
 
 impl Mips4Tlb {

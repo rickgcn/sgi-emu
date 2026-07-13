@@ -22,21 +22,23 @@ const MAX_TRANSFER_BYTES: usize = 16 * 32;
 const BANK_32_MIB_ADDRESS_SHIFT: u32 = 25;
 const BANK_128_MIB_ADDRESS_SHIFT: u32 = 27;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum BankSelection {
     Populated { index: usize, offset: u64 },
     Unpopulated,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct SparseBank {
     config: CrimeSdramBankConfig,
     pages: Vec<Option<Box<SparsePage>>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct SparsePage {
+    #[serde(with = "crate::common::serde_array")]
     data: [u8; PAGE_SIZE],
+    #[serde(with = "crate::common::serde_array")]
     ecc: [u8; PAGE_SIZE / 8],
 }
 
@@ -106,7 +108,7 @@ impl SparseBank {
 /// Reads from a bank selected by its control register but lacking physical
 /// DIMMs return zero-filled data. This is a deterministic functional-model
 /// convention and does not claim to reproduce undriven electrical bus levels.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeSdram {
     id: ComponentId,
     name: String,
@@ -116,6 +118,8 @@ pub struct CrimeSdram {
     use_replacement: bool,
     replacement: u8,
 }
+
+crate::component_state!(CrimeSdramState, CrimeSdram);
 
 impl CrimeSdram {
     /// Creates zero-filled SDRAM from an explicit physical topology.

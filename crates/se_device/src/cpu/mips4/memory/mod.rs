@@ -16,7 +16,7 @@ use crate::cpu::mips4::gpr::sign_extend_word;
 const REGION_BITS_MASK: u64 = 0xc000_0000_0000_0000;
 
 /// MIPS IV memory access size.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4MemoryAccessSize {
     /// One byte.
     Byte,
@@ -32,7 +32,7 @@ pub enum Mips4MemoryAccessSize {
 }
 
 /// MIPS IV memory access kind.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4MemoryAccessKind {
     /// Load from memory.
     Load {
@@ -75,7 +75,7 @@ pub enum Mips4MemoryAccessKind {
 }
 
 /// Result of applying a partial-word store to an aligned memory word.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4MaskedMemoryWord {
     /// Memory word after applying the partial-word store.
     pub value: u32,
@@ -85,7 +85,7 @@ pub struct Mips4MaskedMemoryWord {
 }
 
 /// Result of applying a partial-doubleword store to an aligned memory doubleword.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4MaskedMemoryDoubleword {
     /// Memory doubleword after applying the partial-doubleword store.
     pub value: u64,
@@ -95,7 +95,7 @@ pub struct Mips4MaskedMemoryDoubleword {
 }
 
 /// Stateless MIPS IV memory helper.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Memory;
 
 impl Mips4Memory {

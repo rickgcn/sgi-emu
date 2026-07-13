@@ -55,7 +55,7 @@ unsafe extern "C" {
 }
 
 /// SoftFloat 3e reference backend.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct SoftFloat3Backend;
 
 impl SoftFloat3Backend {

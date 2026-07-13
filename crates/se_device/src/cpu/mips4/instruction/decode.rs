@@ -14,7 +14,7 @@ const MIPS4_SPECIAL_OPCODE: u8 = 0x00;
 const MIPS4_REGIMM_OPCODE: u8 = 0x01;
 
 /// Top-level decode result for a MIPS IV instruction word.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4InstructionDecode {
     /// The instruction is a defined MIPS IV instruction or instruction class.
     Instruction(Mips4InstructionClass),
@@ -41,7 +41,7 @@ impl Mips4InstructionDecode {
 }
 
 /// MIPS IV instruction class after top-level decode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4InstructionClass {
     /// A user-level CPU instruction.
     Cpu(Mips4CpuInstruction),
@@ -65,7 +65,7 @@ impl Mips4InstructionClass {
 }
 
 /// User-level CPU instructions defined by the MIPS IV CPU encoding tables.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4CpuInstruction {
     /// `ADD`.
     Add,
@@ -294,7 +294,7 @@ pub enum Mips4CpuInstruction {
 }
 
 /// CP1 classes that appear in the CPU encoding map.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4FpuInstructionClass {
     /// `COP1`.
     Cop1,

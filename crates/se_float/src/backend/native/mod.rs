@@ -13,7 +13,7 @@ use crate::value::{
 };
 
 /// Host-native floating-point backend.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct NativeFloatBackend;
 
 impl NativeFloatBackend {

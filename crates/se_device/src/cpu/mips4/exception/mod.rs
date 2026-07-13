@@ -5,7 +5,9 @@
 //! manage exception restart state.
 
 /// MIPS IV coprocessor number.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4CoprocessorNumber {
     /// System control coprocessor.
     Cp0,
@@ -44,7 +46,7 @@ impl Mips4CoprocessorNumber {
 }
 
 /// MIPS IV exception reason.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Exception {
     /// External, software, or coprocessor interrupt.
     Interrupt,
@@ -139,7 +141,7 @@ pub const fn check_coprocessor_access(
 /// This type is owned by the exception layer so the classification does not
 /// require a dependency on the instruction decode layer (which already depends
 /// on this layer).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4SystemExceptionKind {
     /// `SYSCALL` instruction.
     SystemCall,
@@ -163,7 +165,7 @@ impl Mips4SystemExceptionKind {
 /// Trap instructions compare two values and signal a `Trap` exception when the
 /// condition holds. This decision is pure: it does not deliver the exception or
 /// update CP0 state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4TrapDecision {
     /// The trap condition held; a `Trap` exception is signalled.
     Trap,
@@ -270,7 +272,7 @@ pub const fn tnei(lhs: u64, immediate: i16) -> Mips4TrapDecision {
 /// instruction is in a branch delay slot, the exception resumes at the branch
 /// instruction so it is re-executed; otherwise it resumes at the excepting
 /// instruction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4ExceptionRestart {
     /// Whether the excepting instruction executes in a branch delay slot.
     pub in_branch_delay_slot: bool,
@@ -308,7 +310,7 @@ impl Mips4ExceptionRestart {
 /// select an exception vector, or mutate architectural state. A processor model
 /// or execution layer consumes the image to update CP0 and vector to the
 /// handler.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4ExceptionImage {
     /// Reason for the exception.
     pub reason: Mips4Exception,
@@ -321,7 +323,7 @@ pub struct Mips4ExceptionImage {
 }
 
 /// Exception that enters CP0 error level instead of ordinary exception level.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4ErrorException {
     /// Warm-reset exception raised by the processor reset input.
     SoftReset,
@@ -334,7 +336,7 @@ pub enum Mips4ErrorException {
 }
 
 /// Captured state for a MIPS IV error-level exception.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4ErrorExceptionImage {
     /// Error-level exception reason.
     pub reason: Mips4ErrorException,

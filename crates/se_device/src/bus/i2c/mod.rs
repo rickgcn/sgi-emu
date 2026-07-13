@@ -7,14 +7,14 @@ use se_core::role::BusRole;
 use se_core::scheduler::SimDuration;
 
 /// I2C bus rate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum I2cRate {
     Standard100Khz,
     Fast400Khz,
 }
 
 /// Atomic I2C message.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct I2cTransaction {
     pub id: u128,
     pub controller: ComponentId,
@@ -26,7 +26,7 @@ pub struct I2cTransaction {
 }
 
 /// I2C completion.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum I2cCompletion {
     Ack { id: u128, data: Vec<u8> },
     Nack { id: u128 },
@@ -35,7 +35,7 @@ pub enum I2cCompletion {
 }
 
 /// I2C bus action.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum I2cBusAction {
     Deliver {
         target: ComponentId,
@@ -49,7 +49,7 @@ pub enum I2cBusAction {
 }
 
 /// Serialized I2C party-line bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct I2cBus {
     id: ComponentId,
     name: String,
@@ -57,6 +57,8 @@ pub struct I2cBus {
     in_flight: Option<I2cTransaction>,
     actions: VecDeque<I2cBusAction>,
 }
+
+crate::component_state!(I2cBusState, I2cBus);
 
 impl I2cBus {
     pub fn new(id: ComponentId, name: impl Into<String>) -> Self {

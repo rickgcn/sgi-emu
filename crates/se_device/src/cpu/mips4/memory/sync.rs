@@ -18,7 +18,9 @@
 /// The manual defines only `stype = 0` (full synchronization). Values `1` through
 /// `31` are reserved but produce the same result as `0`; they are preserved as
 /// [`Self::Reserved`] so the raw field round-trips.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4SyncStype {
     /// `stype = 0`: full synchronization of prior and subsequent loads and stores.
     Full,
@@ -57,7 +59,7 @@ impl Mips4SyncStype {
 /// the manual, so this type carries no further behavioral distinction. It has
 /// no architectural side effect: actual cache drain or bus ordering is
 /// implementation- and system-specific and stays outside the base ISA layer.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4SyncOperation {
     /// Synchronization type field selected by the instruction.
     pub stype: Mips4SyncStype,

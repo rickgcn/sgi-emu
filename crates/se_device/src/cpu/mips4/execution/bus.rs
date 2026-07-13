@@ -3,7 +3,9 @@
 use crate::cpu::mips4::cache::Mips4MemoryAccessType;
 
 /// Transfer width of a functional CPU bus transaction.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4ExecutionTransferSize {
     /// One byte.
     Byte,
@@ -31,7 +33,9 @@ impl Mips4ExecutionTransferSize {
 }
 
 /// Architectural purpose of a functional CPU bus transaction.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4ExecutionAccessKind {
     /// Instruction fetch.
     InstructionFetch,
@@ -44,7 +48,7 @@ pub enum Mips4ExecutionAccessKind {
 }
 
 /// Functional CPU bus transaction emitted by MIPS IV execution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4ExecutionTransaction {
     /// Read bytes beginning at an aligned physical address.
     Read {
@@ -82,7 +86,7 @@ pub enum Mips4ExecutionTransaction {
 }
 
 /// Completion delivered for a functional MIPS IV CPU bus transaction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4ExecutionCompletion {
     /// Read data in physical byte-lane order.
     ReadData(u64),

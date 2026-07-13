@@ -28,7 +28,7 @@ use crate::cpu::mips4::tlb::{Mips4TlbAsid, Mips4TlbEntry};
 /// [`crate::cpu::mips4::exception::Mips4CoprocessorNumber::Cp1`]. The `rd` field
 /// of a COP1X indexed memory instruction must be zero; a non-zero value is
 /// UNPREDICTABLE and is the caller's responsibility, not checked here.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Cp1IndexedMemoryAccess {
     /// Resolved memory access for the indexed operation.
     pub access: Mips4MemoryAccess,
@@ -110,7 +110,7 @@ const fn cp1_indexed_kind(operation: Mips4Cp1IndexedMemoryOperation) -> Mips4Mem
 /// The caller must first verify CP1 usability with
 /// [`crate::cpu::mips4::exception::check_coprocessor_access`] using
 /// [`crate::cpu::mips4::exception::Mips4CoprocessorNumber::Cp1`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Cp1OffsetMemoryAccess {
     /// Resolved memory access for the offset operation.
     pub access: Mips4MemoryAccess,
@@ -190,7 +190,7 @@ const fn cp1_offset_kind(operation: Mips4Cp1OffsetMemoryOperation) -> Mips4Memor
 /// `PREF`. The `PREFX` hint field occupies the `rd` position (bits 15..11) of the
 /// instruction word, distinct from `PREF` whose hint occupies the `rt` position;
 /// extract it with `Mips4Cp1Instruction::prefetch_hint`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Cp1IndexedPrefetch;
 
 impl Mips4Cp1IndexedPrefetch {

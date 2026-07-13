@@ -4,7 +4,7 @@
 pub trait ExecutionBoundary {}
 
 /// Action produced while executing one architectural instruction.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ExecutionTargetAction<T, B> {
     /// An external transaction must complete before execution can continue.
     Transaction(T),
@@ -17,7 +17,7 @@ pub enum ExecutionTargetAction<T, B> {
 }
 
 /// Effect of an asynchronous signal on an outstanding transaction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ExecutionTargetSignalAction {
     /// Preserve the current executor state and any outstanding transaction.
     Continue,

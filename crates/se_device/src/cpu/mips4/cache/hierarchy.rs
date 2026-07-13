@@ -11,7 +11,7 @@ use core::fmt;
 pub const MIPS4_FUNCTIONAL_CACHE_LINE_BYTES: usize = 32;
 
 /// Processor-resolved behavior for a translated memory reference.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4CacheAccessPolicy {
     /// Bypass every cache level.
     Uncached,
@@ -52,7 +52,7 @@ impl Mips4CacheAccessPolicy {
 }
 
 /// Geometry of one functional cache level.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4CacheGeometry {
     /// Total data capacity.
     pub size_bytes: u32,
@@ -100,7 +100,7 @@ impl Mips4CacheGeometry {
 }
 
 /// Geometry of the complete functional cache hierarchy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4CacheHierarchyConfig {
     /// Primary instruction cache, when present.
     pub instruction: Option<Mips4CacheGeometry>,
@@ -131,7 +131,7 @@ impl Mips4CacheHierarchyConfig {
 }
 
 /// Invalid functional cache configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4CacheConfigError {
     /// Only the cache-line size supported by the functional bus protocol may be used.
     UnsupportedLineSize {
@@ -189,7 +189,7 @@ impl fmt::Display for Mips4CacheConfigError {
 impl std::error::Error for Mips4CacheConfigError {}
 
 /// One physical-byte cache line.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct Mips4CacheLine {
     pub(crate) physical_line_base: u64,
     pub(crate) valid: bool,
@@ -268,7 +268,7 @@ impl Mips4CacheLine {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct Mips4SetAssociativeCache {
     geometry: Mips4CacheGeometry,
     sets: Vec<Vec<Mips4CacheLine>>,
@@ -316,7 +316,7 @@ impl Mips4SetAssociativeCache {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct Mips4SecondaryCache {
     geometry: Mips4CacheGeometry,
     lines: Vec<Mips4CacheLine>,
@@ -341,7 +341,7 @@ impl Mips4SecondaryCache {
 }
 
 /// Mutable functional cache hierarchy owned by one processor.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct Mips4CacheHierarchy {
     instruction: Option<Mips4SetAssociativeCache>,
     data: Option<Mips4SetAssociativeCache>,

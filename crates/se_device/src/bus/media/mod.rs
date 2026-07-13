@@ -6,7 +6,9 @@ use se_core::component::{Component, ComponentId};
 use se_core::role::BusRole;
 
 /// External MACE port.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum MediaPort {
     VideoInputAb,
     VideoInputCd,
@@ -23,7 +25,7 @@ pub enum MediaPort {
 }
 
 /// Packed video field supplied at the D1 boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct VideoField {
     pub width: u16,
     pub height: u16,
@@ -32,14 +34,14 @@ pub struct VideoField {
 }
 
 /// Stereo sample block at the TDM boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct AudioSampleBlock {
     pub sample_rate_hz: u32,
     pub samples: Vec<(i32, i32)>,
 }
 
 /// Ethernet frame at the MII boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct EthernetFrame {
     pub data: Vec<u8>,
     pub crc_valid: bool,
@@ -47,7 +49,7 @@ pub struct EthernetFrame {
 }
 
 /// Host-neutral data transported through a media link.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MediaPayload {
     Video(VideoField),
     Audio(AudioSampleBlock),
@@ -57,7 +59,7 @@ pub enum MediaPayload {
 }
 
 /// Media link transaction.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MediaTransaction {
     pub source: ComponentId,
     pub target: ComponentId,
@@ -66,7 +68,7 @@ pub struct MediaTransaction {
 }
 
 /// Immediate point-to-point media bus action.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MediaBusAction {
     Deliver {
         target: ComponentId,
@@ -76,12 +78,14 @@ pub enum MediaBusAction {
 }
 
 /// Ordered point-to-point media link.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MediaBus {
     id: ComponentId,
     name: String,
     queue: VecDeque<MediaBusAction>,
 }
+
+crate::component_state!(MediaBusState, MediaBus);
 
 impl MediaBus {
     pub fn new(id: ComponentId, name: impl Into<String>) -> Self {

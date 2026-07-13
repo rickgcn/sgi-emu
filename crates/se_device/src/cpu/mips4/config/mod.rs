@@ -7,7 +7,7 @@
 //! them.
 
 /// Byte order used by memory-facing MIPS IV operations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Endianness {
     /// Most significant byte is stored at the lowest address.
     Big,
@@ -36,7 +36,7 @@ impl Mips4Endianness {
 }
 
 /// Cache configuration visible to a MIPS IV processor model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4CacheConfig {
     /// The cache is not present.
     Disabled,
@@ -90,7 +90,7 @@ impl Mips4CacheConfig {
 }
 
 /// Virtual and physical address widths for a MIPS IV processor model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4AddressConfig {
     /// Implemented physical address width in bits.
     pub physical_address_bits: u8,
@@ -110,7 +110,7 @@ impl Mips4AddressConfig {
 }
 
 /// Coprocessor availability for a MIPS IV processor model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4CoprocessorConfig {
     /// Whether coprocessor 1 is available.
     pub cp1: bool,
@@ -132,7 +132,7 @@ impl Mips4CoprocessorConfig {
 }
 
 /// Configurable MIPS IV processor parameters.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Config {
     /// Processor memory byte order.
     pub endianness: Mips4Endianness,

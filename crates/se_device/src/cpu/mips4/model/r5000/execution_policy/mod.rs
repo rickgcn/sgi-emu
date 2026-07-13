@@ -41,7 +41,7 @@ const CONFIG_DB: u32 = 1 << 4;
 const CONFIG_WRITABLE_MASK: u64 = (1 << 12) | 0x0f;
 
 /// R5000 model decisions consumed by the generic MIPS IV execution target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct R5000ExecutionPolicy {
     profile: R5000Profile,
     boot_mode: R5000BootMode,

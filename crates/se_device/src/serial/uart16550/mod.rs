@@ -19,7 +19,7 @@ const FIFO_CAPACITY: usize = 16;
 const DEFAULT_MODEM_INPUTS: u8 = 0xb0;
 
 /// Construction parameters for one UART.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Uart16550Config {
     /// Clock supplied to the external prescaler.
     pub input_clock_hz: u64,
@@ -46,7 +46,7 @@ impl Uart16550Config {
 }
 
 /// UART construction or external-link error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Uart16550Error {
     ZeroInputClock,
     ZeroTimebase,
@@ -72,7 +72,7 @@ impl fmt::Display for Uart16550Error {
 impl std::error::Error for Uart16550Error {}
 
 /// Scheduled UART transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Uart16550Event {
     TransmitComplete { epoch: u64 },
     ReceiveComplete { epoch: u64 },
@@ -80,7 +80,7 @@ pub enum Uart16550Event {
 }
 
 /// Observable UART action.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Uart16550Action {
     Schedule {
         delay: SimDuration,
@@ -93,7 +93,7 @@ pub enum Uart16550Action {
     Idle,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct SerialClock {
     remainder: u128,
 }
@@ -126,7 +126,7 @@ impl SerialClock {
 }
 
 /// Software-visible 16550 register file, FIFOs, and serial shift registers.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Uart16550 {
     id: ComponentId,
     name: String,
@@ -154,6 +154,8 @@ pub struct Uart16550 {
     irq_asserted: bool,
     actions: VecDeque<Uart16550Action>,
 }
+
+crate::component_state!(Uart16550State, Uart16550);
 
 impl Uart16550 {
     /// Creates a reset UART.

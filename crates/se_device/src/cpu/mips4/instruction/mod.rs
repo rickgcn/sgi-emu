@@ -7,7 +7,19 @@ pub mod decode;
 pub mod requirements;
 
 /// Raw 32-bit MIPS IV instruction word.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Instruction(u32);
 
 impl Mips4Instruction {

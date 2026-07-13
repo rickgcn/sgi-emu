@@ -122,7 +122,9 @@ const CACHE_ERR_READABLE_MASK: u32 = CACHE_ERR_DATA_REFERENCE
     | CACHE_ERR_VIRTUAL_INDEX_MASK;
 
 /// MIPS IV CP0 register number.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4Cp0Register {
     /// TLB index register.
     Index,
@@ -266,7 +268,7 @@ impl Mips4Cp0Register {
 }
 
 /// Error returned by CP0 register writes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4Cp0WriteError {
     /// The selected CP0 register is read-only through the public register file.
     ReadOnlyRegister {
@@ -285,7 +287,19 @@ impl Mips4Cp0WriteError {
 }
 
 /// CP0 `Index` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Index(u32);
 
 impl Mips4Cp0Index {
@@ -311,7 +325,19 @@ impl Mips4Cp0Index {
 }
 
 /// CP0 `Random` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Random(u32);
 
 impl Mips4Cp0Random {
@@ -332,7 +358,19 @@ impl Mips4Cp0Random {
 }
 
 /// CP0 `Wired` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Wired(u32);
 
 impl Mips4Cp0Wired {
@@ -353,7 +391,19 @@ impl Mips4Cp0Wired {
 }
 
 /// CP0 `EntryLo0` or `EntryLo1` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0EntryLo(u32);
 
 impl Mips4Cp0EntryLo {
@@ -404,7 +454,19 @@ impl Mips4Cp0EntryLo {
 }
 
 /// CP0 `PageMask` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0PageMask(u32);
 
 impl Mips4Cp0PageMask {
@@ -430,7 +492,19 @@ impl Mips4Cp0PageMask {
 }
 
 /// CP0 `EntryHi` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0EntryHi(u64);
 
 impl Mips4Cp0EntryHi {
@@ -479,7 +553,19 @@ impl Mips4Cp0EntryHi {
 }
 
 /// CP0 `Context` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Context(u64);
 
 impl Mips4Cp0Context {
@@ -505,7 +591,19 @@ impl Mips4Cp0Context {
 }
 
 /// CP0 `BadVAddr` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0BadVaddr(u64);
 
 impl Mips4Cp0BadVaddr {
@@ -526,7 +624,19 @@ impl Mips4Cp0BadVaddr {
 }
 
 /// CP0 `Count` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Count(u32);
 
 impl Mips4Cp0Count {
@@ -542,7 +652,19 @@ impl Mips4Cp0Count {
 }
 
 /// CP0 `Compare` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Compare(u32);
 
 impl Mips4Cp0Compare {
@@ -558,7 +680,9 @@ impl Mips4Cp0Compare {
 }
 
 /// CP0 `Status` KSU mode field.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4Cp0KernelUserMode {
     /// Kernel mode.
     Kernel,
@@ -596,7 +720,19 @@ impl Mips4Cp0KernelUserMode {
 }
 
 /// CP0 `Status` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Status(u32);
 
 impl Mips4Cp0Status {
@@ -714,7 +850,19 @@ impl Mips4Cp0Status {
 }
 
 /// CP0 `Cause` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Cause(u32);
 
 impl Mips4Cp0Cause {
@@ -763,7 +911,19 @@ impl Mips4Cp0Cause {
 }
 
 /// CP0 `EPC` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Epc(u64);
 
 impl Mips4Cp0Epc {
@@ -784,7 +944,19 @@ impl Mips4Cp0Epc {
 }
 
 /// CP0 `PRId` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0ProcessorId(u32);
 
 impl Mips4Cp0ProcessorId {
@@ -810,7 +982,19 @@ impl Mips4Cp0ProcessorId {
 }
 
 /// CP0 `Config` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Config(u32);
 
 impl Mips4Cp0Config {
@@ -831,7 +1015,19 @@ impl Mips4Cp0Config {
 }
 
 /// CP0 `LLAddr` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0LlAddr(u32);
 
 impl Mips4Cp0LlAddr {
@@ -857,7 +1053,19 @@ impl Mips4Cp0LlAddr {
 }
 
 /// CP0 `WatchLo` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0WatchLo(u32);
 
 impl Mips4Cp0WatchLo {
@@ -873,7 +1081,19 @@ impl Mips4Cp0WatchLo {
 }
 
 /// CP0 `WatchHi` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0WatchHi(u32);
 
 impl Mips4Cp0WatchHi {
@@ -889,7 +1109,19 @@ impl Mips4Cp0WatchHi {
 }
 
 /// CP0 `XContext` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0XContext(u64);
 
 impl Mips4Cp0XContext {
@@ -920,7 +1152,19 @@ impl Mips4Cp0XContext {
 }
 
 /// CP0 `ECC` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0Ecc(u32);
 
 impl Mips4Cp0Ecc {
@@ -936,7 +1180,19 @@ impl Mips4Cp0Ecc {
 }
 
 /// CP0 `CacheErr` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0CacheErr(u32);
 
 impl Mips4Cp0CacheErr {
@@ -1020,7 +1276,19 @@ impl Mips4Cp0CacheErr {
 }
 
 /// CP0 `TagLo` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0TagLo(u32);
 
 impl Mips4Cp0TagLo {
@@ -1036,7 +1304,19 @@ impl Mips4Cp0TagLo {
 }
 
 /// CP0 `TagHi` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0TagHi(u32);
 
 impl Mips4Cp0TagHi {
@@ -1052,7 +1332,19 @@ impl Mips4Cp0TagHi {
 }
 
 /// CP0 `ErrorEPC` register.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 pub struct Mips4Cp0ErrorEpc(u64);
 
 impl Mips4Cp0ErrorEpc {
@@ -1073,7 +1365,7 @@ impl Mips4Cp0ErrorEpc {
 }
 
 /// MIPS IV CP0 register file.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Cp0 {
     index: Mips4Cp0Index,
     random: Mips4Cp0Random,

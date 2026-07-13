@@ -4,7 +4,7 @@ use se_core::scheduler::SimDuration;
 
 const CRIME_FREQUENCY_HZ: u64 = 66_666_500;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct CrimeClock {
     timebase_hz: u64,
     remainder: u64,

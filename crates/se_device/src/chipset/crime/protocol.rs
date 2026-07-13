@@ -20,7 +20,9 @@ use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4Execution
 pub const CRIME_IRQ_OUTPUT: IrqOutput = IrqOutput::new(0);
 
 /// Identifier correlating one CRIME transaction and completion.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct CrimeTransactionId(u128);
 
 impl CrimeTransactionId {
@@ -42,7 +44,7 @@ impl fmt::Display for CrimeTransactionId {
 }
 
 /// CPU request delivered to CRIME by the SysAD bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeSysAdRequest {
     /// Simulated delivery time.
     pub time: SimTime,
@@ -52,7 +54,9 @@ pub struct CrimeSysAdRequest {
 }
 
 /// Origin of a request competing for CRIME memory service.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum CrimeMemoryClient {
     /// GBE display traffic.
     Gbe,
@@ -67,7 +71,7 @@ pub enum CrimeMemoryClient {
 }
 
 /// Owned byte payload optimized for CRIME's common subblock transfers.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeData(CompactData);
 
 impl CrimeData {
@@ -131,7 +135,7 @@ impl PartialEq<Vec<u8>> for CrimeData {
 }
 
 /// Owned byte-enable payload optimized for CRIME's common subblock transfers.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeByteEnable(CompactByteEnable);
 
 impl CrimeByteEnable {
@@ -193,7 +197,7 @@ impl PartialEq<Vec<bool>> for CrimeByteEnable {
 }
 
 /// Byte-oriented operation transported through a CRIME bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeTransfer(CompactTransfer);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,14 +276,14 @@ impl CrimeTransfer {
 }
 
 /// Reason an otherwise valid memory request must not assert SDRAM bank selects.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeMemoryInhibitReason {
     /// The Rendering Engine generated a request from an invalid TLB entry.
     InvalidRenderTlb,
 }
 
 /// Bank-selection behavior attached to one CRIME memory request.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeMemoryBankSelect {
     /// Decode the request through the programmable MIU bank controls.
     Decode,
@@ -292,7 +296,7 @@ pub enum CrimeMemoryBankSelect {
 }
 
 /// Request routed through the CRIME memory domain.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeMemoryTransaction {
     /// Correlation identifier.
     pub id: CrimeTransactionId,
@@ -320,7 +324,7 @@ pub struct CrimeMemoryTransaction {
 }
 
 /// Successful data returned by a CRIME bus target.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeCompletionPayload {
     /// Read data in ascending physical byte-address order.
     ReadData(CrimeData),
@@ -330,7 +334,7 @@ pub enum CrimeCompletionPayload {
 }
 
 /// Error reported by a CRIME bus or target.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeBusError {
     /// No target decoded the requested address.
     Address,
@@ -346,7 +350,7 @@ pub enum CrimeBusError {
 }
 
 /// Hardware-visible fault reported by the CRIME memory controller.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeMemoryFault {
     /// No programmed bank-control register selected the request address.
     Address,
@@ -356,7 +360,7 @@ pub enum CrimeMemoryFault {
 }
 
 /// Data and diagnostic state produced by one CRIME memory operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeMemoryOutcome {
     /// Data or write acknowledgement returned to the requesting client.
     pub payload: CrimeCompletionPayload,
@@ -409,7 +413,7 @@ impl CrimeMemoryOutcome {
 }
 
 /// Completion returned through the CRIME memory domain.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeMemoryCompletion {
     /// Correlation identifier.
     pub id: CrimeTransactionId,
@@ -419,7 +423,7 @@ pub struct CrimeMemoryCompletion {
 }
 
 /// Software-visible memory diagnostic associated with a completion.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeMemoryDiagnostic {
     /// Memory-domain address of the affected 256-bit word.
     pub address: u64,
@@ -441,7 +445,7 @@ pub struct CrimeMemoryDiagnostic {
 }
 
 /// CPU or Rendering Engine change sent to the SDRAM device.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeSdramSignal {
     /// Replaces one programmable bank-control register.
     SetBankControl {
@@ -472,7 +476,7 @@ pub enum CrimeSdramSignal {
 }
 
 /// CPU PIO request transported over CMI or CGI.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimePioRequest {
     /// Peer-local byte address.
     pub address: u64,
@@ -482,7 +486,7 @@ pub struct CrimePioRequest {
 }
 
 /// DMA request emitted by a peer device.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeDmaRequest {
     /// Main-memory byte address.
     pub address: u64,
@@ -492,7 +496,7 @@ pub struct CrimeDmaRequest {
 }
 
 /// Interrupt transaction posted by a peer device.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeInterruptPost {
     /// CRIME hardware-interrupt bit to assert or deassert.
     pub interrupt_bit: u8,
@@ -502,7 +506,7 @@ pub struct CrimeInterruptPost {
 }
 
 /// Operation transported through a CRIME peer link.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeLinkOperation {
     /// CPU-programmed I/O.
     Pio(CrimePioRequest),
@@ -515,7 +519,7 @@ pub enum CrimeLinkOperation {
 }
 
 /// CMI transaction between CRIME and MACE.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeCmiTransaction {
     /// Correlation identifier.
     pub id: CrimeTransactionId,
@@ -531,7 +535,7 @@ pub struct CrimeCmiTransaction {
 }
 
 /// CMI completion.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeCmiCompletion {
     /// Correlation identifier.
     pub id: CrimeTransactionId,
@@ -544,7 +548,7 @@ pub struct CrimeCmiCompletion {
 }
 
 /// CGI transaction between CRIME and GBE.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeCgiTransaction {
     /// Correlation identifier.
     pub id: CrimeTransactionId,
@@ -560,7 +564,7 @@ pub struct CrimeCgiTransaction {
 }
 
 /// CGI completion.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeCgiCompletion {
     /// Correlation identifier.
     pub id: CrimeTransactionId,
@@ -573,7 +577,7 @@ pub struct CrimeCgiCompletion {
 }
 
 /// Immediate response from a link device.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeLinkDeviceResponse<C> {
     /// The target completed synchronously.
     Complete(C),
@@ -583,7 +587,7 @@ pub enum CrimeLinkDeviceResponse<C> {
 }
 
 /// Result of submitting a transaction to a stateful CRIME bus.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeBusDisposition {
     /// The bus was already scheduled and only queued the transaction.
     Queued,
@@ -599,7 +603,7 @@ pub enum CrimeBusDisposition {
 }
 
 /// Action emitted by a stateful bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeBusAction<T, C> {
     /// Delivers one request to a bus device.
     Deliver {
@@ -630,7 +634,7 @@ pub enum CrimeBusAction<T, C> {
 }
 
 /// CRIME-internal scheduled event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeEvent {
     /// First or second CRIME 1.1 watchdog threshold.
     Watchdog {
@@ -649,7 +653,7 @@ pub enum CrimeEvent {
 }
 
 /// CPU-facing signal emitted by CRIME.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeCpuSignal {
     /// Requests an R5000 warm reset.
     WarmReset,
@@ -659,7 +663,7 @@ pub enum CrimeCpuSignal {
 }
 
 /// Owned trace value generated by CRIME.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeTraceValue {
     /// Boolean value.
     Bool(bool),
@@ -672,7 +676,7 @@ pub enum CrimeTraceValue {
 }
 
 /// Ordered trace field generated by CRIME.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeTraceField {
     /// Stable field name.
     pub key: &'static str,

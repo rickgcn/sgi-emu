@@ -3,7 +3,7 @@
 use crate::control::FloatExceptionFlags;
 
 /// Value returned by a floating-point backend operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct FloatResult<T> {
     /// Operation value.
     pub value: T,

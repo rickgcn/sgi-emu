@@ -15,14 +15,14 @@ use crate::bus::isa::{
 pub const IEEE1284_IRQ_OUTPUT: IrqOutput = IrqOutput::new(0);
 
 /// Observable parallel-port action.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ieee1284Action {
     SetIrq(IrqTransaction),
     Idle,
 }
 
 /// Software-visible byte registers for the external Super I/O parallel port.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ieee1284 {
     id: ComponentId,
     name: String,
@@ -34,6 +34,8 @@ pub struct Ieee1284 {
     irq_asserted: bool,
     actions: VecDeque<Ieee1284Action>,
 }
+
+crate::component_state!(Ieee1284State, Ieee1284);
 
 impl Ieee1284 {
     /// Creates a reset parallel port.

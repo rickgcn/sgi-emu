@@ -14,7 +14,7 @@ use crate::bus::pci::PciTransaction;
 use crate::chipset::crime::protocol::{CrimeCmiCompletion, CrimeCmiTransaction};
 
 /// Board wiring used by the MACE controller roles.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceExternalLinks {
     pub i2c: [ComponentId; 2],
     pub audio: ComponentId,
@@ -27,7 +27,7 @@ pub struct MaceExternalLinks {
 }
 
 /// Topological component identifiers used by MACE.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceWiring {
     pub crime: ComponentId,
     pub pci_bus: ComponentId,
@@ -42,7 +42,7 @@ pub struct MaceWiring {
 }
 
 /// Scheduled internal MACE transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MaceEvent {
     TimerCompare { epoch: u64, timer: u8 },
     Ps2Transmit { epoch: u64, port: u8 },
@@ -53,7 +53,7 @@ pub enum MaceEvent {
 }
 
 /// Host-neutral input scheduled by the machine profile.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceHostInput {
     pub time: SimTime,
     pub port: MediaPort,
@@ -61,7 +61,7 @@ pub struct MaceHostInput {
 }
 
 /// Structured MACE trace value.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MaceTraceValue {
     Bool(bool),
     U64(u64),
@@ -70,7 +70,7 @@ pub enum MaceTraceValue {
 }
 
 /// Structured MACE trace field.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MaceTraceField {
     pub key: &'static str,
     pub value: MaceTraceValue,

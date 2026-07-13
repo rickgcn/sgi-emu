@@ -34,6 +34,7 @@ pub(super) enum Mips4MemoryPlan {
     },
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub(super) struct Mips4PendingRead {
     operation: Mips4LoadOperation,
     target: u8,
@@ -42,6 +43,7 @@ pub(super) struct Mips4PendingRead {
     register_value: u64,
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub(super) struct Mips4PendingWrite {
     conditional_target: Option<u8>,
 }
@@ -78,6 +80,7 @@ pub(super) fn prepare_cache_address(
     })
 }
 
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
 enum Mips4LoadOperation {
     Byte { signed: bool },
     Halfword { signed: bool },

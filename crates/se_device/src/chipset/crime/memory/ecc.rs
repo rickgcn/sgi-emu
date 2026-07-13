@@ -9,7 +9,7 @@ const DATA_SYNDROMES: [u8; 64] = [
 ];
 
 /// Result of checking one data lane and its stored ECC byte.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum EccCheck {
     /// Data and ECC are consistent.
     Clean {

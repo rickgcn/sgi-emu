@@ -8,7 +8,9 @@
 pub const MIPS1_GPR_COUNT: usize = 32;
 
 /// MIPS I general-purpose register index.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct Mips1GprIndex(u8);
 
 impl Mips1GprIndex {
@@ -36,7 +38,7 @@ impl Mips1GprIndex {
 }
 
 /// MIPS I general-purpose register file.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips1GprFile {
     registers: [u32; MIPS1_GPR_COUNT],
 }

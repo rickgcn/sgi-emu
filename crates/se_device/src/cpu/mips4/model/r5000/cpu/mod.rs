@@ -24,7 +24,7 @@ use super::execution_policy::R5000ExecutionPolicy;
 use super::profile::R5000Profile;
 
 /// External signal delivered to the R5000 through its bus-device role.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum R5000CpuSignal {
     /// Invalidates an outstanding load-linked reservation.
     InvalidateReservation,
@@ -40,7 +40,7 @@ pub enum R5000CpuSignal {
 }
 
 /// Cumulative R5000 execution counters.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct R5000CpuStatistics {
     /// Instructions that retired normally.
     pub retired_instructions: u64,
@@ -68,7 +68,7 @@ pub const R5000_IRQ_IP5: IrqInput = IrqInput::new(5);
 pub const R5000_IRQ_IP6: IrqInput = IrqInput::new(6);
 
 /// R5000 interrupt delivery error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum R5000IrqError {
     /// The delivery named an input that is not externally driven on this CPU.
     UnsupportedInput(IrqInput),
@@ -87,7 +87,7 @@ impl fmt::Display for R5000IrqError {
 impl std::error::Error for R5000IrqError {}
 
 /// Terminal functional R5000 execution error.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum R5000CpuError {
     /// The requested architecture or cache configuration is invalid.
     Configuration(Mips4ExecutionConfigError),
@@ -110,6 +110,7 @@ impl fmt::Display for R5000CpuError {
 impl std::error::Error for R5000CpuError {}
 
 /// Functional R5000 CPU with an injectable floating-point backend.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct R5000Cpu<F = SoftFloat3Backend>
 where
     F: FloatBackend,
@@ -123,6 +124,8 @@ where
     terminal_error: Option<R5000CpuError>,
     statistics: R5000CpuStatistics,
 }
+
+crate::component_state!(R5000CpuState, R5000Cpu);
 
 impl R5000Cpu<SoftFloat3Backend> {
     /// Creates an R5000 using SoftFloat 3e as its reference FPU backend.

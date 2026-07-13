@@ -10,7 +10,9 @@ use crate::cpu::mips4::mmu::{Mips4MmuCacheAttribute, Mips4MmuConfig};
 use crate::cpu::mips4::tlb::Mips4TlbAddressMode;
 
 /// Processor decision for the implementation-specific `WAIT` instruction.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4Cp0WaitPolicy {
     /// Treat the encoding as a reserved instruction.
     ReservedInstruction,
@@ -21,7 +23,9 @@ pub enum Mips4Cp0WaitPolicy {
 }
 
 /// Direction of a CP0 doubleword register transfer.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4Cp0DoublewordTransferDirection {
     /// `DMFC0` transfers from CP0 to a general-purpose register.
     FromCp0,
@@ -30,7 +34,9 @@ pub enum Mips4Cp0DoublewordTransferDirection {
 }
 
 /// Processor decision for `DMFC0` or `DMTC0` after generic decoding checks.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4Cp0DoublewordTransferPolicy {
     /// Execute the full 64-bit transfer.
     Execute,
@@ -41,7 +47,9 @@ pub enum Mips4Cp0DoublewordTransferPolicy {
 }
 
 /// Processor decision for architectural prefetch instructions.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4PrefetchPolicy {
     /// Execute the prefetch through the functional cache hierarchy.
     Execute,
@@ -50,7 +58,9 @@ pub enum Mips4PrefetchPolicy {
 }
 
 /// Processor decision for a word instruction with a `NotWordValue` operand.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4NotWordValuePolicy {
     /// Execute the instruction using the low 32 bits of each word operand.
     ExecuteLowWord,
@@ -59,7 +69,9 @@ pub enum Mips4NotWordValuePolicy {
 }
 
 /// Processor decision for transfers involving a reserved CP1 control register.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4ReservedCp1ControlPolicy {
     /// Return zero from `CFC1` and ignore `CTC1` writes.
     ReadZeroWriteIgnore,

@@ -11,7 +11,7 @@ use se_core::role::BusRole;
 use se_core::scheduler::{SimDuration, SimTime};
 
 /// Owned byte payload optimized for common ISA transfers.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IsaData(CompactData);
 
 impl IsaData {
@@ -76,7 +76,7 @@ impl<const N: usize> PartialEq<[u8; N]> for IsaData {
 }
 
 /// Owned byte-enable payload optimized for common ISA transfers.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IsaByteEnable(CompactByteEnable);
 
 impl IsaByteEnable {
@@ -137,7 +137,9 @@ impl<const N: usize> PartialEq<[bool; N]> for IsaByteEnable {
 }
 
 /// Correlation identifier for an ISA transaction.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct IsaTransactionId(u128);
 
 impl IsaTransactionId {
@@ -153,7 +155,7 @@ impl IsaTransactionId {
 }
 
 /// Byte-oriented ISA transfer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IsaTransfer(CompactTransfer);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,7 +234,7 @@ impl IsaTransfer {
 }
 
 /// Transaction routed across an ISA bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IsaTransaction {
     /// Correlation identifier.
     pub id: IsaTransactionId,
@@ -249,7 +251,7 @@ pub struct IsaTransaction {
 }
 
 /// Successful ISA response.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IsaCompletionPayload {
     /// Bytes in ascending address order.
     ReadData(IsaData),
@@ -258,7 +260,7 @@ pub enum IsaCompletionPayload {
 }
 
 /// ISA target or routing error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IsaBusError {
     /// No device decoded the address.
     Address,
@@ -271,7 +273,7 @@ pub enum IsaBusError {
 }
 
 /// Completion returned to an ISA controller.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IsaCompletion {
     /// Correlation identifier.
     pub id: IsaTransactionId,
@@ -280,7 +282,7 @@ pub struct IsaCompletion {
 }
 
 /// Response returned immediately by an ISA target.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IsaDeviceResponse {
     /// The target completed synchronously.
     Complete(IsaCompletion),
@@ -289,7 +291,7 @@ pub enum IsaDeviceResponse {
 }
 
 /// Result of routing an ISA transaction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IsaBusDisposition {
     /// The bus was already active.
     Queued,
@@ -301,7 +303,7 @@ pub enum IsaBusDisposition {
 }
 
 /// Scheduled ISA bus transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IsaBusEvent {
     /// Delivers a queued request.
     Service { epoch: u64 },
@@ -310,7 +312,7 @@ pub enum IsaBusEvent {
 }
 
 /// Action emitted by the ISA bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum IsaBusAction {
     /// Delivers one transaction.
     Deliver {
@@ -332,7 +334,7 @@ pub enum IsaBusAction {
 }
 
 /// Single-transaction deterministic ISA bus.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IsaBus {
     id: ComponentId,
     name: String,
@@ -344,6 +346,8 @@ pub struct IsaBus {
     completion: Option<IsaCompletion>,
     actions: VecDeque<IsaBusAction>,
 }
+
+crate::component_state!(IsaBusState, IsaBus);
 
 impl IsaBus {
     /// Creates an ISA domain with a fixed visible bus-cycle delay.

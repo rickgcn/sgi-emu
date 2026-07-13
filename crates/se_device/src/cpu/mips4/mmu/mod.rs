@@ -34,7 +34,7 @@ const XKPHYS_PHYSICAL_ADDRESS_MASK: u64 = 0x0000_000f_ffff_ffff;
 const XKPHYS_CCA_SHIFT: u8 = 59;
 
 /// Generic MIPS IV MMU configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4MmuConfig {
     /// Implemented virtual and physical address widths.
     pub address: Mips4AddressConfig,
@@ -57,7 +57,9 @@ impl Mips4MmuConfig {
 }
 
 /// Effective privilege mode used by address translation.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4MmuPrivilegeMode {
     /// Kernel mode.
     Kernel,
@@ -86,7 +88,9 @@ impl Mips4MmuPrivilegeMode {
 }
 
 /// MIPS IV virtual-address segment.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4MmuSegment {
     /// 32-bit user segment as viewed from user mode.
     Useg,
@@ -150,7 +154,9 @@ pub enum Mips4MmuSegment {
 }
 
 /// Cache attribute selected by MMU translation.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub enum Mips4MmuCacheAttribute {
     /// Access bypasses the cache hierarchy.
     Uncached,
@@ -192,7 +198,7 @@ impl Mips4MmuCacheAttribute {
 }
 
 /// Virtual-address classification before TLB lookup.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4MmuAddressClassification {
     /// Address belongs to a mapped segment.
     Mapped {
@@ -226,7 +232,7 @@ pub enum Mips4MmuAddressClassification {
 }
 
 /// Source of a successful MMU translation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4MmuTranslationSource {
     /// Translation came from a mapped segment and a TLB hit.
     Mapped {
@@ -245,7 +251,7 @@ pub enum Mips4MmuTranslationSource {
 }
 
 /// Successful MMU translation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4MmuTranslation {
     /// Translated physical address.
     pub physical_address: u64,
@@ -261,7 +267,7 @@ pub struct Mips4MmuTranslation {
 }
 
 /// MMU translation fault.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4MmuFault {
     /// Exception that a CPU pipeline would raise for this access.
     pub exception: Mips4Exception,
@@ -277,7 +283,7 @@ pub struct Mips4MmuFault {
 }
 
 /// MMU translation result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Mips4MmuTranslationResult {
     /// Translation succeeded.
     Hit(Mips4MmuTranslation),
@@ -296,7 +302,7 @@ pub enum Mips4MmuTranslationResult {
 }
 
 /// Stateless MIPS IV MMU helper.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mips4Mmu;
 
 impl Mips4Mmu {

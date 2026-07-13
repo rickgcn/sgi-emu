@@ -13,6 +13,11 @@ pub type FunctionalExecutorPoll<T> = Result<
 >;
 
 /// Functional, one-instruction-at-a-time CPU executor.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(bound(
+    serialize = "T: serde::Serialize, T::Transaction: serde::Serialize, T::Boundary: serde::Serialize",
+    deserialize = "T: serde::Deserialize<'de>, T::Transaction: serde::Deserialize<'de>, T::Boundary: serde::Deserialize<'de>"
+))]
 pub struct FunctionalExecutor<T>
 where
     T: ExecutionTarget,

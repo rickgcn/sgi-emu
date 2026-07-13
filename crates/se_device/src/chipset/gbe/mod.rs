@@ -55,7 +55,7 @@ const PIXEL_REFERENCE_CLOCK_HZ: u64 = 20_000_000;
 const VT_XY_FREEZE: u32 = 1 << 31;
 
 /// SGI Graphics Back End connected to the CRIME CGI link.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Gbe {
     id: ComponentId,
     name: String,
@@ -66,6 +66,8 @@ pub struct Gbe {
     scan_origin_time: SimTime,
     scan_origin_pixel: u64,
 }
+
+crate::component_state!(GbeState, Gbe);
 
 impl Gbe {
     /// Creates a GBE with inactive external sense inputs.

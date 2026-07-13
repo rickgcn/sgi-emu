@@ -1,7 +1,7 @@
 //! MACE video channel state and fixed-point pixel pipeline helpers.
 
 /// Software-visible MACE video pixel formats.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum VideoPixelFormat {
     Rgba8888,
     Abgr8888,
@@ -12,7 +12,7 @@ pub enum VideoPixelFormat {
 }
 
 /// One video channel register set.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct VideoChannel {
     pub output: bool,
     pub control: u16,
