@@ -8,7 +8,9 @@ use std::{
     },
 };
 
-use se_core::tracing::{TraceLevel, TraceRecord, TraceSink, TraceSource, TraceValue};
+use se_core::tracing::{
+    TraceInterest, TraceLevel, TraceRecord, TraceSink, TraceSource, TraceValue,
+};
 
 const APPLICATION_QUEUE_CAPACITY: usize = 8_192;
 
@@ -174,6 +176,14 @@ impl UiTraceSink {
 }
 
 impl TraceSink for UiTraceSink {
+    fn interest(&self, source: TraceSource) -> TraceInterest {
+        if self.queue.enabled(source) {
+            TraceInterest::All
+        } else {
+            TraceInterest::None
+        }
+    }
+
     fn enabled(
         &self,
         source: TraceSource,
@@ -314,7 +324,7 @@ mod tests {
     use se_core::{
         component::ComponentId,
         scheduler::SimTime,
-        tracing::{TraceField, TraceLevel, TraceRecord, TraceSink, TraceSource},
+        tracing::{TraceField, TraceInterest, TraceLevel, TraceRecord, TraceSink, TraceSource},
     };
     use se_machine::o2::ip32::machine::{Ip32Machine, Ip32MachineConfig};
 
@@ -426,12 +436,17 @@ mod tests {
             "scheduler",
             "event_dispatched"
         ));
+        assert_eq!(sink.interest(TraceSource::Scheduler), TraceInterest::None);
         assert!(sink.enabled(
             TraceSource::Component(ComponentId::new(7)),
             TraceLevel::Debug,
             "ip32.sysad",
             "access"
         ));
+        assert_eq!(
+            sink.interest(TraceSource::Component(ComponentId::new(7))),
+            TraceInterest::All
+        );
         sink.record(scheduler_record);
         assert!(sink.queue.drain(8).is_empty());
         assert_eq!(sink.queue.stats().captured, 0);
@@ -450,6 +465,10 @@ mod tests {
         assert_eq!(sink.queue.stats().captured, 1);
 
         sink.queue.capture_enabled.store(false, Ordering::Relaxed);
+        assert_eq!(
+            sink.interest(TraceSource::Component(ComponentId::new(7))),
+            TraceInterest::None
+        );
         assert!(!sink.enabled(
             TraceSource::Component(ComponentId::new(7)),
             TraceLevel::Debug,
@@ -483,12 +502,17 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(2_000_000);
+        let requested_mode =
+            std::env::var("IP32_PROM_TRACE_MODE").unwrap_or_else(|_| "all".to_owned());
 
         for (label, capture, scheduler_capture) in [
             ("capture-disabled", false, false),
             ("component-capture", true, false),
             ("scheduler-capture", true, true),
-        ] {
+        ]
+        .into_iter()
+        .filter(|(label, _, _)| requested_mode == "all" || requested_mode == *label)
+        {
             let sink = UiTraceSink::with_capacity(super::APPLICATION_QUEUE_CAPACITY);
             sink.queue.capture_enabled.store(capture, Ordering::Relaxed);
             sink.queue

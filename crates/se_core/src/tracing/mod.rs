@@ -42,6 +42,19 @@ pub enum TraceSource {
     Component(ComponentId),
 }
 
+/// Coarse producer interest for one trace source.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TraceInterest {
+    /// No records from the source can be observed.
+    None,
+
+    /// Records may be accepted after evaluating their complete metadata.
+    Filtered,
+
+    /// Every record from the source is accepted.
+    All,
+}
+
 /// Structured value stored in a trace field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TraceValue<'a> {
@@ -140,6 +153,11 @@ pub struct TraceRecord<'a> {
 
 /// Destination for trace records.
 pub trait TraceSink {
+    /// Returns the sink's coarse interest in one source.
+    fn interest(&self, _source: TraceSource) -> TraceInterest {
+        TraceInterest::Filtered
+    }
+
     /// Returns whether a record with the given metadata should be constructed.
     fn enabled(
         &self,
@@ -160,6 +178,10 @@ pub trait TraceSink {
 pub struct NoopTraceSink;
 
 impl TraceSink for NoopTraceSink {
+    fn interest(&self, _source: TraceSource) -> TraceInterest {
+        TraceInterest::None
+    }
+
     fn enabled(
         &self,
         _source: TraceSource,
@@ -211,6 +233,14 @@ impl<S> TraceRecorder<S> {
         &mut self.sink
     }
 
+    /// Returns the sink's coarse interest in one trace source.
+    pub fn interest(&self, source: TraceSource) -> TraceInterest
+    where
+        S: TraceSink,
+    {
+        self.sink.interest(source)
+    }
+
     /// Consumes the recorder and returns the underlying sink.
     pub fn into_sink(self) -> S {
         self.sink
@@ -244,9 +274,9 @@ impl<S> TraceRecorder<S> {
 
     /// Lazily constructs and records one structured simulation fact.
     ///
-    /// The sequence number is allocated before the sink gate is evaluated, so
-    /// disabled records preserve the recorder's global sequence space without
-    /// paying the cost of constructing their fields.
+    /// An uninterested source does not allocate a sequence number. A filtered
+    /// record allocates its sequence before the metadata gate is evaluated, so
+    /// fine-grained filtering preserves gaps without constructing fields.
     pub fn record_lazy<'a, F, T>(
         &mut self,
         time: SimTime,
@@ -255,15 +285,20 @@ impl<S> TraceRecorder<S> {
         target: &'a str,
         event: &'a str,
         build_fields: F,
-    ) -> u64
+    ) -> Option<u64>
     where
         S: TraceSink,
         F: FnOnce() -> T,
         T: AsRef<[TraceField<'a>]>,
     {
+        let interest = self.sink.interest(source);
+        if interest == TraceInterest::None {
+            return None;
+        }
+
         let sequence = self.allocate_sequence();
-        if !self.sink.enabled(source, level, target, event) {
-            return sequence;
+        if interest == TraceInterest::Filtered && !self.sink.enabled(source, level, target, event) {
+            return Some(sequence);
         }
 
         let fields = build_fields();
@@ -276,7 +311,7 @@ impl<S> TraceRecorder<S> {
             event,
             fields: fields.as_ref(),
         });
-        sequence
+        Some(sequence)
     }
 
     fn allocate_sequence(&mut self) -> u64 {

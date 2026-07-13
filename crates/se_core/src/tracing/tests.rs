@@ -210,6 +210,26 @@ impl TraceSink for SchedulerDisabledSink {
     }
 }
 
+#[derive(Default)]
+struct SchedulerUninterestedSink {
+    records: Vec<(u64, String)>,
+}
+
+impl TraceSink for SchedulerUninterestedSink {
+    fn interest(&self, source: TraceSource) -> TraceInterest {
+        if matches!(source, TraceSource::Scheduler) {
+            TraceInterest::None
+        } else {
+            TraceInterest::All
+        }
+    }
+
+    fn record(&mut self, record: TraceRecord<'_>) {
+        self.records
+            .push((record.sequence, record.event.to_owned()));
+    }
+}
+
 #[test]
 fn lazy_recording_skips_field_construction_and_preserves_sequence_space() {
     let mut recorder = TraceRecorder::new(SchedulerDisabledSink::default());
@@ -235,9 +255,41 @@ fn lazy_recording_skips_field_construction_and_preserves_sequence_space() {
         || [TraceField::bool("running", true)],
     );
 
-    assert_eq!(disabled, 0);
-    assert_eq!(enabled, 1);
+    assert_eq!(disabled, Some(0));
+    assert_eq!(enabled, Some(1));
     assert!(!fields_built.get());
     assert_eq!(recorder.next_sequence(), 2);
     assert_eq!(recorder.sink().records, vec![(1, "continued".to_owned())]);
+}
+
+#[test]
+fn uninterested_source_skips_sequence_and_field_construction() {
+    let mut recorder = TraceRecorder::new(SchedulerUninterestedSink::default());
+    let fields_built = Cell::new(false);
+
+    let disabled = recorder.record_lazy(
+        SimTime::new(3),
+        TraceSource::Scheduler,
+        TraceLevel::Trace,
+        "scheduler",
+        "event_dispatched",
+        || {
+            fields_built.set(true);
+            [TraceField::u64("event_id", 1)]
+        },
+    );
+    let enabled = recorder.record_lazy(
+        SimTime::new(4),
+        TraceSource::Runtime,
+        TraceLevel::Info,
+        "runtime",
+        "continued",
+        || [TraceField::bool("running", true)],
+    );
+
+    assert_eq!(disabled, None);
+    assert_eq!(enabled, Some(0));
+    assert!(!fields_built.get());
+    assert_eq!(recorder.next_sequence(), 1);
+    assert_eq!(recorder.sink().records, vec![(0, "continued".to_owned())]);
 }

@@ -12,7 +12,7 @@ use se_core::scheduler::{
     ScheduledEvent, ScheduledEventId, Scheduler, SchedulerError, SimDuration, SimTime,
 };
 use se_core::tracing::{
-    NoopTraceSink, TraceField, TraceLevel, TraceRecorder, TraceSink, TraceSource,
+    NoopTraceSink, TraceField, TraceInterest, TraceLevel, TraceRecorder, TraceSink, TraceSource,
 };
 
 use crate::registry::ComponentRegistry;
@@ -378,6 +378,11 @@ impl<E, S> RuntimeContext<'_, E, S>
 where
     S: TraceSink,
 {
+    /// Returns the trace sink's coarse interest in one source.
+    pub fn trace_interest(&self, source: TraceSource) -> TraceInterest {
+        self.trace.interest(source)
+    }
+
     /// Schedules an event at an absolute simulated time.
     pub fn schedule_at(
         &mut self,
@@ -430,7 +435,7 @@ where
         target: &'field str,
         event: &'field str,
         build_fields: F,
-    ) -> u64
+    ) -> Option<u64>
     where
         F: FnOnce() -> T,
         T: AsRef<[TraceField<'field>]>,
