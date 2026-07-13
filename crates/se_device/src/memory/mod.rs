@@ -7,6 +7,7 @@
 use se_core::component::{Component, ComponentId};
 use se_core::role::BusDeviceRole;
 
+pub mod ds2502;
 pub mod flash;
 
 /// Transaction accepted by a byte-addressed memory component.
