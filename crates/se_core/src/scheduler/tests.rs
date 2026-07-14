@@ -5,6 +5,34 @@ use std::collections::BinaryHeap;
 const TARGET: ComponentId = ComponentId::new(1);
 
 #[test]
+fn fractional_clock_projection_matches_iterated_cycles() {
+    for (timebase_hz, frequency_hz, initial_remainder) in [
+        (10_u64, 3_u64, 0_u64),
+        (1_000_000_000, 66_666_667, 66_666_666),
+        (4_000_000_000, 180_000_000, 17),
+        (4_000_000_000, 90_000_000, 89_999_999),
+    ] {
+        let projection =
+            FractionalClockProjection::new(timebase_hz, frequency_hz, initial_remainder);
+        let mut remainder = initial_remainder;
+        let mut elapsed = 0_u64;
+        for cycles in 0..=1_024_u64 {
+            assert_eq!(projection.elapsed(cycles), Some(SimDuration::new(elapsed)));
+            assert_eq!(
+                projection.cycles_until_elapsed_at_least(elapsed),
+                Some(if elapsed == 0 { 0 } else { cycles }),
+            );
+            let numerator = timebase_hz + remainder;
+            elapsed += numerator / frequency_hz;
+            remainder = numerator % frequency_hz;
+        }
+        let mut advanced = projection;
+        assert_eq!(advanced.advance(1_025), projection.elapsed(1_025),);
+        assert_eq!(advanced.remainder(), remainder);
+    }
+}
+
+#[test]
 fn pops_events_by_time_then_insertion_order() {
     let mut scheduler = Scheduler::new();
 
