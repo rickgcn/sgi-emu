@@ -9,7 +9,7 @@ use crate::cpu::mips4::cp0::Mips4Cp0;
 use crate::cpu::mips4::cp1::Mips4Cp1;
 use crate::cpu::mips4::gpr::Mips4GprFile;
 use crate::cpu::mips4::memory::ll_sc::Mips4LlBit;
-use crate::cpu::mips4::mmu::{Mips4Mmu, Mips4MmuAddressClassification};
+use crate::cpu::mips4::mmu::{Mips4Mmu, Mips4MmuAddressClassification, Mips4MmuConfig};
 use crate::cpu::mips4::tlb::{
     Mips4TlbAsid, Mips4TlbEntry, Mips4TlbEntryHi, Mips4TlbEntryLo, Mips4TlbPageMask,
     Mips4TlbPageSize,
@@ -167,24 +167,40 @@ impl Mips4ExecutionState {
         policy: &impl Mips4ExecutionPolicy,
         address: u64,
     ) -> &[Mips4TlbEntry] {
-        let Mips4MmuAddressClassification::Mapped { address_mode, .. } =
-            Mips4Mmu::classify_virtual_address(
-                policy.mmu_config(self.cp0.config()),
-                self.cp0.status(),
-                address,
-            )
-        else {
-            return &self.tlb_entries;
+        self.deterministic_tlb_translation_inputs(policy, address).1
+    }
+
+    pub(super) fn deterministic_tlb_translation_inputs(
+        &self,
+        policy: &impl Mips4ExecutionPolicy,
+        address: u64,
+    ) -> (Mips4MmuAddressClassification, &[Mips4TlbEntry]) {
+        self.deterministic_tlb_translation_inputs_with_config(
+            policy.mmu_config(self.cp0.config()),
+            address,
+        )
+    }
+
+    pub(super) fn deterministic_tlb_translation_inputs_with_config(
+        &self,
+        mmu_config: Mips4MmuConfig,
+        address: u64,
+    ) -> (Mips4MmuAddressClassification, &[Mips4TlbEntry]) {
+        let classification =
+            Mips4Mmu::classify_virtual_address(mmu_config, self.cp0.status(), address);
+        let Mips4MmuAddressClassification::Mapped { address_mode, .. } = classification else {
+            return (classification, &self.tlb_entries);
         };
         let asid = Mips4TlbAsid::new(self.cp0.entry_hi().address_space_identifier());
         let first = self
             .tlb_entries
             .iter()
             .position(|entry| entry.matches_virtual_address(address, asid, address_mode));
-        match first {
+        let entries = match first {
             Some(index) => &self.tlb_entries[..=index],
             None => &self.tlb_entries,
-        }
+        };
+        (classification, entries)
     }
 }
 

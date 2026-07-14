@@ -221,6 +221,50 @@ impl CrimeCmiBus {
     pub fn hard_reset(&mut self) {
         self.inner.reset();
     }
+
+    /// Returns whether a stable fetch may bypass this otherwise idle link.
+    pub fn stable_fetch_ready(&self) -> bool {
+        !self.inner.service_scheduled
+            && self.inner.queue.is_empty()
+            && self.inner.in_flight.is_none()
+            && self.inner.pending_completion.is_none()
+            && self.inner.actions.is_empty()
+    }
+
+    /// Returns the exact current fractional clock used by stable fetches.
+    pub fn stable_fetch_clock(&self) -> Option<se_core::scheduler::FractionalClockProjection> {
+        self.stable_fetch_ready()
+            .then(|| self.inner.clock.projection())
+    }
+
+    /// Plans idle request/completion cycle pairs without changing link state.
+    pub fn plan_stable_fetches(
+        &self,
+        output: &mut [se_core::scheduler::SimDuration],
+    ) -> Option<()> {
+        if !self.stable_fetch_ready() {
+            return None;
+        }
+        let mut clock = self.inner.clock;
+        for delay in output {
+            *delay = se_core::scheduler::SimDuration::new(
+                clock
+                    .next_cycle()
+                    .get()
+                    .saturating_add(clock.next_cycle().get()),
+            );
+        }
+        Some(())
+    }
+
+    /// Commits idle request/completion cycle pairs consumed by stable fetches.
+    pub fn commit_stable_fetches(&mut self, fetches: usize) {
+        assert!(self.stable_fetch_ready());
+        let _ = self
+            .inner
+            .clock
+            .advance_cycles((fetches as u64).saturating_mul(2));
+    }
 }
 
 impl Component for CrimeCmiBus {

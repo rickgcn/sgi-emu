@@ -1,6 +1,6 @@
 //! Deterministic conversion from CRIME cycles to machine time.
 
-use se_core::scheduler::SimDuration;
+use se_core::scheduler::{FractionalClockProjection, SimDuration};
 
 const CRIME_FREQUENCY_HZ: u64 = 66_666_500;
 
@@ -29,6 +29,19 @@ impl CrimeClock {
         let carry = self.remainder / CRIME_FREQUENCY_HZ;
         self.remainder %= CRIME_FREQUENCY_HZ;
         SimDuration::new(base + carry)
+    }
+
+    pub(super) fn projection(self) -> FractionalClockProjection {
+        FractionalClockProjection::new(self.timebase_hz, CRIME_FREQUENCY_HZ, self.remainder)
+    }
+
+    pub(super) fn advance_cycles(&mut self, cycles: u64) -> SimDuration {
+        let mut projection = self.projection();
+        let elapsed = projection
+            .advance(cycles)
+            .expect("a CRIME clock advance must fit simulated time");
+        self.remainder = projection.remainder();
+        elapsed
     }
 }
 

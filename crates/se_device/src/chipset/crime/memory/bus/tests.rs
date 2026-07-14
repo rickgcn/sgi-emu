@@ -1,6 +1,22 @@
 use se_core::role::BusRole;
 
 use super::*;
+
+#[test]
+fn closed_form_cpu_slot_advance_matches_iterated_arbitration() {
+    for slot in 0..64_u8 {
+        for fetches in 0..=129_usize {
+            let mut expected = slot;
+            for _ in 0..fetches {
+                while slot_client(expected) != Some(CrimeMemoryClient::Cpu) {
+                    expected = expected.wrapping_add(1) & 63;
+                }
+                expected = expected.wrapping_add(1) & 63;
+            }
+            assert_eq!(advance_cpu_slots(slot, fetches), expected);
+        }
+    }
+}
 use crate::chipset::crime::protocol::{
     CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryInhibitReason, CrimeMemoryOutcome,
     CrimeTransactionId, CrimeTransfer,

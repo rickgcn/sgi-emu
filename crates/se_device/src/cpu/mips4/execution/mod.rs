@@ -5,6 +5,7 @@
 //! reset, exception-vector, and cache-coherence policy is supplied separately.
 
 pub mod access;
+pub mod block;
 pub mod bus;
 mod cp0;
 mod fpu;

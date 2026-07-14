@@ -10,6 +10,7 @@ use crate::cpu::mips4::mmu::Mips4MmuPrivilegeMode;
 use crate::cpu::mips4::tlb::{Mips4TlbAddressMode, Mips4TlbAsid, Mips4TlbEntry, Mips4TlbEntryHi};
 
 use super::access::{Mips4InstructionAccess, check_architecture_level};
+use super::block::Mips4Cp0RuntimeOperation;
 use super::policy::{
     Mips4Cp0DoublewordTransferDirection, Mips4Cp0DoublewordTransferPolicy, Mips4Cp0WaitPolicy,
     Mips4ExecutionPolicy,
@@ -38,10 +39,57 @@ pub(super) enum Mips4Cp0Execution {
     Exception(Mips4Exception),
 }
 
-pub(super) fn execute_cp0(
+#[cfg(test)]
+fn execute_cp0(
     state: &mut Mips4ExecutionState,
     policy: &impl Mips4ExecutionPolicy,
     instruction: Mips4Instruction,
+) -> Mips4Cp0Execution {
+    execute_decoded_cp0(
+        state,
+        policy,
+        instruction,
+        decode_cp0_operation(instruction),
+    )
+}
+
+pub(super) const fn decode_cp0_operation(
+    instruction: Mips4Instruction,
+) -> Mips4Cp0RuntimeOperation {
+    if instruction.opcode() != COP0_OPCODE {
+        return Mips4Cp0RuntimeOperation::Reserved;
+    }
+    match instruction.rs() {
+        COP0_MFC0 | COP0_DMFC0 => Mips4Cp0RuntimeOperation::TransferFrom {
+            doubleword: instruction.rs() == COP0_DMFC0,
+            target: instruction.rt(),
+            register: Mips4Cp0Register::from_u8(instruction.rd()),
+            encoding_valid: instruction.bits() & 0x7ff == 0,
+        },
+        COP0_MTC0 | COP0_DMTC0 => Mips4Cp0RuntimeOperation::TransferTo {
+            doubleword: instruction.rs() == COP0_DMTC0,
+            source: instruction.rt(),
+            register: Mips4Cp0Register::from_u8(instruction.rd()),
+            encoding_valid: instruction.bits() & 0x7ff == 0,
+        },
+        COP0_CO if instruction.bits() & 0x03ff_ffc0 == 0x0200_0000 => match instruction.funct() {
+            COP0_TLBR => Mips4Cp0RuntimeOperation::TlbRead,
+            COP0_TLBWI => Mips4Cp0RuntimeOperation::TlbWriteIndexed,
+            COP0_TLBWR => Mips4Cp0RuntimeOperation::TlbWriteRandom,
+            COP0_TLBP => Mips4Cp0RuntimeOperation::TlbProbe,
+            COP0_ERET => Mips4Cp0RuntimeOperation::Eret,
+            COP0_WAIT => Mips4Cp0RuntimeOperation::Wait,
+            _ => Mips4Cp0RuntimeOperation::Reserved,
+        },
+        _ => Mips4Cp0RuntimeOperation::Reserved,
+    }
+}
+
+pub(super) fn execute_decoded_cp0(
+    state: &mut Mips4ExecutionState,
+    policy: &impl Mips4ExecutionPolicy,
+    instruction: Mips4Instruction,
+    operation: Mips4Cp0RuntimeOperation,
 ) -> Mips4Cp0Execution {
     if let Err(exception) = check_cp0_access(state.cp0.status()) {
         return Mips4Cp0Execution::Exception(exception);
@@ -51,19 +99,40 @@ pub(super) fn execute_cp0(
     {
         return Mips4Cp0Execution::Exception(exception);
     }
-    if instruction.opcode() != COP0_OPCODE {
-        return Mips4Cp0Execution::Exception(Mips4Exception::ReservedInstruction);
-    }
-
-    match instruction.rs() {
-        COP0_MFC0 => transfer_from(state, policy, instruction, false),
-        COP0_DMFC0 => transfer_from(state, policy, instruction, true),
-        COP0_MTC0 => transfer_to(state, policy, instruction, false),
-        COP0_DMTC0 => transfer_to(state, policy, instruction, true),
-        COP0_CO if instruction.bits() & 0x03ff_ffc0 == 0x0200_0000 => {
-            execute_co_function(state, policy, instruction.funct())
+    match operation {
+        Mips4Cp0RuntimeOperation::TransferFrom {
+            doubleword,
+            target,
+            register,
+            encoding_valid,
+        } => transfer_from(state, policy, doubleword, target, register, encoding_valid),
+        Mips4Cp0RuntimeOperation::TransferTo {
+            doubleword,
+            source,
+            register,
+            encoding_valid,
+        } => transfer_to(state, policy, doubleword, source, register, encoding_valid),
+        Mips4Cp0RuntimeOperation::TlbRead => {
+            execute_co_operation(state, policy, Mips4Cp0RuntimeOperation::TlbRead)
         }
-        _ => Mips4Cp0Execution::Exception(Mips4Exception::ReservedInstruction),
+        Mips4Cp0RuntimeOperation::TlbWriteIndexed => {
+            execute_co_operation(state, policy, Mips4Cp0RuntimeOperation::TlbWriteIndexed)
+        }
+        Mips4Cp0RuntimeOperation::TlbWriteRandom => {
+            execute_co_operation(state, policy, Mips4Cp0RuntimeOperation::TlbWriteRandom)
+        }
+        Mips4Cp0RuntimeOperation::TlbProbe => {
+            execute_co_operation(state, policy, Mips4Cp0RuntimeOperation::TlbProbe)
+        }
+        Mips4Cp0RuntimeOperation::Eret => {
+            execute_co_operation(state, policy, Mips4Cp0RuntimeOperation::Eret)
+        }
+        Mips4Cp0RuntimeOperation::Wait => {
+            execute_co_operation(state, policy, Mips4Cp0RuntimeOperation::Wait)
+        }
+        Mips4Cp0RuntimeOperation::Reserved => {
+            Mips4Cp0Execution::Exception(Mips4Exception::ReservedInstruction)
+        }
     }
 }
 
@@ -84,13 +153,15 @@ pub(super) fn check_cp0_access(status: Mips4Cp0Status) -> Result<(), Mips4Except
 fn transfer_from(
     state: &mut Mips4ExecutionState,
     policy: &impl Mips4ExecutionPolicy,
-    instruction: Mips4Instruction,
     doubleword: bool,
+    target: u8,
+    register: Option<Mips4Cp0Register>,
+    encoding_valid: bool,
 ) -> Mips4Cp0Execution {
-    if instruction.bits() & 0x7ff != 0 {
+    if !encoding_valid {
         return Mips4Cp0Execution::Exception(Mips4Exception::ReservedInstruction);
     }
-    let Some(register) = Mips4Cp0Register::from_u8(instruction.rd()) else {
+    let Some(register) = register else {
         return Mips4Cp0Execution::Exception(Mips4Exception::ReservedInstruction);
     };
     if doubleword {
@@ -114,20 +185,22 @@ fn transfer_from(
     } else {
         sign_extend_word(raw as u32)
     };
-    write_gpr(state, instruction.rt(), value);
+    write_gpr(state, target, value);
     Mips4Cp0Execution::Retire
 }
 
 fn transfer_to(
     state: &mut Mips4ExecutionState,
     policy: &impl Mips4ExecutionPolicy,
-    instruction: Mips4Instruction,
     doubleword: bool,
+    source: u8,
+    register: Option<Mips4Cp0Register>,
+    encoding_valid: bool,
 ) -> Mips4Cp0Execution {
-    if instruction.bits() & 0x7ff != 0 {
+    if !encoding_valid {
         return Mips4Cp0Execution::Exception(Mips4Exception::ReservedInstruction);
     }
-    let Some(register) = Mips4Cp0Register::from_u8(instruction.rd()) else {
+    let Some(register) = register else {
         return Mips4Cp0Execution::Exception(Mips4Exception::ReservedInstruction);
     };
     if doubleword {
@@ -145,7 +218,7 @@ fn transfer_to(
             }
         }
     }
-    let value = read_gpr(state, instruction.rt());
+    let value = read_gpr(state, source);
     let requested = if doubleword {
         value
     } else {
@@ -156,33 +229,33 @@ fn transfer_to(
     Mips4Cp0Execution::Retire
 }
 
-fn execute_co_function(
+fn execute_co_operation(
     state: &mut Mips4ExecutionState,
     policy: &impl Mips4ExecutionPolicy,
-    function: u8,
+    operation: Mips4Cp0RuntimeOperation,
 ) -> Mips4Cp0Execution {
-    match function {
-        COP0_TLBR => {
+    match operation {
+        Mips4Cp0RuntimeOperation::TlbRead => {
             read_tlb_entry(state);
             Mips4Cp0Execution::Retire
         }
-        COP0_TLBWI => {
+        Mips4Cp0RuntimeOperation::TlbWriteIndexed => {
             write_tlb_entry(state, state.cp0.index().index() as usize);
             Mips4Cp0Execution::Retire
         }
-        COP0_TLBWR => {
+        Mips4Cp0RuntimeOperation::TlbWriteRandom => {
             write_tlb_entry(state, state.cp0.random().index() as usize);
             Mips4Cp0Execution::Retire
         }
-        COP0_TLBP => {
+        Mips4Cp0RuntimeOperation::TlbProbe => {
             probe_tlb(state);
             Mips4Cp0Execution::Retire
         }
-        COP0_ERET => {
+        Mips4Cp0RuntimeOperation::Eret => {
             state.llbit = Mips4LlBit::Clear;
             Mips4Cp0Execution::SetPc(state.cp0.return_from_exception())
         }
-        COP0_WAIT => match policy.cp0_wait_policy() {
+        Mips4Cp0RuntimeOperation::Wait => match policy.cp0_wait_policy() {
             Mips4Cp0WaitPolicy::ReservedInstruction => {
                 Mips4Cp0Execution::Exception(Mips4Exception::ReservedInstruction)
             }

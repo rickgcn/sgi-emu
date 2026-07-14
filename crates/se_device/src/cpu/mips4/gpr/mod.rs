@@ -67,6 +67,10 @@ impl Mips4GprFile {
         }
     }
 
+    pub(crate) fn write_through_context(&mut self) -> *mut u64 {
+        self.registers.as_mut_ptr()
+    }
+
     /// Writes a sign-extended 32-bit word to a general-purpose register.
     pub fn write_sign_extended_word(&mut self, index: Mips4GprIndex, value: u32) {
         self.write(index, sign_extend_word(value));

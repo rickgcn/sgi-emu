@@ -57,6 +57,75 @@ where
         &mut self.target
     }
 
+    /// Returns whether no transaction or completed target action is pending.
+    pub const fn ready_for_direct_execution(&self) -> bool {
+        matches!(self.state, FunctionalExecutorState::Ready)
+            && matches!(
+                self.queued_action,
+                None | Some(ExecutionTargetAction::Continue)
+            )
+    }
+
+    /// Consumes a queued internal continuation at a dispatcher-safe point.
+    pub fn consume_ready_continuation(&mut self) -> bool {
+        if !matches!(self.state, FunctionalExecutorState::Ready)
+            || !matches!(self.queued_action, Some(ExecutionTargetAction::Continue))
+        {
+            return false;
+        }
+        self.queued_action = None;
+        true
+    }
+
+    /// Publishes a target action produced by an ISA-specific accelerated path.
+    ///
+    /// Callers must first observe [`Self::ready_for_direct_execution`]. Transaction
+    /// identifiers continue to be allocated exclusively by this executor.
+    pub fn publish_ready_action(
+        &mut self,
+        action: ExecutionTargetAction<T::Transaction, T::Boundary>,
+    ) -> FunctionalExecutorPoll<T> {
+        if !self.ready_for_direct_execution() {
+            return Err(FunctionalExecutorError::Failed);
+        }
+        self.publish(action)
+    }
+
+    /// Publishes one accelerated transaction without an intermediate action enum.
+    pub fn publish_ready_transaction(
+        &mut self,
+        payload: T::Transaction,
+    ) -> Result<ExecutionTransaction<T::Transaction>, FunctionalExecutorError<T::Error>> {
+        if !self.ready_for_direct_execution() {
+            return Err(FunctionalExecutorError::Failed);
+        }
+        let id = self.allocate_transaction_id()?;
+        self.state = FunctionalExecutorState::Waiting { transaction_id: id };
+        Ok(ExecutionTransaction { id, payload })
+    }
+
+    /// Accounts for side-effect-free transactions elided by an accelerated path.
+    ///
+    /// The identifiers are consumed in architectural transaction order without
+    /// publishing work to the external protocol.
+    pub fn account_ready_transactions(
+        &mut self,
+        transactions: u64,
+    ) -> Result<(), FunctionalExecutorError<T::Error>> {
+        if !self.ready_for_direct_execution() {
+            return Err(FunctionalExecutorError::Failed);
+        }
+        let Some(next_transaction_id) = self
+            .next_transaction_id
+            .checked_add(u128::from(transactions))
+        else {
+            self.state = FunctionalExecutorState::Failed;
+            return Err(FunctionalExecutorError::TransactionIdOverflow);
+        };
+        self.next_transaction_id = next_transaction_id;
+        Ok(())
+    }
+
     /// Consumes the executor and returns its execution target.
     pub fn into_target(self) -> T {
         self.target
@@ -90,15 +159,20 @@ where
             FunctionalExecutorState::Ready => {}
         }
 
-        let action = match self.queued_action.take() {
-            Some(action) => action,
-            None => self.target.begin().map_err(|error| {
-                self.state = FunctionalExecutorState::Failed;
-                FunctionalExecutorError::Target(error)
-            })?,
-        };
-
-        self.publish(action)
+        loop {
+            let action = match self.queued_action.take() {
+                Some(action) => action,
+                None => self.target.begin().map_err(|error| {
+                    self.state = FunctionalExecutorState::Failed;
+                    FunctionalExecutorError::Target(error)
+                })?,
+            };
+            if matches!(action, ExecutionTargetAction::Continue) {
+                self.state = FunctionalExecutorState::Ready;
+                continue;
+            }
+            return self.publish(action);
+        }
     }
 
     /// Delivers a correlated external completion to the execution target.
@@ -142,6 +216,10 @@ where
         action: ExecutionTargetAction<T::Transaction, T::Boundary>,
     ) -> FunctionalExecutorPoll<T> {
         match action {
+            ExecutionTargetAction::Continue => {
+                self.state = FunctionalExecutorState::Ready;
+                self.poll()
+            }
             ExecutionTargetAction::Transaction(payload) => {
                 let id = self.allocate_transaction_id()?;
                 self.state = FunctionalExecutorState::Waiting { transaction_id: id };

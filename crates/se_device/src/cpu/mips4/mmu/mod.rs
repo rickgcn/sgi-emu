@@ -306,6 +306,58 @@ pub enum Mips4MmuTranslationResult {
 pub struct Mips4Mmu;
 
 impl Mips4Mmu {
+    pub(crate) const fn direct_mapped_translation(
+        config: Mips4MmuConfig,
+        status: Mips4Cp0Status,
+        address: u64,
+    ) -> Option<Mips4MmuTranslation> {
+        if !matches!(
+            Mips4MmuPrivilegeMode::from_status(status),
+            Some(Mips4MmuPrivilegeMode::Kernel)
+        ) {
+            return None;
+        }
+        if status.error_level() && address <= USEG_END {
+            return Some(Mips4MmuTranslation {
+                physical_address: address,
+                segment: if status.user_64_bit_addressing() {
+                    Mips4MmuSegment::Xkuseg
+                } else {
+                    Mips4MmuSegment::Kuseg
+                },
+                source: Mips4MmuTranslationSource::Unmapped,
+                cache_attribute: Mips4MmuCacheAttribute::Uncached,
+            });
+        }
+        if in_range(address, KSEG0_START, KSEG0_END) {
+            return Some(Mips4MmuTranslation {
+                physical_address: address.wrapping_sub(KSEG0_START),
+                segment: if status.kernel_64_bit_addressing() {
+                    Mips4MmuSegment::Ckseg0
+                } else {
+                    Mips4MmuSegment::Kseg0
+                },
+                source: Mips4MmuTranslationSource::Unmapped,
+                cache_attribute: Mips4MmuCacheAttribute::CacheCoherenceAlgorithm(
+                    config.kseg0_cache_coherence_algorithm,
+                ),
+            });
+        }
+        if in_range(address, KSEG1_START, KSEG1_END) {
+            return Some(Mips4MmuTranslation {
+                physical_address: address.wrapping_sub(KSEG1_START),
+                segment: if status.kernel_64_bit_addressing() {
+                    Mips4MmuSegment::Ckseg1
+                } else {
+                    Mips4MmuSegment::Kseg1
+                },
+                source: Mips4MmuTranslationSource::Unmapped,
+                cache_attribute: Mips4MmuCacheAttribute::Uncached,
+            });
+        }
+        None
+    }
+
     /// Classifies a virtual address for the supplied CP0 `Status` value.
     pub const fn classify_virtual_address(
         config: Mips4MmuConfig,
@@ -344,7 +396,25 @@ impl Mips4Mmu {
         address: u64,
         access_kind: Mips4TlbAccessKind,
     ) -> Mips4MmuTranslationResult {
-        match Self::classify_virtual_address(config, status, address) {
+        Self::translate_classified(
+            config,
+            Self::classify_virtual_address(config, status, address),
+            asid,
+            tlb_entries,
+            address,
+            access_kind,
+        )
+    }
+
+    pub(crate) fn translate_classified(
+        config: Mips4MmuConfig,
+        classification: Mips4MmuAddressClassification,
+        asid: Mips4TlbAsid,
+        tlb_entries: &[Mips4TlbEntry],
+        address: u64,
+        access_kind: Mips4TlbAccessKind,
+    ) -> Mips4MmuTranslationResult {
+        match classification {
             Mips4MmuAddressClassification::Mapped {
                 segment,
                 address_mode,

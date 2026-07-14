@@ -150,6 +150,65 @@ impl CrimeSdram {
         self.bank_control.get(bank).copied()
     }
 
+    /// Reads a side-effect-free code window and fingerprints its data, ECC,
+    /// and programmable mapping state.
+    pub fn stable_code_window(
+        &self,
+        address: u64,
+        length: usize,
+        no_ecc: bool,
+    ) -> Option<(Vec<u8>, u64)> {
+        if length == 0 || length > 128 {
+            return None;
+        }
+        let _ = address.checked_add(length as u64)?;
+        let mut output = Vec::with_capacity(length);
+        let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+        let mut position = 0;
+        while position < length {
+            let current = address + position as u64;
+            let selection = self.decode(current)?;
+            let (data, check, mapping) = match selection {
+                BankSelection::Populated {
+                    index: bank,
+                    offset,
+                } => {
+                    let (data, check) = self.banks[bank]
+                        .as_ref()
+                        .expect("decoded bank exists")
+                        .read_lane(offset & !7);
+                    if self.ecc_enabled
+                        && !no_ecc
+                        && !matches!(ecc::check(data, check), ecc::EccCheck::Clean { .. })
+                    {
+                        return None;
+                    }
+                    (
+                        data,
+                        check,
+                        (u64::from(self.bank_control[bank]) << 8) | bank as u64,
+                    )
+                }
+                BankSelection::Unpopulated => (0, 0, u64::MAX),
+            };
+            for byte in data.to_le_bytes() {
+                fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            fingerprint = (fingerprint ^ u64::from(check)).wrapping_mul(0x0000_0100_0000_01b3);
+            fingerprint = (fingerprint ^ mapping).wrapping_mul(0x0000_0100_0000_01b3);
+            let bytes = data.to_le_bytes();
+            let in_lane = current as usize & 7;
+            let count = (8 - in_lane).min(length - position);
+            output.extend_from_slice(&bytes[in_lane..in_lane + count]);
+            position += count;
+        }
+        fingerprint ^= u64::from(self.ecc_enabled)
+            | (u64::from(self.use_replacement) << 1)
+            | (u64::from(self.replacement) << 8)
+            | (u64::from(no_ecc) << 16);
+        Some((output, fingerprint))
+    }
+
     /// Injects a data-bit fault without updating ECC.
     pub fn inject_data_bit(&mut self, address: u64, bit: u8) -> Result<(), CrimeBusError> {
         if bit >= 64 {

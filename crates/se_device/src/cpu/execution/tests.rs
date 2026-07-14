@@ -18,6 +18,7 @@ impl ExecutionBoundary for TestBoundary {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum TestAction {
+    Continue,
     Transaction(u32),
     Boundary(u32),
     Idle,
@@ -52,6 +53,7 @@ impl TestTarget {
 
     fn next_action(&mut self) -> Result<ExecutionTargetAction<u32, TestBoundary>, TestError> {
         match self.actions.pop_front().unwrap() {
+            TestAction::Continue => Ok(ExecutionTargetAction::Continue),
             TestAction::Transaction(value) => Ok(ExecutionTargetAction::Transaction(value)),
             TestAction::Boundary(value) => Ok(ExecutionTargetAction::Boundary(
                 TestBoundary::Retired(value),
@@ -101,6 +103,30 @@ fn immediate_boundary_leaves_executor_ready() {
         Ok(ExecutionAction::Boundary(TestBoundary::Retired(7)))
     );
     assert_eq!(executor.state(), FunctionalExecutorState::Ready);
+}
+
+#[test]
+fn internal_continuation_does_not_publish_a_boundary() {
+    let mut executor = FunctionalExecutor::new(TestTarget::new([
+        TestAction::Continue,
+        TestAction::Boundary(7),
+    ]));
+
+    assert_eq!(
+        executor.poll(),
+        Ok(ExecutionAction::Boundary(TestBoundary::Retired(7)))
+    );
+}
+
+#[test]
+fn elided_transactions_preserve_identifier_order() {
+    let mut executor = FunctionalExecutor::new(TestTarget::new([TestAction::Transaction(9)]));
+    executor.account_ready_transactions(3).unwrap();
+
+    let ExecutionAction::Transaction(transaction) = executor.poll().unwrap() else {
+        panic!("expected transaction");
+    };
+    assert_eq!(transaction.id, ExecutionTransactionId::new(3));
 }
 
 #[test]

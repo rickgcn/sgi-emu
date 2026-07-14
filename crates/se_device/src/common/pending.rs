@@ -119,6 +119,10 @@ where
         self.0.clear();
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     #[cfg(test)]
     pub(crate) fn spilled(&self) -> bool {
         self.0.spilled()
@@ -226,6 +230,10 @@ where
 
     pub(crate) fn clear(&mut self) {
         self.0.clear();
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     #[cfg(test)]

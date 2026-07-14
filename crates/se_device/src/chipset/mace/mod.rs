@@ -210,6 +210,38 @@ impl Mace {
         self.now = now;
     }
 
+    /// Returns whether an idle stable PROM fetch can bypass MACE.
+    pub fn stable_prom_fetch_ready(&self) -> bool {
+        self.pending_isa.is_empty()
+            && self.pending_pci.is_empty()
+            && self.pending_cmi.is_empty()
+            && self.actions.is_empty()
+            && self.terminal_error.is_none()
+    }
+
+    /// Accounts for bypassed stable PROM requests at the last CMI delivery time.
+    pub fn account_stable_prom_fetches(
+        &mut self,
+        fetches: usize,
+        last_delivery_time: SimTime,
+    ) -> bool {
+        if fetches == 0 {
+            return true;
+        }
+        if !self.stable_prom_fetch_ready() {
+            return false;
+        }
+        let Ok(fetches) = u128::try_from(fetches) else {
+            return false;
+        };
+        let Some(next_transaction_id) = self.next_transaction_id.checked_add(fetches) else {
+            return false;
+        };
+        self.next_transaction_id = next_transaction_id;
+        self.now = last_delivery_time;
+        true
+    }
+
     /// Updates the coarse trace interest supplied by the machine runtime.
     pub fn set_trace_interest(&mut self, interest: TraceInterest) {
         self.trace_interest = interest;

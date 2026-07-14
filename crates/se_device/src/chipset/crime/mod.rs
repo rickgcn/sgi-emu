@@ -253,6 +253,37 @@ impl Crime {
         self.current_time = now;
     }
 
+    /// Returns whether an idle stable PROM fetch can bypass CRIME.
+    pub fn stable_cpu_fetch_ready(&self) -> bool {
+        self.pending_sysad.is_none()
+            && self.pending_memory.is_empty()
+            && self.pending_cmi.is_empty()
+            && self.pending_cgi.is_empty()
+            && self.actions.is_empty()
+            && self.terminal_error.is_none()
+    }
+
+    /// Accounts for bypassed stable CPU requests at the last SysAD delivery time.
+    pub fn account_stable_cpu_fetches(
+        &mut self,
+        fetches: usize,
+        last_delivery_time: SimTime,
+    ) -> Result<bool, CrimeError> {
+        if fetches == 0 {
+            return Ok(true);
+        }
+        if !self.stable_cpu_fetch_ready() {
+            return Ok(false);
+        }
+        let fetches = u128::try_from(fetches).map_err(|_| CrimeError::TransactionIdOverflow)?;
+        self.next_transaction_id = self
+            .next_transaction_id
+            .checked_add(fetches)
+            .ok_or(CrimeError::TransactionIdOverflow)?;
+        self.current_time = last_delivery_time;
+        Ok(true)
+    }
+
     /// Updates the coarse trace interest supplied by the machine runtime.
     pub fn set_trace_interest(&mut self, interest: TraceInterest) {
         self.trace_interest = interest;

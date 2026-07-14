@@ -257,12 +257,12 @@ impl Mips4CacheLine {
     }
 
     pub(crate) fn check_errors(self, physical_address: u64, bytes: usize) -> (bool, bool) {
-        let expected = data_check_bits(&self.data);
         let offset = (physical_address - self.physical_line_base) as usize;
         let first_doubleword = offset / 8;
         let last_doubleword = (offset + bytes - 1) / 8;
-        let data_error = (first_doubleword..=last_doubleword)
-            .any(|doubleword| self.check_bits[doubleword] != expected[doubleword]);
+        let data_error = (first_doubleword..=last_doubleword).any(|doubleword| {
+            self.check_bits[doubleword] != data_check_bits_for_doubleword(&self.data, doubleword)
+        });
         let tag_error = self.tag_check_bit != tag_check_bit(self.physical_line_base);
         (data_error, tag_error)
     }
@@ -348,6 +348,14 @@ pub(crate) struct Mips4CacheHierarchy {
     secondary: Option<Mips4SecondaryCache>,
 }
 
+/// Located primary instruction-cache line returned by a side-effect-free lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Mips4InstructionCacheHit {
+    pub(crate) set: usize,
+    pub(crate) way: usize,
+    pub(crate) line: Mips4CacheLine,
+}
+
 impl Mips4CacheHierarchy {
     pub(crate) fn new(config: Mips4CacheHierarchyConfig) -> Result<Self, Mips4CacheConfigError> {
         Ok(Self {
@@ -365,9 +373,22 @@ impl Mips4CacheHierarchy {
         virtual_address: u64,
         physical_address: u64,
     ) -> Option<Mips4CacheLine> {
+        self.instruction_lookup_with_location(virtual_address, physical_address)
+            .map(|hit| hit.line)
+    }
+
+    pub(crate) fn instruction_lookup_with_location(
+        &self,
+        virtual_address: u64,
+        physical_address: u64,
+    ) -> Option<Mips4InstructionCacheHit> {
         let cache = self.instruction.as_ref()?;
         let (set, way) = cache.lookup(virtual_address, physical_address)?;
-        Some(cache.sets[set][way])
+        Some(Mips4InstructionCacheHit {
+            set,
+            way,
+            line: cache.sets[set][way],
+        })
     }
 
     pub(crate) fn data_lookup(
@@ -470,6 +491,33 @@ impl Mips4CacheHierarchy {
         Some(cache.sets[set][way])
     }
 
+    pub(crate) fn primary_index_location(
+        &self,
+        instruction: bool,
+        virtual_address: u64,
+    ) -> Option<(usize, usize)> {
+        let cache = if instruction {
+            self.instruction.as_ref()?
+        } else {
+            self.data.as_ref()?
+        };
+        Some(cache.index_location(virtual_address))
+    }
+
+    pub(crate) fn primary_hit_location(
+        &self,
+        instruction: bool,
+        virtual_address: u64,
+        physical_address: u64,
+    ) -> Option<(usize, usize)> {
+        let cache = if instruction {
+            self.instruction.as_ref()?
+        } else {
+            self.data.as_ref()?
+        };
+        cache.lookup(virtual_address, physical_address)
+    }
+
     pub(crate) fn primary_index_line_mut(
         &mut self,
         instruction: bool,
@@ -543,16 +591,23 @@ pub(crate) const fn line_base(address: u64) -> u64 {
 
 fn data_check_bits(data: &[u8; MIPS4_FUNCTIONAL_CACHE_LINE_BYTES]) -> [u8; 4] {
     let mut result = [0; 4];
-    for doubleword in 0..4 {
-        let mut bits = 0;
-        for byte in 0..8 {
-            if !data[doubleword * 8 + byte].count_ones().is_multiple_of(2) {
-                bits |= 1 << byte;
-            }
-        }
-        result[doubleword] = bits;
+    for (doubleword, check_bits) in result.iter_mut().enumerate() {
+        *check_bits = data_check_bits_for_doubleword(data, doubleword);
     }
     result
+}
+
+fn data_check_bits_for_doubleword(
+    data: &[u8; MIPS4_FUNCTIONAL_CACHE_LINE_BYTES],
+    doubleword: usize,
+) -> u8 {
+    let mut bits = 0;
+    for byte in 0..8 {
+        if !data[doubleword * 8 + byte].count_ones().is_multiple_of(2) {
+            bits |= 1 << byte;
+        }
+    }
+    bits
 }
 
 fn tag_check_bit(physical_line_base: u64) -> bool {

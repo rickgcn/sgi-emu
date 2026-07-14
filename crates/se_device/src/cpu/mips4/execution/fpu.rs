@@ -14,7 +14,7 @@ use crate::cpu::mips4::cp1::decode::{
     Mips4Cp1BranchOperation, Mips4Cp1CompareCondition, Mips4Cp1Decode,
     Mips4Cp1IndexedMemoryOperation, Mips4Cp1InstructionClass, Mips4Cp1MovciOperation,
     Mips4Cp1OffsetMemoryOperation, Mips4Cp1OperandFormatStatus, Mips4Cp1Operation,
-    Mips4Cp1RegisterTransferOperation, decode_instruction,
+    Mips4Cp1RegisterTransferOperation,
 };
 use crate::cpu::mips4::cp1::operation::{
     Mips4Cp1IndexedMemoryAccess, Mips4Cp1IndexedPrefetch, Mips4Cp1OffsetMemoryAccess,
@@ -72,11 +72,9 @@ pub(super) fn execute_fpu<F: FloatBackend>(
     backend: &F,
     policy: &impl Mips4ExecutionPolicy,
     raw: Mips4Instruction,
+    decoded: Mips4Cp1Decode,
     endianness: Mips4Endianness,
 ) -> Result<Mips4FpuExecution, Mips4MemoryAccessError> {
-    let Some(decoded) = decode_instruction(raw) else {
-        return Ok(unimplemented(state));
-    };
     let access = check_fpu_access(
         state.cp0.status(),
         state.config.coprocessors.cp1,

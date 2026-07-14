@@ -10,6 +10,32 @@ use crate::cpu::mips4::model::r5000::revision::R5000Revision;
 
 use super::*;
 
+struct InterpreterOnlyBackend;
+
+impl Mips4CodegenBackend for InterpreterOnlyBackend {
+    type CompiledBlock = ();
+    type Error = core::convert::Infallible;
+
+    fn compile(
+        &mut self,
+        _block: &crate::cpu::mips4::execution::block::Mips4Block,
+    ) -> Result<Self::CompiledBlock, Self::Error> {
+        Ok(())
+    }
+
+    fn execute(
+        &mut self,
+        _compiled: &Self::CompiledBlock,
+        _frame: &mut Mips4BlockFrame,
+    ) -> Result<Mips4BlockExit, Self::Error> {
+        unreachable!("the test never reaches the native compilation threshold")
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 fn profile() -> R5000Profile {
     R5000Profile::new(
         Mips4Endianness::Big,
@@ -115,6 +141,66 @@ fn decode_cache_keys_include_raw_bits_and_do_not_skip_uncached_fetches() {
         1
     );
     assert_eq!(cpu.statistics().transactions, 2);
+}
+
+#[test]
+fn protocol_boundary_refreshes_the_reusable_block_frame() {
+    let mut cpu = cpu();
+    let mut engine = Mips4BlockEngine::new(InterpreterOnlyBackend);
+    let mut bus = FakeBus {
+        ram: FakeRam::new(),
+    };
+    bus.ram.load_word_be(0x1fc0_0000, 0x3c01_a000);
+    bus.ram.load_word_be(0x1fc0_0004, 0x8c28_0000);
+    bus.ram.load_word_be(0, 0x1234_5678);
+
+    let R5000ExecutionSliceAction::Transaction(fetch) =
+        cpu.run_slice(&mut engine, 1).unwrap().action
+    else {
+        panic!("expected first instruction fetch");
+    };
+    BusControllerRole::complete(&mut cpu, bus.route(fetch));
+    let first = cpu.run_slice(&mut engine, 1).unwrap();
+    assert_eq!(first.retired_instructions, 1);
+
+    let R5000ExecutionSliceAction::Transaction(fetch) =
+        cpu.run_slice(&mut engine, 1).unwrap().action
+    else {
+        panic!("expected second instruction fetch");
+    };
+    BusControllerRole::complete(&mut cpu, bus.route(fetch));
+    let R5000ExecutionSliceAction::Transaction(load) =
+        cpu.run_slice(&mut engine, 1).unwrap().action
+    else {
+        panic!("expected data load");
+    };
+    assert!(cpu.reusable_block_frame.0.is_some());
+    BusControllerRole::complete(&mut cpu, bus.route(load));
+
+    let completed = cpu.run_slice(&mut engine, 1).unwrap();
+
+    assert_eq!(completed.retired_instructions, 1);
+    let frame = cpu.reusable_block_frame.0.as_ref().unwrap();
+    assert_eq!(frame.pc(), cpu.state().pc());
+    assert_eq!(frame.next_pc(), cpu.state().next_pc());
+    assert_eq!(frame.read_gpr(8), 0x1234_5678);
+}
+
+#[test]
+fn component_state_drops_the_reusable_block_frame() {
+    let mut cpu = R5000Cpu::new(
+        ComponentId::new(7),
+        "cpu0",
+        profile(),
+        R5000BootMode::from_low_bits(0).unwrap(),
+    )
+    .unwrap();
+    cpu.reusable_block_frame.0 = Some(cpu.executor.target().block_frame(1));
+
+    let state = cpu.save_state();
+    assert!(state.0.reusable_block_frame.0.is_none());
+    cpu.restore_state(state).unwrap();
+    assert!(cpu.reusable_block_frame.0.is_none());
 }
 
 #[test]

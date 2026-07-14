@@ -444,6 +444,21 @@ impl IsaBus {
     pub const fn next_service_event(&self) -> IsaBusEvent {
         IsaBusEvent::Service { epoch: self.epoch }
     }
+
+    /// Returns whether a stable fetch may bypass this otherwise idle bus.
+    pub fn stable_fetch_ready(&self) -> bool {
+        !self.service_scheduled
+            && self.queue.is_empty()
+            && self.in_flight.is_none()
+            && self.completion.is_none()
+            && self.actions.is_empty()
+    }
+
+    /// Returns the fixed service-and-completion delay of one idle transaction.
+    pub fn stable_fetch_delay(&self) -> Option<SimDuration> {
+        self.stable_fetch_ready()
+            .then(|| SimDuration::new(self.cycle.get().saturating_mul(2)))
+    }
 }
 
 impl Component for IsaBus {

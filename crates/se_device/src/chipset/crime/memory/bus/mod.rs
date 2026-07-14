@@ -112,6 +112,51 @@ impl CrimeMemoryBus {
         self.reset_state(now);
     }
 
+    /// Returns whether a stable CPU fetch may bypass this otherwise idle bus.
+    pub fn stable_fetch_ready(&self) -> bool {
+        !self.service_scheduled
+            && !self.has_pending()
+            && self.in_flight.is_none()
+            && self.pending_completion.is_none()
+            && self.actions.is_empty()
+    }
+
+    /// Returns the exact current fractional clock used by stable fetches.
+    pub fn stable_fetch_clock(&self) -> Option<se_core::scheduler::FractionalClockProjection> {
+        self.stable_fetch_ready().then(|| self.clock.projection())
+    }
+
+    /// Returns the next lazy refresh boundary for stable fetch planning.
+    pub fn stable_fetch_refresh_deadline(&self) -> Option<SimTime> {
+        (self.refresh_delay != SimDuration::ZERO).then_some(self.next_refresh_time)
+    }
+
+    /// Plans idle request/completion cycle pairs without changing bus state.
+    pub fn plan_stable_fetches(&self, output: &mut [SimDuration]) -> Option<()> {
+        if !self.stable_fetch_ready() {
+            return None;
+        }
+        let mut clock = self.clock;
+        for delay in output {
+            *delay = SimDuration::new(
+                clock
+                    .next_cycle()
+                    .get()
+                    .saturating_add(clock.next_cycle().get()),
+            );
+        }
+        Some(())
+    }
+
+    /// Commits idle CPU request/completion cycles consumed by stable fetches.
+    pub fn commit_stable_fetches(&mut self, fetches: usize) {
+        assert!(self.stable_fetch_ready());
+        let _ = self
+            .clock
+            .advance_cycles((fetches as u64).saturating_mul(2));
+        self.slot = advance_cpu_slots(self.slot, fetches);
+    }
+
     /// Handles one scheduled bus event.
     pub fn handle_event(&mut self, event: CrimeMemoryBusEvent) {
         let event_epoch = match event {
@@ -347,6 +392,19 @@ const fn slot_client(slot: u8) -> Option<CrimeMemoryClient> {
         Some(CrimeMemoryClient::Cpu)
     } else {
         None
+    }
+}
+
+const fn advance_cpu_slots(slot: u8, fetches: usize) -> u8 {
+    if fetches == 0 {
+        return slot;
+    }
+    let distance = 15_u8.wrapping_sub(slot & 31) & 31;
+    let after_first = slot.wrapping_add(distance).wrapping_add(1) & 63;
+    if (fetches - 1) & 1 == 0 {
+        after_first
+    } else {
+        after_first ^ 32
     }
 }
 

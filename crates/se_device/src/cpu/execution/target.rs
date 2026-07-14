@@ -6,6 +6,9 @@ pub trait ExecutionBoundary {}
 /// Action produced while executing one architectural instruction.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ExecutionTargetAction<T, B> {
+    /// Internal work completed without reaching an architectural boundary.
+    Continue,
+
     /// An external transaction must complete before execution can continue.
     Transaction(T),
 

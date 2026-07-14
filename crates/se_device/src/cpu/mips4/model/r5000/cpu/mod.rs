@@ -10,9 +10,16 @@ use se_float::backend::softfloat3::SoftFloat3Backend;
 use crate::bus::irq::{IrqDelivery, IrqInput};
 use crate::cpu::execution::functional::FunctionalExecutor;
 use crate::cpu::execution::protocol::{
-    ExecutionAction, ExecutionCompletion, FunctionalExecutorError,
+    ExecutionAction, ExecutionCompletion, ExecutionTransaction, ExecutionTransactionId,
+    FunctionalExecutorError,
 };
+use crate::cpu::execution::target::ExecutionTargetAction;
 use crate::cpu::mips4::cp0::Mips4Cp0CacheErr;
+use crate::cpu::mips4::execution::block::{
+    Mips4BlockEngine, Mips4BlockEngineStatistics, Mips4BlockExecution, Mips4BlockExit,
+    Mips4BlockFrame, Mips4BlockKey, Mips4BlockTier, Mips4CachedBlockExecution,
+    Mips4CodeSourceRequest, Mips4CodeWindow, Mips4CodegenBackend,
+};
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use crate::cpu::mips4::execution::state::{Mips4ExecutionConfigError, Mips4ExecutionState};
 use crate::cpu::mips4::execution::target::{
@@ -50,6 +57,64 @@ pub struct R5000CpuStatistics {
 
     /// Bus transactions published by the CPU.
     pub transactions: u64,
+}
+
+/// Observable disposition after one bounded R5000 execution slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum R5000ExecutionSliceAction {
+    /// Architectural progress was made or the requested budget was zero.
+    Progress,
+
+    /// A typed runtime operation published a bus transaction.
+    Transaction(ExecutionTransaction<Mips4ExecutionTransaction>),
+
+    /// The processor is quiescent until an external interrupt or reset.
+    Idle,
+
+    /// A previously published transaction has not completed.
+    Waiting {
+        /// Outstanding transaction identifier.
+        transaction_id: ExecutionTransactionId,
+    },
+}
+
+/// Result of one bounded scalar or block execution slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct R5000ExecutionSlice {
+    /// Instructions that retired normally.
+    pub retired_instructions: u64,
+
+    /// Total retirement and exception boundaries completed.
+    pub boundaries: u64,
+
+    /// Exception boundary that terminated the slice, when present.
+    pub exception_boundary: Option<Mips4ExecutionBoundary>,
+
+    /// Stable external instruction fetches completed by this slice.
+    pub fast_fetches: u64,
+
+    /// Simulated time consumed by stable external instruction fetches.
+    pub simulated_time_ticks: u64,
+
+    /// Dispatcher action required after the slice.
+    pub action: R5000ExecutionSliceAction,
+}
+
+fn record_block_statistics(
+    statistics: &mut Mips4BlockEngineStatistics,
+    execution: Mips4BlockExecution,
+) {
+    match execution.tier {
+        Mips4BlockTier::Interpreter => {
+            statistics.interpreted_blocks += 1;
+            statistics.interpreted_operations += execution.operations_executed;
+        }
+        Mips4BlockTier::Native => {
+            statistics.native_blocks += 1;
+            statistics.native_operations += execution.operations_executed;
+        }
+    }
+    statistics.runtime_calls += execution.runtime_calls;
 }
 
 /// R5000 external hardware interrupt input IP2.
@@ -94,6 +159,9 @@ pub enum R5000CpuError {
 
     /// The generic executor or MIPS IV target rejected an operation.
     Execution(FunctionalExecutorError<Mips4ExecutionTargetError>),
+
+    /// The basic-block engine violated an invariant or its native backend failed.
+    Block(String),
 }
 
 impl fmt::Display for R5000CpuError {
@@ -103,11 +171,21 @@ impl fmt::Display for R5000CpuError {
                 write!(f, "invalid R5000 configuration: {error}")
             }
             Self::Execution(error) => write!(f, "R5000 execution failed: {error}"),
+            Self::Block(error) => write!(f, "R5000 block execution failed: {error}"),
         }
     }
 }
 
 impl std::error::Error for R5000CpuError {}
+
+#[derive(Default)]
+struct R5000ReusableBlockFrame(Option<Mips4BlockFrame>);
+
+impl Clone for R5000ReusableBlockFrame {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
 
 /// Functional R5000 CPU with an injectable floating-point backend.
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -123,6 +201,8 @@ where
     half_pclock_remainder: u8,
     terminal_error: Option<R5000CpuError>,
     statistics: R5000CpuStatistics,
+    #[serde(skip)]
+    reusable_block_frame: R5000ReusableBlockFrame,
 }
 
 crate::component_state!(R5000CpuState, R5000Cpu);
@@ -166,6 +246,7 @@ where
             half_pclock_remainder: 0,
             terminal_error: None,
             statistics: R5000CpuStatistics::default(),
+            reusable_block_frame: R5000ReusableBlockFrame::default(),
         })
     }
 
@@ -189,6 +270,11 @@ where
         self.statistics
     }
 
+    /// Returns a stable external code-source request for the current PC.
+    pub fn code_source_request(&self) -> Option<Mips4CodeSourceRequest> {
+        self.executor.target().code_source_request()
+    }
+
     /// Polls the next transaction, instruction boundary, idle state, or wait state.
     pub fn poll(
         &mut self,
@@ -196,6 +282,11 @@ where
     {
         if let Some(error) = &self.terminal_error {
             return Err(error.clone());
+        }
+        if self.executor.ready_for_direct_execution()
+            && self.executor.target().block_execution_ready()
+        {
+            self.reusable_block_frame.0 = None;
         }
         let action = self.executor.poll().map_err(R5000CpuError::Execution)?;
         match &action {
@@ -215,10 +306,927 @@ where
             ExecutionAction::Idle | ExecutionAction::Waiting { .. } => {}
         }
         if matches!(action, ExecutionAction::Boundary(_)) {
+            if let ExecutionAction::Boundary(boundary) = &action
+                && let Some(frame) = &mut self.reusable_block_frame.0
+            {
+                self.executor
+                    .target()
+                    .refresh_block_boundary(frame, boundary);
+            }
             self.executor.target_mut().advance_random(1);
             self.advance_pclocks(1);
         }
         Ok(action)
+    }
+
+    /// Runs cached typed blocks up to a retirement budget.
+    pub fn run_slice<B>(
+        &mut self,
+        engine: &mut Mips4BlockEngine<B>,
+        budget: u64,
+    ) -> Result<R5000ExecutionSlice, R5000CpuError>
+    where
+        B: Mips4CodegenBackend,
+        B::Error: fmt::Display,
+    {
+        let mut block_statistics = Mips4BlockEngineStatistics::default();
+        let mut cached_retired = 0;
+        let mut cached_exceptions = 0;
+        let result = self.run_slice_inner(
+            engine,
+            budget,
+            None,
+            &mut block_statistics,
+            &mut cached_retired,
+            &mut cached_exceptions,
+        );
+        engine.record_cached_statistics(block_statistics);
+        self.statistics.retired_instructions = self
+            .statistics
+            .retired_instructions
+            .saturating_add(cached_retired);
+        self.statistics.exceptions = self.statistics.exceptions.saturating_add(cached_exceptions);
+        result
+    }
+
+    /// Runs queued protocol work or a reusable I-cache block before code-source probing.
+    pub fn run_reusable_slice<B>(
+        &mut self,
+        engine: &mut Mips4BlockEngine<B>,
+        budget: u64,
+    ) -> Result<Option<R5000ExecutionSlice>, R5000CpuError>
+    where
+        B: Mips4CodegenBackend,
+        B::Error: fmt::Display,
+    {
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        if !self.executor.ready_for_direct_execution()
+            || !self.executor.target().block_execution_ready()
+        {
+            return self.run_slice(engine, budget).map(Some);
+        }
+        let key = self.executor.target().block_key();
+        if !engine.reusable_instruction_cache_block(key, self.executor.target()) {
+            return Ok(None);
+        }
+        if self.executor.consume_ready_continuation()
+            && !self.executor.target().dynamic_instruction_ready()
+        {
+            self.executor.target_mut().discard_dynamic_instruction();
+        }
+
+        let mut block_statistics = Mips4BlockEngineStatistics::default();
+        let mut cached_retired = 0;
+        let mut cached_exceptions = 0;
+        let result = self.run_slice_inner(
+            engine,
+            budget,
+            Some(key),
+            &mut block_statistics,
+            &mut cached_retired,
+            &mut cached_exceptions,
+        );
+        engine.record_cached_statistics(block_statistics);
+        self.statistics.retired_instructions = self
+            .statistics
+            .retired_instructions
+            .saturating_add(cached_retired);
+        self.statistics.exceptions = self.statistics.exceptions.saturating_add(cached_exceptions);
+        result.map(Some)
+    }
+
+    fn run_slice_inner<B>(
+        &mut self,
+        engine: &mut Mips4BlockEngine<B>,
+        budget: u64,
+        initial_cached_block: Option<Mips4BlockKey>,
+        block_statistics: &mut Mips4BlockEngineStatistics,
+        cached_retired: &mut u64,
+        cached_exceptions: &mut u64,
+    ) -> Result<R5000ExecutionSlice, R5000CpuError>
+    where
+        B: Mips4CodegenBackend,
+        B::Error: fmt::Display,
+    {
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        let mut accumulated = R5000ExecutionSlice {
+            retired_instructions: 0,
+            boundaries: 0,
+            exception_boundary: None,
+            fast_fetches: 0,
+            simulated_time_ticks: 0,
+            action: R5000ExecutionSliceAction::Progress,
+        };
+        if initial_cached_block.is_none()
+            && (!self.executor.ready_for_direct_execution()
+                || !self.executor.target().block_execution_ready())
+        {
+            accumulated = self.poll_protocol_slice()?;
+            if !matches!(accumulated.action, R5000ExecutionSliceAction::Progress)
+                || accumulated.boundaries == 0
+                || accumulated.exception_boundary.is_some()
+                || accumulated.boundaries >= budget
+                || !self.executor.ready_for_direct_execution()
+                || !self.executor.target().block_execution_ready()
+            {
+                return Ok(accumulated);
+            }
+        }
+        let mut no_progress_retries = 0_u8;
+        let mut frame = self.take_block_frame(budget.saturating_sub(accumulated.boundaries));
+        let (mut block_key, mut check_execution_readiness) = match initial_cached_block {
+            Some(key) => (key, false),
+            None => {
+                let key = self.executor.target().block_key_for_frame(&frame);
+                (key, true)
+            }
+        };
+        let mut deferred_boundaries = 0_u64;
+        loop {
+            let remaining = budget.saturating_sub(accumulated.boundaries);
+            if remaining == 0 {
+                self.advance_deferred_boundaries(&mut deferred_boundaries);
+                self.commit_reusable_block_frame(frame);
+                return Ok(accumulated);
+            }
+            if check_execution_readiness {
+                if !self.executor.ready_for_direct_execution()
+                    || !self.executor.target().block_execution_ready()
+                {
+                    self.advance_deferred_boundaries(&mut deferred_boundaries);
+                    self.commit_reusable_block_frame(frame);
+                    if accumulated.boundaries == 0 {
+                        return self.poll_protocol_slice();
+                    }
+                    return Ok(accumulated);
+                }
+                if self.executor.consume_ready_continuation()
+                    && !self.executor.target().dynamic_instruction_ready()
+                {
+                    self.executor.target_mut().discard_dynamic_instruction();
+                }
+                check_execution_readiness = false;
+            }
+
+            let previous_retired = frame.retired();
+            let cached_execution = if block_key.code_guard == 0 {
+                let result = {
+                    let target = self.executor.target_mut();
+                    engine.execute_cached_with_runtime(
+                        block_key,
+                        &mut frame,
+                        target,
+                        deferred_boundaries != 0,
+                    )
+                };
+                result.map_err(|error| self.block_error(error))?
+            } else {
+                Mips4CachedBlockExecution::Missing
+            };
+            let (slice, persistent_frame, counter_barrier) = match cached_execution {
+                Mips4CachedBlockExecution::Executed(block_execution)
+                    if matches!(
+                        block_execution.exit,
+                        Mips4BlockExit::BudgetExhausted
+                            | Mips4BlockExit::Dispatch
+                            | Mips4BlockExit::TimelineExhausted
+                            | Mips4BlockExit::GuardInvalid
+                    ) =>
+                {
+                    self.executor.target_mut().discard_dynamic_instruction();
+                    if block_execution.exit == Mips4BlockExit::GuardInvalid {
+                        engine.invalidate(block_key);
+                    }
+                    let retired_instructions = frame
+                        .retired()
+                        .checked_sub(previous_retired)
+                        .ok_or_else(|| {
+                            self.block_error("block retirement counter moved backwards")
+                        })?;
+                    record_block_statistics(block_statistics, block_execution);
+                    *cached_retired += retired_instructions;
+                    accumulated.retired_instructions += retired_instructions;
+                    accumulated.boundaries += retired_instructions;
+                    deferred_boundaries += retired_instructions;
+
+                    if block_execution.counter_barrier {
+                        self.advance_deferred_boundaries(&mut deferred_boundaries);
+                        self.commit_reusable_block_frame(frame);
+                        return Ok(accumulated);
+                    }
+                    if accumulated.boundaries >= budget {
+                        self.advance_deferred_boundaries(&mut deferred_boundaries);
+                        self.commit_reusable_block_frame(frame);
+                        return Ok(accumulated);
+                    }
+                    if retired_instructions == 0 {
+                        no_progress_retries = no_progress_retries.saturating_add(1);
+                        if no_progress_retries > 1 {
+                            self.advance_deferred_boundaries(&mut deferred_boundaries);
+                            return Err(self.block_error(format_args!(
+                                "cached block dispatcher made no architectural progress with {remaining} boundaries requested, {} frame budget, {} frame retirements, and PC {:#018x}",
+                                frame.budget(),
+                                frame.retired(),
+                                frame.pc(),
+                            )));
+                        }
+                    } else {
+                        no_progress_retries = 0;
+                    }
+                    block_key.pc = frame.pc();
+                    block_key.next_pc = frame.next_pc();
+                    block_key.delay_slot_branch_pc = frame.delay_slot_branch_pc();
+                    continue;
+                }
+                Mips4CachedBlockExecution::Executed(block_execution) => {
+                    self.executor.target_mut().discard_dynamic_instruction();
+                    let slice = self.finish_cached_block_exit(
+                        &mut frame,
+                        previous_retired,
+                        block_execution,
+                    )?;
+                    record_block_statistics(block_statistics, block_execution);
+                    *cached_retired += slice.retired_instructions;
+                    *cached_exceptions += u64::from(slice.exception_boundary.is_some());
+                    (slice, true, block_execution.counter_barrier)
+                }
+                Mips4CachedBlockExecution::CounterSynchronization => {
+                    self.advance_deferred_boundaries(&mut deferred_boundaries);
+                    continue;
+                }
+                Mips4CachedBlockExecution::Missing => {
+                    self.advance_deferred_boundaries(&mut deferred_boundaries);
+                    self.executor.target_mut().commit_block_frame(&mut frame);
+                    if accumulated.boundaries != 0 {
+                        return Ok(accumulated);
+                    }
+                    (
+                        self.run_slice_with_code_window(engine, remaining, None)?,
+                        false,
+                        false,
+                    )
+                }
+            };
+            accumulated.retired_instructions += slice.retired_instructions;
+            accumulated.boundaries += slice.boundaries;
+            accumulated.exception_boundary =
+                slice.exception_boundary.or(accumulated.exception_boundary);
+            if persistent_frame {
+                deferred_boundaries += slice.boundaries;
+            }
+
+            if counter_barrier {
+                self.advance_deferred_boundaries(&mut deferred_boundaries);
+                self.commit_reusable_block_frame(frame);
+                accumulated.action = slice.action;
+                return Ok(accumulated);
+            }
+
+            match slice.action {
+                R5000ExecutionSliceAction::Progress
+                    if accumulated.boundaries < budget
+                        && accumulated.exception_boundary.is_none() =>
+                {
+                    if slice.boundaries == 0 {
+                        no_progress_retries = no_progress_retries.saturating_add(1);
+                        if no_progress_retries > 1 {
+                            self.advance_deferred_boundaries(&mut deferred_boundaries);
+                            return Err(self.block_error(format_args!(
+                                "cached block dispatcher made no architectural progress with {remaining} boundaries requested, {} frame budget, {} frame retirements, and PC {:#018x}",
+                                frame.budget(),
+                                frame.retired(),
+                                frame.pc(),
+                            )));
+                        }
+                    } else {
+                        no_progress_retries = 0;
+                    }
+                    if !persistent_frame {
+                        frame =
+                            self.take_block_frame(budget.saturating_sub(accumulated.boundaries));
+                        block_key = self.executor.target().block_key_for_frame(&frame);
+                        check_execution_readiness = true;
+                    } else {
+                        block_key.pc = frame.pc();
+                        block_key.next_pc = frame.next_pc();
+                        block_key.delay_slot_branch_pc = frame.delay_slot_branch_pc();
+                    }
+                }
+                action => {
+                    if persistent_frame {
+                        self.advance_deferred_boundaries(&mut deferred_boundaries);
+                        self.commit_reusable_block_frame(frame);
+                    }
+                    accumulated.action = action;
+                    return Ok(accumulated);
+                }
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn finish_cached_block_exit(
+        &mut self,
+        frame: &mut Mips4BlockFrame,
+        previous_retired: u64,
+        execution: Mips4BlockExecution,
+    ) -> Result<R5000ExecutionSlice, R5000CpuError> {
+        let mut exception_boundary = None;
+        let mut slice_action = R5000ExecutionSliceAction::Progress;
+        match execution.exit {
+            Mips4BlockExit::Exception => {
+                match self.executor.target_mut().take_block_runtime_action() {
+                    Some(ExecutionTargetAction::Boundary(boundary)) => {
+                        exception_boundary = Some(boundary);
+                    }
+                    Some(_) => {
+                        return Err(self.block_error(
+                            "block runtime exception returned a non-boundary action",
+                        ));
+                    }
+                    None => {
+                        let exception = frame.exception().ok_or_else(|| {
+                            self.block_error(
+                                "block reported an exception without an exception code",
+                            )
+                        })?;
+                        self.executor.target_mut().commit_block_control(frame);
+                        exception_boundary =
+                            Some(self.executor.target_mut().finish_block_exception(exception));
+                        self.executor.target().refresh_block_control(frame);
+                    }
+                }
+            }
+            Mips4BlockExit::RuntimeTransaction => {
+                let Some(ExecutionTargetAction::Transaction(transaction)) =
+                    self.executor.target_mut().take_block_runtime_action()
+                else {
+                    return Err(self.block_error(
+                        "block runtime transaction did not publish a transaction action",
+                    ));
+                };
+                let transaction = self
+                    .executor
+                    .publish_ready_transaction(transaction)
+                    .map_err(R5000CpuError::Execution)?;
+                self.statistics.transactions = self.statistics.transactions.saturating_add(1);
+                slice_action = R5000ExecutionSliceAction::Transaction(transaction);
+            }
+            Mips4BlockExit::RuntimeIdle => {
+                slice_action = R5000ExecutionSliceAction::Idle;
+            }
+            Mips4BlockExit::InternalError => {
+                return Err(self.block_error("block execution returned an internal error"));
+            }
+            Mips4BlockExit::BudgetExhausted
+            | Mips4BlockExit::Dispatch
+            | Mips4BlockExit::TimelineExhausted
+            | Mips4BlockExit::GuardInvalid => unreachable!("progress exits return above"),
+        }
+
+        let retired = frame
+            .retired()
+            .checked_sub(previous_retired)
+            .ok_or_else(|| self.block_error("block retirement counter moved backwards"))?;
+        let boundaries = retired + u64::from(exception_boundary.is_some());
+        Ok(R5000ExecutionSlice {
+            retired_instructions: retired,
+            boundaries,
+            exception_boundary,
+            fast_fetches: 0,
+            simulated_time_ticks: 0,
+            action: slice_action,
+        })
+    }
+
+    /// Runs a typed block with an optional versioned external code window.
+    pub fn run_slice_with_code_window<B>(
+        &mut self,
+        engine: &mut Mips4BlockEngine<B>,
+        budget: u64,
+        code_window: Option<&Mips4CodeWindow>,
+    ) -> Result<R5000ExecutionSlice, R5000CpuError>
+    where
+        B: Mips4CodegenBackend,
+        B::Error: fmt::Display,
+    {
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        if budget == 0 {
+            return Ok(R5000ExecutionSlice {
+                retired_instructions: 0,
+                boundaries: 0,
+                exception_boundary: None,
+                fast_fetches: 0,
+                simulated_time_ticks: 0,
+                action: R5000ExecutionSliceAction::Progress,
+            });
+        }
+        if !self.executor.ready_for_direct_execution()
+            || !self.executor.target().block_execution_ready()
+        {
+            return self.poll_protocol_slice();
+        }
+
+        if self.executor.consume_ready_continuation()
+            && !self.executor.target().dynamic_instruction_ready()
+        {
+            self.executor.target_mut().discard_dynamic_instruction();
+        }
+        if let Some(window) = code_window.filter(|window| {
+            self.executor
+                .target()
+                .block_key_for_code_window(window)
+                .is_some()
+        }) {
+            return self.run_stable_code_window_slice(engine, budget, window);
+        }
+
+        let key = self.executor.target().block_key();
+        let cached_status = engine.block(key).map(|block| {
+            let reusable =
+                !block.guard().lines().is_empty() && block.guard().code_source().is_none();
+            let valid = reusable
+                && key.code_guard == 0
+                && self.executor.target().block_guard_valid(block.guard());
+            (reusable, valid)
+        });
+        if matches!(cached_status, Some((true, false))) {
+            engine.invalidate(key);
+        }
+        let cached_ready = matches!(cached_status, Some((true, true)));
+        if cached_ready {
+            self.executor.target_mut().discard_dynamic_instruction();
+        } else {
+            let cached_block = self
+                .executor
+                .target()
+                .build_block()
+                .map_err(|error| self.block_error(error))?;
+            if let Some(block) = cached_block {
+                self.executor.target_mut().discard_dynamic_instruction();
+                engine
+                    .insert(block)
+                    .map_err(|error| self.block_error(error))?;
+            } else {
+                if !self.executor.target().dynamic_instruction_ready() {
+                    self.executor.target_mut().discard_dynamic_instruction();
+                    let fetch_action =
+                        self.executor
+                            .target_mut()
+                            .begin_block_fetch()
+                            .map_err(|error| {
+                                R5000CpuError::Execution(FunctionalExecutorError::Target(error))
+                            })?;
+                    match fetch_action {
+                        ExecutionTargetAction::Continue => {}
+                        action => {
+                            let action = self
+                                .executor
+                                .publish_ready_action(action)
+                                .map_err(R5000CpuError::Execution)?;
+                            return self.accelerated_protocol_slice(action);
+                        }
+                    }
+                }
+                let block = self
+                    .executor
+                    .target_mut()
+                    .take_dynamic_block()
+                    .map_err(|error| self.block_error(error))?
+                    .ok_or_else(|| {
+                        self.block_error(
+                            "instruction fetch continuation did not provide a dynamic block",
+                        )
+                    })?;
+                engine
+                    .insert_dynamic(block)
+                    .map_err(|error| self.block_error(error))?;
+            }
+        }
+
+        let mut frame = self.take_block_frame(budget);
+        let execution = {
+            let target = self.executor.target_mut();
+            engine
+                .execute_with_runtime(key, &mut frame, target)
+                .map_err(|error| self.block_error(error))?
+        };
+        self.executor.target_mut().commit_block_frame(&mut frame);
+        let fast_fetches = 0;
+
+        let mut exception_boundary = None;
+        let mut slice_action = R5000ExecutionSliceAction::Progress;
+        match execution.exit {
+            Mips4BlockExit::BudgetExhausted | Mips4BlockExit::Dispatch => {}
+            Mips4BlockExit::Exception => {
+                match self.executor.target_mut().take_block_runtime_action() {
+                    Some(ExecutionTargetAction::Boundary(boundary)) => {
+                        exception_boundary = Some(boundary);
+                    }
+                    Some(_) => {
+                        return Err(self.block_error(
+                            "block runtime exception returned a non-boundary action",
+                        ));
+                    }
+                    None => {
+                        let exception = frame.exception().ok_or_else(|| {
+                            self.block_error(
+                                "block reported an exception without an exception code",
+                            )
+                        })?;
+                        exception_boundary =
+                            Some(self.executor.target_mut().finish_block_exception(exception));
+                    }
+                }
+            }
+            Mips4BlockExit::RuntimeTransaction => {
+                let Some(ExecutionTargetAction::Transaction(transaction)) =
+                    self.executor.target_mut().take_block_runtime_action()
+                else {
+                    return Err(self.block_error(
+                        "block runtime transaction did not publish a transaction action",
+                    ));
+                };
+                let transaction = self
+                    .executor
+                    .publish_ready_transaction(transaction)
+                    .map_err(R5000CpuError::Execution)?;
+                self.statistics.transactions = self.statistics.transactions.saturating_add(1);
+                slice_action = R5000ExecutionSliceAction::Transaction(transaction);
+            }
+            Mips4BlockExit::RuntimeIdle => {
+                slice_action = R5000ExecutionSliceAction::Idle;
+            }
+            Mips4BlockExit::TimelineExhausted => {}
+            Mips4BlockExit::GuardInvalid => {
+                engine.invalidate(key);
+            }
+            Mips4BlockExit::InternalError => {
+                return Err(self.block_error("block execution returned an internal error"));
+            }
+        }
+
+        if engine.block(key).is_some_and(|block| {
+            !self.executor.target().block_guard_valid(block.guard())
+                || block.guard().code_source().is_some()
+                || key.code_guard != 0
+        }) {
+            engine.invalidate(key);
+        }
+        let retired = frame.retired();
+        let boundaries = retired + u64::from(exception_boundary.is_some());
+        self.statistics.retired_instructions =
+            self.statistics.retired_instructions.saturating_add(retired);
+        if exception_boundary.is_some() {
+            self.statistics.exceptions = self.statistics.exceptions.saturating_add(1);
+            self.executor.target().refresh_block_control(&mut frame);
+        }
+        self.executor.target_mut().advance_random(boundaries);
+        self.advance_pclocks(boundaries);
+        let simulated_time_ticks = 0;
+        self.reusable_block_frame.0 = Some(frame);
+        Ok(R5000ExecutionSlice {
+            retired_instructions: retired,
+            boundaries,
+            exception_boundary,
+            fast_fetches,
+            simulated_time_ticks,
+            action: slice_action,
+        })
+    }
+
+    fn run_stable_code_window_slice<B>(
+        &mut self,
+        engine: &mut Mips4BlockEngine<B>,
+        budget: u64,
+        window: &Mips4CodeWindow,
+    ) -> Result<R5000ExecutionSlice, R5000CpuError>
+    where
+        B: Mips4CodegenBackend,
+        B::Error: fmt::Display,
+    {
+        let fetch_limit = window.fetch_count() as u64;
+        let mut frame = self.take_block_frame(budget.min(fetch_limit));
+        let mut fast_fetches = 0_u64;
+        let mut final_block = None;
+
+        loop {
+            let remaining_fetches = fetch_limit.saturating_sub(fast_fetches);
+            if remaining_fetches == 0 || frame.budget() == 0 {
+                break;
+            }
+            frame.limit_budget(remaining_fetches);
+            let Some(key) = self
+                .executor
+                .target()
+                .block_key_for_code_window_frame(window, &frame)
+            else {
+                break;
+            };
+            let cached_valid = engine.block(key).is_some_and(|block| {
+                block.guard().code_source() == Some(window.guard())
+                    && self.executor.target().block_guard_valid(block.guard())
+            });
+            if engine.block(key).is_some() && !cached_valid {
+                engine.invalidate(key);
+            }
+            if !cached_valid {
+                let block = self
+                    .executor
+                    .target()
+                    .build_code_window_for_key(window, key)
+                    .map_err(|error| self.block_error(error))?
+                    .ok_or_else(|| {
+                        self.block_error("stable code window did not produce a successor block")
+                    })?;
+                engine
+                    .insert(block)
+                    .map_err(|error| self.block_error(error))?;
+            }
+            if frame.retired() != 0 && engine.counter_barrier(key).unwrap_or(false) {
+                break;
+            }
+
+            self.executor.target_mut().discard_dynamic_instruction();
+            let execution = {
+                let target = self.executor.target_mut();
+                engine
+                    .execute_with_runtime(key, &mut frame, target)
+                    .map_err(|error| self.block_error(error))?
+            };
+            fast_fetches = fast_fetches
+                .checked_add(execution.operations_executed)
+                .ok_or_else(|| self.block_error("stable fetch counter overflowed"))?;
+            final_block = Some((key, execution));
+
+            if execution.counter_barrier
+                || !matches!(
+                    execution.exit,
+                    Mips4BlockExit::BudgetExhausted | Mips4BlockExit::Dispatch
+                )
+            {
+                break;
+            }
+        }
+
+        let Some((key, execution)) = final_block else {
+            return Err(self.block_error("stable code window made no architectural progress"));
+        };
+        self.executor.target_mut().commit_block_frame(&mut frame);
+        self.executor
+            .account_ready_transactions(fast_fetches)
+            .map_err(R5000CpuError::Execution)?;
+        self.statistics.transactions = self.statistics.transactions.saturating_add(fast_fetches);
+
+        let mut exception_boundary = None;
+        let mut slice_action = R5000ExecutionSliceAction::Progress;
+        match execution.exit {
+            Mips4BlockExit::BudgetExhausted | Mips4BlockExit::Dispatch => {}
+            Mips4BlockExit::Exception => {
+                match self.executor.target_mut().take_block_runtime_action() {
+                    Some(ExecutionTargetAction::Boundary(boundary)) => {
+                        exception_boundary = Some(boundary);
+                    }
+                    Some(_) => {
+                        return Err(self.block_error(
+                            "block runtime exception returned a non-boundary action",
+                        ));
+                    }
+                    None => {
+                        let exception = frame.exception().ok_or_else(|| {
+                            self.block_error(
+                                "block reported an exception without an exception code",
+                            )
+                        })?;
+                        exception_boundary =
+                            Some(self.executor.target_mut().finish_block_exception(exception));
+                    }
+                }
+            }
+            Mips4BlockExit::RuntimeTransaction => {
+                let Some(ExecutionTargetAction::Transaction(transaction)) =
+                    self.executor.target_mut().take_block_runtime_action()
+                else {
+                    return Err(self.block_error(
+                        "block runtime transaction did not publish a transaction action",
+                    ));
+                };
+                let transaction = self
+                    .executor
+                    .publish_ready_transaction(transaction)
+                    .map_err(R5000CpuError::Execution)?;
+                self.statistics.transactions = self.statistics.transactions.saturating_add(1);
+                slice_action = R5000ExecutionSliceAction::Transaction(transaction);
+            }
+            Mips4BlockExit::RuntimeIdle => {
+                slice_action = R5000ExecutionSliceAction::Idle;
+            }
+            Mips4BlockExit::TimelineExhausted => {}
+            Mips4BlockExit::GuardInvalid => {
+                engine.invalidate(key);
+            }
+            Mips4BlockExit::InternalError => {
+                return Err(self.block_error("block execution returned an internal error"));
+            }
+        }
+
+        if engine.block(key).is_some_and(|block| {
+            block.guard().code_source() != Some(window.guard())
+                || !self.executor.target().block_guard_valid(block.guard())
+        }) {
+            engine.invalidate(key);
+        }
+        let retired = frame.retired();
+        let boundaries = retired + u64::from(exception_boundary.is_some());
+        self.statistics.retired_instructions =
+            self.statistics.retired_instructions.saturating_add(retired);
+        if exception_boundary.is_some() {
+            self.statistics.exceptions = self.statistics.exceptions.saturating_add(1);
+            self.executor.target().refresh_block_control(&mut frame);
+        }
+        self.executor.target_mut().advance_random(boundaries);
+        self.advance_pclocks(boundaries);
+        engine.record_fast_fetches(fast_fetches);
+        let simulated_time_ticks = window
+            .fetch_time_ticks(fast_fetches as usize)
+            .ok_or_else(|| self.block_error("stable fetches exceeded their planned timeline"))?;
+        self.reusable_block_frame.0 = Some(frame);
+        Ok(R5000ExecutionSlice {
+            retired_instructions: retired,
+            boundaries,
+            exception_boundary,
+            fast_fetches,
+            simulated_time_ticks,
+            action: slice_action,
+        })
+    }
+
+    fn poll_protocol_slice(&mut self) -> Result<R5000ExecutionSlice, R5000CpuError> {
+        let action = self.poll()?;
+        Ok(match action {
+            ExecutionAction::Transaction(transaction) => R5000ExecutionSlice {
+                retired_instructions: 0,
+                boundaries: 0,
+                exception_boundary: None,
+                fast_fetches: 0,
+                simulated_time_ticks: 0,
+                action: R5000ExecutionSliceAction::Transaction(transaction),
+            },
+            ExecutionAction::Boundary(Mips4ExecutionBoundary::Retired { .. }) => {
+                R5000ExecutionSlice {
+                    retired_instructions: 1,
+                    boundaries: 1,
+                    exception_boundary: None,
+                    fast_fetches: 0,
+                    simulated_time_ticks: 0,
+                    action: R5000ExecutionSliceAction::Progress,
+                }
+            }
+            ExecutionAction::Boundary(boundary) => R5000ExecutionSlice {
+                retired_instructions: 0,
+                boundaries: 1,
+                exception_boundary: Some(boundary),
+                fast_fetches: 0,
+                simulated_time_ticks: 0,
+                action: R5000ExecutionSliceAction::Progress,
+            },
+            ExecutionAction::Idle => R5000ExecutionSlice {
+                retired_instructions: 0,
+                boundaries: 0,
+                exception_boundary: None,
+                fast_fetches: 0,
+                simulated_time_ticks: 0,
+                action: R5000ExecutionSliceAction::Idle,
+            },
+            ExecutionAction::Waiting { transaction_id } => R5000ExecutionSlice {
+                retired_instructions: 0,
+                boundaries: 0,
+                exception_boundary: None,
+                fast_fetches: 0,
+                simulated_time_ticks: 0,
+                action: R5000ExecutionSliceAction::Waiting { transaction_id },
+            },
+        })
+    }
+
+    fn accelerated_protocol_slice(
+        &mut self,
+        action: ExecutionAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
+    ) -> Result<R5000ExecutionSlice, R5000CpuError> {
+        let slice = match action {
+            ExecutionAction::Transaction(transaction) => {
+                self.statistics.transactions = self.statistics.transactions.saturating_add(1);
+                R5000ExecutionSlice {
+                    retired_instructions: 0,
+                    boundaries: 0,
+                    exception_boundary: None,
+                    fast_fetches: 0,
+                    simulated_time_ticks: 0,
+                    action: R5000ExecutionSliceAction::Transaction(transaction),
+                }
+            }
+            ExecutionAction::Boundary(boundary @ Mips4ExecutionBoundary::Retired { .. }) => {
+                if let Some(frame) = &mut self.reusable_block_frame.0 {
+                    self.executor
+                        .target()
+                        .refresh_block_boundary(frame, &boundary);
+                }
+                self.statistics.retired_instructions =
+                    self.statistics.retired_instructions.saturating_add(1);
+                self.executor.target_mut().advance_random(1);
+                self.advance_pclocks(1);
+                R5000ExecutionSlice {
+                    retired_instructions: 1,
+                    boundaries: 1,
+                    exception_boundary: None,
+                    fast_fetches: 0,
+                    simulated_time_ticks: 0,
+                    action: R5000ExecutionSliceAction::Progress,
+                }
+            }
+            ExecutionAction::Boundary(boundary) => {
+                if let Some(frame) = &mut self.reusable_block_frame.0 {
+                    self.executor
+                        .target()
+                        .refresh_block_boundary(frame, &boundary);
+                }
+                self.statistics.exceptions = self.statistics.exceptions.saturating_add(1);
+                self.executor.target_mut().advance_random(1);
+                self.advance_pclocks(1);
+                R5000ExecutionSlice {
+                    retired_instructions: 0,
+                    boundaries: 1,
+                    exception_boundary: Some(boundary),
+                    fast_fetches: 0,
+                    simulated_time_ticks: 0,
+                    action: R5000ExecutionSliceAction::Progress,
+                }
+            }
+            ExecutionAction::Idle => R5000ExecutionSlice {
+                retired_instructions: 0,
+                boundaries: 0,
+                exception_boundary: None,
+                fast_fetches: 0,
+                simulated_time_ticks: 0,
+                action: R5000ExecutionSliceAction::Idle,
+            },
+            ExecutionAction::Waiting { transaction_id } => R5000ExecutionSlice {
+                retired_instructions: 0,
+                boundaries: 0,
+                exception_boundary: None,
+                fast_fetches: 0,
+                simulated_time_ticks: 0,
+                action: R5000ExecutionSliceAction::Waiting { transaction_id },
+            },
+        };
+        Ok(slice)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn block_error(&mut self, error: impl fmt::Display) -> R5000CpuError {
+        let error = R5000CpuError::Block(error.to_string());
+        self.terminal_error = Some(error.clone());
+        error
+    }
+
+    fn advance_deferred_boundaries(&mut self, deferred_boundaries: &mut u64) {
+        let boundaries = core::mem::take(deferred_boundaries);
+        if boundaries == 0 {
+            return;
+        }
+        self.executor.target_mut().advance_random(boundaries);
+        self.advance_pclocks(boundaries);
+    }
+
+    fn take_block_frame(&mut self, budget: u64) -> Mips4BlockFrame {
+        let mut frame = if let Some(mut frame) = self.reusable_block_frame.0.take() {
+            debug_assert_eq!(frame.pc(), self.state().pc());
+            debug_assert_eq!(frame.next_pc(), self.state().next_pc());
+            debug_assert_eq!(
+                frame.delay_slot_branch_pc(),
+                self.state().delay_slot_branch_pc()
+            );
+            debug_assert_eq!(frame.hi(), self.state().hi());
+            debug_assert_eq!(frame.lo(), self.state().lo());
+            frame.prepare(budget);
+            frame
+        } else {
+            self.executor.target().block_frame(budget)
+        };
+        self.executor.target_mut().bind_block_frame(&mut frame);
+        frame
+    }
+
+    fn commit_reusable_block_frame(&mut self, mut frame: Mips4BlockFrame) {
+        self.executor.target_mut().commit_block_frame(&mut frame);
+        self.reusable_block_frame.0 = Some(frame);
     }
 
     /// Advances Count using machine-calculated elapsed processor clocks.
@@ -234,6 +1242,26 @@ where
         self.executor
             .target_mut()
             .advance_count(count_increments, self.boot_mode.timer_interrupt_enabled());
+    }
+
+    /// Caps a slice at the first Count/Compare matching processor-clock boundary.
+    pub fn limit_slice_budget(&self, requested: u64) -> u64 {
+        if requested == 0 || !self.boot_mode.timer_interrupt_enabled() {
+            return requested;
+        }
+        let count = self.state().cp0().count().bits();
+        let compare = self.state().cp0().compare().bits();
+        let increments = compare.wrapping_sub(count);
+        if increments == 0 {
+            return requested;
+        }
+        let boundary = match self.boot_mode.count_update_rate() {
+            R5000CountUpdateRate::PClock => u64::from(increments),
+            R5000CountUpdateRate::HalfPClock => u64::from(increments)
+                .saturating_mul(2)
+                .saturating_sub(u64::from(self.half_pclock_remainder)),
+        };
+        requested.min(boundary)
     }
 }
 
@@ -253,6 +1281,7 @@ where
         self.executor.reset();
         self.half_pclock_remainder = 0;
         self.terminal_error = None;
+        self.reusable_block_frame = R5000ReusableBlockFrame::default();
     }
 }
 

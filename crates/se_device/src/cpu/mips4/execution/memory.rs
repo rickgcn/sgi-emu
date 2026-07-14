@@ -8,7 +8,7 @@ use crate::cpu::mips4::instruction::decode::Mips4CpuInstruction;
 use crate::cpu::mips4::memory::ll_sc::Mips4LlBit;
 use crate::cpu::mips4::memory::operation::{Mips4MemoryAccess, Mips4MemoryAccessError};
 use crate::cpu::mips4::memory::{Mips4Memory, Mips4MemoryAccessKind, Mips4MemoryAccessSize};
-use crate::cpu::mips4::mmu::Mips4MmuCacheAttribute;
+use crate::cpu::mips4::mmu::{Mips4Mmu, Mips4MmuCacheAttribute};
 use crate::cpu::mips4::tlb::Mips4TlbAsid;
 
 use super::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransaction, Mips4ExecutionTransferSize};
@@ -57,9 +57,10 @@ pub(super) struct Mips4ResolvedCacheAddress {
 pub(super) fn prepare_cache_address(
     state: &Mips4ExecutionState,
     policy: &impl Mips4ExecutionPolicy,
-    raw: Mips4Instruction,
+    base: u8,
+    offset: i16,
 ) -> Result<Mips4ResolvedCacheAddress, Mips4MemoryAccessError> {
-    let virtual_address = read(state, raw.rs()).wrapping_add(raw.signed_immediate() as i64 as u64);
+    let virtual_address = read(state, base).wrapping_add(offset as i64 as u64);
     let tlb_entries = state.deterministic_tlb_entries(policy, virtual_address);
     let access = Mips4MemoryAccess::prepare(
         virtual_address,
@@ -103,18 +104,57 @@ pub(super) fn prepare_memory(
 ) -> Result<Mips4MemoryPlan, Mips4MemoryAccessError> {
     let base = read(state, raw.rs());
     let register_value = read(state, raw.rt());
+    prepare_memory_with_operands(
+        state,
+        policy,
+        raw,
+        instruction,
+        endianness,
+        base,
+        register_value,
+    )
+}
+
+pub(super) fn prepare_memory_with_operands(
+    state: &Mips4ExecutionState,
+    policy: &impl Mips4ExecutionPolicy,
+    raw: Mips4Instruction,
+    instruction: Mips4CpuInstruction,
+    endianness: Mips4Endianness,
+    base: u64,
+    register_value: u64,
+) -> Result<Mips4MemoryPlan, Mips4MemoryAccessError> {
     let virtual_address = Mips4Memory::effective_address(base, raw.signed_immediate());
     let kind = access_kind(instruction);
-    let tlb_entries = state.deterministic_tlb_entries(policy, virtual_address);
-    let access = Mips4MemoryAccess::prepare(
-        virtual_address,
-        kind,
-        endianness,
-        policy.mmu_config(state.cp0.config()),
-        state.cp0.status(),
-        Mips4TlbAsid::new(state.cp0.entry_hi().address_space_identifier()),
-        tlb_entries,
-    )?;
+    let mmu_config = policy.mmu_config(state.cp0.config());
+    if let Err(exception) = Mips4Memory::check_alignment(virtual_address, kind) {
+        return Err(Mips4MemoryAccessError::AddressError {
+            exception,
+            virtual_address,
+        });
+    }
+    let access = if let Some(translation) =
+        Mips4Mmu::direct_mapped_translation(mmu_config, state.cp0.status(), virtual_address)
+    {
+        Mips4MemoryAccess {
+            virtual_address,
+            translation,
+            kind,
+            endianness,
+        }
+    } else {
+        let (classification, tlb_entries) =
+            state.deterministic_tlb_translation_inputs_with_config(mmu_config, virtual_address);
+        Mips4MemoryAccess::prepare_classified(
+            virtual_address,
+            kind,
+            endianness,
+            mmu_config,
+            classification,
+            Mips4TlbAsid::new(state.cp0.entry_hi().address_space_identifier()),
+            tlb_entries,
+        )?
+    };
     let access_type = policy.resolve_access_type(access.cache_attribute());
     let cache_policy = policy.resolve_cache_policy(access.cache_attribute());
 
@@ -180,6 +220,16 @@ pub(super) fn complete_read(
     physical_lanes: u64,
     endianness: Mips4Endianness,
 ) {
+    let (target, value) = complete_read_value(state, pending, physical_lanes, endianness);
+    write(state, target, value);
+}
+
+pub(super) fn complete_read_value(
+    state: &mut Mips4ExecutionState,
+    pending: Mips4PendingRead,
+    physical_lanes: u64,
+    endianness: Mips4Endianness,
+) -> (u8, u64) {
     let value = match pending.operation {
         Mips4LoadOperation::Byte { signed } => {
             let value = physical_lanes as u8;
@@ -253,14 +303,23 @@ pub(super) fn complete_read(
             decode_u64(physical_lanes, endianness)
         }
     };
-    write(state, pending.target, value);
+    (pending.target, value)
 }
 
 pub(super) fn complete_write(state: &mut Mips4ExecutionState, pending: Mips4PendingWrite) {
-    if let Some(target) = pending.conditional_target {
-        write(state, target, 1);
-        state.llbit = Mips4LlBit::Clear;
+    if let Some((target, value)) = complete_write_value(state, pending) {
+        write(state, target, value);
     }
+}
+
+pub(super) fn complete_write_value(
+    state: &mut Mips4ExecutionState,
+    pending: Mips4PendingWrite,
+) -> Option<(u8, u64)> {
+    pending.conditional_target.map(|target| {
+        state.llbit = Mips4LlBit::Clear;
+        (target, 1)
+    })
 }
 
 fn access_kind(instruction: Mips4CpuInstruction) -> Mips4MemoryAccessKind {

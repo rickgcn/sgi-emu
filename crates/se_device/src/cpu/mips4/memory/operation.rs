@@ -15,8 +15,8 @@ use crate::cpu::mips4::config::Mips4Endianness;
 use crate::cpu::mips4::cp0::Mips4Cp0Status;
 use crate::cpu::mips4::exception::Mips4Exception;
 use crate::cpu::mips4::mmu::{
-    Mips4Mmu, Mips4MmuCacheAttribute, Mips4MmuConfig, Mips4MmuFault, Mips4MmuSegment,
-    Mips4MmuTranslation, Mips4MmuTranslationResult,
+    Mips4Mmu, Mips4MmuAddressClassification, Mips4MmuCacheAttribute, Mips4MmuConfig, Mips4MmuFault,
+    Mips4MmuSegment, Mips4MmuTranslation, Mips4MmuTranslationResult,
 };
 use crate::cpu::mips4::tlb::{
     Mips4TlbAccessKind, Mips4TlbAddressMode, Mips4TlbAsid, Mips4TlbEntry,
@@ -148,6 +148,26 @@ impl Mips4MemoryAccess {
         asid: Mips4TlbAsid,
         tlb_entries: &[Mips4TlbEntry],
     ) -> Result<Self, Mips4MemoryAccessError> {
+        Self::prepare_classified(
+            virtual_address,
+            kind,
+            endianness,
+            mmu_config,
+            Mips4Mmu::classify_virtual_address(mmu_config, status, virtual_address),
+            asid,
+            tlb_entries,
+        )
+    }
+
+    pub(crate) fn prepare_classified(
+        virtual_address: u64,
+        kind: Mips4MemoryAccessKind,
+        endianness: Mips4Endianness,
+        mmu_config: Mips4MmuConfig,
+        classification: Mips4MmuAddressClassification,
+        asid: Mips4TlbAsid,
+        tlb_entries: &[Mips4TlbEntry],
+    ) -> Result<Self, Mips4MemoryAccessError> {
         if let Err(exception) = Mips4Memory::check_alignment(virtual_address, kind) {
             return Err(Mips4MemoryAccessError::AddressError {
                 exception,
@@ -155,9 +175,9 @@ impl Mips4MemoryAccess {
             });
         }
 
-        match Mips4Mmu::translate(
+        match Mips4Mmu::translate_classified(
             mmu_config,
-            status,
+            classification,
             asid,
             tlb_entries,
             virtual_address,
