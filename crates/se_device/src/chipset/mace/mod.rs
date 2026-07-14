@@ -4,6 +4,10 @@
 //! the PCI, ISA, I2C, and external media communication domains. Chip-private
 //! register banks, DMA engines, FIFOs, and media pipelines remain owned by this
 //! component.
+//!
+//! On IP32, MACE routes PROM-environment accesses to byte-programmable System
+//! Flash. The separately decoded DS1687 remains an independent RTC/NVRAM
+//! device.
 
 use core::fmt;
 use std::collections::VecDeque;
@@ -450,12 +454,9 @@ impl Mace {
             .into(),
         });
         match resolution.target {
-            MaceAddressTarget::SystemFlash => self.start_isa(
-                id,
-                self.wiring.prom,
-                resolution.offset as u32,
-                request.transfer,
-            ),
+            MaceAddressTarget::SystemFlash => {
+                self.access_system_flash(id, resolution.offset as u32, request.transfer)
+            }
             MaceAddressTarget::ExternalIsa => {
                 let Some(external) =
                     system::resolve_external_isa(resolution.offset, request.transfer.length())
@@ -507,6 +508,37 @@ impl Mace {
             transfer: to_isa_transfer(transfer),
         }));
         CrimeLinkDeviceResponse::Deferred
+    }
+
+    fn access_system_flash(
+        &mut self,
+        cmi_id: CrimeTransactionId,
+        address: u32,
+        transfer: CrimeTransfer,
+    ) -> CrimeLinkDeviceResponse<CrimeCmiCompletion> {
+        match transfer.view() {
+            CrimeTransferView::Read { length } if (1..=8).contains(&length) => {
+                self.start_isa(cmi_id, self.wiring.prom, address, transfer)
+            }
+            CrimeTransferView::Read { .. } => complete_cmi_error(cmi_id, CrimeBusError::Access),
+            CrimeTransferView::Write { data, byte_enable }
+                if data.len() == 1 && byte_enable.len() == 1 =>
+            {
+                let Some(enabled) = byte_enable.is_enabled(0) else {
+                    unreachable!("the validated byte-enable view contains one lane")
+                };
+                if enabled && self.isa.flash_write_enabled() {
+                    self.start_isa(cmi_id, self.wiring.prom, address, transfer)
+                } else {
+                    CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
+                        id: cmi_id,
+                        result: Ok(CrimeCompletionPayload::WriteComplete),
+                        memory_fault: None,
+                    })
+                }
+            }
+            CrimeTransferView::Write { .. } => complete_cmi_error(cmi_id, CrimeBusError::Access),
+        }
     }
 
     fn start_pci(

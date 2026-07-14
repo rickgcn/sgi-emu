@@ -9,8 +9,9 @@ use crate::bus::media::{EthernetFrame, MediaPayload, MediaPort, MediaTransaction
 use crate::bus::one_wire::OneWireLineDelivery;
 use crate::bus::pci::{PciCompletion, PciStatus};
 use crate::chipset::crime::protocol::{
-    CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeLinkDeviceResponse,
-    CrimeLinkOperation, CrimePioRequest, CrimeTransactionId, CrimeTransfer,
+    CrimeByteEnable, CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeData,
+    CrimeLinkDeviceResponse, CrimeLinkOperation, CrimePioRequest, CrimeTransactionId,
+    CrimeTransfer,
 };
 
 use super::config::MaceConfig;
@@ -230,6 +231,98 @@ fn uninterested_mace_does_not_construct_trace_actions() {
         saw_hardware_action = true;
     }
     assert!(saw_hardware_action);
+}
+
+#[test]
+fn system_flash_writes_obey_mace_write_enable() {
+    let mut mace = Mace::new(
+        component(15),
+        "MACE",
+        MaceConfig::default(),
+        wiring(),
+        1_000_000_000,
+    )
+    .expect("MACE must build");
+    mace.set_trace_interest(TraceInterest::None);
+    let write = || CrimeCmiTransaction {
+        id: CrimeTransactionId::new(1),
+        controller: component(1),
+        target: component(15),
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address: 0x1fc0_4000,
+            transfer: CrimeTransfer::write([0x5a].into(), [true].into()),
+        }),
+    };
+
+    assert_eq!(
+        BusDeviceRole::<CrimeCmiTransaction>::accept(&mut mace, write()),
+        CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
+            id: CrimeTransactionId::new(1),
+            result: Ok(CrimeCompletionPayload::WriteComplete),
+            memory_fault: None,
+        })
+    );
+    assert_eq!(mace.poll(), Ok(MacePoll::Idle));
+
+    mace.write_peripheral(0x10008, 1).unwrap();
+    assert_eq!(
+        BusDeviceRole::<CrimeCmiTransaction>::accept(&mut mace, write()),
+        CrimeLinkDeviceResponse::Deferred
+    );
+    let isa = match mace.poll().unwrap() {
+        MacePoll::Action(MaceAction::StartIsa(transaction)) => transaction,
+        other => panic!("expected System Flash ISA transaction, got {other:?}"),
+    };
+    assert_eq!(isa.target, component(4));
+    assert_eq!(isa.address, 0x4000);
+    assert!(matches!(
+        isa.transfer.view(),
+        IsaTransferView::Write { data, byte_enable }
+            if data == [0x5a] && byte_enable.iter().eq([true])
+    ));
+
+    mace.reset();
+    assert_eq!(
+        BusDeviceRole::<CrimeCmiTransaction>::accept(&mut mace, write()),
+        CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
+            id: CrimeTransactionId::new(1),
+            result: Ok(CrimeCompletionPayload::WriteComplete),
+            memory_fault: None,
+        })
+    );
+}
+
+#[test]
+fn system_flash_rejects_invalid_write_shapes() {
+    let mut mace = Mace::new(
+        component(15),
+        "MACE",
+        MaceConfig::default(),
+        wiring(),
+        1_000_000_000,
+    )
+    .expect("MACE must build");
+    mace.set_trace_interest(TraceInterest::None);
+    let request = CrimeCmiTransaction {
+        id: CrimeTransactionId::new(2),
+        controller: component(1),
+        target: component(15),
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address: 0x1fc0_4000,
+            transfer: CrimeTransfer::write(
+                CrimeData::from([0x12, 0x34]),
+                CrimeByteEnable::from([true, true]),
+            ),
+        }),
+    };
+    assert_eq!(
+        BusDeviceRole::<CrimeCmiTransaction>::accept(&mut mace, request),
+        CrimeLinkDeviceResponse::Complete(CrimeCmiCompletion {
+            id: CrimeTransactionId::new(2),
+            result: Err(crate::chipset::crime::protocol::CrimeBusError::Access),
+            memory_fault: None,
+        })
+    );
 }
 
 #[test]
