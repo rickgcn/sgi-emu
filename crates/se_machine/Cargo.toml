@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+jit = ["dep:se_jit"]
+
 [dependencies]
 se_core.workspace = true
 se_device.workspace = true
+se_jit = { workspace = true, optional = true }
 se_runtime.workspace = true
 serde.workspace = true
 

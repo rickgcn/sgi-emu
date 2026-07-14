@@ -1,0 +1,18 @@
+[package]
+name = "se_jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+se_device.workspace = true
+
+[[bench]]
+name = "mips4_hot_loop"
+harness = false

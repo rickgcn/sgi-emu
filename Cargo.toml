@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/se_core", "crates/se_device", "crates/se_float", "crates/se_machine", "crates/se_runtime", "crates/se_ui"]
+members = ["crates/se_core", "crates/se_device", "crates/se_float", "crates/se_jit", "crates/se_machine", "crates/se_runtime", "crates/se_ui"]
 resolver = "3"
 
 [workspace.package]
@@ -12,12 +12,18 @@ authors = ["rickgcn"]
 cc = "1"
 cxx = "1"
 cxx-build = "1"
+cranelift-codegen = "=0.133.1"
+cranelift-frontend = "=0.133.1"
+cranelift-jit = "=0.133.1"
+cranelift-module = "=0.133.1"
+cranelift-native = "=0.133.1"
 directories = "6"
 postcard = { version = "1", features = ["use-std"] }
 qt-build-utils = "0.9"
 se_core = { path = "crates/se_core" }
 se_device = { path = "crates/se_device" }
 se_float = { path = "crates/se_float" }
+se_jit = { path = "crates/se_jit" }
 se_machine = { path = "crates/se_machine" }
 se_runtime = { path = "crates/se_runtime" }
 serde = { version = "1", features = ["derive"] }
