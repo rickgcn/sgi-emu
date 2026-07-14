@@ -20,6 +20,7 @@ use se_device::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
 use se_device::cpu::mips4::model::r5000::cpu::R5000CpuState;
 use se_device::cpu::mips4::model::r5000::profile::R5000Profile;
 use se_device::memory::ds2502::{Ds2502Config, Ds2502State};
+use se_device::memory::flash::{SystemFlashState, SystemFlashStateError};
 use se_device::parallel::ieee1284::Ieee1284State;
 use se_device::rtc::ds1687::state::Ds1687State;
 use se_device::serial::uart16550::Uart16550State;
@@ -30,7 +31,7 @@ use super::event::{Ip32Event, Ip32HostOutput};
 use super::timing::IP32_TIMEBASE_HZ;
 
 /// Current IP32 serialized-state schema.
-pub const IP32_STATE_SCHEMA_VERSION: u32 = 1;
+pub const IP32_STATE_SCHEMA_VERSION: u32 = 2;
 
 /// Construction settings that do not contain PROM or battery-backed bytes.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -189,6 +190,7 @@ pub struct Ip32MachineState {
     pub(super) mace: MaceState,
     pub(super) gbe: GbeState,
     pub(super) vice: Ip32StubEndpointState,
+    pub(super) system_flash: SystemFlashState,
     pub(super) rtc: Ds1687State,
     pub(super) nic_identity: Ds2502State,
     pub(super) serial: [Uart16550State; 2],
@@ -221,6 +223,8 @@ pub enum Ip32StateError {
     Scheduler(se_core::scheduler::state::SchedulerStateError),
     /// RTC state is internally inconsistent.
     Rtc(se_device::rtc::ds1687::state::Ds1687StateError),
+    /// System Flash state is internally inconsistent.
+    SystemFlash(SystemFlashStateError),
     /// A component state belongs to a different fixed topology identity.
     Device(se_device::state::DeviceStateError),
     /// The machine could not be constructed from saved configuration.
@@ -239,6 +243,7 @@ impl fmt::Display for Ip32StateError {
             Self::Registry(error) => error.fmt(formatter),
             Self::Scheduler(error) => error.fmt(formatter),
             Self::Rtc(error) => error.fmt(formatter),
+            Self::SystemFlash(error) => error.fmt(formatter),
             Self::Device(error) => error.fmt(formatter),
             Self::Build(error) => error.fmt(formatter),
         }
@@ -251,9 +256,17 @@ impl std::error::Error for Ip32StateError {}
 mod tests {
     use super::*;
     use se_core::component::ComponentId;
+    use se_core::role::BusDeviceRole;
+    use se_core::scheduler::SimTime;
 
     use crate::o2::ip32::bus::Ip32StubEndpoint;
+    use crate::o2::ip32::component_ids;
     use crate::o2::ip32::machine::{Ip32Machine, Ip32MachineConfig};
+    use se_device::bus::isa::{
+        IsaCompletionPayload, IsaDeviceResponse, IsaTransaction, IsaTransactionId, IsaTransfer,
+    };
+    use se_device::memory::flash::SystemFlash;
+    use se_device::rtc::ds1687::state::Ds1687PersistentState;
 
     #[test]
     fn exact_machine_state_round_trips_and_continues_deterministically() {
@@ -289,6 +302,36 @@ mod tests {
     }
 
     #[test]
+    fn machine_state_restores_programmed_system_flash_without_the_base_image() {
+        let mut config = Ip32MachineConfig::default();
+        config.prom_image.fill(0xff);
+        config.rtc.nvram[0x20] = 0x3c;
+        let mut machine = Ip32Machine::from_config(config.clone()).unwrap();
+        program_flash_byte(&mut machine, 0x4000, 0x5a);
+        let expected_flash = machine.system_flash_persistent_state().unwrap();
+        let expected_rtc = machine.rtc_persistent_state().unwrap();
+        let state = machine.save_state().unwrap();
+
+        program_flash_byte(&mut machine, 0x4000, 0xa5);
+        machine
+            .restore_rtc_persistent_state(
+                &Ds1687PersistentState::new(123, vec![0x77; 256], 9).unwrap(),
+            )
+            .unwrap();
+        let restored =
+            Ip32Machine::from_state_with_trace_sink(config, state, se_core::tracing::NoopTraceSink)
+                .unwrap();
+        assert_eq!(
+            restored.system_flash_persistent_state().unwrap(),
+            expected_flash
+        );
+        assert_eq!(restored.rtc_persistent_state().unwrap(), expected_rtc);
+        assert_eq!(expected_flash.changes().len(), 1);
+        assert_eq!(expected_flash.changes()[0].offset(), 0x4000);
+        assert_eq!(expected_flash.changes()[0].bytes(), &[0x5a]);
+    }
+
+    #[test]
     fn restore_rejects_component_state_from_another_topology_identity() {
         let config = Ip32MachineConfig::default();
         let machine = Ip32Machine::from_config(config.clone()).unwrap();
@@ -300,6 +343,33 @@ mod tests {
             Err(Ip32StateError::Device(
                 se_device::state::DeviceStateError::ComponentIdMismatch { .. }
             ))
+        ));
+    }
+
+    fn program_flash_byte(
+        machine: &mut Ip32Machine<se_core::tracing::NoopTraceSink>,
+        address: u32,
+        value: u8,
+    ) {
+        let response = machine
+            .runtime_mut()
+            .registry_mut()
+            .get_typed_mut::<SystemFlash>(component_ids::PROM)
+            .unwrap()
+            .accept(IsaTransaction {
+                id: IsaTransactionId::new(1),
+                time: SimTime::ZERO,
+                controller: component_ids::MACE,
+                target: component_ids::PROM,
+                address,
+                transfer: IsaTransfer::write([value].into(), [true].into()),
+            });
+        assert!(matches!(
+            response,
+            IsaDeviceResponse::Complete(se_device::bus::isa::IsaCompletion {
+                result: Ok(IsaCompletionPayload::WriteComplete),
+                ..
+            })
         ));
     }
 }

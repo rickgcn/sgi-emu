@@ -16,7 +16,8 @@ use se_device::chipset::gbe::Gbe;
 use se_device::chipset::mace::Mace;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
 use se_device::memory::ds2502::Ds2502;
-use se_device::memory::flash::ReadArrayFlash;
+use se_device::memory::flash::SystemFlash;
+use se_device::rtc::ds1687::Ds1687;
 use se_device::serial::uart16550::Uart16550;
 use std::time::{Duration, Instant};
 
@@ -132,6 +133,7 @@ fn assert_machine_architecture_equal<A, B>(reference: &Ip32Machine<A>, optimized
     assert_component_eq!(IrqBus, component_ids::MACE_IRQ_BUS);
     assert_component_eq!(OneWireBus, component_ids::ONE_WIRE_BUS);
     assert_component_eq!(Ds2502, component_ids::NIC_IDENTITY);
+    assert_component_eq!(SystemFlash, component_ids::PROM);
     assert_eq!(
         reference.control.cpu_generation,
         optimized.control.cpu_generation
@@ -345,6 +347,38 @@ fn synthetic_prom_transmits_through_uart_and_media_bus() {
 }
 
 #[test]
+fn synthetic_prom_programs_system_flash_through_mace_and_isa() {
+    let config = config_with_program(&[
+        (0, i_type(0x0f, 0, 1, 0xbf31)),
+        (4, i_type(0x09, 0, 2, 1)),
+        (8, i_type(0x3f, 1, 2, 8)),
+        (12, i_type(0x0f, 0, 1, 0xbfc0)),
+        (16, i_type(0x09, 0, 2, 0x5a)),
+        (20, i_type(0x28, 1, 2, 0x4000)),
+        (24, WAIT),
+    ]);
+    let mut machine = Ip32Machine::from_config(config).unwrap();
+    machine.schedule_power_on().unwrap();
+
+    let _ = machine.run_steps(500).unwrap();
+    let flash = machine
+        .runtime()
+        .registry()
+        .get_typed::<SystemFlash>(component_ids::PROM)
+        .unwrap();
+    assert_eq!(flash.bytes()[0x4000], 0x5a);
+    assert_eq!(flash.persistence_revision(), 1);
+
+    machine.hard_reset().unwrap();
+    let flash = machine
+        .runtime()
+        .registry()
+        .get_typed::<SystemFlash>(component_ids::PROM)
+        .unwrap();
+    assert_eq!(flash.bytes()[0x4000], 0x5a);
+}
+
+#[test]
 fn construction_registers_the_role_oriented_ip32_topology() {
     let machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
     let registry = machine.runtime().registry();
@@ -397,7 +431,7 @@ fn construction_registers_the_role_oriented_ip32_topology() {
     );
     assert!(
         registry
-            .get_typed::<ReadArrayFlash>(component_ids::PROM)
+            .get_typed::<SystemFlash>(component_ids::PROM)
             .is_ok()
     );
 }
@@ -947,6 +981,152 @@ impl TraceSink for PromAcceptanceSink {
     }
 }
 
+#[derive(Default)]
+struct PromEnvironmentSink {
+    failed_addresses: Vec<u64>,
+    flash_write_addresses: Vec<u64>,
+}
+
+impl TraceSink for PromEnvironmentSink {
+    fn interest(&self, source: TraceSource) -> TraceInterest {
+        if matches!(source, TraceSource::Scheduler) {
+            TraceInterest::None
+        } else {
+            TraceInterest::Filtered
+        }
+    }
+
+    fn enabled(
+        &self,
+        _source: TraceSource,
+        _level: se_core::tracing::TraceLevel,
+        target: &str,
+        event: &str,
+    ) -> bool {
+        (target == "ip32.sysad" && event == "access")
+            || (target == "ip32.mace.cmi" && event == "pio")
+    }
+
+    fn record(&mut self, record: TraceRecord<'_>) {
+        let value = |key| {
+            record
+                .fields
+                .iter()
+                .find_map(|field| (field.key == key).then_some(field.value))
+        };
+        if record.target == "ip32.sysad" && record.event == "access" {
+            if matches!(value("bus_error"), Some(TraceValue::Bool(true)))
+                && let Some(TraceValue::Hex64(address)) = value("physical_address")
+            {
+                self.failed_addresses.push(address);
+            }
+            return;
+        }
+        if record.target == "ip32.mace.cmi"
+            && record.event == "pio"
+            && matches!(value("write"), Some(TraceValue::Bool(true)))
+            && let Some(TraceValue::Hex64(address)) = value("address")
+            && (se_device::chipset::mace::registers::PROM_START
+                ..se_device::chipset::mace::registers::PROM_END)
+                .contains(&address)
+        {
+            self.flash_write_addresses.push(address);
+        }
+    }
+}
+
+fn drain_serial_one<S>(machine: &mut Ip32Machine<S>, terminal: &mut Vec<u8>) {
+    while let Some(output) = machine.poll_serial_output() {
+        if output.port == Ip32SerialPort::Serial1 {
+            terminal.extend(output.bytes);
+        }
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|candidate| candidate == needle)
+}
+
+fn run_until_serial_one_contains<S: TraceSink>(
+    machine: &mut Ip32Machine<S>,
+    terminal: &mut Vec<u8>,
+    needle: &[u8],
+    max_events: usize,
+    context: &str,
+) {
+    const BATCH_SIZE: usize = 4_096;
+    let mut dispatched = 0;
+    while dispatched < max_events {
+        let batch = (max_events - dispatched).min(BATCH_SIZE);
+        let status = machine.run_steps(batch).unwrap();
+        dispatched += batch;
+        drain_serial_one(machine, terminal);
+        if contains_bytes(terminal, needle) {
+            return;
+        }
+        assert!(
+            !matches!(status, RunStatus::Idle | RunStatus::Stopped),
+            "IP32 became inactive while waiting for {context}"
+        );
+    }
+    panic!("IP32 did not produce {context} within {max_events} events");
+}
+
+fn send_serial_one<S: TraceSink>(machine: &mut Ip32Machine<S>, bytes: &[u8]) {
+    machine
+        .schedule_serial_input(
+            machine.runtime().now(),
+            Ip32SerialPort::Serial1,
+            bytes.to_vec(),
+        )
+        .unwrap();
+}
+
+fn enter_command_monitor<S: TraceSink>(
+    machine: &mut Ip32Machine<S>,
+    terminal: &mut Vec<u8>,
+    max_events: usize,
+) {
+    run_until_serial_one_contains(
+        machine,
+        terminal,
+        b"System Maintenance Menu",
+        max_events,
+        "the System Maintenance Menu",
+    );
+    terminal.clear();
+    send_serial_one(machine, b"5\r");
+    run_until_serial_one_contains(
+        machine,
+        terminal,
+        b"> ",
+        max_events,
+        "the Command Monitor prompt",
+    );
+}
+
+fn printenv_diagmode<S: TraceSink>(
+    machine: &mut Ip32Machine<S>,
+    terminal: &mut Vec<u8>,
+    max_events: usize,
+) {
+    terminal.clear();
+    send_serial_one(machine, b"printenv diagmode\r");
+    run_until_serial_one_contains(
+        machine,
+        terminal,
+        b"> ",
+        max_events,
+        "the prompt after printenv",
+    );
+    assert!(
+        contains_bytes(terminal, b"diagmode=v"),
+        "printenv did not return the value programmed by setenv"
+    );
+}
+
 #[test]
 #[ignore = "requires a local proprietary IP32 PROM image"]
 fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
@@ -1024,6 +1204,84 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
         ),
         "a modeled CRIME access returned a bus error"
     );
+}
+
+#[test]
+#[ignore = "requires a local proprietary IP32 PROM image"]
+fn local_ip32_prom_environment_uses_system_flash() {
+    const ENV_START: u64 = 0x1fc0_4000;
+    const ENV_END: u64 = 0x1fc0_4400;
+    let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
+    let config = Ip32MachineConfig {
+        prom_image: std::fs::read(path).expect("the local PROM image must be readable"),
+        ..Ip32MachineConfig::default()
+    };
+    let max_events = std::env::var("IP32_PROM_INTERACTION_EVENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(120_000_000);
+    let mut machine =
+        Ip32Machine::from_config_with_trace_sink(config.clone(), PromEnvironmentSink::default())
+            .unwrap();
+    machine.schedule_power_on().unwrap();
+
+    let mut terminal = Vec::new();
+    enter_command_monitor(&mut machine, &mut terminal, max_events);
+    let rtc_before = machine
+        .runtime()
+        .registry()
+        .get_typed::<Ds1687>(component_ids::RTC)
+        .unwrap()
+        .nvram_snapshot()
+        .to_vec();
+
+    terminal.clear();
+    send_serial_one(&mut machine, b"setenv diagmode v\r");
+    run_until_serial_one_contains(
+        &mut machine,
+        &mut terminal,
+        b"> ",
+        max_events,
+        "the prompt after setenv",
+    );
+    let rtc_after = machine
+        .runtime()
+        .registry()
+        .get_typed::<Ds1687>(component_ids::RTC)
+        .unwrap()
+        .nvram_snapshot();
+    assert_eq!(rtc_after.as_slice(), rtc_before);
+
+    let sink = machine.runtime().trace_recorder().sink();
+    assert!(
+        sink.failed_addresses.is_empty(),
+        "setenv produced failed SysAD accesses: {:#x?}",
+        sink.failed_addresses
+    );
+    let mut unique_writes = sink.flash_write_addresses.clone();
+    unique_writes.sort_unstable();
+    unique_writes.dedup();
+    assert_eq!(unique_writes, (ENV_START..ENV_END).collect::<Vec<_>>());
+    let flash = machine.system_flash_persistent_state().unwrap();
+    assert!(!flash.changes().is_empty());
+    assert!(flash.changes().iter().all(|change| {
+        let start = se_device::chipset::mace::registers::PROM_START + change.offset();
+        let end = start + change.bytes().len() as u64;
+        start >= ENV_START && end <= ENV_END
+    }));
+    printenv_diagmode(&mut machine, &mut terminal, max_events);
+
+    let saved = machine.save_state().unwrap();
+    machine.hard_reset().unwrap();
+    terminal.clear();
+    enter_command_monitor(&mut machine, &mut terminal, max_events);
+    printenv_diagmode(&mut machine, &mut terminal, max_events);
+
+    let mut restored =
+        Ip32Machine::from_state_with_trace_sink(config, saved, PromEnvironmentSink::default())
+            .unwrap();
+    terminal.clear();
+    printenv_diagmode(&mut restored, &mut terminal, max_events);
 }
 
 #[test]

@@ -56,7 +56,7 @@ use se_device::cpu::mips4::model::r5000::cpu::{
 use se_device::cpu::mips4::model::r5000::profile::R5000Profile;
 use se_device::cpu::mips4::model::r5000::revision::R5000Revision;
 use se_device::memory::ds2502::{Ds2502, Ds2502Action, Ds2502Config, Ds2502Error};
-use se_device::memory::flash::ReadArrayFlash;
+use se_device::memory::flash::{SystemFlash, SystemFlashPersistentState, SystemFlashStateError};
 use se_device::parallel::ieee1284::{IEEE1284_IRQ_OUTPUT, Ieee1284, Ieee1284Action};
 use se_device::rtc::ds1687::state::{Ds1687PersistentState, Ds1687StateError};
 use se_device::rtc::ds1687::{DS1687_IRQ_OUTPUT, Ds1687, Ds1687Action, Ds1687Config, Ds1687Error};
@@ -109,13 +109,18 @@ pub struct Ip32MachineConfig {
     /// MACE I/O ASIC configuration.
     pub mace: MaceConfig,
 
-    /// Deterministic RTC time and battery-backed NVRAM image.
+    /// Deterministic DS1687 RTC time and battery-backed register/NVRAM image.
+    ///
+    /// The IP32 PROM environment is not stored in this device.
     pub rtc: Ds1687Config,
 
     /// Deterministic board-identity ROM and EPROM image.
     pub nic_identity: Ds2502Config,
 
-    /// Exact 512 KiB System PROM image.
+    /// Immutable base image for the 512 KiB byte-programmable System Flash.
+    ///
+    /// On IP32, the PROM environment resides in this System Flash and remains
+    /// physically separate from the DS1687 RTC/NVRAM domain.
     pub prom_image: Vec<u8>,
 }
 
@@ -427,7 +432,7 @@ struct HotComponentSlots {
     gbe: ComponentSlot<Gbe>,
     mace: ComponentSlot<Mace>,
     isa: ComponentSlot<IsaBus>,
-    prom: ComponentSlot<ReadArrayFlash>,
+    prom: ComponentSlot<SystemFlash>,
     rtc: ComponentSlot<Ds1687>,
     serial: [ComponentSlot<Uart16550>; 2],
     parallel: ComponentSlot<Ieee1284>,
@@ -768,7 +773,7 @@ impl<S> Ip32Machine<S> {
         )?;
         insert_component(
             registry,
-            Box::new(ReadArrayFlash::new(
+            Box::new(SystemFlash::new(
                 component_ids::PROM,
                 "System flash",
                 config.prom_image,
@@ -965,7 +970,10 @@ impl<S> Ip32Machine<S> {
         }
     }
 
-    /// Captures the battery-backed RTC and NVRAM image at the current simulated time.
+    /// Captures the physical DS1687 RTC/NVRAM domain at the current simulated time.
+    ///
+    /// This state does not contain the IP32 PROM environment stored in System
+    /// Flash.
     pub fn rtc_persistent_state(&self) -> Result<Ds1687PersistentState, RegistryLookupError> {
         self.runtime
             .registry()
@@ -985,6 +993,32 @@ impl<S> Ip32Machine<S> {
             .map_err(RestoreRtcPersistentStateError::Registry)?
             .restore_persistent_state(state, now)
             .map_err(RestoreRtcPersistentStateError::Rtc)
+    }
+
+    /// Captures guest-programmed System Flash bytes relative to the base PROM image.
+    ///
+    /// On IP32, this includes the PROM environment and is independent of the
+    /// DS1687 RTC/NVRAM state.
+    pub fn system_flash_persistent_state(
+        &self,
+    ) -> Result<SystemFlashPersistentState, RegistryLookupError> {
+        self.runtime
+            .registry()
+            .get_typed::<SystemFlash>(component_ids::PROM)
+            .map(SystemFlash::persistent_state)
+    }
+
+    /// Applies guest-programmed System Flash bytes to a newly constructed machine.
+    pub fn restore_system_flash_persistent_state(
+        &mut self,
+        state: &SystemFlashPersistentState,
+    ) -> Result<(), RestoreSystemFlashPersistentStateError> {
+        self.runtime
+            .registry_mut()
+            .get_typed_mut::<SystemFlash>(component_ids::PROM)
+            .map_err(RestoreSystemFlashPersistentStateError::Registry)?
+            .restore_persistent_state(state)
+            .map_err(RestoreSystemFlashPersistentStateError::SystemFlash)
     }
 
     /// Captures the complete deterministic machine state at an outer event boundary.
@@ -1069,6 +1103,10 @@ impl<S> Ip32Machine<S> {
             mace: save_component(registry, component_ids::MACE, Mace::save_state)?,
             gbe: save_component(registry, component_ids::GBE, Gbe::save_state)?,
             vice: save_component(registry, component_ids::VICE, Ip32StubEndpoint::save_state)?,
+            system_flash: registry
+                .get_typed::<SystemFlash>(component_ids::PROM)
+                .map_err(Ip32StateError::Registry)?
+                .save_state(),
             rtc: registry
                 .get_typed::<Ds1687>(component_ids::RTC)
                 .map_err(Ip32StateError::Registry)?
@@ -1218,6 +1256,11 @@ impl<S> Ip32Machine<S> {
             Ip32StubEndpoint::restore_state,
         )?;
         registry
+            .get_typed_mut::<SystemFlash>(component_ids::PROM)
+            .map_err(Ip32StateError::Registry)?
+            .restore_state(state.system_flash)
+            .map_err(Ip32StateError::SystemFlash)?;
+        registry
             .get_typed_mut::<Ds1687>(component_ids::RTC)
             .map_err(Ip32StateError::Registry)?
             .restore_state(state.rtc)
@@ -1312,6 +1355,26 @@ impl fmt::Display for RestoreRtcPersistentStateError {
 }
 
 impl std::error::Error for RestoreRtcPersistentStateError {}
+
+/// Failure while applying persistent System Flash data to an IP32 machine.
+#[derive(Debug)]
+pub enum RestoreSystemFlashPersistentStateError {
+    /// The fixed System Flash component was missing or had an unexpected type.
+    Registry(RegistryLookupError),
+    /// The saved System Flash image was malformed.
+    SystemFlash(SystemFlashStateError),
+}
+
+impl fmt::Display for RestoreSystemFlashPersistentStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(error) => error.fmt(formatter),
+            Self::SystemFlash(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RestoreSystemFlashPersistentStateError {}
 
 fn save_component<T, State>(
     registry: &ComponentRegistry,
