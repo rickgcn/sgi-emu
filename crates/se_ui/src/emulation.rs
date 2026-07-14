@@ -46,6 +46,7 @@ struct ConfigureRequest {
     prom_path: PathBuf,
     prom: Vec<u8>,
     rtc_mode: RtcPersistenceMode,
+    jit_enabled: bool,
 }
 
 struct SaveStateRequest {
@@ -94,6 +95,7 @@ struct SnapshotData {
     persistence_message: String,
     prom_path: String,
     rtc_mode: RtcPersistenceMode,
+    jit_enabled: bool,
 }
 
 impl Default for SnapshotData {
@@ -110,6 +112,7 @@ impl Default for SnapshotData {
             persistence_message: String::new(),
             prom_path: String::new(),
             rtc_mode: RtcPersistenceMode::RealTime,
+            jit_enabled: false,
         }
     }
 }
@@ -249,11 +252,17 @@ impl EmulationController {
 
     /// Replaces the current machine with one using the supplied System PROM.
     pub fn configure_prom(&self, prom: &[u8]) -> bool {
-        self.configure_machine("", prom, RtcPersistenceMode::RealTime.as_u8())
+        self.configure_machine("", prom, RtcPersistenceMode::RealTime.as_u8(), false)
     }
 
     /// Replaces the current machine and persists its PROM path and RTC policy.
-    pub fn configure_machine(&self, prom_path: &str, prom: &[u8], rtc_mode: u8) -> bool {
+    pub fn configure_machine(
+        &self,
+        prom_path: &str,
+        prom: &[u8],
+        rtc_mode: u8,
+        jit_enabled: bool,
+    ) -> bool {
         if prom.len() != IP32_PROM_IMAGE_SIZE_BYTES {
             return false;
         }
@@ -287,6 +296,7 @@ impl EmulationController {
             prom_path,
             prom: prom.to_vec(),
             rtc_mode,
+            jit_enabled,
         });
         clear_terminal_inputs(&mut state);
         state.snapshot.state = EmulationState::Building;
@@ -448,6 +458,7 @@ impl EmulationController {
             persistence_message: snapshot.persistence_message,
             prom_path: snapshot.prom_path,
             rtc_mode: snapshot.rtc_mode.as_u8(),
+            jit_enabled: snapshot.jit_enabled,
         }
     }
 
@@ -644,6 +655,7 @@ fn configure_worker_machine(
             state.snapshot.sim_time = 0;
             state.snapshot.prom_path = config.prom_path().to_string_lossy().into_owned();
             state.snapshot.rtc_mode = config.rtc_mode();
+            state.snapshot.jit_enabled = config.jit_enabled();
             *machine = Some(new_machine);
             *active_config = Some(config);
             battery.reset();
@@ -734,6 +746,7 @@ fn auto_configure_machine(
             let mut state = lock_state(shared);
             state.snapshot.prom_path = config.prom_path().to_string_lossy().into_owned();
             state.snapshot.rtc_mode = config.rtc_mode();
+            state.snapshot.jit_enabled = config.jit_enabled();
             set_unconfigured_error(&mut state, error.to_string());
             return;
         }
@@ -754,11 +767,12 @@ fn auto_configure_machine(
     if let Some(warning) = flash_load.warning {
         warnings.push(warning);
     }
-    let machine_config = config.machine().machine_config(
+    let mut machine_config = config.machine().machine_config(
         prom,
         battery_load.state.unix_seconds(),
         battery_load.state.nvram().to_vec(),
     );
+    machine_config.jit_enabled = config.jit_enabled();
     let result = (|| {
         let mut new_machine =
             Ip32Machine::from_config_with_trace_sink(machine_config, UiTraceSink::application())
@@ -793,6 +807,7 @@ fn auto_configure_machine(
             state.snapshot.state = EmulationState::Paused;
             state.snapshot.prom_path = config.prom_path().to_string_lossy().into_owned();
             state.snapshot.rtc_mode = config.rtc_mode();
+            state.snapshot.jit_enabled = config.jit_enabled();
             state.snapshot.error_message.clear();
             if !warnings.is_empty() {
                 set_persistence_result(
@@ -824,8 +839,14 @@ fn build_configured_machine(
             .map_err(|error| error.to_string())?
             .join("unpersisted-prom.bin")
     };
-    let config = EmulationConfig::new(metadata_path, prom_hash, request.rtc_mode, persistent)
-        .map_err(|error| error.to_string())?;
+    let config = EmulationConfig::new(
+        metadata_path,
+        prom_hash,
+        request.rtc_mode,
+        persistent,
+        request.jit_enabled,
+    )
+    .map_err(|error| error.to_string())?;
     let battery_load = shared
         .paths
         .as_ref()
@@ -853,10 +874,11 @@ fn build_configured_machine(
             )
             .expect("the fallback battery image has the hardware size")
         });
-    let machine_config =
+    let mut machine_config =
         config
             .machine()
             .machine_config(request.prom, rtc.unix_seconds(), rtc.nvram().to_vec());
+    machine_config.jit_enabled = config.jit_enabled();
     let mut machine =
         Ip32Machine::from_config_with_trace_sink(machine_config, UiTraceSink::application())
             .map_err(|error| error.to_string())?;
@@ -953,11 +975,12 @@ fn load_machine_state(
             .with_prom_path(prom_path)
             .map_err(|error| LoadMachineError::Failed(error.to_string()))?;
         let fallback_rtc = load_battery_for_config(shared, &config);
-        let machine_config = config.machine().machine_config(
+        let mut machine_config = config.machine().machine_config(
             prom,
             fallback_rtc.unix_seconds(),
             fallback_rtc.nvram().to_vec(),
         );
+        machine_config.jit_enabled = config.jit_enabled();
         let new_machine = Ip32Machine::from_state_with_trace_sink(
             machine_config,
             loaded.state,
@@ -992,6 +1015,7 @@ fn load_machine_state(
             state.snapshot.state = EmulationState::Paused;
             state.snapshot.prom_path = config.prom_path().to_string_lossy().into_owned();
             state.snapshot.rtc_mode = config.rtc_mode();
+            state.snapshot.jit_enabled = config.jit_enabled();
             state.snapshot.error_message.clear();
             for (port, bytes) in terminal_output {
                 enqueue_terminal_output(&mut state, port, bytes);
@@ -1585,6 +1609,7 @@ mod tests {
             prom_path.to_str().unwrap(),
             &prom,
             RtcPersistenceMode::Frozen.as_u8(),
+            false,
         ));
         wait_for_state(&controller, EmulationState::Paused);
         let first_session = controller.snapshot().session_id;

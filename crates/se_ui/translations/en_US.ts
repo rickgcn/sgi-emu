@@ -169,6 +169,11 @@
         <translation>RTC Persistence</translation>
     </message>
     <message>
+        <location filename="../src/application.cpp" line="107"/>
+        <source>Enable JIT Compilation</source>
+        <translation>Enable JIT Compilation</translation>
+    </message>
+    <message>
         <location filename="../src/application.cpp" line="101"/>
         <source>Real Time</source>
         <translation>Real Time</translation>

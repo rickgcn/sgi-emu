@@ -38,6 +38,7 @@ pub(crate) mod ffi {
         persistence_message: String,
         prom_path: String,
         rtc_mode: u8,
+        jit_enabled: bool,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +137,7 @@ pub(crate) mod ffi {
             prom_path: &str,
             prom: &[u8],
             rtc_mode: u8,
+            jit_enabled: bool,
         ) -> bool;
         fn request_save_state(self: &EmulationController, path: &str) -> bool;
         fn request_load_state(self: &EmulationController, path: &str, prom_override: &str) -> bool;

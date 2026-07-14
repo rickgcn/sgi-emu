@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 pub(crate) const MACHINE_ID: &str = "sgi-o2-ip32";
-const EMULATION_CONFIG_VERSION: u32 = 1;
+const EMULATION_CONFIG_VERSION: u32 = 2;
 const BATTERY_VERSION: u32 = 1;
 const SYSTEM_FLASH_VERSION: u32 = 1;
 const STATE_CONTAINER_VERSION: u32 = 1;
@@ -79,6 +79,26 @@ pub(crate) struct EmulationConfig {
     prom_sha256: String,
     rtc_mode: RtcPersistenceMode,
     machine: Ip32PersistentConfig,
+    #[serde(default)]
+    jit_enabled: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct EmulationConfigV1 {
+    version: u32,
+    machine_id: String,
+    prom_path: PathBuf,
+    prom_sha256: String,
+    rtc_mode: RtcPersistenceMode,
+    machine: Ip32PersistentConfig,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StateMetadataV1 {
+    machine_id: String,
+    state_schema_version: u32,
+    application_version: String,
+    emulation_config: EmulationConfigV1,
 }
 
 impl EmulationConfig {
@@ -87,6 +107,7 @@ impl EmulationConfig {
         prom_hash: [u8; 32],
         rtc_mode: RtcPersistenceMode,
         machine: Ip32PersistentConfig,
+        jit_enabled: bool,
     ) -> Result<Self, PersistenceError> {
         if !prom_path.is_absolute() {
             return Err(PersistenceError::PromPathNotAbsolute(prom_path));
@@ -98,7 +119,22 @@ impl EmulationConfig {
             prom_sha256: encode_hash(prom_hash),
             rtc_mode,
             machine,
+            jit_enabled,
         })
+    }
+
+    fn migrate(mut self) -> Result<Self, PersistenceError> {
+        match self.version {
+            1 => {
+                self.version = EMULATION_CONFIG_VERSION;
+                self.jit_enabled = false;
+            }
+            EMULATION_CONFIG_VERSION => {}
+            version => {
+                return Err(PersistenceError::UnsupportedEmulationConfig { version });
+            }
+        }
+        Ok(self)
     }
 
     pub(crate) fn validate(&self) -> Result<(), PersistenceError> {
@@ -138,6 +174,10 @@ impl EmulationConfig {
 
     pub(crate) const fn machine(&self) -> &Ip32PersistentConfig {
         &self.machine
+    }
+
+    pub(crate) const fn jit_enabled(&self) -> bool {
+        self.jit_enabled
     }
 
     pub(crate) fn with_prom_path(mut self, path: PathBuf) -> Result<Self, PersistenceError> {
@@ -243,6 +283,7 @@ pub(crate) fn load_emulation_config(
     let parsed = toml::from_str::<EmulationConfig>(&contents)
         .map_err(PersistenceError::TomlRead)
         .and_then(|config| {
+            let config = config.migrate()?;
             config.validate()?;
             Ok(config)
         });
@@ -461,8 +502,26 @@ pub(crate) fn read_state_file(path: &Path) -> Result<LoadedStateFile, Persistenc
     let mut metadata = vec![0; metadata_length as usize];
     file.read_exact(&mut metadata)
         .map_err(PersistenceError::Io)?;
-    let metadata: StateMetadata =
-        postcard::from_bytes(&metadata).map_err(PersistenceError::PostcardRead)?;
+    let metadata = match postcard::from_bytes::<StateMetadata>(&metadata) {
+        Ok(metadata) => metadata,
+        Err(current_error) => match postcard::from_bytes::<StateMetadataV1>(&metadata) {
+            Ok(metadata) => StateMetadata {
+                machine_id: metadata.machine_id,
+                state_schema_version: metadata.state_schema_version,
+                application_version: metadata.application_version,
+                emulation_config: EmulationConfig {
+                    version: metadata.emulation_config.version,
+                    machine_id: metadata.emulation_config.machine_id,
+                    prom_path: metadata.emulation_config.prom_path,
+                    prom_sha256: metadata.emulation_config.prom_sha256,
+                    rtc_mode: metadata.emulation_config.rtc_mode,
+                    machine: metadata.emulation_config.machine,
+                    jit_enabled: false,
+                },
+            },
+            Err(_) => return Err(PersistenceError::PostcardRead(current_error)),
+        },
+    };
     if metadata.machine_id != MACHINE_ID {
         return Err(PersistenceError::WrongMachine {
             machine_id: metadata.machine_id,
@@ -473,8 +532,9 @@ pub(crate) fn read_state_file(path: &Path) -> Result<LoadedStateFile, Persistenc
             version: metadata.state_schema_version,
         });
     }
-    metadata.emulation_config.validate()?;
-    let topology_limit = state_topology_limit(&metadata.emulation_config);
+    let emulation_config = metadata.emulation_config.migrate()?;
+    emulation_config.validate()?;
+    let topology_limit = state_topology_limit(&emulation_config);
     if uncompressed_length > topology_limit {
         return Err(PersistenceError::StateExceedsTopologyLimit {
             length: uncompressed_length,
@@ -500,7 +560,7 @@ pub(crate) fn read_state_file(path: &Path) -> Result<LoadedStateFile, Persistenc
     }
     let state = postcard::from_bytes(&payload).map_err(PersistenceError::PostcardRead)?;
     Ok(LoadedStateFile {
-        metadata_config: metadata.emulation_config,
+        metadata_config: emulation_config,
         state,
     })
 }
@@ -893,6 +953,7 @@ mod tests {
             hash_bytes(&prom),
             RtcPersistenceMode::Frozen,
             Ip32PersistentConfig::default(),
+            true,
         )
         .unwrap();
         let machine = Ip32Machine::from_config(Ip32MachineConfig::default()).unwrap();
@@ -932,6 +993,7 @@ mod tests {
             [0x5a; 32],
             RtcPersistenceMode::RealTime,
             Ip32PersistentConfig::default(),
+            false,
         )
         .unwrap();
         save_emulation_config(&paths, &config).unwrap();
@@ -942,6 +1004,60 @@ mod tests {
         let loaded = load_battery(&paths, RtcPersistenceMode::RealTime, 125);
         assert_eq!(loaded.state.unix_seconds(), 35);
         assert_eq!(loaded.state.revision(), 4);
+    }
+
+    #[test]
+    fn version_one_configuration_and_state_metadata_disable_jit() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = PersistencePaths {
+            config_file: directory.path().join("emulation.toml"),
+            battery_file: directory.path().join("rtc.bin"),
+            system_flash_dir: directory.path().join("flash"),
+        };
+        let prom_path = directory.path().join("prom.bin");
+        let prom = vec![0; IP32_PROM_IMAGE_SIZE_BYTES];
+        fs::write(&prom_path, &prom).unwrap();
+        let legacy = EmulationConfigV1 {
+            version: 1,
+            machine_id: MACHINE_ID.to_owned(),
+            prom_path: prom_path.clone(),
+            prom_sha256: encode_hash(hash_bytes(&prom)),
+            rtc_mode: RtcPersistenceMode::Frozen,
+            machine: Ip32PersistentConfig::default(),
+        };
+        fs::write(&paths.config_file, toml::to_string_pretty(&legacy).unwrap()).unwrap();
+        let migrated = load_emulation_config(&paths).unwrap().unwrap();
+        assert_eq!(migrated.version, EMULATION_CONFIG_VERSION);
+        assert!(!migrated.jit_enabled());
+
+        let machine = Ip32Machine::from_config(Ip32MachineConfig::default()).unwrap();
+        let state = machine.save_state().unwrap();
+        let payload = postcard::to_stdvec(&state).unwrap();
+        let compressed = zstd::stream::encode_all(payload.as_slice(), ZSTD_LEVEL).unwrap();
+        let metadata = postcard::to_stdvec(&StateMetadataV1 {
+            machine_id: MACHINE_ID.to_owned(),
+            state_schema_version: IP32_STATE_SCHEMA_VERSION,
+            application_version: "0.1.0".to_owned(),
+            emulation_config: legacy,
+        })
+        .unwrap();
+        let mut container = Vec::new();
+        container.extend_from_slice(&STATE_MAGIC);
+        container.extend_from_slice(&STATE_CONTAINER_VERSION.to_le_bytes());
+        container.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        container.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        container.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        container.extend_from_slice(&hash_bytes(&payload));
+        container.extend_from_slice(&metadata);
+        container.extend_from_slice(&compressed);
+        let state_path = directory.path().join("legacy.sestate");
+        fs::write(&state_path, container).unwrap();
+        assert!(
+            !read_state_file(&state_path)
+                .unwrap()
+                .metadata_config
+                .jit_enabled()
+        );
     }
 
     #[test]

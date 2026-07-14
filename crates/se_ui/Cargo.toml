@@ -15,7 +15,7 @@ directories.workspace = true
 postcard.workspace = true
 se_core.workspace = true
 se_device.workspace = true
-se_machine.workspace = true
+se_machine = { workspace = true, features = ["jit"] }
 se_runtime.workspace = true
 serde.workspace = true
 sha2.workspace = true

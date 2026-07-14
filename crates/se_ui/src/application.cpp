@@ -29,6 +29,7 @@
 #include <QtSvg/QSvgRenderer>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QComboBox>
+#include <QtWidgets/QCheckBox>
 #include <QtWidgets/QDialog>
 #include <QtWidgets/QDialogButtonBox>
 #include <QtWidgets/QDockWidget>
@@ -102,6 +103,8 @@ constexpr auto rtc_real_time_text = QT_TRANSLATE_NOOP("MainWindow", "Real Time")
 constexpr auto rtc_frozen_text = QT_TRANSLATE_NOOP("MainWindow", "Frozen");
 constexpr auto rtc_sync_host_text =
   QT_TRANSLATE_NOOP("MainWindow", "Synchronize with Host");
+constexpr auto enable_jit_text =
+  QT_TRANSLATE_NOOP("MainWindow", "Enable JIT Compilation");
 constexpr auto browse_text = QT_TRANSLATE_NOOP("MainWindow", "Browse...");
 constexpr auto select_prom_text =
   QT_TRANSLATE_NOOP("MainWindow", "Select System PROM");
@@ -287,6 +290,10 @@ void show_emulation_settings_dialog(
   }
   layout->addRow(translate(rtc_mode_text), rtc_mode);
 
+  auto* jit_enabled = new QCheckBox(translate(enable_jit_text), &dialog);
+  jit_enabled->setChecked(snapshot.jit_enabled);
+  layout->addRow(jit_enabled);
+
   QObject::connect(browse, &QPushButton::clicked, &dialog, [&dialog, prom_path] {
     QSettings settings;
     const auto path = QFileDialog::getOpenFileName(
@@ -307,7 +314,7 @@ void show_emulation_settings_dialog(
     buttons,
     &QDialogButtonBox::accepted,
     &dialog,
-    [&dialog, prom_path, rtc_mode, &controller] {
+    [&dialog, prom_path, rtc_mode, jit_enabled, &controller] {
       if (prom_path->text().isEmpty()) {
         QMessageBox::warning(
           &dialog,
@@ -341,7 +348,8 @@ void show_emulation_settings_dialog(
             rust::Slice<const std::uint8_t>(
               data,
               static_cast<std::size_t>(prom.size())),
-            static_cast<std::uint8_t>(rtc_mode->currentData().toUInt()))) {
+            static_cast<std::uint8_t>(rtc_mode->currentData().toUInt()),
+            jit_enabled->isChecked())) {
         QMessageBox::warning(
           &dialog,
           translate(emulation_settings_text),
