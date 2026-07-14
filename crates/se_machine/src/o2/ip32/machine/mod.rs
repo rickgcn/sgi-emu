@@ -1,10 +1,16 @@
 //! Runtime integration for the SGI O2 IP32 machine profile.
 
 use core::fmt;
+#[cfg(feature = "jit")]
+use std::collections::HashMap;
 use std::collections::VecDeque;
+#[cfg(feature = "jit")]
+use std::hash::{BuildHasherDefault, Hasher};
 
 use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole, BusRole};
+#[cfg(feature = "jit")]
+use se_core::scheduler::FractionalClockProjection;
 use se_core::scheduler::{ScheduledEvent, ScheduledEventId, SchedulerError, SimDuration, SimTime};
 use se_core::tracing::{
     NoopTraceSink, TraceField, TraceInterest, TraceLevel, TraceSink, TraceSource,
@@ -29,6 +35,8 @@ use se_device::chipset::crime::iou::{
 };
 use se_device::chipset::crime::memory::CrimeSdram;
 use se_device::chipset::crime::memory::bus::{CrimeMemoryBus, CrimeMemoryBusEvent};
+#[cfg(feature = "jit")]
+use se_device::chipset::crime::protocol::CrimeTransferView;
 use se_device::chipset::crime::protocol::{
     CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusAction, CrimeBusDisposition, CrimeCgiTransaction,
     CrimeCmiTransaction, CrimeCpuSignal, CrimeLinkDeviceResponse, CrimeMemoryTransaction,
@@ -67,7 +75,19 @@ use se_runtime::registry::{ComponentRegistry, ComponentSlot, RegistryError, Regi
 use se_runtime::runtime::event_chain::EventChainError;
 use se_runtime::runtime::{RunError, RunStatus, Runtime, RuntimeContext, RuntimeStatistics};
 
+#[cfg(feature = "jit")]
+use se_device::cpu::mips4::execution::block::{
+    MIPS4_BLOCK_CACHE_CAPACITY, MIPS4_BLOCK_MAX_INSTRUCTIONS, Mips4BlockEngine, Mips4CodeGuard,
+    Mips4CodeGuardKind, Mips4CodeWindow, Mips4SliceClock, Mips4SliceTimeline,
+};
+#[cfg(feature = "jit")]
+use se_device::cpu::mips4::model::r5000::cpu::R5000ExecutionSliceAction;
+#[cfg(feature = "jit")]
+use se_jit::mips4::CraneliftMips4Backend;
+
 use super::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
+#[cfg(feature = "jit")]
+use super::address_map::{Ip32AddressResolution, Ip32PhysicalRegion};
 use super::bus::{Ip32StubEndpoint, Ip32SysAdBus, Ip32SysAdBusAction};
 use super::component_ids;
 #[cfg(test)]
@@ -97,6 +117,10 @@ const DEFAULT_CPU_CONTINUATION_QUANTUM: usize = 256;
 /// Complete construction input for one IP32 machine.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ip32MachineConfig {
+    /// Enables the host-native tiered execution engine.
+    #[serde(default)]
+    pub jit_enabled: bool,
+
     /// R5000 processor identity, byte order, clocks, and cache geometry.
     pub processor: R5000Profile,
 
@@ -127,6 +151,7 @@ pub struct Ip32MachineConfig {
 impl Default for Ip32MachineConfig {
     fn default() -> Self {
         Self {
+            jit_enabled: false,
             processor: R5000Profile::new(
                 Mips4Endianness::Big,
                 R5000Revision::from_bits(0x21),
@@ -149,6 +174,12 @@ impl Default for Ip32MachineConfig {
 /// Error returned while constructing an IP32 machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Ip32MachineBuildError {
+    /// JIT execution was requested from a build without JIT support.
+    JitUnavailable,
+
+    /// The host-native backend could not be initialized.
+    JitInitialization(String),
+
     /// CRIME configuration is invalid.
     Crime(CrimeError),
 
@@ -195,6 +226,10 @@ pub enum Ip32MachineBuildError {
 impl fmt::Display for Ip32MachineBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::JitUnavailable => write!(f, "JIT execution is unavailable in this build"),
+            Self::JitInitialization(error) => {
+                write!(f, "failed to initialize the JIT backend: {error}")
+            }
             Self::Crime(error) => write!(f, "failed to construct CRIME: {error}"),
             Self::Mace(error) => write!(f, "failed to construct MACE: {error}"),
             Self::Rtc(error) => write!(f, "failed to construct DS1687: {error}"),
@@ -395,9 +430,61 @@ impl CpuClock {
         self.remainder %= self.frequency_hz;
         SimDuration::new(base + carry)
     }
+
+    #[cfg(feature = "jit")]
+    fn projection(self) -> FractionalClockProjection {
+        FractionalClockProjection::new(IP32_TIMEBASE_HZ, self.frequency_hz, self.remainder)
+    }
+
+    #[cfg(feature = "jit")]
+    fn advance_pclocks(&mut self, count: u64) -> SimDuration {
+        let mut projection = self.projection();
+        let elapsed = projection
+            .advance(count)
+            .expect("the bounded PClock advance cannot overflow");
+        self.remainder = projection.remainder();
+        elapsed
+    }
+
+    #[cfg(feature = "jit")]
+    fn plan_boundary_budget(
+        self,
+        now: SimTime,
+        deadline: SimTime,
+        next_event: Option<SimTime>,
+        maximum: usize,
+    ) -> usize {
+        if maximum == 0 {
+            return 0;
+        }
+        let projection = self.projection();
+        let deadline_ticks = deadline.get().saturating_sub(now.get());
+        let maximum_ticks = projection
+            .elapsed(maximum as u64)
+            .expect("the bounded PClock projection cannot overflow")
+            .get();
+        if maximum_ticks <= deadline_ticks
+            && next_event.is_none_or(|event| maximum_ticks <= event.get().saturating_sub(now.get()))
+        {
+            return maximum;
+        }
+        let deadline_boundary = deadline_ticks
+            .checked_add(1)
+            .and_then(|ticks| projection.cycles_until_elapsed_at_least(ticks))
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let event_boundary = next_event.map_or(u64::MAX, |event| {
+            projection
+                .cycles_until_elapsed_at_least(event.get().saturating_sub(now.get()))
+                .unwrap_or(u64::MAX)
+                .max(1)
+        });
+        usize::try_from(deadline_boundary.min(event_boundary))
+            .unwrap_or(usize::MAX)
+            .min(maximum)
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct MachineControl {
     slots: HotComponentSlots,
     persistent_config: Ip32PersistentConfig,
@@ -416,9 +503,85 @@ struct MachineControl {
     cpu_continuation_quantum: usize,
     inline_sysad_completion: bool,
     event_chain_policy: Ip32EventChainPolicy,
+    #[cfg(feature = "jit")]
+    jit_engine: Option<Mips4BlockEngine<CraneliftMips4Backend>>,
+    #[cfg(feature = "jit")]
+    jit_code_sources: Mips4CodeSourceCache,
+    #[cfg(test)]
+    capture_logical_transitions: bool,
     #[cfg(test)]
     logical_transitions: Vec<LogicalTransition>,
+    #[cfg(test)]
+    first_serial_output_time: Option<SimTime>,
 }
+
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct Mips4CodeSourceCacheKey {
+    kind: Mips4CodeGuardKind,
+    source_offset: u64,
+    revision: u64,
+    byte_count: u8,
+    no_ecc: bool,
+}
+
+#[cfg(feature = "jit")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Mips4CodeSourceCacheEntry {
+    bytes: Vec<u8>,
+    fingerprint: u64,
+}
+
+#[cfg(feature = "jit")]
+#[derive(Default)]
+struct Mips4CodeSourceKeyHasher(u64);
+
+#[cfg(feature = "jit")]
+impl Mips4CodeSourceKeyHasher {
+    fn mix(&mut self, value: u64) {
+        self.0 ^= value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        self.0 = self.0.rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Hasher for Mips4CodeSourceKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.mix(u64::from_ne_bytes(chunk.try_into().unwrap()));
+        }
+        let remainder = chunks.remainder();
+        if !remainder.is_empty() {
+            let mut tail = [0; 8];
+            tail[..remainder.len()].copy_from_slice(remainder);
+            self.mix(u64::from_ne_bytes(tail));
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.mix(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.mix(value as u64);
+    }
+}
+
+#[cfg(feature = "jit")]
+type Mips4CodeSourceCache = HashMap<
+    Mips4CodeSourceCacheKey,
+    Mips4CodeSourceCacheEntry,
+    BuildHasherDefault<Mips4CodeSourceKeyHasher>,
+>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HotComponentSlots {
@@ -489,6 +652,34 @@ pub struct Ip32PerformanceSnapshot {
 
     /// Transactions routed onto CGI.
     pub cgi_transactions: u64,
+
+    /// Derived JIT execution counters.
+    pub jit: Ip32JitPerformanceSnapshot,
+}
+
+/// Derived basic-block execution counters for one IP32 machine.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Ip32JitPerformanceSnapshot {
+    /// Guest operations entered by the IR interpreter.
+    pub interpreted_operations: u64,
+
+    /// Guest operations entered by native code.
+    pub native_operations: u64,
+
+    /// Typed runtime helper calls.
+    pub runtime_calls: u64,
+
+    /// Instructions translated after real dynamic fetches.
+    pub dynamic_fetches: u64,
+
+    /// Instructions fetched through stable code windows.
+    pub fast_fetches: u64,
+
+    /// Native blocks compiled since the latest engine reset.
+    pub compiled_blocks: u64,
+
+    /// Whole derived-cache resets.
+    pub cache_resets: u64,
 }
 
 /// SGI O2 IP32 machine with runtime-owned hardware components.
@@ -529,6 +720,15 @@ impl<S> Ip32Machine<S> {
         sink: S,
     ) -> Result<Self, Ip32MachineBuildError> {
         validate_config(&config)?;
+        #[cfg(feature = "jit")]
+        let jit_engine = if config.jit_enabled {
+            Some(Mips4BlockEngine::new(
+                CraneliftMips4Backend::new()
+                    .map_err(|error| Ip32MachineBuildError::JitInitialization(error.to_string()))?,
+            ))
+        } else {
+            None
+        };
         let persistent_config = Ip32PersistentConfig::from_machine_config(&config);
         let processor_frequency_hz = config.processor.processor_frequency_hz;
         let cpu = R5000Cpu::new(
@@ -824,8 +1024,16 @@ impl<S> Ip32Machine<S> {
                 cpu_continuation_quantum: DEFAULT_CPU_CONTINUATION_QUANTUM,
                 inline_sysad_completion: true,
                 event_chain_policy: Ip32EventChainPolicy::all(),
+                #[cfg(feature = "jit")]
+                jit_engine,
+                #[cfg(feature = "jit")]
+                jit_code_sources: Mips4CodeSourceCache::default(),
+                #[cfg(test)]
+                capture_logical_transitions: false,
                 #[cfg(test)]
                 logical_transitions: Vec::new(),
+                #[cfg(test)]
+                first_serial_output_time: None,
             },
         })
     }
@@ -954,6 +1162,26 @@ impl<S> Ip32Machine<S> {
 
     /// Returns a cumulative performance snapshot.
     pub fn performance_snapshot(&self) -> Ip32PerformanceSnapshot {
+        #[cfg(feature = "jit")]
+        let jit = self
+            .control
+            .jit_engine
+            .as_ref()
+            .map(|engine| {
+                let statistics = engine.statistics();
+                Ip32JitPerformanceSnapshot {
+                    interpreted_operations: statistics.interpreted_operations,
+                    native_operations: statistics.native_operations,
+                    runtime_calls: statistics.runtime_calls,
+                    dynamic_fetches: statistics.dynamic_fetches,
+                    fast_fetches: statistics.fast_fetches,
+                    compiled_blocks: statistics.compiled_blocks,
+                    cache_resets: statistics.cache_resets,
+                }
+            })
+            .unwrap_or_default();
+        #[cfg(not(feature = "jit"))]
+        let jit = Ip32JitPerformanceSnapshot::default();
         Ip32PerformanceSnapshot {
             sim_time: self.runtime.now(),
             runtime: self.runtime.statistics(),
@@ -967,6 +1195,7 @@ impl<S> Ip32Machine<S> {
             memory_transactions: self.control.memory_transactions,
             cmi_transactions: self.control.cmi_transactions,
             cgi_transactions: self.control.cgi_transactions,
+            jit,
         }
     }
 
@@ -1300,6 +1529,18 @@ impl<S> Ip32Machine<S> {
         self.runtime
             .restore_state(state.runtime)
             .map_err(Ip32StateError::Scheduler)?;
+        #[cfg(feature = "jit")]
+        let jit_engine = if self.control.jit_engine.is_some() {
+            Some(Mips4BlockEngine::new(
+                CraneliftMips4Backend::new().map_err(|error| {
+                    Ip32StateError::Build(Ip32MachineBuildError::JitInitialization(
+                        error.to_string(),
+                    ))
+                })?,
+            ))
+        } else {
+            None
+        };
         self.control = MachineControl {
             slots: HotComponentSlots::resolve(self.runtime.registry())
                 .map_err(Ip32StateError::Registry)?,
@@ -1329,8 +1570,16 @@ impl<S> Ip32Machine<S> {
                 isa: state.control.fusion_isa,
                 budget: state.control.fusion_budget,
             },
+            #[cfg(feature = "jit")]
+            jit_engine,
+            #[cfg(feature = "jit")]
+            jit_code_sources: Mips4CodeSourceCache::default(),
+            #[cfg(test)]
+            capture_logical_transitions: false,
             #[cfg(test)]
             logical_transitions: Vec::new(),
+            #[cfg(test)]
+            first_serial_output_time: None,
         };
         Ok(())
     }
@@ -1468,6 +1717,10 @@ where
 }
 
 fn validate_config(config: &Ip32MachineConfig) -> Result<(), Ip32MachineBuildError> {
+    #[cfg(not(feature = "jit"))]
+    if config.jit_enabled {
+        return Err(Ip32MachineBuildError::JitUnavailable);
+    }
     config
         .crime
         .validate()
@@ -1550,7 +1803,9 @@ where
     S: TraceSink,
 {
     #[cfg(test)]
-    if let Some(transition) = super::dispatch::logical_transition(context.now(), _target, &payload)
+    if control.capture_logical_transitions
+        && let Some(transition) =
+            super::dispatch::logical_transition(context.now(), _target, &payload)
     {
         control.logical_transitions.push(transition);
     }
@@ -1743,6 +1998,7 @@ where
 {
     advance_cpu_generation(control)?;
     advance_host_generation(control)?;
+    reset_jit_engine(control)?;
     control.host_outputs.clear();
     control.host_output_units.fill(0);
     control.host_dropped_output_bytes.fill(0);
@@ -1821,6 +2077,7 @@ where
 {
     advance_cpu_generation(control)?;
     advance_host_generation(control)?;
+    reset_jit_engine(control)?;
     registry
         .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
         .reset();
@@ -1921,6 +2178,37 @@ fn advance_cpu_generation(control: &mut MachineControl) -> Result<(), Ip32Machin
     Ok(())
 }
 
+#[cfg(feature = "jit")]
+fn reset_jit_engine(control: &mut MachineControl) -> Result<(), Ip32MachineDispatchError> {
+    control.jit_code_sources.clear();
+    if let Some(engine) = &mut control.jit_engine {
+        engine.reset().map_err(|error| {
+            Ip32MachineDispatchError::Cpu(R5000CpuError::Block(error.to_string()))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "jit")]
+fn invalidate_ram_code_sources(control: &mut MachineControl, range: Option<(u64, usize)>) {
+    control.jit_code_sources.retain(|key, _| {
+        if key.kind != Mips4CodeGuardKind::Sdram {
+            return true;
+        }
+        let Some((address, length)) = range else {
+            return false;
+        };
+        let source_end = key.source_offset.saturating_add(u64::from(key.byte_count));
+        let write_end = address.saturating_add(length as u64);
+        write_end <= key.source_offset || source_end <= address
+    });
+}
+
+#[cfg(not(feature = "jit"))]
+fn reset_jit_engine(_control: &mut MachineControl) -> Result<(), Ip32MachineDispatchError> {
+    Ok(())
+}
+
 fn advance_host_generation(control: &mut MachineControl) -> Result<(), Ip32MachineDispatchError> {
     control.host_generation = control
         .host_generation
@@ -1938,8 +2226,598 @@ fn dispatch_cpu_step<S>(
 where
     S: TraceSink,
 {
+    #[cfg(feature = "jit")]
+    if control.jit_engine.is_some() {
+        return drive_cpu_jit(registry, context, control);
+    }
     let action = registry.get_resolved_mut(control.slots.cpu)?.poll()?;
     drive_cpu(registry, context, control, action)
+}
+
+#[cfg(feature = "jit")]
+fn plan_stable_timeline<S>(
+    context: &Ip32DispatchContext<'_, '_, S>,
+    control: &MachineControl,
+    maximum_fetches: usize,
+    clocks: &[Mips4SliceClock],
+    fixed_ticks_per_fetch: u64,
+    stable_deadline: Option<SimTime>,
+) -> Option<Mips4SliceTimeline>
+where
+    S: TraceSink,
+{
+    let timeline = Mips4SliceTimeline::new(maximum_fetches, clocks, fixed_ticks_per_fetch)?;
+    let pclock = control.cpu_clock.projection();
+    let fits = |candidate: usize| {
+        let fetch_ticks = timeline.prefix_ticks(candidate)?;
+        let pclock_ticks = pclock.elapsed(candidate as u64)?.get();
+        let total = fetch_ticks.checked_add(pclock_ticks)?;
+        Some(
+            context
+                .now()
+                .checked_add(SimDuration::new(total))
+                .is_some_and(|end| {
+                    end <= context.deadline()
+                        && context.next_event_time().is_none_or(|event| event > end)
+                        && stable_deadline.is_none_or(|deadline| end <= deadline)
+                }),
+        )
+    };
+    if fits(maximum_fetches)? {
+        return Some(timeline);
+    }
+    let mut lower = 0;
+    let mut upper = maximum_fetches - 1;
+    while lower < upper {
+        let candidate = lower + (upper - lower).div_ceil(2);
+        if fits(candidate)? {
+            lower = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    Mips4SliceTimeline::new(lower, clocks, fixed_ticks_per_fetch)
+}
+
+#[cfg(feature = "jit")]
+fn stable_prom_code_window<S>(
+    registry: &ComponentRegistry,
+    context: &Ip32DispatchContext<'_, '_, S>,
+    control: &mut MachineControl,
+    maximum_instructions: usize,
+) -> Result<Option<Mips4CodeWindow>, Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    if maximum_instructions == 0
+        || !registry
+            .get_resolved(control.slots.sysad)?
+            .stable_fetch_ready()
+        || !registry
+            .get_resolved(control.slots.cmi)?
+            .stable_fetch_ready()
+        || !registry
+            .get_resolved(control.slots.isa)?
+            .stable_fetch_ready()
+        || !registry
+            .get_resolved(control.slots.crime)?
+            .stable_cpu_fetch_ready()
+        || !registry
+            .get_resolved(control.slots.mace)?
+            .stable_prom_fetch_ready()
+    {
+        return Ok(None);
+    }
+    let Some(request) = registry
+        .get_resolved(control.slots.cpu)?
+        .code_source_request()
+    else {
+        return Ok(None);
+    };
+    let ram_size = registry
+        .get_resolved(control.slots.sdram)?
+        .total_size_bytes();
+    let Ip32AddressResolution::Memory {
+        region: Ip32PhysicalRegion::SystemRom,
+        offset,
+        ..
+    } = super::address_map::resolve(request.physical_address, 4, ram_size)
+    else {
+        return Ok(None);
+    };
+
+    let flash = registry.get_resolved(control.slots.prom)?;
+    let available = flash.len().saturating_sub(offset as usize);
+    let source_instructions = (usize::from(request.maximum_bytes) / 4)
+        .min(available / 4)
+        .min(MIPS4_BLOCK_MAX_INSTRUCTIONS);
+    let requested_instructions = maximum_instructions.min(source_instructions);
+    if requested_instructions == 0 {
+        return Ok(None);
+    }
+    let sysad = registry
+        .get_resolved(control.slots.sysad)?
+        .stable_fetch_clock()
+        .and_then(|clock| Mips4SliceClock::new(clock, 2))
+        .expect("stable SysAD readiness was checked");
+    let cmi = registry
+        .get_resolved(control.slots.cmi)?
+        .stable_fetch_clock()
+        .and_then(|clock| Mips4SliceClock::new(clock, 2))
+        .expect("stable CMI readiness was checked");
+    let isa = registry
+        .get_resolved(control.slots.isa)?
+        .stable_fetch_delay()
+        .expect("stable ISA readiness was checked")
+        .get();
+    let Some(timeline) = plan_stable_timeline(
+        context,
+        control,
+        requested_instructions,
+        &[sysad, cmi],
+        isa,
+        None,
+    ) else {
+        return Ok(None);
+    };
+
+    let byte_count = source_instructions * 4;
+    let revision = flash.persistence_revision();
+    let cache_key = Mips4CodeSourceCacheKey {
+        kind: Mips4CodeGuardKind::SystemFlash,
+        source_offset: offset,
+        revision,
+        byte_count: byte_count as u8,
+        no_ecc: false,
+    };
+    if control.jit_code_sources.len() == MIPS4_BLOCK_CACHE_CAPACITY
+        && !control.jit_code_sources.contains_key(&cache_key)
+    {
+        control.jit_code_sources.clear();
+    }
+    let source = control
+        .jit_code_sources
+        .entry(cache_key)
+        .or_insert_with(|| {
+            let bytes = flash.bytes()[offset as usize..offset as usize + byte_count].to_vec();
+            let fingerprint = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+            Mips4CodeSourceCacheEntry { bytes, fingerprint }
+        });
+    let guard = Mips4CodeGuard {
+        kind: Mips4CodeGuardKind::SystemFlash,
+        source_offset: offset,
+        revision,
+        fingerprint: source.fingerprint,
+    };
+    Ok(Mips4CodeWindow::new(
+        request,
+        guard,
+        &source.bytes,
+        timeline,
+    ))
+}
+
+#[cfg(feature = "jit")]
+fn stable_ram_code_window<S>(
+    registry: &ComponentRegistry,
+    context: &Ip32DispatchContext<'_, '_, S>,
+    control: &mut MachineControl,
+    maximum_instructions: usize,
+) -> Result<Option<Mips4CodeWindow>, Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    let memory = registry.get_resolved(control.slots.memory)?;
+    let refresh_deadline = memory.stable_fetch_refresh_deadline();
+    if maximum_instructions == 0
+        || !registry
+            .get_resolved(control.slots.sysad)?
+            .stable_fetch_ready()
+        || !memory.stable_fetch_ready()
+        || refresh_deadline.is_some_and(|deadline| context.now() >= deadline)
+        || !registry
+            .get_resolved(control.slots.crime)?
+            .stable_cpu_fetch_ready()
+    {
+        return Ok(None);
+    }
+    let Some(request) = registry
+        .get_resolved(control.slots.cpu)?
+        .code_source_request()
+    else {
+        return Ok(None);
+    };
+    let ram_size = registry
+        .get_resolved(control.slots.sdram)?
+        .total_size_bytes();
+    let Ip32AddressResolution::Memory {
+        region:
+            Ip32PhysicalRegion::LowMemory
+            | Ip32PhysicalRegion::HighMemoryUnconfirmed
+            | Ip32PhysicalRegion::LinearMemory
+            | Ip32PhysicalRegion::NoEccMemory,
+        offset,
+        no_ecc,
+        ..
+    } = super::address_map::resolve(request.physical_address, 4, ram_size)
+    else {
+        return Ok(None);
+    };
+    let source_instructions =
+        (usize::from(request.maximum_bytes) / 4).min(MIPS4_BLOCK_MAX_INSTRUCTIONS);
+    let requested_instructions = maximum_instructions.min(source_instructions);
+    if requested_instructions == 0 {
+        return Ok(None);
+    }
+    let sysad = registry
+        .get_resolved(control.slots.sysad)?
+        .stable_fetch_clock()
+        .and_then(|clock| Mips4SliceClock::new(clock, 2))
+        .expect("stable SysAD readiness was checked");
+    let memory = registry
+        .get_resolved(control.slots.memory)?
+        .stable_fetch_clock()
+        .and_then(|clock| Mips4SliceClock::new(clock, 2))
+        .expect("stable memory-bus readiness was checked");
+    let Some(timeline) = plan_stable_timeline(
+        context,
+        control,
+        requested_instructions,
+        &[sysad, memory],
+        0,
+        refresh_deadline,
+    ) else {
+        return Ok(None);
+    };
+    let byte_count = source_instructions * 4;
+    let cache_key = Mips4CodeSourceCacheKey {
+        kind: Mips4CodeGuardKind::Sdram,
+        source_offset: offset,
+        revision: 0,
+        byte_count: byte_count as u8,
+        no_ecc,
+    };
+    if control.jit_code_sources.len() == MIPS4_BLOCK_CACHE_CAPACITY
+        && !control.jit_code_sources.contains_key(&cache_key)
+    {
+        control.jit_code_sources.clear();
+    }
+    let source = match control.jit_code_sources.entry(cache_key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let Some((bytes, fingerprint)) = registry
+                .get_resolved(control.slots.sdram)?
+                .stable_code_window(offset, byte_count, no_ecc)
+            else {
+                return Ok(None);
+            };
+            entry.insert(Mips4CodeSourceCacheEntry { bytes, fingerprint })
+        }
+    };
+    let guard = Mips4CodeGuard {
+        kind: Mips4CodeGuardKind::Sdram,
+        source_offset: offset,
+        revision: 0,
+        fingerprint: source.fingerprint,
+    };
+    Ok(Mips4CodeWindow::new(
+        request,
+        guard,
+        &source.bytes,
+        timeline,
+    ))
+}
+
+#[cfg(feature = "jit")]
+fn stable_code_window<S>(
+    registry: &ComponentRegistry,
+    context: &Ip32DispatchContext<'_, '_, S>,
+    control: &mut MachineControl,
+    maximum_instructions: usize,
+) -> Result<Option<Mips4CodeWindow>, Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    if registry
+        .get_resolved(control.slots.cpu)?
+        .code_source_request()
+        .is_none()
+    {
+        return Ok(None);
+    }
+    if let Some(window) = stable_prom_code_window(registry, context, control, maximum_instructions)?
+    {
+        return Ok(Some(window));
+    }
+    stable_ram_code_window(registry, context, control, maximum_instructions)
+}
+
+#[cfg(feature = "jit")]
+fn commit_stable_prom_fetches(
+    registry: &mut ComponentRegistry,
+    control: &MachineControl,
+    window: &Mips4CodeWindow,
+    fetches: usize,
+    slice_start: SimTime,
+) -> Result<(), Ip32MachineDispatchError> {
+    if fetches == 0 {
+        return Ok(());
+    }
+    let previous_fetches = fetches - 1;
+    let previous_fetch_ticks = window
+        .fetch_time_ticks(previous_fetches)
+        .expect("executed fetches must fit the stable timeline");
+    let previous_pclock_ticks = control
+        .cpu_clock
+        .projection()
+        .elapsed(previous_fetches as u64)
+        .expect("the bounded slice PClock projection cannot overflow")
+        .get();
+    let previous_ticks = previous_fetch_ticks
+        .checked_add(previous_pclock_ticks)
+        .expect("the bounded slice timeline cannot overflow");
+    let previous_time = slice_start
+        .checked_add(SimDuration::new(previous_ticks))
+        .expect("the bounded slice timeline must fit simulated time");
+    let sysad = registry
+        .get_resolved(control.slots.sysad)?
+        .stable_fetch_clock()
+        .expect("stable SysAD readiness was checked");
+    let cmi = registry
+        .get_resolved(control.slots.cmi)?
+        .stable_fetch_clock()
+        .expect("stable CMI readiness was checked");
+    let previous_bus_cycles = (previous_fetches as u64)
+        .checked_mul(2)
+        .expect("the bounded slice cycle count cannot overflow");
+    let sysad_delivery_delay = fractional_cycle_delay(sysad, previous_bus_cycles);
+    let cmi_delivery_delay = fractional_cycle_delay(cmi, previous_bus_cycles);
+    let crime_delivery_time = previous_time
+        .checked_add(sysad_delivery_delay)
+        .expect("the bounded SysAD delivery time must fit simulated time");
+    let mace_delivery_time = crime_delivery_time
+        .checked_add(cmi_delivery_delay)
+        .expect("the bounded CMI delivery time must fit simulated time");
+    registry
+        .get_resolved_mut(control.slots.sysad)?
+        .commit_stable_fetches(fetches);
+    registry
+        .get_resolved_mut(control.slots.cmi)?
+        .commit_stable_fetches(fetches);
+    if !registry
+        .get_resolved_mut(control.slots.crime)?
+        .account_stable_cpu_fetches(fetches, crime_delivery_time)?
+        || !registry
+            .get_resolved_mut(control.slots.mace)?
+            .account_stable_prom_fetches(fetches, mace_delivery_time)
+    {
+        return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+            "stable PROM fetch lost idle bus ownership".to_owned(),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "jit")]
+fn commit_stable_ram_fetches(
+    registry: &mut ComponentRegistry,
+    control: &MachineControl,
+    window: &Mips4CodeWindow,
+    fetches: usize,
+    slice_start: SimTime,
+) -> Result<(), Ip32MachineDispatchError> {
+    if fetches == 0 {
+        return Ok(());
+    }
+    let previous_fetches = fetches - 1;
+    let previous_fetch_ticks = window
+        .fetch_time_ticks(previous_fetches)
+        .expect("executed fetches must fit the stable timeline");
+    let previous_pclock_ticks = control
+        .cpu_clock
+        .projection()
+        .elapsed(previous_fetches as u64)
+        .expect("the bounded slice PClock projection cannot overflow")
+        .get();
+    let previous_ticks = previous_fetch_ticks
+        .checked_add(previous_pclock_ticks)
+        .expect("the bounded slice timeline cannot overflow");
+    let previous_time = slice_start
+        .checked_add(SimDuration::new(previous_ticks))
+        .expect("the bounded slice timeline must fit simulated time");
+    let sysad = registry
+        .get_resolved(control.slots.sysad)?
+        .stable_fetch_clock()
+        .expect("stable SysAD readiness was checked");
+    let previous_bus_cycles = (previous_fetches as u64)
+        .checked_mul(2)
+        .expect("the bounded slice cycle count cannot overflow");
+    let crime_delivery_time = previous_time
+        .checked_add(fractional_cycle_delay(sysad, previous_bus_cycles))
+        .expect("the bounded SysAD delivery time must fit simulated time");
+    registry
+        .get_resolved_mut(control.slots.sysad)?
+        .commit_stable_fetches(fetches);
+    registry
+        .get_resolved_mut(control.slots.memory)?
+        .commit_stable_fetches(fetches);
+    if !registry
+        .get_resolved_mut(control.slots.crime)?
+        .account_stable_cpu_fetches(fetches, crime_delivery_time)?
+    {
+        return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+            "stable RAM fetch lost idle bus ownership".to_owned(),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "jit")]
+fn fractional_cycle_delay(
+    projection: FractionalClockProjection,
+    previous_cycles: u64,
+) -> SimDuration {
+    let before = projection
+        .elapsed(previous_cycles)
+        .expect("the bounded clock projection cannot overflow")
+        .get();
+    let after = projection
+        .elapsed(previous_cycles + 1)
+        .expect("the bounded clock projection cannot overflow")
+        .get();
+    SimDuration::new(after - before)
+}
+
+#[cfg(feature = "jit")]
+#[inline(never)]
+fn drive_cpu_jit<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut Ip32DispatchContext<'_, '_, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    let mut boundaries = 0;
+    loop {
+        let slice_start = context.now();
+        let remaining = control.cpu_continuation_quantum - boundaries;
+        let planned = control.cpu_clock.plan_boundary_budget(
+            context.now(),
+            context.deadline(),
+            context.next_event_time(),
+            remaining,
+        );
+        let (requested, cached_slice) = {
+            let engine = control
+                .jit_engine
+                .as_mut()
+                .expect("JIT dispatch requires an initialized engine");
+            let cpu = registry.get_resolved_mut(control.slots.cpu)?;
+            let requested = cpu.limit_slice_budget(planned as u64);
+            let cached_slice = cpu.run_reusable_slice(engine, requested)?;
+            (requested, cached_slice)
+        };
+        let (code_window, slice) = if let Some(slice) = cached_slice {
+            (None, slice)
+        } else {
+            let code_window = stable_code_window(registry, context, control, requested as usize)?;
+            let requested = code_window.as_ref().map_or(requested, |window| {
+                requested.min(window.fetch_count() as u64)
+            });
+            let engine = control
+                .jit_engine
+                .as_mut()
+                .expect("JIT dispatch requires an initialized engine");
+            let cpu = registry.get_resolved_mut(control.slots.cpu)?;
+            let slice = match code_window.as_ref() {
+                Some(window) => cpu.run_slice_with_code_window(engine, requested, Some(window))?,
+                None => cpu.run_slice(engine, requested)?,
+            };
+            (code_window, slice)
+        };
+
+        if slice.simulated_time_ticks != 0 {
+            let delay = SimDuration::new(slice.simulated_time_ticks);
+            let next_time =
+                context
+                    .now()
+                    .checked_add(delay)
+                    .ok_or(SchedulerError::TimeOverflow {
+                        time: context.now(),
+                        duration: delay,
+                    })?;
+            if !context.try_advance_to(next_time)? {
+                return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                    "stable PROM timeline crossed a scheduler event".to_owned(),
+                )));
+            }
+            match code_window
+                .as_ref()
+                .expect("fast fetches require a code window")
+                .guard()
+                .kind
+            {
+                Mips4CodeGuardKind::SystemFlash => commit_stable_prom_fetches(
+                    registry,
+                    control,
+                    code_window
+                        .as_ref()
+                        .expect("fast fetches require a code window"),
+                    slice.fast_fetches as usize,
+                    slice_start,
+                )?,
+                Mips4CodeGuardKind::Sdram => commit_stable_ram_fetches(
+                    registry,
+                    control,
+                    code_window
+                        .as_ref()
+                        .expect("fast fetches require a code window"),
+                    slice.fast_fetches as usize,
+                    slice_start,
+                )?,
+            }
+        }
+
+        let slice_boundaries = usize::try_from(slice.boundaries)
+            .expect("a bounded JIT slice boundary count must fit usize");
+        let bulk_boundaries = slice_boundaries.saturating_sub(1);
+        if bulk_boundaries != 0 {
+            let delay = control.cpu_clock.advance_pclocks(bulk_boundaries as u64);
+            let next_time =
+                context
+                    .now()
+                    .checked_add(delay)
+                    .ok_or(SchedulerError::TimeOverflow {
+                        time: context.now(),
+                        duration: delay,
+                    })?;
+            if !context.try_advance_to(next_time)? {
+                return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                    "planned PClock prefix crossed a scheduler event".to_owned(),
+                )));
+            }
+            boundaries += bulk_boundaries;
+        }
+
+        for _ in bulk_boundaries..slice_boundaries {
+            boundaries += 1;
+            let delay = control.cpu_clock.next_pclock_delay();
+            if boundaries >= control.cpu_continuation_quantum {
+                schedule_cpu_step(context, control, delay)?;
+                return Ok(());
+            }
+            let next_time =
+                context
+                    .now()
+                    .checked_add(delay)
+                    .ok_or(SchedulerError::TimeOverflow {
+                        time: context.now(),
+                        duration: delay,
+                    })?;
+            if !context.try_advance_to(next_time)? {
+                schedule_cpu_step(context, control, delay)?;
+                return Ok(());
+            }
+        }
+
+        match slice.action {
+            R5000ExecutionSliceAction::Transaction(transaction) => {
+                return route_cpu_transaction(registry, context, control, transaction);
+            }
+            R5000ExecutionSliceAction::Progress if slice.boundaries != 0 => {}
+            R5000ExecutionSliceAction::Progress => {
+                return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                    "JIT slice made no architectural progress".to_owned(),
+                )));
+            }
+            R5000ExecutionSliceAction::Idle | R5000ExecutionSliceAction::Waiting { .. } => {
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn drive_cpu<S>(
@@ -1955,22 +2833,7 @@ where
     loop {
         match action {
             ExecutionAction::Transaction(transaction) => {
-                control.sysad_transactions = control.sysad_transactions.saturating_add(1);
-                let disposition = registry
-                    .get_resolved_mut(control.slots.sysad)?
-                    .route(transaction);
-                if let CrimeBusDisposition::QueuedAndNeedsService {
-                    delay,
-                    epoch: generation,
-                } = disposition
-                {
-                    context.schedule_after(
-                        delay,
-                        component_ids::CPU_SYSAD_BUS,
-                        Ip32Event::SysAdBus(super::bus::Ip32SysAdBusEvent::Service { generation }),
-                    )?;
-                }
-                return Ok(());
+                return route_cpu_transaction(registry, context, control, transaction);
             }
             ExecutionAction::Boundary(_) => {
                 boundaries += 1;
@@ -1996,6 +2859,33 @@ where
             ExecutionAction::Idle | ExecutionAction::Waiting { .. } => return Ok(()),
         }
     }
+}
+
+fn route_cpu_transaction<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut Ip32DispatchContext<'_, '_, S>,
+    control: &mut MachineControl,
+    transaction: ExecutionTransaction<Mips4ExecutionTransaction>,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    control.sysad_transactions = control.sysad_transactions.saturating_add(1);
+    let disposition = registry
+        .get_resolved_mut(control.slots.sysad)?
+        .route(transaction);
+    if let CrimeBusDisposition::QueuedAndNeedsService {
+        delay,
+        epoch: generation,
+    } = disposition
+    {
+        context.schedule_after(
+            delay,
+            component_ids::CPU_SYSAD_BUS,
+            Ip32Event::SysAdBus(super::bus::Ip32SysAdBusEvent::Service { generation }),
+        )?;
+    }
+    Ok(())
 }
 
 fn schedule_cpu_step<S>(
@@ -2079,6 +2969,8 @@ where
                 context.schedule_at(context.now(), component_ids::MACHINE, Ip32Event::HardReset)?;
             }
             CrimeAction::SignalMemory(signal) => {
+                #[cfg(feature = "jit")]
+                invalidate_ram_code_sources(control, None);
                 registry
                     .get_typed_mut::<CrimeSdram>(component_ids::RAM)?
                     .accept(signal);
@@ -2577,7 +3469,7 @@ where
                         .receive_bytes(&bytes)?;
                     drain_uart(registry, context, control, target)?;
                 } else {
-                    enqueue_host_output(control, transaction);
+                    enqueue_host_output(control, transaction, context.now());
                 }
             }
             MediaBusAction::Idle => return Ok(()),
@@ -2585,8 +3477,14 @@ where
     }
 }
 
-fn enqueue_host_output(control: &mut MachineControl, transaction: MediaTransaction) {
+fn enqueue_host_output(control: &mut MachineControl, transaction: MediaTransaction, _now: SimTime) {
     let port = transaction.port;
+    #[cfg(test)]
+    if matches!(port, MediaPort::Serial0 | MediaPort::Serial1)
+        && matches!(&transaction.payload, MediaPayload::Bytes(bytes) if !bytes.is_empty())
+    {
+        control.first_serial_output_time.get_or_insert(_now);
+    }
     let index = media_port_index(port);
     let units = host_payload_units(&transaction.payload);
     let capacity = media_port_capacity(control.host_capacities, port);
@@ -2743,8 +3641,7 @@ where
                 if !control.inline_sysad_completion || same_time_event {
                     schedule_cpu_step(context, control, SimDuration::ZERO)?;
                 } else {
-                    let action = registry.get_resolved_mut(control.slots.cpu)?.poll()?;
-                    drive_cpu(registry, context, control, action)?;
+                    dispatch_cpu_step(registry, context, control)?;
                 }
             }
             Ip32SysAdBusAction::Schedule { delay, event } => {
@@ -2776,6 +3673,13 @@ where
             } => {
                 if target != component_ids::RAM {
                     return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                }
+                #[cfg(feature = "jit")]
+                if matches!(transaction.transfer.view(), CrimeTransferView::Write { .. }) {
+                    invalidate_ram_code_sources(
+                        control,
+                        Some((transaction.address, transaction.transfer.length())),
+                    );
                 }
                 let completion = registry
                     .get_resolved_mut(control.slots.sdram)?

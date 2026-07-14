@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use se_core::component::{Component, ComponentId};
 use se_core::role::BusRole;
-use se_core::scheduler::SimDuration;
+use se_core::scheduler::{FractionalClockProjection, SimDuration};
 use se_device::chipset::crime::protocol::CrimeBusDisposition;
 use se_device::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransaction};
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
@@ -122,6 +122,19 @@ impl BusClock {
         let carry = self.remainder / self.frequency_hz;
         self.remainder %= self.frequency_hz;
         SimDuration::new(base + carry)
+    }
+
+    fn projection(self) -> FractionalClockProjection {
+        FractionalClockProjection::new(self.timebase_hz, self.frequency_hz, self.remainder)
+    }
+
+    fn advance_cycles(&mut self, cycles: u64) -> SimDuration {
+        let mut projection = self.projection();
+        let elapsed = projection
+            .advance(cycles)
+            .expect("a machine bus clock advance must fit simulated time");
+        self.remainder = projection.remainder();
+        elapsed
     }
 }
 
@@ -257,6 +270,45 @@ impl Ip32SysAdBus {
     /// Returns the active reset generation.
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Returns whether a stable fetch may bypass this otherwise idle bus.
+    pub fn stable_fetch_ready(&self) -> bool {
+        !self.service_scheduled
+            && self.queue.is_empty()
+            && self.in_flight.is_none()
+            && self.pending_completion.is_none()
+            && self.actions.is_empty()
+    }
+
+    /// Returns the exact current fractional clock used by stable fetches.
+    pub fn stable_fetch_clock(&self) -> Option<FractionalClockProjection> {
+        self.stable_fetch_ready().then(|| self.clock.projection())
+    }
+
+    /// Plans idle request/completion cycle pairs without changing bus state.
+    pub fn plan_stable_fetches(&self, output: &mut [SimDuration]) -> Option<()> {
+        if !self.stable_fetch_ready() {
+            return None;
+        }
+        let mut clock = self.clock;
+        for delay in output {
+            *delay = SimDuration::new(
+                clock
+                    .next_cycle()
+                    .get()
+                    .saturating_add(clock.next_cycle().get()),
+            );
+        }
+        Some(())
+    }
+
+    /// Commits idle request/completion cycle pairs consumed by stable fetches.
+    pub fn commit_stable_fetches(&mut self, fetches: usize) {
+        assert!(self.stable_fetch_ready());
+        let _ = self
+            .clock
+            .advance_cycles((fetches as u64).saturating_mul(2));
     }
 }
 

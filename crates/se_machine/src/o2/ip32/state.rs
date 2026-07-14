@@ -98,6 +98,7 @@ impl Ip32PersistentConfig {
         rtc_nvram: Vec<u8>,
     ) -> super::machine::Ip32MachineConfig {
         super::machine::Ip32MachineConfig {
+            jit_enabled: false,
             processor: self.processor,
             boot_mode: self.boot_mode,
             crime: self.crime,
