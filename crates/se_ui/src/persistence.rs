@@ -1,4 +1,9 @@
-//! Versioned application, battery, and machine-state persistence.
+//! Versioned application, device, and machine-state persistence.
+//!
+//! IP32 has two independent nonvolatile storage domains: the DS1687 battery
+//! file stores RTC/register state, while a base-PROM-specific System Flash
+//! overlay stores guest changes including the PROM environment. The original
+//! PROM file remains immutable.
 
 use std::{
     fmt,
@@ -9,7 +14,9 @@ use std::{
 };
 
 use directories::ProjectDirs;
+use se_device::memory::flash::SystemFlashPersistentState;
 use se_device::rtc::ds1687::state::Ds1687PersistentState;
+use se_machine::o2::ip32::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
 use se_machine::o2::ip32::state::{
     IP32_STATE_SCHEMA_VERSION, Ip32MachineState, Ip32PersistentConfig, Ip32PersistentConfigError,
 };
@@ -20,14 +27,17 @@ use tempfile::NamedTempFile;
 pub(crate) const MACHINE_ID: &str = "sgi-o2-ip32";
 const EMULATION_CONFIG_VERSION: u32 = 1;
 const BATTERY_VERSION: u32 = 1;
+const SYSTEM_FLASH_VERSION: u32 = 1;
 const STATE_CONTAINER_VERSION: u32 = 1;
 const STATE_MAGIC: [u8; 8] = *b"SESTATE\0";
 const BATTERY_MAGIC: [u8; 8] = *b"SERTCNV\0";
+const SYSTEM_FLASH_MAGIC: [u8; 8] = *b"SEFLASH\0";
 const HEADER_SIZE: usize = 8 + 4 + 8 + 8 + 8 + 32;
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_COMPRESSED_STATE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_UNCOMPRESSED_STATE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const STATE_NON_MEMORY_ALLOWANCE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SYSTEM_FLASH_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const ZSTD_LEVEL: i32 = 3;
 const DEFAULT_RTC_UNIX_SECONDS: i64 = 946_684_800;
 
@@ -144,6 +154,7 @@ impl EmulationConfig {
 pub(crate) struct PersistencePaths {
     config_file: PathBuf,
     battery_file: PathBuf,
+    system_flash_dir: PathBuf,
 }
 
 impl PersistencePaths {
@@ -153,6 +164,7 @@ impl PersistencePaths {
         Ok(Self {
             config_file: project.config_dir().join("emulation.toml"),
             battery_file: project.data_dir().join("machines/ip32/rtc_nvram.bin"),
+            system_flash_dir: project.data_dir().join("machines/ip32/system_flash"),
         })
     }
 
@@ -162,6 +174,11 @@ impl PersistencePaths {
 
     pub(crate) fn battery_file(&self) -> &Path {
         &self.battery_file
+    }
+
+    pub(crate) fn system_flash_file(&self, prom_hash: [u8; 32]) -> PathBuf {
+        self.system_flash_dir
+            .join(format!("{}.bin", encode_hash(prom_hash)))
     }
 }
 
@@ -186,8 +203,21 @@ struct BatteryPayload {
     state: Ds1687PersistentState,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SystemFlashPayload {
+    version: u32,
+    machine_id: String,
+    prom_sha256: [u8; 32],
+    state: SystemFlashPersistentState,
+}
+
 pub(crate) struct BatteryLoad {
     pub(crate) state: Ds1687PersistentState,
+    pub(crate) warning: Option<String>,
+}
+
+pub(crate) struct SystemFlashLoad {
+    pub(crate) state: Option<SystemFlashPersistentState>,
     pub(crate) warning: Option<String>,
 }
 
@@ -289,6 +319,66 @@ pub(crate) fn save_battery(
     file.extend_from_slice(&serialized);
     file.extend_from_slice(&hash_bytes(&serialized));
     atomic_write(paths.battery_file(), &file)
+}
+
+pub(crate) fn load_system_flash(paths: &PersistencePaths, prom_hash: [u8; 32]) -> SystemFlashLoad {
+    let path = paths.system_flash_file(prom_hash);
+    match read_system_flash(&path, prom_hash) {
+        Ok(state) => SystemFlashLoad {
+            state,
+            warning: None,
+        },
+        Err(error) => {
+            let backup = preserve_corrupt_file(&path, host_utc_seconds());
+            let suffix = backup
+                .map(|path| format!("; preserved as {}", path.display()))
+                .unwrap_or_default();
+            SystemFlashLoad {
+                state: None,
+                warning: Some(format!(
+                    "failed to load System Flash overlay: {error}{suffix}"
+                )),
+            }
+        }
+    }
+}
+
+pub(crate) fn save_system_flash(
+    paths: &PersistencePaths,
+    prom_hash: [u8; 32],
+    state: SystemFlashPersistentState,
+) -> Result<(), PersistenceError> {
+    if state.image_size() != IP32_PROM_IMAGE_SIZE_BYTES as u64 {
+        return Err(PersistenceError::InvalidSystemFlashImageSize {
+            size: state.image_size(),
+        });
+    }
+    let payload = SystemFlashPayload {
+        version: SYSTEM_FLASH_VERSION,
+        machine_id: MACHINE_ID.to_owned(),
+        prom_sha256: prom_hash,
+        state,
+    };
+    let payload = postcard::to_stdvec(&payload).map_err(PersistenceError::PostcardWrite)?;
+    if payload.len() > MAX_SYSTEM_FLASH_PAYLOAD_BYTES {
+        return Err(PersistenceError::SystemFlashPayloadTooLarge {
+            length: payload.len(),
+        });
+    }
+    let mut file = Vec::with_capacity(8 + 8 + payload.len() + 32);
+    file.extend_from_slice(&SYSTEM_FLASH_MAGIC);
+    file.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    file.extend_from_slice(&payload);
+    file.extend_from_slice(&hash_bytes(&payload));
+    atomic_write(&paths.system_flash_file(prom_hash), &file)
+}
+
+pub(crate) fn preserve_system_flash_overlay(
+    paths: &PersistencePaths,
+    prom_hash: [u8; 32],
+    host_now: i64,
+) -> Option<PathBuf> {
+    preserve_corrupt_file(&paths.system_flash_file(prom_hash), host_now)
 }
 
 pub(crate) fn write_state_file(
@@ -451,6 +541,59 @@ fn read_battery(path: &Path) -> Result<Option<BatteryPayload>, PersistenceError>
     Ok(Some(payload))
 }
 
+fn read_system_flash(
+    path: &Path,
+    expected_prom_hash: [u8; 32],
+) -> Result<Option<SystemFlashPersistentState>, PersistenceError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(PersistenceError::Io(error)),
+    };
+    if bytes.len() < 8 + 8 + 32 || bytes[..8] != SYSTEM_FLASH_MAGIC {
+        return Err(PersistenceError::InvalidSystemFlashFile);
+    }
+    let length = read_u64(&bytes[8..16]);
+    if length > MAX_SYSTEM_FLASH_PAYLOAD_BYTES as u64 {
+        return Err(PersistenceError::SystemFlashPayloadTooLarge {
+            length: length as usize,
+        });
+    }
+    let length = length as usize;
+    let expected = 16_usize
+        .checked_add(length)
+        .and_then(|length| length.checked_add(32))
+        .ok_or(PersistenceError::InvalidSystemFlashFile)?;
+    if bytes.len() != expected {
+        return Err(PersistenceError::InvalidSystemFlashFile);
+    }
+    let payload = &bytes[16..16 + length];
+    if hash_bytes(payload) != bytes[16 + length..] {
+        return Err(PersistenceError::SystemFlashChecksumMismatch);
+    }
+    let payload: SystemFlashPayload =
+        postcard::from_bytes(payload).map_err(PersistenceError::PostcardRead)?;
+    if payload.version != SYSTEM_FLASH_VERSION {
+        return Err(PersistenceError::UnsupportedSystemFlash {
+            version: payload.version,
+        });
+    }
+    if payload.machine_id != MACHINE_ID {
+        return Err(PersistenceError::WrongMachine {
+            machine_id: payload.machine_id,
+        });
+    }
+    if payload.prom_sha256 != expected_prom_hash {
+        return Err(PersistenceError::SystemFlashPromHashMismatch);
+    }
+    if payload.state.image_size() != IP32_PROM_IMAGE_SIZE_BYTES as u64 {
+        return Err(PersistenceError::InvalidSystemFlashImageSize {
+            size: payload.state.image_size(),
+        });
+    }
+    Ok(Some(payload.state))
+}
+
 fn apply_rtc_mode(
     state: Ds1687PersistentState,
     anchor: i64,
@@ -584,6 +727,7 @@ pub(crate) enum PersistenceError {
     UnsupportedEmulationConfig { version: u32 },
     InvalidMachineConfiguration(Ip32PersistentConfigError),
     UnsupportedBattery { version: u32 },
+    UnsupportedSystemFlash { version: u32 },
     WrongMachine { machine_id: String },
     MetadataTooLarge { length: u64 },
     StateTooLarge { length: u64 },
@@ -594,6 +738,11 @@ pub(crate) enum PersistenceError {
     StateChecksumMismatch,
     InvalidBatteryFile,
     BatteryChecksumMismatch,
+    InvalidSystemFlashFile,
+    SystemFlashChecksumMismatch,
+    SystemFlashPromHashMismatch,
+    InvalidSystemFlashImageSize { size: u64 },
+    SystemFlashPayloadTooLarge { length: usize },
     MissingParent(PathBuf),
 }
 
@@ -641,6 +790,12 @@ impl fmt::Display for PersistenceError {
             Self::UnsupportedBattery { version } => {
                 write!(formatter, "unsupported RTC/NVRAM battery version {version}")
             }
+            Self::UnsupportedSystemFlash { version } => {
+                write!(
+                    formatter,
+                    "unsupported System Flash overlay version {version}"
+                )
+            }
             Self::WrongMachine { machine_id } => write!(
                 formatter,
                 "persistence data targets machine {machine_id}, not {MACHINE_ID}"
@@ -673,6 +828,24 @@ impl fmt::Display for PersistenceError {
             Self::BatteryChecksumMismatch => {
                 formatter.write_str("RTC/NVRAM battery checksum does not match")
             }
+            Self::InvalidSystemFlashFile => {
+                formatter.write_str("invalid System Flash overlay file")
+            }
+            Self::SystemFlashChecksumMismatch => {
+                formatter.write_str("System Flash overlay checksum does not match")
+            }
+            Self::SystemFlashPromHashMismatch => {
+                formatter.write_str("System Flash overlay targets a different base PROM")
+            }
+            Self::InvalidSystemFlashImageSize { size } => {
+                write!(formatter, "invalid System Flash image size {size}")
+            }
+            Self::SystemFlashPayloadTooLarge { length } => {
+                write!(
+                    formatter,
+                    "System Flash overlay is too large: {length} bytes"
+                )
+            }
             Self::MissingParent(path) => write!(
                 formatter,
                 "persistence path has no parent directory: {}",
@@ -687,6 +860,11 @@ impl std::error::Error for PersistenceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use se_core::component::ComponentId;
+    use se_core::role::BusDeviceRole;
+    use se_core::scheduler::SimTime;
+    use se_device::bus::isa::{IsaTransaction, IsaTransactionId, IsaTransfer};
+    use se_device::memory::flash::SystemFlash;
     use se_machine::o2::ip32::machine::{Ip32Machine, Ip32MachineConfig};
 
     #[test]
@@ -746,6 +924,7 @@ mod tests {
         let paths = PersistencePaths {
             config_file: directory.path().join("emulation.toml"),
             battery_file: directory.path().join("machines/ip32/rtc_nvram.bin"),
+            system_flash_dir: directory.path().join("machines/ip32/system_flash"),
         };
         let prom_path = directory.path().join("prom.bin");
         let config = EmulationConfig::new(
@@ -763,5 +942,55 @@ mod tests {
         let loaded = load_battery(&paths, RtcPersistenceMode::RealTime, 125);
         assert_eq!(loaded.state.unix_seconds(), 35);
         assert_eq!(loaded.state.revision(), 4);
+    }
+
+    #[test]
+    fn system_flash_overlays_are_atomic_and_isolated_by_prom_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = PersistencePaths {
+            config_file: directory.path().join("emulation.toml"),
+            battery_file: directory.path().join("machines/ip32/rtc_nvram.bin"),
+            system_flash_dir: directory.path().join("machines/ip32/system_flash"),
+        };
+        let base_image = vec![0xff; IP32_PROM_IMAGE_SIZE_BYTES];
+        let prom_path = directory.path().join("ip32prom.bin");
+        fs::write(&prom_path, &base_image).unwrap();
+        let mut flash = SystemFlash::new(ComponentId::new(1), "System flash", base_image.clone());
+        let _ = flash.accept(IsaTransaction {
+            id: IsaTransactionId::new(1),
+            time: SimTime::ZERO,
+            controller: ComponentId::new(2),
+            target: ComponentId::new(1),
+            address: 0x4000,
+            transfer: IsaTransfer::write([0x5a].into(), [true].into()),
+        });
+        let state = flash.persistent_state();
+        let first_hash = hash_bytes(b"PROM 4.3");
+        let second_hash = hash_bytes(b"PROM 4.18");
+
+        save_system_flash(&paths, first_hash, state.clone()).unwrap();
+        assert_eq!(fs::read(&prom_path).unwrap(), base_image);
+        let loaded = load_system_flash(&paths, first_hash);
+        assert_eq!(loaded.state, Some(state.clone()));
+        assert!(loaded.warning.is_none());
+        assert!(load_system_flash(&paths, second_hash).state.is_none());
+        assert_ne!(
+            paths.system_flash_file(first_hash),
+            paths.system_flash_file(second_hash)
+        );
+        let mut restored = SystemFlash::new(ComponentId::new(1), "System flash", base_image);
+        restored
+            .restore_persistent_state(loaded.state.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(restored.bytes()[0x4000], 0x5a);
+
+        let path = paths.system_flash_file(first_hash);
+        let mut corrupted = fs::read(&path).unwrap();
+        *corrupted.last_mut().unwrap() ^= 0x80;
+        fs::write(&path, corrupted).unwrap();
+        let loaded = load_system_flash(&paths, first_hash);
+        assert!(loaded.state.is_none());
+        assert!(loaded.warning.is_some());
+        assert!(!path.exists());
     }
 }

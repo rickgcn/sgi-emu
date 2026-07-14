@@ -24,8 +24,9 @@ use crate::{
     },
     persistence::{
         EmulationConfig, PersistencePaths, RtcPersistenceMode, hash_bytes, host_utc_seconds,
-        load_battery, load_emulation_config, load_prom, read_state_file, save_battery,
-        save_emulation_config, write_state_file,
+        load_battery, load_emulation_config, load_prom, load_system_flash,
+        preserve_system_flash_overlay, read_state_file, save_battery, save_emulation_config,
+        save_system_flash, write_state_file,
     },
     tracing::{UiTraceSink, begin_application_trace_session},
 };
@@ -34,6 +35,7 @@ const RUN_BATCH_SIZE: usize = 4_096;
 const TERMINAL_QUEUE_CAPACITY: usize = 65_536;
 const BATTERY_DEBOUNCE: Duration = Duration::from_secs(1);
 const BATTERY_CHECKPOINT: Duration = Duration::from_secs(60);
+const PERSISTENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 struct TerminalInputRequest {
     port: UiSerialPort,
@@ -499,14 +501,27 @@ fn worker_main(shared: &Arc<SharedController>) {
     let mut machine: Option<Ip32Machine<UiTraceSink>> = None;
     let mut active_config = None;
     let mut battery = BatteryCheckpoint::new();
+    let mut system_flash = SystemFlashCheckpoint::new();
 
-    auto_configure_machine(shared, &mut machine, &mut active_config, &mut battery);
+    auto_configure_machine(
+        shared,
+        &mut machine,
+        &mut active_config,
+        &mut battery,
+        &mut system_flash,
+    );
 
     loop {
         let action = next_action(shared, machine.is_some());
         match action {
             WorkerAction::Shutdown => {
                 force_battery_checkpoint(shared, machine.as_ref(), &mut battery);
+                force_system_flash_checkpoint(
+                    shared,
+                    machine.as_ref(),
+                    active_config.as_ref(),
+                    &mut system_flash,
+                );
                 break;
             }
             WorkerAction::Configure(request) => configure_worker_machine(
@@ -514,6 +529,7 @@ fn worker_main(shared: &Arc<SharedController>) {
                 &mut machine,
                 &mut active_config,
                 &mut battery,
+                &mut system_flash,
                 request,
             ),
             WorkerAction::SaveState(request) => {
@@ -524,6 +540,7 @@ fn worker_main(shared: &Arc<SharedController>) {
                 &mut machine,
                 &mut active_config,
                 &mut battery,
+                &mut system_flash,
                 request,
             ),
             WorkerAction::HardReset => {
@@ -532,9 +549,24 @@ fn worker_main(shared: &Arc<SharedController>) {
             WorkerAction::TerminalInput(request) => {
                 submit_machine_terminal_input(shared, machine.as_mut(), request);
             }
-            WorkerAction::RunBatch => run_machine_batch(shared, machine.as_mut()),
+            WorkerAction::RunBatch => {
+                run_machine_batch(shared, machine.as_mut());
+                periodic_battery_checkpoint(shared, machine.as_ref(), &mut battery);
+                periodic_system_flash_checkpoint(
+                    shared,
+                    machine.as_ref(),
+                    active_config.as_ref(),
+                    &mut system_flash,
+                );
+            }
             WorkerAction::PersistenceTick => {
                 periodic_battery_checkpoint(shared, machine.as_ref(), &mut battery);
+                periodic_system_flash_checkpoint(
+                    shared,
+                    machine.as_ref(),
+                    active_config.as_ref(),
+                    &mut system_flash,
+                );
             }
         }
     }
@@ -591,12 +623,19 @@ fn configure_worker_machine(
     machine: &mut Option<Ip32Machine<UiTraceSink>>,
     active_config: &mut Option<EmulationConfig>,
     battery: &mut BatteryCheckpoint,
+    system_flash: &mut SystemFlashCheckpoint,
     request: ConfigureRequest,
 ) {
     let result = build_configured_machine(shared, request);
     match result {
         Ok((new_machine, config, warning)) => {
             force_battery_checkpoint(shared, machine.as_ref(), battery);
+            force_system_flash_checkpoint(
+                shared,
+                machine.as_ref(),
+                active_config.as_ref(),
+                system_flash,
+            );
             let mut state = lock_state(shared);
             state.desired_running = false;
             let session_id = begin_application_trace_session();
@@ -608,6 +647,7 @@ fn configure_worker_machine(
             *machine = Some(new_machine);
             *active_config = Some(config);
             battery.reset();
+            system_flash.reset();
             state.snapshot.state = EmulationState::Paused;
             state.snapshot.has_machine = true;
             state.snapshot.error_message.clear();
@@ -627,6 +667,7 @@ struct BatteryCheckpoint {
     last_revision: Option<u64>,
     revision_changed_at: Option<Instant>,
     last_checkpoint: Instant,
+    last_poll: Instant,
 }
 
 impl BatteryCheckpoint {
@@ -635,6 +676,7 @@ impl BatteryCheckpoint {
             last_revision: None,
             revision_changed_at: None,
             last_checkpoint: Instant::now(),
+            last_poll: Instant::now() - PERSISTENCE_POLL_INTERVAL,
         }
     }
 
@@ -642,6 +684,29 @@ impl BatteryCheckpoint {
         self.last_revision = None;
         self.revision_changed_at = None;
         self.last_checkpoint = Instant::now();
+        self.last_poll = Instant::now() - PERSISTENCE_POLL_INTERVAL;
+    }
+}
+
+struct SystemFlashCheckpoint {
+    last_revision: Option<u64>,
+    revision_changed_at: Option<Instant>,
+    last_poll: Instant,
+}
+
+impl SystemFlashCheckpoint {
+    fn new() -> Self {
+        Self {
+            last_revision: None,
+            revision_changed_at: None,
+            last_poll: Instant::now() - PERSISTENCE_POLL_INTERVAL,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_revision = None;
+        self.revision_changed_at = None;
+        self.last_poll = Instant::now() - PERSISTENCE_POLL_INTERVAL;
     }
 }
 
@@ -650,6 +715,7 @@ fn auto_configure_machine(
     machine: &mut Option<Ip32Machine<UiTraceSink>>,
     active_config: &mut Option<EmulationConfig>,
     battery: &mut BatteryCheckpoint,
+    system_flash: &mut SystemFlashCheckpoint,
 ) {
     let Some(paths) = shared.paths.as_ref() else {
         return;
@@ -672,24 +738,50 @@ fn auto_configure_machine(
             return;
         }
     };
+    let prom_hash = match config.prom_hash() {
+        Ok(hash) => hash,
+        Err(error) => {
+            set_unconfigured_error(&mut lock_state(shared), error.to_string());
+            return;
+        }
+    };
     let battery_load = load_battery(paths, config.rtc_mode(), host_utc_seconds());
+    let flash_load = load_system_flash(paths, prom_hash);
+    let mut warnings = Vec::new();
+    if let Some(warning) = battery_load.warning {
+        warnings.push(warning);
+    }
+    if let Some(warning) = flash_load.warning {
+        warnings.push(warning);
+    }
     let machine_config = config.machine().machine_config(
         prom,
         battery_load.state.unix_seconds(),
         battery_load.state.nvram().to_vec(),
     );
-    let result =
-        Ip32Machine::from_config_with_trace_sink(machine_config, UiTraceSink::application())
-            .map_err(|error| error.to_string())
-            .and_then(|mut new_machine| {
-                new_machine
-                    .restore_rtc_persistent_state(&battery_load.state)
-                    .map_err(|error| error.to_string())?;
-                new_machine
-                    .schedule_power_on()
-                    .map_err(|error| format!("failed to schedule IP32 power-on: {error}"))?;
-                Ok(new_machine)
-            });
+    let result = (|| {
+        let mut new_machine =
+            Ip32Machine::from_config_with_trace_sink(machine_config, UiTraceSink::application())
+                .map_err(|error| error.to_string())?;
+        new_machine
+            .restore_rtc_persistent_state(&battery_load.state)
+            .map_err(|error| error.to_string())?;
+        if let Some(flash) = flash_load.state
+            && let Err(error) = new_machine.restore_system_flash_persistent_state(&flash)
+        {
+            let backup = preserve_system_flash_overlay(paths, prom_hash, host_utc_seconds());
+            let suffix = backup
+                .map(|path| format!("; preserved as {}", path.display()))
+                .unwrap_or_default();
+            warnings.push(format!(
+                "failed to restore System Flash overlay: {error}{suffix}"
+            ));
+        }
+        new_machine
+            .schedule_power_on()
+            .map_err(|error| format!("failed to schedule IP32 power-on: {error}"))?;
+        Ok::<_, String>(new_machine)
+    })();
     let mut state = lock_state(shared);
     match result {
         Ok(new_machine) => {
@@ -702,12 +794,17 @@ fn auto_configure_machine(
             state.snapshot.prom_path = config.prom_path().to_string_lossy().into_owned();
             state.snapshot.rtc_mode = config.rtc_mode();
             state.snapshot.error_message.clear();
-            if let Some(warning) = battery_load.warning {
-                set_persistence_result(&mut state, PersistenceOutcome::Warning, warning);
+            if !warnings.is_empty() {
+                set_persistence_result(
+                    &mut state,
+                    PersistenceOutcome::Warning,
+                    warnings.join("\n"),
+                );
             }
             *machine = Some(new_machine);
             *active_config = Some(config);
             battery.reset();
+            system_flash.reset();
         }
         Err(error) => set_unconfigured_error(&mut state, error),
     }
@@ -719,6 +816,7 @@ fn build_configured_machine(
 ) -> Result<(Ip32Machine<UiTraceSink>, EmulationConfig, Option<String>), String> {
     let persistent = se_machine::o2::ip32::state::Ip32PersistentConfig::default();
     let persisted_path = !request.prom_path.as_os_str().is_empty();
+    let prom_hash = hash_bytes(&request.prom);
     let metadata_path = if persisted_path {
         request.prom_path.clone()
     } else {
@@ -726,17 +824,23 @@ fn build_configured_machine(
             .map_err(|error| error.to_string())?
             .join("unpersisted-prom.bin")
     };
-    let config = EmulationConfig::new(
-        metadata_path,
-        hash_bytes(&request.prom),
-        request.rtc_mode,
-        persistent,
-    )
-    .map_err(|error| error.to_string())?;
+    let config = EmulationConfig::new(metadata_path, prom_hash, request.rtc_mode, persistent)
+        .map_err(|error| error.to_string())?;
     let battery_load = shared
         .paths
         .as_ref()
         .map(|paths| load_battery(paths, request.rtc_mode, host_utc_seconds()));
+    let flash_load = shared
+        .paths
+        .as_ref()
+        .map(|paths| load_system_flash(paths, prom_hash));
+    let mut warnings = Vec::new();
+    if let Some(warning) = battery_load.as_ref().and_then(|load| load.warning.as_ref()) {
+        warnings.push(warning.clone());
+    }
+    if let Some(warning) = flash_load.as_ref().and_then(|load| load.warning.as_ref()) {
+        warnings.push(warning.clone());
+    }
     let rtc = battery_load
         .as_ref()
         .map(|load| &load.state)
@@ -759,13 +863,30 @@ fn build_configured_machine(
     machine
         .restore_rtc_persistent_state(&rtc)
         .map_err(|error| error.to_string())?;
+    if let Some(flash) = flash_load.as_ref().and_then(|load| load.state.as_ref())
+        && let Err(error) = machine.restore_system_flash_persistent_state(flash)
+    {
+        let suffix = shared
+            .paths
+            .as_ref()
+            .and_then(|paths| preserve_system_flash_overlay(paths, prom_hash, host_utc_seconds()))
+            .map(|path| format!("; preserved as {}", path.display()))
+            .unwrap_or_default();
+        warnings.push(format!(
+            "failed to restore System Flash overlay: {error}{suffix}"
+        ));
+    }
     machine
         .schedule_power_on()
         .map_err(|error| format!("failed to schedule IP32 power-on: {error}"))?;
     if persisted_path && let Some(paths) = shared.paths.as_ref() {
         save_emulation_config(paths, &config).map_err(|error| error.to_string())?;
     }
-    Ok((machine, config, battery_load.and_then(|load| load.warning)))
+    Ok((
+        machine,
+        config,
+        (!warnings.is_empty()).then(|| warnings.join("\n")),
+    ))
 }
 
 fn save_machine_state(
@@ -806,6 +927,7 @@ fn load_machine_state(
     machine: &mut Option<Ip32Machine<UiTraceSink>>,
     active_config: &mut Option<EmulationConfig>,
     battery: &mut BatteryCheckpoint,
+    system_flash: &mut SystemFlashCheckpoint,
     request: LoadStateRequest,
 ) {
     let loaded =
@@ -853,6 +975,13 @@ fn load_machine_state(
                 finish_failed_load(shared, request.return_state, error.to_string());
                 return;
             }
+            force_battery_checkpoint(shared, machine.as_ref(), battery);
+            force_system_flash_checkpoint(
+                shared,
+                machine.as_ref(),
+                active_config.as_ref(),
+                system_flash,
+            );
             let terminal_output = drain_machine_terminal_output(&mut new_machine);
             let session_id = begin_application_trace_session();
             let mut state = lock_state(shared);
@@ -871,6 +1000,7 @@ fn load_machine_state(
             *machine = Some(new_machine);
             *active_config = Some(config);
             battery.reset();
+            system_flash.reset();
             set_persistence_result(
                 &mut state,
                 PersistenceOutcome::Loaded,
@@ -878,6 +1008,12 @@ fn load_machine_state(
             );
             drop(state);
             force_battery_checkpoint(shared, machine.as_ref(), battery);
+            force_system_flash_checkpoint(
+                shared,
+                machine.as_ref(),
+                active_config.as_ref(),
+                system_flash,
+            );
         }
         Err(LoadMachineError::PromRequired(error)) => {
             let mut state = lock_state(shared);
@@ -926,13 +1062,17 @@ fn periodic_battery_checkpoint(
     machine: Option<&Ip32Machine<UiTraceSink>>,
     checkpoint: &mut BatteryCheckpoint,
 ) {
+    let now = Instant::now();
+    if now.duration_since(checkpoint.last_poll) < PERSISTENCE_POLL_INTERVAL {
+        return;
+    }
+    checkpoint.last_poll = now;
     let Some(machine) = machine else {
         return;
     };
     let Ok(rtc) = machine.rtc_persistent_state() else {
         return;
     };
-    let now = Instant::now();
     if checkpoint.last_revision != Some(rtc.revision()) {
         checkpoint.last_revision = Some(rtc.revision());
         checkpoint.revision_changed_at = Some(now);
@@ -946,6 +1086,38 @@ fn periodic_battery_checkpoint(
     }
 }
 
+fn periodic_system_flash_checkpoint(
+    shared: &SharedController,
+    machine: Option<&Ip32Machine<UiTraceSink>>,
+    config: Option<&EmulationConfig>,
+    checkpoint: &mut SystemFlashCheckpoint,
+) {
+    let now = Instant::now();
+    if now.duration_since(checkpoint.last_poll) < PERSISTENCE_POLL_INTERVAL {
+        return;
+    }
+    checkpoint.last_poll = now;
+    let (Some(machine), Some(config)) = (machine, config) else {
+        return;
+    };
+    let Ok(prom_hash) = config.prom_hash() else {
+        return;
+    };
+    let Ok(flash) = machine.system_flash_persistent_state() else {
+        return;
+    };
+    if checkpoint.last_revision != Some(flash.revision()) {
+        checkpoint.last_revision = Some(flash.revision());
+        checkpoint.revision_changed_at = Some(now);
+    }
+    let revision_due = checkpoint
+        .revision_changed_at
+        .is_some_and(|changed| now.duration_since(changed) >= BATTERY_DEBOUNCE);
+    if revision_due {
+        write_system_flash_checkpoint(shared, prom_hash, flash, checkpoint);
+    }
+}
+
 fn force_battery_checkpoint(
     shared: &SharedController,
     machine: Option<&Ip32Machine<UiTraceSink>>,
@@ -956,6 +1128,36 @@ fn force_battery_checkpoint(
     };
     match machine.rtc_persistent_state() {
         Ok(rtc) => write_battery_checkpoint(shared, rtc, checkpoint),
+        Err(error) => set_persistence_result(
+            &mut lock_state(shared),
+            PersistenceOutcome::Warning,
+            error.to_string(),
+        ),
+    }
+}
+
+fn force_system_flash_checkpoint(
+    shared: &SharedController,
+    machine: Option<&Ip32Machine<UiTraceSink>>,
+    config: Option<&EmulationConfig>,
+    checkpoint: &mut SystemFlashCheckpoint,
+) {
+    let (Some(machine), Some(config)) = (machine, config) else {
+        return;
+    };
+    let prom_hash = match config.prom_hash() {
+        Ok(hash) => hash,
+        Err(error) => {
+            set_persistence_result(
+                &mut lock_state(shared),
+                PersistenceOutcome::Warning,
+                error.to_string(),
+            );
+            return;
+        }
+    };
+    match machine.system_flash_persistent_state() {
+        Ok(flash) => write_system_flash_checkpoint(shared, prom_hash, flash, checkpoint),
         Err(error) => set_persistence_result(
             &mut lock_state(shared),
             PersistenceOutcome::Warning,
@@ -982,6 +1184,29 @@ fn write_battery_checkpoint(
             &mut lock_state(shared),
             PersistenceOutcome::Warning,
             format!("failed to persist RTC/NVRAM: {error}"),
+        ),
+    }
+}
+
+fn write_system_flash_checkpoint(
+    shared: &SharedController,
+    prom_hash: [u8; 32],
+    flash: se_device::memory::flash::SystemFlashPersistentState,
+    checkpoint: &mut SystemFlashCheckpoint,
+) {
+    let Some(paths) = shared.paths.as_ref() else {
+        return;
+    };
+    let revision = flash.revision();
+    match save_system_flash(paths, prom_hash, flash) {
+        Ok(()) => {
+            checkpoint.last_revision = Some(revision);
+            checkpoint.revision_changed_at = None;
+        }
+        Err(error) => set_persistence_result(
+            &mut lock_state(shared),
+            PersistenceOutcome::Warning,
+            format!("failed to persist System Flash: {error}"),
         ),
     }
 }
