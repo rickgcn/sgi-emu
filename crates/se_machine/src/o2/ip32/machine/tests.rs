@@ -260,6 +260,450 @@ fn jit_hot_loop_matches_scalar_machine_state_and_scheduler() {
     assert!(restored.control.jit_engine.as_ref().unwrap().is_empty());
 }
 
+#[cfg(feature = "jit")]
+#[test]
+fn jit_native_mace_ust_loop_matches_scalar() {
+    let program = [
+        (0x00, i_type(0x0f, 0, 8, 0xbf34)),
+        (0x04, i_type(0x09, 0, 9, 512)),
+        (0x08, i_type(0x37, 8, 10, 0)),
+        (0x0c, i_type(0x09, 9, 9, u16::MAX)),
+        (0x10, i_type(0x05, 9, 0, 0xfffd)),
+        (0x14, 0),
+        (0x18, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    let deadline = SimTime::new(20_000_000);
+    scalar.run_until_time(deadline).unwrap();
+    jit.run_until_time(deadline).unwrap();
+    let scalar_cpu = scalar
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let jit_cpu = jit
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let register = Mips4GprIndex::from_u8(10).unwrap();
+    assert_eq!(
+        scalar_cpu.state().gpr().read(register),
+        jit_cpu.state().gpr().read(register),
+        "native UST value differs: scalar={:?}, JIT={:?}",
+        scalar.performance_snapshot(),
+        jit.performance_snapshot(),
+    );
+    assert_eq!(
+        scalar.performance_snapshot().cpu.retired_instructions,
+        jit.performance_snapshot().cpu.retired_instructions
+    );
+    assert!(
+        jit.performance_snapshot().jit.fast_transaction_hits > 0,
+        "native UST lowering did not run: {:?}",
+        jit.performance_snapshot(),
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_native_crime_timer_loop_matches_scalar() {
+    let program = [
+        (0x00, i_type(0x0f, 0, 8, 0xb400)),
+        (0x04, i_type(0x09, 0, 9, 512)),
+        (0x08, i_type(0x37, 8, 10, 0x0038)),
+        (0x0c, i_type(0x09, 9, 9, u16::MAX)),
+        (0x10, i_type(0x05, 9, 0, 0xfffd)),
+        (0x14, 0),
+        (0x18, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    let deadline = SimTime::new(20_000_000);
+    scalar.run_until_time(deadline).unwrap();
+    jit.run_until_time(deadline).unwrap();
+    let scalar_cpu = scalar
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let jit_cpu = jit
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let register = Mips4GprIndex::from_u8(10).unwrap();
+    assert_eq!(
+        scalar_cpu.state().gpr().read(register),
+        jit_cpu.state().gpr().read(register),
+        "native CRIME TIMER value differs: scalar={:?}, JIT={:?}",
+        scalar.performance_snapshot(),
+        jit.performance_snapshot(),
+    );
+    assert_eq!(
+        scalar.performance_snapshot().cpu.retired_instructions,
+        jit.performance_snapshot().cpu.retired_instructions
+    );
+    assert!(
+        jit.performance_snapshot().jit.fast_transaction_hits > 0,
+        "native CRIME TIMER lowering did not run: {:?}",
+        jit.performance_snapshot(),
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_native_crime_timer_poll_matches_scalar() {
+    let program = [
+        (0x00, i_type(0x0f, 0, 8, 0xb400)),
+        (0x04, i_type(0x37, 8, 10, 0x0038)),
+        (0x08, i_type(0x09, 10, 10, 30_000)),
+        (0x0c, i_type(0x37, 8, 11, 0x0038)),
+        (0x10, r_type(11, 10, 12, 0, 0x2b)),
+        (0x14, i_type(0x05, 12, 0, 0xfffd)),
+        (0x18, 0),
+        (0x1c, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    let deadline = SimTime::new(20_000_000);
+    scalar.run_until_time(deadline).unwrap();
+    jit.run_until_time(deadline).unwrap();
+    let scalar_cpu = scalar
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let jit_cpu = jit
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    assert_eq!(
+        scalar.performance_snapshot().cpu.retired_instructions,
+        jit.performance_snapshot().cpu.retired_instructions,
+        "CRIME TIMER polling retired a different path: scalar={:?}, JIT={:?}",
+        scalar.performance_snapshot(),
+        jit.performance_snapshot(),
+    );
+    for register in [10, 11, 12] {
+        let register = Mips4GprIndex::from_u8(register).unwrap();
+        assert_eq!(
+            scalar_cpu.state().gpr().read(register),
+            jit_cpu.state().gpr().read(register)
+        );
+    }
+    assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_crime_timer_write_then_poll_reaches_wait_at_scalar_time() {
+    let program = [
+        (0x00, i_type(0x0f, 0, 8, 0xb400)),
+        (0x04, i_type(0x3f, 8, 0, 0x0038)),
+        (0x08, i_type(0x0f, 0, 10, 0x0030)),
+        (0x0c, i_type(0x37, 8, 11, 0x0038)),
+        (0x10, r_type(11, 10, 12, 0, 0x2b)),
+        (0x14, i_type(0x05, 12, 0, 0xfffd)),
+        (0x18, 0),
+        (0x1c, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    scalar.run_until_time(SimTime::new(60_000_000)).unwrap();
+    jit.run_until_time(SimTime::new(60_000_000)).unwrap();
+    assert_eq!(
+        jit.control.first_cpu_idle_time,
+        scalar.control.first_cpu_idle_time
+    );
+    assert_machine_architecture_equal(&scalar, &jit);
+    assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
+    assert!(
+        jit.performance_snapshot().jit.region_entries > 0,
+        "timer polling did not enter a Region: {:?}",
+        jit.performance_snapshot()
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_sdram_refills_preserve_crime_timer_poll_timing() {
+    let program = [
+        (0x00, i_type(0x0f, 0, 8, 0xb400)),
+        (0x04, i_type(0x3f, 8, 0, 0x0038)),
+        (0x08, i_type(0x0f, 0, 10, 0x0030)),
+        (0x0c, i_type(0x0f, 0, 1, 0x8000)),
+        (0x10, i_type(0x2b, 1, 2, 0x0000)),
+        (0x14, i_type(0x09, 1, 1, 0x0020)),
+        (0x18, i_type(0x37, 8, 11, 0x0038)),
+        (0x1c, r_type(11, 10, 12, 0, 0x2b)),
+        (0x20, i_type(0x05, 12, 0, 0xfffb)),
+        (0x24, 0),
+        (0x28, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    scalar.run_until_time(SimTime::new(60_000_000)).unwrap();
+    jit.run_until_time(SimTime::new(60_000_000)).unwrap();
+    assert_eq!(
+        jit.control.first_cpu_idle_time,
+        scalar.control.first_cpu_idle_time
+    );
+    assert_machine_architecture_equal(&scalar, &jit);
+    assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_direct_sdram_transactions_reach_wait_at_scalar_time() {
+    let program = [
+        (0x00, LUI_R1_LINEAR_RAM),
+        (0x04, ADDIU_R2_1234),
+        (0x08, SW_R2_R1),
+        (0x0c, LW_R3_R1),
+        (0x10, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    scalar.run_until_time(SimTime::new(1_000_000)).unwrap();
+    jit.run_until_time(SimTime::new(1_000_000)).unwrap();
+    assert_eq!(
+        jit.control.first_cpu_idle_time,
+        scalar.control.first_cpu_idle_time
+    );
+    assert_machine_architecture_equal(&scalar, &jit);
+    assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_component_tracing_preserves_scheduled_transaction_path() {
+    let program = [
+        (0x00, LUI_R1_LINEAR_RAM),
+        (0x04, ADDIU_R2_1234),
+        (0x08, SW_R2_R1),
+        (0x0c, LW_R3_R1),
+        (0x10, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar =
+        Ip32Machine::from_config_with_trace_sink(scalar_config, ComponentCaptureSink::default())
+            .unwrap();
+    let mut jit =
+        Ip32Machine::from_config_with_trace_sink(jit_config, ComponentCaptureSink::default())
+            .unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    scalar.run_until_time(SimTime::new(1_000_000)).unwrap();
+    jit.run_until_time(SimTime::new(1_000_000)).unwrap();
+
+    assert_machine_architecture_equal(&scalar, &jit);
+    assert_eq!(
+        scalar.runtime().trace_recorder().sink().records,
+        jit.runtime().trace_recorder().sink().records
+    );
+    let performance = jit.performance_snapshot();
+    assert_eq!(performance.jit.fast_transaction_hits, 0);
+    assert!(performance.jit.fast_transaction_attempts > 0);
+    assert_eq!(
+        performance.jit.fast_transaction_fallbacks,
+        performance.jit.fast_transaction_attempts
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_direct_sdram_transactions_respect_uart_completion() {
+    let loop_address = 0xffff_ffff_9fc0_0014_u64;
+    let branch_to_loop = ((loop_address as i64 - 0xffff_ffff_9fc0_0028_u64 as i64) / 4) as u16;
+    let program = [
+        (0x00, i_type(0x0f, 0, 1, 0xbf39)),
+        (0x04, i_type(0x0d, 1, 1, 0x0007)),
+        (0x08, i_type(0x09, 0, 2, b'A'.into())),
+        (0x0c, i_type(0x28, 1, 2, 0x0000)),
+        (0x10, i_type(0x0f, 0, 3, 0x8000)),
+        (0x14, i_type(0x23, 3, 4, 0x0000)),
+        (0x18, i_type(0x09, 3, 3, 0x0020)),
+        (0x1c, i_type(0x24, 1, 5, 0x0500)),
+        (0x20, i_type(0x0c, 5, 5, 0x0020)),
+        (0x24, i_type(0x04, 5, 0, branch_to_loop)),
+        (0x28, 0),
+        (0x2c, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    let deadline = SimTime::new(10_000_000);
+    scalar.run_until_time(deadline).unwrap();
+    jit.run_until_time(deadline).unwrap();
+    assert_eq!(
+        jit.control.first_cpu_idle_time,
+        scalar.control.first_cpu_idle_time
+    );
+    assert_machine_architecture_equal(&scalar, &jit);
+    assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_native_timer_reads_respect_uart_completion() {
+    let loop_address = 0xffff_ffff_9fc0_0014_u64;
+    let branch_to_loop = ((loop_address as i64 - 0xffff_ffff_9fc0_0024_u64 as i64) / 4) as u16;
+    let program = [
+        (0x00, i_type(0x0f, 0, 1, 0xbf39)),
+        (0x04, i_type(0x0d, 1, 1, 0x0007)),
+        (0x08, i_type(0x09, 0, 2, b'A'.into())),
+        (0x0c, i_type(0x28, 1, 2, 0x0000)),
+        (0x10, i_type(0x0f, 0, 3, 0xb400)),
+        (0x14, i_type(0x23, 3, 4, 0x003c)),
+        (0x18, i_type(0x24, 1, 5, 0x0500)),
+        (0x1c, i_type(0x0c, 5, 5, 0x0020)),
+        (0x20, i_type(0x04, 5, 0, branch_to_loop)),
+        (0x24, 0),
+        (0x28, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    let deadline = SimTime::new(10_000_000);
+    scalar.run_until_time(deadline).unwrap();
+    jit.run_until_time(deadline).unwrap();
+    assert_eq!(
+        jit.control.first_cpu_idle_time,
+        scalar.control.first_cpu_idle_time
+    );
+    assert_machine_architecture_equal(&scalar, &jit);
+    assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_native_crime_timer_poll_from_ram_matches_scalar() {
+    let ram_program = [
+        i_type(0x0f, 0, 8, 0xb400),
+        i_type(0x23, 8, 10, 0x003c),
+        i_type(0x09, 10, 10, 30_000),
+        i_type(0x23, 8, 11, 0x003c),
+        r_type(11, 10, 12, 0, 0x2b),
+        i_type(0x05, 12, 0, 0xfffd),
+        0,
+        WAIT,
+    ];
+    let mut loader = vec![
+        (0x00, i_type(0x0f, 0, 8, 0xa000)),
+        (0x04, i_type(0x0d, 8, 8, 0x1000)),
+    ];
+    let mut offset = 0x08;
+    for (index, instruction) in ram_program.into_iter().enumerate() {
+        loader.push((offset, i_type(0x0f, 0, 9, (instruction >> 16) as u16)));
+        loader.push((offset + 4, i_type(0x0d, 9, 9, instruction as u16)));
+        loader.push((offset + 8, i_type(0x2b, 8, 9, (index * 4) as u16)));
+        offset += 12;
+    }
+    loader.push((offset, i_type(0x0f, 0, 7, 0x8000)));
+    loader.push((offset + 4, i_type(0x0d, 7, 7, 0x1000)));
+    loader.push((offset + 8, r_type(7, 0, 0, 0, 0x08)));
+    loader.push((offset + 12, 0));
+
+    let scalar_config = config_with_program(&loader);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    let deadline = SimTime::new(100_000_000);
+    scalar.run_until_time(deadline).unwrap();
+    jit.run_until_time(deadline).unwrap();
+    let scalar_cpu = scalar
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let jit_cpu = jit
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let timer_registers = |cpu: &R5000Cpu| {
+        [10, 11, 12].map(|register| {
+            cpu.state()
+                .gpr()
+                .read(Mips4GprIndex::from_u8(register).unwrap())
+        })
+    };
+    assert_eq!(
+        scalar.performance_snapshot().cpu.retired_instructions,
+        jit.performance_snapshot().cpu.retired_instructions,
+        "RAM CRIME TIMER polling retired a different path: scalar_registers={:?}, JIT_registers={:?}, scalar={:?}, JIT={:?}",
+        timer_registers(scalar_cpu),
+        timer_registers(jit_cpu),
+        scalar.performance_snapshot(),
+        jit.performance_snapshot(),
+    );
+    for register in [10, 11, 12] {
+        let register = Mips4GprIndex::from_u8(register).unwrap();
+        assert_eq!(
+            scalar_cpu.state().gpr().read(register),
+            jit_cpu.state().gpr().read(register)
+        );
+    }
+    assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
+    assert!(jit.performance_snapshot().jit.region_entries > 0);
+}
+
 #[cfg(not(feature = "jit"))]
 #[test]
 fn requesting_jit_without_the_feature_is_rejected() {
@@ -1640,8 +2084,91 @@ fn local_ip32_prom_core_throughput_probe() {
 #[cfg(feature = "jit")]
 #[test]
 #[ignore = "requires local proprietary IP32 PROM images and a release build"]
+fn local_ip32_prom_jit_matches_scalar_through_4_2_billion_ticks() {
+    const DEADLINE: SimTime = SimTime::new(4_200_000_000);
+    let paths = std::env::var("IP32_PROM_PATHS")
+        .ok()
+        .map(|paths| {
+            paths
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|paths| !paths.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                std::env::var("IP32_PROM_PATH")
+                    .expect("IP32_PROM_PATHS or IP32_PROM_PATH must name local images"),
+            ]
+        });
+
+    for path in paths {
+        let prom = std::fs::read(&path).expect("the local PROM image must be readable");
+        let scalar_config = Ip32MachineConfig {
+            prom_image: prom,
+            ..Ip32MachineConfig::default()
+        };
+        let mut jit_config = scalar_config.clone();
+        jit_config.jit_enabled = true;
+        let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+        let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+        scalar.schedule_power_on().unwrap();
+        jit.schedule_power_on().unwrap();
+
+        assert_eq!(
+            scalar.run_until_time(DEADLINE).unwrap(),
+            RunStatus::DeadlineReached
+        );
+        assert_eq!(
+            jit.run_until_time(DEADLINE).unwrap(),
+            RunStatus::DeadlineReached
+        );
+        assert_machine_architecture_equal(&scalar, &jit);
+        assert_eq!(
+            scalar.control.first_serial_output_time, jit.control.first_serial_output_time,
+            "first serial output time differs for {path}"
+        );
+        let scalar_performance = scalar.performance_snapshot();
+        let jit_performance = jit.performance_snapshot();
+        assert_eq!(scalar_performance.sim_time, jit_performance.sim_time);
+        assert_eq!(
+            scalar_performance.cpu.retired_instructions, jit_performance.cpu.retired_instructions,
+            "retired instruction count differs for {path}"
+        );
+        assert_eq!(
+            scalar_performance.cpu.transactions, jit_performance.cpu.transactions,
+            "CPU transaction count differs for {path}"
+        );
+        assert_eq!(
+            scalar_performance.cpu.exceptions, jit_performance.cpu.exceptions,
+            "exception count differs for {path}"
+        );
+        assert_eq!(
+            scalar_performance.sysad_transactions, jit_performance.sysad_transactions,
+            "SysAD transaction count differs for {path}"
+        );
+        assert_eq!(
+            scalar_performance.memory_transactions, jit_performance.memory_transactions,
+            "memory transaction count differs for {path}"
+        );
+        assert_eq!(
+            scalar_performance.cmi_transactions, jit_performance.cmi_transactions,
+            "CMI transaction count differs for {path}"
+        );
+        assert_eq!(
+            scalar_performance.cgi_transactions, jit_performance.cgi_transactions,
+            "CGI transaction count differs for {path}"
+        );
+    }
+}
+
+#[cfg(feature = "jit")]
+#[test]
+#[ignore = "requires local proprietary IP32 PROM images and a release build"]
 fn local_ip32_prom_jit_first_serial_acceptance() {
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct Sample {
         elapsed: Duration,
         simulated_time: SimTime,
@@ -1697,7 +2224,8 @@ fn local_ip32_prom_jit_first_serial_acceptance() {
 
     fn median(mut samples: Vec<Sample>) -> Sample {
         samples.sort_by_key(|sample| sample.elapsed);
-        samples[samples.len() / 2]
+        let middle = samples.len() / 2;
+        samples.remove(middle)
     }
 
     if cfg!(debug_assertions) {
@@ -1723,7 +2251,7 @@ fn local_ip32_prom_jit_first_serial_acceptance() {
     let requested_runs = std::env::var("IP32_PROM_BENCH_RUNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(3)
+        .unwrap_or(5)
         .max(1);
     let runs = if requested_runs.is_multiple_of(2) {
         requested_runs + 1
@@ -1737,11 +2265,29 @@ fn local_ip32_prom_jit_first_serial_acceptance() {
 
     for path in paths {
         let prom = std::fs::read(&path).expect("the local PROM image must be readable");
+        let _ = run(&prom, false, max_events);
+        let _ = run(&prom, true, max_events);
         let scalar = median((0..runs).map(|_| run(&prom, false, max_events)).collect());
         let jit = median((0..runs).map(|_| run(&prom, true, max_events)).collect());
         let speedup = scalar.elapsed.as_secs_f64() / jit.elapsed.as_secs_f64();
+        let simulated_seconds = jit.simulated_time.get() as f64 / IP32_TIMEBASE_HZ as f64;
+        let rtf = simulated_seconds / jit.elapsed.as_secs_f64();
+        let region_operations_per_entry =
+            jit.jit.region_operations as f64 / jit.jit.region_entries.max(1) as f64;
+        let guest_operations = jit
+            .jit
+            .interpreted_operations
+            .saturating_add(jit.jit.native_operations)
+            .saturating_add(jit.jit.region_operations);
+        let runtime_calls_per_operation =
+            jit.jit.runtime_calls as f64 / guest_operations.max(1) as f64;
+        let region_side_exits = jit
+            .jit
+            .region_cold_side_exits
+            .saturating_add(jit.jit.region_budget_side_exits)
+            .saturating_add(jit.jit.region_runtime_side_exits);
         eprintln!(
-            "{path}: scalar={:?}@{} ticks, jit={:?}@{} ticks, speedup={speedup:.3}x, retired={}/{}, cpu-transactions={}/{}, jit={:?}",
+            "{path}: scalar={:?}@{} ticks, jit={:?}@{} ticks, rtf={rtf:.3}, speedup={speedup:.3}x, retired={}/{}, cpu-transactions={}/{}, region-operations/entry={region_operations_per_entry:.3}, runtime-calls/operation={runtime_calls_per_operation:.5}, jit={:?}",
             scalar.elapsed,
             scalar.simulated_time.get(),
             jit.elapsed,
@@ -1761,143 +2307,113 @@ fn local_ip32_prom_jit_first_serial_acceptance() {
             "first serial simulated time differs for {path}"
         );
         assert!(
-            speedup >= 1.5,
-            "first serial output for {path} reached only {speedup:.3}x speedup"
+            rtf >= 1.5,
+            "first serial output for {path} reached only RTF {rtf:.3}"
+        );
+        assert!(
+            region_operations_per_entry >= 16.0,
+            "first serial output for {path} averaged only {region_operations_per_entry:.3} Region operations per entry"
+        );
+        assert!(
+            runtime_calls_per_operation < 0.10,
+            "first serial output for {path} used {runtime_calls_per_operation:.5} runtime calls per guest operation"
+        );
+        assert_eq!(
+            region_side_exits, jit.jit.region_entries,
+            "first serial output for {path} did not classify every Region exit"
+        );
+        assert_eq!(
+            jit.jit
+                .system_flash_fetches
+                .saturating_add(jit.jit.sdram_fetches),
+            jit.jit.fast_fetches,
+            "first serial output for {path} did not classify every stable code fetch"
         );
     }
 }
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "requires a local proprietary IP32 PROM image"]
-fn local_ip32_prom_jit_divergence_probe() {
-    let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
-    let prom = std::fs::read(path).expect("the local PROM image must be readable");
-    let scalar_config = Ip32MachineConfig {
-        prom_image: prom.clone(),
-        ..Ip32MachineConfig::default()
-    };
-    let jit_config = Ip32MachineConfig {
-        prom_image: prom,
-        jit_enabled: true,
-        ..Ip32MachineConfig::default()
-    };
-    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
-    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
-    scalar.schedule_power_on().unwrap();
-    jit.schedule_power_on().unwrap();
-    let step = std::env::var("IP32_PROM_COMPARE_STEP")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1_000_000);
-    let maximum = std::env::var("IP32_PROM_COMPARE_MAX")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(4_200_000_000);
-    let fine_after = std::env::var("IP32_PROM_COMPARE_FINE_AFTER")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(maximum);
-    let fine_step = std::env::var("IP32_PROM_COMPARE_FINE_STEP")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(step);
-    let coarse_deadlines = (step..=fine_after).step_by(step as usize);
-    let fine_deadlines =
-        (fine_after.saturating_add(fine_step)..=maximum).step_by(fine_step as usize);
+#[ignore = "requires the local rev4.3 IP32 PROM image and a release build"]
+fn local_ip32_prom_jit_instruction_acceptance() {
+    #[derive(Clone)]
+    struct Sample {
+        elapsed: Duration,
+        performance: Ip32PerformanceSnapshot,
+    }
 
-    for deadline in coarse_deadlines.chain(fine_deadlines) {
-        let deadline = SimTime::new(deadline);
-        scalar.run_until_time(deadline).unwrap();
-        jit.run_until_time(deadline).unwrap();
-        let scalar_cpu = scalar
-            .runtime()
-            .registry()
-            .get_typed::<R5000Cpu>(component_ids::CPU0)
-            .unwrap();
-        let jit_cpu = jit
-            .runtime()
-            .registry()
-            .get_typed::<R5000Cpu>(component_ids::CPU0)
-            .unwrap();
-        let scalar_state = scalar_cpu.state();
-        let jit_state = jit_cpu.state();
-        if scalar.runtime().now() != jit.runtime().now()
-            || scalar.runtime().scheduler().peek_next_time()
-                != jit.runtime().scheduler().peek_next_time()
-            || scalar_state != jit_state
-            || scalar.control.cpu_clock != jit.control.cpu_clock
-        {
-            let gpr_differences = (0..32)
-                .filter_map(|index| {
-                    let index = Mips4GprIndex::from_u8(index).unwrap();
-                    let scalar_value = scalar_state.gpr().read(index);
-                    let jit_value = jit_state.gpr().read(index);
-                    (scalar_value != jit_value).then_some((index.number(), scalar_value, jit_value))
-                })
-                .collect::<Vec<_>>();
-            let mut differences = Vec::new();
-            for (name, differs) in [
-                ("pc", scalar_state.pc() != jit_state.pc()),
-                ("next_pc", scalar_state.next_pc() != jit_state.next_pc()),
-                (
-                    "delay_slot_branch_pc",
-                    scalar_state.delay_slot_branch_pc() != jit_state.delay_slot_branch_pc(),
-                ),
-                ("gpr", scalar_state.gpr() != jit_state.gpr()),
-                ("hi", scalar_state.hi() != jit_state.hi()),
-                ("lo", scalar_state.lo() != jit_state.lo()),
-                ("cp0", scalar_state.cp0() != jit_state.cp0()),
-                ("cp1", scalar_state.cp1() != jit_state.cp1()),
-                ("tlb", scalar_state.tlb_entries() != jit_state.tlb_entries()),
-                ("llbit", scalar_state.llbit() != jit_state.llbit()),
-                (
-                    "external_interrupts",
-                    scalar_state.external_interrupts() != jit_state.external_interrupts(),
-                ),
-                (
-                    "unexposed_execution_state",
-                    scalar_state != jit_state
-                        && scalar_state.pc() == jit_state.pc()
-                        && scalar_state.next_pc() == jit_state.next_pc()
-                        && scalar_state.delay_slot_branch_pc() == jit_state.delay_slot_branch_pc()
-                        && scalar_state.gpr() == jit_state.gpr()
-                        && scalar_state.hi() == jit_state.hi()
-                        && scalar_state.lo() == jit_state.lo()
-                        && scalar_state.cp0() == jit_state.cp0()
-                        && scalar_state.cp1() == jit_state.cp1()
-                        && scalar_state.tlb_entries() == jit_state.tlb_entries()
-                        && scalar_state.llbit() == jit_state.llbit()
-                        && scalar_state.external_interrupts() == jit_state.external_interrupts(),
-                ),
-                (
-                    "cpu_clock",
-                    scalar.control.cpu_clock != jit.control.cpu_clock,
-                ),
-            ] {
-                if differs {
-                    differences.push(name);
-                }
+    fn run(prom: &[u8], target: u64) -> Sample {
+        let mut machine = Ip32Machine::from_config(Ip32MachineConfig {
+            prom_image: prom.to_vec(),
+            jit_enabled: true,
+            ..Ip32MachineConfig::default()
+        })
+        .unwrap();
+        machine.schedule_power_on().unwrap();
+        let started = Instant::now();
+        loop {
+            let retired = machine.performance_snapshot().cpu.retired_instructions;
+            if retired >= target {
+                break;
             }
-            panic!(
-                "JIT divergence before deadline {deadline}: fields={differences:?}, gpr={gpr_differences:#x?}; scalar now={}, next={:?}, pc={:#018x}/{:#018x}, delay={:?}, count={}, clock={:?}, performance={:?}; JIT now={}, next={:?}, pc={:#018x}/{:#018x}, delay={:?}, count={}, clock={:?}, performance={:?}",
-                scalar.runtime().now(),
-                scalar.runtime().scheduler().peek_next_time(),
-                scalar_state.pc(),
-                scalar_state.next_pc(),
-                scalar_state.delay_slot_branch_pc(),
-                scalar_state.cp0().count().bits(),
-                scalar.control.cpu_clock,
-                scalar.performance_snapshot(),
-                jit.runtime().now(),
-                jit.runtime().scheduler().peek_next_time(),
-                jit_state.pc(),
-                jit_state.next_pc(),
-                jit_state.delay_slot_branch_pc(),
-                jit_state.cp0().count().bits(),
-                jit.control.cpu_clock,
-                jit.performance_snapshot(),
-            );
+            let events = if target - retired > 1_000_000 {
+                4_096
+            } else {
+                1
+            };
+            match machine.run_steps(events).unwrap() {
+                RunStatus::Dispatched | RunStatus::StepLimitReached => {}
+                status => panic!(
+                    "PROM became inactive before reaching {target} retired instructions: {status:?}"
+                ),
+            }
+        }
+        Sample {
+            elapsed: started.elapsed(),
+            performance: machine.performance_snapshot(),
         }
     }
+
+    fn median(mut samples: Vec<Sample>) -> Sample {
+        samples.sort_by_key(|sample| sample.elapsed);
+        let middle = samples.len() / 2;
+        samples.remove(middle)
+    }
+
+    if cfg!(debug_assertions) {
+        panic!("the instruction-count JIT acceptance must run with --release");
+    }
+    const TARGET: u64 = 120_000_000;
+    let path =
+        std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name the local rev4.3 image");
+    let prom = std::fs::read(&path).expect("the local PROM image must be readable");
+    let requested_runs = std::env::var("IP32_PROM_BENCH_RUNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5)
+        .max(1);
+    let runs = if requested_runs.is_multiple_of(2) {
+        requested_runs + 1
+    } else {
+        requested_runs
+    };
+
+    let _ = run(&prom, TARGET);
+    let sample = median((0..runs).map(|_| run(&prom, TARGET)).collect());
+    let simulated_seconds = sample.performance.sim_time.get() as f64 / IP32_TIMEBASE_HZ as f64;
+    let rtf = simulated_seconds / sample.elapsed.as_secs_f64();
+    let mips = sample.performance.cpu.retired_instructions as f64
+        / sample.elapsed.as_secs_f64()
+        / 1_000_000.0;
+    eprintln!(
+        "{path}: elapsed={:?}, simulated-ticks={}, retired={}, rtf={rtf:.3}, throughput={mips:.3} MIPS, jit={:?}",
+        sample.elapsed,
+        sample.performance.sim_time.get(),
+        sample.performance.cpu.retired_instructions,
+        sample.performance.jit,
+    );
+    assert!(
+        rtf >= 1.5,
+        "120,000,000-instruction benchmark reached only RTF {rtf:.3}"
+    );
 }

@@ -94,6 +94,27 @@ pub enum Ip32SysAdBusAction {
     Idle,
 }
 
+/// Immutable timing proof for one direct transaction on an idle SysAD bus.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ip32DirectSysAdPlan {
+    generation: u64,
+    clock_remainder: u64,
+    request_delay: SimDuration,
+    completion_delay: SimDuration,
+}
+
+impl Ip32DirectSysAdPlan {
+    /// Returns the delay from CPU request to CRIME delivery.
+    pub const fn request_delay(self) -> SimDuration {
+        self.request_delay
+    }
+
+    /// Returns the delay from CRIME completion to CPU delivery.
+    pub const fn completion_delay(self) -> SimDuration {
+        self.completion_delay
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct BusClock {
     timebase_hz: u64,
@@ -284,6 +305,47 @@ impl Ip32SysAdBus {
     /// Returns the exact current fractional clock used by stable fetches.
     pub fn stable_fetch_clock(&self) -> Option<FractionalClockProjection> {
         self.stable_fetch_ready().then(|| self.clock.projection())
+    }
+
+    /// Plans one request/completion pair on an otherwise idle bus.
+    pub fn plan_direct_transaction(&self) -> Option<Ip32DirectSysAdPlan> {
+        if !self.stable_fetch_ready() {
+            return None;
+        }
+        let mut clock = self.clock;
+        Some(Ip32DirectSysAdPlan {
+            generation: self.generation,
+            clock_remainder: self.clock.remainder,
+            request_delay: clock.next_cycle(),
+            completion_delay: clock.next_cycle(),
+        })
+    }
+
+    /// Returns whether an idle-bus timing proof still owns the exact bus state.
+    pub fn direct_transaction_plan_valid(&self, plan: Ip32DirectSysAdPlan) -> bool {
+        self.stable_fetch_ready()
+            && self.generation == plan.generation
+            && self.clock.remainder == plan.clock_remainder
+    }
+
+    /// Commits one previously validated direct request/completion pair.
+    #[must_use]
+    pub fn commit_direct_transaction(&mut self, plan: Ip32DirectSysAdPlan) -> bool {
+        if !self.direct_transaction_plan_valid(plan) {
+            return false;
+        }
+        let mut clock = self.clock;
+        if clock.next_cycle() != plan.request_delay || clock.next_cycle() != plan.completion_delay {
+            return false;
+        }
+        self.clock = clock;
+        true
+    }
+
+    /// Commits a proven batch of direct request/completion cycle pairs.
+    pub fn commit_direct_transactions(&mut self, transactions: u64) {
+        assert!(self.stable_fetch_ready());
+        let _ = self.clock.advance_cycles(transactions.saturating_mul(2));
     }
 
     /// Plans idle request/completion cycle pairs without changing bus state.

@@ -103,3 +103,44 @@ fn sysad_queue_preserves_order_and_rejects_mismatched_completion() {
         ExecutionTransactionId::new(2)
     );
 }
+
+#[test]
+fn direct_sysad_commit_matches_scheduled_clock_progress() {
+    let new_bus = || {
+        Ip32SysAdBus::new(
+            component_ids::CPU_SYSAD_BUS,
+            "SysAD",
+            component_ids::CPU0,
+            component_ids::CRIME,
+            1_000_000_000,
+            66_666_500,
+        )
+    };
+    let mut scheduled = new_bus();
+    let mut direct = new_bus();
+    let transaction = cpu_read(7);
+    let plan = direct.plan_direct_transaction().unwrap();
+
+    assert!(matches!(
+        scheduled.route(transaction.clone()),
+        CrimeBusDisposition::QueuedAndNeedsService { .. }
+    ));
+    scheduled.handle_event(Ip32SysAdBusEvent::Service {
+        generation: scheduled.generation(),
+    });
+    assert!(matches!(
+        scheduled.poll(),
+        Ip32SysAdBusAction::Deliver { .. }
+    ));
+    scheduled.accept_device_completion(ExecutionCompletion {
+        id: transaction.id,
+        payload: Mips4ExecutionCompletion::ReadData(0x1234),
+    });
+    assert!(matches!(
+        scheduled.poll(),
+        Ip32SysAdBusAction::Schedule { .. }
+    ));
+
+    assert!(direct.commit_direct_transaction(plan));
+    assert_eq!(direct.clock, scheduled.clock);
+}
