@@ -126,6 +126,39 @@ where
         Ok(())
     }
 
+    /// Inserts elided transactions immediately before the current waiting request.
+    ///
+    /// Returns the renumbered identifier that must replace the request's
+    /// externally published identifier.
+    pub fn account_transactions_before_waiting(
+        &mut self,
+        transactions: u64,
+    ) -> Result<ExecutionTransactionId, FunctionalExecutorError<T::Error>> {
+        let FunctionalExecutorState::Waiting { transaction_id } = self.state else {
+            return Err(FunctionalExecutorError::Failed);
+        };
+        let Some(waiting_id) = transaction_id
+            .get()
+            .checked_add(u128::from(transactions))
+            .map(ExecutionTransactionId::new)
+        else {
+            self.state = FunctionalExecutorState::Failed;
+            return Err(FunctionalExecutorError::TransactionIdOverflow);
+        };
+        let Some(next_transaction_id) = self
+            .next_transaction_id
+            .checked_add(u128::from(transactions))
+        else {
+            self.state = FunctionalExecutorState::Failed;
+            return Err(FunctionalExecutorError::TransactionIdOverflow);
+        };
+        self.state = FunctionalExecutorState::Waiting {
+            transaction_id: waiting_id,
+        };
+        self.next_transaction_id = next_transaction_id;
+        Ok(waiting_id)
+    }
+
     /// Consumes the executor and returns its execution target.
     pub fn into_target(self) -> T {
         self.target

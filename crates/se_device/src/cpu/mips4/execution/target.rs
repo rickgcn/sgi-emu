@@ -44,7 +44,9 @@ use super::block::{
     MIPS4_BLOCK_MAX_INSTRUCTIONS, Mips4Block, Mips4BlockBuildError, Mips4BlockFrame,
     Mips4BlockGuard, Mips4BlockGuardLine, Mips4BlockInstructionMetadata, Mips4BlockKey,
     Mips4BlockLiftedInstruction, Mips4BlockRuntime, Mips4CodeSourceRequest, Mips4CodeWindow,
-    Mips4Cp0RuntimeOperation, Mips4RuntimeOperation, Mips4RuntimeResult, lift_cpu_instruction,
+    Mips4Cp0RuntimeOperation, Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult,
+    Mips4FastMemoryRuntime, Mips4RuntimeAbiV3, Mips4RuntimeOperation, Mips4RuntimeResult,
+    lift_cpu_instruction,
 };
 use super::bus::{
     Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransaction,
@@ -277,6 +279,8 @@ pub struct Mips4ExecutionTarget<P, F> {
     #[serde(skip, default)]
     block_runtime_action:
         Option<ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>>,
+    #[serde(skip, default)]
+    fast_memory_runtime: Option<Mips4RuntimeAbiV3>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -337,6 +341,7 @@ where
             code_visibility: Mips4CodeVisibility::default(),
             fetched_instruction: None,
             block_runtime_action: None,
+            fast_memory_runtime: None,
         })
     }
 
@@ -860,6 +865,18 @@ where
         &mut self,
     ) -> Option<ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>> {
         self.block_runtime_action.take()
+    }
+
+    pub(crate) fn bind_fast_memory_runtime<R>(&mut self, runtime: &mut R)
+    where
+        R: Mips4FastMemoryRuntime,
+    {
+        debug_assert!(self.fast_memory_runtime.is_none());
+        self.fast_memory_runtime = Some(Mips4RuntimeAbiV3::new(runtime));
+    }
+
+    pub(crate) fn clear_fast_memory_runtime(&mut self) {
+        self.fast_memory_runtime = None;
     }
 
     fn prepare_runtime_frame(&mut self, frame: &Mips4BlockFrame, operation: Mips4RuntimeOperation) {
@@ -2735,6 +2752,19 @@ where
     P: Mips4ExecutionPolicy,
     F: FloatBackend,
 {
+    fn runtime_abi_v3(&mut self) -> Option<Mips4RuntimeAbiV3> {
+        matches!(
+            Mips4MmuPrivilegeMode::from_status(self.state.cp0.status()),
+            Some(Mips4MmuPrivilegeMode::Kernel)
+        )
+        .then_some(self.fast_memory_runtime)
+        .flatten()
+    }
+
+    fn runtime_memory_big_endian(&self) -> bool {
+        self.effective_endianness() == Mips4Endianness::Big
+    }
+
     fn execute(
         &mut self,
         frame: &mut Mips4BlockFrame,
@@ -2769,6 +2799,54 @@ where
                     ) {
                         Ok(()) => return Mips4RuntimeResult::ContinueControl,
                         Err(pending) => {
+                            if let Some(runtime) = self.fast_memory_runtime {
+                                let Mips4ExecutionTransaction::Read {
+                                    physical_address,
+                                    size,
+                                    kind,
+                                    access_type,
+                                } = transaction
+                                else {
+                                    return Mips4RuntimeResult::InternalError;
+                                };
+                                let request = Mips4FastMemoryReadRequest::new(
+                                    physical_address,
+                                    size,
+                                    kind,
+                                    access_type,
+                                    frame.retired(),
+                                );
+                                match runtime.read(request) {
+                                    Mips4FastMemoryReadResult::Complete {
+                                        value: lanes,
+                                        retirement_limit,
+                                    } => {
+                                        let remaining = retirement_limit
+                                            .saturating_sub(request.retired_boundaries());
+                                        if remaining == 0 {
+                                            return Mips4RuntimeResult::TimelineExhausted;
+                                        }
+                                        frame.limit_budget(remaining);
+                                        let endianness = self.effective_endianness();
+                                        let (register, value) = complete_read_value(
+                                            &mut self.state,
+                                            pending,
+                                            lanes,
+                                            endianness,
+                                        );
+                                        frame.write_gpr(register, value);
+                                        retire_block_frame_control(frame);
+                                        return Mips4RuntimeResult::ContinueControl;
+                                    }
+                                    Mips4FastMemoryReadResult::TimelineExhausted => {
+                                        return Mips4RuntimeResult::TimelineExhausted;
+                                    }
+                                    Mips4FastMemoryReadResult::InternalError => {
+                                        return Mips4RuntimeResult::InternalError;
+                                    }
+                                    Mips4FastMemoryReadResult::Unavailable => {}
+                                }
+                            }
                             self.prepare_runtime_frame(frame, operation);
                             self.start_memory_access(
                                 Mips4CachedClient::DataRead {
@@ -2942,6 +3020,7 @@ where
         self.code_visibility = Mips4CodeVisibility::default();
         self.fetched_instruction = None;
         self.block_runtime_action = None;
+        self.fast_memory_runtime = None;
     }
 
     fn signal(&mut self, signal: Self::Signal) -> ExecutionTargetSignalAction {

@@ -3,7 +3,8 @@
 use core::{fmt, mem, ptr::NonNull};
 
 use cranelift_codegen::ir::{
-    AbiParam, Function, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC, types,
+    AbiParam, BlockArg, Function, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC,
+    types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
@@ -13,20 +14,61 @@ use cranelift_module::{Linkage, Module, default_libcall_names};
 use se_device::cpu::mips4::execution::block::{
     MIPS4_BLOCK_FRAME_BUDGET_OFFSET, MIPS4_BLOCK_FRAME_DELAY_PC_OFFSET,
     MIPS4_BLOCK_FRAME_DELAY_VALID_OFFSET, MIPS4_BLOCK_FRAME_EXCEPTION_OFFSET,
-    MIPS4_BLOCK_FRAME_GPR_WRITE_THROUGH_OFFSET, MIPS4_BLOCK_FRAME_HI_OFFSET,
-    MIPS4_BLOCK_FRAME_LO_OFFSET, MIPS4_BLOCK_FRAME_NEXT_PC_OFFSET,
-    MIPS4_BLOCK_FRAME_OPERATIONS_EXECUTED_OFFSET, MIPS4_BLOCK_FRAME_PC_OFFSET,
+    MIPS4_BLOCK_FRAME_FAST_MEMORY_CONTEXT_OFFSET,
+    MIPS4_BLOCK_FRAME_FAST_MEMORY_NATIVE_CONTEXT_OFFSET,
+    MIPS4_BLOCK_FRAME_FAST_MEMORY_READ_END_OFFSET, MIPS4_BLOCK_FRAME_FAST_MEMORY_READ_OFFSET,
+    MIPS4_BLOCK_FRAME_FAST_MEMORY_READ_START_OFFSET, MIPS4_BLOCK_FRAME_GPR_WRITE_THROUGH_OFFSET,
+    MIPS4_BLOCK_FRAME_HI_OFFSET, MIPS4_BLOCK_FRAME_LO_OFFSET, MIPS4_BLOCK_FRAME_NEXT_PC_OFFSET,
+    MIPS4_BLOCK_FRAME_OPERATION_BASE_OFFSET, MIPS4_BLOCK_FRAME_OPERATIONS_EXECUTED_OFFSET,
+    MIPS4_BLOCK_FRAME_PC_OFFSET, MIPS4_BLOCK_FRAME_REGION_SIDE_EXIT_OFFSET,
     MIPS4_BLOCK_FRAME_RETIRED_OFFSET, MIPS4_BLOCK_FRAME_RUNTIME_CALL_OFFSET,
-    MIPS4_BLOCK_FRAME_RUNTIME_CALLS_OFFSET, MIPS4_BLOCK_FRAME_RUNTIME_CONTEXT_OFFSET, Mips4Block,
-    Mips4BlockArithmetic, Mips4BlockBranchCondition, Mips4BlockBranchTarget, Mips4BlockComparison,
-    Mips4BlockException, Mips4BlockExit, Mips4BlockFrame, Mips4BlockLogical, Mips4BlockOperand,
-    Mips4BlockOperation, Mips4BlockShift, Mips4BlockShiftAmount, Mips4BlockTrap, Mips4BlockWidth,
-    Mips4CodegenBackend, Mips4RuntimeOperation, Mips4RuntimeResult, mips4_block_frame_gpr_offset,
+    MIPS4_BLOCK_FRAME_RUNTIME_CALLS_OFFSET, MIPS4_BLOCK_FRAME_RUNTIME_CONTEXT_OFFSET,
+    MIPS4_BLOCK_FRAME_RUNTIME_MEMORY_BIG_ENDIAN_OFFSET, MIPS4_BLOCK_FRAME_RUNTIME_VALUE_OFFSET,
+    MIPS4_FAST_MEMORY_ATTEMPTS_OFFSET, MIPS4_FAST_MEMORY_AVAILABLE_TICKS_OFFSET,
+    MIPS4_FAST_MEMORY_BUS_BASE_TICKS_OFFSET, MIPS4_FAST_MEMORY_BUS_FRACTION_TICKS_OFFSET,
+    MIPS4_FAST_MEMORY_BUS_FREQUENCY_OFFSET, MIPS4_FAST_MEMORY_BUS_FREQUENCY_RECIPROCAL_OFFSET,
+    MIPS4_FAST_MEMORY_BUS_REMAINDER_OFFSET, MIPS4_FAST_MEMORY_CMI_BASE_TICKS_OFFSET,
+    MIPS4_FAST_MEMORY_CMI_COMPLETED_OFFSET, MIPS4_FAST_MEMORY_CMI_FRACTION_TICKS_OFFSET,
+    MIPS4_FAST_MEMORY_CMI_FREQUENCY_OFFSET, MIPS4_FAST_MEMORY_CMI_FREQUENCY_RECIPROCAL_OFFSET,
+    MIPS4_FAST_MEMORY_CMI_REMAINDER_OFFSET, MIPS4_FAST_MEMORY_CODE_AUX_BASE_TICKS_OFFSET,
+    MIPS4_FAST_MEMORY_CODE_AUX_FRACTION_TICKS_OFFSET, MIPS4_FAST_MEMORY_CODE_AUX_FREQUENCY_OFFSET,
+    MIPS4_FAST_MEMORY_CODE_AUX_FREQUENCY_RECIPROCAL_OFFSET,
+    MIPS4_FAST_MEMORY_CODE_AUX_REMAINDER_OFFSET, MIPS4_FAST_MEMORY_CODE_FETCH_ACTIVE_OFFSET,
+    MIPS4_FAST_MEMORY_CODE_FETCH_FIXED_TICKS_OFFSET, MIPS4_FAST_MEMORY_CODE_FETCH_LIMIT_OFFSET,
+    MIPS4_FAST_MEMORY_CODE_FETCH_SHARES_CMI_OFFSET, MIPS4_FAST_MEMORY_COMPLETED_OFFSET,
+    MIPS4_FAST_MEMORY_CPU_BASE_TICKS_OFFSET, MIPS4_FAST_MEMORY_CPU_FRACTION_TICKS_OFFSET,
+    MIPS4_FAST_MEMORY_CPU_FREQUENCY_OFFSET, MIPS4_FAST_MEMORY_CPU_FREQUENCY_RECIPROCAL_OFFSET,
+    MIPS4_FAST_MEMORY_CPU_REMAINDER_OFFSET, MIPS4_FAST_MEMORY_FULL_BUDGET_ADMITTED_OFFSET,
+    MIPS4_FAST_MEMORY_LAST_CMI_DELIVERY_OFFSET,
+    MIPS4_FAST_MEMORY_LAST_CMI_TRANSACTION_FETCH_OFFSET, MIPS4_FAST_MEMORY_LAST_DELIVERY_OFFSET,
+    MIPS4_FAST_MEMORY_LAST_TRANSACTION_FETCH_OFFSET, MIPS4_FAST_MEMORY_LINEAR_ADDRESS_OFFSET,
+    MIPS4_FAST_MEMORY_LINEAR_BASE_OFFSET, MIPS4_FAST_MEMORY_LINEAR_BASE_TIME_OFFSET,
+    MIPS4_FAST_MEMORY_LINEAR_FREQUENCY_OFFSET, MIPS4_FAST_MEMORY_LINEAR_TIMEBASE_OFFSET,
+    MIPS4_FAST_MEMORY_LINEAR_TIMEBASE_RECIPROCAL_OFFSET, MIPS4_FAST_MEMORY_NATIVE_ENABLED_OFFSET,
+    MIPS4_FAST_MEMORY_SECONDARY_LINEAR_ADDRESS_OFFSET,
+    MIPS4_FAST_MEMORY_SECONDARY_LINEAR_BASE_OFFSET,
+    MIPS4_FAST_MEMORY_SECONDARY_LINEAR_BASE_TIME_OFFSET,
+    MIPS4_FAST_MEMORY_SECONDARY_LINEAR_FREQUENCY_OFFSET,
+    MIPS4_FAST_MEMORY_SECONDARY_LINEAR_TIMEBASE_OFFSET,
+    MIPS4_FAST_MEMORY_SECONDARY_LINEAR_TIMEBASE_RECIPROCAL_OFFSET,
+    MIPS4_FAST_MEMORY_START_TIME_OFFSET, Mips4Block, Mips4BlockArithmetic,
+    Mips4BlockBranchCondition, Mips4BlockBranchTarget, Mips4BlockComparison, Mips4BlockException,
+    Mips4BlockExit, Mips4BlockFrame, Mips4BlockLogical, Mips4BlockOperand, Mips4BlockOperation,
+    Mips4BlockShift, Mips4BlockShiftAmount, Mips4BlockTrap, Mips4BlockWidth, Mips4CodegenBackend,
+    Mips4Region, Mips4RegionSideExit, Mips4RuntimeOperation, Mips4RuntimeResult,
+    mips4_block_frame_gpr_offset,
 };
+use se_device::cpu::mips4::instruction::decode::Mips4CpuInstruction;
 
 /// Compiled host entry point owned by one Cranelift module generation.
 #[derive(Debug)]
 pub struct CraneliftMips4Block {
+    entry: NonNull<u8>,
+}
+
+/// Compiled host entry point for one bounded MIPS IV Region.
+#[derive(Debug)]
+pub struct CraneliftMips4Region {
     entry: NonNull<u8>,
 }
 
@@ -76,6 +118,7 @@ impl CraneliftMips4Backend {
 
 impl Mips4CodegenBackend for CraneliftMips4Backend {
     type CompiledBlock = CraneliftMips4Block;
+    type CompiledRegion = CraneliftMips4Region;
     type Error = CraneliftMips4Error;
 
     fn compile(&mut self, block: &Mips4Block) -> Result<Self::CompiledBlock, Self::Error> {
@@ -148,6 +191,79 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
         })
     }
 
+    fn compile_region(
+        &mut self,
+        region: &Mips4Region,
+    ) -> Result<Self::CompiledRegion, Self::Error> {
+        region.verify().map_err(CraneliftMips4Error::new)?;
+        let mut context = self.module.make_context();
+        let pointer_type = self.module.target_config().pointer_type();
+        context.func = Function::with_name_signature(
+            cranelift_codegen::ir::UserFuncName::user(0, self.next_function as u32),
+            Signature {
+                params: vec![AbiParam::new(pointer_type)],
+                returns: vec![AbiParam::new(types::I32)],
+                call_conv: self.module.target_config().default_call_conv,
+            },
+        );
+
+        let mut function_builder_context = FunctionBuilderContext::new();
+        {
+            let mut builder =
+                FunctionBuilder::new(&mut context.func, &mut function_builder_context);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let frame = builder.block_params(entry)[0];
+            lower_region(
+                &mut builder,
+                frame,
+                region,
+                pointer_type,
+                self.module.target_config().default_call_conv,
+            );
+            builder.seal_all_blocks();
+            builder.finalize();
+        }
+
+        let name = format!("mips4_region_{}", self.next_function);
+        self.next_function = self.next_function.wrapping_add(1);
+        let function = self
+            .module
+            .declare_function(&name, Linkage::Local, &context.func.signature)
+            .map_err(CraneliftMips4Error::new)?;
+        self.module
+            .define_function(function, &mut context)
+            .map_err(CraneliftMips4Error::new)?;
+        self.module.clear_context(&mut context);
+        self.module
+            .finalize_definitions()
+            .map_err(CraneliftMips4Error::new)?;
+        let entry = NonNull::new(self.module.get_finalized_function(function).cast_mut())
+            .ok_or_else(|| CraneliftMips4Error::message("Cranelift returned a null entry point"))?;
+        Ok(CraneliftMips4Region { entry })
+    }
+
+    fn execute_region(
+        &mut self,
+        compiled: &Self::CompiledRegion,
+        frame: &mut Mips4BlockFrame,
+    ) -> Result<Mips4BlockExit, Self::Error> {
+        type NativeRegion = unsafe extern "C" fn(*mut Mips4BlockFrame) -> u32;
+
+        let installed_write_through = frame.prepare_native_gpr_write_through();
+        // SAFETY: Cranelift emitted this entry with the exact NativeRegion signature,
+        // and the module remains alive while every compiled handle is cached.
+        let function: NativeRegion = unsafe { mem::transmute(compiled.entry.as_ptr()) };
+        // SAFETY: The frame is uniquely borrowed for the duration of native execution.
+        let code = unsafe { function(frame) };
+        frame.release_native_gpr_write_through(installed_write_through);
+        Mips4BlockExit::from_code(code).ok_or_else(|| {
+            CraneliftMips4Error::message(format!("native MIPS IV Region returned exit code {code}"))
+        })
+    }
+
     fn clear(&mut self) -> Result<(), Self::Error> {
         self.module = create_module()?;
         self.next_function = 0;
@@ -178,6 +294,88 @@ fn lower_block(
     pointer_type: cranelift_codegen::ir::Type,
     call_conv: CallConv,
 ) {
+    lower_block_with_region_edge(
+        builder,
+        frame,
+        block,
+        pointer_type,
+        call_conv,
+        0,
+        false,
+        None,
+    );
+}
+
+fn lower_region(
+    builder: &mut FunctionBuilder<'_>,
+    frame: Value,
+    region: &Mips4Region,
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: CallConv,
+) {
+    let runtime_side_exit = builder
+        .ins()
+        .iconst(types::I64, Mips4RegionSideExit::Runtime as i64);
+    store_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_REGION_SIDE_EXIT_OFFSET,
+        runtime_side_exit,
+    );
+    let headers = region
+        .nodes()
+        .iter()
+        .map(|_| builder.create_block())
+        .collect::<Vec<_>>();
+    builder.ins().jump(headers[0], &[]);
+    let mut runtime_descriptor_base = 0_u32;
+    for (node_index, node) in region.nodes().iter().enumerate() {
+        builder.switch_to_block(headers[node_index]);
+        let edge = node.hot_successor().map(|successor| NativeRegionEdge {
+            header: headers[successor],
+            entry: region.nodes()[successor].block().key(),
+        });
+        lower_block_with_region_edge(
+            builder,
+            frame,
+            node.block(),
+            pointer_type,
+            call_conv,
+            runtime_descriptor_base,
+            true,
+            edge,
+        );
+        runtime_descriptor_base =
+            runtime_descriptor_base.saturating_add(block_runtime_operation_count(node.block()));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NativeRegionEdge {
+    header: cranelift_codegen::ir::Block,
+    entry: se_device::cpu::mips4::execution::block::Mips4BlockKey,
+}
+
+fn block_runtime_operation_count(block: &Mips4Block) -> u32 {
+    block
+        .body()
+        .iter()
+        .chain(block.delay_slot().iter())
+        .filter(|instruction| matches!(instruction.operation, Mips4BlockOperation::Runtime(_)))
+        .count() as u32
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_block_with_region_edge(
+    builder: &mut FunctionBuilder<'_>,
+    frame: Value,
+    block: &Mips4Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: CallConv,
+    runtime_descriptor_base: u32,
+    region_mode: bool,
+    edge: Option<NativeRegionEdge>,
+) {
     let mut runtime_index = 0;
     let mut entered_operations = 0_u64;
     let mut control = load_control(builder, frame);
@@ -191,6 +389,7 @@ fn lower_block(
         if operation_requires_early_count(instruction.operation) {
             lower_enter_operation(builder, frame, entered_operations);
             store_control(builder, frame, control);
+            store_accounting(builder, frame, accounting);
         }
         let runtime_operation = matches!(instruction.operation, Mips4BlockOperation::Runtime(_));
         match lower_operation(
@@ -198,6 +397,7 @@ fn lower_block(
             frame,
             instruction.operation,
             &mut runtime_index,
+            runtime_descriptor_base,
             entered_operations,
             &mut accounting,
             runtime_abi,
@@ -222,10 +422,15 @@ fn lower_block(
     }
 
     let Some(branch) = block.branch() else {
-        lower_enter_operation(builder, frame, entered_operations);
-        store_accounting(builder, frame, accounting);
-        store_control(builder, frame, control);
-        return_exit(builder, Mips4BlockExit::Dispatch);
+        lower_dispatch(
+            builder,
+            frame,
+            entered_operations,
+            control,
+            accounting,
+            region_mode,
+            edge,
+        );
         return;
     };
     entered_operations += 1;
@@ -273,22 +478,33 @@ fn lower_block(
     let delay = builder.create_block();
     builder.ins().brif(nullify, dispatch, &[], delay, &[]);
     builder.switch_to_block(dispatch);
-    lower_enter_operation(builder, frame, entered_operations);
-    store_accounting(builder, frame, accounting);
-    store_control(builder, frame, control);
-    return_exit(builder, Mips4BlockExit::Dispatch);
+    lower_dispatch(
+        builder,
+        frame,
+        entered_operations,
+        control,
+        accounting,
+        region_mode,
+        edge,
+    );
     builder.switch_to_block(delay);
     let Some(delay_slot) = block.delay_slot() else {
-        lower_enter_operation(builder, frame, entered_operations);
-        store_accounting(builder, frame, accounting);
-        store_control(builder, frame, control);
-        return_exit(builder, Mips4BlockExit::Dispatch);
+        lower_dispatch(
+            builder,
+            frame,
+            entered_operations,
+            control,
+            accounting,
+            region_mode,
+            edge,
+        );
         return;
     };
     entered_operations += 1;
     if operation_requires_early_count(delay_slot.operation) {
         lower_enter_operation(builder, frame, entered_operations);
         store_control(builder, frame, control);
+        store_accounting(builder, frame, accounting);
     }
     let runtime_operation = matches!(delay_slot.operation, Mips4BlockOperation::Runtime(_));
     match lower_operation(
@@ -296,6 +512,7 @@ fn lower_block(
         frame,
         delay_slot.operation,
         &mut runtime_index,
+        runtime_descriptor_base,
         entered_operations,
         &mut accounting,
         runtime_abi,
@@ -317,10 +534,109 @@ fn lower_block(
         }
         LoweredOperation::Terminated => return,
     }
+    lower_dispatch(
+        builder,
+        frame,
+        entered_operations,
+        control,
+        accounting,
+        region_mode,
+        edge,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_dispatch(
+    builder: &mut FunctionBuilder<'_>,
+    frame: Value,
+    entered_operations: u64,
+    control: NativeControl,
+    accounting: NativeAccounting,
+    region_mode: bool,
+    edge: Option<NativeRegionEdge>,
+) {
     lower_enter_operation(builder, frame, entered_operations);
     store_accounting(builder, frame, accounting);
     store_control(builder, frame, control);
+    let Some(edge) = edge else {
+        if region_mode {
+            store_region_side_exit(builder, frame, Mips4RegionSideExit::ColdSuccessor);
+        }
+        return_exit(builder, Mips4BlockExit::Dispatch);
+        return;
+    };
+
+    let pc = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, control.pc, edge.entry.pc as i64);
+    let next_pc = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, control.next_pc, edge.entry.next_pc as i64);
+    let expected_delay_pc = edge.entry.delay_slot_branch_pc.unwrap_or(0);
+    let delay_pc = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, control.delay_pc, expected_delay_pc as i64);
+    let delay_valid = builder.ins().icmp_imm(
+        IntCC::Equal,
+        control.delay_valid,
+        i64::from(edge.entry.delay_slot_branch_pc.is_some()),
+    );
+    let control_matches = builder.ins().band(pc, next_pc);
+    let control_matches = builder.ins().band(control_matches, delay_pc);
+    let control_matches = builder.ins().band(control_matches, delay_valid);
+    let hot = builder.create_block();
+    let cold = builder.create_block();
+    builder.ins().brif(control_matches, hot, &[], cold, &[]);
+
+    builder.switch_to_block(hot);
+    add_region_base(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_OPERATION_BASE_OFFSET,
+        entered_operations,
+    );
+    builder.ins().jump(edge.header, &[]);
+
+    builder.switch_to_block(cold);
+    if region_mode {
+        store_region_side_exit(builder, frame, Mips4RegionSideExit::ColdSuccessor);
+    }
     return_exit(builder, Mips4BlockExit::Dispatch);
+}
+
+fn store_region_side_exit(
+    builder: &mut FunctionBuilder<'_>,
+    frame: Value,
+    side_exit: Mips4RegionSideExit,
+) {
+    let side_exit = builder.ins().iconst(types::I64, side_exit as i64);
+    store_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_REGION_SIDE_EXIT_OFFSET,
+        side_exit,
+    );
+}
+
+fn store_region_budget_side_exit(builder: &mut FunctionBuilder<'_>, frame: Value) {
+    let current = load_i64(builder, frame, MIPS4_BLOCK_FRAME_REGION_SIDE_EXIT_OFFSET);
+    let region_active = builder.ins().icmp_imm(IntCC::NotEqual, current, 0);
+    let budget = builder
+        .ins()
+        .iconst(types::I64, Mips4RegionSideExit::Budget as i64);
+    let side_exit = builder.ins().select(region_active, budget, current);
+    store_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_REGION_SIDE_EXIT_OFFSET,
+        side_exit,
+    );
+}
+
+fn add_region_base(builder: &mut FunctionBuilder<'_>, frame: Value, offset: i32, increment: u64) {
+    let base = load_i64(builder, frame, offset);
+    let base = builder.ins().iadd_imm(base, increment as i64);
+    store_i64(builder, frame, offset, base);
 }
 
 const fn operation_requires_early_count(operation: Mips4BlockOperation) -> bool {
@@ -348,11 +664,13 @@ struct NativeRuntimeAbi {
     call_conv: CallConv,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_operation(
     builder: &mut FunctionBuilder<'_>,
     frame: Value,
     operation: Mips4BlockOperation,
     runtime_index: &mut u32,
+    runtime_descriptor_base: u32,
     entered_operations: u64,
     accounting: &mut NativeAccounting,
     runtime_abi: NativeRuntimeAbi,
@@ -538,29 +856,855 @@ fn lower_operation(
             return LoweredOperation::Terminated;
         }
         Mips4BlockOperation::Runtime(operation) => {
-            let index = *runtime_index;
+            let local_index = *runtime_index;
             *runtime_index = runtime_index.saturating_add(1);
-            let runtime_calls = builder.ins().iconst(types::I64, i64::from(index) + 1);
-            store_i64(
-                builder,
-                frame,
-                MIPS4_BLOCK_FRAME_RUNTIME_CALLS_OFFSET,
-                runtime_calls,
-            );
-            lower_runtime_operation(
-                builder,
-                frame,
-                index,
-                operation,
-                entered_operations,
-                accounting,
-                runtime_abi,
-            );
+            let descriptor_index = runtime_descriptor_base.saturating_add(local_index);
+            if let Mips4RuntimeOperation::Memory { instruction, raw } = operation
+                && let Some((size, signed)) = fast_integer_load_shape(instruction)
+            {
+                lower_fast_integer_load(
+                    builder,
+                    frame,
+                    descriptor_index,
+                    operation,
+                    raw.rs(),
+                    raw.rt(),
+                    raw.signed_immediate(),
+                    size,
+                    signed,
+                    entered_operations,
+                    accounting,
+                    runtime_abi,
+                );
+            } else {
+                lower_runtime_operation(
+                    builder,
+                    frame,
+                    descriptor_index,
+                    operation,
+                    entered_operations,
+                    accounting,
+                    runtime_abi,
+                );
+            }
             return LoweredOperation::Retired;
         }
         Mips4BlockOperation::NoOperation => {}
     }
     LoweredOperation::NeedsRetirement
+}
+
+const fn fast_integer_load_shape(instruction: Mips4CpuInstruction) -> Option<(u8, bool)> {
+    match instruction {
+        Mips4CpuInstruction::Lb => Some((1, true)),
+        Mips4CpuInstruction::Lbu => Some((1, false)),
+        Mips4CpuInstruction::Lh => Some((2, true)),
+        Mips4CpuInstruction::Lhu => Some((2, false)),
+        Mips4CpuInstruction::Lw => Some((4, true)),
+        Mips4CpuInstruction::Lwu => Some((4, false)),
+        Mips4CpuInstruction::Ld => Some((8, false)),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_fast_integer_load(
+    builder: &mut FunctionBuilder<'_>,
+    frame: Value,
+    operation_index: u32,
+    operation: Mips4RuntimeOperation,
+    base_register: u8,
+    target_register: u8,
+    offset: i16,
+    size: u8,
+    signed: bool,
+    entered_operations: u64,
+    accounting: &mut NativeAccounting,
+    runtime_abi: NativeRuntimeAbi,
+) {
+    const KSEG1_START: u64 = 0xffff_ffff_a000_0000;
+    const KSEG1_END: u64 = 0xffff_ffff_bfff_ffff;
+
+    let base = load_gpr(builder, frame, base_register);
+    let virtual_address = builder.ins().iadd_imm(base, i64::from(offset));
+    let kseg1_start = builder.ins().iconst(types::I64, KSEG1_START as i64);
+    let physical_address = builder.ins().isub(virtual_address, kseg1_start);
+    let aligned_bits = builder.ins().band_imm(virtual_address, i64::from(size - 1));
+    let aligned = builder.ins().icmp_imm(IntCC::Equal, aligned_bits, 0);
+    let above_start = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        virtual_address,
+        KSEG1_START as i64,
+    );
+    let below_end = builder.ins().icmp_imm(
+        IntCC::UnsignedLessThanOrEqual,
+        virtual_address,
+        KSEG1_END as i64,
+    );
+    let read_entry = builder.ins().load(
+        runtime_abi.pointer_type,
+        MemFlagsData::trusted(),
+        frame,
+        MIPS4_BLOCK_FRAME_FAST_MEMORY_READ_OFFSET,
+    );
+    let entry_available = builder.ins().icmp_imm(IntCC::NotEqual, read_entry, 0);
+    let read_start = load_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_FAST_MEMORY_READ_START_OFFSET,
+    );
+    let read_end = load_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_FAST_MEMORY_READ_END_OFFSET,
+    );
+    let in_read_range_start = builder.ins().icmp(
+        IntCC::UnsignedGreaterThanOrEqual,
+        physical_address,
+        read_start,
+    );
+    let in_read_range_end = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, physical_address, read_end);
+    let mut eligible = builder.ins().band(aligned, above_start);
+    eligible = builder.ins().band(eligible, below_end);
+    eligible = builder.ins().band(eligible, entry_available);
+    eligible = builder.ins().band(eligible, in_read_range_start);
+    eligible = builder.ins().band(eligible, in_read_range_end);
+
+    let select_native = builder.create_block();
+    let inspect_native = builder.create_block();
+    let inline_primary = builder.create_block();
+    let inspect_secondary = builder.create_block();
+    let inline_secondary = builder.create_block();
+    let direct = builder.create_block();
+    let fallback = builder.create_block();
+    let completed = builder.create_block();
+    let classify_failure = builder.create_block();
+    let timeline_exhausted = builder.create_block();
+    let invalid = builder.create_block();
+    let done = builder.create_block();
+    builder
+        .ins()
+        .brif(eligible, select_native, &[], fallback, &[]);
+
+    builder.switch_to_block(select_native);
+    let native_context = builder.ins().load(
+        runtime_abi.pointer_type,
+        MemFlagsData::trusted(),
+        frame,
+        MIPS4_BLOCK_FRAME_FAST_MEMORY_NATIVE_CONTEXT_OFFSET,
+    );
+    let native_context_available = builder.ins().icmp_imm(IntCC::NotEqual, native_context, 0);
+    builder
+        .ins()
+        .brif(native_context_available, inspect_native, &[], direct, &[]);
+
+    builder.switch_to_block(inspect_native);
+    let native_enabled = load_i64(
+        builder,
+        native_context,
+        MIPS4_FAST_MEMORY_NATIVE_ENABLED_OFFSET,
+    );
+    let native_enabled = builder.ins().icmp_imm(IntCC::NotEqual, native_enabled, 0);
+    let linear_address = load_i64(
+        builder,
+        native_context,
+        MIPS4_FAST_MEMORY_LINEAR_ADDRESS_OFFSET,
+    );
+    let linear_address = if size == 4 {
+        builder.ins().iadd_imm(linear_address, 4)
+    } else {
+        linear_address
+    };
+    let primary_address_matches =
+        builder
+            .ins()
+            .icmp(IntCC::Equal, physical_address, linear_address);
+    let secondary_address = load_i64(
+        builder,
+        native_context,
+        MIPS4_FAST_MEMORY_SECONDARY_LINEAR_ADDRESS_OFFSET,
+    );
+    let secondary_address = if size == 4 {
+        builder.ins().iadd_imm(secondary_address, 4)
+    } else {
+        secondary_address
+    };
+    let secondary_address_matches =
+        builder
+            .ins()
+            .icmp(IntCC::Equal, physical_address, secondary_address);
+    let big_endian = load_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_RUNTIME_MEMORY_BIG_ENDIAN_OFFSET,
+    );
+    let big_endian = builder.ins().icmp_imm(IntCC::NotEqual, big_endian, 0);
+    let inline_width_supported = builder
+        .ins()
+        .iconst(types::I8, i64::from(size == 4 || size == 8));
+    let mut inline_enabled = builder.ins().band(native_enabled, big_endian);
+    inline_enabled = builder.ins().band(inline_enabled, inline_width_supported);
+    let primary_eligible = builder.ins().band(inline_enabled, primary_address_matches);
+    builder.ins().brif(
+        primary_eligible,
+        inline_primary,
+        &[],
+        inspect_secondary,
+        &[],
+    );
+
+    builder.switch_to_block(inline_primary);
+    lower_inline_linear_integer_read(
+        builder,
+        frame,
+        native_context,
+        NativeLinearReadOffsets::PRIMARY,
+        target_register,
+        size,
+        signed,
+        entered_operations,
+        done,
+        fallback,
+        timeline_exhausted,
+    );
+
+    builder.switch_to_block(inspect_secondary);
+    let secondary_eligible = builder
+        .ins()
+        .band(inline_enabled, secondary_address_matches);
+    builder
+        .ins()
+        .brif(secondary_eligible, inline_secondary, &[], direct, &[]);
+
+    builder.switch_to_block(inline_secondary);
+    lower_inline_linear_integer_read(
+        builder,
+        frame,
+        native_context,
+        NativeLinearReadOffsets::SECONDARY,
+        target_register,
+        size,
+        signed,
+        entered_operations,
+        done,
+        fallback,
+        timeline_exhausted,
+    );
+
+    builder.switch_to_block(direct);
+    record_runtime_call(builder, frame);
+    let context = builder.ins().load(
+        runtime_abi.pointer_type,
+        MemFlagsData::trusted(),
+        frame,
+        MIPS4_BLOCK_FRAME_FAST_MEMORY_CONTEXT_OFFSET,
+    );
+    let size_value = builder.ins().iconst(types::I32, i64::from(size));
+    let mut signature = Signature::new(runtime_abi.call_conv);
+    signature.params.extend([
+        AbiParam::new(runtime_abi.pointer_type),
+        AbiParam::new(runtime_abi.pointer_type),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I32),
+    ]);
+    signature.returns.push(AbiParam::new(types::I32));
+    let signature = builder.import_signature(signature);
+    let call = builder.ins().call_indirect(
+        signature,
+        read_entry,
+        &[context, frame, physical_address, size_value],
+    );
+    let result = builder.inst_results(call)[0];
+    let complete = builder.ins().icmp_imm(IntCC::Equal, result, 1);
+    builder
+        .ins()
+        .brif(complete, completed, &[], classify_failure, &[]);
+
+    builder.switch_to_block(completed);
+    let lanes = load_i64(builder, frame, MIPS4_BLOCK_FRAME_RUNTIME_VALUE_OFFSET);
+    let big_endian = load_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_RUNTIME_MEMORY_BIG_ENDIAN_OFFSET,
+    );
+    let big_endian = builder.ins().icmp_imm(IntCC::NotEqual, big_endian, 0);
+    let value = lower_integer_load_value(builder, lanes, big_endian, size, signed);
+    store_gpr(builder, frame, target_register, value);
+    lower_retire_sequential(builder, frame);
+    let runtime_accounting = load_accounting(builder, frame);
+    let continued_accounting = retire_accounting(builder, runtime_accounting);
+    lower_budget_check(builder, frame, entered_operations, continued_accounting);
+    store_accounting(builder, frame, continued_accounting);
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(classify_failure);
+    let unavailable = builder.ins().icmp_imm(IntCC::Equal, result, 0);
+    let classify_nonzero = builder.create_block();
+    builder
+        .ins()
+        .brif(unavailable, fallback, &[], classify_nonzero, &[]);
+    builder.switch_to_block(classify_nonzero);
+    let exhausted = builder.ins().icmp_imm(IntCC::Equal, result, 2);
+    builder
+        .ins()
+        .brif(exhausted, timeline_exhausted, &[], invalid, &[]);
+
+    builder.switch_to_block(timeline_exhausted);
+    lower_enter_operation(builder, frame, entered_operations.saturating_sub(1));
+    return_exit(builder, Mips4BlockExit::TimelineExhausted);
+
+    builder.switch_to_block(invalid);
+    return_exit(builder, Mips4BlockExit::InternalError);
+
+    builder.switch_to_block(fallback);
+    lower_runtime_operation(
+        builder,
+        frame,
+        operation_index,
+        operation,
+        entered_operations,
+        accounting,
+        runtime_abi,
+    );
+    store_accounting(builder, frame, *accounting);
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(done);
+    *accounting = load_accounting(builder, frame);
+}
+
+#[derive(Clone, Copy)]
+struct NativeLinearReadOffsets {
+    base: i32,
+    base_time: i32,
+    frequency: i32,
+    timebase: i32,
+    timebase_reciprocal: i32,
+    uses_cmi: bool,
+}
+
+impl NativeLinearReadOffsets {
+    const PRIMARY: Self = Self {
+        base: MIPS4_FAST_MEMORY_LINEAR_BASE_OFFSET,
+        base_time: MIPS4_FAST_MEMORY_LINEAR_BASE_TIME_OFFSET,
+        frequency: MIPS4_FAST_MEMORY_LINEAR_FREQUENCY_OFFSET,
+        timebase: MIPS4_FAST_MEMORY_LINEAR_TIMEBASE_OFFSET,
+        timebase_reciprocal: MIPS4_FAST_MEMORY_LINEAR_TIMEBASE_RECIPROCAL_OFFSET,
+        uses_cmi: false,
+    };
+
+    const SECONDARY: Self = Self {
+        base: MIPS4_FAST_MEMORY_SECONDARY_LINEAR_BASE_OFFSET,
+        base_time: MIPS4_FAST_MEMORY_SECONDARY_LINEAR_BASE_TIME_OFFSET,
+        frequency: MIPS4_FAST_MEMORY_SECONDARY_LINEAR_FREQUENCY_OFFSET,
+        timebase: MIPS4_FAST_MEMORY_SECONDARY_LINEAR_TIMEBASE_OFFSET,
+        timebase_reciprocal: MIPS4_FAST_MEMORY_SECONDARY_LINEAR_TIMEBASE_RECIPROCAL_OFFSET,
+        uses_cmi: true,
+    };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_inline_linear_integer_read(
+    builder: &mut FunctionBuilder<'_>,
+    frame: Value,
+    context: Value,
+    linear: NativeLinearReadOffsets,
+    target_register: u8,
+    size: u8,
+    signed: bool,
+    entered_operations: u64,
+    done: cranelift_codegen::ir::Block,
+    fallback: cranelift_codegen::ir::Block,
+    timeline_exhausted: cranelift_codegen::ir::Block,
+) {
+    let attempts = load_i64(builder, context, MIPS4_FAST_MEMORY_ATTEMPTS_OFFSET);
+    let attempts = builder.ins().iadd_imm(attempts, 1);
+    store_i64(
+        builder,
+        context,
+        MIPS4_FAST_MEMORY_ATTEMPTS_OFFSET,
+        attempts,
+    );
+
+    let retired = load_i64(builder, frame, MIPS4_BLOCK_FRAME_RETIRED_OFFSET);
+    let completed = load_i64(builder, context, MIPS4_FAST_MEMORY_COMPLETED_OFFSET);
+    let cpu_ticks = lower_clock_elapsed(
+        builder,
+        context,
+        retired,
+        MIPS4_FAST_MEMORY_CPU_BASE_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CPU_FRACTION_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CPU_FREQUENCY_OFFSET,
+        MIPS4_FAST_MEMORY_CPU_FREQUENCY_RECIPROCAL_OFFSET,
+        MIPS4_FAST_MEMORY_CPU_REMAINDER_OFFSET,
+    );
+    let code_fetch_active = load_i64(builder, context, MIPS4_FAST_MEMORY_CODE_FETCH_ACTIVE_OFFSET);
+    let code_fetch_active = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, code_fetch_active, 0);
+    let current_fetch = builder.ins().iadd_imm(retired, 1);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let code_fetches = builder.ins().select(code_fetch_active, current_fetch, zero);
+    let sysad_completed = builder.ins().iadd(completed, code_fetches);
+    let request_cycle = builder.ins().ishl_imm(sysad_completed, 1);
+    let request_cycle = builder.ins().iadd_imm(request_cycle, 1);
+    let completion_cycle = builder.ins().iadd_imm(request_cycle, 1);
+    let request_bus_ticks = lower_clock_elapsed(
+        builder,
+        context,
+        request_cycle,
+        MIPS4_FAST_MEMORY_BUS_BASE_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_FRACTION_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_FREQUENCY_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_FREQUENCY_RECIPROCAL_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_REMAINDER_OFFSET,
+    );
+    let completion_bus_ticks = lower_clock_elapsed(
+        builder,
+        context,
+        completion_cycle,
+        MIPS4_FAST_MEMORY_BUS_BASE_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_FRACTION_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_FREQUENCY_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_FREQUENCY_RECIPROCAL_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_REMAINDER_OFFSET,
+    );
+    let fixed_ticks = load_i64(
+        builder,
+        context,
+        MIPS4_FAST_MEMORY_CODE_FETCH_FIXED_TICKS_OFFSET,
+    );
+    let fixed_ticks = builder.ins().imul(fixed_ticks, code_fetches);
+    let code_aux_cycles = builder.ins().ishl_imm(code_fetches, 1);
+    let code_aux_ticks = lower_clock_elapsed(
+        builder,
+        context,
+        code_aux_cycles,
+        MIPS4_FAST_MEMORY_CODE_AUX_BASE_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CODE_AUX_FRACTION_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CODE_AUX_FREQUENCY_OFFSET,
+        MIPS4_FAST_MEMORY_CODE_AUX_FREQUENCY_RECIPROCAL_OFFSET,
+        MIPS4_FAST_MEMORY_CODE_AUX_REMAINDER_OFFSET,
+    );
+    let code_fetch_shares_cmi = load_i64(
+        builder,
+        context,
+        MIPS4_FAST_MEMORY_CODE_FETCH_SHARES_CMI_OFFSET,
+    );
+    let code_fetch_shares_cmi = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, code_fetch_shares_cmi, 0);
+    let separate_code_aux_ticks = builder
+        .ins()
+        .select(code_fetch_shares_cmi, zero, code_aux_ticks);
+    let shared_code_fetches = builder
+        .ins()
+        .select(code_fetch_shares_cmi, code_fetches, zero);
+    let cmi_completed = load_i64(builder, context, MIPS4_FAST_MEMORY_CMI_COMPLETED_OFFSET);
+    let cmi_prefix = builder.ins().iadd(cmi_completed, shared_code_fetches);
+    let cmi_request_cycle = builder.ins().ishl_imm(cmi_prefix, 1);
+    let cmi_request_cycle = builder
+        .ins()
+        .iadd_imm(cmi_request_cycle, i64::from(linear.uses_cmi));
+    let cmi_completion_cycle = builder
+        .ins()
+        .iadd_imm(cmi_request_cycle, i64::from(linear.uses_cmi));
+    let cmi_request_ticks = lower_clock_elapsed(
+        builder,
+        context,
+        cmi_request_cycle,
+        MIPS4_FAST_MEMORY_CMI_BASE_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_FRACTION_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_FREQUENCY_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_FREQUENCY_RECIPROCAL_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_REMAINDER_OFFSET,
+    );
+    let cmi_completion_ticks = lower_clock_elapsed(
+        builder,
+        context,
+        cmi_completion_cycle,
+        MIPS4_FAST_MEMORY_CMI_BASE_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_FRACTION_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_FREQUENCY_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_FREQUENCY_RECIPROCAL_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_REMAINDER_OFFSET,
+    );
+    let common_ticks = builder.ins().iadd(cpu_ticks, fixed_ticks);
+    let common_ticks = builder.ins().iadd(common_ticks, separate_code_aux_ticks);
+    let delivery_ticks = builder.ins().iadd(common_ticks, request_bus_ticks);
+    let delivery_ticks = builder.ins().iadd(delivery_ticks, cmi_request_ticks);
+    let completion_ticks = builder.ins().iadd(common_ticks, completion_bus_ticks);
+    let completion_ticks = builder.ins().iadd(completion_ticks, cmi_completion_ticks);
+    let available_ticks = load_i64(builder, context, MIPS4_FAST_MEMORY_AVAILABLE_TICKS_OFFSET);
+    let admitted = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, completion_ticks, available_ticks);
+    let calculate_limit = builder.create_block();
+    let rejected = builder.create_block();
+    builder
+        .ins()
+        .brif(admitted, calculate_limit, &[], rejected, &[]);
+
+    builder.switch_to_block(calculate_limit);
+    let current_budget = load_i64(builder, frame, MIPS4_BLOCK_FRAME_BUDGET_OFFSET);
+    let maximum_retirement = builder.ins().iadd(retired, current_budget);
+    let code_fetch_limit = load_i64(builder, context, MIPS4_FAST_MEMORY_CODE_FETCH_LIMIT_OFFSET);
+    let within_code_limit = builder.ins().icmp(
+        IntCC::UnsignedLessThan,
+        maximum_retirement,
+        code_fetch_limit,
+    );
+    let bounded_code_retirement =
+        builder
+            .ins()
+            .select(within_code_limit, maximum_retirement, code_fetch_limit);
+    let maximum_retirement = builder.ins().select(
+        code_fetch_active,
+        bounded_code_retirement,
+        maximum_retirement,
+    );
+    let next_completed = builder.ins().iadd_imm(completed, 1);
+    let next_cmi_completed = builder
+        .ins()
+        .iadd_imm(cmi_completed, i64::from(linear.uses_cmi));
+    let retirement_limit = lower_combined_retirement_limit(
+        builder,
+        context,
+        retired,
+        maximum_retirement,
+        next_completed,
+        next_cmi_completed,
+        code_fetch_active,
+        code_fetch_shares_cmi,
+        available_ticks,
+    );
+    let retirement_admitted =
+        builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, retirement_limit, retired);
+    let complete = builder.create_block();
+    builder
+        .ins()
+        .brif(retirement_admitted, complete, &[], rejected, &[]);
+
+    builder.switch_to_block(complete);
+    let start_time = load_i64(builder, context, MIPS4_FAST_MEMORY_START_TIME_OFFSET);
+    let delivery_time = builder.ins().iadd(start_time, delivery_ticks);
+    let base_time = load_i64(builder, context, linear.base_time);
+    let after_base =
+        builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, delivery_time, base_time);
+    let elapsed = builder.ins().isub(delivery_time, base_time);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let elapsed = builder.ins().select(after_base, elapsed, zero);
+    let linear_frequency = load_i64(builder, context, linear.frequency);
+    let linear_timebase = load_i64(builder, context, linear.timebase);
+    let linear_timebase_reciprocal = load_i64(builder, context, linear.timebase_reciprocal);
+    let increments = builder.ins().imul(elapsed, linear_frequency);
+    let increments = lower_reciprocal_udiv(
+        builder,
+        increments,
+        linear_timebase,
+        linear_timebase_reciprocal,
+    );
+    let base = load_i64(builder, context, linear.base);
+    let value = builder.ins().iadd(base, increments);
+    let value = builder.ins().ireduce(types::I32, value);
+    let value = if size == 4 && signed {
+        builder.ins().sextend(types::I64, value)
+    } else {
+        builder.ins().uextend(types::I64, value)
+    };
+    store_gpr(builder, frame, target_register, value);
+
+    store_i64(
+        builder,
+        context,
+        MIPS4_FAST_MEMORY_COMPLETED_OFFSET,
+        next_completed,
+    );
+    store_i64(
+        builder,
+        context,
+        MIPS4_FAST_MEMORY_LAST_DELIVERY_OFFSET,
+        delivery_ticks,
+    );
+    store_i64(
+        builder,
+        context,
+        MIPS4_FAST_MEMORY_LAST_TRANSACTION_FETCH_OFFSET,
+        code_fetches,
+    );
+    if linear.uses_cmi {
+        store_i64(
+            builder,
+            context,
+            MIPS4_FAST_MEMORY_CMI_COMPLETED_OFFSET,
+            next_cmi_completed,
+        );
+        store_i64(
+            builder,
+            context,
+            MIPS4_FAST_MEMORY_LAST_CMI_DELIVERY_OFFSET,
+            delivery_ticks,
+        );
+        store_i64(
+            builder,
+            context,
+            MIPS4_FAST_MEMORY_LAST_CMI_TRANSACTION_FETCH_OFFSET,
+            code_fetches,
+        );
+    }
+    let current_budget = load_i64(builder, frame, MIPS4_BLOCK_FRAME_BUDGET_OFFSET);
+    let remaining = builder.ins().isub(retirement_limit, retired);
+    let tighter = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, remaining, current_budget);
+    let budget = builder.ins().select(tighter, remaining, current_budget);
+    store_i64(builder, frame, MIPS4_BLOCK_FRAME_BUDGET_OFFSET, budget);
+    lower_retire_sequential(builder, frame);
+    let runtime_accounting = load_accounting(builder, frame);
+    let continued_accounting = retire_accounting(builder, runtime_accounting);
+    lower_budget_check(builder, frame, entered_operations, continued_accounting);
+    store_accounting(builder, frame, continued_accounting);
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(rejected);
+    let no_completed = builder.ins().icmp_imm(IntCC::Equal, completed, 0);
+    let no_retired = builder.ins().icmp_imm(IntCC::Equal, retired, 0);
+    let no_progress = builder.ins().band(no_completed, no_retired);
+    builder
+        .ins()
+        .brif(no_progress, fallback, &[], timeline_exhausted, &[]);
+}
+
+fn lower_integer_load_value(
+    builder: &mut FunctionBuilder<'_>,
+    lanes: Value,
+    big_endian: Value,
+    size: u8,
+    signed: bool,
+) -> Value {
+    let lane_type = match size {
+        1 => types::I8,
+        2 => types::I16,
+        4 => types::I32,
+        8 => types::I64,
+        _ => unreachable!("typed integer loads have a supported width"),
+    };
+    let lanes = if size == 8 {
+        lanes
+    } else {
+        builder.ins().ireduce(lane_type, lanes)
+    };
+    let decoded = if size == 1 {
+        lanes
+    } else {
+        let swapped = builder.ins().bswap(lanes);
+        builder.ins().select(big_endian, swapped, lanes)
+    };
+    if size == 8 {
+        decoded
+    } else if signed {
+        builder.ins().sextend(types::I64, decoded)
+    } else {
+        builder.ins().uextend(types::I64, decoded)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_combined_retirement_limit(
+    builder: &mut FunctionBuilder<'_>,
+    context: Value,
+    mut lower: Value,
+    mut upper: Value,
+    completed: Value,
+    cmi_completed: Value,
+    code_fetch_active: Value,
+    code_fetch_shares_cmi: Value,
+    available_ticks: Value,
+) -> Value {
+    let full_budget_admitted = load_i64(
+        builder,
+        context,
+        MIPS4_FAST_MEMORY_FULL_BUDGET_ADMITTED_OFFSET,
+    );
+    let full_budget_admitted = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, full_budget_admitted, 0);
+    let check_upper = builder.create_block();
+    let search = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let upper_argument = [BlockArg::Value(upper)];
+    builder.ins().brif(
+        full_budget_admitted,
+        done,
+        &upper_argument,
+        check_upper,
+        &[],
+    );
+
+    builder.switch_to_block(check_upper);
+    let upper_elapsed = lower_combined_elapsed_ticks(
+        builder,
+        context,
+        upper,
+        completed,
+        cmi_completed,
+        code_fetch_active,
+        code_fetch_shares_cmi,
+    );
+    let upper_fits = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, upper_elapsed, available_ticks);
+    builder
+        .ins()
+        .brif(upper_fits, done, &upper_argument, search, &[]);
+
+    builder.switch_to_block(search);
+    for _ in 0..9 {
+        let midpoint = builder.ins().iadd(lower, upper);
+        let midpoint = builder.ins().iadd_imm(midpoint, 1);
+        let midpoint = builder.ins().ushr_imm(midpoint, 1);
+        let elapsed = lower_combined_elapsed_ticks(
+            builder,
+            context,
+            midpoint,
+            completed,
+            cmi_completed,
+            code_fetch_active,
+            code_fetch_shares_cmi,
+        );
+        let fits = builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, elapsed, available_ticks);
+        let rejected_upper = builder.ins().iadd_imm(midpoint, -1);
+        lower = builder.ins().select(fits, midpoint, lower);
+        upper = builder.ins().select(fits, upper, rejected_upper);
+    }
+    let lower_argument = [BlockArg::Value(lower)];
+    builder.ins().jump(done, &lower_argument);
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_combined_elapsed_ticks(
+    builder: &mut FunctionBuilder<'_>,
+    context: Value,
+    retirements: Value,
+    completed: Value,
+    cmi_completed: Value,
+    code_fetch_active: Value,
+    code_fetch_shares_cmi: Value,
+) -> Value {
+    let zero = builder.ins().iconst(types::I64, 0);
+    let code_fetches = builder.ins().select(code_fetch_active, retirements, zero);
+    let cpu_ticks = lower_clock_elapsed(
+        builder,
+        context,
+        retirements,
+        MIPS4_FAST_MEMORY_CPU_BASE_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CPU_FRACTION_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CPU_FREQUENCY_OFFSET,
+        MIPS4_FAST_MEMORY_CPU_FREQUENCY_RECIPROCAL_OFFSET,
+        MIPS4_FAST_MEMORY_CPU_REMAINDER_OFFSET,
+    );
+    let sysad_transactions = builder.ins().iadd(code_fetches, completed);
+    let sysad_cycles = builder.ins().ishl_imm(sysad_transactions, 1);
+    let sysad_ticks = lower_clock_elapsed(
+        builder,
+        context,
+        sysad_cycles,
+        MIPS4_FAST_MEMORY_BUS_BASE_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_FRACTION_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_FREQUENCY_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_FREQUENCY_RECIPROCAL_OFFSET,
+        MIPS4_FAST_MEMORY_BUS_REMAINDER_OFFSET,
+    );
+    let shared_code_fetches = builder
+        .ins()
+        .select(code_fetch_shares_cmi, code_fetches, zero);
+    let cmi_transactions = builder.ins().iadd(shared_code_fetches, cmi_completed);
+    let cmi_cycles = builder.ins().ishl_imm(cmi_transactions, 1);
+    let cmi_ticks = lower_clock_elapsed(
+        builder,
+        context,
+        cmi_cycles,
+        MIPS4_FAST_MEMORY_CMI_BASE_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_FRACTION_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_FREQUENCY_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_FREQUENCY_RECIPROCAL_OFFSET,
+        MIPS4_FAST_MEMORY_CMI_REMAINDER_OFFSET,
+    );
+    let code_aux_cycles = builder.ins().ishl_imm(code_fetches, 1);
+    let code_aux_ticks = lower_clock_elapsed(
+        builder,
+        context,
+        code_aux_cycles,
+        MIPS4_FAST_MEMORY_CODE_AUX_BASE_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CODE_AUX_FRACTION_TICKS_OFFSET,
+        MIPS4_FAST_MEMORY_CODE_AUX_FREQUENCY_OFFSET,
+        MIPS4_FAST_MEMORY_CODE_AUX_FREQUENCY_RECIPROCAL_OFFSET,
+        MIPS4_FAST_MEMORY_CODE_AUX_REMAINDER_OFFSET,
+    );
+    let code_aux_ticks = builder
+        .ins()
+        .select(code_fetch_shares_cmi, zero, code_aux_ticks);
+    let fixed_ticks = load_i64(
+        builder,
+        context,
+        MIPS4_FAST_MEMORY_CODE_FETCH_FIXED_TICKS_OFFSET,
+    );
+    let fixed_ticks = builder.ins().imul(fixed_ticks, code_fetches);
+    let elapsed = builder.ins().iadd(cpu_ticks, sysad_ticks);
+    let elapsed = builder.ins().iadd(elapsed, cmi_ticks);
+    let elapsed = builder.ins().iadd(elapsed, code_aux_ticks);
+    builder.ins().iadd(elapsed, fixed_ticks)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_clock_elapsed(
+    builder: &mut FunctionBuilder<'_>,
+    context: Value,
+    cycles: Value,
+    base_ticks_offset: i32,
+    fraction_ticks_offset: i32,
+    divisor_offset: i32,
+    reciprocal_offset: i32,
+    remainder_offset: i32,
+) -> Value {
+    let base = load_i64(builder, context, base_ticks_offset);
+    let fraction = load_i64(builder, context, fraction_ticks_offset);
+    let divisor = load_i64(builder, context, divisor_offset);
+    let reciprocal = load_i64(builder, context, reciprocal_offset);
+    let remainder = load_i64(builder, context, remainder_offset);
+    let base_ticks = builder.ins().imul(base, cycles);
+    let fractional_ticks = builder.ins().imul(fraction, cycles);
+    let fractional_ticks = builder.ins().iadd(remainder, fractional_ticks);
+    let fractional_ticks = lower_reciprocal_udiv(builder, fractional_ticks, divisor, reciprocal);
+    builder.ins().iadd(base_ticks, fractional_ticks)
+}
+
+fn lower_reciprocal_udiv(
+    builder: &mut FunctionBuilder<'_>,
+    numerator: Value,
+    divisor: Value,
+    reciprocal: Value,
+) -> Value {
+    let quotient = builder.ins().umulhi(numerator, reciprocal);
+    let product = builder.ins().imul(quotient, divisor);
+    let remainder = builder.ins().isub(numerator, product);
+    let needs_correction =
+        builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, remainder, divisor);
+    let correction = builder.ins().uextend(types::I64, needs_correction);
+    builder.ins().iadd(quotient, correction)
 }
 
 fn lower_runtime_operation(
@@ -572,6 +1716,7 @@ fn lower_runtime_operation(
     accounting: &mut NativeAccounting,
     runtime_abi: NativeRuntimeAbi,
 ) {
+    record_runtime_call(builder, frame);
     if !accounting.frame_synchronized {
         store_accounting(builder, frame, *accounting);
         accounting.frame_synchronized = true;
@@ -601,7 +1746,8 @@ fn lower_runtime_operation(
         .ins()
         .call_indirect(signature, runtime_call, &[context, frame, operation]);
     let result = builder.inst_results(call)[0];
-    let continued_accounting = retire_accounting(builder, *accounting);
+    let runtime_accounting = load_accounting(builder, frame);
+    let continued_accounting = retire_accounting(builder, runtime_accounting);
 
     let expected_result = expected_runtime_result(runtime_operation);
     let expected = builder
@@ -635,6 +1781,7 @@ fn lower_runtime_operation(
     let transaction = builder.create_block();
     let exception = builder.create_block();
     let idle = builder.create_block();
+    let timeline_exhausted = builder.create_block();
     let invalid = builder.create_block();
     let done = builder.create_block();
     if expected_result == Mips4RuntimeResult::ContinueControl {
@@ -681,6 +1828,10 @@ fn lower_runtime_operation(
     switch.set_entry(Mips4RuntimeResult::Transaction as u128, transaction);
     switch.set_entry(Mips4RuntimeResult::Exception as u128, exception);
     switch.set_entry(Mips4RuntimeResult::Idle as u128, idle);
+    switch.set_entry(
+        Mips4RuntimeResult::TimelineExhausted as u128,
+        timeline_exhausted,
+    );
     switch.set_entry(Mips4RuntimeResult::InternalError as u128, invalid);
     switch.emit(builder, result, invalid);
 
@@ -714,11 +1865,27 @@ fn lower_runtime_operation(
     store_accounting(builder, frame, continued_accounting);
     return_exit(builder, Mips4BlockExit::RuntimeIdle);
 
+    builder.switch_to_block(timeline_exhausted);
+    lower_enter_operation(builder, frame, entered_operations.saturating_sub(1));
+    store_accounting(builder, frame, *accounting);
+    return_exit(builder, Mips4BlockExit::TimelineExhausted);
+
     builder.switch_to_block(invalid);
     return_exit(builder, Mips4BlockExit::InternalError);
 
     builder.switch_to_block(done);
     *accounting = continued_accounting;
+}
+
+fn record_runtime_call(builder: &mut FunctionBuilder<'_>, frame: Value) {
+    let runtime_calls = load_i64(builder, frame, MIPS4_BLOCK_FRAME_RUNTIME_CALLS_OFFSET);
+    let runtime_calls = builder.ins().iadd_imm(runtime_calls, 1);
+    store_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_RUNTIME_CALLS_OFFSET,
+        runtime_calls,
+    );
 }
 
 const fn expected_runtime_result(operation: Mips4RuntimeOperation) -> Mips4RuntimeResult {
@@ -1090,7 +2257,10 @@ fn retire_control_sequential(builder: &mut FunctionBuilder<'_>, control: &mut Na
 }
 
 fn lower_enter_operation(builder: &mut FunctionBuilder<'_>, frame: Value, entered_operations: u64) {
-    let entered = builder.ins().iconst(types::I64, entered_operations as i64);
+    let operation_base = load_i64(builder, frame, MIPS4_BLOCK_FRAME_OPERATION_BASE_OFFSET);
+    let entered = builder
+        .ins()
+        .iadd_imm(operation_base, entered_operations as i64);
     store_i64(
         builder,
         frame,
@@ -1144,6 +2314,7 @@ fn lower_budget_check_with_control(
     lower_enter_operation(builder, frame, entered_operations);
     store_accounting(builder, frame, *accounting);
     store_control(builder, frame, control);
+    store_region_budget_side_exit(builder, frame);
     return_exit(builder, Mips4BlockExit::BudgetExhausted);
     builder.switch_to_block(continue_block);
 }
@@ -1163,6 +2334,7 @@ fn lower_budget_check(
     builder.switch_to_block(exit);
     lower_enter_operation(builder, frame, entered_operations);
     store_accounting(builder, frame, accounting);
+    store_region_budget_side_exit(builder, frame);
     return_exit(builder, Mips4BlockExit::BudgetExhausted);
     builder.switch_to_block(continue_block);
 }
@@ -1361,8 +2533,8 @@ mod tests {
     use se_device::cpu::mips4::execution::block::{
         Mips4BlockBranch, Mips4BlockEngine, Mips4BlockGuard, Mips4BlockInstruction,
         Mips4BlockInstructionMetadata, Mips4BlockKey, Mips4BlockLiftedInstruction,
-        Mips4BlockRetire, Mips4BlockRuntime, Mips4BlockTier, Mips4RuntimeOperation,
-        interpret_block, lift_cpu_instruction,
+        Mips4BlockRetire, Mips4BlockRuntime, Mips4BlockTier, Mips4CodeGuard, Mips4CodeGuardKind,
+        Mips4RegionNode, Mips4RuntimeOperation, interpret_block, lift_cpu_instruction,
     };
     use se_device::cpu::mips4::instruction::Mips4Instruction;
     use se_device::cpu::mips4::instruction::decode::{
@@ -1451,6 +2623,95 @@ mod tests {
         let native_exit = backend.execute(&compiled, &mut native).unwrap();
         assert_eq!(native_exit, interpreted_exit);
         assert_eq!(native, interpreted);
+    }
+
+    #[test]
+    fn native_multi_block_region_matches_boundary_interpreter() {
+        let code_guard = Mips4CodeGuard {
+            kind: Mips4CodeGuardKind::SystemFlash,
+            source_offset: 0,
+            revision: 1,
+            fingerprint: 2,
+        };
+        let first_key = Mips4BlockKey {
+            pc: 0x1000,
+            next_pc: 0x1004,
+            delay_slot_branch_pc: None,
+            fetch_context: 7,
+            translation_generation: 11,
+            code_guard: code_guard.token(),
+        };
+        let second_key = Mips4BlockKey {
+            pc: 0x1004,
+            next_pc: 0x1008,
+            ..first_key
+        };
+        let mut first = Mips4Block::new(first_key, Mips4BlockGuard::from_code_source(code_guard));
+        first
+            .push(sequential(
+                0x1000,
+                (0x09_u32 << 26) | (1 << 21) | (1 << 16) | 1,
+            ))
+            .unwrap();
+        first.terminate_dispatch().unwrap();
+
+        let mut second = Mips4Block::new(second_key, Mips4BlockGuard::from_code_source(code_guard));
+        second
+            .terminate_with_branch(
+                branch(0x1004, (0x04_u32 << 26) | u32::from(u16::MAX - 1)),
+                sequential_with_delay(0x1008, 0, Some(0x1004)),
+            )
+            .unwrap();
+
+        let region = Mips4Region::new(vec![
+            Mips4RegionNode::new(first.clone(), Some(1)),
+            Mips4RegionNode::new(second.clone(), Some(0)),
+        ])
+        .unwrap();
+        let mut backend = CraneliftMips4Backend::new().unwrap();
+        let compiled = backend.compile_region(&region).unwrap();
+
+        for budget in 1..=32 {
+            let frame = Mips4BlockFrame::new([0; 32], 0, 0, 0x1000, 0x1004, None, budget);
+            let mut interpreted = frame.clone();
+            let mut interpreted_operations = 0_u64;
+            loop {
+                let block = match interpreted.pc() {
+                    0x1000 => &first,
+                    0x1004 => &second,
+                    pc => panic!("unexpected interpreted Region PC {pc:#x}"),
+                };
+                let exit = interpret_block(block, &mut interpreted);
+                interpreted_operations =
+                    interpreted_operations.saturating_add(interpreted.operations_executed());
+                match exit {
+                    Mips4BlockExit::Dispatch => {}
+                    Mips4BlockExit::BudgetExhausted => break,
+                    other => panic!("unexpected interpreted Region exit {other:?}"),
+                }
+            }
+
+            let mut native = frame;
+            assert_eq!(
+                backend.execute_region(&compiled, &mut native).unwrap(),
+                Mips4BlockExit::BudgetExhausted
+            );
+            assert_eq!(native.gpr(), interpreted.gpr());
+            assert_eq!(native.hi(), interpreted.hi());
+            assert_eq!(native.lo(), interpreted.lo());
+            assert_eq!(native.pc(), interpreted.pc());
+            assert_eq!(native.next_pc(), interpreted.next_pc());
+            assert_eq!(
+                native.delay_slot_branch_pc(),
+                interpreted.delay_slot_branch_pc()
+            );
+            assert_eq!(native.budget(), interpreted.budget());
+            assert_eq!(native.retired(), interpreted.retired());
+            assert_eq!(native.exception(), interpreted.exception());
+            assert_eq!(native.operations_executed(), interpreted_operations);
+            assert_eq!(native.runtime_calls(), 0);
+            assert_eq!(native.region_side_exit(), Some(Mips4RegionSideExit::Budget));
+        }
     }
 
     #[test]

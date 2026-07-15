@@ -14,6 +14,7 @@ struct InterpreterOnlyBackend;
 
 impl Mips4CodegenBackend for InterpreterOnlyBackend {
     type CompiledBlock = ();
+    type CompiledRegion = ();
     type Error = core::convert::Infallible;
 
     fn compile(
@@ -29,6 +30,21 @@ impl Mips4CodegenBackend for InterpreterOnlyBackend {
         _frame: &mut Mips4BlockFrame,
     ) -> Result<Mips4BlockExit, Self::Error> {
         unreachable!("the test never reaches the native compilation threshold")
+    }
+
+    fn compile_region(
+        &mut self,
+        _region: &crate::cpu::mips4::execution::block::Mips4Region,
+    ) -> Result<Self::CompiledRegion, Self::Error> {
+        unreachable!("the test never reaches the Region compilation threshold")
+    }
+
+    fn execute_region(
+        &mut self,
+        _compiled: &Self::CompiledRegion,
+        _frame: &mut Mips4BlockFrame,
+    ) -> Result<Mips4BlockExit, Self::Error> {
+        unreachable!("the test never reaches the Region compilation threshold")
     }
 
     fn clear(&mut self) -> Result<(), Self::Error> {
