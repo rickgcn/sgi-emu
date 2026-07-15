@@ -33,6 +33,34 @@ fn fractional_clock_projection_matches_iterated_cycles() {
 }
 
 #[test]
+fn rational_clock_projection_matches_iterated_cycles() {
+    for (timebase_hz, numerator, denominator, initial_remainder) in [
+        (1_000_u64, 300_u64, 2_u64, 0_u64),
+        (1_000_000_000, 2_940_000_000, 116, 17),
+        (1_000_000_000, 5_120_000_000, 512, 5_119_999_999),
+    ] {
+        let projection =
+            RationalClockProjection::new(timebase_hz, numerator, denominator, initial_remainder);
+        let mut remainder = u128::from(initial_remainder);
+        let per_cycle = u128::from(timebase_hz) * u128::from(denominator);
+        let mut elapsed = 0_u64;
+        for cycles in 0..=1_024_u64 {
+            assert_eq!(projection.elapsed(cycles), Some(SimDuration::new(elapsed)));
+            assert_eq!(
+                projection.cycles_until_elapsed_at_least(elapsed),
+                Some(if elapsed == 0 { 0 } else { cycles }),
+            );
+            remainder += per_cycle;
+            elapsed += (remainder / u128::from(numerator)) as u64;
+            remainder %= u128::from(numerator);
+        }
+        let mut advanced = projection;
+        assert_eq!(advanced.advance(1_025), projection.elapsed(1_025));
+        assert_eq!(advanced.remainder(), remainder as u64);
+    }
+}
+
+#[test]
 fn pops_events_by_time_then_insertion_order() {
     let mut scheduler = Scheduler::new();
 

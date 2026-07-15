@@ -201,6 +201,103 @@ impl FractionalClockProjection {
     }
 }
 
+/// Side-effect-free projection of a rational-frequency simulated clock.
+///
+/// The projected frequency is `frequency_numerator_hz / frequency_denominator`
+/// hertz. The remainder is measured against the frequency numerator so no
+/// integer-hertz rounding is required.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RationalClockProjection {
+    timebase_hz: u64,
+    frequency_numerator_hz: u64,
+    frequency_denominator: u64,
+    remainder: u64,
+}
+
+impl RationalClockProjection {
+    /// Creates a projection from one clock's exact current remainder.
+    pub const fn new(
+        timebase_hz: u64,
+        frequency_numerator_hz: u64,
+        frequency_denominator: u64,
+        remainder: u64,
+    ) -> Self {
+        assert!(timebase_hz != 0, "the timebase must be nonzero");
+        assert!(
+            frequency_numerator_hz != 0,
+            "the frequency numerator must be nonzero"
+        );
+        assert!(
+            frequency_denominator != 0,
+            "the frequency denominator must be nonzero"
+        );
+        assert!(
+            remainder < frequency_numerator_hz,
+            "the remainder must be normalized"
+        );
+        Self {
+            timebase_hz,
+            frequency_numerator_hz,
+            frequency_denominator,
+            remainder,
+        }
+    }
+
+    /// Returns the current normalized remainder.
+    pub const fn remainder(self) -> u64 {
+        self.remainder
+    }
+
+    /// Returns the simulated timebase frequency.
+    pub const fn timebase_hz(self) -> u64 {
+        self.timebase_hz
+    }
+
+    /// Returns the projected frequency numerator in hertz.
+    pub const fn frequency_numerator_hz(self) -> u64 {
+        self.frequency_numerator_hz
+    }
+
+    /// Returns the projected frequency denominator.
+    pub const fn frequency_denominator(self) -> u64 {
+        self.frequency_denominator
+    }
+
+    /// Projects elapsed time for a number of cycles without changing state.
+    pub fn elapsed(self, cycles: u64) -> Option<SimDuration> {
+        let ticks_per_cycle =
+            u128::from(self.timebase_hz).checked_mul(u128::from(self.frequency_denominator))?;
+        let total = u128::from(self.remainder)
+            .checked_add(ticks_per_cycle.checked_mul(u128::from(cycles))?)?;
+        let ticks = total / u128::from(self.frequency_numerator_hz);
+        u64::try_from(ticks).ok().map(SimDuration::new)
+    }
+
+    /// Returns the fewest cycles whose elapsed time reaches a tick count.
+    pub fn cycles_until_elapsed_at_least(self, ticks: u64) -> Option<u64> {
+        if ticks == 0 {
+            return Some(0);
+        }
+        let target = u128::from(ticks).checked_mul(u128::from(self.frequency_numerator_hz))?;
+        let distance = target.checked_sub(u128::from(self.remainder))?;
+        let ticks_per_cycle =
+            u128::from(self.timebase_hz).checked_mul(u128::from(self.frequency_denominator))?;
+        u64::try_from(distance.div_ceil(ticks_per_cycle)).ok()
+    }
+
+    /// Advances the projected remainder and returns the exact elapsed time.
+    pub fn advance(&mut self, cycles: u64) -> Option<SimDuration> {
+        let elapsed = self.elapsed(cycles)?;
+        let ticks_per_cycle =
+            u128::from(self.timebase_hz).checked_mul(u128::from(self.frequency_denominator))?;
+        let remainder = u128::from(self.remainder)
+            .checked_add(ticks_per_cycle.checked_mul(u128::from(cycles))?)?
+            % u128::from(self.frequency_numerator_hz);
+        self.remainder = remainder as u64;
+        Some(elapsed)
+    }
+}
+
 /// Stable identifier for a scheduled event.
 ///
 /// Event identifiers are assigned by the scheduler in insertion order. They are
