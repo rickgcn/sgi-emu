@@ -1,4 +1,5 @@
 #include "se_ui/include/application.h"
+#include "se_ui/include/display_dock.h"
 #include "se_ui/include/terminal_dock.h"
 #include "se_ui/include/tracing_dock.h"
 #include "se_ui/src/application.rs.h"
@@ -536,10 +537,14 @@ public:
     auto* terminal_dock = create_terminal_dock(this, controller_);
     addDockWidget(Qt::BottomDockWidgetArea, terminal_dock);
     tabifyDockWidget(tracing_dock, terminal_dock);
+    display_dock_ = create_display_dock(this, controller_);
+    addDockWidget(Qt::RightDockWidgetArea, display_dock_);
     window_menu->addSeparator();
+    window_menu->addAction(display_dock_->toggleViewAction());
     window_menu->addAction(tracing_dock->toggleViewAction());
     window_menu->addAction(terminal_dock->toggleViewAction());
     resizeDocks({ tracing_dock, terminal_dock }, { 320, 320 }, Qt::Vertical);
+    resizeDocks({ display_dock_ }, { 640 }, Qt::Horizontal);
     terminal_dock->raise();
 
     QSettings settings;
@@ -566,6 +571,12 @@ public:
     state_timer->start();
     refresh_action_icons();
     update_emulation_state();
+  }
+
+  void showDisplayDock()
+  {
+    display_dock_->show();
+    display_dock_->raise();
   }
 
 protected:
@@ -714,6 +725,7 @@ private:
   QAction* save_state_action_ = nullptr;
   QAction* load_state_action_ = nullptr;
   QAction* emulation_settings_action_ = nullptr;
+  QDockWidget* display_dock_ = nullptr;
   QLabel* emulation_status_ = nullptr;
   bool run_icon_running_ = false;
   std::uint64_t last_error_id_ = 0;
@@ -790,6 +802,7 @@ std::int32_t run_application(
 
   MainWindow main_window(controller);
   main_window.show();
+  main_window.showDisplayDock();
 
   const auto exit_code = application.exec();
   QCoreApplication::removeTranslator(&translator);

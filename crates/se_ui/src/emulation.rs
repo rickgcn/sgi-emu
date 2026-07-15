@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use se_device::chipset::gbe::protocol::{
+    GbeExternalClock, GbeExternalInput, GbeFrame, GbeFrameField,
+};
 use se_machine::o2::ip32::{
     address_map::IP32_PROM_IMAGE_SIZE_BYTES,
     event::{Ip32SerialOutput, Ip32SerialPort},
@@ -19,8 +22,8 @@ use se_runtime::runtime::RunStatus;
 
 use crate::{
     application::ffi::{
-        EmulationSnapshot, EmulationState, PersistenceOutcome, TerminalInputStatus, UiSerialPort,
-        UiTerminalChunk, UiTerminalIoStats,
+        EmulationSnapshot, EmulationState, PersistenceOutcome, TerminalInputStatus, UiDisplayField,
+        UiDisplayUpdate, UiSerialPort, UiTerminalChunk, UiTerminalIoStats,
     },
     persistence::{
         EmulationConfig, PersistencePaths, RtcPersistenceMode, hash_bytes, host_utc_seconds,
@@ -36,6 +39,25 @@ const TERMINAL_QUEUE_CAPACITY: usize = 65_536;
 const BATTERY_DEBOUNCE: Duration = Duration::from_secs(1);
 const BATTERY_CHECKPOINT: Duration = Duration::from_secs(60);
 const PERSISTENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CRT_INITIAL_PIXEL_CLOCK_HZ: u64 = 20_000_000;
+
+fn connect_crt_display(machine: &mut Ip32Machine<UiTraceSink>) -> Result<(), String> {
+    let now = machine.runtime().now();
+    machine
+        .schedule_gbe_external_input(now, GbeExternalInput::SenseN(false))
+        .map_err(|error| format!("failed to connect the CRT display sense input: {error}"))?;
+    machine
+        .schedule_gbe_external_input(
+            now,
+            GbeExternalInput::PixelClock {
+                source: GbeExternalClock::Ttl,
+                numerator_hz: CRT_INITIAL_PIXEL_CLOCK_HZ,
+                denominator: 1,
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| format!("failed to connect the CRT display pixel clock: {error}"))
+}
 
 struct TerminalInputRequest {
     port: UiSerialPort,
@@ -79,7 +101,17 @@ struct ControllerState {
     terminal_outputs: VecDeque<UiTerminalChunk>,
     terminal_output_units: [usize; 2],
     terminal_stats: [TerminalStatsData; 2],
+    display: DisplayState,
     snapshot: SnapshotData,
+}
+
+#[derive(Default)]
+struct DisplayState {
+    generation: u64,
+    pending_frame: Option<GbeFrame>,
+    machine_dropped: u64,
+    transport_dropped: u64,
+    invalid_frames: u64,
 }
 
 #[derive(Clone)]
@@ -159,6 +191,7 @@ impl EmulationController {
                 terminal_outputs: VecDeque::new(),
                 terminal_output_units: [0; 2],
                 terminal_stats: [TerminalStatsData::default(); 2],
+                display: DisplayState::default(),
                 snapshot: SnapshotData::default(),
             }),
             wake: Condvar::new(),
@@ -183,6 +216,7 @@ impl EmulationController {
                         state.save_state = None;
                         state.load_state = None;
                         state.snapshot.has_machine = false;
+                        reset_display_session(&mut state);
                         set_fault(&mut state, "IP32 worker thread panicked".to_owned());
                     }
                 }
@@ -443,6 +477,53 @@ impl EmulationController {
         }
     }
 
+    /// Moves at most one current-session display frame to the UI thread.
+    pub fn take_display_update(&self) -> UiDisplayUpdate {
+        let mut state = lock_state(&self.shared);
+        let generation = state.display.generation;
+        let session_id = state.snapshot.session_id;
+        let machine_dropped = state.display.machine_dropped;
+        let transport_dropped = state.display.transport_dropped;
+        let invalid_frames = state.display.invalid_frames;
+        let Some(frame) = state.display.pending_frame.take() else {
+            return UiDisplayUpdate {
+                generation,
+                session_id,
+                has_frame: false,
+                sequence: 0,
+                completed_at: 0,
+                width: 0,
+                height: 0,
+                stride: 0,
+                field: UiDisplayField::Progressive,
+                rgba: Vec::new(),
+                machine_dropped,
+                transport_dropped,
+                invalid_frames,
+            };
+        };
+        let field = match frame.field {
+            GbeFrameField::Progressive => UiDisplayField::Progressive,
+            GbeFrameField::First => UiDisplayField::First,
+            GbeFrameField::Second => UiDisplayField::Second,
+        };
+        UiDisplayUpdate {
+            generation,
+            session_id,
+            has_frame: true,
+            sequence: frame.sequence,
+            completed_at: frame.completed_at.get(),
+            width: frame.width,
+            height: frame.height,
+            stride: frame.stride,
+            field,
+            rgba: frame.rgba,
+            machine_dropped,
+            transport_dropped,
+            invalid_frames,
+        }
+    }
+
     /// Returns the latest worker state without touching the machine.
     pub fn snapshot(&self) -> EmulationSnapshot {
         let snapshot = lock_state(&self.shared).snapshot.clone();
@@ -651,6 +732,7 @@ fn configure_worker_machine(
             state.desired_running = false;
             let session_id = begin_application_trace_session();
             clear_terminal_session(&mut state);
+            reset_display_session(&mut state);
             state.snapshot.session_id = session_id;
             state.snapshot.sim_time = 0;
             state.snapshot.prom_path = config.prom_path().to_string_lossy().into_owned();
@@ -794,6 +876,7 @@ fn auto_configure_machine(
         new_machine
             .schedule_power_on()
             .map_err(|error| format!("failed to schedule IP32 power-on: {error}"))?;
+        connect_crt_display(&mut new_machine)?;
         Ok::<_, String>(new_machine)
     })();
     let mut state = lock_state(shared);
@@ -801,6 +884,7 @@ fn auto_configure_machine(
         Ok(new_machine) => {
             let session_id = begin_application_trace_session();
             clear_terminal_session(&mut state);
+            reset_display_session(&mut state);
             state.snapshot.session_id = session_id;
             state.snapshot.sim_time = 0;
             state.snapshot.has_machine = true;
@@ -901,6 +985,7 @@ fn build_configured_machine(
     machine
         .schedule_power_on()
         .map_err(|error| format!("failed to schedule IP32 power-on: {error}"))?;
+    connect_crt_display(&mut machine)?;
     if persisted_path && let Some(paths) = shared.paths.as_ref() {
         save_emulation_config(paths, &config).map_err(|error| error.to_string())?;
     }
@@ -981,12 +1066,13 @@ fn load_machine_state(
             fallback_rtc.nvram().to_vec(),
         );
         machine_config.jit_enabled = config.jit_enabled();
-        let new_machine = Ip32Machine::from_state_with_trace_sink(
+        let mut new_machine = Ip32Machine::from_state_with_trace_sink(
             machine_config,
             loaded.state,
             UiTraceSink::application(),
         )
         .map_err(|error| LoadMachineError::Failed(error.to_string()))?;
+        connect_crt_display(&mut new_machine).map_err(LoadMachineError::Failed)?;
         Ok((new_machine, config))
     });
 
@@ -1006,9 +1092,13 @@ fn load_machine_state(
                 system_flash,
             );
             let terminal_output = drain_machine_terminal_output(&mut new_machine);
+            let display_frame = new_machine.take_display_frame();
+            let machine_dropped = new_machine.dropped_display_frame_count();
             let session_id = begin_application_trace_session();
             let mut state = lock_state(shared);
             clear_terminal_session(&mut state);
+            reset_display_session(&mut state);
+            update_display_output(&mut state, display_frame, machine_dropped);
             state.snapshot.session_id = session_id;
             state.snapshot.sim_time = new_machine.runtime().now().get();
             state.snapshot.has_machine = true;
@@ -1242,12 +1332,16 @@ fn hard_reset_machine(
     let Some(machine) = machine else {
         return;
     };
-    let result = machine.hard_reset();
+    let result = machine
+        .hard_reset()
+        .map_err(|error| error.to_string())
+        .and_then(|()| connect_crt_display(machine));
     let sim_time = machine.runtime().now().get();
     let mut state = lock_state(shared);
     state.snapshot.sim_time = sim_time;
     match result {
         Ok(()) => {
+            reset_display_session(&mut state);
             state.snapshot.error_message.clear();
             state.snapshot.state = if state.desired_running {
                 EmulationState::Running
@@ -1257,7 +1351,7 @@ fn hard_reset_machine(
         }
         Err(error) => {
             state.desired_running = false;
-            set_fault(&mut state, error.to_string());
+            set_fault(&mut state, error);
         }
     }
 }
@@ -1304,11 +1398,14 @@ fn run_machine_batch(
     let result = machine.run_steps(RUN_BATCH_SIZE);
     let sim_time = machine.runtime().now().get();
     let terminal_output = drain_machine_terminal_output(machine);
+    let display_frame = machine.take_display_frame();
+    let machine_dropped = machine.dropped_display_frame_count();
     let mut state = lock_state(shared);
     state.snapshot.sim_time = sim_time;
     for (port, bytes) in terminal_output {
         enqueue_terminal_output(&mut state, port, bytes);
     }
+    update_display_output(&mut state, display_frame, machine_dropped);
 
     match result {
         Ok(RunStatus::StepLimitReached | RunStatus::Dispatched | RunStatus::DeadlineReached) => {
@@ -1419,6 +1516,51 @@ fn clear_terminal_session(state: &mut ControllerState) {
     state.terminal_stats.fill(TerminalStatsData::default());
 }
 
+fn reset_display_session(state: &mut ControllerState) {
+    state.display.generation = state.display.generation.saturating_add(1);
+    state.display.pending_frame = None;
+    state.display.machine_dropped = 0;
+    state.display.transport_dropped = 0;
+    state.display.invalid_frames = 0;
+}
+
+fn update_display_output(
+    state: &mut ControllerState,
+    frame: Option<GbeFrame>,
+    machine_dropped: u64,
+) {
+    state.display.machine_dropped = machine_dropped;
+    let Some(frame) = frame else {
+        return;
+    };
+    if !valid_display_frame(&frame) {
+        state.display.invalid_frames = state.display.invalid_frames.saturating_add(1);
+        return;
+    }
+    if state.display.pending_frame.replace(frame).is_some() {
+        state.display.transport_dropped = state.display.transport_dropped.saturating_add(1);
+    }
+}
+
+fn valid_display_frame(frame: &GbeFrame) -> bool {
+    if frame.width == 0
+        || frame.height == 0
+        || frame.width > i32::MAX as u32
+        || frame.height > i32::MAX as u32
+        || frame.stride > i32::MAX as u32
+    {
+        return false;
+    }
+    let Some(row_bytes) = (frame.width as usize).checked_mul(4) else {
+        return false;
+    };
+    let stride = frame.stride as usize;
+    let Some(required_bytes) = stride.checked_mul(frame.height as usize) else {
+        return false;
+    };
+    stride >= row_bytes && frame.rgba.len() >= required_bytes
+}
+
 fn set_fault(state: &mut ControllerState, message: String) {
     state.snapshot.state = EmulationState::Faulted;
     state.snapshot.error_id = state.snapshot.error_id.saturating_add(1);
@@ -1460,6 +1602,20 @@ fn lock_state(shared: &SharedController) -> std::sync::MutexGuard<'_, Controller
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
+
+    use se_core::role::BusDeviceRole;
+    use se_core::scheduler::SimTime;
+    use se_device::chipset::{
+        crime::protocol::{
+            CrimeByteEnable, CrimeCgiTransaction, CrimeCompletionPayload, CrimeLinkDeviceResponse,
+            CrimeLinkOperation, CrimePioRequest, CrimeTransactionId, CrimeTransfer,
+        },
+        gbe::{
+            Gbe,
+            protocol::{GbeAction, GbePoll},
+        },
+    };
+    use se_machine::o2::ip32::{component_ids, machine::Ip32MachineConfig};
 
     use super::*;
 
@@ -1524,9 +1680,221 @@ mod tests {
         );
     }
 
+    fn wait_for_display_generation(controller: &EmulationController, previous: u64) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let generation = controller.take_display_update().generation;
+            if generation > previous {
+                return generation;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("timed out waiting for a display generation after {previous}");
+    }
+
+    fn display_frame(sequence: u64, field: GbeFrameField) -> GbeFrame {
+        GbeFrame {
+            sequence,
+            completed_at: se_core::scheduler::SimTime::new(sequence * 10),
+            width: 2,
+            height: 1,
+            stride: 8,
+            field,
+            rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        }
+    }
+
+    #[test]
+    fn crt_display_connection_applies_inputs_after_power_on() {
+        let mut prom = vec![0; IP32_PROM_IMAGE_SIZE_BYTES];
+        prom[..4].copy_from_slice(&WAIT.to_be_bytes());
+        let config = Ip32MachineConfig {
+            prom_image: prom,
+            ..Ip32MachineConfig::default()
+        };
+        let mut machine =
+            Ip32Machine::from_config_with_trace_sink(config, UiTraceSink::application()).unwrap();
+        machine.schedule_power_on().unwrap();
+        connect_crt_display(&mut machine).unwrap();
+        machine.run_steps(3).unwrap();
+
+        let gbe = machine
+            .runtime_mut()
+            .registry_mut()
+            .get_typed_mut::<Gbe>(component_ids::GBE)
+            .unwrap();
+        let response = gbe.accept(CrimeCgiTransaction {
+            id: CrimeTransactionId::new(1),
+            controller: component_ids::CRIME,
+            target: component_ids::GBE,
+            operation: CrimeLinkOperation::Pio(CrimePioRequest {
+                address: 0x1600_0000,
+                transfer: CrimeTransfer::read(4),
+            }),
+        });
+        let CrimeLinkDeviceResponse::Complete(completion) = response else {
+            panic!("GBE control status read was unexpectedly deferred");
+        };
+        let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap() else {
+            panic!("GBE control status read returned the wrong payload");
+        };
+        let control_status = u32::from_be_bytes(data.as_ref().try_into().unwrap());
+        assert_eq!(control_status & (1 << 4), 0);
+
+        for (id, address, value) in [(2, 0x1603_000c, 1_u32), (3, 0x1601_0000, 0)] {
+            let response = gbe.accept(CrimeCgiTransaction {
+                id: CrimeTransactionId::new(id),
+                controller: component_ids::CRIME,
+                target: component_ids::GBE,
+                operation: CrimeLinkOperation::Pio(CrimePioRequest {
+                    address,
+                    transfer: CrimeTransfer::write(
+                        value.to_be_bytes().into(),
+                        CrimeByteEnable::from([true; 4]),
+                    ),
+                }),
+            });
+            assert!(matches!(response, CrimeLinkDeviceResponse::Complete(_)));
+        }
+        let (delay, event) = loop {
+            let GbePoll::Action(action) = gbe.poll() else {
+                panic!("the connected pixel clock did not schedule GBE timing");
+            };
+            if let GbeAction::Schedule { delay, event } = action {
+                break (delay, event);
+            }
+        };
+        gbe.observe_time(SimTime::new(delay.get()));
+        gbe.handle_event(event);
+
+        let response = gbe.accept(CrimeCgiTransaction {
+            id: CrimeTransactionId::new(4),
+            controller: component_ids::CRIME,
+            target: component_ids::GBE,
+            operation: CrimeLinkOperation::Pio(CrimePioRequest {
+                address: 0x1603_0008,
+                transfer: CrimeTransfer::read(4),
+            }),
+        });
+        let CrimeLinkDeviceResponse::Complete(completion) = response else {
+            panic!("GBE frame control read was unexpectedly deferred");
+        };
+        let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap() else {
+            panic!("GBE frame control read returned the wrong payload");
+        };
+        assert_eq!(u32::from_be_bytes(data.as_ref().try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn display_update_moves_exact_frame_metadata_and_bytes_once() {
+        let controller = EmulationController::new();
+        {
+            let mut state = lock_state(&controller.shared);
+            state.snapshot.session_id = 42;
+            reset_display_session(&mut state);
+            update_display_output(&mut state, Some(display_frame(7, GbeFrameField::Second)), 3);
+        }
+
+        let update = controller.take_display_update();
+        assert_eq!(update.generation, 1);
+        assert_eq!(update.session_id, 42);
+        assert!(update.has_frame);
+        assert_eq!(update.sequence, 7);
+        assert_eq!(update.completed_at, 70);
+        assert_eq!(update.width, 2);
+        assert_eq!(update.height, 1);
+        assert_eq!(update.stride, 8);
+        assert_eq!(update.field, UiDisplayField::Second);
+        assert_eq!(update.rgba, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(update.machine_dropped, 3);
+        assert_eq!(update.transport_dropped, 0);
+        assert_eq!(update.invalid_frames, 0);
+
+        let empty = controller.take_display_update();
+        assert_eq!(empty.generation, update.generation);
+        assert_eq!(empty.session_id, update.session_id);
+        assert!(!empty.has_frame);
+        assert!(empty.rgba.is_empty());
+    }
+
+    #[test]
+    fn display_slot_keeps_latest_valid_frame_and_counts_every_loss_domain() {
+        let controller = EmulationController::new();
+        {
+            let mut state = lock_state(&controller.shared);
+            reset_display_session(&mut state);
+            update_display_output(
+                &mut state,
+                Some(display_frame(1, GbeFrameField::Progressive)),
+                4,
+            );
+            update_display_output(&mut state, Some(display_frame(2, GbeFrameField::First)), 5);
+
+            let mut invalid = display_frame(3, GbeFrameField::Second);
+            invalid.stride = 4;
+            update_display_output(&mut state, Some(invalid), 6);
+            state.display.transport_dropped = u64::MAX;
+            update_display_output(&mut state, Some(display_frame(4, GbeFrameField::Second)), 7);
+        }
+
+        let update = controller.take_display_update();
+        assert!(update.has_frame);
+        assert_eq!(update.sequence, 4);
+        assert_eq!(update.field, UiDisplayField::Second);
+        assert_eq!(update.machine_dropped, 7);
+        assert_eq!(update.transport_dropped, u64::MAX);
+        assert_eq!(update.invalid_frames, 1);
+    }
+
+    #[test]
+    fn display_validation_rejects_invalid_qimage_layouts_without_clearing_valid_data() {
+        let valid = display_frame(1, GbeFrameField::Progressive);
+        assert!(valid_display_frame(&valid));
+
+        let mut zero_width = valid.clone();
+        zero_width.width = 0;
+        assert!(!valid_display_frame(&zero_width));
+
+        let mut oversized_width = valid.clone();
+        oversized_width.width = i32::MAX as u32 + 1;
+        assert!(!valid_display_frame(&oversized_width));
+
+        let mut short_stride = valid.clone();
+        short_stride.stride = 7;
+        assert!(!valid_display_frame(&short_stride));
+
+        let mut short_data = valid;
+        short_data.rgba.pop();
+        assert!(!valid_display_frame(&short_data));
+    }
+
+    #[test]
+    fn display_session_reset_clears_pending_data_and_counters() {
+        let controller = EmulationController::new();
+        {
+            let mut state = lock_state(&controller.shared);
+            update_display_output(
+                &mut state,
+                Some(display_frame(1, GbeFrameField::Progressive)),
+                9,
+            );
+            state.display.transport_dropped = 8;
+            state.display.invalid_frames = 7;
+            reset_display_session(&mut state);
+        }
+
+        let update = controller.take_display_update();
+        assert_eq!(update.generation, 1);
+        assert!(!update.has_frame);
+        assert_eq!(update.machine_dropped, 0);
+        assert_eq!(update.transport_dropped, 0);
+        assert_eq!(update.invalid_frames, 0);
+    }
+
     #[test]
     fn controller_configures_runs_resets_and_shuts_down() {
         let controller = EmulationController::new();
+        let initial_display_generation = controller.take_display_update().generation;
         assert_eq!(controller.snapshot().state, EmulationState::Unconfigured);
         assert!(!controller.configure_prom(&[]));
 
@@ -1534,17 +1902,22 @@ mod tests {
         prom[..4].copy_from_slice(&WAIT.to_be_bytes());
         assert!(controller.configure_prom(&prom));
         wait_for_state(&controller, EmulationState::Paused);
+        let configured_display_generation =
+            wait_for_display_generation(&controller, initial_display_generation);
         let first_session_id = controller.snapshot().session_id;
         assert_ne!(first_session_id, 0);
 
         assert!(controller.request_run());
         wait_for_state(&controller, EmulationState::Idle);
         assert!(controller.request_hard_reset());
+        let reset_display_generation =
+            wait_for_display_generation(&controller, configured_display_generation);
         wait_for_state(&controller, EmulationState::Paused);
 
         let prom = vec![0; IP32_PROM_IMAGE_SIZE_BYTES];
         assert!(controller.configure_prom(&prom));
         wait_for_state(&controller, EmulationState::Paused);
+        assert!(wait_for_display_generation(&controller, reset_display_generation) > 0);
         assert!(controller.snapshot().session_id > first_session_id);
         assert!(controller.request_run());
         wait_for_state(&controller, EmulationState::Running);
@@ -1613,6 +1986,7 @@ mod tests {
         ));
         wait_for_state(&controller, EmulationState::Paused);
         let first_session = controller.snapshot().session_id;
+        let first_display_generation = controller.take_display_update().generation;
 
         assert!(controller.request_save_state(state_path.to_str().unwrap()));
         wait_for_persistence(&controller, PersistenceOutcome::Saved);
@@ -1626,5 +2000,6 @@ mod tests {
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.state, EmulationState::Paused);
         assert!(snapshot.session_id > first_session);
+        assert!(controller.take_display_update().generation > first_display_generation);
     }
 }

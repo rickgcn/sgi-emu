@@ -280,6 +280,19 @@
     </message>
 </context>
 <context>
+    <name>DisplayDock</name>
+    <message>
+        <location filename="../src/display_dock.cpp" line="25"/>
+        <source>Display</source>
+        <translation>Display</translation>
+    </message>
+    <message>
+        <location filename="../src/display_dock.cpp" line="27"/>
+        <source>No Signal</source>
+        <translation>No Signal</translation>
+    </message>
+</context>
+<context>
     <name>TerminalDock</name>
     <message>
         <location filename="../src/terminal_dock.cpp" line="41"/>

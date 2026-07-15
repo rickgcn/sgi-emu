@@ -28,6 +28,7 @@ fn main() {
     let mut build = cxx_build::bridges(["src/application.rs", "src/tracing.rs"]);
     build
         .file("src/application.cpp")
+        .file("src/display_dock.cpp")
         .file("src/terminal_dock.cpp")
         .file("src/tracing_dock.cpp")
         .file(resource.file.expect("rcc must generate a C++ source file"))
@@ -42,9 +43,11 @@ fn main() {
     build.compile("se_ui");
 
     println!("cargo::rerun-if-changed=include/application.h");
+    println!("cargo::rerun-if-changed=include/display_dock.h");
     println!("cargo::rerun-if-changed=include/terminal_dock.h");
     println!("cargo::rerun-if-changed=include/tracing_dock.h");
     println!("cargo::rerun-if-changed=src/application.cpp");
+    println!("cargo::rerun-if-changed=src/display_dock.cpp");
     println!("cargo::rerun-if-changed=src/terminal_dock.cpp");
     println!("cargo::rerun-if-changed=src/tracing_dock.cpp");
 }

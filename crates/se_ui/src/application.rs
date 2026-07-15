@@ -42,6 +42,29 @@ pub(crate) mod ffi {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum UiDisplayField {
+        Progressive,
+        First,
+        Second,
+    }
+
+    struct UiDisplayUpdate {
+        generation: u64,
+        session_id: u64,
+        has_frame: bool,
+        sequence: u64,
+        completed_at: u64,
+        width: u32,
+        height: u32,
+        stride: u32,
+        field: UiDisplayField,
+        rgba: Vec<u8>,
+        machine_dropped: u64,
+        transport_dropped: u64,
+        invalid_frames: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum UiSerialPort {
         Serial1,
         Serial2,
@@ -142,6 +165,7 @@ pub(crate) mod ffi {
         fn request_save_state(self: &EmulationController, path: &str) -> bool;
         fn request_load_state(self: &EmulationController, path: &str, prom_override: &str) -> bool;
         fn snapshot(self: &EmulationController) -> EmulationSnapshot;
+        fn take_display_update(self: &EmulationController) -> UiDisplayUpdate;
         fn submit_terminal_input(
             self: &EmulationController,
             port: UiSerialPort,
