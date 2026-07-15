@@ -209,6 +209,102 @@ impl CrimeSdram {
         Some((output, fingerprint))
     }
 
+    /// Returns whether an immediate CPU transaction is free of exceptional
+    /// ECC, address, and read-modify-write diagnostics.
+    pub fn synchronous_transaction_ready(&self, transaction: &CrimeMemoryTransaction) -> bool {
+        let length = transaction.transfer.length();
+        if length == 0
+            || length > MAX_TRANSFER_BYTES
+            || !matches!(transaction.bank_select, CrimeMemoryBankSelect::Decode)
+            || transaction
+                .address
+                .checked_add(length.saturating_sub(1) as u64)
+                .is_none()
+        {
+            return false;
+        }
+        match transaction.transfer.view() {
+            CrimeTransferView::Read { .. } => {
+                self.synchronous_read_ready(transaction.address, length, transaction.no_ecc)
+            }
+            CrimeTransferView::Write { data, byte_enable } => {
+                data.len() == byte_enable.len()
+                    && self.synchronous_write_ready(transaction.address, data, byte_enable)
+            }
+        }
+    }
+
+    fn synchronous_read_ready(&self, address: u64, length: usize, no_ecc: bool) -> bool {
+        let mut position = 0;
+        while position < length {
+            let current = address + position as u64;
+            let Some(selection) = self.decode(current) else {
+                return false;
+            };
+            if let BankSelection::Populated {
+                index: bank,
+                offset,
+            } = selection
+                && self.ecc_enabled
+                && !no_ecc
+            {
+                let (data, check) = self.banks[bank]
+                    .as_ref()
+                    .expect("decoded bank exists")
+                    .read_lane(offset & !7);
+                if !matches!(ecc::check(data, check), ecc::EccCheck::Clean { .. }) {
+                    return false;
+                }
+            }
+            position += (8 - (current as usize & 7)).min(length - position);
+        }
+        true
+    }
+
+    fn synchronous_write_ready(
+        &self,
+        address: u64,
+        data: &[u8],
+        byte_enable: CrimeByteEnableView<'_>,
+    ) -> bool {
+        let mut position = 0;
+        while position < data.len() {
+            let current = address + position as u64;
+            let in_lane = current as usize & 7;
+            let count = (8 - in_lane).min(data.len() - position);
+            let read_modify_write = in_lane != 0
+                || count != 8
+                || (position..position + count).any(|index| {
+                    !byte_enable
+                        .is_enabled(index)
+                        .expect("validated byte-enable length covers write data")
+                });
+            let Some(selection) = self.decode(current) else {
+                return false;
+            };
+            if let BankSelection::Populated {
+                index: bank,
+                offset,
+            } = selection
+                && read_modify_write
+                && self.ecc_enabled
+            {
+                let (old_data, stored_check) = self.banks[bank]
+                    .as_ref()
+                    .expect("decoded bank exists")
+                    .read_lane(offset & !7);
+                if !matches!(
+                    ecc::check(old_data, stored_check),
+                    ecc::EccCheck::Clean { .. }
+                ) {
+                    return false;
+                }
+            }
+            position += count;
+        }
+        true
+    }
+
     /// Injects a data-bit fault without updating ECC.
     pub fn inject_data_bit(&mut self, address: u64, bit: u8) -> Result<(), CrimeBusError> {
         if bit >= 64 {

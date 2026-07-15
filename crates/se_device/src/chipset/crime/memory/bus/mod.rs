@@ -46,6 +46,30 @@ struct InFlightMemory {
     transaction_id: CrimeTransactionId,
 }
 
+/// Immutable timing and ownership proof for one idle CPU memory transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CrimeDirectMemoryPlan {
+    epoch: u64,
+    clock: se_core::scheduler::FractionalClockProjection,
+    slot: u8,
+    submission_time: SimTime,
+    next_refresh_time: SimTime,
+    service_delay: SimDuration,
+    completion_delay: SimDuration,
+}
+
+impl CrimeDirectMemoryPlan {
+    /// Returns the delay before SDRAM delivery.
+    pub const fn service_delay(self) -> SimDuration {
+        self.service_delay
+    }
+
+    /// Returns the delay before the memory completion becomes visible.
+    pub const fn completion_delay(self) -> SimDuration {
+        self.completion_delay
+    }
+}
+
 /// CRIME MIU arbitration and ordering domain.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeMemoryBus {
@@ -157,6 +181,82 @@ impl CrimeMemoryBus {
         self.slot = advance_cpu_slots(self.slot, fetches);
     }
 
+    /// Plans one CPU request and completion on an idle memory domain.
+    pub fn plan_direct_cpu_transaction(
+        &self,
+        submission_time: SimTime,
+    ) -> Option<CrimeDirectMemoryPlan> {
+        if !self.stable_fetch_ready()
+            || (self.refresh_delay != SimDuration::ZERO
+                && submission_time >= self.next_refresh_time)
+        {
+            return None;
+        }
+        let mut clock = self.clock;
+        Some(CrimeDirectMemoryPlan {
+            epoch: self.epoch,
+            clock: self.clock.projection(),
+            slot: self.slot,
+            submission_time,
+            next_refresh_time: self.next_refresh_time,
+            service_delay: clock.next_cycle(),
+            completion_delay: clock.next_cycle(),
+        })
+    }
+
+    /// Starts a previously planned direct transaction through normal bus semantics.
+    pub fn begin_direct_cpu_transaction(
+        &mut self,
+        plan: CrimeDirectMemoryPlan,
+        transaction: CrimeMemoryTransaction,
+    ) -> CrimeMemoryTransaction {
+        assert!(self.direct_plan_valid(plan));
+        assert_eq!(transaction.client, CrimeMemoryClient::Cpu);
+        assert_eq!(transaction.time, plan.submission_time);
+        assert_eq!(
+            self.route(transaction.clone()),
+            CrimeBusDisposition::QueuedAndNeedsService {
+                delay: plan.service_delay,
+                epoch: plan.epoch,
+            }
+        );
+        self.handle_event(CrimeMemoryBusEvent::Service { epoch: plan.epoch });
+        match self.poll() {
+            CrimeBusAction::Deliver {
+                target,
+                transaction: delivered,
+            } => {
+                assert_eq!(target, self.target);
+                assert_eq!(delivered, transaction);
+                delivered
+            }
+            action => panic!("direct CRIME memory service produced {action:?}"),
+        }
+    }
+
+    /// Completes a direct SDRAM response through normal bus semantics.
+    pub fn finish_direct_cpu_transaction(
+        &mut self,
+        plan: CrimeDirectMemoryPlan,
+        completion: CrimeMemoryCompletion,
+    ) -> (ComponentId, CrimeMemoryCompletion) {
+        self.accept_device_completion(completion);
+        match self.poll() {
+            CrimeBusAction::ScheduleService { delay } => {
+                assert_eq!(delay, plan.completion_delay);
+            }
+            action => panic!("direct CRIME memory completion produced {action:?}"),
+        }
+        self.handle_event(CrimeMemoryBusEvent::Complete { epoch: plan.epoch });
+        match self.poll() {
+            CrimeBusAction::Complete {
+                controller,
+                completion,
+            } => (controller, completion),
+            action => panic!("direct CRIME memory publication produced {action:?}"),
+        }
+    }
+
     /// Handles one scheduled bus event.
     pub fn handle_event(&mut self, event: CrimeMemoryBusEvent) {
         let event_epoch = match event {
@@ -239,6 +339,16 @@ impl CrimeMemoryBus {
         self.in_flight = None;
         self.pending_completion = None;
         self.actions.clear();
+    }
+
+    fn direct_plan_valid(&self, plan: CrimeDirectMemoryPlan) -> bool {
+        self.stable_fetch_ready()
+            && self.epoch == plan.epoch
+            && self.clock.projection() == plan.clock
+            && self.slot == plan.slot
+            && self.next_refresh_time == plan.next_refresh_time
+            && (self.refresh_delay == SimDuration::ZERO
+                || plan.submission_time < self.next_refresh_time)
     }
 
     fn service(&mut self) {

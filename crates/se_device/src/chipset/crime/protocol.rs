@@ -53,6 +53,28 @@ pub struct CrimeSysAdRequest {
     pub transaction: ExecutionTransaction<Mips4ExecutionTransaction>,
 }
 
+/// Side-effect-free classification of one processor SysAD request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CrimeSysAdRoute {
+    /// The request targets CRIME-controlled SDRAM or framebuffer storage.
+    Memory,
+
+    /// The request targets a synchronous PIU or MIU control register.
+    SynchronousInternalRegister,
+
+    /// The request targets the Rendering Engine register window.
+    RenderRegister,
+
+    /// The request targets the GBE link.
+    Cgi,
+
+    /// The request targets the MACE link.
+    Cmi,
+
+    /// The request has no implemented CRIME route.
+    Unsupported,
+}
+
 /// Origin of a request competing for CRIME memory service.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,

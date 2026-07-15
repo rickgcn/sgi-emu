@@ -219,6 +219,29 @@ impl Mace {
             && self.terminal_error.is_none()
     }
 
+    /// Captures the side-effect-free UST model while the incoming CMI path is idle.
+    pub fn synchronous_ust_projection(&self) -> Option<peripheral::MaceUstProjection> {
+        self.stable_prom_fetch_ready()
+            .then(|| self.timers.ust_projection())
+            .flatten()
+    }
+
+    /// Commits time observed by a proven batch of side-effect-free UST reads.
+    pub fn commit_synchronous_ust_reads(
+        &mut self,
+        reads: u64,
+        last_delivery_time: SimTime,
+    ) -> bool {
+        if reads == 0 {
+            return true;
+        }
+        if !self.stable_prom_fetch_ready() {
+            return false;
+        }
+        self.now = self.now.max(last_delivery_time);
+        true
+    }
+
     /// Accounts for bypassed stable PROM requests at the last CMI delivery time.
     pub fn account_stable_prom_fetches(
         &mut self,
@@ -238,8 +261,17 @@ impl Mace {
             return false;
         };
         self.next_transaction_id = next_transaction_id;
-        self.now = last_delivery_time;
+        self.now = self.now.max(last_delivery_time);
         true
+    }
+
+    /// Returns whether stable PROM fetches can allocate all downstream IDs.
+    pub fn stable_prom_fetches_ready(&self, fetches: usize) -> bool {
+        self.stable_prom_fetch_ready()
+            && u128::try_from(fetches)
+                .ok()
+                .and_then(|fetches| self.next_transaction_id.checked_add(fetches))
+                .is_some()
     }
 
     /// Updates the coarse trace interest supplied by the machine runtime.

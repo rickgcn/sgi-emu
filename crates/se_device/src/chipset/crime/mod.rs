@@ -24,20 +24,22 @@ use se_core::scheduler::SimTime;
 use se_core::tracing::{TraceInterest, TraceLevel};
 
 use crate::bus::irq::{IrqSource, IrqTransaction};
-use crate::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransactionId};
+use crate::cpu::execution::protocol::{
+    ExecutionCompletion, ExecutionTransaction, ExecutionTransactionId,
+};
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 
 use self::clock::CrimeClock;
 use self::config::{CrimeAccessPolicy, CrimeConfig, CrimeConfigError};
-use self::piu::{CrimePiu, PiuEffect};
+use self::piu::{CRIME_MASTER_FREQUENCY_HZ, CrimePiu, PiuEffect};
 use self::protocol::{
     CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusError, CrimeCgiCompletion, CrimeCgiTransaction,
     CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal,
     CrimeDmaRequest, CrimeEvent, CrimeInterruptPost, CrimeLinkDeviceResponse, CrimeLinkOperation,
     CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryCompletion, CrimeMemoryFault,
     CrimeMemoryInhibitReason, CrimeMemoryOutcome, CrimeMemoryTransaction, CrimePioRequest,
-    CrimePoll, CrimeSdramSignal, CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceField,
-    CrimeTraceFields, CrimeTraceValue, CrimeTransactionId, CrimeTransfer,
+    CrimePoll, CrimeSdramSignal, CrimeSysAdRequest, CrimeSysAdRoute, CrimeTraceEvent,
+    CrimeTraceField, CrimeTraceFields, CrimeTraceValue, CrimeTransactionId, CrimeTransfer,
 };
 use self::render::{
     CrimeRender, CrimeRenderError, RenderInterruptEffect, RenderMemoryWrite, RenderNotice,
@@ -187,6 +189,83 @@ pub struct Crime {
     current_time: SimTime,
 }
 
+/// Immutable register image used by a proven synchronous SysAD read batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrimeSynchronousReadSnapshot {
+    timebase_hz: u64,
+    piu: CrimePiu,
+    memory_control: u64,
+    bank_control: [u16; 8],
+    refresh_counter: u16,
+    memory_error_status: u32,
+    memory_error_address: u64,
+    memory_ecc_syndrome: u32,
+    memory_ecc_check: u32,
+    memory_ecc_replacement: u8,
+}
+
+/// Affine CRIME TIMER model captured for one synchronous read batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CrimeSynchronousTimerProjection {
+    /// Physical address of the TIMER register.
+    pub physical_address: u64,
+
+    /// Timer value programmed at the projection origin.
+    pub base: u32,
+
+    /// Simulated time at which `base` was programmed.
+    pub base_time: SimTime,
+
+    /// CRIME master frequency driving the timer.
+    pub frequency_hz: u64,
+
+    /// Simulated machine timebase frequency.
+    pub timebase_hz: u64,
+}
+
+impl CrimeSynchronousReadSnapshot {
+    /// Completes a defined, aligned control-register read at an exact delivery time.
+    pub fn read(
+        &self,
+        transaction: Mips4ExecutionTransaction,
+        delivery_time: SimTime,
+    ) -> Option<Mips4ExecutionCompletion> {
+        control_register_read_completion(transaction, |address| {
+            self.piu
+                .read(address, delivery_time, self.timebase_hz)
+                .or_else(|| self.read_memory_register(address))
+        })
+    }
+
+    /// Returns the exact affine TIMER model represented by this snapshot.
+    pub fn timer_projection(&self) -> CrimeSynchronousTimerProjection {
+        let (base, base_time) = self.piu.timer_projection();
+        CrimeSynchronousTimerProjection {
+            physical_address: registers::TIMER,
+            base,
+            base_time,
+            frequency_hz: CRIME_MASTER_FREQUENCY_HZ,
+            timebase_hz: self.timebase_hz,
+        }
+    }
+
+    fn read_memory_register(&self, address: u64) -> Option<u64> {
+        if let Some(bank) = registers::memory_bank_index(address) {
+            return Some(u64::from(self.bank_control[bank]));
+        }
+        match address {
+            registers::MEMORY_CONTROL => Some(self.memory_control),
+            registers::MEMORY_REFRESH_COUNTER => Some(u64::from(self.refresh_counter)),
+            registers::MEMORY_ERROR_STATUS => Some(u64::from(self.memory_error_status)),
+            registers::MEMORY_ERROR_ADDRESS => Some(self.memory_error_address),
+            registers::MEMORY_ECC_SYNDROME => Some(u64::from(self.memory_ecc_syndrome)),
+            registers::MEMORY_ECC_CHECK => Some(u64::from(self.memory_ecc_check)),
+            registers::MEMORY_ECC_REPLACEMENT => Some(u64::from(self.memory_ecc_replacement)),
+            _ => None,
+        }
+    }
+}
+
 crate::component_state!(CrimeState, Crime);
 
 const fn default_trace_interest() -> TraceInterest {
@@ -263,6 +342,134 @@ impl Crime {
             && self.terminal_error.is_none()
     }
 
+    /// Classifies a CPU request without changing chipset state.
+    pub fn classify_sysad_route(transaction: Mips4ExecutionTransaction) -> CrimeSysAdRoute {
+        let (address, size) = transaction_shape(transaction);
+        if decode_memory(address, size).is_some() {
+            CrimeSysAdRoute::Memory
+        } else if (registers::CRIME_BASE..registers::CRIME_RENDER_BASE).contains(&address) {
+            CrimeSysAdRoute::SynchronousInternalRegister
+        } else if (registers::CRIME_RENDER_BASE..registers::CRIME_REGISTER_END).contains(&address) {
+            CrimeSysAdRoute::RenderRegister
+        } else if in_window(address, size, GBE_START, GBE_END) {
+            CrimeSysAdRoute::Cgi
+        } else if in_window(address, size, MACE_LOW_START, MACE_LOW_END)
+            || in_window(address, size, PCI_HIGH_START, PCI_HIGH_END)
+        {
+            CrimeSysAdRoute::Cmi
+        } else {
+            CrimeSysAdRoute::Unsupported
+        }
+    }
+
+    /// Previews the exact memory-domain request produced by an idle CPU access.
+    pub fn preview_synchronous_memory_request(
+        &self,
+        request: &ExecutionTransaction<Mips4ExecutionTransaction>,
+        delivery_time: SimTime,
+    ) -> Option<CrimeMemoryTransaction> {
+        if !self.stable_cpu_fetch_ready()
+            || Self::classify_sysad_route(request.payload) != CrimeSysAdRoute::Memory
+            || self.next_transaction_id.checked_add(1).is_none()
+        {
+            return None;
+        }
+        let (address, size) = transaction_shape(request.payload);
+        let (memory_address, no_ecc) = decode_memory(address, size)?;
+        Some(CrimeMemoryTransaction {
+            id: CrimeTransactionId::new(self.next_transaction_id),
+            time: delivery_time,
+            controller: self.id,
+            client: CrimeMemoryClient::Cpu,
+            address: memory_address,
+            bank_select: CrimeMemoryBankSelect::Decode,
+            no_ecc,
+            transfer: transfer_from_cpu(request.payload),
+        })
+    }
+
+    /// Returns whether an idle, defined control-register read can complete synchronously.
+    pub fn synchronous_sysad_read_ready(&self, transaction: Mips4ExecutionTransaction) -> bool {
+        self.stable_cpu_fetch_ready()
+            && Self::classify_sysad_route(transaction)
+                == CrimeSysAdRoute::SynchronousInternalRegister
+            && self
+                .control_register_read_completion(transaction, self.current_time)
+                .is_some()
+    }
+
+    /// Captures the immutable register image needed by direct read batches.
+    pub fn synchronous_read_snapshot(&self) -> Option<CrimeSynchronousReadSnapshot> {
+        self.stable_cpu_fetch_ready()
+            .then(|| CrimeSynchronousReadSnapshot {
+                timebase_hz: self.timebase_hz,
+                piu: self.piu.clone(),
+                memory_control: self.memory_control,
+                bank_control: self.bank_control,
+                refresh_counter: self.refresh_counter,
+                memory_error_status: self.memory_error_status,
+                memory_error_address: self.memory_error_address,
+                memory_ecc_syndrome: self.memory_ecc_syndrome,
+                memory_ecc_check: self.memory_ecc_check,
+                memory_ecc_replacement: self.memory_ecc_replacement,
+            })
+    }
+
+    /// Commits the time observed by a proven batch of side-effect-free reads.
+    pub fn commit_synchronous_sysad_reads(
+        &mut self,
+        reads: u64,
+        last_delivery_time: SimTime,
+    ) -> bool {
+        if reads == 0 {
+            return true;
+        }
+        if !self.stable_cpu_fetch_ready() {
+            return false;
+        }
+        self.current_time = self.current_time.max(last_delivery_time);
+        true
+    }
+
+    /// Accounts for CMI transaction IDs consumed by proven synchronous reads.
+    pub fn commit_synchronous_cmi_reads(&mut self, reads: u64) -> Result<bool, CrimeError> {
+        if reads == 0 {
+            return Ok(true);
+        }
+        if !self.stable_cpu_fetch_ready() {
+            return Ok(false);
+        }
+        self.next_transaction_id = self
+            .next_transaction_id
+            .checked_add(u128::from(reads))
+            .ok_or(CrimeError::TransactionIdOverflow)?;
+        Ok(true)
+    }
+
+    /// Returns whether a synchronous CMI batch can allocate all transaction IDs.
+    pub fn synchronous_cmi_reads_ready(&self, reads: u64) -> bool {
+        self.stable_cpu_fetch_ready()
+            && self
+                .next_transaction_id
+                .checked_add(u128::from(reads))
+                .is_some()
+    }
+
+    /// Completes a previously planned synchronous control-register read.
+    ///
+    /// The caller must retain exclusive ownership of the idle SysAD path from
+    /// planning through commit.
+    pub fn commit_synchronous_sysad_read(
+        &mut self,
+        transaction: Mips4ExecutionTransaction,
+        delivery_time: SimTime,
+    ) -> Mips4ExecutionCompletion {
+        debug_assert!(self.synchronous_sysad_read_ready(transaction));
+        self.current_time = delivery_time;
+        self.control_register_read_completion(transaction, delivery_time)
+            .expect("a validated synchronous CRIME read must remain defined")
+    }
+
     /// Accounts for bypassed stable CPU requests at the last SysAD delivery time.
     pub fn account_stable_cpu_fetches(
         &mut self,
@@ -280,8 +487,17 @@ impl Crime {
             .next_transaction_id
             .checked_add(fetches)
             .ok_or(CrimeError::TransactionIdOverflow)?;
-        self.current_time = last_delivery_time;
+        self.current_time = self.current_time.max(last_delivery_time);
         Ok(true)
+    }
+
+    /// Returns whether a stable CPU batch can allocate all downstream IDs.
+    pub fn stable_cpu_fetches_ready(&self, fetches: usize) -> bool {
+        self.stable_cpu_fetch_ready()
+            && u128::try_from(fetches)
+                .ok()
+                .and_then(|fetches| self.next_transaction_id.checked_add(fetches))
+                .is_some()
     }
 
     /// Updates the coarse trace interest supplied by the machine runtime.
@@ -600,12 +816,9 @@ impl Crime {
     ) -> Mips4ExecutionCompletion {
         let (address, _) = transaction_shape(transaction);
         match transaction {
-            Mips4ExecutionTransaction::Read { .. } => {
-                match self.read_control_register(address, now) {
-                    Some(value) => Mips4ExecutionCompletion::ReadData(value.swap_bytes()),
-                    None => self.unsupported_read_completion(),
-                }
-            }
+            Mips4ExecutionTransaction::Read { .. } => self
+                .control_register_read_completion(transaction, now)
+                .unwrap_or_else(|| self.unsupported_read_completion()),
             Mips4ExecutionTransaction::Write {
                 data, byte_enable, ..
             } => {
@@ -626,21 +839,29 @@ impl Crime {
         }
     }
 
-    fn access_control_register_word(&self, address: u64, now: SimTime) -> Mips4ExecutionCompletion {
-        let register_address = address & !7;
-        let Some(value) = self.read_control_register(register_address, now) else {
-            return self.unsupported_read_completion();
-        };
+    fn control_register_read_completion(
+        &self,
+        transaction: Mips4ExecutionTransaction,
+        now: SimTime,
+    ) -> Option<Mips4ExecutionCompletion> {
+        control_register_read_completion(transaction, |address| {
+            self.read_control_register(address, now)
+        })
+    }
 
-        // The execution request retains the CPU load width, while R5000 SysAD
-        // obtains the complete aligned doubleword and selects the requested
-        // big-endian word lane inside the processor.
-        let word = if address & 4 == 0 {
-            (value >> 32) as u32
-        } else {
-            value as u32
-        };
-        Mips4ExecutionCompletion::ReadData(encode_big_endian(u64::from(word), 4))
+    fn access_control_register_word(&self, address: u64, now: SimTime) -> Mips4ExecutionCompletion {
+        self.control_register_word_read_completion(address, now)
+            .unwrap_or_else(|| self.unsupported_read_completion())
+    }
+
+    fn control_register_word_read_completion(
+        &self,
+        address: u64,
+        now: SimTime,
+    ) -> Option<Mips4ExecutionCompletion> {
+        control_register_word_read_completion(address, |register_address| {
+            self.read_control_register(register_address, now)
+        })
     }
 
     fn read_control_register(&self, address: u64, now: SimTime) -> Option<u64> {
@@ -1488,6 +1709,48 @@ impl BusDeviceRole<CrimeCgiTransaction> for Crime {
             }),
         }
     }
+}
+
+fn control_register_read_completion(
+    transaction: Mips4ExecutionTransaction,
+    mut read: impl FnMut(u64) -> Option<u64>,
+) -> Option<Mips4ExecutionCompletion> {
+    let Mips4ExecutionTransaction::Read {
+        physical_address: address,
+        size,
+        ..
+    } = transaction
+    else {
+        return None;
+    };
+    let size = size.bytes();
+    if size == 4 && address & 3 == 0 {
+        return control_register_word_read_completion(address, read);
+    }
+    if size == 8 && address & 7 == 0 {
+        return read(address).map(|value| Mips4ExecutionCompletion::ReadData(value.swap_bytes()));
+    }
+    None
+}
+
+fn control_register_word_read_completion(
+    address: u64,
+    mut read: impl FnMut(u64) -> Option<u64>,
+) -> Option<Mips4ExecutionCompletion> {
+    let value = read(address & !7)?;
+
+    // The execution request retains the CPU load width, while R5000 SysAD
+    // obtains the complete aligned doubleword and selects the requested
+    // big-endian word lane inside the processor.
+    let word = if address & 4 == 0 {
+        (value >> 32) as u32
+    } else {
+        value as u32
+    };
+    Some(Mips4ExecutionCompletion::ReadData(encode_big_endian(
+        u64::from(word),
+        4,
+    )))
 }
 
 fn transaction_shape(transaction: Mips4ExecutionTransaction) -> (u64, u8) {

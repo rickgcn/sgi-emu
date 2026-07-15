@@ -4,7 +4,7 @@ use se_core::scheduler::{SimDuration, SimTime};
 
 use super::registers;
 
-const CRIME_MASTER_FREQUENCY_HZ: u64 = 66_666_500;
+pub(super) const CRIME_MASTER_FREQUENCY_HZ: u64 = 66_666_500;
 const WATCHDOG_THRESHOLD_CRIME_CYCLES: u64 = (1 << 19) * 64;
 
 /// Side effect produced by a processor-interface register transition.
@@ -120,6 +120,10 @@ impl CrimePiu {
     /// Returns whether enabled CRIME interrupts assert its processor output.
     pub const fn interrupt_output_asserted(&self) -> bool {
         self.interrupt_output_asserted
+    }
+
+    pub(super) const fn timer_projection(&self) -> (u32, SimTime) {
+        (self.timer_base, self.timer_base_time)
     }
 
     /// Reads a defined PIU register.

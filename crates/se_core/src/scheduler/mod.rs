@@ -135,6 +135,16 @@ impl FractionalClockProjection {
         self.remainder
     }
 
+    /// Returns the simulated timebase frequency.
+    pub const fn timebase_hz(self) -> u64 {
+        self.timebase_hz
+    }
+
+    /// Returns the projected clock frequency.
+    pub const fn frequency_hz(self) -> u64 {
+        self.frequency_hz
+    }
+
     /// Projects elapsed time for a number of cycles without changing state.
     pub fn elapsed(self, cycles: u64) -> Option<SimDuration> {
         if let Some(ticks) = (self.timebase_hz % self.frequency_hz)
