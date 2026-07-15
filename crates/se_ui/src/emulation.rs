@@ -1,7 +1,7 @@
 //! Host-side lifecycle control for the IP32 machine.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -13,9 +13,10 @@ use std::{
 use se_device::chipset::gbe::protocol::{
     GbeExternalClock, GbeExternalInput, GbeFrame, GbeFrameField,
 };
+use se_device::input::ps2::{Ps2KeyPosition, Ps2KeyboardInput, Ps2MouseButtons, Ps2MouseInput};
 use se_machine::o2::ip32::{
     address_map::IP32_PROM_IMAGE_SIZE_BYTES,
-    event::{Ip32SerialOutput, Ip32SerialPort},
+    event::{Ip32InputEvent, Ip32SerialOutput, Ip32SerialPort},
     machine::Ip32Machine,
 };
 use se_runtime::runtime::RunStatus;
@@ -23,7 +24,8 @@ use se_runtime::runtime::RunStatus;
 use crate::{
     application::ffi::{
         EmulationSnapshot, EmulationState, PersistenceOutcome, TerminalInputStatus, UiDisplayField,
-        UiDisplayUpdate, UiSerialPort, UiTerminalChunk, UiTerminalIoStats,
+        UiDisplayUpdate, UiInputStatus, UiMouseButtons, UiPhysicalKey, UiSerialPort,
+        UiTerminalChunk, UiTerminalIoStats,
     },
     persistence::{
         EmulationConfig, PersistencePaths, RtcPersistenceMode, hash_bytes, host_utc_seconds,
@@ -36,6 +38,7 @@ use crate::{
 
 const RUN_BATCH_SIZE: usize = 4_096;
 const TERMINAL_QUEUE_CAPACITY: usize = 65_536;
+const INPUT_QUEUE_CAPACITY: usize = 4_096;
 const BATTERY_DEBOUNCE: Duration = Duration::from_secs(1);
 const BATTERY_CHECKPOINT: Duration = Duration::from_secs(60);
 const PERSISTENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -62,6 +65,11 @@ fn connect_crt_display(machine: &mut Ip32Machine<UiTraceSink>) -> Result<(), Str
 struct TerminalInputRequest {
     port: UiSerialPort,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct InputRequest {
+    input: Ip32InputEvent,
 }
 
 struct ConfigureRequest {
@@ -101,6 +109,10 @@ struct ControllerState {
     terminal_outputs: VecDeque<UiTerminalChunk>,
     terminal_output_units: [usize; 2],
     terminal_stats: [TerminalStatsData; 2],
+    inputs: VecDeque<InputRequest>,
+    pressed_keys: BTreeSet<Ps2KeyPosition>,
+    mouse_buttons: Ps2MouseButtons,
+    dropped_inputs: u64,
     display: DisplayState,
     snapshot: SnapshotData,
 }
@@ -191,6 +203,10 @@ impl EmulationController {
                 terminal_outputs: VecDeque::new(),
                 terminal_output_units: [0; 2],
                 terminal_stats: [TerminalStatsData::default(); 2],
+                inputs: VecDeque::new(),
+                pressed_keys: BTreeSet::new(),
+                mouse_buttons: Ps2MouseButtons::default(),
+                dropped_inputs: 0,
                 display: DisplayState::default(),
                 snapshot: SnapshotData::default(),
             }),
@@ -216,6 +232,7 @@ impl EmulationController {
                         state.save_state = None;
                         state.load_state = None;
                         state.snapshot.has_machine = false;
+                        clear_input_session(&mut state);
                         reset_display_session(&mut state);
                         set_fault(&mut state, "IP32 worker thread panicked".to_owned());
                     }
@@ -280,6 +297,7 @@ impl EmulationController {
         }
         state.hard_reset_requested = true;
         clear_terminal_inputs(&mut state);
+        clear_input_session(&mut state);
         self.shared.wake.notify_one();
         true
     }
@@ -333,6 +351,7 @@ impl EmulationController {
             jit_enabled,
         });
         clear_terminal_inputs(&mut state);
+        clear_input_session(&mut state);
         state.snapshot.state = EmulationState::Building;
         state.snapshot.error_message.clear();
         self.shared.wake.notify_one();
@@ -398,6 +417,7 @@ impl EmulationController {
             prom_override,
             return_state,
         });
+        clear_input_session(&mut state);
         state.snapshot.state = EmulationState::Loading;
         self.shared.wake.notify_one();
         true
@@ -432,6 +452,66 @@ impl EmulationController {
         }
         self.shared.wake.notify_one();
         TerminalInputStatus::Accepted
+    }
+
+    /// Queues one physical keyboard transition for the worker-owned machine.
+    pub fn submit_key_input(&self, key: UiPhysicalKey, pressed: bool) -> UiInputStatus {
+        let mut state = lock_state(&self.shared);
+        if !input_available(&state) {
+            return UiInputStatus::Unavailable;
+        }
+        let Some(key) = physical_key(key) else {
+            return UiInputStatus::Accepted;
+        };
+        let changed = if pressed {
+            state.pressed_keys.insert(key)
+        } else {
+            state.pressed_keys.remove(&key)
+        };
+        if !changed {
+            return UiInputStatus::Accepted;
+        }
+        let status = enqueue_input(
+            &mut state,
+            Ip32InputEvent::Keyboard(Ps2KeyboardInput { key, pressed }),
+        );
+        self.shared.wake.notify_one();
+        status
+    }
+
+    /// Queues relative mouse movement and authoritative button state.
+    pub fn submit_mouse_input(
+        &self,
+        delta_x: i32,
+        delta_y: i32,
+        buttons: UiMouseButtons,
+    ) -> UiInputStatus {
+        let mut state = lock_state(&self.shared);
+        if !input_available(&state) {
+            return UiInputStatus::Unavailable;
+        }
+        let buttons = Ps2MouseButtons {
+            left: buttons.left,
+            middle: buttons.middle,
+            right: buttons.right,
+        };
+        let status = enqueue_mouse_input(&mut state, delta_x, delta_y, buttons);
+        self.shared.wake.notify_one();
+        status
+    }
+
+    /// Releases all guest keys and mouse buttons known to the UI session.
+    pub fn release_all_input(&self) -> UiInputStatus {
+        let mut state = lock_state(&self.shared);
+        state.pressed_keys.clear();
+        state.mouse_buttons = Ps2MouseButtons::default();
+        if !input_available(&state) {
+            state.inputs.clear();
+            return UiInputStatus::Unavailable;
+        }
+        let status = enqueue_input(&mut state, Ip32InputEvent::ReleaseAll);
+        self.shared.wake.notify_one();
+        status
     }
 
     /// Drains terminal output without touching the worker-owned machine.
@@ -551,6 +631,7 @@ impl EmulationController {
             state.save_state = None;
             state.load_state = None;
             clear_terminal_inputs(&mut state);
+            clear_input_session(&mut state);
             state.snapshot.state = EmulationState::ShuttingDown;
             self.shared.wake.notify_one();
         }
@@ -583,6 +664,7 @@ enum WorkerAction {
     SaveState(SaveStateRequest),
     LoadState(LoadStateRequest),
     HardReset,
+    Input(InputRequest),
     TerminalInput(TerminalInputRequest),
     RunBatch,
     PersistenceTick,
@@ -638,6 +720,9 @@ fn worker_main(shared: &Arc<SharedController>) {
             WorkerAction::HardReset => {
                 hard_reset_machine(shared, machine.as_mut());
             }
+            WorkerAction::Input(request) => {
+                submit_machine_input(shared, machine.as_mut(), request);
+            }
             WorkerAction::TerminalInput(request) => {
                 submit_machine_terminal_input(shared, machine.as_mut(), request);
             }
@@ -682,6 +767,9 @@ fn next_action(shared: &Arc<SharedController>, has_machine: bool) -> WorkerActio
             if has_machine {
                 return WorkerAction::HardReset;
             }
+        }
+        if let Some(request) = state.inputs.pop_front() {
+            return WorkerAction::Input(request);
         }
         if let Some(request) = state.terminal_inputs.pop_front() {
             let index = terminal_port_index(request.port);
@@ -732,6 +820,7 @@ fn configure_worker_machine(
             state.desired_running = false;
             let session_id = begin_application_trace_session();
             clear_terminal_session(&mut state);
+            clear_input_session(&mut state);
             reset_display_session(&mut state);
             state.snapshot.session_id = session_id;
             state.snapshot.sim_time = 0;
@@ -884,6 +973,7 @@ fn auto_configure_machine(
         Ok(new_machine) => {
             let session_id = begin_application_trace_session();
             clear_terminal_session(&mut state);
+            clear_input_session(&mut state);
             reset_display_session(&mut state);
             state.snapshot.session_id = session_id;
             state.snapshot.sim_time = 0;
@@ -1073,6 +1163,13 @@ fn load_machine_state(
         )
         .map_err(|error| LoadMachineError::Failed(error.to_string()))?;
         connect_crt_display(&mut new_machine).map_err(LoadMachineError::Failed)?;
+        new_machine
+            .schedule_input(new_machine.runtime().now(), Ip32InputEvent::ReleaseAll)
+            .map_err(|error| {
+                LoadMachineError::Failed(format!(
+                    "failed to schedule input release after state load: {error}"
+                ))
+            })?;
         Ok((new_machine, config))
     });
 
@@ -1097,6 +1194,7 @@ fn load_machine_state(
             let session_id = begin_application_trace_session();
             let mut state = lock_state(shared);
             clear_terminal_session(&mut state);
+            clear_input_session(&mut state);
             reset_display_session(&mut state);
             update_display_output(&mut state, display_frame, machine_dropped);
             state.snapshot.session_id = session_id;
@@ -1341,6 +1439,7 @@ fn hard_reset_machine(
     state.snapshot.sim_time = sim_time;
     match result {
         Ok(()) => {
+            clear_input_session(&mut state);
             reset_display_session(&mut state);
             state.snapshot.error_message.clear();
             state.snapshot.state = if state.desired_running {
@@ -1388,6 +1487,25 @@ fn submit_machine_terminal_input(
     }
 }
 
+fn submit_machine_input(
+    shared: &Arc<SharedController>,
+    machine: Option<&mut Ip32Machine<UiTraceSink>>,
+    request: InputRequest,
+) {
+    let Some(machine) = machine else {
+        return;
+    };
+    let result = machine.schedule_input(machine.runtime().now(), request.input);
+    if let Err(error) = result {
+        let mut state = lock_state(shared);
+        state.desired_running = false;
+        set_fault(
+            &mut state,
+            format!("failed to schedule physical input: {error}"),
+        );
+    }
+}
+
 fn run_machine_batch(
     shared: &Arc<SharedController>,
     machine: Option<&mut Ip32Machine<UiTraceSink>>,
@@ -1421,6 +1539,7 @@ fn run_machine_batch(
         }
         Err(error) => {
             state.desired_running = false;
+            clear_input_session(&mut state);
             set_fault(&mut state, error.to_string());
         }
     }
@@ -1507,6 +1626,111 @@ fn ui_serial_port(port: Ip32SerialPort) -> UiSerialPort {
 fn clear_terminal_inputs(state: &mut ControllerState) {
     state.terminal_inputs.clear();
     state.terminal_input_units.fill(0);
+}
+
+fn input_available(state: &ControllerState) -> bool {
+    !state.shutdown_requested
+        && state.snapshot.has_machine
+        && matches!(
+            state.snapshot.state,
+            EmulationState::Paused | EmulationState::Running | EmulationState::Idle
+        )
+}
+
+fn enqueue_input(state: &mut ControllerState, input: Ip32InputEvent) -> UiInputStatus {
+    if state.inputs.len() < INPUT_QUEUE_CAPACITY {
+        state.inputs.push_back(InputRequest { input });
+        return UiInputStatus::Accepted;
+    }
+    let mut pending_mouse_x = 0i32;
+    let mut pending_mouse_y = 0i32;
+    for request in &state.inputs {
+        if let Ip32InputEvent::Mouse(mouse) = request.input {
+            pending_mouse_x = pending_mouse_x.saturating_add(mouse.delta_x);
+            pending_mouse_y = pending_mouse_y.saturating_add(mouse.delta_y);
+        }
+    }
+    if let Ip32InputEvent::Mouse(mouse) = input {
+        pending_mouse_x = pending_mouse_x.saturating_add(mouse.delta_x);
+        pending_mouse_y = pending_mouse_y.saturating_add(mouse.delta_y);
+    }
+    state.dropped_inputs = state.dropped_inputs.saturating_add(1);
+    state.inputs.clear();
+    state.inputs.push_back(InputRequest {
+        input: Ip32InputEvent::ReleaseAll,
+    });
+    for key in state.pressed_keys.iter().copied() {
+        state.inputs.push_back(InputRequest {
+            input: Ip32InputEvent::Keyboard(Ps2KeyboardInput { key, pressed: true }),
+        });
+    }
+    state.inputs.push_back(InputRequest {
+        input: Ip32InputEvent::Mouse(Ps2MouseInput {
+            delta_x: pending_mouse_x,
+            delta_y: pending_mouse_y,
+            buttons: state.mouse_buttons,
+        }),
+    });
+    UiInputStatus::QueueFull
+}
+
+fn enqueue_mouse_input(
+    state: &mut ControllerState,
+    delta_x: i32,
+    delta_y: i32,
+    buttons: Ps2MouseButtons,
+) -> UiInputStatus {
+    state.mouse_buttons = buttons;
+    if let Some(InputRequest {
+        input: Ip32InputEvent::Mouse(input),
+    }) = state.inputs.back_mut()
+    {
+        input.delta_x = input.delta_x.saturating_add(delta_x);
+        input.delta_y = input.delta_y.saturating_add(delta_y);
+        input.buttons = buttons;
+        return UiInputStatus::Accepted;
+    }
+    enqueue_input(
+        state,
+        Ip32InputEvent::Mouse(Ps2MouseInput {
+            delta_x,
+            delta_y,
+            buttons,
+        }),
+    )
+}
+
+fn clear_input_session(state: &mut ControllerState) {
+    state.inputs.clear();
+    state.pressed_keys.clear();
+    state.mouse_buttons = Ps2MouseButtons::default();
+    state.dropped_inputs = 0;
+}
+
+macro_rules! physical_key_match {
+    ($key:expr; $($variant:ident),+ $(,)?) => {
+        match $key {
+            $(UiPhysicalKey::$variant => Some(Ps2KeyPosition::$variant),)+
+            _ => None,
+        }
+    };
+}
+
+fn physical_key(key: UiPhysicalKey) -> Option<Ps2KeyPosition> {
+    physical_key_match!(key;
+        Escape, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+        PrintScreen, ScrollLock, Pause, Grave, Digit1, Digit2, Digit3, Digit4,
+        Digit5, Digit6, Digit7, Digit8, Digit9, Digit0, Minus, Equal, Backspace,
+        Insert, Home, PageUp, NumLock, NumpadDivide, NumpadMultiply,
+        NumpadSubtract, Tab, Q, W, E, R, T, Y, U, I, O, P, LeftBracket,
+        RightBracket, Backslash, IsoHash, Delete, End, PageDown, Numpad7,
+        Numpad8, Numpad9, NumpadAdd, CapsLock, A, S, D, F, G, H, J, K, L,
+        Semicolon, Apostrophe, Enter, Numpad4, Numpad5, Numpad6, LeftShift,
+        Iso102, Z, X, C, V, B, N, M, Comma, Period, Slash, RightShift, ArrowUp,
+        Numpad1, Numpad2, Numpad3, NumpadEnter, LeftControl, LeftAlt, Space,
+        RightAlt, RightControl, ArrowLeft, ArrowDown, ArrowRight, Numpad0,
+        NumpadDecimal,
+    )
 }
 
 fn clear_terminal_session(state: &mut ControllerState) {
@@ -1889,6 +2113,154 @@ mod tests {
         assert_eq!(update.machine_dropped, 0);
         assert_eq!(update.transport_dropped, 0);
         assert_eq!(update.invalid_frames, 0);
+    }
+
+    #[test]
+    fn input_queue_preserves_keyboard_order_and_merges_adjacent_motion() {
+        let controller = EmulationController::new();
+        let mut state = lock_state(&controller.shared);
+        assert_eq!(
+            enqueue_input(
+                &mut state,
+                Ip32InputEvent::Keyboard(Ps2KeyboardInput {
+                    key: Ps2KeyPosition::A,
+                    pressed: true,
+                }),
+            ),
+            UiInputStatus::Accepted
+        );
+        assert_eq!(
+            enqueue_input(
+                &mut state,
+                Ip32InputEvent::Keyboard(Ps2KeyboardInput {
+                    key: Ps2KeyPosition::A,
+                    pressed: false,
+                }),
+            ),
+            UiInputStatus::Accepted
+        );
+        let buttons = Ps2MouseButtons {
+            left: true,
+            middle: false,
+            right: false,
+        };
+        assert_eq!(
+            enqueue_mouse_input(&mut state, 7, -5, buttons),
+            UiInputStatus::Accepted
+        );
+        assert_eq!(
+            enqueue_mouse_input(&mut state, i32::MAX, 2, buttons),
+            UiInputStatus::Accepted
+        );
+
+        let queued: Vec<_> = state.inputs.iter().map(|request| request.input).collect();
+        assert_eq!(
+            queued,
+            [
+                Ip32InputEvent::Keyboard(Ps2KeyboardInput {
+                    key: Ps2KeyPosition::A,
+                    pressed: true,
+                }),
+                Ip32InputEvent::Keyboard(Ps2KeyboardInput {
+                    key: Ps2KeyPosition::A,
+                    pressed: false,
+                }),
+                Ip32InputEvent::Mouse(Ps2MouseInput {
+                    delta_x: i32::MAX,
+                    delta_y: -3,
+                    buttons,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_overflow_builds_one_authoritative_bounded_resync() {
+        let controller = EmulationController::new();
+        let mut state = lock_state(&controller.shared);
+        state.pressed_keys.insert(Ps2KeyPosition::A);
+        state.pressed_keys.insert(Ps2KeyPosition::Escape);
+        state.mouse_buttons = Ps2MouseButtons {
+            left: false,
+            middle: false,
+            right: true,
+        };
+        state.inputs.push_back(InputRequest {
+            input: Ip32InputEvent::Mouse(Ps2MouseInput {
+                delta_x: 3,
+                delta_y: -2,
+                buttons: Ps2MouseButtons::default(),
+            }),
+        });
+        state
+            .inputs
+            .extend((1..INPUT_QUEUE_CAPACITY).map(|_| InputRequest {
+                input: Ip32InputEvent::ReleaseAll,
+            }));
+        state.dropped_inputs = u64::MAX;
+        let mouse_buttons = state.mouse_buttons;
+
+        assert_eq!(
+            enqueue_input(
+                &mut state,
+                Ip32InputEvent::Mouse(Ps2MouseInput {
+                    delta_x: 5,
+                    delta_y: 4,
+                    buttons: mouse_buttons,
+                }),
+            ),
+            UiInputStatus::QueueFull
+        );
+
+        let queued: Vec<_> = state.inputs.iter().map(|request| request.input).collect();
+        assert_eq!(state.dropped_inputs, u64::MAX);
+        assert_eq!(queued.len(), 4);
+        assert_eq!(queued[0], Ip32InputEvent::ReleaseAll);
+        assert_eq!(
+            queued[1],
+            Ip32InputEvent::Keyboard(Ps2KeyboardInput {
+                key: Ps2KeyPosition::Escape,
+                pressed: true,
+            })
+        );
+        assert_eq!(
+            queued[2],
+            Ip32InputEvent::Keyboard(Ps2KeyboardInput {
+                key: Ps2KeyPosition::A,
+                pressed: true,
+            })
+        );
+        assert_eq!(
+            queued[3],
+            Ip32InputEvent::Mouse(Ps2MouseInput {
+                delta_x: 8,
+                delta_y: 2,
+                buttons: state.mouse_buttons,
+            })
+        );
+    }
+
+    #[test]
+    fn input_session_reset_clears_authoritative_host_state() {
+        let controller = EmulationController::new();
+        let mut state = lock_state(&controller.shared);
+        state.inputs.push_back(InputRequest {
+            input: Ip32InputEvent::ReleaseAll,
+        });
+        state.pressed_keys.insert(Ps2KeyPosition::LeftControl);
+        state.mouse_buttons.left = true;
+        state.dropped_inputs = 9;
+
+        clear_input_session(&mut state);
+
+        assert!(state.inputs.is_empty());
+        assert!(state.pressed_keys.is_empty());
+        assert_eq!(state.mouse_buttons, Ps2MouseButtons::default());
+        assert_eq!(state.dropped_inputs, 0);
+        assert_eq!(
+            physical_key(UiPhysicalKey::Iso102),
+            Some(Ps2KeyPosition::Iso102)
+        );
     }
 
     #[test]
