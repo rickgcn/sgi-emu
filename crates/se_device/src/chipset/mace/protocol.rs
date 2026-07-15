@@ -11,6 +11,7 @@ use crate::bus::isa::IsaTransaction;
 use crate::bus::media::{MediaPayload, MediaPort, MediaTransaction};
 use crate::bus::one_wire::OneWireDrive;
 use crate::bus::pci::PciTransaction;
+use crate::bus::two_wire::TwoWireDrive;
 use crate::chipset::crime::protocol::{CrimeCmiCompletion, CrimeCmiTransaction};
 
 /// Board wiring used by the MACE controller roles.
@@ -22,8 +23,6 @@ pub struct MaceExternalLinks {
     pub video_input_cd: ComponentId,
     pub video_output: ComponentId,
     pub ethernet: ComponentId,
-    pub keyboard: ComponentId,
-    pub mouse: ComponentId,
 }
 
 /// Topological component identifiers used by MACE.
@@ -38,18 +37,37 @@ pub struct MaceWiring {
     pub rtc: ComponentId,
     pub serial: [ComponentId; 2],
     pub parallel: ComponentId,
+    pub ps2_buses: [ComponentId; 2],
     pub external_links: MaceExternalLinks,
 }
 
 /// Scheduled internal MACE transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MaceEvent {
-    TimerCompare { epoch: u64, timer: u8 },
-    Ps2Transmit { epoch: u64, port: u8 },
-    I2cComplete { epoch: u64, port: u8 },
-    DmaStep { epoch: u64, channel: u8 },
-    VideoLine { epoch: u64, channel: u8 },
-    EthernetStep { epoch: u64 },
+    TimerCompare {
+        epoch: u64,
+        timer: u8,
+    },
+    Ps2Transition {
+        epoch: u64,
+        port: u8,
+        port_epoch: u64,
+    },
+    I2cComplete {
+        epoch: u64,
+        port: u8,
+    },
+    DmaStep {
+        epoch: u64,
+        channel: u8,
+    },
+    VideoLine {
+        epoch: u64,
+        channel: u8,
+    },
+    EthernetStep {
+        epoch: u64,
+    },
 }
 
 /// Host-neutral input scheduled by the machine profile.
@@ -152,6 +170,10 @@ pub enum MaceAction {
     StartI2c(I2cTransaction),
     StartExternal(MediaTransaction),
     SetOneWire(OneWireDrive),
+    SetTwoWire {
+        bus: ComponentId,
+        drive: TwoWireDrive,
+    },
     CompleteCmiDevice(CrimeCmiCompletion),
     Trace(Box<MaceTraceEvent>),
 }

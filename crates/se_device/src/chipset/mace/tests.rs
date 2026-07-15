@@ -8,6 +8,7 @@ use crate::bus::isa::{IsaCompletion, IsaCompletionPayload, IsaTransferView};
 use crate::bus::media::{EthernetFrame, MediaPayload, MediaPort, MediaTransaction};
 use crate::bus::one_wire::OneWireLineDelivery;
 use crate::bus::pci::{PciCompletion, PciStatus};
+use crate::bus::two_wire::TwoWireLineDelivery;
 use crate::chipset::crime::protocol::{
     CrimeByteEnable, CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeData,
     CrimeLinkDeviceResponse, CrimeLinkOperation, CrimePioRequest, CrimeTransactionId,
@@ -39,6 +40,7 @@ fn wiring() -> MaceWiring {
         rtc: component(5),
         serial: [component(16), component(17)],
         parallel: component(18),
+        ps2_buses: [component(13), component(14)],
         external_links: MaceExternalLinks {
             i2c: [component(6), component(7)],
             audio: component(8),
@@ -46,8 +48,6 @@ fn wiring() -> MaceWiring {
             video_input_cd: component(10),
             video_output: component(11),
             ethernet: component(12),
-            keyboard: component(13),
-            mouse: component(14),
         },
     }
 }
@@ -71,6 +71,7 @@ fn mace_implements_every_topological_role() {
     assert_device::<Mace, IrqDelivery>();
     assert_device::<Mace, MediaTransaction>();
     assert_device::<Mace, OneWireLineDelivery>();
+    assert_device::<Mace, TwoWireLineDelivery>();
     assert_controller::<Mace, CrimeCmiCompletion>();
     assert_controller::<Mace, IsaCompletion>();
     assert_controller::<Mace, PciCompletion>();
@@ -89,6 +90,76 @@ fn component_reset_restores_revision_register() {
     .expect("MACE must build");
     mace.reset();
     assert_eq!(mace.id(), component(15));
+}
+
+#[test]
+fn ps2_registers_require_full_aligned_sixty_four_bit_pio() {
+    let mut mace = Mace::new(
+        component(15),
+        "MACE",
+        MaceConfig::default(),
+        wiring(),
+        1_000_000_000,
+    )
+    .expect("MACE must build");
+
+    assert_eq!(
+        mace.access_internal(
+            super::system::MaceAddressTarget::Peripheral,
+            0x20018,
+            CrimeTransfer::read(4),
+        ),
+        Err(crate::chipset::crime::protocol::CrimeBusError::Access)
+    );
+    assert!(
+        mace.access_internal(
+            super::system::MaceAddressTarget::Peripheral,
+            0x20018,
+            CrimeTransfer::read(8),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn ps2_interrupt_and_poll_sources_follow_controller_levels() {
+    let mut mace = Mace::new(
+        component(15),
+        "MACE",
+        MaceConfig::default(),
+        wiring(),
+        1_000_000_000,
+    )
+    .expect("MACE must build");
+    mace.write_ps2(0x10, 0x18).unwrap();
+    let byte = 0xaa_u8;
+    let parity = u16::from(byte.count_ones() & 1 == 0);
+    let frame = (u16::from(byte) << 1) | parity << 9 | 1 << 10;
+    for bit in 0u8..=10 {
+        let data_low = frame & (1 << bit) == 0;
+        for (phase, clock_low) in [(0, true), (1, false)] {
+            BusDeviceRole::<TwoWireLineDelivery>::accept(
+                &mut mace,
+                TwoWireLineDelivery {
+                    bus: component(13),
+                    source: component(30),
+                    time: se_core::scheduler::SimTime::new(u64::from(bit) * 2 + phase),
+                    source_clock_low: clock_low,
+                    source_data_low: data_low,
+                    clock_low,
+                    data_low,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    assert_eq!(mace.peripheral_interrupt_status() & (3 << 9), 3 << 9);
+    assert_eq!(mace.read_ps2(0x08).unwrap() as u8, 0xaa);
+    assert_eq!(mace.peripheral_interrupt_status() & (3 << 9), 0);
+
+    mace.write_ps2(0x10, 0x14).unwrap();
+    assert_eq!(mace.peripheral_interrupt_status() & (3 << 9), 1 << 9);
 }
 
 #[test]

@@ -25,6 +25,7 @@ use crate::bus::isa::{
 use crate::bus::media::{MediaPayload, MediaPort, MediaTransaction};
 use crate::bus::one_wire::{OneWireDrive, OneWireLineDelivery};
 use crate::bus::pci::{PciCommand, PciCompletion, PciStatus, PciTransaction};
+use crate::bus::two_wire::TwoWireLineDelivery;
 use crate::chipset::crime::protocol::{
     CrimeBusError, CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeData,
     CrimeInterruptPost, CrimeLinkDeviceResponse, CrimeLinkOperation, CrimePioRequest,
@@ -36,7 +37,7 @@ use self::config::MaceConfig;
 use self::ethernet::MaceEthernet;
 use self::interrupt::{MaceInterruptController, MaceInterruptGroup};
 use self::pci::MacePci;
-use self::peripheral::{I2cPort, IsaController, MaceTimers, Ps2Port};
+use self::peripheral::{I2cPort, IsaController, MaceTimers, Ps2Port, Ps2PortAction};
 use self::protocol::{
     MaceAction, MaceEvent, MacePoll, MaceTraceEvent, MaceTraceField, MaceTraceValue, MaceWiring,
 };
@@ -76,7 +77,9 @@ pub enum MaceError {
     UnexpectedIsaCompletion(IsaTransactionId),
     UnexpectedPciCompletion(CrimeTransactionId),
     UnsupportedIrqInput(IrqInput),
+    UnexpectedPs2Bus(ComponentId),
     HostPortFull(MediaPort),
+    UnsupportedHostPort(MediaPort),
 }
 
 impl fmt::Display for MaceError {
@@ -98,7 +101,14 @@ impl fmt::Display for MaceError {
             Self::UnsupportedIrqInput(input) => {
                 write!(formatter, "unsupported MACE IRQ input {}", input.get())
             }
+            Self::UnexpectedPs2Bus(bus) => write!(formatter, "unexpected MACE PS/2 bus {bus}"),
             Self::HostPortFull(port) => write!(formatter, "MACE host port is full: {port:?}"),
+            Self::UnsupportedHostPort(port) => {
+                write!(
+                    formatter,
+                    "MACE host input is unsupported for port {port:?}"
+                )
+            }
         }
     }
 }
@@ -190,7 +200,10 @@ impl Mace {
             interrupts: MaceInterruptController::new(),
             timers: MaceTimers::new(timebase_hz),
             isa: IsaController::new(),
-            ps2: [Ps2Port::new(), Ps2Port::new()],
+            ps2: [
+                Ps2Port::new(id, wiring.ps2_buses[0], timebase_hz),
+                Ps2Port::new(id, wiring.ps2_buses[1], timebase_hz),
+            ],
             i2c: [I2cPort::new(), I2cPort::new()],
             audio: MaceAudio::new(),
             ethernet: MaceEthernet::new(),
@@ -306,7 +319,10 @@ impl Mace {
             time: now,
             drive_low: self.isa.nic_drive_low(),
         }));
-        self.ps2 = [Ps2Port::new(), Ps2Port::new()];
+        for port in 0..self.ps2.len() {
+            self.ps2[port].reset(now);
+            self.drain_ps2_port(port);
+        }
         self.i2c = [I2cPort::new(), I2cPort::new()];
         self.audio.reset();
         self.ethernet.reset();
@@ -328,7 +344,7 @@ impl Mace {
         self.now = now;
         let event_epoch = match event {
             MaceEvent::TimerCompare { epoch, .. }
-            | MaceEvent::Ps2Transmit { epoch, .. }
+            | MaceEvent::Ps2Transition { epoch, .. }
             | MaceEvent::I2cComplete { epoch, .. }
             | MaceEvent::DmaStep { epoch, .. }
             | MaceEvent::VideoLine { epoch, .. }
@@ -344,25 +360,11 @@ impl Mace {
                     self.push_interrupt_posts();
                 }
             }
-            MaceEvent::Ps2Transmit { port, .. } if port < 2 => {
-                if let Some(byte) = self.ps2[port as usize].take_transmit() {
-                    let target = if port == 0 {
-                        self.wiring.external_links.keyboard
-                    } else {
-                        self.wiring.external_links.mouse
-                    };
-                    self.actions
-                        .push_back(MaceAction::StartExternal(MediaTransaction {
-                            source: self.id,
-                            target,
-                            port: if port == 0 {
-                                MediaPort::Keyboard
-                            } else {
-                                MediaPort::Mouse
-                            },
-                            payload: MediaPayload::Bytes(vec![byte]),
-                        }));
-                }
+            MaceEvent::Ps2Transition {
+                port, port_epoch, ..
+            } if port < 2 => {
+                self.ps2[port as usize].handle_event(now, port_epoch);
+                self.drain_ps2_port(port as usize);
                 self.update_ps2_interrupts();
             }
             MaceEvent::I2cComplete { port, .. } if port < 2 => {
@@ -372,7 +374,7 @@ impl Mace {
             MaceEvent::DmaStep { .. }
             | MaceEvent::VideoLine { .. }
             | MaceEvent::TimerCompare { .. }
-            | MaceEvent::Ps2Transmit { .. }
+            | MaceEvent::Ps2Transition { .. }
             | MaceEvent::I2cComplete { .. } => {}
         }
     }
@@ -391,6 +393,9 @@ impl Mace {
 
     /// Accepts one host-neutral media input.
     pub fn accept_host_input(&mut self, transaction: MediaTransaction) -> Result<(), MaceError> {
+        if matches!(transaction.port, MediaPort::Keyboard | MediaPort::Mouse) {
+            return Err(MaceError::UnsupportedHostPort(transaction.port));
+        }
         let capacity = match transaction.port {
             MediaPort::Ethernet => self.config.ports.ethernet_frames,
             MediaPort::AudioInput | MediaPort::AudioOutput1 | MediaPort::AudioOutput2 => {
@@ -405,14 +410,6 @@ impl Mace {
             return Err(MaceError::HostPortFull(transaction.port));
         }
         match (&transaction.port, &transaction.payload) {
-            (MediaPort::Keyboard, MediaPayload::Bytes(bytes))
-            | (MediaPort::Mouse, MediaPayload::Bytes(bytes)) => {
-                let index = usize::from(transaction.port == MediaPort::Mouse);
-                if let Some(&byte) = bytes.first() {
-                    self.ps2[index].receive(byte, false, false);
-                    self.update_ps2_interrupts();
-                }
-            }
             (MediaPort::Ethernet, MediaPayload::Ethernet(frame))
                 if self.ethernet.accepts(&frame.data) =>
             {
@@ -723,6 +720,12 @@ impl Mace {
                 return Err(CrimeBusError::Access);
             }
         } else if !matches!(width, 4 | 8) || offset & (width as u64 - 1) != 0 {
+            return Err(CrimeBusError::Access);
+        }
+        if target == MaceAddressTarget::Peripheral
+            && (0x20000..0x20040).contains(&offset)
+            && width != 8
+        {
             return Err(CrimeBusError::Access);
         }
         let aligned_offset = if pci { offset } else { offset & !7 };
@@ -1086,12 +1089,15 @@ impl Mace {
 
     fn read_ps2(&mut self, offset: u64) -> Result<u64, CrimeBusError> {
         let port = usize::from(offset >= 0x20);
-        match offset & 0x1f {
+        let result = match offset & 0x1f {
             0x08 => Ok(u64::from(self.ps2[port].read_receive())),
             0x10 => Ok(u64::from(self.ps2[port].control())),
             0x18 => Ok(u64::from(self.ps2[port].status())),
             _ => Err(CrimeBusError::Address),
-        }
+        };
+        self.drain_ps2_port(port);
+        self.update_ps2_interrupts();
+        result
     }
 
     fn write_ps2(&mut self, offset: u64, value: u8) -> Result<(), CrimeBusError> {
@@ -1099,19 +1105,34 @@ impl Mace {
         match offset & 0x1f {
             0x00 => {
                 self.ps2[port].write_transmit(value);
-                self.actions.push_back(MaceAction::Schedule {
-                    delay: se_core::scheduler::SimDuration::new(self.timebase_hz / 10_000),
-                    event: MaceEvent::Ps2Transmit {
-                        epoch: self.epoch,
-                        port: port as u8,
-                    },
-                });
             }
             0x10 => self.ps2[port].set_control(value),
             _ => return Err(CrimeBusError::Address),
         }
+        self.drain_ps2_port(port);
         self.update_ps2_interrupts();
         Ok(())
+    }
+
+    fn drain_ps2_port(&mut self, port: usize) {
+        while let Some(action) = self.ps2[port].poll() {
+            match action {
+                Ps2PortAction::Schedule { delay, epoch } => {
+                    self.actions.push_back(MaceAction::Schedule {
+                        delay,
+                        event: MaceEvent::Ps2Transition {
+                            epoch: self.epoch,
+                            port: port as u8,
+                            port_epoch: epoch,
+                        },
+                    });
+                }
+                Ps2PortAction::Drive { bus, drive } => {
+                    self.actions
+                        .push_back(MaceAction::SetTwoWire { bus, drive });
+                }
+            }
+        }
     }
 
     fn read_i2c(&self, offset: u64) -> Result<u64, CrimeBusError> {
@@ -1379,6 +1400,26 @@ impl BusDeviceRole<OneWireLineDelivery> for Mace {
     fn accept(&mut self, delivery: OneWireLineDelivery) -> Self::Response {
         self.now = delivery.time;
         self.isa.set_nic_line_low(delivery.line_low);
+    }
+}
+
+impl BusDeviceRole<TwoWireLineDelivery> for Mace {
+    type Response = Result<(), MaceError>;
+
+    fn accept(&mut self, delivery: TwoWireLineDelivery) -> Self::Response {
+        let Some(port) = self
+            .wiring
+            .ps2_buses
+            .iter()
+            .position(|bus| *bus == delivery.bus)
+        else {
+            return Err(MaceError::UnexpectedPs2Bus(delivery.bus));
+        };
+        self.now = delivery.time;
+        self.ps2[port].observe_lines(delivery);
+        self.drain_ps2_port(port);
+        self.update_ps2_interrupts();
+        Ok(())
     }
 }
 
