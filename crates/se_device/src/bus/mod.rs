@@ -7,3 +7,4 @@ pub mod media;
 pub mod one_wire;
 pub mod pci;
 pub(crate) mod transfer;
+pub mod two_wire;

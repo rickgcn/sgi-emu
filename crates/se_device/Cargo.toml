@@ -10,3 +10,6 @@ se_core.workspace = true
 se_float.workspace = true
 serde.workspace = true
 smallvec.workspace = true
+
+[dev-dependencies]
+postcard.workspace = true

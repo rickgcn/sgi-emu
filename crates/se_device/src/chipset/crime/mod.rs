@@ -40,10 +40,11 @@ use self::protocol::{
     CrimeMemoryInhibitReason, CrimeMemoryOutcome, CrimeMemoryTransaction, CrimePioRequest,
     CrimePoll, CrimeSdramSignal, CrimeSysAdRequest, CrimeSysAdRoute, CrimeTraceEvent,
     CrimeTraceField, CrimeTraceFields, CrimeTraceValue, CrimeTransactionId, CrimeTransfer,
+    CrimeTransferView,
 };
 use self::render::{
-    CrimeRender, CrimeRenderError, RenderInterruptEffect, RenderMemoryWrite, RenderNotice,
-    RenderProgress, RenderWriteError,
+    CrimeRender, CrimeRenderError, RenderAccessError, RenderInterruptEffect,
+    RenderMemoryDestination, RenderMemoryRequest, RenderNotice, RenderProgress, RenderWriteError,
 };
 use crate::common::pending::InlineMap8;
 
@@ -878,10 +879,15 @@ impl Crime {
         let (address, size) = transaction_shape(transaction);
         let result = match transaction {
             Mips4ExecutionTransaction::Read { .. } => match self.render.read(address, size) {
-                Some(value) => RenderAccessResult::Complete(Mips4ExecutionCompletion::ReadData(
+                Ok(value) => RenderAccessResult::Complete(Mips4ExecutionCompletion::ReadData(
                     encode_big_endian(value, size),
                 )),
-                None => RenderAccessResult::Complete(self.unsupported_read_completion()),
+                Err(RenderAccessError::Access) => {
+                    RenderAccessResult::Complete(Mips4ExecutionCompletion::BusError)
+                }
+                Err(RenderAccessError::Unsupported) => {
+                    RenderAccessResult::Complete(self.unsupported_read_completion())
+                }
             },
             Mips4ExecutionTransaction::Write {
                 data, byte_enable, ..
@@ -907,7 +913,10 @@ impl Crime {
                         });
                         RenderAccessResult::Deferred
                     }
-                    Err(RenderWriteError::UndefinedRegister) => {
+                    Err(RenderWriteError::Access(RenderAccessError::Access)) => {
+                        RenderAccessResult::Complete(Mips4ExecutionCompletion::BusError)
+                    }
+                    Err(RenderWriteError::Access(RenderAccessError::Unsupported)) => {
                         RenderAccessResult::Complete(self.unsupported_write_completion())
                     }
                 }
@@ -935,7 +944,7 @@ impl Crime {
                 RenderWriteError::InterfaceFull => {
                     unreachable!("the RE interface space was checked before retry")
                 }
-                RenderWriteError::UndefinedRegister => {
+                RenderWriteError::Access(_) => {
                     unreachable!("the deferred RE write was validated before retry")
                 }
             })?;
@@ -954,8 +963,8 @@ impl Crime {
         for notice in progress.notices {
             self.trace_render_notice(notice);
         }
-        if let Some(write) = progress.memory_write {
-            self.start_render_memory(write)?;
+        if let Some(request) = progress.memory_request {
+            self.start_render_memory(request)?;
         }
         if progress.schedule_step {
             self.actions.push_back(CrimeAction::Schedule {
@@ -975,10 +984,18 @@ impl Crime {
         }
     }
 
-    fn start_render_memory(&mut self, write: RenderMemoryWrite) -> Result<(), CrimeError> {
+    fn start_render_memory(&mut self, request: RenderMemoryRequest) -> Result<(), CrimeError> {
         let id = self.allocate_transaction_id()?;
         self.pending_memory.insert(id, PendingMemoryOrigin::Render);
-        if let CrimeMemoryBankSelect::Inhibited { reason } = write.bank_select {
+        let operation = match request.transfer.view() {
+            CrimeTransferView::Read { .. } => "read",
+            CrimeTransferView::Write { .. } => "write",
+        };
+        let destination = match request.destination {
+            RenderMemoryDestination::Mte => "mte",
+            RenderMemoryDestination::Pixel => "pixel",
+        };
+        if let CrimeMemoryBankSelect::Inhibited { reason } = request.bank_select {
             self.push_trace(|| CrimeTraceEvent {
                 level: TraceLevel::Debug,
                 target: trace::RENDER_TARGET,
@@ -992,11 +1009,15 @@ impl Crime {
                     },
                     CrimeTraceField {
                         key: "physical_address",
-                        value: CrimeTraceValue::Hex64(write.physical_address),
+                        value: CrimeTraceValue::Hex64(request.physical_address),
                     },
                     CrimeTraceField {
                         key: "operation",
-                        value: CrimeTraceValue::String("write"),
+                        value: CrimeTraceValue::String(operation),
+                    },
+                    CrimeTraceField {
+                        key: "destination",
+                        value: CrimeTraceValue::String(destination),
                     },
                 ]
                 .into(),
@@ -1008,10 +1029,10 @@ impl Crime {
                 time: self.current_time,
                 controller: self.id,
                 client: CrimeMemoryClient::Render,
-                address: write.physical_address,
-                bank_select: write.bank_select,
-                no_ecc: false,
-                transfer: CrimeTransfer::write(write.data, write.byte_enable),
+                address: request.physical_address,
+                bank_select: request.bank_select,
+                no_ecc: request.no_ecc,
+                transfer: request.transfer,
             }));
         Ok(())
     }
@@ -1037,9 +1058,12 @@ impl Crime {
                 CrimeTraceField {
                     key: "commit",
                     value: CrimeTraceValue::Bool(
-                        (registers::CRIME_RENDER_BASE + 0x3800
-                            ..=registers::CRIME_RENDER_BASE + 0x3878)
-                            .contains(&address),
+                        (registers::CRIME_RENDER_BASE + 0x2800
+                            ..registers::CRIME_RENDER_BASE + 0x2a00)
+                            .contains(&address)
+                            || (registers::CRIME_RENDER_BASE + 0x3800
+                                ..registers::CRIME_RENDER_BASE + 0x3880)
+                                .contains(&address),
                     ),
                 },
             ]
@@ -1077,12 +1101,74 @@ impl Crime {
                 ]
                 .into(),
             ),
+            RenderNotice::PixelCommandCommitted {
+                primitive,
+                x0,
+                y0,
+                x1,
+                y1,
+            } => (
+                "pixel_command_commit",
+                [
+                    CrimeTraceField {
+                        key: "primitive",
+                        value: CrimeTraceValue::Hex64(u64::from(primitive)),
+                    },
+                    CrimeTraceField {
+                        key: "x0",
+                        value: CrimeTraceValue::U64(u64::from(x0)),
+                    },
+                    CrimeTraceField {
+                        key: "y0",
+                        value: CrimeTraceValue::U64(u64::from(y0)),
+                    },
+                    CrimeTraceField {
+                        key: "x1",
+                        value: CrimeTraceValue::U64(u64::from(x1)),
+                    },
+                    CrimeTraceField {
+                        key: "y1",
+                        value: CrimeTraceValue::U64(u64::from(y1)),
+                    },
+                ]
+                .into(),
+            ),
             RenderNotice::MemoryChunk {
+                destination,
                 virtual_address,
                 physical_address,
                 length,
             } => (
-                "mte_chunk",
+                match destination {
+                    RenderMemoryDestination::Mte => "mte_chunk",
+                    RenderMemoryDestination::Pixel => "pixel_chunk",
+                },
+                [
+                    CrimeTraceField {
+                        key: "virtual_address",
+                        value: CrimeTraceValue::Hex64(u64::from(virtual_address)),
+                    },
+                    CrimeTraceField {
+                        key: "physical_address",
+                        value: CrimeTraceValue::Hex64(physical_address),
+                    },
+                    CrimeTraceField {
+                        key: "length",
+                        value: CrimeTraceValue::U64(u64::from(length)),
+                    },
+                ]
+                .into(),
+            ),
+            RenderNotice::MemoryCompleted {
+                destination,
+                virtual_address,
+                physical_address,
+                length,
+            } => (
+                match destination {
+                    RenderMemoryDestination::Mte => "memory_complete",
+                    RenderMemoryDestination::Pixel => "pixel_memory_complete",
+                },
                 [
                     CrimeTraceField {
                         key: "virtual_address",
@@ -1141,6 +1227,38 @@ impl Crime {
                     CrimeTraceField {
                         key: "end",
                         value: CrimeTraceValue::Hex64(u64::from(end)),
+                    },
+                ]
+                .into(),
+            ),
+            RenderNotice::PixelCommandCompleted {
+                primitive,
+                x0,
+                y0,
+                x1,
+                y1,
+            } => (
+                "pixel_command_complete",
+                [
+                    CrimeTraceField {
+                        key: "primitive",
+                        value: CrimeTraceValue::Hex64(u64::from(primitive)),
+                    },
+                    CrimeTraceField {
+                        key: "x0",
+                        value: CrimeTraceValue::U64(u64::from(x0)),
+                    },
+                    CrimeTraceField {
+                        key: "y0",
+                        value: CrimeTraceValue::U64(u64::from(y0)),
+                    },
+                    CrimeTraceField {
+                        key: "x1",
+                        value: CrimeTraceValue::U64(u64::from(x1)),
+                    },
+                    CrimeTraceField {
+                        key: "y1",
+                        value: CrimeTraceValue::U64(u64::from(y1)),
                     },
                 ]
                 .into(),
@@ -1525,6 +1643,29 @@ impl Crime {
 
     fn latch_render_error(&mut self, error: CrimeRenderError) {
         let fields: CrimeTraceFields = match &error {
+            CrimeRenderError::UnsupportedPixelCommand {
+                trigger_address,
+                primitive,
+                draw_mode,
+            } => [
+                CrimeTraceField {
+                    key: "kind",
+                    value: CrimeTraceValue::String("unsupported_pixel_command"),
+                },
+                CrimeTraceField {
+                    key: "trigger_address",
+                    value: CrimeTraceValue::Hex64(*trigger_address),
+                },
+                CrimeTraceField {
+                    key: "primitive",
+                    value: CrimeTraceValue::Hex64(u64::from(*primitive)),
+                },
+                CrimeTraceField {
+                    key: "draw_mode",
+                    value: CrimeTraceValue::Hex64(u64::from(*draw_mode)),
+                },
+            ]
+            .into(),
             CrimeRenderError::UnsupportedMteJob {
                 mode,
                 byte_mask,

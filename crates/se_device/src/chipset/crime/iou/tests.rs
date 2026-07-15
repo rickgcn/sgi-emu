@@ -108,3 +108,83 @@ fn reset_invalidates_old_link_events() {
     bus.handle_event(CrimeCgiBusEvent::Service { epoch: old });
     assert_eq!(bus.poll(), CrimeBusAction::Idle);
 }
+
+#[test]
+fn cgi_allows_multiple_requests_and_scopes_ids_by_target() {
+    let gbe = ComponentId::new(4);
+    let mut bus = CrimeCgiBus::new(BUS, "CGI", 1_000_000_000);
+    let transaction = |controller, target| CrimeCgiTransaction {
+        id: CrimeTransactionId::new(5),
+        controller,
+        target,
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address: 0,
+            transfer: CrimeTransfer::read(4),
+        }),
+    };
+    assert!(matches!(
+        bus.route(transaction(CRIME, gbe)),
+        CrimeBusDisposition::QueuedAndNeedsService { .. }
+    ));
+    assert_eq!(
+        bus.route(transaction(gbe, CRIME)),
+        CrimeBusDisposition::Queued
+    );
+
+    let epoch = bus.epoch();
+    bus.handle_event(CrimeCgiBusEvent::Service { epoch });
+    let CrimeBusAction::Deliver {
+        target: first_target,
+        ..
+    } = bus.poll()
+    else {
+        panic!("first CGI request must be delivered");
+    };
+    assert_eq!(first_target, gbe);
+    let CrimeBusAction::ScheduleService { .. } = bus.poll() else {
+        panic!("second CGI request must be scheduled without waiting for completion");
+    };
+    let next = bus.next_scheduled_event().unwrap();
+    bus.handle_event(next);
+    assert!(matches!(
+        bus.poll(),
+        CrimeBusAction::Deliver {
+            target,
+            transaction: CrimeCgiTransaction { id, .. }
+        } if target == CRIME && id == CrimeTransactionId::new(5)
+    ));
+    assert_eq!(bus.in_flight.len(), 2);
+
+    let completion = || CrimeCgiCompletion {
+        id: CrimeTransactionId::new(5),
+        result: Ok(CrimeCompletionPayload::ReadData(vec![0; 4].into())),
+        memory_fault: None,
+    };
+    bus.accept_device_completion(CRIME, completion());
+    bus.accept_device_completion(gbe, completion());
+    assert_eq!(bus.in_flight.len(), 0);
+    assert_eq!(bus.pending_completions.len(), 2);
+}
+
+#[test]
+fn cgi_dma_cycle_count_includes_one_cycle_per_sixteen_data_bytes() {
+    use crate::chipset::crime::protocol::CrimeDmaRequest;
+
+    let mut bus = CrimeCgiBus::new(BUS, "CGI", 1_000_000_000);
+    let disposition = bus.route(CrimeCgiTransaction {
+        id: CrimeTransactionId::new(1),
+        controller: CRIME,
+        target: MACE,
+        operation: CrimeLinkOperation::Dma(CrimeDmaRequest {
+            address: 0,
+            transfer: CrimeTransfer::write(
+                vec![0; 512].into(),
+                crate::chipset::crime::protocol::CrimeByteEnable::enabled(512),
+            ),
+        }),
+    });
+    let CrimeBusDisposition::QueuedAndNeedsService { delay, .. } = disposition else {
+        panic!("an idle CGI bus must schedule service");
+    };
+    assert_eq!(delay.get(), 495);
+}

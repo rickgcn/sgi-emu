@@ -557,6 +557,154 @@ fn render_memory_fault_uses_the_miu_re_source_without_cpu_bus_error() {
 }
 
 #[test]
+fn diagnostic_x_line_reaches_the_crime_memory_domain() {
+    let mut crime = crime();
+    let render_base = registers::CRIME_RENDER_BASE;
+    retire_render_write(
+        &mut crime,
+        render_base + 0x1200,
+        8,
+        u64::from(0x8001_u16) << 48,
+    );
+    for (offset, value) in [
+        (0x2000, 0x0000_0628),
+        (0x2008, 0x0000_0628),
+        (0x2018, 0x0000_02f8),
+        (0x2060, 0x0100_0020),
+        (0x20d0, 0x1122_3344),
+        (0x21b0, 3),
+        (0x21b8, u32::MAX),
+        (0x2070, 0),
+        (0x2074, 7 << 16),
+    ] {
+        retire_render_write(&mut crime, render_base + offset, 4, value.into());
+    }
+
+    let progress = crime.render.write(render_base + 0x29f0, 4, 0).unwrap();
+    crime.apply_render_progress(progress).unwrap();
+    crime.handle_event(
+        SimTime::new(1),
+        CrimeEvent::RenderStep {
+            epoch: crime.render.epoch(),
+        },
+    );
+    let memory = crime
+        .actions
+        .iter()
+        .find_map(|action| match action {
+            CrimeAction::StartMemory(transaction) => Some(transaction),
+            _ => None,
+        })
+        .expect("the X line must issue a memory transaction");
+    assert_eq!(memory.client, CrimeMemoryClient::Render);
+    assert_eq!(memory.address, 0x1_0000);
+    assert_eq!(memory.bank_select, CrimeMemoryBankSelect::Decode);
+    assert!(!memory.no_ecc);
+    assert!(matches!(
+        memory.transfer.view(),
+        CrimeTransferView::Write { data, byte_enable }
+            if data == [0x11, 0x22, 0x33, 0x44].repeat(8)
+                && byte_enable.iter().all(|enabled| enabled)
+    ));
+    assert!(crime.terminal_error.is_none());
+}
+
+#[test]
+fn prom_ci8_zero_rectangle_reaches_the_crime_memory_domain() {
+    let mut crime = crime();
+    let render_base = registers::CRIME_RENDER_BASE;
+    retire_render_write(
+        &mut crime,
+        render_base + 0x1000,
+        8,
+        u64::from(0x8002_u16) << 48,
+    );
+    for (offset, value) in [
+        (0x20d0, 0),
+        (0x2018, 0x0000_00f8),
+        (0x21b8, u32::MAX),
+        (0x2070, 0),
+        (0x2074, 63 << 16 | 1),
+        (0x2060, 0x0302_0000),
+    ] {
+        retire_render_write(&mut crime, render_base + offset, 4, value.into());
+    }
+
+    let progress = crime.render.write(render_base + 0x29f0, 4, 0).unwrap();
+    crime.apply_render_progress(progress).unwrap();
+    crime.handle_event(
+        SimTime::new(1),
+        CrimeEvent::RenderStep {
+            epoch: crime.render.epoch(),
+        },
+    );
+    let memory = crime
+        .actions
+        .iter()
+        .find_map(|action| match action {
+            CrimeAction::StartMemory(transaction) => Some(transaction),
+            _ => None,
+        })
+        .expect("the PROM rectangle must issue a memory transaction");
+    assert_eq!(memory.client, CrimeMemoryClient::Render);
+    assert_eq!(memory.address, 0x2_0000);
+    assert_eq!(memory.bank_select, CrimeMemoryBankSelect::Decode);
+    assert!(!memory.no_ecc);
+    assert!(matches!(
+        memory.transfer.view(),
+        CrimeTransferView::Write { data, byte_enable }
+            if data == [0; 32] && byte_enable.iter().all(|enabled| enabled)
+    ));
+    assert!(crime.terminal_error.is_none());
+}
+
+#[test]
+fn prom_ci8_flat_rectangle_reaches_memory_with_the_color_index() {
+    let mut crime = crime();
+    let render_base = registers::CRIME_RENDER_BASE;
+    retire_render_write(
+        &mut crime,
+        render_base + 0x1000,
+        8,
+        u64::from(0x8002_u16) << 48,
+    );
+    for (offset, value) in [
+        (0x20d0, 0x7b7b_7b7b),
+        (0x2018, 0x0000_02f8),
+        (0x21b0, 3),
+        (0x21b8, u32::MAX),
+        (0x2070, 0),
+        (0x2074, 31 << 16),
+        (0x2060, 0x0302_0000),
+    ] {
+        retire_render_write(&mut crime, render_base + offset, 4, value.into());
+    }
+
+    let progress = crime.render.write(render_base + 0x29f0, 4, 0).unwrap();
+    crime.apply_render_progress(progress).unwrap();
+    crime.handle_event(
+        SimTime::new(1),
+        CrimeEvent::RenderStep {
+            epoch: crime.render.epoch(),
+        },
+    );
+    let memory = crime
+        .actions
+        .iter()
+        .find_map(|action| match action {
+            CrimeAction::StartMemory(transaction) => Some(transaction),
+            _ => None,
+        })
+        .expect("the PROM flat rectangle must issue a memory transaction");
+    assert!(matches!(
+        memory.transfer.view(),
+        CrimeTransferView::Write { data, byte_enable }
+            if data == [0x7b; 32] && byte_enable.iter().all(|enabled| enabled)
+    ));
+    assert!(crime.terminal_error.is_none());
+}
+
+#[test]
 fn prom_linear_tlb_sequence_completes_through_miu_faults() {
     let config = CrimeConfig::default();
     let mut crime = Crime::new(CRIME, "CRIME", config, TIMEBASE_HZ, RAM, MACE, GBE).unwrap();

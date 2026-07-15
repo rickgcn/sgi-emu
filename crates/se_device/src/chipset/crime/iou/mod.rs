@@ -1,6 +1,6 @@
 //! CRIME CMI and CGI communication domains.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use se_core::component::{Component, ComponentId};
 use se_core::role::BusRole;
@@ -8,7 +8,7 @@ use se_core::role::BusRole;
 use super::clock::CrimeClock;
 use super::protocol::{
     CrimeBusAction, CrimeBusDisposition, CrimeCgiCompletion, CrimeCgiTransaction,
-    CrimeCmiCompletion, CrimeCmiTransaction,
+    CrimeCmiCompletion, CrimeCmiTransaction, CrimeLinkOperation, CrimeTransactionId,
 };
 
 /// Scheduled CMI bus event.
@@ -40,6 +40,12 @@ pub enum CrimeCgiBusEvent {
     Complete {
         /// Reset epoch.
         epoch: u64,
+
+        /// Component that accepted the matching request.
+        target: ComponentId,
+
+        /// Transaction identifier scoped by `target`.
+        id: CrimeTransactionId,
     },
 }
 
@@ -294,7 +300,15 @@ impl BusRole<CrimeCmiTransaction> for CrimeCmiBus {
 pub struct CrimeCgiBus {
     id: ComponentId,
     name: String,
-    inner: LinkBus<CrimeCgiTransaction, CrimeCgiCompletion>,
+    clock: CrimeClock,
+    epoch: u64,
+    service_scheduled: bool,
+    queue: VecDeque<CrimeCgiTransaction>,
+    in_flight: BTreeMap<(ComponentId, CrimeTransactionId), CrimeCgiTransaction>,
+    pending_completions:
+        BTreeMap<(ComponentId, CrimeTransactionId), (ComponentId, CrimeCgiCompletion)>,
+    scheduled_events: VecDeque<CrimeCgiBusEvent>,
+    actions: VecDeque<CrimeBusAction<CrimeCgiTransaction, CrimeCgiCompletion>>,
 }
 
 crate::component_state!(CrimeCgiBusState, CrimeCgiBus);
@@ -305,61 +319,141 @@ impl CrimeCgiBus {
         Self {
             id,
             name: name.into(),
-            inner: LinkBus::new(timebase_hz),
+            clock: CrimeClock::new(timebase_hz),
+            epoch: 0,
+            service_scheduled: false,
+            queue: VecDeque::new(),
+            in_flight: BTreeMap::new(),
+            pending_completions: BTreeMap::new(),
+            scheduled_events: VecDeque::new(),
+            actions: VecDeque::new(),
         }
     }
 
     /// Handles a scheduled CGI event.
     pub fn handle_event(&mut self, event: CrimeCgiBusEvent) {
         let epoch = match event {
-            CrimeCgiBusEvent::Service { epoch } | CrimeCgiBusEvent::Complete { epoch } => epoch,
+            CrimeCgiBusEvent::Service { epoch } | CrimeCgiBusEvent::Complete { epoch, .. } => epoch,
         };
-        if epoch != self.inner.epoch {
+        if epoch != self.epoch {
             return;
         }
         match event {
-            CrimeCgiBusEvent::Service { .. } => {
-                self.inner.service(|transaction| transaction.target)
-            }
-            CrimeCgiBusEvent::Complete { .. } => self.inner.publish_completion(),
+            CrimeCgiBusEvent::Service { .. } => self.service(),
+            CrimeCgiBusEvent::Complete { target, id, .. } => self.publish_completion(target, id),
         }
     }
 
     /// Accepts a CGI target response.
-    pub fn accept_device_completion(&mut self, completion: CrimeCgiCompletion) {
-        self.inner.accept_completion(
-            completion,
-            |transaction, completion| transaction.id == completion.id,
-            |transaction| transaction.controller,
-        );
+    pub fn accept_device_completion(
+        &mut self,
+        target: ComponentId,
+        completion: CrimeCgiCompletion,
+    ) {
+        let key = (target, completion.id);
+        let Some(transaction) = self.in_flight.remove(&key) else {
+            return;
+        };
+        let controller = transaction.controller;
+        let delay = self
+            .clock
+            .advance_cycles(cgi_completion_cycles(&transaction));
+        self.pending_completions
+            .insert(key, (controller, completion));
+        let event = CrimeCgiBusEvent::Complete {
+            epoch: self.epoch,
+            target,
+            id: transaction.id,
+        };
+        self.scheduled_events.push_back(event);
+        self.actions
+            .push_back(CrimeBusAction::ScheduleService { delay });
     }
 
     /// Polls one CGI action.
     pub fn poll(&mut self) -> CrimeBusAction<CrimeCgiTransaction, CrimeCgiCompletion> {
-        self.inner.poll()
+        self.actions.pop_front().unwrap_or(CrimeBusAction::Idle)
     }
 
     /// Returns the active reset epoch.
     pub const fn epoch(&self) -> u64 {
-        self.inner.epoch
+        self.epoch
     }
 
-    /// Returns the event corresponding to the latest scheduling action.
-    pub const fn next_scheduled_event(&self) -> CrimeCgiBusEvent {
-        if self.inner.pending_completion.is_some() {
-            CrimeCgiBusEvent::Complete {
-                epoch: self.inner.epoch,
-            }
-        } else {
-            CrimeCgiBusEvent::Service {
-                epoch: self.inner.epoch,
-            }
-        }
+    /// Removes the event corresponding to the oldest scheduling action.
+    pub fn next_scheduled_event(&mut self) -> Option<CrimeCgiBusEvent> {
+        self.scheduled_events.pop_front()
     }
 
     /// Cancels all CGI work and advances its epoch.
     pub fn hard_reset(&mut self) {
-        self.inner.reset();
+        self.reset_state();
+    }
+
+    fn reset_state(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.clock.reset();
+        self.service_scheduled = false;
+        self.queue.clear();
+        self.in_flight.clear();
+        self.pending_completions.clear();
+        self.scheduled_events.clear();
+        self.actions.clear();
+    }
+
+    fn schedule_service(&mut self) -> CrimeBusDisposition {
+        if self.service_scheduled {
+            return CrimeBusDisposition::Queued;
+        }
+        let Some(transaction) = self.queue.front() else {
+            return CrimeBusDisposition::Queued;
+        };
+        self.service_scheduled = true;
+        let delay = self.clock.advance_cycles(cgi_request_cycles(transaction));
+        CrimeBusDisposition::QueuedAndNeedsService {
+            delay,
+            epoch: self.epoch,
+        }
+    }
+
+    fn service(&mut self) {
+        self.service_scheduled = false;
+        let Some(transaction) = self.queue.pop_front() else {
+            return;
+        };
+        let key = (transaction.target, transaction.id);
+        if self.in_flight.contains_key(&key) {
+            self.queue.push_front(transaction);
+            return;
+        }
+        let target = transaction.target;
+        self.in_flight.insert(key, transaction.clone());
+        self.actions.push_back(CrimeBusAction::Deliver {
+            target,
+            transaction,
+        });
+        if !self.queue.is_empty() {
+            self.service_scheduled = true;
+            let delay = self.clock.advance_cycles(cgi_request_cycles(
+                self.queue
+                    .front()
+                    .expect("a nonempty CGI queue must have a front transaction"),
+            ));
+            self.scheduled_events
+                .push_back(CrimeCgiBusEvent::Service { epoch: self.epoch });
+            self.actions
+                .push_back(CrimeBusAction::ScheduleService { delay });
+        }
+    }
+
+    fn publish_completion(&mut self, target: ComponentId, id: CrimeTransactionId) {
+        let Some((controller, completion)) = self.pending_completions.remove(&(target, id)) else {
+            return;
+        };
+        self.actions.push_back(CrimeBusAction::Complete {
+            controller,
+            completion,
+        });
     }
 }
 
@@ -373,7 +467,7 @@ impl Component for CrimeCgiBus {
     }
 
     fn reset(&mut self) {
-        self.inner.reset();
+        self.reset_state();
     }
 }
 
@@ -381,7 +475,40 @@ impl BusRole<CrimeCgiTransaction> for CrimeCgiBus {
     type Response = CrimeBusDisposition;
 
     fn route(&mut self, transaction: CrimeCgiTransaction) -> Self::Response {
-        self.inner.route(transaction)
+        self.queue.push_back(transaction);
+        self.schedule_service()
+    }
+}
+
+fn cgi_request_cycles(transaction: &CrimeCgiTransaction) -> u64 {
+    match &transaction.operation {
+        CrimeLinkOperation::Dma(request)
+            if matches!(
+                request.transfer.view(),
+                crate::chipset::crime::protocol::CrimeTransferView::Write { .. }
+            ) =>
+        {
+            1 + (request.transfer.length() as u64).div_ceil(16)
+        }
+        CrimeLinkOperation::Pio(_)
+        | CrimeLinkOperation::Dma(_)
+        | CrimeLinkOperation::InterruptPost(_) => 1,
+    }
+}
+
+fn cgi_completion_cycles(transaction: &CrimeCgiTransaction) -> u64 {
+    match &transaction.operation {
+        CrimeLinkOperation::Dma(request)
+            if matches!(
+                request.transfer.view(),
+                crate::chipset::crime::protocol::CrimeTransferView::Read { .. }
+            ) =>
+        {
+            1 + (request.transfer.length() as u64).div_ceil(16)
+        }
+        CrimeLinkOperation::Pio(_)
+        | CrimeLinkOperation::Dma(_)
+        | CrimeLinkOperation::InterruptPost(_) => 1,
     }
 }
 
