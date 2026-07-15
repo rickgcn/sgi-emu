@@ -21,6 +21,7 @@ use se_device::chipset::mace::config::{MaceConfig, MacePortConfig};
 use se_device::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
 use se_device::cpu::mips4::model::r5000::cpu::R5000CpuState;
 use se_device::cpu::mips4::model::r5000::profile::R5000Profile;
+use se_device::input::ps2::{Ps2KeyboardState, Ps2MouseState};
 use se_device::memory::ds2502::{Ds2502Config, Ds2502State};
 use se_device::memory::flash::{SystemFlashState, SystemFlashStateError};
 use se_device::parallel::ieee1284::Ieee1284State;
@@ -33,7 +34,7 @@ use super::event::{Ip32Event, Ip32HostOutput};
 use super::timing::IP32_TIMEBASE_HZ;
 
 /// Current IP32 serialized-state schema.
-pub const IP32_STATE_SCHEMA_VERSION: u32 = 4;
+pub const IP32_STATE_SCHEMA_VERSION: u32 = 5;
 
 /// Construction settings that do not contain PROM or battery-backed bytes.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -184,6 +185,7 @@ pub struct Ip32MachineState {
     pub(super) mace_irq: IrqBusState,
     pub(super) one_wire: OneWireBusState,
     pub(super) gbe_ddc: [TwoWireBusState; 2],
+    pub(super) ps2_buses: [TwoWireBusState; 2],
     pub(super) crime: CrimeState,
     pub(super) memory_bus: CrimeMemoryBusState,
     pub(super) cmi: CrimeCmiBusState,
@@ -194,6 +196,8 @@ pub struct Ip32MachineState {
     pub(super) i2c: [I2cBusState; 2],
     pub(super) media: MediaBusState,
     pub(super) mace: MaceState,
+    pub(super) keyboard: Ps2KeyboardState,
+    pub(super) mouse: Ps2MouseState,
     pub(super) gbe: GbeState,
     pub(super) vice: Ip32StubEndpointState,
     pub(super) system_flash: SystemFlashState,
@@ -353,14 +357,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_three_state_is_explicitly_rejected() {
+    fn schema_four_state_is_explicitly_rejected() {
         let config = Ip32MachineConfig::default();
         let machine = Ip32Machine::from_config(config.clone()).unwrap();
         let mut state = machine.save_state().unwrap();
-        state.schema_version = 3;
+        state.schema_version = 4;
         assert!(matches!(
             Ip32Machine::from_state_with_trace_sink(config, state, se_core::tracing::NoopTraceSink,),
-            Err(Ip32StateError::UnsupportedSchema { version: 3 })
+            Err(Ip32StateError::UnsupportedSchema { version: 4 })
         ));
     }
 

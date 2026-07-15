@@ -19,6 +19,7 @@ use se_device::chipset::gbe::Gbe;
 use se_device::chipset::gbe::protocol::{GbeExternalClock, GbeExternalInput};
 use se_device::chipset::mace::Mace;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
+use se_device::input::ps2::{Ps2Keyboard, Ps2Mouse};
 use se_device::memory::ds2502::Ds2502;
 use se_device::memory::flash::SystemFlash;
 use se_device::rtc::ds1687::Ds1687;
@@ -138,6 +139,10 @@ fn assert_machine_architecture_equal<A, B>(reference: &Ip32Machine<A>, optimized
     assert_component_eq!(OneWireBus, component_ids::ONE_WIRE_BUS);
     assert_component_eq!(TwoWireBus, component_ids::GBE_CRT_DDC_BUS);
     assert_component_eq!(TwoWireBus, component_ids::GBE_FLAT_PANEL_DDC_BUS);
+    assert_component_eq!(TwoWireBus, component_ids::KEYBOARD_PS2_BUS);
+    assert_component_eq!(TwoWireBus, component_ids::MOUSE_PS2_BUS);
+    assert_component_eq!(Ps2Keyboard, component_ids::KEYBOARD);
+    assert_component_eq!(Ps2Mouse, component_ids::MOUSE);
     assert_component_eq!(Gbe, component_ids::GBE);
     assert_component_eq!(Ds2502, component_ids::NIC_IDENTITY);
     assert_component_eq!(SystemFlash, component_ids::PROM);
@@ -771,7 +776,7 @@ fn host_input_reservations_enforce_configured_capacity() {
     config.mace.ports.byte_stream_bytes = 1;
     let mut machine = Ip32Machine::from_config(config).unwrap();
     let input = Ip32HostInput {
-        port: MediaPort::Keyboard,
+        port: MediaPort::Serial0,
         payload: MediaPayload::Bytes(vec![0xaa]),
     };
     machine
@@ -779,8 +784,25 @@ fn host_input_reservations_enforce_configured_capacity() {
         .unwrap();
     assert_eq!(
         machine.schedule_host_input(SimTime::new(2), input),
-        Err(Ip32HostInputError::QueueFull(MediaPort::Keyboard))
+        Err(Ip32HostInputError::QueueFull(MediaPort::Serial0))
     );
+}
+
+#[test]
+fn keyboard_and_mouse_reject_legacy_byte_injection() {
+    let mut machine = Ip32Machine::from_config(Ip32MachineConfig::default()).unwrap();
+    for port in [MediaPort::Keyboard, MediaPort::Mouse] {
+        assert_eq!(
+            machine.schedule_host_input(
+                SimTime::ZERO,
+                Ip32HostInput {
+                    port,
+                    payload: MediaPayload::Bytes(vec![0xaa]),
+                },
+            ),
+            Err(Ip32HostInputError::UnsupportedPort(port))
+        );
+    }
 }
 
 #[test]
@@ -1001,7 +1023,7 @@ fn construction_registers_the_role_oriented_ip32_topology() {
     let machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
     let registry = machine.runtime().registry();
 
-    assert_eq!(registry.len(), 27);
+    assert_eq!(registry.len(), 31);
     assert!(registry.get_typed::<R5000Cpu>(component_ids::CPU0).is_ok());
     assert!(
         registry
@@ -1052,6 +1074,22 @@ fn construction_registers_the_role_oriented_ip32_topology() {
             .get_typed::<TwoWireBus>(component_ids::GBE_FLAT_PANEL_DDC_BUS)
             .is_ok()
     );
+    assert!(
+        registry
+            .get_typed::<TwoWireBus>(component_ids::KEYBOARD_PS2_BUS)
+            .is_ok()
+    );
+    assert!(
+        registry
+            .get_typed::<TwoWireBus>(component_ids::MOUSE_PS2_BUS)
+            .is_ok()
+    );
+    assert!(
+        registry
+            .get_typed::<Ps2Keyboard>(component_ids::KEYBOARD)
+            .is_ok()
+    );
+    assert!(registry.get_typed::<Ps2Mouse>(component_ids::MOUSE).is_ok());
     assert!(
         registry
             .get_typed::<Ip32StubEndpoint>(component_ids::VICE)
@@ -1189,7 +1227,7 @@ fn cpu_prom_and_ram_accesses_cross_all_required_buses() {
     machine.schedule_power_on().unwrap();
     assert_eq!(
         machine.run_until_time(SimTime::new(1_000_000)).unwrap(),
-        RunStatus::Idle
+        RunStatus::DeadlineReached
     );
 
     let cpu = machine
@@ -1245,11 +1283,11 @@ fn inline_cpu_continuation_matches_single_step_reference_execution() {
 
     assert_eq!(
         reference.run_until_time(SimTime::new(1_000_000)).unwrap(),
-        RunStatus::Idle
+        RunStatus::DeadlineReached
     );
     assert_eq!(
         optimized.run_until_time(SimTime::new(1_000_000)).unwrap(),
-        RunStatus::Idle
+        RunStatus::DeadlineReached
     );
     assert_machine_architecture_equal(&reference, &optimized);
     assert_eq!(
@@ -1275,7 +1313,7 @@ fn fusion_budget_materializes_the_next_logical_transition() {
     assert!(machine.runtime().scheduler().peek_next_time().is_some());
     assert_eq!(
         machine.run_until_time(SimTime::new(1_000_000)).unwrap(),
-        RunStatus::Idle
+        RunStatus::DeadlineReached
     );
 }
 
@@ -1450,7 +1488,7 @@ fn synthetic_prom_clears_linear_a_range_through_the_render_memory_client() {
     machine.schedule_power_on().unwrap();
     assert_eq!(
         machine.run_until_time(SimTime::new(1_000_000)).unwrap(),
-        RunStatus::Idle
+        RunStatus::DeadlineReached
     );
 
     let cpu = machine
@@ -1975,8 +2013,6 @@ fn local_ip32_prom_reaches_gbe_display_output() {
     let mut events = 0;
     let mut last_frame = None;
     let mut terminal = Vec::new();
-    let mut keyboard_output = Vec::new();
-    let mut keyboard_parameter_pending = false;
     let diagnostic_frame_limit = std::env::var("IP32_PROM_DISPLAY_DIAGNOSTIC_FRAMES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
@@ -1985,55 +2021,6 @@ fn local_ip32_prom_reaches_gbe_display_output() {
         let status = machine.run_steps(batch).unwrap();
         events += batch;
         drain_serial_one(&mut machine, &mut terminal);
-        let mut enable_render_trace = false;
-        while let Some(output) = machine.poll_host_output() {
-            if output.port == MediaPort::Keyboard
-                && let MediaPayload::Bytes(bytes) = output.payload
-            {
-                for byte in bytes {
-                    keyboard_output.push(byte);
-                    enable_render_trace |= byte == 0xf4;
-                    let replies: &[u8] = if keyboard_parameter_pending {
-                        keyboard_parameter_pending = false;
-                        &[0xfa]
-                    } else {
-                        match byte {
-                            0xed | 0xf0 | 0xf3 => {
-                                keyboard_parameter_pending = true;
-                                &[0xfa]
-                            }
-                            0xee => &[0xee],
-                            0xf2 => &[0xfa, 0xab, 0x83],
-                            0xff => &[0xfa, 0xaa],
-                            _ => &[0xfa],
-                        }
-                    };
-                    let now = machine.runtime().now().get();
-                    for (index, reply) in replies.iter().copied().enumerate() {
-                        machine
-                            .schedule_host_input(
-                                SimTime::new(
-                                    now.saturating_add(
-                                        (index as u64 + 1) * IP32_TIMEBASE_HZ / 1_000,
-                                    ),
-                                ),
-                                Ip32HostInput {
-                                    port: MediaPort::Keyboard,
-                                    payload: MediaPayload::Bytes(vec![reply]),
-                                },
-                            )
-                            .unwrap();
-                    }
-                }
-            }
-        }
-        if enable_render_trace {
-            machine
-                .runtime_mut()
-                .trace_recorder_mut()
-                .sink_mut()
-                .capture_render = true;
-        }
         if let Some(frame) = machine.take_display_frame() {
             assert!(frame.width != 0 && frame.height != 0);
             let has_visible_pixel = frame
@@ -2134,7 +2121,85 @@ fn local_ip32_prom_reaches_gbe_display_output() {
         }
     }
     panic!(
-        "the PROM did not publish a non-black GBE frame within {max_events} events; last_frame={last_frame:?}; dma_events={dma_events:?}; render_writes={render_writes:016x?}; keyboard_output={keyboard_output:02x?}; terminal={terminal:?}; tile_pages={tile_pages:04x?}; nonzero_tiles={nonzero_tiles:04x?}; time={time:?}; PERFORMANCE={performance:#?}; PC={pc:#018x}; GPR={gpr:#018x?}; CODE_ADDRESS={code_address:#010x}; CODE={code:02x?}; CTRLSTAT={control_status:#010x}; DOTCLOCK={dot_clock:#010x}; VT_XY={vt_xy:#010x}; VT_XY_MAX={vt_xy_max:#010x}; VT_INTR01={vt_intr01:#010x}; VT_INTR23={vt_intr23:#010x}; VT_HPIXEN={vt_hpixen:#010x}; VT_VPIXEN={vt_vpixen:#010x}; FRM_0={frame_size_tile:#010x}; FRM_1={frame_size_pixel:#010x}; FRM_2={frame_active:#010x}; FRM_3={frame_shadow:#010x}; DID={did_active:#010x}; WID_0={wid_zero:#010x}; CMAP_0={color_zero:#010x}; CMAP_1={color_one:#010x}; GMAP_0={gamma_zero:#010x}; GMAP_1={gamma_one:#010x}; GMAP_255={gamma_max:#010x}"
+        "the PROM did not publish a non-black GBE frame within {max_events} events; last_frame={last_frame:?}; dma_events={dma_events:?}; render_writes={render_writes:016x?}; terminal={terminal:?}; tile_pages={tile_pages:04x?}; nonzero_tiles={nonzero_tiles:04x?}; time={time:?}; PERFORMANCE={performance:#?}; PC={pc:#018x}; GPR={gpr:#018x?}; CODE_ADDRESS={code_address:#010x}; CODE={code:02x?}; CTRLSTAT={control_status:#010x}; DOTCLOCK={dot_clock:#010x}; VT_XY={vt_xy:#010x}; VT_XY_MAX={vt_xy_max:#010x}; VT_INTR01={vt_intr01:#010x}; VT_INTR23={vt_intr23:#010x}; VT_HPIXEN={vt_hpixen:#010x}; VT_VPIXEN={vt_vpixen:#010x}; FRM_0={frame_size_tile:#010x}; FRM_1={frame_size_pixel:#010x}; FRM_2={frame_active:#010x}; FRM_3={frame_shadow:#010x}; DID={did_active:#010x}; WID_0={wid_zero:#010x}; CMAP_0={color_zero:#010x}; CMAP_1={color_one:#010x}; GMAP_0={gamma_zero:#010x}; GMAP_1={gamma_one:#010x}; GMAP_255={gamma_max:#010x}"
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+#[ignore = "requires a local proprietary IP32 PROM image"]
+fn local_ip32_prom_initializes_classic_ps2_keyboard() {
+    use se_device::chipset::crime::{CrimeError, render::CrimeRenderError};
+    use se_runtime::runtime::RunError;
+
+    let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
+    let config = Ip32MachineConfig {
+        prom_image: std::fs::read(&path).expect("the local PROM image must be readable"),
+        jit_enabled: true,
+        ..Ip32MachineConfig::default()
+    };
+    let mut machine = Ip32Machine::from_config(config).unwrap();
+    machine.schedule_power_on().unwrap();
+    machine
+        .schedule_gbe_external_input(SimTime::ZERO, GbeExternalInput::SenseN(false))
+        .unwrap();
+    machine
+        .schedule_gbe_external_input(
+            SimTime::ZERO,
+            GbeExternalInput::PixelClock {
+                source: GbeExternalClock::Ttl,
+                numerator_hz: 20_000_000,
+                denominator: 1,
+            },
+        )
+        .unwrap();
+    let max_events = std::env::var("IP32_PROM_INPUT_EVENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20_000_000);
+    let mut terminal = Vec::new();
+    let mut events = 0;
+    while events < max_events {
+        let batch = (max_events - events).min(4_096);
+        match machine.run_steps(batch) {
+            Ok(RunStatus::Idle | RunStatus::Stopped) => {
+                panic!("PROM became inactive before PS/2 initialization: {path}")
+            }
+            Ok(_) => {}
+            Err(RunError::Dispatch(Ip32MachineDispatchError::Crime(CrimeError::Render(
+                CrimeRenderError::UnsupportedPixelCommand {
+                    primitive: 0x0100_0020,
+                    draw_mode: 0x0008_02f8,
+                    ..
+                },
+            )))) => break,
+            Err(error) => panic!("PROM failed before PS/2 initialization: {error}"),
+        }
+        events += batch;
+        drain_serial_one(&mut machine, &mut terminal);
+        let registry = machine.runtime().registry();
+        let keyboard = registry
+            .get_typed::<Ps2Keyboard>(component_ids::KEYBOARD)
+            .unwrap();
+        if keyboard.scan_set() == 3 {
+            break;
+        }
+    }
+
+    drain_serial_one(&mut machine, &mut terminal);
+    let terminal = String::from_utf8_lossy(&terminal);
+    assert!(
+        !terminal.contains("Cannot connect to keyboard -- check the cable."),
+        "PROM reported a disconnected keyboard: {terminal}"
+    );
+    let registry = machine.runtime().registry();
+    assert_eq!(
+        registry
+            .get_typed::<Ps2Keyboard>(component_ids::KEYBOARD)
+            .unwrap()
+            .scan_set(),
+        3,
+        "PROM did not select keyboard scan-code set 3: {path}"
     );
 }
 

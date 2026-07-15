@@ -42,6 +42,8 @@ fn bus_component_ids_are_present_and_distinct() {
             ONE_WIRE_BUS,
             GBE_CRT_DDC_BUS,
             GBE_FLAT_PANEL_DDC_BUS,
+            KEYBOARD_PS2_BUS,
+            MOUSE_PS2_BUS,
         ]
     );
 

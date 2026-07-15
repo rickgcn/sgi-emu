@@ -10,6 +10,7 @@ use se_device::chipset::crime::memory::bus::CrimeMemoryBusEvent;
 use se_device::chipset::crime::protocol::CrimeEvent;
 use se_device::chipset::gbe::protocol::{GbeEvent, GbeExternalInput};
 use se_device::chipset::mace::protocol::MaceEvent;
+use se_device::input::ps2::{Ps2KeyboardEvent, Ps2KeyboardInput, Ps2MouseEvent, Ps2MouseInput};
 use se_device::memory::ds2502::Ds2502Event;
 use se_device::serial::uart16550::Uart16550Event;
 
@@ -54,6 +55,12 @@ pub enum Ip32Event {
     /// MACE-internal event.
     Mace(MaceEvent),
 
+    /// Keyboard-internal serial or timing transition.
+    Keyboard(Ps2KeyboardEvent),
+
+    /// Mouse-internal serial or timing transition.
+    Mouse(Ps2MouseEvent),
+
     /// Board-identity DS2502 transition.
     Ds2502(Ds2502Event),
 
@@ -80,6 +87,20 @@ pub enum Ip32Event {
         generation: u64,
         input: Ip32HostInput,
     },
+
+    /// Deterministic physical keyboard or mouse input.
+    Input {
+        generation: u64,
+        input: Ip32InputEvent,
+    },
+}
+
+/// Physical input accepted by the IP32 keyboard and mouse devices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum Ip32InputEvent {
+    Keyboard(Ps2KeyboardInput),
+    Mouse(Ps2MouseInput),
+    ReleaseAll,
 }
 
 /// Physical serial connectors exposed by the IP32 profile.

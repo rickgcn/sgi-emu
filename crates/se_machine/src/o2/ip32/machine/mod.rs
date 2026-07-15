@@ -84,6 +84,10 @@ use se_device::cpu::mips4::model::r5000::cpu::{
 };
 use se_device::cpu::mips4::model::r5000::profile::R5000Profile;
 use se_device::cpu::mips4::model::r5000::revision::R5000Revision;
+use se_device::input::ps2::{
+    Ps2DeviceBuildError, Ps2Keyboard, Ps2KeyboardAction, Ps2KeyboardError, Ps2KeyboardPoll,
+    Ps2Mouse, Ps2MouseAction, Ps2MouseError, Ps2MousePoll, Ps2Wiring,
+};
 use se_device::memory::ds2502::{Ds2502, Ds2502Action, Ds2502Config, Ds2502Error};
 use se_device::memory::flash::{SystemFlash, SystemFlashPersistentState, SystemFlashStateError};
 use se_device::parallel::ieee1284::{IEEE1284_IRQ_OUTPUT, Ieee1284, Ieee1284Action};
@@ -117,7 +121,8 @@ use super::component_ids;
 use super::dispatch::LogicalTransition;
 use super::dispatch::{Ip32DispatchContext, Ip32EventChainPolicy};
 use super::event::{
-    Ip32Event, Ip32HostInput, Ip32HostIoStats, Ip32HostOutput, Ip32SerialOutput, Ip32SerialPort,
+    Ip32Event, Ip32HostInput, Ip32HostIoStats, Ip32HostOutput, Ip32InputEvent, Ip32SerialOutput,
+    Ip32SerialPort,
 };
 use super::state::{
     IP32_STATE_SCHEMA_VERSION, Ip32MachineState, Ip32PersistentConfig, Ip32StateError,
@@ -209,6 +214,9 @@ pub enum Ip32MachineBuildError {
     /// MACE configuration is invalid.
     Mace(MaceError),
 
+    /// A PS/2 input device configuration is invalid.
+    Ps2(Ps2DeviceBuildError),
+
     /// RTC configuration is invalid.
     Rtc(Ds1687Error),
 
@@ -224,7 +232,7 @@ pub enum Ip32MachineBuildError {
     /// The board-identity 1-Wire topology is invalid.
     OneWireBus(OneWireBusBuildError),
 
-    /// A GBE DDC bus topology is invalid.
+    /// An open-drain two-wire bus topology is invalid.
     TwoWireBus(TwoWireBusBuildError),
 
     /// PROM image does not have the fixed hardware size.
@@ -258,6 +266,7 @@ impl fmt::Display for Ip32MachineBuildError {
             }
             Self::Crime(error) => write!(f, "failed to construct CRIME: {error}"),
             Self::Mace(error) => write!(f, "failed to construct MACE: {error}"),
+            Self::Ps2(error) => write!(f, "failed to construct PS/2 input: {error}"),
             Self::Rtc(error) => write!(f, "failed to construct DS1687: {error}"),
             Self::NicIdentity(error) => write!(f, "failed to construct DS2502: {error}"),
             Self::Uart(error) => write!(f, "failed to construct IP32 UART: {error}"),
@@ -266,7 +275,7 @@ impl fmt::Display for Ip32MachineBuildError {
                 write!(f, "failed to construct IP32 1-Wire bus: {error}")
             }
             Self::TwoWireBus(error) => {
-                write!(f, "failed to construct IP32 GBE DDC bus: {error}")
+                write!(f, "failed to construct IP32 two-wire bus: {error}")
             }
             Self::InvalidPromSize { size_bytes } => {
                 write!(f, "invalid IP32 PROM size: {size_bytes} bytes")
@@ -300,6 +309,12 @@ pub enum Ip32MachineDispatchError {
     /// MACE reported an internal protocol error.
     Mace(MaceError),
 
+    /// The keyboard rejected a routed line transition.
+    Keyboard(Ps2KeyboardError),
+
+    /// The mouse rejected a routed line transition.
+    Mouse(Ps2MouseError),
+
     /// A UART rejected host data.
     Uart(Uart16550Error),
 
@@ -309,7 +324,7 @@ pub enum Ip32MachineDispatchError {
     /// The 1-Wire bus rejected a source transition.
     OneWireBus(OneWireBusRouteError),
 
-    /// A GBE DDC bus rejected a source transition.
+    /// An open-drain two-wire bus rejected a source transition.
     TwoWireBus(TwoWireBusRouteError),
 
     /// The R5000 rejected an IRQ bus delivery.
@@ -331,6 +346,7 @@ pub enum Ip32MachineDispatchError {
 /// Error returned while scheduling deterministic host input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Ip32HostInputError {
+    UnsupportedPort(se_device::bus::media::MediaPort),
     QueueFull(se_device::bus::media::MediaPort),
     Scheduler(SchedulerError),
 }
@@ -338,6 +354,12 @@ pub enum Ip32HostInputError {
 impl fmt::Display for Ip32HostInputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedPort(port) => {
+                write!(
+                    formatter,
+                    "IP32 host byte injection is unsupported for {port:?}"
+                )
+            }
             Self::QueueFull(port) => write!(formatter, "IP32 host input queue is full: {port:?}"),
             Self::Scheduler(error) => {
                 write!(formatter, "failed to schedule IP32 host input: {error}")
@@ -361,10 +383,12 @@ impl fmt::Display for Ip32MachineDispatchError {
             Self::Cpu(error) => write!(f, "IP32 CPU execution failed: {error}"),
             Self::Crime(error) => write!(f, "CRIME dispatch failed: {error}"),
             Self::Mace(error) => write!(f, "MACE dispatch failed: {error}"),
+            Self::Keyboard(error) => write!(f, "PS/2 keyboard dispatch failed: {error}"),
+            Self::Mouse(error) => write!(f, "PS/2 mouse dispatch failed: {error}"),
             Self::Uart(error) => write!(f, "IP32 UART dispatch failed: {error}"),
             Self::IrqBus(error) => write!(f, "IP32 IRQ routing failed: {error}"),
             Self::OneWireBus(error) => write!(f, "IP32 1-Wire routing failed: {error}"),
-            Self::TwoWireBus(error) => write!(f, "IP32 GBE DDC routing failed: {error}"),
+            Self::TwoWireBus(error) => write!(f, "IP32 two-wire routing failed: {error}"),
             Self::CpuIrq(error) => write!(f, "IP32 CPU IRQ delivery failed: {error}"),
             Self::Scheduler(error) => write!(f, "IP32 event scheduling failed: {error}"),
             Self::EventChain(error) => write!(f, "IP32 event chain failed: {error}"),
@@ -399,6 +423,18 @@ impl From<CrimeError> for Ip32MachineDispatchError {
 impl From<MaceError> for Ip32MachineDispatchError {
     fn from(error: MaceError) -> Self {
         Self::Mace(error)
+    }
+}
+
+impl From<Ps2KeyboardError> for Ip32MachineDispatchError {
+    fn from(error: Ps2KeyboardError) -> Self {
+        Self::Keyboard(error)
+    }
+}
+
+impl From<Ps2MouseError> for Ip32MachineDispatchError {
+    fn from(error: Ps2MouseError) -> Self {
+        Self::Mouse(error)
     }
 }
 
@@ -1084,6 +1120,9 @@ struct HotComponentSlots {
     parallel: ComponentSlot<Ieee1284>,
     one_wire: ComponentSlot<OneWireBus>,
     gbe_ddc: [ComponentSlot<TwoWireBus>; 2],
+    ps2_buses: [ComponentSlot<TwoWireBus>; 2],
+    keyboard: ComponentSlot<Ps2Keyboard>,
+    mouse: ComponentSlot<Ps2Mouse>,
     nic_identity: ComponentSlot<Ds2502>,
 }
 
@@ -1112,6 +1151,12 @@ impl HotComponentSlots {
                 registry.resolve(component_ids::GBE_CRT_DDC_BUS)?,
                 registry.resolve(component_ids::GBE_FLAT_PANEL_DDC_BUS)?,
             ],
+            ps2_buses: [
+                registry.resolve(component_ids::KEYBOARD_PS2_BUS)?,
+                registry.resolve(component_ids::MOUSE_PS2_BUS)?,
+            ],
+            keyboard: registry.resolve(component_ids::KEYBOARD)?,
+            mouse: registry.resolve(component_ids::MOUSE)?,
             nic_identity: registry.resolve(component_ids::NIC_IDENTITY)?,
         })
     }
@@ -1360,6 +1405,38 @@ impl<S> Ip32Machine<S> {
             [component_ids::GBE],
         )
         .map_err(Ip32MachineBuildError::TwoWireBus)?;
+        let keyboard_ps2_bus = TwoWireBus::new(
+            component_ids::KEYBOARD_PS2_BUS,
+            "MACE keyboard PS/2 bus",
+            [component_ids::MACE, component_ids::KEYBOARD],
+        )
+        .map_err(Ip32MachineBuildError::TwoWireBus)?;
+        let mouse_ps2_bus = TwoWireBus::new(
+            component_ids::MOUSE_PS2_BUS,
+            "MACE mouse PS/2 bus",
+            [component_ids::MACE, component_ids::MOUSE],
+        )
+        .map_err(Ip32MachineBuildError::TwoWireBus)?;
+        let keyboard = Ps2Keyboard::new(
+            component_ids::KEYBOARD,
+            "IBM enhanced PS/2 keyboard",
+            Ps2Wiring {
+                controller: component_ids::MACE,
+                bus: component_ids::KEYBOARD_PS2_BUS,
+            },
+            IP32_TIMEBASE_HZ,
+        )
+        .map_err(Ip32MachineBuildError::Ps2)?;
+        let mouse = Ps2Mouse::new(
+            component_ids::MOUSE,
+            "Standard three-button PS/2 mouse",
+            Ps2Wiring {
+                controller: component_ids::MACE,
+                bus: component_ids::MOUSE_PS2_BUS,
+            },
+            IP32_TIMEBASE_HZ,
+        )
+        .map_err(Ip32MachineBuildError::Ps2)?;
         let mace = Mace::new(
             component_ids::MACE,
             "MACE 2.0",
@@ -1380,6 +1457,10 @@ impl<S> Ip32Machine<S> {
                 rtc: component_ids::RTC,
                 serial: [component_ids::SERIAL0, component_ids::SERIAL1],
                 parallel: component_ids::PARALLEL_PORT,
+                ps2_buses: [
+                    component_ids::KEYBOARD_PS2_BUS,
+                    component_ids::MOUSE_PS2_BUS,
+                ],
                 external_links: MaceExternalLinks {
                     i2c: [component_ids::VIDEO_INPUT0, component_ids::VIDEO_INPUT1],
                     audio: component_ids::AUDIO_SUBSYSTEM,
@@ -1387,8 +1468,6 @@ impl<S> Ip32Machine<S> {
                     video_input_cd: component_ids::VIDEO_INPUT1,
                     video_output: component_ids::VIDEO_OUTPUT,
                     ethernet: component_ids::ETHERNET_CONTROLLER,
-                    keyboard: component_ids::KEYBOARD,
-                    mouse: component_ids::MOUSE,
                 },
             },
             IP32_TIMEBASE_HZ,
@@ -1438,6 +1517,8 @@ impl<S> Ip32Machine<S> {
         insert_component(registry, Box::new(one_wire_bus))?;
         insert_component(registry, Box::new(gbe_crt_ddc))?;
         insert_component(registry, Box::new(gbe_flat_panel_ddc))?;
+        insert_component(registry, Box::new(keyboard_ps2_bus))?;
+        insert_component(registry, Box::new(mouse_ps2_bus))?;
         insert_component(registry, Box::new(crime))?;
         insert_component(
             registry,
@@ -1505,6 +1586,8 @@ impl<S> Ip32Machine<S> {
             )),
         )?;
         insert_component(registry, Box::new(mace))?;
+        insert_component(registry, Box::new(keyboard))?;
+        insert_component(registry, Box::new(mouse))?;
         insert_component(
             registry,
             Box::new(Gbe::new(
@@ -1627,6 +1710,9 @@ impl<S> Ip32Machine<S> {
     where
         S: TraceSink,
     {
+        if matches!(input.port, MediaPort::Keyboard | MediaPort::Mouse) {
+            return Err(Ip32HostInputError::UnsupportedPort(input.port));
+        }
         let index = media_port_index(input.port);
         let units = host_payload_units(&input.payload);
         let queued = match input.port {
@@ -1658,6 +1744,25 @@ impl<S> Ip32Machine<S> {
         )?;
         self.control.host_reservations[index] += units;
         Ok(id)
+    }
+
+    /// Schedules one physical keyboard or mouse transition.
+    pub fn schedule_input(
+        &mut self,
+        at: SimTime,
+        input: Ip32InputEvent,
+    ) -> Result<ScheduledEventId, SchedulerError>
+    where
+        S: TraceSink,
+    {
+        self.runtime.schedule_at(
+            at,
+            component_ids::MACHINE,
+            Ip32Event::Input {
+                generation: self.control.host_generation,
+                input,
+            },
+        )
     }
 
     /// Schedules bytes arriving at one physical serial connector.
@@ -1932,6 +2037,18 @@ impl<S> Ip32Machine<S> {
                     TwoWireBus::save_state,
                 )?,
             ],
+            ps2_buses: [
+                save_component(
+                    registry,
+                    component_ids::KEYBOARD_PS2_BUS,
+                    TwoWireBus::save_state,
+                )?,
+                save_component(
+                    registry,
+                    component_ids::MOUSE_PS2_BUS,
+                    TwoWireBus::save_state,
+                )?,
+            ],
             crime: save_component(registry, component_ids::CRIME, Crime::save_state)?,
             memory_bus: save_component(
                 registry,
@@ -1961,6 +2078,8 @@ impl<S> Ip32Machine<S> {
                 MediaBus::save_state,
             )?,
             mace: save_component(registry, component_ids::MACE, Mace::save_state)?,
+            keyboard: save_component(registry, component_ids::KEYBOARD, Ps2Keyboard::save_state)?,
+            mouse: save_component(registry, component_ids::MOUSE, Ps2Mouse::save_state)?,
             gbe: save_component(registry, component_ids::GBE, Gbe::save_state)?,
             vice: save_component(registry, component_ids::VICE, Ip32StubEndpoint::save_state)?,
             system_flash: registry
@@ -2054,6 +2173,19 @@ impl<S> Ip32Machine<S> {
             flat_panel_ddc,
             TwoWireBus::restore_state,
         )?;
+        let [keyboard_ps2, mouse_ps2] = state.ps2_buses;
+        restore_component(
+            registry,
+            component_ids::KEYBOARD_PS2_BUS,
+            keyboard_ps2,
+            TwoWireBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::MOUSE_PS2_BUS,
+            mouse_ps2,
+            TwoWireBus::restore_state,
+        )?;
         restore_component(
             registry,
             component_ids::CRIME,
@@ -2120,6 +2252,18 @@ impl<S> Ip32Machine<S> {
             component_ids::MACE,
             state.mace,
             Mace::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::KEYBOARD,
+            state.keyboard,
+            Ps2Keyboard::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::MOUSE,
+            state.mouse,
+            Ps2Mouse::restore_state,
         )?;
         restore_component(registry, component_ids::GBE, state.gbe, Gbe::restore_state)?;
         restore_component(
@@ -2536,6 +2680,18 @@ where
                 .handle_event(context.now(), event);
             drain_mace(registry, context, control)?;
         }
+        Ip32Event::Keyboard(event) => {
+            registry
+                .get_resolved_mut(control.slots.keyboard)?
+                .handle_event(context.now(), event);
+            drain_keyboard(registry, context, control)?;
+        }
+        Ip32Event::Mouse(event) => {
+            registry
+                .get_resolved_mut(control.slots.mouse)?
+                .handle_event(context.now(), event);
+            drain_mouse(registry, context, control)?;
+        }
         Ip32Event::Ds2502(event) => {
             registry
                 .get_resolved_mut(control.slots.nic_identity)?
@@ -2588,6 +2744,35 @@ where
                 .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
                 .route(transaction);
             drain_media_bus(registry, context, control)?;
+        }
+        Ip32Event::Input { generation, input } => {
+            if generation != control.host_generation {
+                return Ok(());
+            }
+            match input {
+                Ip32InputEvent::Keyboard(input) => {
+                    registry
+                        .get_resolved_mut(control.slots.keyboard)?
+                        .apply_input(input);
+                    drain_keyboard(registry, context, control)?;
+                }
+                Ip32InputEvent::Mouse(input) => {
+                    registry
+                        .get_resolved_mut(control.slots.mouse)?
+                        .apply_input(input);
+                    drain_mouse(registry, context, control)?;
+                }
+                Ip32InputEvent::ReleaseAll => {
+                    registry
+                        .get_resolved_mut(control.slots.keyboard)?
+                        .release_all();
+                    registry
+                        .get_resolved_mut(control.slots.mouse)?
+                        .release_all();
+                    drain_keyboard(registry, context, control)?;
+                    drain_mouse(registry, context, control)?;
+                }
+            }
         }
     }
     Ok(())
@@ -2724,9 +2909,21 @@ where
     registry.get_resolved_mut(control.slots.gbe_ddc[0])?.reset();
     registry.get_resolved_mut(control.slots.gbe_ddc[1])?.reset();
     registry
+        .get_resolved_mut(control.slots.ps2_buses[0])?
+        .reset();
+    registry
+        .get_resolved_mut(control.slots.ps2_buses[1])?
+        .reset();
+    registry
         .get_resolved_mut(control.slots.nic_identity)?
         .power_on(context.now());
     mace_with_trace_interest(registry, context, control.slots.mace)?.power_on(context.now());
+    registry
+        .get_resolved_mut(control.slots.keyboard)?
+        .power_on(context.now());
+    registry
+        .get_resolved_mut(control.slots.mouse)?
+        .power_on(context.now());
     registry
         .get_resolved_mut(control.slots.rtc)?
         .power_on(context.now());
@@ -2746,6 +2943,8 @@ where
     crime_with_trace_interest(registry, context, control.slots.crime)?.power_on(context.now());
     drain_crime(registry, context, control)?;
     drain_mace(registry, context, control)?;
+    drain_keyboard(registry, context, control)?;
+    drain_mouse(registry, context, control)?;
     context.schedule_after(
         SimDuration::new(SDRAM_INITIALIZATION_TICKS),
         component_ids::CPU0,
@@ -2804,9 +3003,21 @@ where
     registry.get_resolved_mut(control.slots.gbe_ddc[0])?.reset();
     registry.get_resolved_mut(control.slots.gbe_ddc[1])?.reset();
     registry
+        .get_resolved_mut(control.slots.ps2_buses[0])?
+        .reset();
+    registry
+        .get_resolved_mut(control.slots.ps2_buses[1])?
+        .reset();
+    registry
         .get_resolved_mut(control.slots.nic_identity)?
         .hard_reset(context.now());
     mace_with_trace_interest(registry, context, control.slots.mace)?.hard_reset(context.now());
+    registry
+        .get_resolved_mut(control.slots.keyboard)?
+        .power_on(context.now());
+    registry
+        .get_resolved_mut(control.slots.mouse)?
+        .power_on(context.now());
     registry
         .get_resolved_mut(control.slots.rtc)?
         .hard_reset(context.now());
@@ -2826,6 +3037,8 @@ where
     crime_with_trace_interest(registry, context, control.slots.crime)?.hard_reset(context.now());
     drain_crime(registry, context, control)?;
     drain_mace(registry, context, control)?;
+    drain_keyboard(registry, context, control)?;
+    drain_mouse(registry, context, control)?;
     context.schedule_at(
         context.now(),
         component_ids::CPU0,
@@ -4576,6 +4789,14 @@ where
                     .route(drive)?;
                 drain_one_wire_bus(registry, context, control)?;
             }
+            MaceAction::SetTwoWire { bus, drive } => {
+                context.request_barrier();
+                let index = ps2_bus_index(bus)?;
+                registry
+                    .get_resolved_mut(control.slots.ps2_buses[index])?
+                    .route(drive)?;
+                drain_ps2_bus(registry, context, control, index)?;
+            }
             MaceAction::CompleteCmiDevice(completion) => {
                 registry
                     .get_resolved_mut(control.slots.cmi)?
@@ -4583,6 +4804,111 @@ where
                 drain_cmi_bus(registry, context, control)?;
             }
             MaceAction::Trace(event) => trace_mace(context, *event),
+        }
+    }
+}
+
+fn ps2_bus_index(bus: ComponentId) -> Result<usize, Ip32MachineDispatchError> {
+    if bus == component_ids::KEYBOARD_PS2_BUS {
+        Ok(0)
+    } else if bus == component_ids::MOUSE_PS2_BUS {
+        Ok(1)
+    } else {
+        Err(Ip32MachineDispatchError::UnexpectedController(bus))
+    }
+}
+
+fn drain_ps2_bus<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut Ip32DispatchContext<'_, '_, S>,
+    control: &mut MachineControl,
+    index: usize,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry
+            .get_resolved_mut(control.slots.ps2_buses[index])?
+            .poll()
+        {
+            TwoWireBusAction::Deliver { target, delivery } if target == component_ids::MACE => {
+                mace_with_trace_interest(registry, context, control.slots.mace)?
+                    .accept(delivery)?;
+                drain_mace(registry, context, control)?;
+            }
+            TwoWireBusAction::Deliver { target, delivery }
+                if target == component_ids::KEYBOARD && index == 0 =>
+            {
+                registry
+                    .get_resolved_mut(control.slots.keyboard)?
+                    .observe_lines(delivery)?;
+                drain_keyboard(registry, context, control)?;
+            }
+            TwoWireBusAction::Deliver { target, delivery }
+                if target == component_ids::MOUSE && index == 1 =>
+            {
+                registry
+                    .get_resolved_mut(control.slots.mouse)?
+                    .observe_lines(delivery)?;
+                drain_mouse(registry, context, control)?;
+            }
+            TwoWireBusAction::Deliver { target, .. } => {
+                return Err(Ip32MachineDispatchError::UnexpectedController(target));
+            }
+            TwoWireBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_keyboard<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut Ip32DispatchContext<'_, '_, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry.get_resolved_mut(control.slots.keyboard)?.poll() {
+            Ps2KeyboardPoll::Action(Ps2KeyboardAction::Schedule { delay, event }) => {
+                context.schedule_after(
+                    delay,
+                    component_ids::KEYBOARD,
+                    Ip32Event::Keyboard(event),
+                )?;
+            }
+            Ps2KeyboardPoll::Action(Ps2KeyboardAction::Drive(drive)) => {
+                registry
+                    .get_resolved_mut(control.slots.ps2_buses[0])?
+                    .route(drive)?;
+                drain_ps2_bus(registry, context, control, 0)?;
+            }
+            Ps2KeyboardPoll::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_mouse<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut Ip32DispatchContext<'_, '_, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry.get_resolved_mut(control.slots.mouse)?.poll() {
+            Ps2MousePoll::Action(Ps2MouseAction::Schedule { delay, event }) => {
+                context.schedule_after(delay, component_ids::MOUSE, Ip32Event::Mouse(event))?;
+            }
+            Ps2MousePoll::Action(Ps2MouseAction::Drive(drive)) => {
+                registry
+                    .get_resolved_mut(control.slots.ps2_buses[1])?
+                    .route(drive)?;
+                drain_ps2_bus(registry, context, control, 1)?;
+            }
+            Ps2MousePoll::Idle => return Ok(()),
         }
     }
 }
