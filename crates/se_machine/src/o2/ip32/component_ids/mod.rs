@@ -56,6 +56,12 @@ pub const MACE_MEDIA_BUS: ComponentId = ip32_id(0x010a);
 /// MACE board-identity 1-Wire communication domain.
 pub const ONE_WIRE_BUS: ComponentId = ip32_id(0x010b);
 
+/// GBE CRT DDC open-drain communication domain.
+pub const GBE_CRT_DDC_BUS: ComponentId = ip32_id(0x010c);
+
+/// GBE flat-panel DDC open-drain communication domain.
+pub const GBE_FLAT_PANEL_DDC_BUS: ComponentId = ip32_id(0x010d);
+
 /// Primary MIPS CPU core.
 pub const CPU0: ComponentId = ip32_id(0x0200);
 
@@ -138,7 +144,7 @@ pub const VIDEO_OUTPUT: ComponentId = ip32_id(0x050b);
 pub const PCI_SLOT0: ComponentId = ip32_id(0x050c);
 
 /// All IP32 component identifiers in stable definition order.
-pub const ALL_COMPONENT_IDS: [ComponentId; 40] = [
+pub const ALL_COMPONENT_IDS: [ComponentId; 42] = [
     MACHINE,
     CPU_SYSAD_BUS,
     CRIME_MEMORY_DOMAIN,
@@ -152,6 +158,8 @@ pub const ALL_COMPONENT_IDS: [ComponentId; 40] = [
     I2C_BUS1,
     MACE_MEDIA_BUS,
     ONE_WIRE_BUS,
+    GBE_CRT_DDC_BUS,
+    GBE_FLAT_PANEL_DDC_BUS,
     CPU0,
     FPU0,
     ICACHE0,
@@ -182,7 +190,7 @@ pub const ALL_COMPONENT_IDS: [ComponentId; 40] = [
 ];
 
 /// IP32 bus and communication-domain component identifiers.
-pub const BUS_COMPONENT_IDS: [ComponentId; 12] = [
+pub const BUS_COMPONENT_IDS: [ComponentId; 14] = [
     CPU_SYSAD_BUS,
     CRIME_MEMORY_DOMAIN,
     CRIME_MACE_LINK,
@@ -195,6 +203,8 @@ pub const BUS_COMPONENT_IDS: [ComponentId; 12] = [
     I2C_BUS1,
     MACE_MEDIA_BUS,
     ONE_WIRE_BUS,
+    GBE_CRT_DDC_BUS,
+    GBE_FLAT_PANEL_DDC_BUS,
 ];
 
 #[cfg(test)]

@@ -129,7 +129,7 @@ impl CompactIp32BusEvent {
                 Ip32Event::CrimeCgiBus(CrimeCgiBusEvent::Service { epoch: self.epoch })
             }
             (Ip32EventChainClass::Cgi, CompactBusPhase::Complete) => {
-                Ip32Event::CrimeCgiBus(CrimeCgiBusEvent::Complete { epoch: self.epoch })
+                unreachable!("CGI completions carry correlation state and are never compacted")
             }
             (Ip32EventChainClass::Isa, CompactBusPhase::Service) => {
                 Ip32Event::IsaBus(IsaBusEvent::Service { epoch: self.epoch })
@@ -169,8 +169,8 @@ impl CompactIp32BusEvent {
             Ip32Event::CrimeCgiBus(CrimeCgiBusEvent::Service { epoch }) => {
                 (Ip32EventChainClass::Cgi, CompactBusPhase::Service, epoch)
             }
-            Ip32Event::CrimeCgiBus(CrimeCgiBusEvent::Complete { epoch }) => {
-                (Ip32EventChainClass::Cgi, CompactBusPhase::Complete, epoch)
+            event @ Ip32Event::CrimeCgiBus(CrimeCgiBusEvent::Complete { .. }) => {
+                return Err(event);
             }
             Ip32Event::IsaBus(IsaBusEvent::Service { epoch }) => {
                 (Ip32EventChainClass::Isa, CompactBusPhase::Service, epoch)

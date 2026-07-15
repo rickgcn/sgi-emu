@@ -8,12 +8,14 @@ use se_device::bus::isa::IsaBusState;
 use se_device::bus::media::MediaBusState;
 use se_device::bus::one_wire::OneWireBusState;
 use se_device::bus::pci::{PciBusState, PciConfigurationEndpointState};
+use se_device::bus::two_wire::TwoWireBusState;
 use se_device::chipset::crime::CrimeState;
 use se_device::chipset::crime::config::{CrimeConfig, CrimeConfigError};
 use se_device::chipset::crime::iou::{CrimeCgiBusState, CrimeCmiBusState};
 use se_device::chipset::crime::memory::CrimeSdramState;
 use se_device::chipset::crime::memory::bus::CrimeMemoryBusState;
 use se_device::chipset::gbe::GbeState;
+use se_device::chipset::gbe::protocol::GbeFrame;
 use se_device::chipset::mace::MaceState;
 use se_device::chipset::mace::config::{MaceConfig, MacePortConfig};
 use se_device::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
@@ -31,7 +33,7 @@ use super::event::{Ip32Event, Ip32HostOutput};
 use super::timing::IP32_TIMEBASE_HZ;
 
 /// Current IP32 serialized-state schema.
-pub const IP32_STATE_SCHEMA_VERSION: u32 = 2;
+pub const IP32_STATE_SCHEMA_VERSION: u32 = 4;
 
 /// Construction settings that do not contain PROM or battery-backed bytes.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -153,6 +155,8 @@ pub(super) struct MachineControlState {
     pub(super) host_outputs: Vec<Ip32HostOutput>,
     pub(super) host_output_units: [usize; 12],
     pub(super) host_dropped_output_bytes: [u64; 12],
+    pub(super) latest_display_frame: Option<GbeFrame>,
+    pub(super) dropped_display_frames: u64,
     pub(super) sysad_transactions: u64,
     pub(super) memory_transactions: u64,
     pub(super) cmi_transactions: u64,
@@ -179,6 +183,7 @@ pub struct Ip32MachineState {
     pub(super) cpu_irq: IrqBusState,
     pub(super) mace_irq: IrqBusState,
     pub(super) one_wire: OneWireBusState,
+    pub(super) gbe_ddc: [TwoWireBusState; 2],
     pub(super) crime: CrimeState,
     pub(super) memory_bus: CrimeMemoryBusState,
     pub(super) cmi: CrimeCmiBusState,
@@ -344,6 +349,18 @@ mod tests {
             Err(Ip32StateError::Device(
                 se_device::state::DeviceStateError::ComponentIdMismatch { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn schema_three_state_is_explicitly_rejected() {
+        let config = Ip32MachineConfig::default();
+        let machine = Ip32Machine::from_config(config.clone()).unwrap();
+        let mut state = machine.save_state().unwrap();
+        state.schema_version = 3;
+        assert!(matches!(
+            Ip32Machine::from_state_with_trace_sink(config, state, se_core::tracing::NoopTraceSink,),
+            Err(Ip32StateError::UnsupportedSchema { version: 3 })
         ));
     }
 

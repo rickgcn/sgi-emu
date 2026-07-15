@@ -8,6 +8,7 @@ use se_device::bus::media::{MediaPayload, MediaPort};
 use se_device::chipset::crime::iou::{CrimeCgiBusEvent, CrimeCmiBusEvent};
 use se_device::chipset::crime::memory::bus::CrimeMemoryBusEvent;
 use se_device::chipset::crime::protocol::CrimeEvent;
+use se_device::chipset::gbe::protocol::{GbeEvent, GbeExternalInput};
 use se_device::chipset::mace::protocol::MaceEvent;
 use se_device::memory::ds2502::Ds2502Event;
 use se_device::serial::uart16550::Uart16550Event;
@@ -43,6 +44,12 @@ pub enum Ip32Event {
 
     /// CRIME-to-GBE link event.
     CrimeCgiBus(CrimeCgiBusEvent),
+
+    /// GBE-internal timing transition.
+    Gbe(GbeEvent),
+
+    /// Deterministic external GBE pin or clock input.
+    GbeInput(GbeExternalInput),
 
     /// MACE-internal event.
     Mace(MaceEvent),

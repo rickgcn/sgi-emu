@@ -3,16 +3,20 @@ use se_core::tracing::{TraceInterest, TraceRecord, TraceSink, TraceSource, Trace
 use se_device::bus::irq::{IrqBus, IrqTransaction};
 use se_device::bus::media::{MediaPayload, MediaPort};
 use se_device::bus::one_wire::OneWireBus;
+use se_device::bus::two_wire::TwoWireBus;
 use se_device::chipset::crime::config::{CrimeAccessPolicy, CrimeConfigError, CrimeSdramBankSize};
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
 use se_device::chipset::crime::memory::bus::CrimeMemoryBus;
 use se_device::chipset::crime::protocol::{
-    CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryTransaction,
+    CrimeCgiTransaction, CrimeCompletionPayload, CrimeLinkDeviceResponse, CrimeLinkOperation,
+    CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryTransaction, CrimePioRequest,
     CrimeTransactionId, CrimeTransfer,
 };
 use se_device::chipset::crime::registers;
 use se_device::chipset::gbe::Gbe;
+#[cfg(feature = "jit")]
+use se_device::chipset::gbe::protocol::{GbeExternalClock, GbeExternalInput};
 use se_device::chipset::mace::Mace;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
 use se_device::memory::ds2502::Ds2502;
@@ -132,6 +136,9 @@ fn assert_machine_architecture_equal<A, B>(reference: &Ip32Machine<A>, optimized
     assert_component_eq!(IrqBus, component_ids::CPU_IRQ_BUS);
     assert_component_eq!(IrqBus, component_ids::MACE_IRQ_BUS);
     assert_component_eq!(OneWireBus, component_ids::ONE_WIRE_BUS);
+    assert_component_eq!(TwoWireBus, component_ids::GBE_CRT_DDC_BUS);
+    assert_component_eq!(TwoWireBus, component_ids::GBE_FLAT_PANEL_DDC_BUS);
+    assert_component_eq!(Gbe, component_ids::GBE);
     assert_component_eq!(Ds2502, component_ids::NIC_IDENTITY);
     assert_component_eq!(SystemFlash, component_ids::PROM);
     assert_eq!(
@@ -158,6 +165,14 @@ fn assert_machine_architecture_equal<A, B>(reference: &Ip32Machine<A>, optimized
     assert_eq!(
         reference.control.host_dropped_output_bytes,
         optimized.control.host_dropped_output_bytes
+    );
+    assert_eq!(
+        reference.control.latest_display_frame,
+        optimized.control.latest_display_frame
+    );
+    assert_eq!(
+        reference.control.dropped_display_frames,
+        optimized.control.dropped_display_frames
     );
 }
 
@@ -986,7 +1001,7 @@ fn construction_registers_the_role_oriented_ip32_topology() {
     let machine = Ip32Machine::from_config(config_with_program(&[])).unwrap();
     let registry = machine.runtime().registry();
 
-    assert_eq!(registry.len(), 25);
+    assert_eq!(registry.len(), 27);
     assert!(registry.get_typed::<R5000Cpu>(component_ids::CPU0).is_ok());
     assert!(
         registry
@@ -1027,6 +1042,16 @@ fn construction_registers_the_role_oriented_ip32_topology() {
             .is_ok()
     );
     assert!(registry.get_typed::<Gbe>(component_ids::GBE).is_ok());
+    assert!(
+        registry
+            .get_typed::<TwoWireBus>(component_ids::GBE_CRT_DDC_BUS)
+            .is_ok()
+    );
+    assert!(
+        registry
+            .get_typed::<TwoWireBus>(component_ids::GBE_FLAT_PANEL_DDC_BUS)
+            .is_ok()
+    );
     assert!(
         registry
             .get_typed::<Ip32StubEndpoint>(component_ids::VICE)
@@ -1736,6 +1761,58 @@ fn printenv_diagmode<S: TraceSink>(
     );
 }
 
+#[derive(Default)]
+struct PromDisplaySink {
+    dma_events: std::collections::BTreeMap<String, u64>,
+    render_writes: std::collections::BTreeMap<u64, (u64, u64)>,
+    capture_render: bool,
+}
+
+impl TraceSink for PromDisplaySink {
+    fn interest(&self, source: TraceSource) -> TraceInterest {
+        if source == TraceSource::Component(component_ids::GBE)
+            || self.capture_render && source == TraceSource::Component(component_ids::CRIME)
+        {
+            TraceInterest::Filtered
+        } else {
+            TraceInterest::None
+        }
+    }
+
+    fn enabled(
+        &self,
+        _source: TraceSource,
+        _level: se_core::tracing::TraceLevel,
+        target: &str,
+        _event: &str,
+    ) -> bool {
+        target == "gbe.dma" || target == "ip32.crime.re"
+    }
+
+    fn record(&mut self, record: TraceRecord<'_>) {
+        if record.target == "gbe.dma" {
+            *self.dma_events.entry(record.event.to_owned()).or_default() += 1;
+            return;
+        }
+        if record.event != "register_write" {
+            return;
+        }
+        let value = |key| {
+            record
+                .fields
+                .iter()
+                .find_map(|field| (field.key == key).then_some(field.value))
+        };
+        if let (Some(TraceValue::Hex64(address)), Some(TraceValue::Hex64(value))) =
+            (value("physical_address"), value("value"))
+        {
+            let entry = self.render_writes.entry(address).or_default();
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = value;
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires a local proprietary IP32 PROM image"]
 fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
@@ -1812,6 +1889,252 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
             |address| !(registers::CRIME_BASE..registers::CRIME_REGISTER_END).contains(address)
         ),
         "a modeled CRIME access returned a bus error"
+    );
+    assert!(
+        failed
+            .iter()
+            .all(|address| !(0x1600_0000..0x1700_0000).contains(address)),
+        "a PROM GBE initialization access returned a bus error"
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+#[ignore = "requires a local proprietary IP32 PROM image"]
+fn local_ip32_prom_reaches_gbe_display_output() {
+    fn read_gbe<S: TraceSink>(machine: &mut Ip32Machine<S>, address: u64) -> u32 {
+        let gbe = machine
+            .runtime_mut()
+            .registry_mut()
+            .get_typed_mut::<Gbe>(component_ids::GBE)
+            .unwrap();
+        let response = gbe.accept(CrimeCgiTransaction {
+            id: CrimeTransactionId::new(u128::MAX),
+            controller: component_ids::CRIME,
+            target: component_ids::GBE,
+            operation: CrimeLinkOperation::Pio(CrimePioRequest {
+                address,
+                transfer: CrimeTransfer::read(4),
+            }),
+        });
+        let CrimeLinkDeviceResponse::Complete(completion) = response else {
+            panic!("diagnostic GBE read was unexpectedly deferred");
+        };
+        let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap() else {
+            panic!("diagnostic GBE read returned the wrong payload");
+        };
+        u32::from_be_bytes(data.as_ref().try_into().unwrap())
+    }
+
+    fn read_ram<S: TraceSink>(machine: &Ip32Machine<S>, address: u64, length: usize) -> Vec<u8> {
+        let ram = machine
+            .runtime()
+            .registry()
+            .get_typed::<CrimeSdram>(component_ids::RAM)
+            .unwrap();
+        let mut data = Vec::with_capacity(length);
+        let mut offset = 0;
+        while offset < length {
+            let chunk = (length - offset).min(128);
+            let (bytes, _) = ram
+                .stable_code_window(address + offset as u64, chunk, true)
+                .unwrap();
+            data.extend_from_slice(&bytes);
+            offset += chunk;
+        }
+        data
+    }
+
+    let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
+    let config = Ip32MachineConfig {
+        prom_image: std::fs::read(path).expect("the local PROM image must be readable"),
+        jit_enabled: true,
+        ..Ip32MachineConfig::default()
+    };
+    let mut machine =
+        Ip32Machine::from_config_with_trace_sink(config, PromDisplaySink::default()).unwrap();
+    machine.schedule_power_on().unwrap();
+    machine
+        .schedule_gbe_external_input(SimTime::ZERO, GbeExternalInput::SenseN(false))
+        .unwrap();
+    machine
+        .schedule_gbe_external_input(
+            SimTime::ZERO,
+            GbeExternalInput::PixelClock {
+                source: GbeExternalClock::Ttl,
+                numerator_hz: 20_000_000,
+                denominator: 1,
+            },
+        )
+        .unwrap();
+
+    let max_events = std::env::var("IP32_PROM_DISPLAY_EVENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000_000);
+    let mut events = 0;
+    let mut last_frame = None;
+    let mut terminal = Vec::new();
+    let mut keyboard_output = Vec::new();
+    let mut keyboard_parameter_pending = false;
+    let diagnostic_frame_limit = std::env::var("IP32_PROM_DISPLAY_DIAGNOSTIC_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    while events < max_events {
+        let batch = (max_events - events).min(4_096);
+        let status = machine.run_steps(batch).unwrap();
+        events += batch;
+        drain_serial_one(&mut machine, &mut terminal);
+        let mut enable_render_trace = false;
+        while let Some(output) = machine.poll_host_output() {
+            if output.port == MediaPort::Keyboard
+                && let MediaPayload::Bytes(bytes) = output.payload
+            {
+                for byte in bytes {
+                    keyboard_output.push(byte);
+                    enable_render_trace |= byte == 0xf4;
+                    let replies: &[u8] = if keyboard_parameter_pending {
+                        keyboard_parameter_pending = false;
+                        &[0xfa]
+                    } else {
+                        match byte {
+                            0xed | 0xf0 | 0xf3 => {
+                                keyboard_parameter_pending = true;
+                                &[0xfa]
+                            }
+                            0xee => &[0xee],
+                            0xf2 => &[0xfa, 0xab, 0x83],
+                            0xff => &[0xfa, 0xaa],
+                            _ => &[0xfa],
+                        }
+                    };
+                    let now = machine.runtime().now().get();
+                    for (index, reply) in replies.iter().copied().enumerate() {
+                        machine
+                            .schedule_host_input(
+                                SimTime::new(
+                                    now.saturating_add(
+                                        (index as u64 + 1) * IP32_TIMEBASE_HZ / 1_000,
+                                    ),
+                                ),
+                                Ip32HostInput {
+                                    port: MediaPort::Keyboard,
+                                    payload: MediaPayload::Bytes(vec![reply]),
+                                },
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        if enable_render_trace {
+            machine
+                .runtime_mut()
+                .trace_recorder_mut()
+                .sink_mut()
+                .capture_render = true;
+        }
+        if let Some(frame) = machine.take_display_frame() {
+            assert!(frame.width != 0 && frame.height != 0);
+            let has_visible_pixel = frame
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[..3] != [0, 0, 0]);
+            if has_visible_pixel {
+                return;
+            }
+            last_frame = Some((events, frame.sequence, frame.width, frame.height));
+            if diagnostic_frame_limit.is_some_and(|limit| frame.sequence >= limit) {
+                break;
+            }
+        }
+        assert!(!matches!(status, RunStatus::Idle | RunStatus::Stopped));
+    }
+
+    let cpu = machine
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let pc = cpu.state().pc();
+    let gpr = (0..32)
+        .map(|index| {
+            cpu.state()
+                .gpr()
+                .read(Mips4GprIndex::from_u8(index).unwrap())
+        })
+        .collect::<Vec<_>>();
+    let code_address = (pc & 0x1fff_ffff).saturating_sub(32);
+    let code = machine
+        .runtime()
+        .registry()
+        .get_typed::<CrimeSdram>(component_ids::RAM)
+        .unwrap()
+        .stable_code_window(code_address, 96, true)
+        .map(|(code, _)| code)
+        .unwrap();
+    let time = machine.runtime().now();
+    let performance = machine.performance_snapshot();
+    let dma_events = machine.runtime().trace_recorder().sink().dma_events.clone();
+    let render_writes = machine
+        .runtime()
+        .trace_recorder()
+        .sink()
+        .render_writes
+        .clone();
+    let terminal_start = terminal.len().saturating_sub(2_048);
+    let terminal = String::from_utf8_lossy(&terminal[terminal_start..]);
+    let control_status = read_gbe(&mut machine, 0x1600_0000);
+    let dot_clock = read_gbe(&mut machine, 0x1600_0004);
+    let vt_xy = read_gbe(&mut machine, 0x1601_0000);
+    let vt_xy_max = read_gbe(&mut machine, 0x1601_0004);
+    let vt_intr01 = read_gbe(&mut machine, 0x1601_0020);
+    let vt_intr23 = read_gbe(&mut machine, 0x1601_0024);
+    let vt_hpixen = read_gbe(&mut machine, 0x1601_0034);
+    let vt_vpixen = read_gbe(&mut machine, 0x1601_0038);
+    let frame_size_tile = read_gbe(&mut machine, 0x1603_0000);
+    let frame_size_pixel = read_gbe(&mut machine, 0x1603_0004);
+    let frame_active = read_gbe(&mut machine, 0x1603_0008);
+    let frame_shadow = read_gbe(&mut machine, 0x1603_000c);
+    let did_active = read_gbe(&mut machine, 0x1604_0000);
+    let wid_zero = read_gbe(&mut machine, 0x1604_8000);
+    let color_zero = read_gbe(&mut machine, 0x1605_0000);
+    let color_one = read_gbe(&mut machine, 0x1605_0004);
+    let gamma_zero = read_gbe(&mut machine, 0x1606_0000);
+    let gamma_one = read_gbe(&mut machine, 0x1606_0004);
+    let gamma_max = read_gbe(&mut machine, 0x1606_03fc);
+    let tile_columns = usize::from(((frame_size_tile >> 5) & 0xff) as u8)
+        + usize::from(frame_size_tile & 0x1f != 0);
+    let tile_rows = usize::try_from(frame_size_pixel >> 16)
+        .unwrap()
+        .div_ceil(128);
+    let tile_pointer_count = tile_columns.saturating_mul(tile_rows);
+    let tile_pointer_bytes = read_ram(
+        &machine,
+        u64::from(frame_active & !0x1f),
+        tile_pointer_count.saturating_mul(2),
+    );
+    let tile_pages = tile_pointer_bytes
+        .chunks_exact(2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+        .collect::<Vec<_>>();
+    let mut nonzero_tiles = Vec::new();
+    for page in tile_pages.iter().copied().filter(|page| *page != 0) {
+        let base = u64::from(page) << 16;
+        let mut first_nonzero = None;
+        for offset in (0..65_536).step_by(128) {
+            let bytes = read_ram(&machine, base + offset as u64, 128);
+            if let Some(index) = bytes.iter().position(|byte| *byte != 0) {
+                first_nonzero = Some((offset + index, bytes[index]));
+                break;
+            }
+        }
+        if let Some(first_nonzero) = first_nonzero {
+            nonzero_tiles.push((page, first_nonzero));
+        }
+    }
+    panic!(
+        "the PROM did not publish a non-black GBE frame within {max_events} events; last_frame={last_frame:?}; dma_events={dma_events:?}; render_writes={render_writes:016x?}; keyboard_output={keyboard_output:02x?}; terminal={terminal:?}; tile_pages={tile_pages:04x?}; nonzero_tiles={nonzero_tiles:04x?}; time={time:?}; PERFORMANCE={performance:#?}; PC={pc:#018x}; GPR={gpr:#018x?}; CODE_ADDRESS={code_address:#010x}; CODE={code:02x?}; CTRLSTAT={control_status:#010x}; DOTCLOCK={dot_clock:#010x}; VT_XY={vt_xy:#010x}; VT_XY_MAX={vt_xy_max:#010x}; VT_INTR01={vt_intr01:#010x}; VT_INTR23={vt_intr23:#010x}; VT_HPIXEN={vt_hpixen:#010x}; VT_VPIXEN={vt_vpixen:#010x}; FRM_0={frame_size_tile:#010x}; FRM_1={frame_size_pixel:#010x}; FRM_2={frame_active:#010x}; FRM_3={frame_shadow:#010x}; DID={did_active:#010x}; WID_0={wid_zero:#010x}; CMAP_0={color_zero:#010x}; CMAP_1={color_one:#010x}; GMAP_0={gamma_zero:#010x}; GMAP_1={gamma_one:#010x}; GMAP_255={gamma_max:#010x}"
     );
 }
 

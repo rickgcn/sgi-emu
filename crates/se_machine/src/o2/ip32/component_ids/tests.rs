@@ -40,6 +40,8 @@ fn bus_component_ids_are_present_and_distinct() {
             I2C_BUS1,
             MACE_MEDIA_BUS,
             ONE_WIRE_BUS,
+            GBE_CRT_DDC_BUS,
+            GBE_FLAT_PANEL_DDC_BUS,
         ]
     );
 

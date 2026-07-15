@@ -29,6 +29,9 @@ use se_device::bus::one_wire::{
 use se_device::bus::pci::{
     PciBus, PciBusAction, PciCompletion, PciConfigurationEndpoint, PciStatus,
 };
+use se_device::bus::two_wire::{
+    TwoWireBus, TwoWireBusAction, TwoWireBusBuildError, TwoWireBusRouteError,
+};
 #[cfg(feature = "jit")]
 use se_device::chipset::crime::CrimeSynchronousReadSnapshot;
 use se_device::chipset::crime::config::CrimeConfig;
@@ -50,6 +53,10 @@ use se_device::chipset::crime::protocol::{
 };
 use se_device::chipset::crime::{Crime, CrimeError};
 use se_device::chipset::gbe::Gbe;
+use se_device::chipset::gbe::protocol::{
+    GbeAction, GbeExternalInput, GbeFrame, GbeOutputPins, GbePoll, GbeTraceEvent, GbeTraceLevel,
+    GbeTraceValue, GbeWiring,
+};
 use se_device::chipset::mace::config::{MaceConfig, MacePortConfig};
 use se_device::chipset::mace::protocol::{
     MaceAction, MaceExternalLinks, MacePoll, MaceTraceEvent, MaceTraceValue, MaceWiring,
@@ -217,6 +224,9 @@ pub enum Ip32MachineBuildError {
     /// The board-identity 1-Wire topology is invalid.
     OneWireBus(OneWireBusBuildError),
 
+    /// A GBE DDC bus topology is invalid.
+    TwoWireBus(TwoWireBusBuildError),
+
     /// PROM image does not have the fixed hardware size.
     InvalidPromSize {
         /// Requested image size in bytes.
@@ -254,6 +264,9 @@ impl fmt::Display for Ip32MachineBuildError {
             Self::IrqBus(error) => write!(f, "failed to construct IP32 IRQ bus: {error}"),
             Self::OneWireBus(error) => {
                 write!(f, "failed to construct IP32 1-Wire bus: {error}")
+            }
+            Self::TwoWireBus(error) => {
+                write!(f, "failed to construct IP32 GBE DDC bus: {error}")
             }
             Self::InvalidPromSize { size_bytes } => {
                 write!(f, "invalid IP32 PROM size: {size_bytes} bytes")
@@ -295,6 +308,9 @@ pub enum Ip32MachineDispatchError {
 
     /// The 1-Wire bus rejected a source transition.
     OneWireBus(OneWireBusRouteError),
+
+    /// A GBE DDC bus rejected a source transition.
+    TwoWireBus(TwoWireBusRouteError),
 
     /// The R5000 rejected an IRQ bus delivery.
     CpuIrq(R5000IrqError),
@@ -348,6 +364,7 @@ impl fmt::Display for Ip32MachineDispatchError {
             Self::Uart(error) => write!(f, "IP32 UART dispatch failed: {error}"),
             Self::IrqBus(error) => write!(f, "IP32 IRQ routing failed: {error}"),
             Self::OneWireBus(error) => write!(f, "IP32 1-Wire routing failed: {error}"),
+            Self::TwoWireBus(error) => write!(f, "IP32 GBE DDC routing failed: {error}"),
             Self::CpuIrq(error) => write!(f, "IP32 CPU IRQ delivery failed: {error}"),
             Self::Scheduler(error) => write!(f, "IP32 event scheduling failed: {error}"),
             Self::EventChain(error) => write!(f, "IP32 event chain failed: {error}"),
@@ -400,6 +417,12 @@ impl From<IrqBusRouteError> for Ip32MachineDispatchError {
 impl From<OneWireBusRouteError> for Ip32MachineDispatchError {
     fn from(error: OneWireBusRouteError) -> Self {
         Self::OneWireBus(error)
+    }
+}
+
+impl From<TwoWireBusRouteError> for Ip32MachineDispatchError {
+    fn from(error: TwoWireBusRouteError) -> Self {
+        Self::TwoWireBus(error)
     }
 }
 
@@ -512,6 +535,8 @@ struct MachineControl {
     host_outputs: VecDeque<Ip32HostOutput>,
     host_output_units: [usize; 12],
     host_dropped_output_bytes: [u64; 12],
+    latest_display_frame: Option<GbeFrame>,
+    dropped_display_frames: u64,
     sysad_transactions: u64,
     memory_transactions: u64,
     cmi_transactions: u64,
@@ -1058,6 +1083,7 @@ struct HotComponentSlots {
     serial: [ComponentSlot<Uart16550>; 2],
     parallel: ComponentSlot<Ieee1284>,
     one_wire: ComponentSlot<OneWireBus>,
+    gbe_ddc: [ComponentSlot<TwoWireBus>; 2],
     nic_identity: ComponentSlot<Ds2502>,
 }
 
@@ -1082,6 +1108,10 @@ impl HotComponentSlots {
             ],
             parallel: registry.resolve(component_ids::PARALLEL_PORT)?,
             one_wire: registry.resolve(component_ids::ONE_WIRE_BUS)?,
+            gbe_ddc: [
+                registry.resolve(component_ids::GBE_CRT_DDC_BUS)?,
+                registry.resolve(component_ids::GBE_FLAT_PANEL_DDC_BUS)?,
+            ],
             nic_identity: registry.resolve(component_ids::NIC_IDENTITY)?,
         })
     }
@@ -1318,6 +1348,18 @@ impl<S> Ip32Machine<S> {
             [component_ids::MACE, component_ids::NIC_IDENTITY],
         )
         .map_err(Ip32MachineBuildError::OneWireBus)?;
+        let gbe_crt_ddc = TwoWireBus::new(
+            component_ids::GBE_CRT_DDC_BUS,
+            "GBE CRT DDC bus",
+            [component_ids::GBE],
+        )
+        .map_err(Ip32MachineBuildError::TwoWireBus)?;
+        let gbe_flat_panel_ddc = TwoWireBus::new(
+            component_ids::GBE_FLAT_PANEL_DDC_BUS,
+            "GBE flat-panel DDC bus",
+            [component_ids::GBE],
+        )
+        .map_err(Ip32MachineBuildError::TwoWireBus)?;
         let mace = Mace::new(
             component_ids::MACE,
             "MACE 2.0",
@@ -1394,6 +1436,8 @@ impl<S> Ip32Machine<S> {
         insert_component(registry, Box::new(irq_bus))?;
         insert_component(registry, Box::new(mace_irq_bus))?;
         insert_component(registry, Box::new(one_wire_bus))?;
+        insert_component(registry, Box::new(gbe_crt_ddc))?;
+        insert_component(registry, Box::new(gbe_flat_panel_ddc))?;
         insert_component(registry, Box::new(crime))?;
         insert_component(
             registry,
@@ -1467,6 +1511,11 @@ impl<S> Ip32Machine<S> {
                 component_ids::GBE,
                 "Graphics Back End",
                 IP32_TIMEBASE_HZ,
+                GbeWiring {
+                    crime: component_ids::CRIME,
+                    crt_ddc: component_ids::GBE_CRT_DDC_BUS,
+                    flat_panel_ddc: component_ids::GBE_FLAT_PANEL_DDC_BUS,
+                },
             )),
         )?;
         insert_component(
@@ -1519,6 +1568,8 @@ impl<S> Ip32Machine<S> {
                 host_outputs: VecDeque::new(),
                 host_output_units: [0; 12],
                 host_dropped_output_bytes: [0; 12],
+                latest_display_frame: None,
+                dropped_display_frames: 0,
                 sysad_transactions: 0,
                 memory_transactions: 0,
                 cmi_transactions: 0,
@@ -1631,6 +1682,31 @@ impl<S> Ip32Machine<S> {
         )
     }
 
+    /// Schedules one deterministic external GBE pin or clock input.
+    pub fn schedule_gbe_external_input(
+        &mut self,
+        at: SimTime,
+        input: GbeExternalInput,
+    ) -> Result<ScheduledEventId, SchedulerError>
+    where
+        S: TraceSink,
+    {
+        self.runtime
+            .schedule_at(at, component_ids::GBE, Ip32Event::GbeInput(input))
+    }
+
+    /// Returns current CRT, flat-panel, field, auxiliary, and GPIO pin levels.
+    pub fn gbe_output_pins(&mut self) -> GbeOutputPins {
+        let now = self.runtime.now();
+        let gbe = self
+            .runtime
+            .registry_mut()
+            .get_typed_mut::<Gbe>(component_ids::GBE)
+            .expect("the IP32 GBE component must remain registered");
+        gbe.observe_time(now);
+        gbe.output_pins()
+    }
+
     /// Removes the oldest host-neutral output produced by the machine.
     pub fn poll_host_output(&mut self) -> Option<Ip32HostOutput> {
         let output = self.control.host_outputs.pop_front()?;
@@ -1672,6 +1748,21 @@ impl<S> Ip32Machine<S> {
         Ip32HostIoStats {
             dropped_output_bytes: self.control.host_dropped_output_bytes,
         }
+    }
+
+    /// Returns the newest completed display frame without consuming it.
+    pub const fn latest_display_frame(&self) -> Option<&GbeFrame> {
+        self.control.latest_display_frame.as_ref()
+    }
+
+    /// Removes and returns the newest completed display frame.
+    pub fn take_display_frame(&mut self) -> Option<GbeFrame> {
+        self.control.latest_display_frame.take()
+    }
+
+    /// Returns the number of completed frames overwritten before consumption.
+    pub const fn dropped_display_frame_count(&self) -> u64 {
+        self.control.dropped_display_frames
     }
 
     /// Returns a cumulative performance snapshot.
@@ -1801,6 +1892,8 @@ impl<S> Ip32Machine<S> {
                 host_outputs: self.control.host_outputs.iter().cloned().collect(),
                 host_output_units: self.control.host_output_units,
                 host_dropped_output_bytes: self.control.host_dropped_output_bytes,
+                latest_display_frame: self.control.latest_display_frame.clone(),
+                dropped_display_frames: self.control.dropped_display_frames,
                 sysad_transactions: self.control.sysad_transactions,
                 memory_transactions: self.control.memory_transactions,
                 cmi_transactions: self.control.cmi_transactions,
@@ -1827,6 +1920,18 @@ impl<S> Ip32Machine<S> {
                 component_ids::ONE_WIRE_BUS,
                 OneWireBus::save_state,
             )?,
+            gbe_ddc: [
+                save_component(
+                    registry,
+                    component_ids::GBE_CRT_DDC_BUS,
+                    TwoWireBus::save_state,
+                )?,
+                save_component(
+                    registry,
+                    component_ids::GBE_FLAT_PANEL_DDC_BUS,
+                    TwoWireBus::save_state,
+                )?,
+            ],
             crime: save_component(registry, component_ids::CRIME, Crime::save_state)?,
             memory_bus: save_component(
                 registry,
@@ -1935,6 +2040,19 @@ impl<S> Ip32Machine<S> {
             component_ids::ONE_WIRE_BUS,
             state.one_wire,
             OneWireBus::restore_state,
+        )?;
+        let [crt_ddc, flat_panel_ddc] = state.gbe_ddc;
+        restore_component(
+            registry,
+            component_ids::GBE_CRT_DDC_BUS,
+            crt_ddc,
+            TwoWireBus::restore_state,
+        )?;
+        restore_component(
+            registry,
+            component_ids::GBE_FLAT_PANEL_DDC_BUS,
+            flat_panel_ddc,
+            TwoWireBus::restore_state,
         )?;
         restore_component(
             registry,
@@ -2104,6 +2222,8 @@ impl<S> Ip32Machine<S> {
             host_outputs: state.control.host_outputs.into(),
             host_output_units: state.control.host_output_units,
             host_dropped_output_bytes: state.control.host_dropped_output_bytes,
+            latest_display_frame: state.control.latest_display_frame,
+            dropped_display_frames: state.control.dropped_display_frames,
             sysad_transactions: state.control.sysad_transactions,
             memory_transactions: state.control.memory_transactions,
             cmi_transactions: state.control.cmi_transactions,
@@ -2399,6 +2519,18 @@ where
                 .handle_event(event);
             drain_cgi_bus(registry, context, control)?;
         }
+        Ip32Event::Gbe(event) => {
+            let gbe = registry.get_resolved_mut(control.slots.gbe)?;
+            gbe.observe_time(context.now());
+            gbe.handle_event(event);
+            drain_gbe(registry, context, control)?;
+        }
+        Ip32Event::GbeInput(input) => {
+            let gbe = registry.get_resolved_mut(control.slots.gbe)?;
+            gbe.observe_time(context.now());
+            gbe.apply_external_input(input);
+            drain_gbe(registry, context, control)?;
+        }
         Ip32Event::Mace(event) => {
             mace_with_trace_interest(registry, context, control.slots.mace)?
                 .handle_event(context.now(), event);
@@ -2555,6 +2687,8 @@ where
     control.host_outputs.clear();
     control.host_output_units.fill(0);
     control.host_dropped_output_bytes.fill(0);
+    control.latest_display_frame = None;
+    control.dropped_display_frames = 0;
     registry
         .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
         .reset();
@@ -2587,6 +2721,8 @@ where
         .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
         .reset();
     registry.get_resolved_mut(control.slots.one_wire)?.reset();
+    registry.get_resolved_mut(control.slots.gbe_ddc[0])?.reset();
+    registry.get_resolved_mut(control.slots.gbe_ddc[1])?.reset();
     registry
         .get_resolved_mut(control.slots.nic_identity)?
         .power_on(context.now());
@@ -2631,6 +2767,8 @@ where
     advance_cpu_generation(control)?;
     advance_host_generation(control)?;
     reset_jit_engine(control)?;
+    control.latest_display_frame = None;
+    control.dropped_display_frames = 0;
     registry
         .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
         .reset();
@@ -2663,6 +2801,8 @@ where
         .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
         .reset();
     registry.get_resolved_mut(control.slots.one_wire)?.reset();
+    registry.get_resolved_mut(control.slots.gbe_ddc[0])?.reset();
+    registry.get_resolved_mut(control.slots.gbe_ddc[1])?.reset();
     registry
         .get_resolved_mut(control.slots.nic_identity)?
         .hard_reset(context.now());
@@ -4288,7 +4428,7 @@ where
             CrimeAction::CompleteCgiDevice(completion) => {
                 registry
                     .get_resolved_mut(control.slots.cgi)?
-                    .accept_device_completion(completion);
+                    .accept_device_completion(component_ids::CRIME, completion);
                 drain_cgi_bus(registry, context, control)?;
             }
             CrimeAction::CompleteSysAd(completion) => {
@@ -5156,27 +5296,35 @@ where
                     CrimeLinkDeviceResponse::Complete(completion) => {
                         registry
                             .get_resolved_mut(control.slots.cgi)?
-                            .accept_device_completion(completion);
+                            .accept_device_completion(target, completion);
                     }
                     CrimeLinkDeviceResponse::Deferred => context.request_barrier(),
                 }
                 drain_crime(registry, context, control)?;
+                drain_gbe(registry, context, control)?;
             }
             CrimeBusAction::Complete {
                 controller,
                 completion,
             } => {
-                if controller != component_ids::CRIME {
+                if controller == component_ids::CRIME {
+                    crime_with_trace_interest(registry, context, control.slots.crime)?
+                        .complete(completion);
+                    drain_crime(registry, context, control)?;
+                } else if controller == component_ids::GBE {
+                    registry
+                        .get_resolved_mut(control.slots.gbe)?
+                        .complete(completion);
+                    drain_gbe(registry, context, control)?;
+                } else {
                     return Err(Ip32MachineDispatchError::UnexpectedController(controller));
                 }
-                crime_with_trace_interest(registry, context, control.slots.crime)?
-                    .complete(completion);
-                drain_crime(registry, context, control)?;
             }
             CrimeBusAction::ScheduleService { delay } => {
                 let event = registry
-                    .get_resolved(control.slots.cgi)?
-                    .next_scheduled_event();
+                    .get_resolved_mut(control.slots.cgi)?
+                    .next_scheduled_event()
+                    .expect("every CGI scheduling action must carry one event");
                 context.schedule_after(
                     delay,
                     component_ids::CRIME_GBE_LINK,
@@ -5184,6 +5332,78 @@ where
                 )?;
             }
             CrimeBusAction::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_gbe<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut Ip32DispatchContext<'_, '_, S>,
+    control: &mut MachineControl,
+) -> Result<(), Ip32MachineDispatchError>
+where
+    S: TraceSink,
+{
+    loop {
+        match registry.get_resolved_mut(control.slots.gbe)?.poll() {
+            GbePoll::Action(GbeAction::Schedule { delay, event }) => {
+                context.schedule_after(delay, component_ids::GBE, Ip32Event::Gbe(event))?;
+            }
+            GbePoll::Action(GbeAction::StartCgi(transaction)) => {
+                control.cgi_transactions = control.cgi_transactions.saturating_add(1);
+                route_cgi(registry, context, control.slots.cgi, transaction)?;
+            }
+            GbePoll::Action(GbeAction::SetDdc { bus, drive }) => {
+                context.request_barrier();
+                let index = if bus == component_ids::GBE_CRT_DDC_BUS {
+                    0
+                } else if bus == component_ids::GBE_FLAT_PANEL_DDC_BUS {
+                    1
+                } else {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(bus));
+                };
+                registry
+                    .get_resolved_mut(control.slots.gbe_ddc[index])?
+                    .route(drive)?;
+                drain_gbe_ddc_bus(registry, control, index)?;
+            }
+            GbePoll::Action(GbeAction::CompleteCgiDevice(completion)) => {
+                registry
+                    .get_resolved_mut(control.slots.cgi)?
+                    .accept_device_completion(component_ids::GBE, completion);
+                drain_cgi_bus(registry, context, control)?;
+            }
+            GbePoll::Action(GbeAction::PublishFrame(frame)) => {
+                if control.latest_display_frame.replace(frame).is_some() {
+                    control.dropped_display_frames =
+                        control.dropped_display_frames.saturating_add(1);
+                }
+            }
+            GbePoll::Action(GbeAction::Trace(event)) => trace_gbe(context, *event),
+            GbePoll::Idle => return Ok(()),
+        }
+    }
+}
+
+fn drain_gbe_ddc_bus(
+    registry: &mut ComponentRegistry,
+    control: &MachineControl,
+    index: usize,
+) -> Result<(), Ip32MachineDispatchError> {
+    loop {
+        match registry
+            .get_resolved_mut(control.slots.gbe_ddc[index])?
+            .poll()
+        {
+            TwoWireBusAction::Deliver { target, delivery } => {
+                if target != component_ids::GBE {
+                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                }
+                registry
+                    .get_resolved_mut(control.slots.gbe)?
+                    .observe_ddc(delivery);
+            }
+            TwoWireBusAction::Idle => return Ok(()),
         }
     }
 }
@@ -5278,6 +5498,37 @@ where
                     MaceTraceValue::U64(value) => TraceField::u64(field.key, value),
                     MaceTraceValue::Hex64(value) => TraceField::hex64(field.key, value),
                     MaceTraceValue::String(value) => TraceField::string(field.key, value),
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+}
+
+fn trace_gbe<S>(context: &mut Ip32DispatchContext<'_, '_, S>, event: GbeTraceEvent)
+where
+    S: TraceSink,
+{
+    let level = match event.level {
+        GbeTraceLevel::Error => TraceLevel::Error,
+        GbeTraceLevel::Warn => TraceLevel::Warn,
+        GbeTraceLevel::Info => TraceLevel::Info,
+        GbeTraceLevel::Debug => TraceLevel::Debug,
+        GbeTraceLevel::Trace => TraceLevel::Trace,
+    };
+    context.trace_lazy(
+        TraceSource::Component(component_ids::GBE),
+        level,
+        &event.target,
+        &event.event,
+        || {
+            event
+                .fields
+                .iter()
+                .map(|field| match &field.value {
+                    GbeTraceValue::Bool(value) => TraceField::bool(&field.key, *value),
+                    GbeTraceValue::U64(value) => TraceField::u64(&field.key, *value),
+                    GbeTraceValue::Hex64(value) => TraceField::hex64(&field.key, *value),
+                    GbeTraceValue::String(value) => TraceField::string(&field.key, value),
                 })
                 .collect::<Vec<_>>()
         },
