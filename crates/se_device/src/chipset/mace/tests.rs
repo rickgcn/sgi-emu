@@ -275,6 +275,35 @@ fn rtc_lane_access_is_forwarded_to_isa() {
 }
 
 #[test]
+fn mace_trace_targets_are_device_local() {
+    let mut mace = Mace::new(
+        component(15),
+        "MACE",
+        MaceConfig::default(),
+        wiring(),
+        1_000_000_000,
+    )
+    .expect("MACE must build");
+    let request = CrimeCmiTransaction {
+        id: CrimeTransactionId::new(1),
+        controller: component(1),
+        target: component(15),
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address: 0x1f3a_3707,
+            transfer: CrimeTransfer::read(1),
+        }),
+    };
+
+    BusDeviceRole::<CrimeCmiTransaction>::accept(&mut mace, request);
+    let MacePoll::Action(MaceAction::Trace(event)) = mace.poll().unwrap() else {
+        panic!("MACE must trace an accepted CMI request first");
+    };
+    assert_eq!(event.target, "mace.cmi");
+    assert_eq!(event.event, "pio");
+    assert!(!event.target.starts_with("ip32."));
+}
+
+#[test]
 fn uninterested_mace_does_not_construct_trace_actions() {
     let mut mace = Mace::new(
         component(15),

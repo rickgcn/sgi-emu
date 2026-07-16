@@ -7,3 +7,7 @@ authors.workspace = true
 
 [dependencies]
 serde.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+postcard.workspace = true

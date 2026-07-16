@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::scheduler::{RationalClockProjection, SimDuration, SimTime};
+use se_core::tracing::{OwnedTraceEvent, OwnedTraceField, OwnedTraceValue, TraceLevel};
 
 use crate::bus::two_wire::{TwoWireDrive, TwoWireLineDelivery};
 use crate::chipset::crime::protocol::{
@@ -25,7 +26,7 @@ use self::display::{
 };
 use self::protocol::{
     GbeAction, GbeEvent, GbeExternalClock, GbeExternalInput, GbeFrame, GbeFrameField,
-    GbeOutputPins, GbePoll, GbeTraceEvent, GbeTraceField, GbeTraceLevel, GbeTraceValue, GbeWiring,
+    GbeOutputPins, GbePoll, GbeWiring,
 };
 use self::registers::{
     COLOR_MAP_FIFO, DOT_CLOCK_RUN, GbeRegisters, RegisterWrite, VT_F2RF_LOCK, VT_FLAGS, VT_HBLANK,
@@ -1405,20 +1406,21 @@ impl Gbe {
 
     fn trace_dma_error(&mut self, event: &str, address: u64, length: usize) {
         self.actions
-            .push_back(GbeAction::Trace(Box::new(GbeTraceEvent {
-                level: GbeTraceLevel::Warn,
-                target: "gbe.dma".to_owned(),
-                event: event.to_owned(),
+            .push_back(GbeAction::Trace(Box::new(OwnedTraceEvent {
+                level: TraceLevel::Warn,
+                target: "gbe.dma".into(),
+                event: event.to_owned().into(),
                 fields: vec![
-                    GbeTraceField {
-                        key: "address".to_owned(),
-                        value: GbeTraceValue::Hex64(address),
+                    OwnedTraceField {
+                        key: "address".into(),
+                        value: OwnedTraceValue::Hex64(address),
                     },
-                    GbeTraceField {
-                        key: "length".to_owned(),
-                        value: GbeTraceValue::U64(length as u64),
+                    OwnedTraceField {
+                        key: "length".into(),
+                        value: OwnedTraceValue::U64(length as u64),
                     },
-                ],
+                ]
+                .into(),
             })));
     }
 
@@ -2168,6 +2170,33 @@ mod tests {
             postcard::to_stdvec(&restored.save_state()).unwrap(),
             encoded
         );
+    }
+
+    #[test]
+    fn serialized_state_preserves_device_local_trace_actions() {
+        let mut reference = gbe();
+        BusControllerRole::<CrimeCgiCompletion>::complete(
+            &mut reference,
+            CrimeCgiCompletion {
+                id: CrimeTransactionId::new(17),
+                result: Ok(CrimeCompletionPayload::WriteComplete),
+                memory_fault: None,
+            },
+        );
+
+        let encoded = postcard::to_stdvec(&reference.save_state()).unwrap();
+        let state: GbeState = postcard::from_bytes(&encoded).unwrap();
+        let mut restored = gbe();
+        restored.restore_state(state).unwrap();
+
+        let expected = reference.poll();
+        let actual = restored.poll();
+        assert_eq!(actual, expected);
+        assert!(matches!(
+            actual,
+            GbePoll::Action(GbeAction::Trace(event))
+                if event.target == "gbe.dma" && event.event == "unexpected-completion"
+        ));
     }
 
     #[test]

@@ -21,7 +21,9 @@ use std::collections::{BTreeSet, VecDeque};
 use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::scheduler::SimTime;
-use se_core::tracing::{TraceInterest, TraceLevel};
+use se_core::tracing::{
+    OwnedTraceEvent, OwnedTraceField, OwnedTraceFields, OwnedTraceValue, TraceInterest, TraceLevel,
+};
 
 use self::clock::CrimeClock;
 use self::config::{CrimeAccessPolicy, CrimeConfig, CrimeConfigError};
@@ -33,8 +35,7 @@ use self::protocol::{
     CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryCompletion, CrimeMemoryFault,
     CrimeMemoryInhibitReason, CrimeMemoryOutcome, CrimeMemoryTransaction, CrimePioRequest,
     CrimePoll, CrimeSdramSignal, CrimeSysAdCompletion, CrimeSysAdRequest, CrimeSysAdRoute,
-    CrimeTraceEvent, CrimeTraceField, CrimeTraceFields, CrimeTraceValue, CrimeTransactionId,
-    CrimeTransfer, CrimeTransferView,
+    CrimeTransactionId, CrimeTransfer, CrimeTransferView,
 };
 use self::render::{
     CrimeRender, CrimeRenderError, RenderAccessError, RenderInterruptEffect,
@@ -614,7 +615,7 @@ impl Crime {
 
     fn push_trace<F>(&mut self, build: F)
     where
-        F: FnOnce() -> CrimeTraceEvent,
+        F: FnOnce() -> OwnedTraceEvent,
     {
         if self.trace_interest != TraceInterest::None {
             self.actions
@@ -634,18 +635,18 @@ impl Crime {
         } = request;
         self.current_time = time;
         let size = transfer.length();
-        self.push_trace(|| CrimeTraceEvent {
+        self.push_trace(|| OwnedTraceEvent {
             level: TraceLevel::Trace,
-            target: trace::PIU_TARGET,
-            event: "sysad_request",
+            target: trace::PIU_TARGET.into(),
+            event: "sysad_request".into(),
             fields: [
-                CrimeTraceField {
-                    key: "physical_address",
-                    value: CrimeTraceValue::Hex64(address),
+                OwnedTraceField {
+                    key: "physical_address".into(),
+                    value: OwnedTraceValue::Hex64(address),
                 },
-                CrimeTraceField {
-                    key: "size",
-                    value: CrimeTraceValue::U64(size as u64),
+                OwnedTraceField {
+                    key: "size".into(),
+                    value: OwnedTraceValue::U64(size as u64),
                 },
             ]
             .into(),
@@ -763,33 +764,36 @@ impl Crime {
         } else {
             trace::RENDER_TARGET
         };
-        self.push_trace(|| CrimeTraceEvent {
+        self.push_trace(|| OwnedTraceEvent {
             level: if completion.is_err() {
                 TraceLevel::Warn
             } else {
                 TraceLevel::Trace
             },
-            target,
-            event: "register_access",
+            target: target.into(),
+            event: "register_access".into(),
             fields: [
-                CrimeTraceField {
-                    key: "physical_address",
-                    value: CrimeTraceValue::Hex64(address),
+                OwnedTraceField {
+                    key: "physical_address".into(),
+                    value: OwnedTraceValue::Hex64(address),
                 },
-                CrimeTraceField {
-                    key: "size",
-                    value: CrimeTraceValue::U64(size as u64),
+                OwnedTraceField {
+                    key: "size".into(),
+                    value: OwnedTraceValue::U64(size as u64),
                 },
-                CrimeTraceField {
-                    key: "operation",
-                    value: CrimeTraceValue::String(match transfer.view() {
-                        CrimeTransferView::Read { .. } => "read",
-                        CrimeTransferView::Write { .. } => "write",
-                    }),
+                OwnedTraceField {
+                    key: "operation".into(),
+                    value: OwnedTraceValue::String(
+                        (match transfer.view() {
+                            CrimeTransferView::Read { .. } => "read",
+                            CrimeTransferView::Write { .. } => "write",
+                        })
+                        .into(),
+                    ),
                 },
-                CrimeTraceField {
-                    key: "bus_error",
-                    value: CrimeTraceValue::Bool(completion.is_err()),
+                OwnedTraceField {
+                    key: "bus_error".into(),
+                    value: OwnedTraceValue::Bool(completion.is_err()),
                 },
             ]
             .into(),
@@ -1000,28 +1004,31 @@ impl Crime {
             RenderMemoryDestination::Pixel => "pixel",
         };
         if let CrimeMemoryBankSelect::Inhibited { reason } = request.bank_select {
-            self.push_trace(|| CrimeTraceEvent {
+            self.push_trace(|| OwnedTraceEvent {
                 level: TraceLevel::Debug,
-                target: trace::RENDER_TARGET,
-                event: "bank_select_inhibited",
+                target: trace::RENDER_TARGET.into(),
+                event: "bank_select_inhibited".into(),
                 fields: [
-                    CrimeTraceField {
-                        key: "reason",
-                        value: CrimeTraceValue::String(match reason {
-                            CrimeMemoryInhibitReason::InvalidRenderTlb => "invalid_render_tlb",
-                        }),
+                    OwnedTraceField {
+                        key: "reason".into(),
+                        value: OwnedTraceValue::String(
+                            (match reason {
+                                CrimeMemoryInhibitReason::InvalidRenderTlb => "invalid_render_tlb",
+                            })
+                            .into(),
+                        ),
                     },
-                    CrimeTraceField {
-                        key: "physical_address",
-                        value: CrimeTraceValue::Hex64(request.physical_address),
+                    OwnedTraceField {
+                        key: "physical_address".into(),
+                        value: OwnedTraceValue::Hex64(request.physical_address),
                     },
-                    CrimeTraceField {
-                        key: "operation",
-                        value: CrimeTraceValue::String(operation),
+                    OwnedTraceField {
+                        key: "operation".into(),
+                        value: OwnedTraceValue::String(operation.into()),
                     },
-                    CrimeTraceField {
-                        key: "destination",
-                        value: CrimeTraceValue::String(destination),
+                    OwnedTraceField {
+                        key: "destination".into(),
+                        value: OwnedTraceValue::String(destination.into()),
                     },
                 ]
                 .into(),
@@ -1042,26 +1049,26 @@ impl Crime {
     }
 
     fn trace_render_register_write(&mut self, address: u64, size: u8, value: u64) {
-        self.push_trace(|| CrimeTraceEvent {
+        self.push_trace(|| OwnedTraceEvent {
             level: TraceLevel::Trace,
-            target: trace::RENDER_TARGET,
-            event: "register_write",
+            target: trace::RENDER_TARGET.into(),
+            event: "register_write".into(),
             fields: [
-                CrimeTraceField {
-                    key: "physical_address",
-                    value: CrimeTraceValue::Hex64(address),
+                OwnedTraceField {
+                    key: "physical_address".into(),
+                    value: OwnedTraceValue::Hex64(address),
                 },
-                CrimeTraceField {
-                    key: "size",
-                    value: CrimeTraceValue::U64(u64::from(size)),
+                OwnedTraceField {
+                    key: "size".into(),
+                    value: OwnedTraceValue::U64(u64::from(size)),
                 },
-                CrimeTraceField {
-                    key: "value",
-                    value: CrimeTraceValue::Hex64(value),
+                OwnedTraceField {
+                    key: "value".into(),
+                    value: OwnedTraceValue::Hex64(value),
                 },
-                CrimeTraceField {
-                    key: "commit",
-                    value: CrimeTraceValue::Bool(
+                OwnedTraceField {
+                    key: "commit".into(),
+                    value: OwnedTraceValue::Bool(
                         (registers::CRIME_RENDER_BASE + 0x2800
                             ..registers::CRIME_RENDER_BASE + 0x2a00)
                             .contains(&address)
@@ -1076,17 +1083,17 @@ impl Crime {
     }
 
     fn trace_render_notice(&mut self, notice: RenderNotice) {
-        let (event, fields): (&'static str, CrimeTraceFields) = match notice {
+        let (event, fields): (&'static str, OwnedTraceFields) = match notice {
             RenderNotice::RegisterRetired(write) => (
                 "register_retired",
                 [
-                    CrimeTraceField {
-                        key: "physical_address",
-                        value: CrimeTraceValue::Hex64(write.address),
+                    OwnedTraceField {
+                        key: "physical_address".into(),
+                        value: OwnedTraceValue::Hex64(write.address),
                     },
-                    CrimeTraceField {
-                        key: "commit",
-                        value: CrimeTraceValue::Bool(write.commit),
+                    OwnedTraceField {
+                        key: "commit".into(),
+                        value: OwnedTraceValue::Bool(write.commit),
                     },
                 ]
                 .into(),
@@ -1094,13 +1101,13 @@ impl Crime {
             RenderNotice::JobCommitted { start, end } => (
                 "job_commit",
                 [
-                    CrimeTraceField {
-                        key: "start",
-                        value: CrimeTraceValue::Hex64(u64::from(start)),
+                    OwnedTraceField {
+                        key: "start".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(start)),
                     },
-                    CrimeTraceField {
-                        key: "end",
-                        value: CrimeTraceValue::Hex64(u64::from(end)),
+                    OwnedTraceField {
+                        key: "end".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(end)),
                     },
                 ]
                 .into(),
@@ -1114,25 +1121,25 @@ impl Crime {
             } => (
                 "pixel_command_commit",
                 [
-                    CrimeTraceField {
-                        key: "primitive",
-                        value: CrimeTraceValue::Hex64(u64::from(primitive)),
+                    OwnedTraceField {
+                        key: "primitive".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(primitive)),
                     },
-                    CrimeTraceField {
-                        key: "x0",
-                        value: CrimeTraceValue::U64(u64::from(x0)),
+                    OwnedTraceField {
+                        key: "x0".into(),
+                        value: OwnedTraceValue::U64(u64::from(x0)),
                     },
-                    CrimeTraceField {
-                        key: "y0",
-                        value: CrimeTraceValue::U64(u64::from(y0)),
+                    OwnedTraceField {
+                        key: "y0".into(),
+                        value: OwnedTraceValue::U64(u64::from(y0)),
                     },
-                    CrimeTraceField {
-                        key: "x1",
-                        value: CrimeTraceValue::U64(u64::from(x1)),
+                    OwnedTraceField {
+                        key: "x1".into(),
+                        value: OwnedTraceValue::U64(u64::from(x1)),
                     },
-                    CrimeTraceField {
-                        key: "y1",
-                        value: CrimeTraceValue::U64(u64::from(y1)),
+                    OwnedTraceField {
+                        key: "y1".into(),
+                        value: OwnedTraceValue::U64(u64::from(y1)),
                     },
                 ]
                 .into(),
@@ -1148,17 +1155,17 @@ impl Crime {
                     RenderMemoryDestination::Pixel => "pixel_chunk",
                 },
                 [
-                    CrimeTraceField {
-                        key: "virtual_address",
-                        value: CrimeTraceValue::Hex64(u64::from(virtual_address)),
+                    OwnedTraceField {
+                        key: "virtual_address".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(virtual_address)),
                     },
-                    CrimeTraceField {
-                        key: "physical_address",
-                        value: CrimeTraceValue::Hex64(physical_address),
+                    OwnedTraceField {
+                        key: "physical_address".into(),
+                        value: OwnedTraceValue::Hex64(physical_address),
                     },
-                    CrimeTraceField {
-                        key: "length",
-                        value: CrimeTraceValue::U64(u64::from(length)),
+                    OwnedTraceField {
+                        key: "length".into(),
+                        value: OwnedTraceValue::U64(u64::from(length)),
                     },
                 ]
                 .into(),
@@ -1174,17 +1181,17 @@ impl Crime {
                     RenderMemoryDestination::Pixel => "pixel_memory_complete",
                 },
                 [
-                    CrimeTraceField {
-                        key: "virtual_address",
-                        value: CrimeTraceValue::Hex64(u64::from(virtual_address)),
+                    OwnedTraceField {
+                        key: "virtual_address".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(virtual_address)),
                     },
-                    CrimeTraceField {
-                        key: "physical_address",
-                        value: CrimeTraceValue::Hex64(physical_address),
+                    OwnedTraceField {
+                        key: "physical_address".into(),
+                        value: OwnedTraceValue::Hex64(physical_address),
                     },
-                    CrimeTraceField {
-                        key: "length",
-                        value: CrimeTraceValue::U64(u64::from(length)),
+                    OwnedTraceField {
+                        key: "length".into(),
+                        value: OwnedTraceValue::U64(u64::from(length)),
                     },
                 ]
                 .into(),
@@ -1198,25 +1205,25 @@ impl Crime {
             } => (
                 "tlb_translate",
                 [
-                    CrimeTraceField {
-                        key: "virtual_address",
-                        value: CrimeTraceValue::Hex64(u64::from(virtual_address)),
+                    OwnedTraceField {
+                        key: "virtual_address".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(virtual_address)),
                     },
-                    CrimeTraceField {
-                        key: "raw_entry",
-                        value: CrimeTraceValue::Hex64(u64::from(raw_entry)),
+                    OwnedTraceField {
+                        key: "raw_entry".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(raw_entry)),
                     },
-                    CrimeTraceField {
-                        key: "valid",
-                        value: CrimeTraceValue::Bool(valid),
+                    OwnedTraceField {
+                        key: "valid".into(),
+                        value: OwnedTraceValue::Bool(valid),
                     },
-                    CrimeTraceField {
-                        key: "alias_address",
-                        value: CrimeTraceValue::Hex64(alias_address),
+                    OwnedTraceField {
+                        key: "alias_address".into(),
+                        value: OwnedTraceValue::Hex64(alias_address),
                     },
-                    CrimeTraceField {
-                        key: "physical_address",
-                        value: CrimeTraceValue::Hex64(physical_address),
+                    OwnedTraceField {
+                        key: "physical_address".into(),
+                        value: OwnedTraceValue::Hex64(physical_address),
                     },
                 ]
                 .into(),
@@ -1224,13 +1231,13 @@ impl Crime {
             RenderNotice::JobCompleted { start, end } => (
                 "job_complete",
                 [
-                    CrimeTraceField {
-                        key: "start",
-                        value: CrimeTraceValue::Hex64(u64::from(start)),
+                    OwnedTraceField {
+                        key: "start".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(start)),
                     },
-                    CrimeTraceField {
-                        key: "end",
-                        value: CrimeTraceValue::Hex64(u64::from(end)),
+                    OwnedTraceField {
+                        key: "end".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(end)),
                     },
                 ]
                 .into(),
@@ -1244,34 +1251,34 @@ impl Crime {
             } => (
                 "pixel_command_complete",
                 [
-                    CrimeTraceField {
-                        key: "primitive",
-                        value: CrimeTraceValue::Hex64(u64::from(primitive)),
+                    OwnedTraceField {
+                        key: "primitive".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(primitive)),
                     },
-                    CrimeTraceField {
-                        key: "x0",
-                        value: CrimeTraceValue::U64(u64::from(x0)),
+                    OwnedTraceField {
+                        key: "x0".into(),
+                        value: OwnedTraceValue::U64(u64::from(x0)),
                     },
-                    CrimeTraceField {
-                        key: "y0",
-                        value: CrimeTraceValue::U64(u64::from(y0)),
+                    OwnedTraceField {
+                        key: "y0".into(),
+                        value: OwnedTraceValue::U64(u64::from(y0)),
                     },
-                    CrimeTraceField {
-                        key: "x1",
-                        value: CrimeTraceValue::U64(u64::from(x1)),
+                    OwnedTraceField {
+                        key: "x1".into(),
+                        value: OwnedTraceValue::U64(u64::from(x1)),
                     },
-                    CrimeTraceField {
-                        key: "y1",
-                        value: CrimeTraceValue::U64(u64::from(y1)),
+                    OwnedTraceField {
+                        key: "y1".into(),
+                        value: OwnedTraceValue::U64(u64::from(y1)),
                     },
                 ]
                 .into(),
             ),
         };
-        self.push_trace(|| CrimeTraceEvent {
+        self.push_trace(|| OwnedTraceEvent {
             level: TraceLevel::Debug,
-            target: trace::RENDER_TARGET,
-            event,
+            target: trace::RENDER_TARGET.into(),
+            event: event.into(),
             fields,
         });
     }
@@ -1643,27 +1650,27 @@ impl Crime {
     }
 
     fn latch_render_error(&mut self, error: CrimeRenderError) {
-        let fields: CrimeTraceFields = match &error {
+        let fields: OwnedTraceFields = match &error {
             CrimeRenderError::UnsupportedPixelCommand {
                 trigger_address,
                 primitive,
                 draw_mode,
             } => [
-                CrimeTraceField {
-                    key: "kind",
-                    value: CrimeTraceValue::String("unsupported_pixel_command"),
+                OwnedTraceField {
+                    key: "kind".into(),
+                    value: OwnedTraceValue::String("unsupported_pixel_command".into()),
                 },
-                CrimeTraceField {
-                    key: "trigger_address",
-                    value: CrimeTraceValue::Hex64(*trigger_address),
+                OwnedTraceField {
+                    key: "trigger_address".into(),
+                    value: OwnedTraceValue::Hex64(*trigger_address),
                 },
-                CrimeTraceField {
-                    key: "primitive",
-                    value: CrimeTraceValue::Hex64(u64::from(*primitive)),
+                OwnedTraceField {
+                    key: "primitive".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*primitive)),
                 },
-                CrimeTraceField {
-                    key: "draw_mode",
-                    value: CrimeTraceValue::Hex64(u64::from(*draw_mode)),
+                OwnedTraceField {
+                    key: "draw_mode".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*draw_mode)),
                 },
             ]
             .into(),
@@ -1672,70 +1679,73 @@ impl Crime {
                 byte_mask,
                 foreground,
             } => [
-                CrimeTraceField {
-                    key: "kind",
-                    value: CrimeTraceValue::String("unsupported_mte_job"),
+                OwnedTraceField {
+                    key: "kind".into(),
+                    value: OwnedTraceValue::String("unsupported_mte_job".into()),
                 },
-                CrimeTraceField {
-                    key: "mode",
-                    value: CrimeTraceValue::Hex64(u64::from(*mode)),
+                OwnedTraceField {
+                    key: "mode".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*mode)),
                 },
-                CrimeTraceField {
-                    key: "byte_mask",
-                    value: CrimeTraceValue::Hex64(u64::from(*byte_mask)),
+                OwnedTraceField {
+                    key: "byte_mask".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*byte_mask)),
                 },
-                CrimeTraceField {
-                    key: "foreground",
-                    value: CrimeTraceValue::Hex64(u64::from(*foreground)),
+                OwnedTraceField {
+                    key: "foreground".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*foreground)),
                 },
             ]
             .into(),
             CrimeRenderError::InvalidMteRange { start, end } => [
-                CrimeTraceField {
-                    key: "kind",
-                    value: CrimeTraceValue::String("invalid_mte_range"),
+                OwnedTraceField {
+                    key: "kind".into(),
+                    value: OwnedTraceValue::String("invalid_mte_range".into()),
                 },
-                CrimeTraceField {
-                    key: "start",
-                    value: CrimeTraceValue::Hex64(u64::from(*start)),
+                OwnedTraceField {
+                    key: "start".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*start)),
                 },
-                CrimeTraceField {
-                    key: "end",
-                    value: CrimeTraceValue::Hex64(u64::from(*end)),
+                OwnedTraceField {
+                    key: "end".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*end)),
                 },
             ]
             .into(),
-            CrimeRenderError::UnexpectedMemoryCompletion => [CrimeTraceField {
-                key: "kind",
-                value: CrimeTraceValue::String("unexpected_memory_completion"),
+            CrimeRenderError::UnexpectedMemoryCompletion => [OwnedTraceField {
+                key: "kind".into(),
+                value: OwnedTraceValue::String("unexpected_memory_completion".into()),
             }]
             .into(),
-            CrimeRenderError::UnexpectedMemoryPayload => [CrimeTraceField {
-                key: "kind",
-                value: CrimeTraceValue::String("unexpected_memory_payload"),
+            CrimeRenderError::UnexpectedMemoryPayload => [OwnedTraceField {
+                key: "kind".into(),
+                value: OwnedTraceValue::String("unexpected_memory_payload".into()),
             }]
             .into(),
             CrimeRenderError::MemoryTransport(error) => [
-                CrimeTraceField {
-                    key: "kind",
-                    value: CrimeTraceValue::String("memory_transport"),
+                OwnedTraceField {
+                    key: "kind".into(),
+                    value: OwnedTraceValue::String("memory_transport".into()),
                 },
-                CrimeTraceField {
-                    key: "transport_error",
-                    value: CrimeTraceValue::String(match error {
-                        CrimeBusError::Address => "address",
-                        CrimeBusError::Access => "access",
-                        CrimeBusError::Unsupported => "unsupported",
-                        CrimeBusError::Timeout => "timeout",
-                    }),
+                OwnedTraceField {
+                    key: "transport_error".into(),
+                    value: OwnedTraceValue::String(
+                        (match error {
+                            CrimeBusError::Address => "address",
+                            CrimeBusError::Access => "access",
+                            CrimeBusError::Unsupported => "unsupported",
+                            CrimeBusError::Timeout => "timeout",
+                        })
+                        .into(),
+                    ),
                 },
             ]
             .into(),
         };
-        self.push_trace(|| CrimeTraceEvent {
+        self.push_trace(|| OwnedTraceEvent {
             level: TraceLevel::Error,
-            target: trace::RENDER_TARGET,
-            event: "render_error",
+            target: trace::RENDER_TARGET.into(),
+            event: "render_error".into(),
             fields,
         });
         self.latch_error(CrimeError::Render(error));

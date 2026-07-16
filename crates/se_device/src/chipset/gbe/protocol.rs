@@ -2,6 +2,7 @@
 
 use se_core::component::ComponentId;
 use se_core::scheduler::{SimDuration, SimTime};
+use se_core::tracing::OwnedTraceEvent;
 
 use crate::bus::two_wire::TwoWireDrive;
 use crate::chipset::crime::protocol::{CrimeCgiCompletion, CrimeCgiTransaction};
@@ -139,67 +140,6 @@ pub enum GbeEvent {
     },
 }
 
-/// Structured GBE trace value.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub enum GbeTraceValue {
-    /// Boolean value.
-    Bool(bool),
-
-    /// Unsigned integer value.
-    U64(u64),
-
-    /// Hexadecimal unsigned integer value.
-    Hex64(u64),
-
-    /// Owned text value.
-    String(String),
-}
-
-/// Structured GBE trace field.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct GbeTraceField {
-    /// Field name.
-    pub key: String,
-
-    /// Field value.
-    pub value: GbeTraceValue,
-}
-
-/// Structured GBE trace event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub enum GbeTraceLevel {
-    /// Error condition.
-    Error,
-
-    /// Suspicious condition.
-    Warn,
-
-    /// Notable lifecycle event.
-    Info,
-
-    /// Detailed diagnostic event.
-    Debug,
-
-    /// High-frequency low-level event.
-    Trace,
-}
-
-/// Structured GBE trace event.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct GbeTraceEvent {
-    /// Trace severity.
-    pub level: GbeTraceLevel,
-
-    /// Trace target.
-    pub target: String,
-
-    /// Event name.
-    pub event: String,
-
-    /// Ordered fields.
-    pub fields: Vec<GbeTraceField>,
-}
-
 /// Action emitted while polling GBE.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[allow(clippy::large_enum_variant)]
@@ -232,7 +172,7 @@ pub enum GbeAction {
     PublishFrame(GbeFrame),
 
     /// Emits structured diagnostic information.
-    Trace(Box<GbeTraceEvent>),
+    Trace(Box<OwnedTraceEvent>),
 }
 
 /// Result of polling GBE.

@@ -7,11 +7,16 @@
 //! Trace records are data, not callbacks. Emitting a trace record must not
 //! advance simulated time, dispatch events, or affect component behavior.
 
+use core::ops::Deref;
+use std::borrow::Cow;
+
+use smallvec::SmallVec;
+
 use crate::component::ComponentId;
 use crate::scheduler::SimTime;
 
 /// Importance level of a trace record.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum TraceLevel {
     /// An error condition was observed.
     Error,
@@ -74,6 +79,43 @@ pub enum TraceValue<'a> {
     Str(&'a str),
 }
 
+/// Owned structured value transported from a trace producer.
+///
+/// Text may borrow static data or own dynamically generated data, so producers
+/// do not need to allocate for stable trace names and values.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum OwnedTraceValue {
+    /// Boolean value.
+    Bool(bool),
+
+    /// Unsigned integer value.
+    U64(u64),
+
+    /// Unsigned integer value that should usually be displayed as hexadecimal.
+    Hex64(u64),
+
+    /// Static or owned string value.
+    String(Cow<'static, str>),
+
+    /// Signed integer value.
+    ///
+    /// This variant follows the original owned trace variants to preserve their
+    /// serialized discriminants.
+    I64(i64),
+}
+
+impl<'a> From<&'a OwnedTraceValue> for TraceValue<'a> {
+    fn from(value: &'a OwnedTraceValue) -> Self {
+        match value {
+            OwnedTraceValue::Bool(value) => Self::Bool(*value),
+            OwnedTraceValue::U64(value) => Self::U64(*value),
+            OwnedTraceValue::Hex64(value) => Self::Hex64(*value),
+            OwnedTraceValue::String(value) => Self::Str(value.as_ref()),
+            OwnedTraceValue::I64(value) => Self::I64(*value),
+        }
+    }
+}
+
 /// Single ordered key-value fact in a trace record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TraceField<'a> {
@@ -122,6 +164,143 @@ impl<'a> TraceField<'a> {
         Self {
             key,
             value: TraceValue::Str(value),
+        }
+    }
+}
+
+/// Single ordered owned key-value fact produced by a component.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct OwnedTraceField {
+    /// Stable or dynamically generated field name.
+    pub key: Cow<'static, str>,
+
+    /// Field value.
+    pub value: OwnedTraceValue,
+}
+
+impl OwnedTraceField {
+    /// Creates a boolean owned trace field.
+    pub fn bool(key: impl Into<Cow<'static, str>>, value: bool) -> Self {
+        Self {
+            key: key.into(),
+            value: OwnedTraceValue::Bool(value),
+        }
+    }
+
+    /// Creates an unsigned integer owned trace field.
+    pub fn u64(key: impl Into<Cow<'static, str>>, value: u64) -> Self {
+        Self {
+            key: key.into(),
+            value: OwnedTraceValue::U64(value),
+        }
+    }
+
+    /// Creates a signed integer owned trace field.
+    pub fn i64(key: impl Into<Cow<'static, str>>, value: i64) -> Self {
+        Self {
+            key: key.into(),
+            value: OwnedTraceValue::I64(value),
+        }
+    }
+
+    /// Creates a hexadecimal display hint owned trace field.
+    pub fn hex64(key: impl Into<Cow<'static, str>>, value: u64) -> Self {
+        Self {
+            key: key.into(),
+            value: OwnedTraceValue::Hex64(value),
+        }
+    }
+
+    /// Creates a static or owned string trace field.
+    pub fn string(key: impl Into<Cow<'static, str>>, value: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            key: key.into(),
+            value: OwnedTraceValue::String(value.into()),
+        }
+    }
+}
+
+impl<'a> From<&'a OwnedTraceField> for TraceField<'a> {
+    fn from(field: &'a OwnedTraceField) -> Self {
+        Self {
+            key: field.key.as_ref(),
+            value: (&field.value).into(),
+        }
+    }
+}
+
+/// Ordered owned trace fields with inline storage for common component events.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct OwnedTraceFields(SmallVec<[OwnedTraceField; 8]>);
+
+impl OwnedTraceFields {
+    /// Returns whether the fields spilled beyond inline storage.
+    pub fn spilled(&self) -> bool {
+        self.0.spilled()
+    }
+}
+
+impl Deref for OwnedTraceFields {
+    type Target = [OwnedTraceField];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<[OwnedTraceField]> for OwnedTraceFields {
+    fn as_ref(&self) -> &[OwnedTraceField] {
+        self
+    }
+}
+
+impl From<Vec<OwnedTraceField>> for OwnedTraceFields {
+    fn from(value: Vec<OwnedTraceField>) -> Self {
+        Self(SmallVec::from_vec(value))
+    }
+}
+
+impl<const N: usize> From<[OwnedTraceField; N]> for OwnedTraceFields {
+    fn from(value: [OwnedTraceField; N]) -> Self {
+        Self(value.into_iter().collect())
+    }
+}
+
+impl FromIterator<OwnedTraceField> for OwnedTraceFields {
+    fn from_iter<T: IntoIterator<Item = OwnedTraceField>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+/// Complete owned trace event transported from a component to its integration layer.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct OwnedTraceEvent {
+    /// Importance level.
+    pub level: TraceLevel,
+
+    /// Producer-local trace target.
+    pub target: Cow<'static, str>,
+
+    /// Stable or dynamically generated event name.
+    pub event: Cow<'static, str>,
+
+    /// Ordered fields.
+    pub fields: OwnedTraceFields,
+}
+
+impl OwnedTraceEvent {
+    /// Creates an owned trace event.
+    pub fn new(
+        level: TraceLevel,
+        target: impl Into<Cow<'static, str>>,
+        event: impl Into<Cow<'static, str>>,
+        fields: impl Into<OwnedTraceFields>,
+    ) -> Self {
+        Self {
+            level,
+            target: target.into(),
+            event: event.into(),
+            fields: fields.into(),
         }
     }
 }

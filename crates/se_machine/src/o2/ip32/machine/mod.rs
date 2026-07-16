@@ -13,7 +13,7 @@ use se_core::role::{BusControllerRole, BusDeviceRole, BusRole};
 use se_core::scheduler::FractionalClockProjection;
 use se_core::scheduler::{ScheduledEvent, ScheduledEventId, SchedulerError, SimDuration, SimTime};
 use se_core::tracing::{
-    NoopTraceSink, TraceField, TraceInterest, TraceLevel, TraceSink, TraceSource,
+    NoopTraceSink, OwnedTraceEvent, TraceField, TraceInterest, TraceLevel, TraceSink, TraceSource,
 };
 use se_device::bus::i2c::{I2cBus, I2cBusAction, I2cCompletion};
 use se_device::bus::irq::{
@@ -47,20 +47,17 @@ use se_device::chipset::crime::protocol::CrimeTransferView;
 use se_device::chipset::crime::protocol::{
     CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusAction, CrimeBusDisposition, CrimeCgiTransaction,
     CrimeCmiTransaction, CrimeCpuSignal, CrimeLinkDeviceResponse, CrimeMemoryTransaction,
-    CrimePoll, CrimeTraceEvent, CrimeTraceValue,
+    CrimePoll,
 };
 #[cfg(feature = "jit")]
 use se_device::chipset::crime::protocol::{CrimeSysAdRequest, CrimeSysAdRoute};
 use se_device::chipset::crime::{Crime, CrimeError};
 use se_device::chipset::gbe::Gbe;
 use se_device::chipset::gbe::protocol::{
-    GbeAction, GbeExternalInput, GbeFrame, GbeOutputPins, GbePoll, GbeTraceEvent, GbeTraceLevel,
-    GbeTraceValue, GbeWiring,
+    GbeAction, GbeExternalInput, GbeFrame, GbeOutputPins, GbePoll, GbeWiring,
 };
 use se_device::chipset::mace::config::{MaceConfig, MacePortConfig};
-use se_device::chipset::mace::protocol::{
-    MaceAction, MaceExternalLinks, MacePoll, MaceTraceEvent, MaceTraceValue, MaceWiring,
-};
+use se_device::chipset::mace::protocol::{MaceAction, MaceExternalLinks, MacePoll, MaceWiring};
 use se_device::chipset::mace::{
     MACE_IRQ_PARALLEL, MACE_IRQ_RTC, MACE_IRQ_SERIAL0, MACE_IRQ_SERIAL1, Mace, MaceError,
 };
@@ -145,6 +142,7 @@ const ISA_CYCLE_TICKS: u64 = 1_000;
 const PCI_CYCLE_TICKS: u64 = 30;
 const UART_INPUT_CLOCK_HZ: u64 = 22_000_000;
 const DEFAULT_CPU_CONTINUATION_QUANTUM: usize = 256;
+const TRACE_NAMESPACE: &str = "ip32";
 
 /// Complete construction input for one IP32 machine.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -3872,7 +3870,11 @@ where
                     .get_typed_mut::<CrimeSdram>(component_ids::RAM)?
                     .accept(signal);
             }
-            CrimeAction::Trace(event) => trace_crime(context, *event),
+            CrimeAction::Trace(event) => trace_device_event(
+                context,
+                TraceSource::Component(component_ids::CRIME),
+                *event,
+            ),
         }
     }
 }
@@ -4003,7 +4005,9 @@ where
                     .accept_device_completion(completion);
                 drain_cmi_bus(registry, context, control)?;
             }
-            MaceAction::Trace(event) => trace_mace(context, *event),
+            MaceAction::Trace(event) => {
+                trace_device_event(context, TraceSource::Component(component_ids::MACE), *event)
+            }
         }
     }
 }
@@ -4898,7 +4902,9 @@ where
                         control.dropped_display_frames.saturating_add(1);
                 }
             }
-            GbePoll::Action(GbeAction::Trace(event)) => trace_gbe(context, *event),
+            GbePoll::Action(GbeAction::Trace(event)) => {
+                trace_device_event(context, TraceSource::Component(component_ids::GBE), *event)
+            }
             GbePoll::Idle => return Ok(()),
         }
     }
@@ -4975,83 +4981,23 @@ where
     Ok(())
 }
 
-fn trace_crime<S>(context: &mut Ip32DispatchContext<'_, '_, S>, event: CrimeTraceEvent)
-where
+fn trace_device_event<S>(
+    context: &mut Ip32DispatchContext<'_, '_, S>,
+    source: TraceSource,
+    event: OwnedTraceEvent,
+) where
     S: TraceSink,
 {
-    context.trace_lazy(
-        TraceSource::Component(component_ids::CRIME),
-        event.level,
-        event.target,
-        event.event,
-        || {
-            event
-                .fields
-                .iter()
-                .map(|field| match field.value {
-                    CrimeTraceValue::Bool(value) => TraceField::bool(field.key, value),
-                    CrimeTraceValue::U64(value) => TraceField::u64(field.key, value),
-                    CrimeTraceValue::Hex64(value) => TraceField::hex64(field.key, value),
-                    CrimeTraceValue::String(value) => TraceField::string(field.key, value),
-                })
-                .collect::<Vec<_>>()
-        },
-    );
-}
-
-fn trace_mace<S>(context: &mut Ip32DispatchContext<'_, '_, S>, event: MaceTraceEvent)
-where
-    S: TraceSink,
-{
-    context.trace_lazy(
-        TraceSource::Component(component_ids::MACE),
-        event.level,
-        event.target,
-        event.event,
-        || {
-            event
-                .fields
-                .iter()
-                .map(|field| match field.value {
-                    MaceTraceValue::Bool(value) => TraceField::bool(field.key, value),
-                    MaceTraceValue::U64(value) => TraceField::u64(field.key, value),
-                    MaceTraceValue::Hex64(value) => TraceField::hex64(field.key, value),
-                    MaceTraceValue::String(value) => TraceField::string(field.key, value),
-                })
-                .collect::<Vec<_>>()
-        },
-    );
-}
-
-fn trace_gbe<S>(context: &mut Ip32DispatchContext<'_, '_, S>, event: GbeTraceEvent)
-where
-    S: TraceSink,
-{
-    let level = match event.level {
-        GbeTraceLevel::Error => TraceLevel::Error,
-        GbeTraceLevel::Warn => TraceLevel::Warn,
-        GbeTraceLevel::Info => TraceLevel::Info,
-        GbeTraceLevel::Debug => TraceLevel::Debug,
-        GbeTraceLevel::Trace => TraceLevel::Trace,
-    };
-    context.trace_lazy(
-        TraceSource::Component(component_ids::GBE),
+    let OwnedTraceEvent {
         level,
-        &event.target,
-        &event.event,
-        || {
-            event
-                .fields
-                .iter()
-                .map(|field| match &field.value {
-                    GbeTraceValue::Bool(value) => TraceField::bool(&field.key, *value),
-                    GbeTraceValue::U64(value) => TraceField::u64(&field.key, *value),
-                    GbeTraceValue::Hex64(value) => TraceField::hex64(&field.key, *value),
-                    GbeTraceValue::String(value) => TraceField::string(&field.key, value),
-                })
-                .collect::<Vec<_>>()
-        },
-    );
+        target: local_target,
+        event,
+        fields,
+    } = event;
+    let target = format!("{TRACE_NAMESPACE}.{local_target}");
+    context.trace_lazy(source, level, &target, event.as_ref(), || {
+        fields.iter().map(TraceField::from).collect::<Vec<_>>()
+    });
 }
 
 #[cfg(test)]

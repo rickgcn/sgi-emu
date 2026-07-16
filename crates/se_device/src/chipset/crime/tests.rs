@@ -92,6 +92,19 @@ fn uninterested_crime_does_not_construct_trace_actions() {
     assert!(saw_hardware_action);
 }
 
+#[test]
+fn crime_trace_targets_are_device_local() {
+    let mut crime = crime();
+    crime.accept_sysad(read(1, registers::ID, 8)).unwrap();
+
+    let CrimePoll::Action(CrimeAction::Trace(event)) = crime.poll().unwrap() else {
+        panic!("CRIME must trace an accepted SysAD request first");
+    };
+    assert_eq!(event.target, "crime.piu");
+    assert_eq!(event.event, "sysad_request");
+    assert!(!event.target.starts_with("ip32."));
+}
+
 fn retire_render_write(crime: &mut Crime, address: u64, size: u8, value: u64) {
     let progress = crime.render.write(address, size, value).unwrap();
     crime.apply_render_progress(progress).unwrap();
@@ -783,7 +796,8 @@ fn render_memory_transport_failure_is_terminal_and_traced() {
     });
     assert!(matches!(
         crime.actions.front(),
-        Some(CrimeAction::Trace(event)) if event.event == "render_error"
+        Some(CrimeAction::Trace(event))
+            if event.target == "crime.re" && event.event == "render_error"
     ));
     clear_actions(&mut crime);
     assert_eq!(

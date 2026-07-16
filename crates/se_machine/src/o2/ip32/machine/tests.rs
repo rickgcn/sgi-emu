@@ -1,4 +1,4 @@
-use se_core::role::BusDeviceRole;
+use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::tracing::{TraceInterest, TraceRecord, TraceSink, TraceSource, TraceValue};
 use se_device::bus::irq::{IrqBus, IrqTransaction};
 use se_device::bus::media::{MediaPayload, MediaPort};
@@ -8,13 +8,13 @@ use se_device::chipset::crime::config::{CrimeAccessPolicy, CrimeConfigError, Cri
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
 use se_device::chipset::crime::memory::bus::CrimeMemoryBus;
+use se_device::chipset::crime::protocol::{
+    CrimeCgiCompletion, CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryClient,
+    CrimeMemoryTransaction, CrimeTransactionId, CrimeTransfer,
+};
 #[cfg(feature = "jit")]
 use se_device::chipset::crime::protocol::{
     CrimeCgiTransaction, CrimeLinkDeviceResponse, CrimeLinkOperation, CrimePioRequest,
-};
-use se_device::chipset::crime::protocol::{
-    CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryTransaction,
-    CrimeTransactionId, CrimeTransfer,
 };
 use se_device::chipset::crime::registers;
 use se_device::chipset::gbe::Gbe;
@@ -90,6 +90,66 @@ impl TraceSink for ComponentCaptureSink {
             record.target.to_owned(),
             record.event.to_owned(),
         ));
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CapturedDeviceTraceValue {
+    Bool(bool),
+    U64(u64),
+    I64(i64),
+    Hex64(u64),
+    String(String),
+}
+
+impl From<TraceValue<'_>> for CapturedDeviceTraceValue {
+    fn from(value: TraceValue<'_>) -> Self {
+        match value {
+            TraceValue::Bool(value) => Self::Bool(value),
+            TraceValue::U64(value) => Self::U64(value),
+            TraceValue::I64(value) => Self::I64(value),
+            TraceValue::Hex64(value) => Self::Hex64(value),
+            TraceValue::Str(value) => Self::String(value.to_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CapturedDeviceTrace {
+    source: TraceSource,
+    target: String,
+    event: String,
+    fields: Vec<(String, CapturedDeviceTraceValue)>,
+}
+
+#[derive(Default)]
+struct DeviceTraceCaptureSink {
+    records: Vec<CapturedDeviceTrace>,
+}
+
+impl TraceSink for DeviceTraceCaptureSink {
+    fn interest(&self, source: TraceSource) -> TraceInterest {
+        if matches!(
+            source,
+            TraceSource::Component(component_ids::CRIME | component_ids::MACE | component_ids::GBE)
+        ) {
+            TraceInterest::All
+        } else {
+            TraceInterest::None
+        }
+    }
+
+    fn record(&mut self, record: TraceRecord<'_>) {
+        self.records.push(CapturedDeviceTrace {
+            source: record.source,
+            target: record.target.to_owned(),
+            event: record.event.to_owned(),
+            fields: record
+                .fields
+                .iter()
+                .map(|field| (field.key.to_owned(), field.value.into()))
+                .collect(),
+        });
     }
 }
 
@@ -1562,6 +1622,109 @@ fn scheduler_capture_forces_reference_dispatch_and_component_trace_order_is_pres
 }
 
 #[test]
+fn device_trace_events_receive_the_ip32_namespace_once() {
+    let config = config_with_program(&[
+        (0, LUI_R1_CRIME),
+        (4, LW_R3_R1),
+        (8, LUI_R1_MACE_ISA),
+        (12, ORI_R1_RTC_37),
+        (16, LBU_R3_R1),
+        (20, WAIT),
+    ]);
+    let mut machine =
+        Ip32Machine::from_config_with_trace_sink(config, DeviceTraceCaptureSink::default())
+            .unwrap();
+    machine.schedule_power_on().unwrap();
+    machine.run_steps(1).unwrap();
+
+    let gbe = machine
+        .runtime
+        .registry_mut()
+        .get_typed_mut::<Gbe>(component_ids::GBE)
+        .unwrap();
+    BusControllerRole::<CrimeCgiCompletion>::complete(
+        gbe,
+        CrimeCgiCompletion {
+            id: CrimeTransactionId::new(17),
+            result: Ok(CrimeCompletionPayload::WriteComplete),
+            memory_fault: None,
+        },
+    );
+    machine
+        .schedule_gbe_external_input(machine.runtime().now(), GbeExternalInput::SenseN(false))
+        .unwrap();
+    machine.run_until_time(SimTime::new(1_000_000)).unwrap();
+
+    let records = &machine.runtime().trace_recorder().sink().records;
+    let crime = records
+        .iter()
+        .find(|record| {
+            record.source == TraceSource::Component(component_ids::CRIME)
+                && record.target == "ip32.crime.piu"
+                && record.event == "sysad_request"
+                && record.fields.iter().any(|(key, value)| {
+                    key == "physical_address"
+                        && value == &CapturedDeviceTraceValue::Hex64(0x1400_0000)
+                })
+        })
+        .expect("CRIME must publish a namespaced SysAD request trace");
+    assert_eq!(
+        crime.fields,
+        vec![
+            (
+                "physical_address".to_owned(),
+                CapturedDeviceTraceValue::Hex64(0x1400_0000),
+            ),
+            ("size".to_owned(), CapturedDeviceTraceValue::U64(4)),
+        ]
+    );
+
+    let mace = records
+        .iter()
+        .find(|record| {
+            record.source == TraceSource::Component(component_ids::MACE)
+                && record.target == "ip32.mace.cmi"
+                && record.event == "pio"
+                && record.fields.iter().any(|(key, value)| {
+                    key == "address" && value == &CapturedDeviceTraceValue::Hex64(0x1f3a_3707)
+                })
+        })
+        .expect("MACE must publish a namespaced CMI trace");
+    assert_eq!(
+        mace.fields,
+        vec![
+            (
+                "address".to_owned(),
+                CapturedDeviceTraceValue::Hex64(0x1f3a_3707),
+            ),
+            ("width".to_owned(), CapturedDeviceTraceValue::U64(1)),
+            ("write".to_owned(), CapturedDeviceTraceValue::Bool(false),),
+        ]
+    );
+
+    let gbe = records
+        .iter()
+        .find(|record| {
+            record.source == TraceSource::Component(component_ids::GBE)
+                && record.target == "ip32.gbe.dma"
+                && record.event == "unexpected-completion"
+        })
+        .expect("GBE must publish a namespaced DMA trace");
+    assert_eq!(
+        gbe.fields,
+        vec![
+            ("address".to_owned(), CapturedDeviceTraceValue::Hex64(17),),
+            ("length".to_owned(), CapturedDeviceTraceValue::U64(0)),
+        ]
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.target.starts_with("ip32."))
+    );
+}
+
+#[test]
 fn synthetic_prom_clears_linear_a_range_through_the_render_memory_client() {
     let lui = |rt, immediate| i_type(0x0f, 0, rt, immediate);
     let ori = |rt, rs, immediate| i_type(0x0d, rs, rt, immediate);
@@ -1951,11 +2114,11 @@ impl TraceSink for PromDisplaySink {
         target: &str,
         _event: &str,
     ) -> bool {
-        target == "gbe.dma" || target == "ip32.crime.re"
+        target == "ip32.gbe.dma" || target == "ip32.crime.re"
     }
 
     fn record(&mut self, record: TraceRecord<'_>) {
-        if record.target == "gbe.dma" {
+        if record.target == "ip32.gbe.dma" {
             *self.dma_events.entry(record.event.to_owned()).or_default() += 1;
             return;
         }

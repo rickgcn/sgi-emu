@@ -15,7 +15,9 @@ use std::collections::VecDeque;
 use se_core::component::{Component, ComponentId};
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::scheduler::SimTime;
-use se_core::tracing::{TraceInterest, TraceLevel};
+use se_core::tracing::{
+    OwnedTraceEvent, OwnedTraceField, OwnedTraceValue, TraceInterest, TraceLevel,
+};
 
 use crate::bus::i2c::{I2cCompletion, I2cRate, I2cTransaction};
 use crate::bus::irq::{IrqDelivery, IrqInput};
@@ -38,9 +40,7 @@ use self::ethernet::MaceEthernet;
 use self::interrupt::{MaceInterruptController, MaceInterruptGroup};
 use self::pci::MacePci;
 use self::peripheral::{I2cPort, IsaController, MaceTimers, Ps2Port, Ps2PortAction};
-use self::protocol::{
-    MaceAction, MaceEvent, MacePoll, MaceTraceEvent, MaceTraceField, MaceTraceValue, MaceWiring,
-};
+use self::protocol::{MaceAction, MaceEvent, MacePoll, MaceWiring};
 use self::system::{MaceAddressTarget, MaceExternalIsaTarget};
 use self::video::VideoChannel;
 use crate::common::pending::{InlineMap16, InlineSet16};
@@ -294,7 +294,7 @@ impl Mace {
 
     fn push_trace<F>(&mut self, build: F)
     where
-        F: FnOnce() -> MaceTraceEvent,
+        F: FnOnce() -> OwnedTraceEvent,
     {
         if self.trace_interest != TraceInterest::None {
             self.actions.push_back(MaceAction::Trace(Box::new(build())));
@@ -422,13 +422,13 @@ impl Mace {
         }
         let port = transaction.port;
         self.host_inputs.push_back(transaction);
-        self.push_trace(|| MaceTraceEvent {
+        self.push_trace(|| OwnedTraceEvent {
             level: TraceLevel::Debug,
-            target: trace::MEDIA,
-            event: "host_input",
-            fields: [MaceTraceField {
-                key: "port",
-                value: MaceTraceValue::String(media_port_name(port)),
+            target: trace::MEDIA.into(),
+            event: "host_input".into(),
+            fields: [OwnedTraceField {
+                key: "port".into(),
+                value: OwnedTraceValue::String(media_port_name(port).into()),
             }]
             .into(),
         });
@@ -491,22 +491,22 @@ impl Mace {
         let Some(resolution) = system::resolve(request.address, request.transfer.length()) else {
             return complete_cmi_error(id, CrimeBusError::Address);
         };
-        self.push_trace(|| MaceTraceEvent {
+        self.push_trace(|| OwnedTraceEvent {
             level: TraceLevel::Trace,
-            target: trace::CMI,
-            event: "pio",
+            target: trace::CMI.into(),
+            event: "pio".into(),
             fields: [
-                MaceTraceField {
-                    key: "address",
-                    value: MaceTraceValue::Hex64(request.address),
+                OwnedTraceField {
+                    key: "address".into(),
+                    value: OwnedTraceValue::Hex64(request.address),
                 },
-                MaceTraceField {
-                    key: "width",
-                    value: MaceTraceValue::U64(request.transfer.length() as u64),
+                OwnedTraceField {
+                    key: "width".into(),
+                    value: OwnedTraceValue::U64(request.transfer.length() as u64),
                 },
-                MaceTraceField {
-                    key: "write",
-                    value: MaceTraceValue::Bool(matches!(
+                OwnedTraceField {
+                    key: "write".into(),
+                    value: OwnedTraceValue::Bool(matches!(
                         request.transfer.view(),
                         CrimeTransferView::Write { .. }
                     )),
@@ -1204,18 +1204,18 @@ impl Mace {
                 return;
             };
             self.pending_cmi.insert(id);
-            self.push_trace(|| MaceTraceEvent {
+            self.push_trace(|| OwnedTraceEvent {
                 level: TraceLevel::Debug,
-                target: trace::INTERRUPT,
-                event: "post",
+                target: trace::INTERRUPT.into(),
+                event: "post".into(),
                 fields: [
-                    MaceTraceField {
-                        key: "slot",
-                        value: MaceTraceValue::U64(u64::from(bit)),
+                    OwnedTraceField {
+                        key: "slot".into(),
+                        value: OwnedTraceValue::U64(u64::from(bit)),
                     },
-                    MaceTraceField {
-                        key: "asserted",
-                        value: MaceTraceValue::Bool(asserted),
+                    OwnedTraceField {
+                        key: "asserted".into(),
+                        value: OwnedTraceValue::Bool(asserted),
                     },
                 ]
                 .into(),

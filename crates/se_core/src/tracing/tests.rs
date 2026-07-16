@@ -171,6 +171,127 @@ fn field_constructors_build_expected_fields() {
 }
 
 #[test]
+fn owned_fields_borrow_every_supported_value() {
+    let dynamic_key = "dynamic_key".to_owned();
+    let dynamic_value = "dynamic_value".to_owned();
+    let fields: OwnedTraceFields = [
+        OwnedTraceField::bool("cached", true),
+        OwnedTraceField::u64("width", 4),
+        OwnedTraceField::hex64("address", 0x1fc0_0000),
+        OwnedTraceField::string("phase", "route"),
+        OwnedTraceField::i64("offset", -8),
+        OwnedTraceField::string(dynamic_key, dynamic_value),
+    ]
+    .into();
+    let borrowed = fields.iter().map(TraceField::from).collect::<Vec<_>>();
+
+    assert_eq!(
+        borrowed,
+        vec![
+            TraceField::bool("cached", true),
+            TraceField::u64("width", 4),
+            TraceField::hex64("address", 0x1fc0_0000),
+            TraceField::string("phase", "route"),
+            TraceField::i64("offset", -8),
+            TraceField::string("dynamic_key", "dynamic_value"),
+        ]
+    );
+}
+
+#[test]
+fn owned_trace_fields_inline_eight_entries() {
+    let fields: OwnedTraceFields = (0..8).map(|_| OwnedTraceField::u64("field", 0)).collect();
+    assert!(!fields.spilled());
+
+    let fields: OwnedTraceFields = (0..9).map(|_| OwnedTraceField::u64("field", 0)).collect();
+    assert!(fields.spilled());
+}
+
+#[test]
+fn owned_trace_event_round_trips_static_and_dynamic_text() {
+    let event = OwnedTraceEvent::new(
+        TraceLevel::Warn,
+        "gbe.dma",
+        "read-fault".to_owned(),
+        [
+            OwnedTraceField::hex64("address", 0x1234),
+            OwnedTraceField::string("reason", "transport".to_owned()),
+        ],
+    );
+
+    let encoded = postcard::to_stdvec(&event).unwrap();
+    let decoded: OwnedTraceEvent = postcard::from_bytes(&encoded).unwrap();
+
+    assert_eq!(decoded, event);
+}
+
+#[test]
+fn owned_trace_event_preserves_the_original_gbe_postcard_layout() {
+    #[allow(dead_code)]
+    #[derive(serde::Serialize)]
+    enum LegacyTraceLevel {
+        Error,
+        Warn,
+        Info,
+        Debug,
+        Trace,
+    }
+
+    #[allow(dead_code)]
+    #[derive(serde::Serialize)]
+    enum LegacyTraceValue {
+        Bool(bool),
+        U64(u64),
+        Hex64(u64),
+        String(String),
+    }
+
+    #[derive(serde::Serialize)]
+    struct LegacyTraceField {
+        key: String,
+        value: LegacyTraceValue,
+    }
+
+    #[derive(serde::Serialize)]
+    struct LegacyTraceEvent {
+        level: LegacyTraceLevel,
+        target: String,
+        event: String,
+        fields: Vec<LegacyTraceField>,
+    }
+
+    let legacy = LegacyTraceEvent {
+        level: LegacyTraceLevel::Warn,
+        target: "gbe.dma".to_owned(),
+        event: "read-fault".to_owned(),
+        fields: vec![
+            LegacyTraceField {
+                key: "address".to_owned(),
+                value: LegacyTraceValue::Hex64(0x1234),
+            },
+            LegacyTraceField {
+                key: "reason".to_owned(),
+                value: LegacyTraceValue::String("transport".to_owned()),
+            },
+        ],
+    };
+    let owned = OwnedTraceEvent::new(
+        TraceLevel::Warn,
+        "gbe.dma",
+        "read-fault",
+        [
+            OwnedTraceField::hex64("address", 0x1234),
+            OwnedTraceField::string("reason", "transport"),
+        ],
+    );
+
+    assert_eq!(
+        postcard::to_stdvec(&owned).unwrap(),
+        postcard::to_stdvec(&legacy).unwrap()
+    );
+}
+
+#[test]
 fn noop_recorder_discards_records_but_keeps_sequence() {
     let mut recorder = TraceRecorder::noop();
 
