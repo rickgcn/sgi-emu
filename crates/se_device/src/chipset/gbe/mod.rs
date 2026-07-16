@@ -188,7 +188,7 @@ pub struct Gbe {
     capture_writes_remaining: usize,
 }
 
-crate::component_state!(GbeState, Gbe);
+se_core::component_state!(GbeState, Gbe);
 
 impl Gbe {
     /// Creates a reset GBE with no connected external clocks or monitor endpoint.

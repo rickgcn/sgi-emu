@@ -93,7 +93,7 @@ pub struct CrimeMemoryBus {
     actions: VecDeque<CrimeBusAction<CrimeMemoryTransaction, CrimeMemoryCompletion>>,
 }
 
-crate::component_state!(CrimeMemoryBusState, CrimeMemoryBus);
+se_core::component_state!(CrimeMemoryBusState, CrimeMemoryBus);
 
 impl CrimeMemoryBus {
     /// Creates a memory domain with machine-calculated CRIME timing.

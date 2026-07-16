@@ -9,38 +9,6 @@ use se_device::chipset::crime::protocol::CrimeBusDisposition;
 use se_device::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransaction};
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 
-macro_rules! component_state {
-    ($state:ident, $component:ty) => {
-        #[doc = "Serializable deterministic component state."]
-        #[derive(Clone, serde::Deserialize, serde::Serialize)]
-        pub struct $state($component);
-
-        impl $component {
-            #[doc = "Captures all hardware-visible and in-flight component state."]
-            pub fn save_state(&self) -> $state {
-                $state(self.clone())
-            }
-
-            #[doc = "Restores validated component state without changing topology identity."]
-            pub fn restore_state(
-                &mut self,
-                state: $state,
-            ) -> Result<(), se_device::state::DeviceStateError> {
-                let expected = Component::id(self);
-                let actual = Component::id(&state.0);
-                if actual != expected {
-                    return Err(se_device::state::DeviceStateError::ComponentIdMismatch {
-                        expected,
-                        actual,
-                    });
-                }
-                *self = state.0;
-                Ok(())
-            }
-        }
-    };
-}
-
 /// Scheduled SysAD bus event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Ip32SysAdBusEvent {
@@ -178,7 +146,7 @@ pub struct Ip32SysAdBus {
     actions: VecDeque<Ip32SysAdBusAction>,
 }
 
-component_state!(Ip32SysAdBusState, Ip32SysAdBus);
+se_core::component_state!(Ip32SysAdBusState, Ip32SysAdBus);
 
 impl Ip32SysAdBus {
     /// Creates a SysAD domain connecting one CPU controller to CRIME.
@@ -415,7 +383,7 @@ pub struct Ip32StubEndpoint {
     name: String,
 }
 
-component_state!(Ip32StubEndpointState, Ip32StubEndpoint);
+se_core::component_state!(Ip32StubEndpointState, Ip32StubEndpoint);
 
 impl Ip32StubEndpoint {
     /// Creates an identity-only endpoint.

@@ -163,7 +163,7 @@ pub struct CrimeCmiBus {
     inner: LinkBus<CrimeCmiTransaction, CrimeCmiCompletion>,
 }
 
-crate::component_state!(CrimeCmiBusState, CrimeCmiBus);
+se_core::component_state!(CrimeCmiBusState, CrimeCmiBus);
 
 impl CrimeCmiBus {
     /// Creates a CMI domain.
@@ -311,7 +311,7 @@ pub struct CrimeCgiBus {
     actions: VecDeque<CrimeBusAction<CrimeCgiTransaction, CrimeCgiCompletion>>,
 }
 
-crate::component_state!(CrimeCgiBusState, CrimeCgiBus);
+se_core::component_state!(CrimeCgiBusState, CrimeCgiBus);
 
 impl CrimeCgiBus {
     /// Creates a CGI domain.

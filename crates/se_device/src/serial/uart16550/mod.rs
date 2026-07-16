@@ -155,7 +155,7 @@ pub struct Uart16550 {
     actions: VecDeque<Uart16550Action>,
 }
 
-crate::component_state!(Uart16550State, Uart16550);
+se_core::component_state!(Uart16550State, Uart16550);
 
 impl Uart16550 {
     /// Creates a reset UART.

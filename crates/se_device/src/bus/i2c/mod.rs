@@ -58,7 +58,7 @@ pub struct I2cBus {
     actions: VecDeque<I2cBusAction>,
 }
 
-crate::component_state!(I2cBusState, I2cBus);
+se_core::component_state!(I2cBusState, I2cBus);
 
 impl I2cBus {
     pub fn new(id: ComponentId, name: impl Into<String>) -> Self {

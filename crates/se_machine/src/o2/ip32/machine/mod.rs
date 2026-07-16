@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "jit")]
 use std::hash::{BuildHasherDefault, Hasher};
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{Component, ComponentId, ComponentStateError};
 use se_core::role::{BusControllerRole, BusDeviceRole, BusRole};
 #[cfg(feature = "jit")]
 use se_core::scheduler::FractionalClockProjection;
@@ -2109,7 +2109,7 @@ fn restore_component<T, State>(
     registry: &mut ComponentRegistry,
     id: ComponentId,
     state: State,
-    restore: fn(&mut T, State) -> Result<(), se_device::state::DeviceStateError>,
+    restore: fn(&mut T, State) -> Result<(), ComponentStateError>,
 ) -> Result<(), Ip32StateError>
 where
     T: Component,
@@ -2120,7 +2120,7 @@ where
             .map_err(Ip32StateError::Registry)?,
         state,
     )
-    .map_err(Ip32StateError::Device)
+    .map_err(Ip32StateError::Component)
 }
 
 impl<S> Ip32Machine<S>

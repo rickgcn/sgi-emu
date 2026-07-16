@@ -164,7 +164,7 @@ pub struct Ds2502 {
     actions: VecDeque<Ds2502Action>,
 }
 
-crate::component_state!(Ds2502State, Ds2502);
+se_core::component_state!(Ds2502State, Ds2502);
 
 impl Ds2502 {
     /// Creates a DS2502 with immutable ROM and EPROM data.

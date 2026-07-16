@@ -236,7 +236,7 @@ pub enum Ip32StateError {
     /// System Flash state is internally inconsistent.
     SystemFlash(SystemFlashStateError),
     /// A component state belongs to a different fixed topology identity.
-    Device(se_device::state::DeviceStateError),
+    Component(se_core::component::ComponentStateError),
     /// The machine could not be constructed from saved configuration.
     Build(super::machine::Ip32MachineBuildError),
 }
@@ -254,7 +254,7 @@ impl fmt::Display for Ip32StateError {
             Self::Scheduler(error) => error.fmt(formatter),
             Self::Rtc(error) => error.fmt(formatter),
             Self::SystemFlash(error) => error.fmt(formatter),
-            Self::Device(error) => error.fmt(formatter),
+            Self::Component(error) => error.fmt(formatter),
             Self::Build(error) => error.fmt(formatter),
         }
     }
@@ -350,8 +350,8 @@ mod tests {
 
         assert!(matches!(
             Ip32Machine::from_state_with_trace_sink(config, state, se_core::tracing::NoopTraceSink,),
-            Err(Ip32StateError::Device(
-                se_device::state::DeviceStateError::ComponentIdMismatch { .. }
+            Err(Ip32StateError::Component(
+                se_core::component::ComponentStateError::ComponentIdMismatch { .. }
             ))
         ));
     }

@@ -108,7 +108,7 @@ pub struct OneWireBus {
     actions: VecDeque<OneWireBusAction>,
 }
 
-crate::component_state!(OneWireBusState, OneWireBus);
+se_core::component_state!(OneWireBusState, OneWireBus);
 
 impl OneWireBus {
     /// Creates a bus with a fixed participant list.

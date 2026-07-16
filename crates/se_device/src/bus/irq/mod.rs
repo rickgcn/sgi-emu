@@ -176,7 +176,7 @@ pub struct IrqBus {
     actions: VecDeque<IrqBusAction>,
 }
 
-crate::component_state!(IrqBusState, IrqBus);
+se_core::component_state!(IrqBusState, IrqBus);
 
 impl IrqBus {
     /// Creates an interrupt bus with a fixed routing table.

@@ -2,15 +2,13 @@
 
 use core::fmt;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{Component, ComponentId, ComponentStateError};
 use se_core::role::BusDeviceRole;
 
 use crate::bus::isa::{
     IsaBusError, IsaCompletion, IsaCompletionPayload, IsaDeviceResponse, IsaTransaction,
     IsaTransferView,
 };
-use crate::state::DeviceStateError;
-
 /// One contiguous range whose current contents differ from the base image.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct SystemFlashChange {
@@ -69,7 +67,7 @@ pub struct SystemFlashState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SystemFlashStateError {
     /// State belongs to another fixed-topology component.
-    Device(DeviceStateError),
+    Component(ComponentStateError),
     /// The state was created for a differently sized base image.
     ImageSizeMismatch { expected: u64, actual: u64 },
     /// A changed range contains no bytes.
@@ -85,7 +83,7 @@ pub enum SystemFlashStateError {
 impl fmt::Display for SystemFlashStateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Device(error) => error.fmt(formatter),
+            Self::Component(error) => error.fmt(formatter),
             Self::ImageSizeMismatch { expected, actual } => write!(
                 formatter,
                 "system flash state image size mismatch: expected {expected}, got {actual}"
@@ -169,8 +167,8 @@ impl SystemFlash {
     /// Restores exact component state after validating topology identity and ranges.
     pub fn restore_state(&mut self, state: SystemFlashState) -> Result<(), SystemFlashStateError> {
         if state.id != self.id {
-            return Err(SystemFlashStateError::Device(
-                DeviceStateError::ComponentIdMismatch {
+            return Err(SystemFlashStateError::Component(
+                ComponentStateError::ComponentIdMismatch {
                     expected: self.id,
                     actual: state.id,
                 },

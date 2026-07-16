@@ -347,7 +347,7 @@ pub struct IsaBus {
     actions: VecDeque<IsaBusAction>,
 }
 
-crate::component_state!(IsaBusState, IsaBus);
+se_core::component_state!(IsaBusState, IsaBus);
 
 impl IsaBus {
     /// Creates an ISA domain with a fixed visible bus-cycle delay.

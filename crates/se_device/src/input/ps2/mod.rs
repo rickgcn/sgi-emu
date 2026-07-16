@@ -655,7 +655,7 @@ pub struct Ps2Keyboard {
     actions: VecDeque<Ps2KeyboardAction>,
 }
 
-crate::component_state!(Ps2KeyboardState, Ps2Keyboard);
+se_core::component_state!(Ps2KeyboardState, Ps2Keyboard);
 
 /// Standard three-button PS/2 mouse.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -684,7 +684,7 @@ pub struct Ps2Mouse {
     actions: VecDeque<Ps2MouseAction>,
 }
 
-crate::component_state!(Ps2MouseState, Ps2Mouse);
+se_core::component_state!(Ps2MouseState, Ps2Mouse);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum KeyboardParameter {

@@ -267,7 +267,7 @@ impl CrimeSynchronousReadSnapshot {
     }
 }
 
-crate::component_state!(CrimeState, Crime);
+se_core::component_state!(CrimeState, Crime);
 
 const fn default_trace_interest() -> TraceInterest {
     TraceInterest::All

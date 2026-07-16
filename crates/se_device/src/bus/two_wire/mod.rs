@@ -121,7 +121,7 @@ pub struct TwoWireBus {
     actions: VecDeque<TwoWireBusAction>,
 }
 
-crate::component_state!(TwoWireBusState, TwoWireBus);
+se_core::component_state!(TwoWireBusState, TwoWireBus);
 
 impl TwoWireBus {
     /// Creates a bus with a fixed participant list.

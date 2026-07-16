@@ -164,7 +164,7 @@ pub struct Mace {
     host_outputs: VecDeque<MediaTransaction>,
 }
 
-crate::component_state!(MaceState, Mace);
+se_core::component_state!(MaceState, Mace);
 
 const fn default_trace_interest() -> TraceInterest {
     TraceInterest::All

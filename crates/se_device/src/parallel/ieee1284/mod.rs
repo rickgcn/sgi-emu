@@ -35,7 +35,7 @@ pub struct Ieee1284 {
     actions: VecDeque<Ieee1284Action>,
 }
 
-crate::component_state!(Ieee1284State, Ieee1284);
+se_core::component_state!(Ieee1284State, Ieee1284);
 
 impl Ieee1284 {
     /// Creates a reset parallel port.

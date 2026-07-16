@@ -85,7 +85,7 @@ pub struct MediaBus {
     queue: VecDeque<MediaBusAction>,
 }
 
-crate::component_state!(MediaBusState, MediaBus);
+se_core::component_state!(MediaBusState, MediaBus);
 
 impl MediaBus {
     pub fn new(id: ComponentId, name: impl Into<String>) -> Self {

@@ -195,7 +195,7 @@ where
     reusable_block_frame: R5000ReusableBlockFrame,
 }
 
-crate::component_state!(R5000CpuState, R5000Cpu);
+se_core::component_state!(R5000CpuState, R5000Cpu);
 
 impl R5000Cpu<SoftFloat3Backend> {
     /// Creates an R5000 using SoftFloat 3e as its reference FPU backend.

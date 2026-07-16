@@ -119,7 +119,7 @@ pub struct CrimeSdram {
     replacement: u8,
 }
 
-crate::component_state!(CrimeSdramState, CrimeSdram);
+se_core::component_state!(CrimeSdramState, CrimeSdram);
 
 impl CrimeSdram {
     /// Creates zero-filled SDRAM from an explicit physical topology.

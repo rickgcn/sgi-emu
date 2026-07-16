@@ -95,7 +95,7 @@ pub struct PciBus {
     actions: VecDeque<PciBusAction>,
 }
 
-crate::component_state!(PciBusState, PciBus);
+se_core::component_state!(PciBusState, PciBus);
 
 /// Protocol-correct PCI configuration endpoint with no device engine.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -106,7 +106,7 @@ pub struct PciConfigurationEndpoint {
     configuration: [u8; 256],
 }
 
-crate::component_state!(PciConfigurationEndpointState, PciConfigurationEndpoint);
+se_core::component_state!(PciConfigurationEndpointState, PciConfigurationEndpoint);
 
 impl PciConfigurationEndpoint {
     /// Creates an enumerable PCI function.
