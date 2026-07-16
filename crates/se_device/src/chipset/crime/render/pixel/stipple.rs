@@ -20,12 +20,14 @@ impl PixelStippleMode {
     }
 }
 
-/// Cursor for the proven, non-repeating stipple subset.
+/// Cursor for line and polygon stipple repetition and wrap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct PixelStippleCursor {
     pattern: u32,
     index: u8,
     max_index: u8,
+    repeat_count: u8,
+    max_repeat: u8,
 }
 
 impl PixelStippleCursor {
@@ -34,6 +36,8 @@ impl PixelStippleCursor {
             pattern,
             index: mode.index,
             max_index: mode.max_index,
+            repeat_count: mode.repeat_count,
+            max_repeat: mode.max_repeat,
         }
     }
 
@@ -42,12 +46,23 @@ impl PixelStippleCursor {
     }
 
     pub(crate) fn permits(self, candidate_offset: u16) -> bool {
-        let index = u16::from(self.index) + candidate_offset;
-        debug_assert!(index <= 31);
-        self.pattern & (1_u32 << (31 - index)) != 0
+        let mut cursor = self;
+        cursor.advance(candidate_offset);
+        cursor.pattern & (1_u32 << (31 - cursor.index)) != 0
     }
 
     pub(crate) fn advance(&mut self, candidates: u16) {
-        self.index = self.index.saturating_add(candidates as u8);
+        for _ in 0..candidates {
+            if self.repeat_count < self.max_repeat {
+                self.repeat_count += 1;
+            } else {
+                self.repeat_count = 0;
+                self.index = if self.index >= self.max_index {
+                    0
+                } else {
+                    self.index + 1
+                };
+            }
+        }
     }
 }

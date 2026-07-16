@@ -1102,23 +1102,202 @@ fn prom_ci8_flat_rectangle_supports_evidence_backed_descending_rows() {
 }
 
 #[test]
-fn prom_zero_rectangle_rejects_nonzero_foreground() {
+fn flat_rectangle_accepts_nonzero_foreground() {
     let mut render = CrimeRender::new();
     configure_prom_ci8_zero_rectangle(&mut render, 31, 1);
     queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x0d0, 4, 1);
     render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
 
-    let error = render.step().unwrap_err();
-    assert!(matches!(
-        error,
-        CrimeRenderError::UnsupportedPixelCommand {
-            trigger_address: PIXEL_PIPE_NULL,
-            primitive: 0x0302_0000,
-            draw_mode: 0x0000_00f8,
-            ref blockers,
-            ..
-        } if blockers.iter().any(|blocker| blocker.capability == PixelCapability::ZeroRectangleColor)
-    ));
+    let progress = render.step().unwrap();
+    let request = progress.memory_request.unwrap();
+    let CrimeTransferView::Write { data, byte_enable } = request.transfer.view() else {
+        panic!("flat rectangle emitted a read")
+    };
+    assert_eq!(data, vec![1; 32]);
+    assert!(byte_enable.iter().all(|enabled| enabled));
+}
+
+#[test]
+fn point_reverse_line_triangle_and_flush_are_executable() {
+    let mut point = CrimeRender::new();
+    configure_x_line(&mut point, 0x1122_3344, 3, 4, 3, 4);
+    queue_and_retire(&mut point, PIXEL_PIPE_BASE + 0x060, 4, 0);
+    point.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+    assert_eq!(collect_pixel_writes(&mut point).len(), 1);
+
+    let mut line = CrimeRender::new();
+    configure_x_line(&mut line, 0x1122_3344, 3, 3, 0, 0);
+    queue_and_retire(
+        &mut line,
+        PIXEL_PIPE_BASE + 0x060,
+        4,
+        u64::from(0x0104_0020_u32),
+    );
+    line.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+    let writes = collect_pixel_writes(&mut line);
+    assert_eq!(writes.len(), 3);
+
+    let mut triangle = CrimeRender::new();
+    configure_x_line(&mut triangle, 0xff00_00ff, 0, 0, 2, 0);
+    queue_and_retire(&mut triangle, PIXEL_PIPE_BASE + 0x078, 4, u64::from(2_u32));
+    queue_and_retire(
+        &mut triangle,
+        PIXEL_PIPE_BASE + 0x060,
+        4,
+        u64::from(0x0200_0000_u32),
+    );
+    triangle
+        .write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0)
+        .unwrap();
+    assert!(!collect_pixel_writes(&mut triangle).is_empty());
+
+    let mut flush = CrimeRender::new();
+    configure_x_line(&mut flush, 0, 0, 0, 0, 0);
+    queue_and_retire(
+        &mut flush,
+        PIXEL_PIPE_BASE + 0x060,
+        4,
+        u64::from(0x0400_0000_u32),
+    );
+    flush.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+    assert!(collect_pixel_writes(&mut flush).is_empty());
+}
+
+#[test]
+fn all_rectangle_traversal_directions_follow_edge_type() {
+    for (edge_type, expected_first) in [
+        (0_u32, (1_u16, 2_u16)),
+        (1, (2, 2)),
+        (2, (1, 1)),
+        (3, (2, 1)),
+    ] {
+        let mut render = CrimeRender::new();
+        configure_x_line(&mut render, 0x0102_0304, 1, 1, 2, 2);
+        queue_and_retire(
+            &mut render,
+            PIXEL_PIPE_BASE + 0x060,
+            4,
+            u64::from(0x0300_0000 | edge_type << 16),
+        );
+        render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+        let first = retire(&mut render).memory_request.unwrap();
+        assert_eq!(
+            first.virtual_address,
+            u32::from(expected_first.1) << 16 | u32::from(expected_first.0)
+        );
+    }
+}
+
+#[test]
+fn scissor_screen_mask_and_window_offset_filter_candidates() {
+    let mut render = CrimeRender::new();
+    configure_x_line(&mut render, 0x1122_3344, 0, 0, 3, 0);
+    let rectangle = 1_u64 << 48 | 3_u64 << 16 | 1;
+    let screen_mask = 2_u64 << 48 | 4_u64 << 16 | 1;
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x048, 8, rectangle);
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x020, 8, screen_mask);
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x010, 4, 1 << 9 | 1 << 4);
+    queue_and_retire(
+        &mut render,
+        PIXEL_PIPE_BASE + 0x018,
+        4,
+        u64::from(0x0010_02f8_u32),
+    );
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x058, 4, 1_u64 << 16);
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let writes = collect_pixel_writes(&mut render);
+    assert_eq!(writes.len(), 1);
+    let (_, _, enables) = &writes[0];
+    assert_eq!(enables.iter().filter(|enabled| **enabled).count(), 2 * 4);
+}
+
+#[test]
+fn opaque_repeating_stipple_writes_background_and_wraps() {
+    let mut render = CrimeRender::new();
+    configure_stippled_line(
+        &mut render,
+        StippledLineConfig {
+            buffer_mode: 0,
+            color: 0xaa,
+            x0: 0,
+            y: 0,
+            x1: 3,
+            stipple_mode: 1 << 16 | 1,
+            pattern: 1 << 31,
+        },
+    );
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x0d8, 4, 0x55);
+    queue_and_retire(
+        &mut render,
+        PIXEL_PIPE_BASE + 0x018,
+        4,
+        u64::from(0x000a_02f8_u32),
+    );
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let writes = collect_pixel_writes(&mut render);
+    assert_eq!(writes.len(), 1);
+    let (_, data, enables) = &writes[0];
+    assert_eq!(enables.iter().filter(|enabled| **enabled).count(), 4);
+    assert_eq!(&data[28..32], [0xaa, 0xaa, 0x55, 0x55]);
+}
+
+#[test]
+fn gl_point_uses_six_bit_subpixel_coordinates() {
+    let mut render = CrimeRender::new();
+    configure_x_line(&mut render, 0x1122_3344, 0, 0, 0, 0);
+    queue_and_retire(
+        &mut render,
+        PIXEL_PIPE_BASE + 0x018,
+        4,
+        u64::from(0x0040_02f8_u32),
+    );
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x080, 4, 96);
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x084, 4, 2 * 64 + 32);
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x060, 4, 0);
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let request = retire(&mut render).memory_request.unwrap();
+    assert_eq!(request.virtual_address, 2 << 16 | 1);
+}
+
+#[test]
+fn clipped_candidates_still_advance_line_stipple_cursor() {
+    let mut render = CrimeRender::new();
+    configure_stippled_line(
+        &mut render,
+        StippledLineConfig {
+            buffer_mode: 0,
+            color: 0xaa,
+            x0: 0,
+            y: 0,
+            x1: 3,
+            stipple_mode: 3 << 16,
+            pattern: 1 << 29,
+        },
+    );
+    let scissor = 2_u64 << 48 | 4_u64 << 16 | 1;
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x048, 8, scissor);
+    queue_and_retire(
+        &mut render,
+        PIXEL_PIPE_BASE + 0x018,
+        4,
+        u64::from(0x0018_02f8_u32),
+    );
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let writes = collect_pixel_writes(&mut render);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0]
+            .2
+            .iter()
+            .enumerate()
+            .filter_map(|(index, enabled)| enabled.then_some(index))
+            .collect::<Vec<_>>(),
+        [30]
+    );
 }
 
 #[test]

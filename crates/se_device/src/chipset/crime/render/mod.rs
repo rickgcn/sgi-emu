@@ -13,10 +13,7 @@ use pixel::command::{
     DecodedPixelCommand, PixelCommandSnapshot, PixelCommandValidation, PixelPrimitiveKind,
     PixelRegisters,
 };
-use pixel::raster::{
-    AxisLineDirection, AxisLineRasterizer, InclusiveRectangleRasterizer, Rasterizer,
-    RectangleRowDirection,
-};
+use pixel::raster::Rasterizer;
 use pixel::stipple::PixelStippleCursor;
 const INTERFACE_DATA_BASE: u64 = registers::CRIME_RENDER_BASE;
 const INTERFACE_ADDRESS_BASE: u64 = registers::CRIME_RENDER_BASE + 0x200;
@@ -31,6 +28,7 @@ const CID_TLB_BASE: u64 = TLB_BASE + 0x6e0;
 const LINEAR_A_BASE: u64 = TLB_BASE + 0x700;
 const LINEAR_B_BASE: u64 = TLB_BASE + 0x780;
 const PIXEL_PIPE_BASE: u64 = registers::CRIME_RENDER_BASE + 0x2000;
+#[cfg(test)]
 const PIXEL_PIPE_NULL: u64 = PIXEL_PIPE_BASE + 0x1f0;
 const MTE_BASE: u64 = registers::CRIME_RENDER_BASE + 0x3000;
 const STATUS_BASE: u64 = registers::CRIME_RENDER_BASE + 0x4000;
@@ -49,8 +47,6 @@ const FRAMEBUFFER_TILE_ROW_BYTES: u64 = 512;
 const FRAMEBUFFER_TLB_VALID: u16 = 0x8000;
 const FRAMEBUFFER_TLB_TILE_MASK: u16 = 0x7fff;
 const RENDER_MEMORY_WORD_BYTES: usize = 32;
-const FRAMEBUFFER_8_WIDTH: u16 = 8192;
-const FRAMEBUFFER_32_WIDTH: u16 = 2048;
 const FRAMEBUFFER_HEIGHT: u16 = 2048;
 const LOGIC_COPY: u32 = 3;
 const STATUS_IDLE: u32 = 0x1000_0000;
@@ -1195,14 +1191,22 @@ impl CrimeRender {
                             y1,
                         });
                         self.active_pixel_command = Some(PixelExecution::Running(Box::new(job)));
-                        if let Some(memory_request) =
-                            self.prepare_pixel_batch(&mut progress.notices)
+                        if self
+                            .active_pixel_command
+                            .as_ref()
+                            .is_some_and(PixelExecution::complete)
                         {
-                            append_memory_notices(&mut progress.notices, &memory_request);
-                            self.memory_request_unit.issue(&memory_request);
-                            progress.memory_request = Some(memory_request);
-                        } else {
                             progress.schedule_step = self.ensure_step_scheduled();
+                        } else {
+                            if let Some(memory_request) =
+                                self.prepare_pixel_batch(&mut progress.notices)
+                            {
+                                append_memory_notices(&mut progress.notices, &memory_request);
+                                self.memory_request_unit.issue(&memory_request);
+                                progress.memory_request = Some(memory_request);
+                            } else {
+                                progress.schedule_step = self.ensure_step_scheduled();
+                            }
                         }
                     }
                     Err(blocked) => {
@@ -1435,36 +1439,40 @@ impl CrimeRender {
         }
         let command = validation.decoded;
         let rasterizer = match command.primitive_kind {
-            PixelPrimitiveKind::Line => {
-                let direction = if command.y0 == command.y1 {
-                    AxisLineDirection::Horizontal
-                } else {
-                    AxisLineDirection::Vertical
-                };
-                Rasterizer::AxisLine(AxisLineRasterizer {
-                    direction,
-                    x: command.x0,
-                    y: command.y0,
-                    end_x: command.x1,
-                    end_y: command.y1,
-                })
-            }
-            PixelPrimitiveKind::Rectangle => {
-                Rasterizer::InclusiveRectangle(InclusiveRectangleRasterizer {
-                    x_start: command.x0,
-                    x: command.x0,
-                    y: command.y0,
-                    end_x: command.x1,
-                    end_y: command.y1,
-                    row_direction: if command.edge_type == 0 {
-                        RectangleRowDirection::Descending
-                    } else {
-                        RectangleRowDirection::Ascending
-                    },
-                    finished: false,
-                })
-            }
-            _ => unreachable!("validated command has an implemented rasterizer"),
+            PixelPrimitiveKind::Point => Rasterizer::point(command.x0, command.y0),
+            PixelPrimitiveKind::Line if command.features.gl() => Rasterizer::line_gl(
+                command.vertices_subpixel[0].0,
+                command.vertices_subpixel[0].1,
+                command.vertices_subpixel[1].0,
+                command.vertices_subpixel[1].1,
+                command.line_width,
+                command.skip_last_endpoint,
+            ),
+            PixelPrimitiveKind::Line => Rasterizer::line_x(
+                command.x0,
+                command.y0,
+                command.x1,
+                command.y1,
+                command.line_width,
+                command.skip_last_endpoint,
+            ),
+            PixelPrimitiveKind::Triangle => Rasterizer::triangle(command.vertices_subpixel),
+            PixelPrimitiveKind::Rectangle if command.features.gl() => Rasterizer::rectangle_gl(
+                command.vertices_subpixel[0].0,
+                command.vertices_subpixel[0].1,
+                command.vertices_subpixel[1].0,
+                command.vertices_subpixel[1].1,
+                command.edge_type,
+            ),
+            PixelPrimitiveKind::Rectangle => Rasterizer::rectangle_x(
+                command.x0,
+                command.y0,
+                command.x1,
+                command.y1,
+                command.edge_type,
+            ),
+            PixelPrimitiveKind::Flush => Rasterizer::empty(),
+            PixelPrimitiveKind::Invalid(_) => unreachable!("invalid primitive was rejected"),
         };
         let pixel_dma = if command.features.pixel_transfer() {
             let source_selector = command
@@ -1494,8 +1502,7 @@ impl CrimeRender {
             .framebuffer_selector()
             .and_then(|selector| self.tlbs.framebuffer_entries(selector))
             .map(Box::new);
-        let stipple = command
-            .line_stipple_enabled()
+        let stipple = (command.line_stipple_enabled() || command.features.polygon_stipple())
             .then(|| PixelStippleCursor::new(command.stipple_pattern, command.stipple_mode));
         Ok(PixelPipelineJob {
             entries,
@@ -1518,6 +1525,12 @@ impl CrimeRender {
         }
         debug_assert!(job.pending_batch.is_none());
         let position = job.rasterizer.position();
+        let Some((framebuffer_x, framebuffer_y)) =
+            job.command.framebuffer_position(position.x, position.y)
+        else {
+            job.advance_candidates(1);
+            return None;
+        };
         let bytes_per_pixel = job
             .command
             .destination
@@ -1525,15 +1538,20 @@ impl CrimeRender {
             .bytes_per_pixel()
             .expect("validated command has a sized pixel format");
         let tile_width = (FRAMEBUFFER_TILE_ROW_BYTES / u64::from(bytes_per_pixel)) as u16;
-        let tile_x = usize::from(position.x / tile_width);
-        let tile_y = usize::from(position.y / FRAMEBUFFER_TILE_HEIGHT);
-        let entry = job
+        let tile_x = usize::from(framebuffer_x / tile_width);
+        let tile_y = usize::from(framebuffer_y / FRAMEBUFFER_TILE_HEIGHT);
+        let entries = job
             .entries
             .as_ref()
-            .expect("non-DMA pixel command selects a framebuffer")
-            .entry(tile_y * FRAMEBUFFER_TILES_PER_ROW + tile_x);
-        let x_in_tile = position.x % tile_width;
-        let y_in_tile = position.y % FRAMEBUFFER_TILE_HEIGHT;
+            .expect("non-DMA pixel command selects a framebuffer");
+        let entry_index = tile_y * FRAMEBUFFER_TILES_PER_ROW + tile_x;
+        if entry_index >= FRAMEBUFFER_TLB_ENTRY_COUNT {
+            job.advance_candidates(1);
+            return None;
+        }
+        let entry = entries.entry(entry_index);
+        let x_in_tile = framebuffer_x % tile_width;
+        let y_in_tile = framebuffer_y % FRAMEBUFFER_TILE_HEIGHT;
         let pixel_offset = u64::from(y_in_tile) * FRAMEBUFFER_TILE_ROW_BYTES
             + u64::from(x_in_tile) * u64::from(bytes_per_pixel);
         let pixel_alias = entry.alias_address(pixel_offset);
@@ -1547,6 +1565,7 @@ impl CrimeRender {
             1
         };
         let pixel_bytes = job.command.pixel_bytes();
+        let background_pixel_bytes = job.command.background_pixel_bytes();
         let mut data = vec![0; RENDER_MEMORY_WORD_BYTES];
         let mut byte_enable = vec![false; RENDER_MEMORY_WORD_BYTES];
         let first_physical_lane =
@@ -1560,29 +1579,43 @@ impl CrimeRender {
         let mut enabled_count = 0_u16;
         let mut enabled_mask = 0_u32;
         for candidate in 0..candidate_count {
-            let enabled = job.stipple.is_none_or(|stipple| stipple.permits(candidate));
-            if !enabled {
+            let Some(window_x) = position.x.checked_add(candidate) else {
+                continue;
+            };
+            if !job.command.clip_passes(window_x, position.y) {
+                continue;
+            }
+            let stipple_enabled = job.stipple.is_none_or(|stipple| stipple.permits(candidate));
+            let write_enabled = stipple_enabled || job.command.features.opaque_stipple();
+            if !write_enabled {
                 continue;
             }
             enabled_count += 1;
-            enabled_mask |= 1_u32 << (31 - candidate);
+            if stipple_enabled {
+                enabled_mask |= 1_u32 << (31 - candidate);
+            }
             let bytes = usize::from(bytes_per_pixel);
             let logical_lane = first_logical_lane + usize::from(candidate) * bytes;
             let lane = framebuffer::physical_pixel_lane(logical_lane, bytes)
                 .expect("validated pixel batch remains inside one framebuffer word");
-            data[lane..lane + bytes].copy_from_slice(&pixel_bytes[..bytes]);
+            let color = if stipple_enabled {
+                &pixel_bytes
+            } else {
+                &background_pixel_bytes
+            };
+            data[lane..lane + bytes].copy_from_slice(&color[..bytes]);
             byte_enable[lane..lane + bytes].fill(true);
         }
         let batch = PixelCandidateBatch {
-            x: position.x,
-            y: position.y,
+            x: framebuffer_x,
+            y: framebuffer_y,
             candidate_count,
             enabled_count,
             stipple_index: job.stipple.map(PixelStippleCursor::index),
         };
         notices.push(RenderNotice::RasterBatch {
-            x: position.x,
-            y: position.y,
+            x: framebuffer_x,
+            y: framebuffer_y,
             candidates: candidate_count,
             enabled: enabled_count,
         });
@@ -1602,7 +1635,7 @@ impl CrimeRender {
         let physical_address = super::normalize_render_memory_alias(word_alias);
         let valid = entry.valid();
         Some(RenderMemoryRequest {
-            virtual_address: u32::from(position.y) << 16 | u32::from(position.x),
+            virtual_address: u32::from(framebuffer_y) << 16 | u32::from(framebuffer_x),
             raw_entry: u32::from(entry.raw()),
             valid,
             alias_address: word_alias,
@@ -1696,6 +1729,10 @@ fn prepare_pixel_dma_batch(
     let destination_bytes = job.command.destination.format.bytes_per_pixel()?;
     let dma = job.pixel_dma.as_mut().expect("PixelDMA state exists");
     if matches!(dma.stage, PixelDmaStage::Read) && job.pending_batch.is_none() {
+        if !job.command.clip_passes(position.x, position.y) {
+            job.advance_candidates(1);
+            return None;
+        }
         let enabled = job.stipple.is_none_or(|stipple| stipple.permits(0));
         notices.push(RenderNotice::RasterBatch {
             x: position.x,
@@ -1793,8 +1830,14 @@ fn pixel_dma_source_address(
         0 => i64::from(bytes_per_pixel),
         value => i64::from(value),
     };
-    let x = wrapping_add_signed(u32::from(base as u16), dx * x_step) as u16;
-    let y_byte = wrapping_add_signed(base >> 16, dy * y_step) as u16;
+    let base_x = base as u16;
+    let base_y = (base >> 16) as u16 / u16::from(bytes_per_pixel);
+    let (base_x, base_y) = command
+        .source_framebuffer_position(base_x, base_y)
+        .unwrap_or((u16::MAX, u16::MAX));
+    let x = wrapping_add_signed(u32::from(base_x), dx * x_step) as u16;
+    let y_byte =
+        wrapping_add_signed(u32::from(base_y) * u32::from(bytes_per_pixel), dy * y_step) as u16;
     u32::from(y_byte) << 16 | u32::from(x)
 }
 fn pixel_dma_destination_address(
@@ -1805,8 +1848,11 @@ fn pixel_dma_destination_address(
     dy: i64,
 ) -> u32 {
     if !buffer.linear() {
-        let x = wrapping_add_signed(u32::from(command.x0), dx) as u16;
-        let y = wrapping_add_signed(u32::from(command.y0), dy) as u16;
+        let window_x = wrapping_add_signed(u32::from(command.x0), dx) as u16;
+        let window_y = wrapping_add_signed(u32::from(command.y0), dy) as u16;
+        let (x, y) = command
+            .framebuffer_position(window_x, window_y)
+            .unwrap_or((u16::MAX, u16::MAX));
         return (u32::from(y) * u32::from(bytes_per_pixel)) << 16 | u32::from(x);
     }
     let base = command.snapshot.pixel_transfer_destination_address();
