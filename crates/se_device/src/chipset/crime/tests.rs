@@ -3,10 +3,9 @@ use se_core::tracing::TraceInterest;
 
 use super::*;
 use crate::chipset::crime::memory::CrimeSdram;
-use crate::chipset::crime::protocol::{CrimeMemoryDiagnostic, CrimeTransferView};
-use crate::cpu::execution::protocol::{ExecutionTransaction, ExecutionTransactionId};
-use crate::cpu::mips4::cache::Mips4MemoryAccessType;
-use crate::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
+use crate::chipset::crime::protocol::{
+    CrimeByteEnable, CrimeData, CrimeMemoryDiagnostic, CrimeTransferView,
+};
 
 const CRIME: ComponentId = ComponentId::new(1);
 const RAM: ComponentId = ComponentId::new(2);
@@ -27,40 +26,41 @@ fn crime() -> Crime {
     .unwrap()
 }
 
-fn read(id: u128, address: u64, size: Mips4ExecutionTransferSize) -> CrimeSysAdRequest {
+fn read(id: u128, address: u64, size: u16) -> CrimeSysAdRequest {
     CrimeSysAdRequest {
+        id: CrimeTransactionId::new(id),
         time: SimTime::ZERO,
-        transaction: ExecutionTransaction {
-            id: ExecutionTransactionId::new(id),
-            payload: Mips4ExecutionTransaction::Read {
-                physical_address: address,
-                size,
-                kind: Mips4ExecutionAccessKind::DataLoad,
-                access_type: Mips4MemoryAccessType::Uncached,
-            },
-        },
+        address,
+        transfer: CrimeTransfer::read(size),
     }
 }
 
-fn write(
-    id: u128,
-    address: u64,
-    size: Mips4ExecutionTransferSize,
-    value: u64,
-) -> CrimeSysAdRequest {
+fn write(id: u128, address: u64, size: u16, value: u64) -> CrimeSysAdRequest {
+    let length = usize::from(size);
+    let bytes = value.to_be_bytes();
     CrimeSysAdRequest {
+        id: CrimeTransactionId::new(id),
         time: SimTime::ZERO,
-        transaction: ExecutionTransaction {
-            id: ExecutionTransactionId::new(id),
-            payload: Mips4ExecutionTransaction::Write {
-                physical_address: address,
-                size,
-                data: encode_big_endian(value, size.bytes()),
-                byte_enable: ((1_u16 << size.bytes()) - 1) as u8,
-                access_type: Mips4MemoryAccessType::Uncached,
-            },
-        },
+        address,
+        transfer: CrimeTransfer::write(
+            bytes[bytes.len() - length..].iter().copied().collect(),
+            CrimeByteEnable::enabled(length),
+        ),
     }
+}
+
+fn read_completion(id: u128, data: impl Into<CrimeData>) -> CrimeAction {
+    CrimeAction::CompleteSysAd(CrimeSysAdCompletion {
+        id: CrimeTransactionId::new(id),
+        result: Ok(CrimeCompletionPayload::ReadData(data.into())),
+    })
+}
+
+fn write_completion(id: u128) -> CrimeAction {
+    CrimeAction::CompleteSysAd(CrimeSysAdCompletion {
+        id: CrimeTransactionId::new(id),
+        result: Ok(CrimeCompletionPayload::WriteComplete),
+    })
 }
 
 fn next_non_trace(crime: &mut Crime) -> CrimeAction {
@@ -82,13 +82,7 @@ fn clear_actions(crime: &mut Crime) {
 fn uninterested_crime_does_not_construct_trace_actions() {
     let mut crime = crime();
     crime.set_trace_interest(TraceInterest::None);
-    crime
-        .accept_sysad(read(
-            1,
-            registers::ID,
-            Mips4ExecutionTransferSize::Doubleword,
-        ))
-        .unwrap();
+    crime.accept_sysad(read(1, registers::ID, 8)).unwrap();
 
     let mut saw_hardware_action = false;
     while let CrimePoll::Action(action) = crime.poll().unwrap() {
@@ -224,48 +218,26 @@ fn gbe_interrupt_posts_drive_the_crime_irq_output() {
 #[test]
 fn doubleword_id_read_returns_crime_11_identity_in_big_endian_lanes() {
     let mut crime = crime();
-    crime
-        .accept(read(
-            1,
-            registers::ID,
-            Mips4ExecutionTransferSize::Doubleword,
-        ))
-        .unwrap();
+    crime.accept(read(1, registers::ID, 8)).unwrap();
 
     assert_eq!(
         next_non_trace(&mut crime),
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
-            id: ExecutionTransactionId::new(1),
-            payload: Mips4ExecutionCompletion::ReadData(0xa100_0000_0000_0000),
-        })
+        read_completion(1, [0, 0, 0, 0, 0, 0, 0, 0xa1])
     );
 }
 
 #[test]
 fn word_reads_select_big_endian_lanes_from_the_sysad_doubleword() {
     let mut crime = crime();
-    crime
-        .accept(read(1, registers::ID, Mips4ExecutionTransferSize::Word))
-        .unwrap();
+    crime.accept(read(1, registers::ID, 4)).unwrap();
+
+    assert_eq!(next_non_trace(&mut crime), read_completion(1, [0; 4]));
+
+    crime.accept(read(2, registers::ID + 4, 4)).unwrap();
 
     assert_eq!(
         next_non_trace(&mut crime),
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
-            id: ExecutionTransactionId::new(1),
-            payload: Mips4ExecutionCompletion::ReadData(0),
-        })
-    );
-
-    crime
-        .accept(read(2, registers::ID + 4, Mips4ExecutionTransferSize::Word))
-        .unwrap();
-
-    assert_eq!(
-        next_non_trace(&mut crime),
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
-            id: ExecutionTransactionId::new(2),
-            payload: Mips4ExecutionCompletion::ReadData(0xa100_0000),
-        })
+        read_completion(2, [0, 0, 0, 0xa1])
     );
 }
 
@@ -273,18 +245,13 @@ fn word_reads_select_big_endian_lanes_from_the_sysad_doubleword() {
 fn word_writes_to_piu_remain_precise_bus_errors() {
     let mut crime = crime();
     crime
-        .accept(write(
-            1,
-            registers::CONTROL + 4,
-            Mips4ExecutionTransferSize::Word,
-            0,
-        ))
+        .accept(write(1, registers::CONTROL + 4, 4, 0))
         .unwrap();
 
     assert!(matches!(
         next_non_trace(&mut crime),
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
-            payload: Mips4ExecutionCompletion::BusError,
+        CrimeAction::CompleteSysAd(CrimeSysAdCompletion {
+            result: Err(CrimeBusError::Access),
             ..
         })
     ));
@@ -294,21 +261,10 @@ fn word_writes_to_piu_remain_precise_bus_errors() {
 fn reserved_prom_write_sink_accepts_only_complete_aligned_doubleword_writes() {
     let mut device = crime();
     device
-        .accept(write(
-            1,
-            registers::CPU_RESERVED_WRITE_SINK,
-            Mips4ExecutionTransferSize::Doubleword,
-            u64::MAX,
-        ))
+        .accept(write(1, registers::CPU_RESERVED_WRITE_SINK, 8, u64::MAX))
         .unwrap();
 
-    assert_eq!(
-        next_non_trace(&mut device),
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
-            id: ExecutionTransactionId::new(1),
-            payload: Mips4ExecutionCompletion::WriteComplete,
-        })
-    );
+    assert_eq!(next_non_trace(&mut device), write_completion(1));
     assert_eq!(
         device
             .piu
@@ -324,61 +280,59 @@ fn reserved_prom_write_sink_accepts_only_complete_aligned_doubleword_writes() {
     assert!(!device.piu.interrupt_output_asserted());
 
     for request in [
-        read(
-            2,
-            registers::CPU_RESERVED_WRITE_SINK,
-            Mips4ExecutionTransferSize::Doubleword,
-        ),
-        write(
-            3,
-            registers::CPU_RESERVED_WRITE_SINK,
-            Mips4ExecutionTransferSize::Word,
-            0,
-        ),
-        write(
-            4,
-            registers::CPU_RESERVED_WRITE_SINK + 4,
-            Mips4ExecutionTransferSize::Doubleword,
-            0,
-        ),
-        write(
-            5,
-            registers::CPU_RESERVED_WRITE_SINK + 8,
-            Mips4ExecutionTransferSize::Doubleword,
-            0,
-        ),
+        read(2, registers::CPU_RESERVED_WRITE_SINK, 8),
+        write(3, registers::CPU_RESERVED_WRITE_SINK, 4, 0),
+        write(4, registers::CPU_RESERVED_WRITE_SINK + 4, 8, 0),
+        write(5, registers::CPU_RESERVED_WRITE_SINK + 8, 8, 0),
     ] {
         let mut candidate = crime();
         candidate.accept(request).unwrap();
         assert!(matches!(
             next_non_trace(&mut candidate),
-            CrimeAction::CompleteSysAd(ExecutionCompletion {
-                payload: Mips4ExecutionCompletion::BusError,
-                ..
-            })
+            CrimeAction::CompleteSysAd(CrimeSysAdCompletion { result: Err(_), .. })
         ));
     }
 
-    let mut request = write(
-        6,
-        registers::CPU_RESERVED_WRITE_SINK,
-        Mips4ExecutionTransferSize::Doubleword,
-        0,
+    let mut request = write(6, registers::CPU_RESERVED_WRITE_SINK, 8, 0);
+    request.transfer = CrimeTransfer::write(
+        [0; 8].into(),
+        [true, true, true, true, false, false, false, false].into(),
     );
-    let Mips4ExecutionTransaction::Write { byte_enable, .. } = &mut request.transaction.payload
-    else {
-        unreachable!("the helper always creates a write transaction")
-    };
-    *byte_enable = 0x0f;
     let mut candidate = crime();
     candidate.accept(request).unwrap();
     assert!(matches!(
         next_non_trace(&mut candidate),
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
-            payload: Mips4ExecutionCompletion::BusError,
+        CrimeAction::CompleteSysAd(CrimeSysAdCompletion {
+            result: Err(CrimeBusError::Access),
             ..
         })
     ));
+}
+
+#[test]
+fn sysad_rejects_invalid_transfer_shapes() {
+    let mut crime = crime();
+    for (id, transfer) in [
+        (7, CrimeTransfer::write([0; 8].into(), [true; 4].into())),
+        (8, CrimeTransfer::read(3)),
+    ] {
+        crime
+            .accept(CrimeSysAdRequest {
+                id: CrimeTransactionId::new(id),
+                time: SimTime::ZERO,
+                address: registers::CONTROL,
+                transfer,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            next_non_trace(&mut crime),
+            CrimeAction::CompleteSysAd(CrimeSysAdCompletion {
+                id: completion_id,
+                result: Err(CrimeBusError::Access),
+            }) if completion_id == CrimeTransactionId::new(id)
+        ));
+    }
 }
 
 #[test]
@@ -389,17 +343,12 @@ fn cpu_error_status_clear_semantics_are_not_aliased_to_the_reserved_write_sink()
     clear_actions(&mut crime);
 
     crime
-        .accept(write(
-            1,
-            registers::CPU_RESERVED_WRITE_SINK,
-            Mips4ExecutionTransferSize::Doubleword,
-            0,
-        ))
+        .accept(write(1, registers::CPU_RESERVED_WRITE_SINK, 8, 0))
         .unwrap();
     assert!(matches!(
         next_non_trace(&mut crime),
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
-            payload: Mips4ExecutionCompletion::WriteComplete,
+        CrimeAction::CompleteSysAd(CrimeSysAdCompletion {
+            result: Ok(CrimeCompletionPayload::WriteComplete),
             ..
         })
     ));
@@ -411,17 +360,12 @@ fn cpu_error_status_clear_semantics_are_not_aliased_to_the_reserved_write_sink()
     );
 
     crime
-        .accept(write(
-            2,
-            registers::CPU_ERROR_STATUS,
-            Mips4ExecutionTransferSize::Doubleword,
-            0,
-        ))
+        .accept(write(2, registers::CPU_ERROR_STATUS, 8, 0))
         .unwrap();
     assert!(matches!(
         next_non_trace(&mut crime),
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
-            payload: Mips4ExecutionCompletion::WriteComplete,
+        CrimeAction::CompleteSysAd(CrimeSysAdCompletion {
+            result: Ok(CrimeCompletionPayload::WriteComplete),
             ..
         })
     ));
@@ -446,21 +390,16 @@ fn full_render_fifo_defers_sysad_until_a_slot_is_retired() {
     crime.actions.clear();
 
     crime
-        .accept(write(
-            31,
-            registers::CRIME_RENDER_BASE + 0x2000,
-            Mips4ExecutionTransferSize::Word,
-            1,
-        ))
+        .accept(write(31, registers::CRIME_RENDER_BASE + 0x2000, 4, 1))
         .unwrap();
-    assert_eq!(crime.pending_sysad, Some(ExecutionTransactionId::new(31)));
+    assert_eq!(crime.pending_sysad, Some(CrimeTransactionId::new(31)));
     assert!(crime.pending_render_write.is_some());
     assert!(!crime.actions.iter().any(|action| matches!(
         action,
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
+        CrimeAction::CompleteSysAd(CrimeSysAdCompletion {
             id,
-            payload: Mips4ExecutionCompletion::BusError,
-        }) if *id == ExecutionTransactionId::new(31)
+            result: Err(_),
+        }) if *id == CrimeTransactionId::new(31)
     )));
 
     crime.handle_event(
@@ -473,10 +412,10 @@ fn full_render_fifo_defers_sysad_until_a_slot_is_retired() {
     assert_eq!(crime.render.interface_level(), 64);
     assert!(crime.actions.iter().any(|action| matches!(
         action,
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
+        CrimeAction::CompleteSysAd(CrimeSysAdCompletion {
             id,
-            payload: Mips4ExecutionCompletion::WriteComplete,
-        }) if *id == ExecutionTransactionId::new(31)
+            result: Ok(CrimeCompletionPayload::WriteComplete),
+        }) if *id == CrimeTransactionId::new(31)
     )));
 }
 
@@ -858,13 +797,7 @@ fn render_memory_transport_failure_is_terminal_and_traced() {
 #[test]
 fn memory_request_is_deferred_until_the_matching_bus_completion() {
     let mut crime = crime();
-    crime
-        .accept(read(
-            9,
-            LINEAR_MEMORY_START,
-            Mips4ExecutionTransferSize::Word,
-        ))
-        .unwrap();
+    crime.accept(read(9, LINEAR_MEMORY_START, 4)).unwrap();
     let CrimeAction::StartMemory(transaction) = next_non_trace(&mut crime) else {
         panic!("expected a memory transaction");
     };
@@ -878,26 +811,14 @@ fn memory_request_is_deferred_until_the_matching_bus_completion() {
             None,
         )),
     });
-    assert_eq!(
-        next_non_trace(&mut crime),
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
-            id: ExecutionTransactionId::new(9),
-            payload: Mips4ExecutionCompletion::ReadData(0x0403_0201),
-        })
-    );
+    assert_eq!(next_non_trace(&mut crime), read_completion(9, [1, 2, 3, 4]));
 }
 
 #[test]
 fn memory_address_fault_updates_miu_and_completes_sysad_without_cpu_error() {
     let mut crime = crime();
     enable_interrupt_bit(&mut crime, 21);
-    crime
-        .accept(read(
-            11,
-            LINEAR_MEMORY_START,
-            Mips4ExecutionTransferSize::Doubleword,
-        ))
-        .unwrap();
+    crime.accept(read(11, LINEAR_MEMORY_START, 8)).unwrap();
     let CrimeAction::StartMemory(transaction) = next_non_trace(&mut crime) else {
         panic!("expected a memory transaction");
     };
@@ -918,13 +839,7 @@ fn memory_address_fault_updates_miu_and_completes_sysad_without_cpu_error() {
     });
 
     assert!(matches!(next_non_trace(&mut crime), CrimeAction::SetIrq(_)));
-    assert_eq!(
-        next_non_trace(&mut crime),
-        CrimeAction::CompleteSysAd(ExecutionCompletion {
-            id: ExecutionTransactionId::new(11),
-            payload: Mips4ExecutionCompletion::ReadData(0),
-        })
-    );
+    assert_eq!(next_non_trace(&mut crime), read_completion(11, [0; 8]));
     assert_eq!(
         crime.memory_error_status,
         registers::MEMORY_ERROR_CPU_ACCESS | registers::MEMORY_ERROR_INVALID_READ

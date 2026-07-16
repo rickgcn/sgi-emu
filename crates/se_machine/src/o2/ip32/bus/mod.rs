@@ -4,9 +4,14 @@ use std::collections::VecDeque;
 
 use se_core::component::{Component, ComponentId};
 use se_core::role::BusRole;
-use se_core::scheduler::{FractionalClockProjection, SimDuration};
-use se_device::chipset::crime::protocol::CrimeBusDisposition;
-use se_device::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransaction};
+use se_core::scheduler::{FractionalClockProjection, SimDuration, SimTime};
+use se_device::chipset::crime::protocol::{
+    CrimeBusDisposition, CrimeByteEnable, CrimeCompletionPayload, CrimeData, CrimeSysAdCompletion,
+    CrimeSysAdRequest, CrimeTransactionId, CrimeTransfer,
+};
+use se_device::cpu::execution::protocol::{
+    ExecutionCompletion, ExecutionTransaction, ExecutionTransactionId,
+};
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 
 /// Scheduled SysAD bus event.
@@ -33,8 +38,8 @@ pub enum Ip32SysAdBusAction {
         /// CRIME component.
         target: ComponentId,
 
-        /// Original CPU transaction.
-        transaction: ExecutionTransaction<Mips4ExecutionTransaction>,
+        /// Physical request translated for CRIME.
+        request: CrimeSysAdRequest,
     },
 
     /// Delivers one CRIME completion to the CPU controller.
@@ -185,7 +190,7 @@ impl Ip32SysAdBus {
     }
 
     /// Handles one scheduled SysAD event.
-    pub fn handle_event(&mut self, event: Ip32SysAdBusEvent) {
+    pub fn handle_event(&mut self, now: SimTime, event: Ip32SysAdBusEvent) {
         let generation = match event {
             Ip32SysAdBusEvent::Service { generation }
             | Ip32SysAdBusEvent::Complete { generation } => generation,
@@ -205,7 +210,7 @@ impl Ip32SysAdBus {
                 self.in_flight = Some(transaction.clone());
                 self.actions.push_back(Ip32SysAdBusAction::Deliver {
                     target: self.target,
-                    transaction,
+                    request: Self::translate_cpu_transaction(&transaction, now),
                 });
             }
             Ip32SysAdBusEvent::Complete { .. } => {
@@ -231,17 +236,14 @@ impl Ip32SysAdBus {
     }
 
     /// Accepts CRIME's response to the current CPU request.
-    pub fn accept_device_completion(
-        &mut self,
-        completion: ExecutionCompletion<Mips4ExecutionCompletion>,
-    ) {
+    pub fn accept_device_completion(&mut self, completion: CrimeSysAdCompletion) {
         let Some(transaction) = self.in_flight.take() else {
             return;
         };
-        if transaction.id != completion.id {
+        let Some(completion) = Self::translate_crime_completion(&transaction, completion) else {
             self.in_flight = Some(transaction);
             return;
-        }
+        };
         self.pending_completion = Some((transaction, completion));
         self.actions.push_back(Ip32SysAdBusAction::Schedule {
             delay: self.clock.next_cycle(),
@@ -254,6 +256,90 @@ impl Ip32SysAdBus {
     /// Polls one SysAD action.
     pub fn poll(&mut self) -> Ip32SysAdBusAction {
         self.actions.pop_front().unwrap_or(Ip32SysAdBusAction::Idle)
+    }
+
+    /// Translates one CPU execution transaction into a CRIME SysAD request.
+    pub(super) fn translate_cpu_transaction(
+        transaction: &ExecutionTransaction<Mips4ExecutionTransaction>,
+        time: SimTime,
+    ) -> CrimeSysAdRequest {
+        let (address, transfer) = match transaction.payload {
+            Mips4ExecutionTransaction::Read {
+                physical_address,
+                size,
+                ..
+            } => (
+                physical_address,
+                CrimeTransfer::read(u16::from(size.bytes())),
+            ),
+            Mips4ExecutionTransaction::Write {
+                physical_address,
+                size,
+                data,
+                byte_enable,
+                ..
+            } => {
+                let length = usize::from(size.bytes());
+                (
+                    physical_address,
+                    CrimeTransfer::write(
+                        data.to_le_bytes()[..length].iter().copied().collect(),
+                        (0..length)
+                            .map(|lane| byte_enable & (1 << lane) != 0)
+                            .collect::<CrimeByteEnable>(),
+                    ),
+                )
+            }
+        };
+        CrimeSysAdRequest {
+            id: Self::crime_transaction_id(transaction.id),
+            time,
+            address,
+            transfer,
+        }
+    }
+
+    /// Translates a correlated CRIME completion back into the CPU protocol.
+    pub(super) fn translate_crime_completion(
+        transaction: &ExecutionTransaction<Mips4ExecutionTransaction>,
+        completion: CrimeSysAdCompletion,
+    ) -> Option<ExecutionCompletion<Mips4ExecutionCompletion>> {
+        if completion.id != Self::crime_transaction_id(transaction.id) {
+            return None;
+        }
+        let payload = match (transaction.payload, completion.result) {
+            (
+                Mips4ExecutionTransaction::Read { size, .. },
+                Ok(CrimeCompletionPayload::ReadData(data)),
+            ) if data.len() == usize::from(size.bytes()) => Self::pack_read_data(&data)
+                .map(Mips4ExecutionCompletion::ReadData)
+                .unwrap_or(Mips4ExecutionCompletion::BusError),
+            (
+                Mips4ExecutionTransaction::Write { .. },
+                Ok(CrimeCompletionPayload::WriteComplete),
+            ) => Mips4ExecutionCompletion::WriteComplete,
+            (_, Err(_))
+            | (_, Ok(CrimeCompletionPayload::ReadData(_)))
+            | (_, Ok(CrimeCompletionPayload::WriteComplete)) => Mips4ExecutionCompletion::BusError,
+        };
+        Some(ExecutionCompletion {
+            id: transaction.id,
+            payload,
+        })
+    }
+
+    /// Packs ascending physical bytes into the CPU's low-order lane representation.
+    pub(super) fn pack_read_data(data: &CrimeData) -> Option<u64> {
+        if data.len() > 8 {
+            return None;
+        }
+        let mut lanes = [0; 8];
+        lanes[..data.len()].copy_from_slice(data);
+        Some(u64::from_le_bytes(lanes))
+    }
+
+    const fn crime_transaction_id(id: ExecutionTransactionId) -> CrimeTransactionId {
+        CrimeTransactionId::new(id.get())
     }
 
     /// Returns the active reset generation.

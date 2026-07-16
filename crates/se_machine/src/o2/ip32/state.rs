@@ -34,7 +34,7 @@ use super::event::{Ip32Event, Ip32HostOutput};
 use super::timing::IP32_TIMEBASE_HZ;
 
 /// Current IP32 serialized-state schema.
-pub const IP32_STATE_SCHEMA_VERSION: u32 = 5;
+pub const IP32_STATE_SCHEMA_VERSION: u32 = 6;
 
 /// Construction settings that do not contain PROM or battery-backed bytes.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -357,14 +357,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_four_state_is_explicitly_rejected() {
+    fn schema_five_state_is_explicitly_rejected() {
         let config = Ip32MachineConfig::default();
         let machine = Ip32Machine::from_config(config.clone()).unwrap();
         let mut state = machine.save_state().unwrap();
-        state.schema_version = 4;
+        state.schema_version = 5;
         assert!(matches!(
             Ip32Machine::from_state_with_trace_sink(config, state, se_core::tracing::NoopTraceSink,),
-            Err(Ip32StateError::UnsupportedSchema { version: 4 })
+            Err(Ip32StateError::UnsupportedSchema { version: 5 })
         ));
     }
 

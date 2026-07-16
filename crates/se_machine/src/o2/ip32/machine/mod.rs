@@ -43,14 +43,14 @@ use se_device::chipset::crime::memory::CrimeSdram;
 use se_device::chipset::crime::memory::bus::CrimeDirectMemoryPlan;
 use se_device::chipset::crime::memory::bus::{CrimeMemoryBus, CrimeMemoryBusEvent};
 #[cfg(feature = "jit")]
-use se_device::chipset::crime::protocol::CrimeSysAdRoute;
-#[cfg(feature = "jit")]
 use se_device::chipset::crime::protocol::CrimeTransferView;
 use se_device::chipset::crime::protocol::{
     CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusAction, CrimeBusDisposition, CrimeCgiTransaction,
     CrimeCmiTransaction, CrimeCpuSignal, CrimeLinkDeviceResponse, CrimeMemoryTransaction,
-    CrimePoll, CrimeSysAdRequest, CrimeTraceEvent, CrimeTraceValue,
+    CrimePoll, CrimeTraceEvent, CrimeTraceValue,
 };
+#[cfg(feature = "jit")]
+use se_device::chipset::crime::protocol::{CrimeSysAdRequest, CrimeSysAdRoute};
 use se_device::chipset::crime::{Crime, CrimeError};
 use se_device::chipset::gbe::Gbe;
 use se_device::chipset::gbe::protocol::{
@@ -72,8 +72,6 @@ use se_device::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 use se_device::cpu::mips4::execution::block::{
     Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult, Mips4FastMemoryRuntime,
 };
-#[cfg(feature = "jit")]
-use se_device::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use se_device::cpu::mips4::execution::target::Mips4ExecutionBoundary;
 use se_device::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
@@ -679,7 +677,7 @@ struct Mips4CodeSourceCacheEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Ip32CpuTransactionPlan {
     sysad: Ip32DirectSysAdPlan,
-    delivery_time: SimTime,
+    request: CrimeSysAdRequest,
     completion_time: SimTime,
     route: Ip32CpuTransactionRoute,
 }
@@ -2291,7 +2289,7 @@ where
         Ip32Event::SysAdBus(event) => {
             registry
                 .get_resolved_mut(control.slots.sysad)?
-                .handle_event(event);
+                .handle_event(context.now(), event);
             drain_sysad_bus(registry, context, control)?;
         }
         Ip32Event::CrimeMemoryBus(event) => {
@@ -3506,28 +3504,26 @@ where
             "the SysAD transaction changed after planning",
         ));
     }
-    let payload = match plan.route {
+    let crime_completion = match plan.route {
         Ip32CpuTransactionRoute::InternalRegister => registry
             .get_resolved_mut(control.slots.crime)?
-            .commit_synchronous_sysad_read(transaction.payload, plan.delivery_time),
+            .commit_synchronous_sysad_read(&plan.request),
         Ip32CpuTransactionRoute::Memory {
             plan: memory_plan,
             transaction: memory_transaction,
         } => commit_fast_cpu_memory_transaction(
             registry,
             control,
-            transaction,
-            plan.delivery_time,
+            &plan.request,
             memory_plan,
             memory_transaction,
         )?,
     };
+    let completion = Ip32SysAdBus::translate_crime_completion(transaction, crime_completion)
+        .ok_or_else(|| fast_transaction_invariant("CRIME changed the direct SysAD correlation"))?;
     registry
         .get_resolved_mut(control.slots.cpu)?
-        .complete(ExecutionCompletion {
-            id: transaction.id,
-            payload,
-        });
+        .complete(completion);
     control.sysad_transactions = control.sysad_transactions.saturating_add(1);
     control.fast_transaction_hits = control.fast_transaction_hits.saturating_add(1);
     Ok(true)
@@ -3537,17 +3533,13 @@ where
 fn commit_fast_cpu_memory_transaction(
     registry: &mut ComponentRegistry,
     control: &mut MachineControl,
-    cpu_transaction: &ExecutionTransaction<Mips4ExecutionTransaction>,
-    delivery_time: SimTime,
+    request: &CrimeSysAdRequest,
     plan: CrimeDirectMemoryPlan,
     planned_memory_transaction: CrimeMemoryTransaction,
-) -> Result<Mips4ExecutionCompletion, Ip32MachineDispatchError> {
+) -> Result<se_device::chipset::crime::protocol::CrimeSysAdCompletion, Ip32MachineDispatchError> {
     registry
         .get_resolved_mut(control.slots.crime)?
-        .accept(CrimeSysAdRequest {
-            time: delivery_time,
-            transaction: cpu_transaction.clone(),
-        })?;
+        .accept(request.clone())?;
     let memory_transaction = match registry.get_resolved_mut(control.slots.crime)?.poll()? {
         CrimePoll::Action(CrimeAction::StartMemory(transaction))
             if transaction == planned_memory_transaction =>
@@ -3583,7 +3575,7 @@ fn commit_fast_cpu_memory_transaction(
         .complete(memory_completion);
     let completion = match registry.get_resolved_mut(control.slots.crime)?.poll()? {
         CrimePoll::Action(CrimeAction::CompleteSysAd(completion))
-            if completion.id == cpu_transaction.id =>
+            if completion.id == request.id =>
         {
             completion
         }
@@ -3594,7 +3586,7 @@ fn commit_fast_cpu_memory_transaction(
         }
     };
     control.memory_transactions = control.memory_transactions.saturating_add(1);
-    Ok(completion.payload)
+    Ok(completion)
 }
 
 #[cfg(feature = "jit")]
@@ -3630,18 +3622,19 @@ where
                 time: context.now(),
                 duration: sysad.request_delay(),
             })?;
-    let route = match Crime::classify_sysad_route(transaction.payload) {
+    let request = Ip32SysAdBus::translate_cpu_transaction(transaction, delivery_time);
+    let route = match Crime::classify_sysad_route(request.address, &request.transfer) {
         CrimeSysAdRoute::SynchronousInternalRegister
             if registry
                 .get_resolved(control.slots.crime)?
-                .synchronous_sysad_read_ready(transaction.payload) =>
+                .synchronous_sysad_read_ready(request.address, &request.transfer) =>
         {
             Ip32CpuTransactionRoute::InternalRegister
         }
         CrimeSysAdRoute::Memory => {
             let Some(memory_transaction) = registry
                 .get_resolved(control.slots.crime)?
-                .preview_synchronous_memory_request(transaction, delivery_time)
+                .preview_synchronous_memory_request(&request)
             else {
                 return Ok(None);
             };
@@ -3693,7 +3686,7 @@ where
     }
     Ok(Some(Ip32CpuTransactionPlan {
         sysad,
-        delivery_time,
+        request,
         completion_time,
         route,
     }))
@@ -4619,19 +4612,12 @@ where
     loop {
         let action = registry.get_resolved_mut(control.slots.sysad)?.poll();
         match action {
-            Ip32SysAdBusAction::Deliver {
-                target,
-                transaction,
-            } => {
+            Ip32SysAdBusAction::Deliver { target, request } => {
                 if target != component_ids::CRIME {
                     return Err(Ip32MachineDispatchError::UnexpectedController(target));
                 }
-                crime_with_trace_interest(registry, context, control.slots.crime)?.accept(
-                    CrimeSysAdRequest {
-                        time: context.now(),
-                        transaction,
-                    },
-                )?;
+                crime_with_trace_interest(registry, context, control.slots.crime)?
+                    .accept(request)?;
                 drain_crime(registry, context, control)?;
             }
             Ip32SysAdBusAction::Complete {

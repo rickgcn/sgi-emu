@@ -13,8 +13,6 @@ use crate::bus::irq::{IrqOutput, IrqTransaction};
 use crate::bus::transfer::{
     CompactByteEnable, CompactByteEnableView, CompactData, CompactTransfer, CompactTransferView,
 };
-use crate::cpu::execution::protocol::{ExecutionCompletion, ExecutionTransaction};
-use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 
 /// CRIME's single processor interrupt output.
 pub const CRIME_IRQ_OUTPUT: IrqOutput = IrqOutput::new(0);
@@ -46,11 +44,17 @@ impl fmt::Display for CrimeTransactionId {
 /// CPU request delivered to CRIME by the SysAD bus.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeSysAdRequest {
+    /// Correlation identifier owned by the SysAD domain.
+    pub id: CrimeTransactionId,
+
     /// Simulated delivery time.
     pub time: SimTime,
 
-    /// Original correlated CPU transaction.
-    pub transaction: ExecutionTransaction<Mips4ExecutionTransaction>,
+    /// Physical byte address.
+    pub address: u64,
+
+    /// Physical byte transfer.
+    pub transfer: CrimeTransfer,
 }
 
 /// Side-effect-free classification of one processor SysAD request.
@@ -444,6 +448,16 @@ pub struct CrimeMemoryCompletion {
     pub result: Result<CrimeMemoryOutcome, CrimeBusError>,
 }
 
+/// Completion returned to the SysAD domain.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CrimeSysAdCompletion {
+    /// Correlation identifier copied from the request.
+    pub id: CrimeTransactionId,
+
+    /// CRIME transfer result.
+    pub result: Result<CrimeCompletionPayload, CrimeBusError>,
+}
+
 /// Software-visible memory diagnostic associated with a completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeMemoryDiagnostic {
@@ -789,7 +803,7 @@ pub enum CrimeAction {
     CompleteCgiDevice(CrimeCgiCompletion),
 
     /// Completes the outstanding CPU transaction.
-    CompleteSysAd(ExecutionCompletion<Mips4ExecutionCompletion>),
+    CompleteSysAd(CrimeSysAdCompletion),
 
     /// Drives CRIME's interrupt output through the attached IRQ bus.
     SetIrq(IrqTransaction),
@@ -857,6 +871,8 @@ mod tests {
 
     #[test]
     fn compact_crime_protocols_meet_hot_path_size_limits() {
+        assert!(core::mem::size_of::<CrimeSysAdRequest>() <= 64);
+        assert!(core::mem::size_of::<CrimeSysAdCompletion>() <= 64);
         assert!(core::mem::size_of::<CrimeMemoryTransaction>() <= 64);
         assert!(core::mem::size_of::<CrimeMemoryCompletion>() <= 64);
         assert!(core::mem::size_of::<CrimeCmiTransaction>() <= 64);

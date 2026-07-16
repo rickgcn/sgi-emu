@@ -578,11 +578,8 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
             return Mips4FastMemoryReadResult::Unavailable;
         }
         let uses_cmi = mace_ust;
-        let size = match request.size() {
-            1 => Mips4ExecutionTransferSize::Byte,
-            2 => Mips4ExecutionTransferSize::Halfword,
-            4 => Mips4ExecutionTransferSize::Word,
-            8 => Mips4ExecutionTransferSize::Doubleword,
+        let length = match request.size() {
+            1 | 2 | 4 | 8 => request.size() as u16,
             _ => return Mips4FastMemoryReadResult::InternalError,
         };
         let Some((delivery_ticks, completion_ticks, code_fetches)) =
@@ -619,16 +616,14 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
             };
             value
         } else {
-            let transaction = Mips4ExecutionTransaction::Read {
-                physical_address: request.physical_address(),
-                size,
-                kind: Mips4ExecutionAccessKind::DataLoad,
-                access_type: se_device::cpu::mips4::cache::Mips4MemoryAccessType::Uncached,
-            };
-            let Some(Mips4ExecutionCompletion::ReadData(value)) =
-                self.crime.read(transaction, delivery_time)
+            let Some(data) = self
+                .crime
+                .read(request.physical_address(), length, delivery_time)
             else {
                 return Mips4FastMemoryReadResult::Unavailable;
+            };
+            let Some(value) = Ip32SysAdBus::pack_read_data(&data) else {
+                return Mips4FastMemoryReadResult::InternalError;
             };
             value
         };

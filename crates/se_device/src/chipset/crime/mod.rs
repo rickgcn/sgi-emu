@@ -23,29 +23,24 @@ use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::scheduler::SimTime;
 use se_core::tracing::{TraceInterest, TraceLevel};
 
-use crate::bus::irq::{IrqSource, IrqTransaction};
-use crate::cpu::execution::protocol::{
-    ExecutionCompletion, ExecutionTransaction, ExecutionTransactionId,
-};
-use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
-
 use self::clock::CrimeClock;
 use self::config::{CrimeAccessPolicy, CrimeConfig, CrimeConfigError};
 use self::piu::{CRIME_MASTER_FREQUENCY_HZ, CrimePiu, PiuEffect};
 use self::protocol::{
     CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusError, CrimeCgiCompletion, CrimeCgiTransaction,
-    CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal,
+    CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal, CrimeData,
     CrimeDmaRequest, CrimeEvent, CrimeInterruptPost, CrimeLinkDeviceResponse, CrimeLinkOperation,
     CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryCompletion, CrimeMemoryFault,
     CrimeMemoryInhibitReason, CrimeMemoryOutcome, CrimeMemoryTransaction, CrimePioRequest,
-    CrimePoll, CrimeSdramSignal, CrimeSysAdRequest, CrimeSysAdRoute, CrimeTraceEvent,
-    CrimeTraceField, CrimeTraceFields, CrimeTraceValue, CrimeTransactionId, CrimeTransfer,
-    CrimeTransferView,
+    CrimePoll, CrimeSdramSignal, CrimeSysAdCompletion, CrimeSysAdRequest, CrimeSysAdRoute,
+    CrimeTraceEvent, CrimeTraceField, CrimeTraceFields, CrimeTraceValue, CrimeTransactionId,
+    CrimeTransfer, CrimeTransferView,
 };
 use self::render::{
     CrimeRender, CrimeRenderError, RenderAccessError, RenderInterruptEffect,
     RenderMemoryDestination, RenderMemoryRequest, RenderNotice, RenderProgress, RenderWriteError,
 };
+use crate::bus::irq::{IrqSource, IrqTransaction};
 use crate::common::pending::InlineMap8;
 
 const LOW_MEMORY_END: u64 = 0x1000_0000;
@@ -69,8 +64,8 @@ const PCI_HIGH_END: u64 = 0x3_0000_0000;
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum PendingMemoryOrigin {
     SysAd {
-        execution_id: ExecutionTransactionId,
-        request: Mips4ExecutionTransaction,
+        sysad_id: CrimeTransactionId,
+        address: u64,
     },
     CmiDma {
         link_id: CrimeTransactionId,
@@ -83,22 +78,24 @@ enum PendingMemoryOrigin {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingLink {
-    execution_id: ExecutionTransactionId,
-    request: Mips4ExecutionTransaction,
+    sysad_id: CrimeTransactionId,
+    address: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingRenderWrite {
-    execution_id: ExecutionTransactionId,
-    transaction: Mips4ExecutionTransaction,
+    sysad_id: CrimeTransactionId,
+    address: u64,
+    transfer: CrimeTransfer,
 }
 
 type PendingMemoryTable = InlineMap8<CrimeTransactionId, PendingMemoryOrigin>;
 type PendingLinkTable = InlineMap8<CrimeTransactionId, PendingLink>;
+type CrimeSysAdResult = Result<CrimeCompletionPayload, CrimeBusError>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum RenderAccessResult {
-    Complete(Mips4ExecutionCompletion),
+    Complete(Result<CrimeCompletionPayload, CrimeBusError>),
     Deferred,
 }
 
@@ -111,10 +108,10 @@ pub enum CrimeError {
     /// The machine timing ABI has no ticks.
     InvalidTimebase,
 
-    /// A second SysAD request arrived while the R5000 request was outstanding.
+    /// A second SysAD request arrived while another processor request was outstanding.
     SysAdBusy {
-        /// Outstanding CPU transaction.
-        transaction_id: ExecutionTransactionId,
+        /// Outstanding SysAD transaction.
+        transaction_id: CrimeTransactionId,
     },
 
     /// CRIME exhausted its transaction identifier space.
@@ -174,7 +171,7 @@ pub struct Crime {
     memory_ecc_check: u32,
     memory_ecc_replacement: u8,
     next_transaction_id: u128,
-    pending_sysad: Option<ExecutionTransactionId>,
+    pending_sysad: Option<CrimeTransactionId>,
     pending_render_write: Option<PendingRenderWrite>,
     pending_memory: PendingMemoryTable,
     pending_cmi: PendingLinkTable,
@@ -226,12 +223,8 @@ pub struct CrimeSynchronousTimerProjection {
 
 impl CrimeSynchronousReadSnapshot {
     /// Completes a defined, aligned control-register read at an exact delivery time.
-    pub fn read(
-        &self,
-        transaction: Mips4ExecutionTransaction,
-        delivery_time: SimTime,
-    ) -> Option<Mips4ExecutionCompletion> {
-        control_register_read_completion(transaction, |address| {
+    pub fn read(&self, address: u64, length: u16, delivery_time: SimTime) -> Option<CrimeData> {
+        control_register_read_data(address, length, |address| {
             self.piu
                 .read(address, delivery_time, self.timebase_hz)
                 .or_else(|| self.read_memory_register(address))
@@ -344,8 +337,8 @@ impl Crime {
     }
 
     /// Classifies a CPU request without changing chipset state.
-    pub fn classify_sysad_route(transaction: Mips4ExecutionTransaction) -> CrimeSysAdRoute {
-        let (address, size) = transaction_shape(transaction);
+    pub fn classify_sysad_route(address: u64, transfer: &CrimeTransfer) -> CrimeSysAdRoute {
+        let size = transfer.length();
         if decode_memory(address, size).is_some() {
             CrimeSysAdRoute::Memory
         } else if (registers::CRIME_BASE..registers::CRIME_RENDER_BASE).contains(&address) {
@@ -366,36 +359,35 @@ impl Crime {
     /// Previews the exact memory-domain request produced by an idle CPU access.
     pub fn preview_synchronous_memory_request(
         &self,
-        request: &ExecutionTransaction<Mips4ExecutionTransaction>,
-        delivery_time: SimTime,
+        request: &CrimeSysAdRequest,
     ) -> Option<CrimeMemoryTransaction> {
         if !self.stable_cpu_fetch_ready()
-            || Self::classify_sysad_route(request.payload) != CrimeSysAdRoute::Memory
+            || Self::classify_sysad_route(request.address, &request.transfer)
+                != CrimeSysAdRoute::Memory
             || self.next_transaction_id.checked_add(1).is_none()
         {
             return None;
         }
-        let (address, size) = transaction_shape(request.payload);
-        let (memory_address, no_ecc) = decode_memory(address, size)?;
+        let (memory_address, no_ecc) = decode_memory(request.address, request.transfer.length())?;
         Some(CrimeMemoryTransaction {
             id: CrimeTransactionId::new(self.next_transaction_id),
-            time: delivery_time,
+            time: request.time,
             controller: self.id,
             client: CrimeMemoryClient::Cpu,
             address: memory_address,
             bank_select: CrimeMemoryBankSelect::Decode,
             no_ecc,
-            transfer: transfer_from_cpu(request.payload),
+            transfer: request.transfer.clone(),
         })
     }
 
     /// Returns whether an idle, defined control-register read can complete synchronously.
-    pub fn synchronous_sysad_read_ready(&self, transaction: Mips4ExecutionTransaction) -> bool {
+    pub fn synchronous_sysad_read_ready(&self, address: u64, transfer: &CrimeTransfer) -> bool {
         self.stable_cpu_fetch_ready()
-            && Self::classify_sysad_route(transaction)
+            && Self::classify_sysad_route(address, transfer)
                 == CrimeSysAdRoute::SynchronousInternalRegister
             && self
-                .control_register_read_completion(transaction, self.current_time)
+                .control_register_read_data(address, transfer, self.current_time)
                 .is_some()
     }
 
@@ -462,13 +454,17 @@ impl Crime {
     /// planning through commit.
     pub fn commit_synchronous_sysad_read(
         &mut self,
-        transaction: Mips4ExecutionTransaction,
-        delivery_time: SimTime,
-    ) -> Mips4ExecutionCompletion {
-        debug_assert!(self.synchronous_sysad_read_ready(transaction));
-        self.current_time = delivery_time;
-        self.control_register_read_completion(transaction, delivery_time)
-            .expect("a validated synchronous CRIME read must remain defined")
+        request: &CrimeSysAdRequest,
+    ) -> CrimeSysAdCompletion {
+        debug_assert!(self.synchronous_sysad_read_ready(request.address, &request.transfer));
+        self.current_time = request.time;
+        CrimeSysAdCompletion {
+            id: request.id,
+            result: Ok(CrimeCompletionPayload::ReadData(
+                self.control_register_read_data(request.address, &request.transfer, request.time)
+                    .expect("a validated synchronous CRIME read must remain defined"),
+            )),
+        }
     }
 
     /// Accounts for bypassed stable CPU requests at the last SysAD delivery time.
@@ -630,10 +626,14 @@ impl Crime {
         if let Some(transaction_id) = self.pending_sysad {
             return Err(CrimeError::SysAdBusy { transaction_id });
         }
-        self.current_time = request.time;
-        let execution_id = request.transaction.id;
-        let transaction = request.transaction.payload;
-        let (address, size) = transaction_shape(transaction);
+        let CrimeSysAdRequest {
+            id: sysad_id,
+            time,
+            address,
+            transfer,
+        } = request;
+        self.current_time = time;
+        let size = transfer.length();
         self.push_trace(|| CrimeTraceEvent {
             level: TraceLevel::Trace,
             target: trace::PIU_TARGET,
@@ -645,58 +645,57 @@ impl Crime {
                 },
                 CrimeTraceField {
                     key: "size",
-                    value: CrimeTraceValue::U64(u64::from(size)),
+                    value: CrimeTraceValue::U64(size as u64),
                 },
             ]
             .into(),
         });
 
+        if !matches!(size, 1 | 2 | 4 | 8)
+            || matches!(
+                transfer.view(),
+                CrimeTransferView::Write { data, byte_enable }
+                    if data.len() != byte_enable.len()
+            )
+        {
+            self.record_cpu_error(address);
+            self.finish_sysad(sysad_id, Err(CrimeBusError::Access));
+            return Ok(());
+        }
+
         if let Some((memory_address, no_ecc)) = decode_memory(address, size) {
             let id = self.allocate_transaction_id()?;
-            self.pending_sysad = Some(execution_id);
-            self.pending_memory.insert(
-                id,
-                PendingMemoryOrigin::SysAd {
-                    execution_id,
-                    request: transaction,
-                },
-            );
+            self.pending_sysad = Some(sysad_id);
+            self.pending_memory
+                .insert(id, PendingMemoryOrigin::SysAd { sysad_id, address });
             self.actions
                 .push_back(CrimeAction::StartMemory(CrimeMemoryTransaction {
                     id,
-                    time: request.time,
+                    time,
                     controller: self.id,
                     client: CrimeMemoryClient::Cpu,
                     address: memory_address,
                     bank_select: CrimeMemoryBankSelect::Decode,
                     no_ecc,
-                    transfer: transfer_from_cpu(transaction),
+                    transfer,
                 }));
             return Ok(());
         }
         if (registers::CRIME_BASE..registers::CRIME_REGISTER_END).contains(&address) {
-            self.access_internal_register(execution_id, transaction, request.time)?;
+            self.access_internal_register(sysad_id, address, transfer, time)?;
             return Ok(());
         }
         if in_window(address, size, GBE_START, GBE_END) {
             let id = self.allocate_transaction_id()?;
-            self.pending_sysad = Some(execution_id);
-            self.pending_cgi.insert(
-                id,
-                PendingLink {
-                    execution_id,
-                    request: transaction,
-                },
-            );
+            self.pending_sysad = Some(sysad_id);
+            self.pending_cgi
+                .insert(id, PendingLink { sysad_id, address });
             self.actions
                 .push_back(CrimeAction::StartCgi(CrimeCgiTransaction {
                     id,
                     controller: self.id,
                     target: self.gbe_target,
-                    operation: CrimeLinkOperation::Pio(CrimePioRequest {
-                        address,
-                        transfer: transfer_from_cpu(transaction),
-                    }),
+                    operation: CrimeLinkOperation::Pio(CrimePioRequest { address, transfer }),
                 }));
             return Ok(());
         }
@@ -704,65 +703,59 @@ impl Crime {
             || in_window(address, size, PCI_HIGH_START, PCI_HIGH_END)
         {
             let id = self.allocate_transaction_id()?;
-            self.pending_sysad = Some(execution_id);
-            self.pending_cmi.insert(
-                id,
-                PendingLink {
-                    execution_id,
-                    request: transaction,
-                },
-            );
+            self.pending_sysad = Some(sysad_id);
+            self.pending_cmi
+                .insert(id, PendingLink { sysad_id, address });
             self.actions
                 .push_back(CrimeAction::StartCmi(CrimeCmiTransaction {
                     id,
                     controller: self.id,
                     target: self.mace_target,
-                    operation: CrimeLinkOperation::Pio(CrimePioRequest {
-                        address,
-                        transfer: transfer_from_cpu(transaction),
-                    }),
+                    operation: CrimeLinkOperation::Pio(CrimePioRequest { address, transfer }),
                 }));
             return Ok(());
         }
         let _vice = in_window(address, size, VICE_START, VICE_END);
-        self.complete_unsupported(execution_id, transaction, address);
+        self.complete_unsupported(sysad_id, &transfer, address);
         Ok(())
     }
 
     fn access_internal_register(
         &mut self,
-        execution_id: ExecutionTransactionId,
-        transaction: Mips4ExecutionTransaction,
+        sysad_id: CrimeTransactionId,
+        address: u64,
+        transfer: CrimeTransfer,
         now: SimTime,
     ) -> Result<(), CrimeError> {
-        let (address, size) = transaction_shape(transaction);
+        let size = transfer.length();
         let completion = if address < registers::CRIME_RENDER_BASE {
-            match transaction {
-                Mips4ExecutionTransaction::Read { .. } if size == 4 && address & 3 == 0 => {
+            match transfer.view() {
+                CrimeTransferView::Read { .. } if size == 4 && address & 3 == 0 => {
                     self.access_control_register_word(address, now)
                 }
                 _ if size == 8 && address & 7 == 0 => {
-                    self.access_control_register(transaction, now)
+                    self.access_control_register(address, &transfer, now)
                 }
-                _ => Mips4ExecutionCompletion::BusError,
+                _ => Err(CrimeBusError::Access),
             }
         } else {
-            match self.access_render_register(execution_id, transaction)? {
+            match self.access_render_register(sysad_id, address, &transfer)? {
                 RenderAccessResult::Complete(completion) => completion,
                 RenderAccessResult::Deferred => return Ok(()),
             }
         };
-        self.complete_internal_register_access(execution_id, transaction, completion);
+        self.complete_internal_register_access(sysad_id, address, &transfer, completion);
         Ok(())
     }
 
     fn complete_internal_register_access(
         &mut self,
-        execution_id: ExecutionTransactionId,
-        transaction: Mips4ExecutionTransaction,
-        completion: Mips4ExecutionCompletion,
+        sysad_id: CrimeTransactionId,
+        address: u64,
+        transfer: &CrimeTransfer,
+        completion: CrimeSysAdResult,
     ) {
-        let (address, size) = transaction_shape(transaction);
+        let size = transfer.length();
         let target = if address < registers::CRIME_BASE + 0x0200 {
             trace::PIU_TARGET
         } else if address < registers::CRIME_RENDER_BASE {
@@ -771,7 +764,7 @@ impl Crime {
             trace::RENDER_TARGET
         };
         self.push_trace(|| CrimeTraceEvent {
-            level: if matches!(completion, Mips4ExecutionCompletion::BusError) {
+            level: if completion.is_err() {
                 TraceLevel::Warn
             } else {
                 TraceLevel::Trace
@@ -785,82 +778,88 @@ impl Crime {
                 },
                 CrimeTraceField {
                     key: "size",
-                    value: CrimeTraceValue::U64(u64::from(size)),
+                    value: CrimeTraceValue::U64(size as u64),
                 },
                 CrimeTraceField {
                     key: "operation",
-                    value: CrimeTraceValue::String(match transaction {
-                        Mips4ExecutionTransaction::Read { .. } => "read",
-                        Mips4ExecutionTransaction::Write { .. } => "write",
+                    value: CrimeTraceValue::String(match transfer.view() {
+                        CrimeTransferView::Read { .. } => "read",
+                        CrimeTransferView::Write { .. } => "write",
                     }),
                 },
                 CrimeTraceField {
                     key: "bus_error",
-                    value: CrimeTraceValue::Bool(matches!(
-                        completion,
-                        Mips4ExecutionCompletion::BusError
-                    )),
+                    value: CrimeTraceValue::Bool(completion.is_err()),
                 },
             ]
             .into(),
         });
-        if matches!(completion, Mips4ExecutionCompletion::BusError) {
+        if completion.is_err() {
             self.record_cpu_error(address);
         }
-        self.finish_sysad(execution_id, completion);
+        self.finish_sysad(sysad_id, completion);
     }
 
     fn access_control_register(
         &mut self,
-        transaction: Mips4ExecutionTransaction,
+        address: u64,
+        transfer: &CrimeTransfer,
         now: SimTime,
-    ) -> Mips4ExecutionCompletion {
-        let (address, _) = transaction_shape(transaction);
-        match transaction {
-            Mips4ExecutionTransaction::Read { .. } => self
-                .control_register_read_completion(transaction, now)
-                .unwrap_or_else(|| self.unsupported_read_completion()),
-            Mips4ExecutionTransaction::Write {
-                data, byte_enable, ..
-            } => {
-                if byte_enable != 0xff {
-                    return Mips4ExecutionCompletion::BusError;
+    ) -> CrimeSysAdResult {
+        match transfer.view() {
+            CrimeTransferView::Read { .. } => self
+                .control_register_read_data(address, transfer, now)
+                .map(CrimeCompletionPayload::ReadData)
+                .map(Ok)
+                .unwrap_or_else(|| self.unsupported_read_result(transfer.length())),
+            CrimeTransferView::Write { data, byte_enable } => {
+                if data.len() != 8
+                    || byte_enable.len() != 8
+                    || byte_enable.iter().any(|enabled| !enabled)
+                {
+                    return Err(CrimeBusError::Access);
                 }
-                let value = data.swap_bytes();
+                let value = u64::from_be_bytes(data.try_into().expect("length was checked"));
                 let result = self.piu.write(address, value, now, self.timebase_hz);
                 if result.handled {
                     self.apply_piu_effects(result.effects);
-                    Mips4ExecutionCompletion::WriteComplete
+                    Ok(CrimeCompletionPayload::WriteComplete)
                 } else if self.write_memory_register(address, value) {
-                    Mips4ExecutionCompletion::WriteComplete
+                    Ok(CrimeCompletionPayload::WriteComplete)
                 } else {
-                    self.unsupported_write_completion()
+                    self.unsupported_write_result()
                 }
             }
         }
     }
 
-    fn control_register_read_completion(
+    fn control_register_read_data(
         &self,
-        transaction: Mips4ExecutionTransaction,
+        address: u64,
+        transfer: &CrimeTransfer,
         now: SimTime,
-    ) -> Option<Mips4ExecutionCompletion> {
-        control_register_read_completion(transaction, |address| {
+    ) -> Option<CrimeData> {
+        let CrimeTransferView::Read { length } = transfer.view() else {
+            return None;
+        };
+        control_register_read_data(address, length, |address| {
             self.read_control_register(address, now)
         })
     }
 
-    fn access_control_register_word(&self, address: u64, now: SimTime) -> Mips4ExecutionCompletion {
-        self.control_register_word_read_completion(address, now)
-            .unwrap_or_else(|| self.unsupported_read_completion())
+    fn access_control_register_word(&self, address: u64, now: SimTime) -> CrimeSysAdResult {
+        self.control_register_word_read_data(address, now)
+            .map(CrimeCompletionPayload::ReadData)
+            .map(Ok)
+            .unwrap_or_else(|| self.unsupported_read_result(4))
     }
 
-    fn control_register_word_read_completion(
+    fn control_register_word_read_data(
         &self,
         address: u64,
         now: SimTime,
-    ) -> Option<Mips4ExecutionCompletion> {
-        control_register_word_read_completion(address, |register_address| {
+    ) -> Option<self::protocol::CrimeData> {
+        control_register_word_read_data(address, |register_address| {
             self.read_control_register(register_address, now)
         })
     }
@@ -873,51 +872,55 @@ impl Crime {
 
     fn access_render_register(
         &mut self,
-        execution_id: ExecutionTransactionId,
-        transaction: Mips4ExecutionTransaction,
+        sysad_id: CrimeTransactionId,
+        address: u64,
+        transfer: &CrimeTransfer,
     ) -> Result<RenderAccessResult, CrimeError> {
-        let (address, size) = transaction_shape(transaction);
-        let result = match transaction {
-            Mips4ExecutionTransaction::Read { .. } => match self.render.read(address, size) {
-                Ok(value) => RenderAccessResult::Complete(Mips4ExecutionCompletion::ReadData(
-                    encode_big_endian(value, size),
-                )),
+        let Ok(size) = u8::try_from(transfer.length()) else {
+            return Ok(RenderAccessResult::Complete(Err(CrimeBusError::Access)));
+        };
+        if !matches!(size, 4 | 8) {
+            return Ok(RenderAccessResult::Complete(Err(CrimeBusError::Access)));
+        }
+        let result = match transfer.view() {
+            CrimeTransferView::Read { .. } => match self.render.read(address, size) {
+                Ok(value) => RenderAccessResult::Complete(Ok(CrimeCompletionPayload::ReadData(
+                    encode_register_data(value, size),
+                ))),
                 Err(RenderAccessError::Access) => {
-                    RenderAccessResult::Complete(Mips4ExecutionCompletion::BusError)
+                    RenderAccessResult::Complete(Err(CrimeBusError::Access))
                 }
                 Err(RenderAccessError::Unsupported) => {
-                    RenderAccessResult::Complete(self.unsupported_read_completion())
+                    RenderAccessResult::Complete(self.unsupported_read_result(usize::from(size)))
                 }
             },
-            Mips4ExecutionTransaction::Write {
-                data, byte_enable, ..
-            } => {
-                let expected_enable = ((1_u16 << size) - 1) as u8;
-                if byte_enable != expected_enable {
-                    return Ok(RenderAccessResult::Complete(
-                        Mips4ExecutionCompletion::BusError,
-                    ));
+            CrimeTransferView::Write { data, byte_enable } => {
+                if byte_enable.len() != data.len() || byte_enable.iter().any(|enabled| !enabled) {
+                    return Ok(RenderAccessResult::Complete(Err(CrimeBusError::Access)));
                 }
-                let value = decode_big_endian(data, size);
+                let Some(value) = decode_register_data(data) else {
+                    return Ok(RenderAccessResult::Complete(Err(CrimeBusError::Access)));
+                };
                 match self.render.write(address, size, value) {
                     Ok(progress) => {
                         self.trace_render_register_write(address, size, value);
                         self.apply_render_progress(progress)?;
-                        RenderAccessResult::Complete(Mips4ExecutionCompletion::WriteComplete)
+                        RenderAccessResult::Complete(Ok(CrimeCompletionPayload::WriteComplete))
                     }
                     Err(RenderWriteError::InterfaceFull) => {
-                        self.pending_sysad = Some(execution_id);
+                        self.pending_sysad = Some(sysad_id);
                         self.pending_render_write = Some(PendingRenderWrite {
-                            execution_id,
-                            transaction,
+                            sysad_id,
+                            address,
+                            transfer: transfer.clone(),
                         });
                         RenderAccessResult::Deferred
                     }
                     Err(RenderWriteError::Access(RenderAccessError::Access)) => {
-                        RenderAccessResult::Complete(Mips4ExecutionCompletion::BusError)
+                        RenderAccessResult::Complete(Err(CrimeBusError::Access))
                     }
                     Err(RenderWriteError::Access(RenderAccessError::Unsupported)) => {
-                        RenderAccessResult::Complete(self.unsupported_write_completion())
+                        RenderAccessResult::Complete(self.unsupported_write_result())
                     }
                 }
             }
@@ -932,28 +935,29 @@ impl Crime {
         let Some(pending) = self.pending_render_write.take() else {
             return Ok(());
         };
-        let (address, size) = transaction_shape(pending.transaction);
-        let Mips4ExecutionTransaction::Write { data, .. } = pending.transaction else {
+        let CrimeTransferView::Write { data, .. } = pending.transfer.view() else {
             unreachable!("only RE writes can be deferred")
         };
-        let value = decode_big_endian(data, size);
-        let progress = self
-            .render
-            .write(address, size, value)
-            .map_err(|error| match error {
-                RenderWriteError::InterfaceFull => {
-                    unreachable!("the RE interface space was checked before retry")
-                }
-                RenderWriteError::Access(_) => {
-                    unreachable!("the deferred RE write was validated before retry")
-                }
-            })?;
-        self.trace_render_register_write(address, size, value);
+        let size = u8::try_from(data.len()).expect("validated RE writes fit the size ABI");
+        let value = decode_register_data(data).expect("deferred RE write was validated");
+        let progress =
+            self.render
+                .write(pending.address, size, value)
+                .map_err(|error| match error {
+                    RenderWriteError::InterfaceFull => {
+                        unreachable!("the RE interface space was checked before retry")
+                    }
+                    RenderWriteError::Access(_) => {
+                        unreachable!("the deferred RE write was validated before retry")
+                    }
+                })?;
+        self.trace_render_register_write(pending.address, size, value);
         self.apply_render_progress(progress)?;
         self.complete_internal_register_access(
-            pending.execution_id,
-            pending.transaction,
-            Mips4ExecutionCompletion::WriteComplete,
+            pending.sysad_id,
+            pending.address,
+            &pending.transfer,
+            Ok(CrimeCompletionPayload::WriteComplete),
         );
         Ok(())
     }
@@ -1349,15 +1353,12 @@ impl Crime {
             self.record_memory_diagnostic(&origin, outcome);
         }
         match origin {
-            PendingMemoryOrigin::SysAd {
-                execution_id,
-                request,
-            } => {
-                let payload = cpu_memory_completion(completion.result);
-                if matches!(payload, Mips4ExecutionCompletion::BusError) {
-                    self.record_cpu_error(transaction_shape(request).0);
+            PendingMemoryOrigin::SysAd { sysad_id, address } => {
+                let result = sysad_memory_completion(completion.result);
+                if result.is_err() {
+                    self.record_cpu_error(address);
                 }
-                self.finish_sysad(execution_id, payload);
+                self.finish_sysad(sysad_id, result);
             }
             PendingMemoryOrigin::CmiDma { link_id } => {
                 let (result, memory_fault) = link_memory_completion(completion.result);
@@ -1397,11 +1398,11 @@ impl Crime {
                 transaction_id: completion.id,
             });
         };
-        let payload = cpu_link_completion(completion.result);
-        if matches!(payload, Mips4ExecutionCompletion::BusError) {
-            self.record_cpu_error(transaction_shape(pending.request).0);
+        let result = completion.result;
+        if result.is_err() {
+            self.record_cpu_error(pending.address);
         }
-        self.finish_sysad(pending.execution_id, payload);
+        self.finish_sysad(pending.sysad_id, result);
         Ok(())
     }
 
@@ -1414,11 +1415,11 @@ impl Crime {
                 transaction_id: completion.id,
             });
         };
-        let payload = cpu_link_completion(completion.result);
-        if matches!(payload, Mips4ExecutionCompletion::BusError) {
-            self.record_cpu_error(transaction_shape(pending.request).0);
+        let result = completion.result;
+        if result.is_err() {
+            self.record_cpu_error(pending.address);
         }
-        self.finish_sysad(pending.execution_id, payload);
+        self.finish_sysad(pending.sysad_id, result);
         Ok(())
     }
 
@@ -1580,49 +1581,49 @@ impl Crime {
 
     fn complete_unsupported(
         &mut self,
-        execution_id: ExecutionTransactionId,
-        request: Mips4ExecutionTransaction,
+        sysad_id: CrimeTransactionId,
+        transfer: &CrimeTransfer,
         address: u64,
     ) {
-        let completion = match self.config.unimplemented_access_policy {
-            CrimeAccessPolicy::Strict => Mips4ExecutionCompletion::BusError,
-            CrimeAccessPolicy::Permissive => match request {
-                Mips4ExecutionTransaction::Read { .. } => Mips4ExecutionCompletion::ReadData(0),
-                Mips4ExecutionTransaction::Write { .. } => Mips4ExecutionCompletion::WriteComplete,
+        let result = match self.config.unimplemented_access_policy {
+            CrimeAccessPolicy::Strict => Err(CrimeBusError::Address),
+            CrimeAccessPolicy::Permissive => match transfer.view() {
+                CrimeTransferView::Read { .. } => Ok(CrimeCompletionPayload::ReadData(
+                    CrimeData::zeroed(transfer.length()),
+                )),
+                CrimeTransferView::Write { .. } => Ok(CrimeCompletionPayload::WriteComplete),
             },
         };
-        if matches!(completion, Mips4ExecutionCompletion::BusError) {
+        if result.is_err() {
             self.record_cpu_error(address);
         }
-        self.finish_sysad(execution_id, completion);
+        self.finish_sysad(sysad_id, result);
     }
 
-    fn unsupported_read_completion(&self) -> Mips4ExecutionCompletion {
+    fn unsupported_read_result(&self, length: usize) -> CrimeSysAdResult {
         match self.config.unimplemented_access_policy {
-            CrimeAccessPolicy::Strict => Mips4ExecutionCompletion::BusError,
-            CrimeAccessPolicy::Permissive => Mips4ExecutionCompletion::ReadData(0),
+            CrimeAccessPolicy::Strict => Err(CrimeBusError::Unsupported),
+            CrimeAccessPolicy::Permissive => {
+                Ok(CrimeCompletionPayload::ReadData(CrimeData::zeroed(length)))
+            }
         }
     }
 
-    fn unsupported_write_completion(&self) -> Mips4ExecutionCompletion {
+    fn unsupported_write_result(&self) -> CrimeSysAdResult {
         match self.config.unimplemented_access_policy {
-            CrimeAccessPolicy::Strict => Mips4ExecutionCompletion::BusError,
-            CrimeAccessPolicy::Permissive => Mips4ExecutionCompletion::WriteComplete,
+            CrimeAccessPolicy::Strict => Err(CrimeBusError::Unsupported),
+            CrimeAccessPolicy::Permissive => Ok(CrimeCompletionPayload::WriteComplete),
         }
     }
 
-    fn finish_sysad(
-        &mut self,
-        execution_id: ExecutionTransactionId,
-        payload: Mips4ExecutionCompletion,
-    ) {
-        if self.pending_sysad == Some(execution_id) {
+    fn finish_sysad(&mut self, sysad_id: CrimeTransactionId, result: CrimeSysAdResult) {
+        if self.pending_sysad == Some(sysad_id) {
             self.pending_sysad = None;
         }
         self.actions
-            .push_back(CrimeAction::CompleteSysAd(ExecutionCompletion {
-                id: execution_id,
-                payload,
+            .push_back(CrimeAction::CompleteSysAd(CrimeSysAdCompletion {
+                id: sysad_id,
+                result,
             }));
     }
 
@@ -1852,106 +1853,38 @@ impl BusDeviceRole<CrimeCgiTransaction> for Crime {
     }
 }
 
-fn control_register_read_completion(
-    transaction: Mips4ExecutionTransaction,
+fn control_register_read_data(
+    address: u64,
+    length: u16,
     mut read: impl FnMut(u64) -> Option<u64>,
-) -> Option<Mips4ExecutionCompletion> {
-    let Mips4ExecutionTransaction::Read {
-        physical_address: address,
-        size,
-        ..
-    } = transaction
-    else {
-        return None;
-    };
-    let size = size.bytes();
-    if size == 4 && address & 3 == 0 {
-        return control_register_word_read_completion(address, read);
+) -> Option<CrimeData> {
+    if length == 4 && address & 3 == 0 {
+        return control_register_word_read_data(address, read);
     }
-    if size == 8 && address & 7 == 0 {
-        return read(address).map(|value| Mips4ExecutionCompletion::ReadData(value.swap_bytes()));
+    if length == 8 && address & 7 == 0 {
+        return read(address).map(|value| value.to_be_bytes().into());
     }
     None
 }
 
-fn control_register_word_read_completion(
+fn control_register_word_read_data(
     address: u64,
     mut read: impl FnMut(u64) -> Option<u64>,
-) -> Option<Mips4ExecutionCompletion> {
+) -> Option<CrimeData> {
     let value = read(address & !7)?;
 
-    // The execution request retains the CPU load width, while R5000 SysAD
-    // obtains the complete aligned doubleword and selects the requested
-    // big-endian word lane inside the processor.
+    // SysAD obtains the complete aligned doubleword and selects the requested
+    // big-endian word lane for a word transfer.
     let word = if address & 4 == 0 {
         (value >> 32) as u32
     } else {
         value as u32
     };
-    Some(Mips4ExecutionCompletion::ReadData(encode_big_endian(
-        u64::from(word),
-        4,
-    )))
+    Some(word.to_be_bytes().into())
 }
 
-fn transaction_shape(transaction: Mips4ExecutionTransaction) -> (u64, u8) {
-    match transaction {
-        Mips4ExecutionTransaction::Read {
-            physical_address,
-            size,
-            ..
-        }
-        | Mips4ExecutionTransaction::Write {
-            physical_address,
-            size,
-            ..
-        } => (physical_address, size.bytes()),
-    }
-}
-
-fn transfer_from_cpu(transaction: Mips4ExecutionTransaction) -> CrimeTransfer {
-    match transaction {
-        Mips4ExecutionTransaction::Read { size, .. } => {
-            CrimeTransfer::read(u16::from(size.bytes()))
-        }
-        Mips4ExecutionTransaction::Write {
-            size,
-            data,
-            byte_enable,
-            ..
-        } => {
-            let length = usize::from(size.bytes());
-            CrimeTransfer::write(
-                data.to_le_bytes()[..length].iter().copied().collect(),
-                (0..length)
-                    .map(|lane| byte_enable & (1 << lane) != 0)
-                    .collect(),
-            )
-        }
-    }
-}
-
-fn cpu_link_completion(
-    result: Result<CrimeCompletionPayload, CrimeBusError>,
-) -> Mips4ExecutionCompletion {
-    match result {
-        Ok(CrimeCompletionPayload::ReadData(data)) if data.len() <= 8 => {
-            let mut lanes = [0; 8];
-            lanes[..data.len()].copy_from_slice(&data);
-            Mips4ExecutionCompletion::ReadData(u64::from_le_bytes(lanes))
-        }
-        Ok(CrimeCompletionPayload::WriteComplete) => Mips4ExecutionCompletion::WriteComplete,
-        Ok(CrimeCompletionPayload::ReadData(_)) | Err(_) => Mips4ExecutionCompletion::BusError,
-    }
-}
-
-fn cpu_memory_completion(
-    result: Result<CrimeMemoryOutcome, CrimeBusError>,
-) -> Mips4ExecutionCompletion {
-    match result {
-        Ok(outcome) => cpu_link_completion(Ok(outcome.payload)),
-        Err(error) => cpu_link_completion(Err(error)),
-    }
+fn sysad_memory_completion(result: Result<CrimeMemoryOutcome, CrimeBusError>) -> CrimeSysAdResult {
+    result.map(|outcome| outcome.payload)
 }
 
 fn link_memory_completion(
@@ -1966,7 +1899,7 @@ fn link_memory_completion(
     }
 }
 
-fn decode_memory(address: u64, size: u8) -> Option<(u64, bool)> {
+fn decode_memory(address: u64, size: usize) -> Option<(u64, bool)> {
     if in_window(address, size, 0, LOW_MEMORY_END) {
         return Some((address, false));
     }
@@ -1996,11 +1929,12 @@ pub(super) fn normalize_render_memory_alias(address: u64) -> u64 {
         .unwrap_or(address & 0x3fff_ffff)
 }
 
-fn in_window(address: u64, size: u8, start: u64, end: u64) -> bool {
+fn in_window(address: u64, size: usize, start: u64, end: u64) -> bool {
+    let size = u64::try_from(size).ok();
     address >= start
         && address < end
-        && address
-            .checked_add(u64::from(size))
+        && size
+            .and_then(|size| address.checked_add(size))
             .is_some_and(|transfer_end| transfer_end <= end)
 }
 
@@ -2017,30 +1951,19 @@ const fn reset_bank_control(memory: config::CrimeMemoryConfig) -> [u16; 8] {
     controls
 }
 
-fn encode_big_endian(value: u64, size: u8) -> u64 {
+fn encode_register_data(value: u64, size: u8) -> CrimeData {
     match size {
-        4 => u64::from_le_bytes([
-            (value >> 24) as u8,
-            (value >> 16) as u8,
-            (value >> 8) as u8,
-            value as u8,
-            0,
-            0,
-            0,
-            0,
-        ]),
-        8 => value.swap_bytes(),
-        _ => 0,
+        4 => (value as u32).to_be_bytes().into(),
+        8 => value.to_be_bytes().into(),
+        _ => unreachable!("validated CRIME register sizes are four or eight bytes"),
     }
 }
 
-fn decode_big_endian(data: u64, size: u8) -> u64 {
-    match size {
-        4 => u64::from(u32::from_be_bytes(
-            data.to_le_bytes()[..4].try_into().unwrap(),
-        )),
-        8 => data.swap_bytes(),
-        _ => 0,
+fn decode_register_data(data: &[u8]) -> Option<u64> {
+    match data {
+        [a, b, c, d] => Some(u64::from(u32::from_be_bytes([*a, *b, *c, *d]))),
+        [a, b, c, d, e, f, g, h] => Some(u64::from_be_bytes([*a, *b, *c, *d, *e, *f, *g, *h])),
+        _ => None,
     }
 }
 
