@@ -58,11 +58,7 @@ const PIXEL_FEATURE_DESCRIPTORS: [PixelFeatureDescriptor; 24] = [
         PixelFeatureEvidence::A,
         Some(PixelCapability::GlRasterization),
     ),
-    feature(
-        FEATURE_PIXEL_TRANSFER,
-        PixelFeatureEvidence::A,
-        Some(PixelCapability::PixelTransfer),
-    ),
+    feature(FEATURE_PIXEL_TRANSFER, PixelFeatureEvidence::A, None),
     feature(
         FEATURE_SCISSOR,
         PixelFeatureEvidence::A,
@@ -222,6 +218,26 @@ impl PixelCommandSnapshot {
         self.register32(0x058)
     }
 
+    pub(crate) fn pixel_transfer_source_address(&self) -> u32 {
+        self.register32(0x0a0)
+    }
+
+    pub(crate) fn pixel_transfer_source_x_step(&self) -> i32 {
+        self.register32(0x0a8) as i32
+    }
+
+    pub(crate) fn pixel_transfer_source_y_step(&self) -> i32 {
+        self.register32(0x0ac) as i32
+    }
+
+    pub(crate) fn pixel_transfer_destination_address(&self) -> u32 {
+        self.register32(0x0b0)
+    }
+
+    pub(crate) fn pixel_transfer_destination_stride(&self) -> i32 {
+        self.register32(0x0b4) as i32
+    }
+
     pub(crate) fn foreground_color(&self) -> u32 {
         self.register32(0x0d0)
     }
@@ -257,10 +273,8 @@ pub(crate) enum PixelBufferKind {
     FramebufferA,
     FramebufferB,
     FramebufferC,
-    Texture,
     LinearA,
     LinearB,
-    ClipId,
     Invalid(u8),
 }
 
@@ -271,6 +285,17 @@ impl PixelBufferKind {
             Self::FramebufferB => Some(1),
             Self::FramebufferC => Some(2),
             _ => None,
+        }
+    }
+
+    pub(crate) const fn buffer_selector(self) -> Option<u8> {
+        match self {
+            Self::FramebufferA => Some(0),
+            Self::FramebufferB => Some(1),
+            Self::FramebufferC => Some(2),
+            Self::LinearA => Some(4),
+            Self::LinearB => Some(5),
+            Self::Invalid(_) => None,
         }
     }
 }
@@ -332,6 +357,10 @@ impl PixelFeatureSet {
 
     pub(crate) const fn color_byte_mask(self) -> u8 {
         ((self.0 >> 3) & 0x0f) as u8
+    }
+
+    pub(crate) const fn pixel_transfer(self) -> bool {
+        self.enabled(FEATURE_PIXEL_TRANSFER)
     }
 }
 
@@ -652,9 +681,14 @@ impl PixelCommandValidation {
                 PixelBlockerKind::Implementation,
             );
         }
-        if command.source.kind.framebuffer_selector().is_none()
-            || command.destination.kind.framebuffer_selector().is_none()
-        {
+        let pixel_transfer = command.features.pixel_transfer();
+        if if pixel_transfer {
+            command.source.kind.buffer_selector().is_none()
+                || command.destination.kind.buffer_selector().is_none()
+        } else {
+            command.source.kind.framebuffer_selector().is_none()
+                || command.destination.kind.framebuffer_selector().is_none()
+        } {
             add_blocker(
                 &mut self.blockers,
                 PixelCapability::BufferKind,
@@ -663,8 +697,9 @@ impl PixelCommandValidation {
                 PixelBlockerKind::Implementation,
             );
         }
-        if !command.source.format.supported_for_flat_write()
-            || !command.destination.format.supported_for_flat_write()
+        if !pixel_transfer
+            && (!command.source.format.supported_for_flat_write()
+                || !command.destination.format.supported_for_flat_write())
         {
             add_blocker(
                 &mut self.blockers,
@@ -674,9 +709,10 @@ impl PixelCommandValidation {
                 PixelBlockerKind::Implementation,
             );
         }
-        if command.source.kind != command.destination.kind
-            || command.source.format != command.destination.format
-            || command.source.buffer_depth != command.destination.buffer_depth
+        if !pixel_transfer
+            && (command.source.kind != command.destination.kind
+                || command.source.format != command.destination.format
+                || command.source.buffer_depth != command.destination.buffer_depth)
         {
             add_blocker(
                 &mut self.blockers,
@@ -862,10 +898,10 @@ fn decode_buffer_mode(raw: u32) -> PixelBufferMode {
         0 => PixelBufferKind::FramebufferA,
         1 => PixelBufferKind::FramebufferB,
         2 => PixelBufferKind::FramebufferC,
-        3 => PixelBufferKind::Texture,
+        3 => PixelBufferKind::Invalid(3),
         4 => PixelBufferKind::LinearA,
         5 => PixelBufferKind::LinearB,
-        6 => PixelBufferKind::ClipId,
+        6 => PixelBufferKind::Invalid(6),
         value => PixelBufferKind::Invalid(value),
     };
     let format = match (pixel_type, pixel_depth) {
@@ -1231,7 +1267,7 @@ mod tests {
 
     #[test]
     fn buffer_mode_enumerations_are_decoded_field_by_field() {
-        for kind in 0..=6_u32 {
+        for kind in [0_u32, 1, 2, 4, 5] {
             for depth in 0..=2_u32 {
                 for pixel_type in [0_u32, 1, 2, 3] {
                     let raw = kind << 10 | depth << 8 | pixel_type << 4 | depth << 2;
@@ -1246,6 +1282,19 @@ mod tests {
                     assert!(violations.is_empty(), "BufMode {raw:#010x}");
                 }
             }
+        }
+        for kind in [3_u32, 6] {
+            let mut violations = Vec::new();
+            validate_buffer_mode(
+                &mut violations,
+                PixelRegister::SourceBufferMode,
+                decode_buffer_mode(kind << 10),
+                false,
+            );
+            assert!(violations.iter().any(|violation| {
+                violation.field == PixelField::BufferKind
+                    && violation.kind == PixelViolationKind::InvalidEncoding
+            }));
         }
         let mut violations = Vec::new();
         validate_buffer_mode(

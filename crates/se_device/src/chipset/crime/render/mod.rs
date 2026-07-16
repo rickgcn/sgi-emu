@@ -2,11 +2,13 @@
 use core::fmt;
 use super::memory::framebuffer;
 use super::protocol::{
-    CrimeBusError, CrimeByteEnable, CrimeCompletionPayload, CrimeData, CrimeMemoryBankSelect,
+    CrimeBusError, CrimeByteEnable, CrimeCompletionPayload, CrimeMemoryBankSelect,
     CrimeMemoryInhibitReason, CrimeMemoryOutcome, CrimeTransfer,
 };
 use super::registers;
+mod mte;
 mod pixel;
+use mte::{MteBufferSnapshot, MteJob, MteStage, MteTranslation};
 use pixel::command::{
     DecodedPixelCommand, PixelCommandSnapshot, PixelCommandValidation, PixelPrimitiveKind,
     PixelRegisters,
@@ -305,6 +307,26 @@ pub struct PixelCommandBlocker {
     /// Whether evidence or implementation is missing.
     pub kind: PixelBlockerKind,
 }
+/// Field that makes an MTE command illegal.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+pub enum MteInvalidField {
+    /// Bits outside the documented low twelve mode bits were set.
+    ReservedModeBits,
+    /// Pixel depth used the reserved encoding.
+    PixelDepth,
+    /// Source buffer selector used the reserved encoding.
+    SourceBuffer,
+    /// Destination buffer selector used the reserved encoding.
+    DestinationBuffer,
+    /// A start/end range was malformed or outside the selected buffer.
+    Range,
+    /// Source and destination copy rectangles contain different pixel counts.
+    CopyShape,
+    /// A framebuffer Y step cannot be represented by the execution cursor.
+    YStep,
+}
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct HostInterface {
     #[serde(with = "crate::common::serde_array")]
@@ -549,10 +571,11 @@ struct PixelCandidateBatch {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PixelPipelineJob {
     command: DecodedPixelCommand,
-    entries: Box<FramebufferTlbSnapshot>,
+    entries: Option<Box<FramebufferTlbSnapshot>>,
     rasterizer: Rasterizer,
     stipple: Option<PixelStippleCursor>,
     pending_batch: Option<PixelCandidateBatch>,
+    pixel_dma: Option<PixelDmaState>,
 }
 impl PixelPipelineJob {
     fn complete(&self) -> bool {
@@ -573,6 +596,18 @@ impl PixelPipelineJob {
         Some(batch)
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+enum PixelDmaStage {
+    Read,
+    Write,
+}
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct PixelDmaState {
+    source_buffer: MteBufferSnapshot,
+    destination_buffer: MteBufferSnapshot,
+    stage: PixelDmaStage,
+    source_pixel: Vec<u8>,
+}
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct BlockedPixelCommand {
     command: DecodedPixelCommand,
@@ -580,8 +615,8 @@ struct BlockedPixelCommand {
 }
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum PixelExecution {
-    Blocked(BlockedPixelCommand),
-    Running(PixelPipelineJob),
+    Blocked(Box<BlockedPixelCommand>),
+    Running(Box<PixelPipelineJob>),
 }
 impl PixelExecution {
     fn complete(&self) -> bool {
@@ -612,7 +647,7 @@ impl PixelExecution {
     fn running_mut(&mut self) -> Option<&mut PixelPipelineJob> {
         match self {
             Self::Blocked(_) => None,
-            Self::Running(job) => Some(job),
+            Self::Running(job) => Some(job.as_mut()),
         }
     }
 }
@@ -653,14 +688,12 @@ pub enum CrimeRenderError {
         /// Complete stable list of missing capabilities.
         blockers: Vec<PixelCommandBlocker>,
     },
-    /// The committed MTE state is outside the evidence-complete zero-clear subset.
-    UnsupportedMteJob {
-        /// MTE mode value.
+    /// A committed MTE command contains an illegal field or combination.
+    InvalidMteJob {
+        /// Frozen MTE mode value.
         mode: u32,
-        /// MTE byte mask.
-        byte_mask: u32,
-        /// MTE foreground value.
-        foreground: u32,
+        /// Field that failed validation.
+        field: MteInvalidField,
     },
     /// The inclusive MTE destination endpoints are not valid for the selected buffer.
     InvalidMteRange {
@@ -703,14 +736,9 @@ impl fmt::Display for CrimeRenderError {
                 f,
                 "unsupported CRIME pixel command triggered by {trigger_address:#010x}, primitive {primitive:#010x}, draw mode {draw_mode:#010x}, features {feature_bits:#08x}, source format {source_buffer_mode:#010x}, destination format {destination_buffer_mode:#010x}: {blockers:?}"
             ),
-            Self::UnsupportedMteJob {
-                mode,
-                byte_mask,
-                foreground,
-            } => write!(
-                f,
-                "unsupported CRIME MTE job mode {mode:#010x}, byte mask {byte_mask:#010x}, foreground {foreground:#010x}"
-            ),
+            Self::InvalidMteJob { mode, field } => {
+                write!(f, "invalid CRIME MTE job mode {mode:#010x}: {field:?}")
+            }
             Self::InvalidMteRange { start, end } => {
                 write!(f, "invalid CRIME MTE range {start:#010x}..={end:#010x}")
             }
@@ -845,60 +873,6 @@ struct MteRegisters {
     destination_end: u32,
     source_y_step: u32,
     destination_y_step: u32,
-}
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-struct MteJob {
-    start: u32,
-    end: u32,
-    destination: MteDestination,
-    no_ecc: bool,
-}
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-enum MteDestination {
-    Linear {
-        next: u64,
-        end: u64,
-        entries: [u32; LINEAR_PAGE_COUNT],
-    },
-    Framebuffer {
-        entries: Box<FramebufferTlbSnapshot>,
-        bytes_per_pixel: u8,
-        x_start: u16,
-        x_end: u16,
-        x: u16,
-        y_end: u16,
-        y: u16,
-    },
-}
-impl MteJob {
-    fn complete(&self) -> bool {
-        match &self.destination {
-            MteDestination::Linear { next, end, .. } => next > end,
-            MteDestination::Framebuffer { y, y_end, .. } => y > y_end,
-        }
-    }
-    fn advance(&mut self, length: u16) {
-        match &mut self.destination {
-            MteDestination::Linear { next, .. } => *next += u64::from(length),
-            MteDestination::Framebuffer {
-                bytes_per_pixel,
-                x_start,
-                x_end,
-                x,
-                y,
-                ..
-            } => {
-                let pixels = length / u16::from(*bytes_per_pixel);
-                let next = u32::from(*x) + u32::from(pixels);
-                if next > u32::from(*x_end) {
-                    *x = *x_start;
-                    *y = y.saturating_add(1);
-                } else {
-                    *x = next as u16;
-                }
-            }
-        }
-    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingRenderMemory {
@@ -1191,7 +1165,7 @@ impl CrimeRender {
                     progress.interrupts = self.update_conditions(previous);
                     return Ok(progress);
                 }
-                let job = self.snapshot_zero_clear_job()?;
+                let job = self.snapshot_mte_job()?;
                 progress.notices.push(RenderNotice::JobCommitted {
                     start: job.start,
                     end: job.end,
@@ -1220,7 +1194,7 @@ impl CrimeRender {
                             x1,
                             y1,
                         });
-                        self.active_pixel_command = Some(PixelExecution::Running(job));
+                        self.active_pixel_command = Some(PixelExecution::Running(Box::new(job)));
                         if let Some(memory_request) =
                             self.prepare_pixel_batch(&mut progress.notices)
                         {
@@ -1232,7 +1206,6 @@ impl CrimeRender {
                         }
                     }
                     Err(blocked) => {
-                        let blocked = *blocked;
                         let error = blocked.error.clone();
                         self.active_pixel_command = Some(PixelExecution::Blocked(blocked));
                         return Err(error);
@@ -1255,15 +1228,25 @@ impl CrimeRender {
             return Err(CrimeRenderError::UnexpectedMemoryCompletion);
         };
         let outcome = result.map_err(CrimeRenderError::MemoryTransport)?;
-        if !matches!(outcome.payload, CrimeCompletionPayload::WriteComplete) {
-            return Err(CrimeRenderError::UnexpectedMemoryPayload);
-        }
         match pending.destination {
             RenderMemoryDestination::Mte => {
                 let Some(job) = self.active_job.as_mut() else {
                     return Err(CrimeRenderError::UnexpectedMemoryCompletion);
                 };
-                job.advance(pending.length);
+                match (job.stage, outcome.payload) {
+                    (MteStage::Clear, CrimeCompletionPayload::WriteComplete) => {
+                        job.finish_clear(usize::from(pending.length));
+                    }
+                    (MteStage::CopyRead, CrimeCompletionPayload::ReadData(data))
+                        if data.len() == usize::from(pending.length) =>
+                    {
+                        job.finish_copy_read(&data);
+                    }
+                    (MteStage::CopyWrite, CrimeCompletionPayload::WriteComplete) => {
+                        job.finish_copy_write(usize::from(pending.length));
+                    }
+                    _ => return Err(CrimeRenderError::UnexpectedMemoryPayload),
+                }
             }
             RenderMemoryDestination::Pixel => {
                 let Some(command) = self.active_pixel_command.as_mut() else {
@@ -1272,8 +1255,30 @@ impl CrimeRender {
                 let Some(job) = command.running_mut() else {
                     return Err(CrimeRenderError::UnexpectedMemoryCompletion);
                 };
-                if job.complete_pending_batch().is_none() {
-                    return Err(CrimeRenderError::UnexpectedMemoryCompletion);
+                if let Some(dma) = job.pixel_dma.as_mut() {
+                    match (dma.stage, outcome.payload) {
+                        (PixelDmaStage::Read, CrimeCompletionPayload::ReadData(data))
+                            if data.len() == usize::from(pending.length) =>
+                        {
+                            dma.source_pixel = data.to_vec();
+                            dma.stage = PixelDmaStage::Write;
+                        }
+                        (PixelDmaStage::Write, CrimeCompletionPayload::WriteComplete) => {
+                            dma.source_pixel.clear();
+                            dma.stage = PixelDmaStage::Read;
+                            if job.complete_pending_batch().is_none() {
+                                return Err(CrimeRenderError::UnexpectedMemoryCompletion);
+                            }
+                        }
+                        _ => return Err(CrimeRenderError::UnexpectedMemoryPayload),
+                    }
+                } else {
+                    if !matches!(outcome.payload, CrimeCompletionPayload::WriteComplete) {
+                        return Err(CrimeRenderError::UnexpectedMemoryPayload);
+                    }
+                    if job.complete_pending_batch().is_none() {
+                        return Err(CrimeRenderError::UnexpectedMemoryCompletion);
+                    }
                 }
             }
         }
@@ -1461,24 +1466,44 @@ impl CrimeRender {
             }
             _ => unreachable!("validated command has an implemented rasterizer"),
         };
-        let selector = command
+        let pixel_dma = if command.features.pixel_transfer() {
+            let source_selector = command
+                .source
+                .kind
+                .buffer_selector()
+                .expect("validated PixelDMA source selector");
+            let destination_selector = command
+                .destination
+                .kind
+                .buffer_selector()
+                .expect("validated PixelDMA destination selector");
+            Some(PixelDmaState {
+                source_buffer: MteBufferSnapshot::capture(&self.tlbs, source_selector)
+                    .expect("validated PixelDMA source selector"),
+                destination_buffer: MteBufferSnapshot::capture(&self.tlbs, destination_selector)
+                    .expect("validated PixelDMA destination selector"),
+                stage: PixelDmaStage::Read,
+                source_pixel: Vec::new(),
+            })
+        } else {
+            None
+        };
+        let entries = command
             .destination
             .kind
             .framebuffer_selector()
-            .expect("validated command selects a framebuffer");
+            .and_then(|selector| self.tlbs.framebuffer_entries(selector))
+            .map(Box::new);
         let stipple = command
             .line_stipple_enabled()
             .then(|| PixelStippleCursor::new(command.stipple_pattern, command.stipple_mode));
         Ok(PixelPipelineJob {
-            entries: Box::new(
-                self.tlbs
-                    .framebuffer_entries(selector)
-                    .expect("validated framebuffer selector"),
-            ),
+            entries,
             command,
             rasterizer,
             stipple,
             pending_batch: None,
+            pixel_dma,
         })
     }
     fn prepare_pixel_batch(
@@ -1488,6 +1513,9 @@ impl CrimeRender {
         let Some(PixelExecution::Running(job)) = self.active_pixel_command.as_mut() else {
             unreachable!("pixel batch requires an active running command")
         };
+        if job.pixel_dma.is_some() {
+            return prepare_pixel_dma_batch(job, notices);
+        }
         debug_assert!(job.pending_batch.is_none());
         let position = job.rasterizer.position();
         let bytes_per_pixel = job
@@ -1501,6 +1529,8 @@ impl CrimeRender {
         let tile_y = usize::from(position.y / FRAMEBUFFER_TILE_HEIGHT);
         let entry = job
             .entries
+            .as_ref()
+            .expect("non-DMA pixel command selects a framebuffer")
             .entry(tile_y * FRAMEBUFFER_TILES_PER_ROW + tile_x);
         let x_in_tile = position.x % tile_width;
         let y_in_tile = position.y % FRAMEBUFFER_TILE_HEIGHT;
@@ -1589,162 +1619,215 @@ impl CrimeRender {
             transfer: CrimeTransfer::write(data.into(), byte_enable.into()),
         })
     }
-    fn snapshot_zero_clear_job(&self) -> Result<MteJob, CrimeRenderError> {
-        let mode = self.mte.mode;
-        let depth = ((mode >> 8) & 3) as u8;
-        let source = ((mode >> 5) & 7) as u8;
-        let destination = ((mode >> 2) & 7) as u8;
-        let unsupported_mode = mode & !0x0000_0fff != 0
-            || mode & (1 << 11) != 0
-            || mode & (1 << 10) != 0
-            || depth == 3
-            || source != 0
-            || !matches!(destination, 0..=2 | 4..=5)
-            || mode & (1 << 1) != 0;
-        if unsupported_mode || self.mte.byte_mask != u32::MAX || self.mte.foreground != 0 {
-            return Err(CrimeRenderError::UnsupportedMteJob {
-                mode,
-                byte_mask: self.mte.byte_mask,
-                foreground: self.mte.foreground,
-            });
-        }
-        let start = self.mte.destination_start;
-        let end = self.mte.destination_end;
-        let no_ecc = mode & 1 == 0;
-        let destination = match destination {
-            4 | 5 => {
-                if end < start {
-                    return Err(CrimeRenderError::InvalidMteRange { start, end });
+    fn snapshot_mte_job(&self) -> Result<MteJob, CrimeRenderError> {
+        MteJob::snapshot(self.mte, &self.tlbs).map_err(|field| {
+            if field == MteInvalidField::Range {
+                CrimeRenderError::InvalidMteRange {
+                    start: self.mte.destination_start,
+                    end: self.mte.destination_end,
                 }
-                let entries = if destination == 4 {
-                    self.tlbs.linear_a_entries()
-                } else {
-                    self.tlbs.linear_b_entries()
-                };
-                MteDestination::Linear {
-                    next: u64::from(start),
-                    end: u64::from(end),
-                    entries,
+            } else {
+                CrimeRenderError::InvalidMteJob {
+                    mode: self.mte.mode,
+                    field,
                 }
             }
-            framebuffer => {
-                let bytes_per_pixel = 1_u8 << depth;
-                let x_start = start as u16;
-                let x_end = end as u16;
-                let y_byte_start = (start >> 16) as u16;
-                let y_byte_end = (end >> 16) as u16;
-                let bytes = u16::from(bytes_per_pixel);
-                let y_start = y_byte_start / bytes;
-                let y_end = y_byte_end / bytes;
-                let tile_width = (FRAMEBUFFER_TILE_ROW_BYTES / u64::from(bytes_per_pixel)) as u16;
-                let width = u32::from(tile_width) * FRAMEBUFFER_TILES_PER_ROW as u32;
-                let height = u32::from(FRAMEBUFFER_TILE_HEIGHT)
-                    * (FRAMEBUFFER_TLB_ENTRY_COUNT / FRAMEBUFFER_TILES_PER_ROW) as u32;
-                let valid = x_end >= x_start
-                    && y_byte_start.is_multiple_of(bytes)
-                    && y_byte_end % bytes == bytes - 1
-                    && y_end >= y_start
-                    && u32::from(x_end) < width
-                    && u32::from(y_end) < height;
-                if !valid {
-                    return Err(CrimeRenderError::InvalidMteRange { start, end });
-                }
-                MteDestination::Framebuffer {
-                    entries: Box::new(
-                        self.tlbs
-                            .framebuffer_entries(framebuffer)
-                            .expect("validated framebuffer selector"),
-                    ),
-                    bytes_per_pixel,
-                    x_start,
-                    x_end,
-                    x: x_start,
-                    y_end,
-                    y: y_start,
-                }
-            }
-        };
-        Ok(MteJob {
-            start,
-            end,
-            destination,
-            no_ecc,
         })
     }
     fn prepare_mte_memory_request(&self) -> Result<RenderMemoryRequest, CrimeRenderError> {
         let job = self.active_job.as_ref().expect("active MTE job exists");
-        let (virtual_address, raw_entry, valid, alias_address, length) = match &job.destination {
-            MteDestination::Linear { next, end, entries } => {
-                let virtual_address = *next as u32;
-                let page_index = ((*next >> 12) & 0x1f) as usize;
-                let entry = LinearTlbEntry(entries[page_index]);
-                let in_page = *next & (LINEAR_PAGE_SIZE - 1);
-                let remaining = *end - *next + 1;
-                let length = remaining
-                    .min(LINEAR_PAGE_SIZE - in_page)
-                    .min(MAX_MEMORY_CHUNK_BYTES as u64) as usize;
+        let (translation, transfer, no_ecc) = match job.stage {
+            MteStage::Clear => {
+                let (translation, data, byte_enable) = job.clear_transfer();
                 (
-                    virtual_address,
-                    entry.0,
-                    entry.valid(),
-                    entry.alias_address(in_page),
-                    length,
+                    translation,
+                    CrimeTransfer::write(data.into(), byte_enable.into()),
+                    !job.destination_ecc,
                 )
             }
-            MteDestination::Framebuffer {
-                entries,
-                bytes_per_pixel,
-                x_end,
-                x,
-                y,
-                ..
-            } => {
-                let bytes = u16::from(*bytes_per_pixel);
-                let tile_width = (FRAMEBUFFER_TILE_ROW_BYTES / u64::from(*bytes_per_pixel)) as u16;
-                let tile_x = usize::from(*x / tile_width);
-                let tile_y = usize::from(*y / FRAMEBUFFER_TILE_HEIGHT);
-                let entry = entries.entry(tile_y * FRAMEBUFFER_TILES_PER_ROW + tile_x);
-                let x_in_tile = *x % tile_width;
-                let y_in_tile = *y % FRAMEBUFFER_TILE_HEIGHT;
-                let tile_offset = u64::from(y_in_tile) * FRAMEBUFFER_TILE_ROW_BYTES
-                    + u64::from(x_in_tile) * u64::from(*bytes_per_pixel);
-                let remaining_pixels = u32::from(*x_end) - u32::from(*x) + 1;
-                let tile_pixels = u32::from(tile_width - x_in_tile);
-                let length = (remaining_pixels.min(tile_pixels) * u32::from(bytes)) as usize;
-                let virtual_address = (u32::from(*y) * u32::from(bytes)) << 16 | u32::from(*x);
+            MteStage::CopyRead => {
+                let translation = job.copy_read();
                 (
-                    virtual_address,
-                    u32::from(entry.raw()),
-                    entry.valid(),
-                    entry.alias_address(tile_offset),
-                    length,
+                    translation,
+                    CrimeTransfer::read(u16::from(job.bytes_per_pixel)),
+                    !job.source_ecc,
                 )
             }
+            MteStage::CopyWrite => {
+                let (translation, data) = job.copy_write();
+                (
+                    translation,
+                    CrimeTransfer::write(
+                        data.to_vec().into(),
+                        CrimeByteEnable::enabled(data.len()),
+                    ),
+                    !job.destination_ecc,
+                )
+            }
+            MteStage::Complete => unreachable!("complete MTE job is retired before issuing memory"),
         };
-        let physical_address = super::normalize_render_memory_alias(alias_address);
-        let bank_select = if valid {
+        let physical_address = super::normalize_render_memory_alias(translation.alias_address);
+        let bank_select = if translation.valid {
             CrimeMemoryBankSelect::Decode
         } else {
             CrimeMemoryBankSelect::Inhibited {
                 reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
             }
         };
-        let no_ecc = job.no_ecc;
-        let request = RenderMemoryRequest {
-            virtual_address,
-            raw_entry,
-            valid,
-            alias_address,
+        Ok(RenderMemoryRequest {
+            virtual_address: translation.virtual_address,
+            raw_entry: translation.raw_entry,
+            valid: translation.valid,
+            alias_address: translation.alias_address,
             physical_address,
             bank_select,
             no_ecc,
             destination: RenderMemoryDestination::Mte,
-            transfer: CrimeTransfer::write(
-                CrimeData::zeroed(length),
-                CrimeByteEnable::enabled(length),
-            ),
+            transfer,
+        })
+    }
+}
+fn prepare_pixel_dma_batch(
+    job: &mut PixelPipelineJob,
+    notices: &mut Vec<RenderNotice>,
+) -> Option<RenderMemoryRequest> {
+    let position = job.rasterizer.position();
+    let source_bytes = job.command.source.format.bytes_per_pixel()?;
+    let destination_bytes = job.command.destination.format.bytes_per_pixel()?;
+    let dma = job.pixel_dma.as_mut().expect("PixelDMA state exists");
+    if matches!(dma.stage, PixelDmaStage::Read) && job.pending_batch.is_none() {
+        let enabled = job.stipple.is_none_or(|stipple| stipple.permits(0));
+        notices.push(RenderNotice::RasterBatch {
+            x: position.x,
+            y: position.y,
+            candidates: 1,
+            enabled: u16::from(enabled),
+        });
+        if !enabled {
+            job.advance_candidates(1);
+            return None;
+        }
+        job.pending_batch = Some(PixelCandidateBatch {
+            x: position.x,
+            y: position.y,
+            candidate_count: 1,
+            enabled_count: 1,
+            stipple_index: job.stipple.map(PixelStippleCursor::index),
+        });
+    }
+    let batch = job
+        .pending_batch
+        .expect("PixelDMA memory operation has a frozen candidate");
+    let dx = i64::from(batch.x) - i64::from(job.command.x0);
+    let dy = i64::from(batch.y) - i64::from(job.command.y0);
+    let (translation, transfer) = match dma.stage {
+        PixelDmaStage::Read => {
+            let source_address =
+                pixel_dma_source_address(&job.command, &dma.source_buffer, source_bytes, dx, dy);
+            let translation =
+                dma.source_buffer
+                    .translate_address(source_address, source_bytes, true)?;
+            (translation, CrimeTransfer::read(u16::from(source_bytes)))
+        }
+        PixelDmaStage::Write => {
+            let destination_address = pixel_dma_destination_address(
+                &job.command,
+                &dma.destination_buffer,
+                destination_bytes,
+                dx,
+                dy,
+            );
+            let translation = dma.destination_buffer.translate_address(
+                destination_address,
+                destination_bytes,
+                true,
+            )?;
+            let color = pixel::format::decode(job.command.source.format, &dma.source_pixel);
+            let data = pixel::format::encode(job.command.destination.format, color);
+            let length = data.len();
+            (
+                translation,
+                CrimeTransfer::write(data.into(), CrimeByteEnable::enabled(length)),
+            )
+        }
+    };
+    let physical_address = super::normalize_render_memory_alias(translation.alias_address);
+    Some(RenderMemoryRequest {
+        virtual_address: translation.virtual_address,
+        raw_entry: translation.raw_entry,
+        valid: translation.valid,
+        alias_address: translation.alias_address,
+        physical_address,
+        bank_select: render_bank_select(translation),
+        no_ecc: false,
+        destination: RenderMemoryDestination::Pixel,
+        transfer,
+    })
+}
+fn pixel_dma_source_address(
+    command: &DecodedPixelCommand,
+    buffer: &MteBufferSnapshot,
+    bytes_per_pixel: u8,
+    dx: i64,
+    dy: i64,
+) -> u32 {
+    let base = command.snapshot.pixel_transfer_source_address();
+    if buffer.linear() {
+        let x_step = match command.snapshot.pixel_transfer_source_x_step() {
+            0 => i64::from(bytes_per_pixel),
+            value => i64::from(value),
         };
-        Ok(request)
+        let default_stride =
+            (u32::from(command.x0.abs_diff(command.x1)) + 1) * u32::from(bytes_per_pixel);
+        let y_step = match command.snapshot.pixel_transfer_source_y_step() {
+            0 => i64::from(default_stride),
+            value => i64::from(value),
+        };
+        return wrapping_add_signed(base, dx * x_step + dy * y_step);
+    }
+    let x_step = match command.snapshot.pixel_transfer_source_x_step() {
+        0 => 1_i64,
+        value => i64::from(value),
+    };
+    let y_step = match command.snapshot.pixel_transfer_source_y_step() {
+        0 => i64::from(bytes_per_pixel),
+        value => i64::from(value),
+    };
+    let x = wrapping_add_signed(u32::from(base as u16), dx * x_step) as u16;
+    let y_byte = wrapping_add_signed(base >> 16, dy * y_step) as u16;
+    u32::from(y_byte) << 16 | u32::from(x)
+}
+fn pixel_dma_destination_address(
+    command: &DecodedPixelCommand,
+    buffer: &MteBufferSnapshot,
+    bytes_per_pixel: u8,
+    dx: i64,
+    dy: i64,
+) -> u32 {
+    if !buffer.linear() {
+        let x = wrapping_add_signed(u32::from(command.x0), dx) as u16;
+        let y = wrapping_add_signed(u32::from(command.y0), dy) as u16;
+        return (u32::from(y) * u32::from(bytes_per_pixel)) << 16 | u32::from(x);
+    }
+    let base = command.snapshot.pixel_transfer_destination_address();
+    let default_stride =
+        (u32::from(command.x0.abs_diff(command.x1)) + 1) * u32::from(bytes_per_pixel);
+    let stride = match command.snapshot.pixel_transfer_destination_stride() {
+        0 => i64::from(default_stride),
+        value => i64::from(value),
+    };
+    wrapping_add_signed(base, dx * i64::from(bytes_per_pixel) + dy * stride)
+}
+fn wrapping_add_signed(base: u32, delta: i64) -> u32 {
+    base.wrapping_add(delta as u32)
+}
+const fn render_bank_select(translation: MteTranslation) -> CrimeMemoryBankSelect {
+    if translation.valid {
+        CrimeMemoryBankSelect::Decode
+    } else {
+        CrimeMemoryBankSelect::Inhibited {
+            reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
+        }
     }
 }
 fn append_memory_notices(notices: &mut Vec<RenderNotice>, request: &RenderMemoryRequest) {

@@ -1830,26 +1830,18 @@ impl Crime {
                 },
             ]
             .into(),
-            CrimeRenderError::UnsupportedMteJob {
-                mode,
-                byte_mask,
-                foreground,
-            } => [
+            CrimeRenderError::InvalidMteJob { mode, field } => [
                 OwnedTraceField {
                     key: "kind".into(),
-                    value: OwnedTraceValue::String("unsupported_mte_job".into()),
+                    value: OwnedTraceValue::String("invalid_mte_job".into()),
                 },
                 OwnedTraceField {
                     key: "mode".into(),
                     value: OwnedTraceValue::Hex64(u64::from(*mode)),
                 },
                 OwnedTraceField {
-                    key: "byte_mask".into(),
-                    value: OwnedTraceValue::Hex64(u64::from(*byte_mask)),
-                },
-                OwnedTraceField {
-                    key: "foreground".into(),
-                    value: OwnedTraceValue::Hex64(u64::from(*foreground)),
+                    key: "field".into(),
+                    value: OwnedTraceValue::String(format!("{field:?}").into()),
                 },
             ]
             .into(),

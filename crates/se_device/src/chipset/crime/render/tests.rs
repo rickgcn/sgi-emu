@@ -161,6 +161,32 @@ fn read_gbe_word(sdram: &mut CrimeSdram, address: u64) -> Vec<u8> {
     data.to_vec()
 }
 
+fn write_sdram(sdram: &mut CrimeSdram, address: u64, data: &[u8]) {
+    let completion = sdram.accept(CrimeMemoryTransaction {
+        id: CrimeTransactionId::new(3),
+        time: SimTime::ZERO,
+        controller: ComponentId::new(1),
+        client: CrimeMemoryClient::Render,
+        address,
+        bank_select: CrimeMemoryBankSelect::Decode,
+        no_ecc: false,
+        transfer: CrimeTransfer::write(data.to_vec().into(), CrimeByteEnable::enabled(data.len())),
+    });
+    assert!(matches!(
+        completion.result.unwrap().payload,
+        CrimeCompletionPayload::WriteComplete
+    ));
+}
+
+fn run_mte_through_sdram(render: &mut CrimeRender, sdram: &mut CrimeSdram) {
+    while render.active_job.is_some() || render.interface_level() != 0 {
+        let progress = retire(render);
+        if let Some(request) = progress.memory_request {
+            complete_through_sdram(render, sdram, request);
+        }
+    }
+}
+
 #[test]
 fn interface_buffer_enforces_sixty_four_entry_capacity() {
     let mut render = CrimeRender::new();
@@ -1454,39 +1480,182 @@ fn in_flight_mte_state_round_trips_with_the_memory_correlation() {
 }
 
 #[test]
-fn unproven_mte_modes_fail_instead_of_falling_back() {
-    let cases = [
-        (1_u32 << 11 | PROM_CLEAR_MODE, u32::MAX, 0_u32),
-        (PROM_CLEAR_MODE, 0xffff_fffe, 0),
-        (PROM_CLEAR_MODE, u32::MAX, 0x1122_3344),
-    ];
-    for (mode, byte_mask, foreground) in cases {
-        let mut render = CrimeRender::new();
-        queue_and_retire(
-            &mut render,
-            LINEAR_A_BASE,
-            8,
-            u64::from(0x8000_0001_u32) << 32,
-        );
-        queue_and_retire(&mut render, MTE_BASE + 0x08, 4, byte_mask.into());
-        queue_and_retire(&mut render, MTE_BASE + 0x18, 4, foreground.into());
-        queue_and_retire(&mut render, MTE_BASE + 0x30, 4, 0);
-        queue_and_retire(&mut render, MTE_BASE + 0x38, 4, 0);
-        render
-            .write(MTE_BASE + START_OFFSET, 4, mode.into())
-            .unwrap();
+fn mte_accepts_foreground_and_byte_mask_but_rejects_reserved_mode_bits() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        LINEAR_A_BASE,
+        8,
+        u64::from(0x8000_0001_u32) << 32,
+    );
+    queue_and_retire(&mut render, MTE_BASE + 0x08, 4, 0x7fff_ffff);
+    queue_and_retire(&mut render, MTE_BASE + 0x18, 4, 0x1122_3344);
+    queue_and_retire(&mut render, MTE_BASE + 0x30, 4, 0);
+    queue_and_retire(&mut render, MTE_BASE + 0x38, 4, 0);
+    render
+        .write(MTE_BASE + START_OFFSET, 4, u64::from(PROM_CLEAR_MODE))
+        .unwrap();
 
-        assert_eq!(
-            render.step(),
-            Err(CrimeRenderError::UnsupportedMteJob {
-                mode,
-                byte_mask,
-                foreground,
-            })
-        );
-        assert!(render.active_job.is_none());
-        assert!(!render.memory_request_unit.busy());
+    let request = render.step().unwrap().memory_request.unwrap();
+    let CrimeTransferView::Write { data, byte_enable } = request.transfer.view() else {
+        panic!("MTE clear emitted a read")
+    };
+    assert_eq!(data, [0x44]);
+    assert_eq!(byte_enable.iter().collect::<Vec<_>>(), [false]);
+
+    let mut invalid = CrimeRender::new();
+    configure_zero_clear_destination(&mut invalid, 0, 0);
+    let mode = 1_u32 << 12 | PROM_CLEAR_MODE;
+    invalid
+        .write(MTE_BASE + START_OFFSET, 4, mode.into())
+        .unwrap();
+    assert_eq!(
+        invalid.step(),
+        Err(CrimeRenderError::InvalidMteJob {
+            mode,
+            field: MteInvalidField::ReservedModeBits,
+        })
+    );
+}
+
+#[test]
+fn mte_copy_reads_then_writes_across_distinct_linear_tlbs() {
+    let mut render = CrimeRender::new();
+    let mut sdram = CrimeSdram::new(ComponentId::new(2), "SDRAM", CrimeMemoryConfig::default());
+    queue_and_retire(
+        &mut render,
+        LINEAR_A_BASE,
+        8,
+        u64::from(0x8000_0001_u32) << 32,
+    );
+    queue_and_retire(
+        &mut render,
+        LINEAR_B_BASE,
+        8,
+        u64::from(0x8000_0002_u32) << 32,
+    );
+    write_sdram(&mut sdram, 0x1000, &[0x11, 0x22, 0x33, 0x44]);
+    for (offset, value) in [(0x20, 0_u32), (0x28, 3), (0x30, 0), (0x38, 3)] {
+        queue_and_retire(&mut render, MTE_BASE + offset, 4, value.into());
     }
+    let mode = 1_u32 << 11 | 4 << 5 | 5 << 2 | 3;
+    render
+        .write(MTE_BASE + START_OFFSET, 4, mode.into())
+        .unwrap();
+    run_mte_through_sdram(&mut render, &mut sdram);
+
+    assert_eq!(
+        &read_gbe_word(&mut sdram, 0x2000)[..4],
+        [0x11, 0x22, 0x33, 0x44]
+    );
+}
+
+#[test]
+fn overlapping_mte_copy_uses_memmove_safe_reverse_order() {
+    let mut render = CrimeRender::new();
+    let mut sdram = CrimeSdram::new(ComponentId::new(2), "SDRAM", CrimeMemoryConfig::default());
+    queue_and_retire(
+        &mut render,
+        LINEAR_A_BASE,
+        8,
+        u64::from(0x8000_0001_u32) << 32,
+    );
+    write_sdram(&mut sdram, 0x1000, &[1, 2, 3, 4, 5]);
+    for (offset, value) in [(0x20, 0_u32), (0x28, 3), (0x30, 1), (0x38, 4)] {
+        queue_and_retire(&mut render, MTE_BASE + offset, 4, value.into());
+    }
+    let mode = 1_u32 << 11 | 4 << 5 | 4 << 2 | 3;
+    render
+        .write(MTE_BASE + START_OFFSET, 4, mode.into())
+        .unwrap();
+    run_mte_through_sdram(&mut render, &mut sdram);
+
+    assert_eq!(&read_gbe_word(&mut sdram, 0x1000)[..5], [1, 1, 2, 3, 4]);
+}
+
+#[test]
+fn mte_copy_read_stage_round_trips_with_row_buffer_state() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        LINEAR_A_BASE,
+        8,
+        u64::from(0x8000_0001_u32) << 32,
+    );
+    for (offset, value) in [(0x20, 0_u32), (0x28, 1), (0x30, 2), (0x38, 3)] {
+        queue_and_retire(&mut render, MTE_BASE + offset, 4, value.into());
+    }
+    let mode = 1_u32 << 11 | 4 << 5 | 4 << 2;
+    render
+        .write(MTE_BASE + START_OFFSET, 4, mode.into())
+        .unwrap();
+    let first = retire(&mut render).memory_request.unwrap();
+    assert!(matches!(
+        first.transfer.view(),
+        CrimeTransferView::Read { length: 1 }
+    ));
+    render
+        .complete_memory(Ok(CrimeMemoryOutcome::new(
+            CrimeCompletionPayload::ReadData(vec![0xaa].into()),
+            None,
+            None,
+        )))
+        .unwrap();
+
+    let encoded = postcard::to_stdvec(&render).unwrap();
+    let restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+    assert_eq!(restored, render);
+    let job = restored.active_job.as_ref().unwrap();
+    assert_eq!(job.row_buffer, [0xaa]);
+    assert_eq!(job.stage, MteStage::CopyRead);
+}
+
+#[test]
+fn pixel_dma_converts_linear_ycrcb_into_tiled_rgba() {
+    let mut render = CrimeRender::new();
+    let mut sdram = CrimeSdram::new(ComponentId::new(2), "SDRAM", CrimeMemoryConfig::default());
+    queue_and_retire(
+        &mut render,
+        LINEAR_A_BASE,
+        8,
+        u64::from(0x8000_0001_u32) << 32,
+    );
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 2) << 48,
+    );
+    write_sdram(&mut sdram, 0x1000, &[235, 128, 128, 0]);
+    for (offset, value) in [
+        (0x000, 0x0000_12f8_u32),
+        (0x008, 0x0000_0228),
+        (0x018, 0x0020_02f8),
+        (0x060, 0x0100_0020),
+        (0x070, 0),
+        (0x074, 0),
+        (0x0a0, 0),
+        (0x0a8, 4),
+        (0x1b0, LOGIC_COPY),
+        (0x1b8, u32::MAX),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value.into());
+    }
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+    while render.active_pixel_command.is_some() || render.interface_level() != 0 {
+        let progress = retire(&mut render);
+        if let Some(request) = progress.memory_request {
+            complete_through_sdram(&mut render, &mut sdram, request);
+        }
+    }
+
+    assert_eq!(
+        &decode_raw_pixels(
+            &read_gbe_word(&mut sdram, 2 * FRAMEBUFFER_TILE_BYTES),
+            PlaneDepth::ThirtyTwo,
+        )[..1],
+        [u32::MAX]
+    );
 }
 
 #[test]
