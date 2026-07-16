@@ -1,13 +1,21 @@
 //! CRIME Rendering Engine register front end and evidence-backed transfer path.
-
 use core::fmt;
-
+use super::memory::framebuffer;
 use super::protocol::{
     CrimeBusError, CrimeByteEnable, CrimeCompletionPayload, CrimeData, CrimeMemoryBankSelect,
     CrimeMemoryInhibitReason, CrimeMemoryOutcome, CrimeTransfer,
 };
 use super::registers;
-
+mod pixel;
+use pixel::command::{
+    DecodedPixelCommand, PixelCommandSnapshot, PixelCommandValidation, PixelPrimitiveKind,
+    PixelRegisters,
+};
+use pixel::raster::{
+    AxisLineDirection, AxisLineRasterizer, InclusiveRectangleRasterizer, Rasterizer,
+    RectangleRowDirection,
+};
+use pixel::stipple::PixelStippleCursor;
 const INTERFACE_DATA_BASE: u64 = registers::CRIME_RENDER_BASE;
 const INTERFACE_ADDRESS_BASE: u64 = registers::CRIME_RENDER_BASE + 0x200;
 const INTERFACE_CONTROL: u64 = registers::CRIME_RENDER_BASE + 0x400;
@@ -42,16 +50,7 @@ const RENDER_MEMORY_WORD_BYTES: usize = 32;
 const FRAMEBUFFER_8_WIDTH: u16 = 8192;
 const FRAMEBUFFER_32_WIDTH: u16 = 2048;
 const FRAMEBUFFER_HEIGHT: u16 = 2048;
-
-const X_LINE_PRIMITIVE: u32 = 0x0100_0020;
-const X_LINE_DRAW_MODE: u32 = 0x0000_02f8;
-const RGBA32_FRAMEBUFFER_B_MODE: u32 = 0x0000_0628;
-const PROM_CI8_RECTANGLE_PRIMITIVE: u32 = 0x0302_0000;
-const PROM_CI8_ZERO_RECTANGLE_DRAW_MODE: u32 = 0x0000_00f8;
-const PROM_CI8_FLAT_RECTANGLE_DRAW_MODE: u32 = 0x0000_02f8;
-const CI8_FRAMEBUFFER_A_MODE: u32 = 0;
 const LOGIC_COPY: u32 = 3;
-
 const STATUS_IDLE: u32 = 0x1000_0000;
 const STATUS_SETUP_IDLE: u32 = 0x0800_0000;
 const STATUS_PIXEL_PIPE_IDLE: u32 = 0x0400_0000;
@@ -60,13 +59,11 @@ const STATUS_LEVEL_SHIFT: u32 = 18;
 const STATUS_READ_POINTER_SHIFT: u32 = 12;
 const STATUS_WRITE_POINTER_SHIFT: u32 = 6;
 const STATUS_START_POINTER_SHIFT: u32 = 0;
-
 const INTERFACE_CONTROL_MASK: u32 = 0x0fff_ffff;
 const INTERFACE_FULL_SHIFT: u32 = 21;
 const INTERFACE_EMPTY_SHIFT: u32 = 14;
 const INTERFACE_STALL_LEVEL_SHIFT: u32 = 7;
 const INTERFACE_FIELD_MASK: u32 = 0x7f;
-
 const ADDRESS_START: u64 = 1 << 45;
 const ADDRESS_WMASK_SHIFT: u32 = 43;
 const ADDRESS_PAGE_SHIFT: u32 = 40;
@@ -74,23 +71,240 @@ const ADDRESS_OFFSET_SHIFT: u32 = 32;
 const ADDRESS_WMASK_UPPER: u64 = 1;
 const ADDRESS_WMASK_LOWER: u64 = 2;
 const ADDRESS_WMASK_DOUBLE: u64 = 3;
-
 /// One host register write retained by the Rendering Engine interface buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct RenderRegisterWrite {
     /// Canonical register address without the start tag.
     pub address: u64,
-
     /// Register value.
     pub value: u64,
-
     /// Access width in bytes.
     pub size: u8,
-
     /// Whether this write commits the current operation.
     pub commit: bool,
 }
-
+/// PixelPipe register associated with a command diagnostic.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+pub enum PixelRegister {
+    /// Source buffer mode.
+    SourceBufferMode,
+    /// Destination buffer mode.
+    DestinationBufferMode,
+    /// Clip mode.
+    ClipMode,
+    /// Draw mode.
+    DrawMode,
+    /// Destination window offset.
+    DestinationWindowOffset,
+    /// Primitive descriptor.
+    Primitive,
+    /// Line-stipple mode.
+    StippleMode,
+    /// Texture mode.
+    TextureMode,
+    /// Alpha-test mode.
+    AlphaTest,
+    /// Blend function.
+    BlendFunction,
+    /// Logic operation.
+    LogicOperation,
+    /// Color mask.
+    ColorMask,
+    /// Depth mode.
+    DepthMode,
+    /// Stencil mode.
+    StencilMode,
+    /// Register whose START alias submitted the command.
+    StartTrigger,
+    /// Frozen X vertices.
+    XVertex,
+}
+/// Category of a proven-invalid PixelPipe command field.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+pub enum PixelViolationKind {
+    /// Bits documented as reserved were nonzero.
+    ReservedBits,
+    /// An enumerated field used a reserved encoding.
+    InvalidEncoding,
+    /// Individually valid fields formed a documented invalid combination.
+    InvalidCombination,
+}
+/// PixelPipe field associated with a command violation.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+pub enum PixelField {
+    /// Reserved bits.
+    Reserved,
+    /// Primitive opcode.
+    PrimitiveOpcode,
+    /// Buffer selector.
+    BufferKind,
+    /// Buffer word depth.
+    BufferDepth,
+    /// Pixel type.
+    PixelType,
+    /// Pixel depth.
+    PixelDepth,
+    /// Stipple starting index.
+    StippleIndex,
+    /// Stipple maximum index.
+    StippleMaxIndex,
+    /// Texture texel type.
+    TexelType,
+    /// Texture texel depth.
+    TexelDepth,
+    /// Texture base level.
+    TextureBaseLevel,
+    /// Texture maximum level.
+    TextureMaximumLevel,
+    /// Texture minification filter.
+    TextureMinificationFilter,
+    /// Alpha comparison function.
+    AlphaFunction,
+    /// Blend equation.
+    BlendOperation,
+    /// Source blend factor.
+    SourceBlendFactor,
+    /// Destination blend factor.
+    DestinationBlendFactor,
+    /// Logic operation.
+    LogicOperation,
+    /// Depth comparison function.
+    DepthFunction,
+    /// Stencil comparison function.
+    StencilFunction,
+    /// Stencil operation.
+    StencilOperation,
+}
+/// One proven-invalid field in a frozen PixelPipe command.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+pub struct PixelCommandViolation {
+    /// Register containing the invalid field.
+    pub register: PixelRegister,
+    /// Field whose value was invalid.
+    pub field: PixelField,
+    /// Raw field or bit value.
+    pub value: u64,
+    /// Reason the value is invalid.
+    pub kind: PixelViolationKind,
+}
+/// Evidence or implementation capability needed by a valid PixelPipe command.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+pub enum PixelCapability {
+    /// Primitive opcode 4 semantics.
+    FlushPrimitive,
+    /// A START alias other than PixPipeNull.
+    StartAlias,
+    /// Point rasterization.
+    PointRasterization,
+    /// Triangle rasterization.
+    TriangleRasterization,
+    /// Non-axis-aligned or reverse X line rasterization.
+    GeneralLineRasterization,
+    /// Line width other than the proven X-line value.
+    GeneralLineWidth,
+    /// Endpoint skipping.
+    SkipLastEndpoint,
+    /// Rectangle traversal outside the evidence-backed left-to-right row modes.
+    GeneralRectangleTraversal,
+    /// Coordinate range not covered by the current framebuffer iterator.
+    FramebufferBounds,
+    /// GL vertex and raster semantics.
+    GlRasterization,
+    /// Pixel transfer.
+    PixelTransfer,
+    /// Scissor testing.
+    ScissorTest,
+    /// Screen-mask testing.
+    ScreenMaskTest,
+    /// Clip-ID testing.
+    ClipIdTest,
+    /// Polygon stippling.
+    PolygonStipple,
+    /// Opaque stippling.
+    OpaqueStipple,
+    /// Line-stipple repetition or index wrap.
+    RepeatingLineStipple,
+    /// Line stippling combined with clipping.
+    ClippedLineStipple,
+    /// Line stippling on a non-horizontal line.
+    GeneralLineStipple,
+    /// Smooth shading.
+    SmoothShade,
+    /// Texture mapping.
+    TextureMapping,
+    /// Texture levels beyond the evidence-backed range.
+    TextureLevelRange,
+    /// Fog.
+    Fog,
+    /// Coverage.
+    Coverage,
+    /// Line antialiasing.
+    LineAntialiasing,
+    /// Alpha testing.
+    AlphaTest,
+    /// Blending.
+    Blend,
+    /// RGB dithering.
+    Dither,
+    /// Destination read-modify-write for a non-COPY logic operation.
+    LogicReadModifyWrite,
+    /// Partial color bit masking.
+    PartialColorMask,
+    /// Partial color byte masking.
+    PartialColorByteMask,
+    /// Depth testing or writes.
+    Depth,
+    /// Stencil testing or writes.
+    Stencil,
+    /// Read/write conflict bypass.
+    ConflictBypass,
+    /// Double-pixel buffer selection.
+    DoublePixel,
+    /// A legal buffer kind not supported by the current raster path.
+    BufferKind,
+    /// A legal pixel format not supported by the current raster path.
+    PixelFormat,
+    /// Source and destination conversion.
+    BufferConversion,
+    /// Destination window translation.
+    WindowOffset,
+    /// PROM zero-fill rectangle with a nonzero flat color.
+    ZeroRectangleColor,
+}
+/// Source of a capability blocker.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+pub enum PixelBlockerKind {
+    /// Software-visible behavior is not yet evidence-complete.
+    Evidence,
+    /// Behavior is legal and evidence-complete but not implemented.
+    Implementation,
+}
+/// One capability missing from an otherwise legal PixelPipe command.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+pub struct PixelCommandBlocker {
+    /// Missing capability.
+    pub capability: PixelCapability,
+    /// Register that enabled or selected the capability.
+    pub register: PixelRegister,
+    /// Raw enabling value.
+    pub value: u64,
+    /// Whether evidence or implementation is missing.
+    pub kind: PixelBlockerKind,
+}
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct HostInterface {
     #[serde(with = "crate::common::serde_array")]
@@ -104,7 +318,6 @@ struct HostInterface {
     level: u8,
     stall_cycles: u8,
 }
-
 impl HostInterface {
     const fn new() -> Self {
         Self {
@@ -118,7 +331,6 @@ impl HostInterface {
             stall_cycles: 0,
         }
     }
-
     fn reset(&mut self) {
         self.data.fill(0);
         self.address.fill(0);
@@ -128,47 +340,36 @@ impl HostInterface {
         self.level = 0;
         self.stall_cycles = 0;
     }
-
     const fn level(&self) -> usize {
         self.level as usize
     }
-
     const fn can_accept(&self) -> bool {
         self.level < INTERFACE_CAPACITY as u8 && self.stall_cycles == 0
     }
-
     const fn empty_level(&self) -> u8 {
         ((self.control >> INTERFACE_EMPTY_SHIFT) & INTERFACE_FIELD_MASK) as u8
     }
-
     const fn full_level(&self) -> u8 {
         ((self.control >> INTERFACE_FULL_SHIFT) & INTERFACE_FIELD_MASK) as u8
     }
-
     const fn stall_level(&self) -> u8 {
         ((self.control >> INTERFACE_STALL_LEVEL_SHIFT) & INTERFACE_FIELD_MASK) as u8
     }
-
     const fn stall_count(&self) -> u8 {
         (self.control & INTERFACE_FIELD_MASK) as u8
     }
-
     const fn empty_condition(&self) -> bool {
         self.level <= self.empty_level()
     }
-
     const fn full_condition(&self) -> bool {
         self.full_level() != 0 && self.level >= self.full_level()
     }
-
     fn set_control(&mut self, value: u32) {
         self.control = value & INTERFACE_CONTROL_MASK;
     }
-
     fn set_start_pointer(&mut self) {
         self.start_pointer = self.write_pointer;
     }
-
     fn accept(&mut self, write: RenderRegisterWrite) {
         debug_assert!(self.can_accept());
         let index = usize::from(self.write_pointer);
@@ -184,7 +385,6 @@ impl HostInterface {
             self.stall_cycles = self.stall_count();
         }
     }
-
     fn retire(&mut self) -> Option<RenderRegisterWrite> {
         if self.level == 0 {
             return None;
@@ -195,11 +395,9 @@ impl HostInterface {
         self.level -= 1;
         Some(write)
     }
-
     fn advance_stall(&mut self) {
         self.stall_cycles = self.stall_cycles.saturating_sub(1);
     }
-
     fn read_ram(&self, address: u64) -> Option<u64> {
         if (INTERFACE_DATA_BASE..INTERFACE_DATA_BASE + 0x200).contains(&address) {
             return Some(self.data[((address - INTERFACE_DATA_BASE) / 8) as usize]);
@@ -209,7 +407,6 @@ impl HostInterface {
         }
         None
     }
-
     fn write_ram(&mut self, address: u64, value: u64) -> bool {
         if (INTERFACE_DATA_BASE..INTERFACE_DATA_BASE + 0x200).contains(&address) {
             self.data[((address - INTERFACE_DATA_BASE) / 8) as usize] = value;
@@ -222,7 +419,6 @@ impl HostInterface {
         false
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RenderTlbs {
     #[serde(with = "crate::common::serde_array")]
@@ -236,7 +432,6 @@ struct RenderTlbs {
     linear_a: [u64; 16],
     linear_b: [u64; 16],
 }
-
 impl RenderTlbs {
     const fn new() -> Self {
         Self {
@@ -249,11 +444,9 @@ impl RenderTlbs {
             linear_b: [0; 16],
         }
     }
-
     fn reset(&mut self) {
         *self = Self::new();
     }
-
     fn read(&self, address: u64) -> Option<u64> {
         tlb_slot(address).map(|slot| match slot {
             TlbSlot::FramebufferA(index) => self.framebuffer_a[index],
@@ -265,7 +458,6 @@ impl RenderTlbs {
             TlbSlot::LinearB(index) => self.linear_b[index],
         })
     }
-
     fn write(&mut self, address: u64, value: u64) -> bool {
         let Some(slot) = tlb_slot(address) else {
             return false;
@@ -281,15 +473,12 @@ impl RenderTlbs {
         }
         true
     }
-
     fn linear_a_entries(&self) -> [u32; LINEAR_PAGE_COUNT] {
         Self::linear_entries(&self.linear_a)
     }
-
     fn linear_b_entries(&self) -> [u32; LINEAR_PAGE_COUNT] {
         Self::linear_entries(&self.linear_b)
     }
-
     fn framebuffer_entries(&self, buffer: u8) -> Option<FramebufferTlbSnapshot> {
         let slots = match buffer {
             0 => &self.framebuffer_a,
@@ -306,7 +495,6 @@ impl RenderTlbs {
         }
         Some(FramebufferTlbSnapshot(entries))
     }
-
     fn linear_entries(slots: &[u64; 16]) -> [u32; LINEAR_PAGE_COUNT] {
         let mut entries = [0; LINEAR_PAGE_COUNT];
         let mut slot = 0;
@@ -318,7 +506,6 @@ impl RenderTlbs {
         entries
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TlbSlot {
     FramebufferA(usize),
@@ -329,232 +516,127 @@ enum TlbSlot {
     LinearA(usize),
     LinearB(usize),
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct FramebufferTlbSnapshot(
     #[serde(with = "crate::common::serde_array")] [u16; FRAMEBUFFER_TLB_ENTRY_COUNT],
 );
-
 impl FramebufferTlbSnapshot {
     fn entry(&self, index: usize) -> FramebufferTlbEntry {
         FramebufferTlbEntry(self.0[index])
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct FramebufferTlbEntry(u16);
-
 impl FramebufferTlbEntry {
     const fn raw(self) -> u16 {
         self.0
     }
-
     const fn valid(self) -> bool {
         self.0 & FRAMEBUFFER_TLB_VALID != 0
     }
-
     const fn alias_address(self, tile_offset: u64) -> u64 {
         ((self.0 & FRAMEBUFFER_TLB_TILE_MASK) as u64) * FRAMEBUFFER_TILE_BYTES + tile_offset
     }
 }
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-struct PixelRegisters {
-    #[serde(with = "crate::common::serde_array")]
-    slots: [u64; 64],
-}
-
-impl PixelRegisters {
-    const fn new() -> Self {
-        Self { slots: [0; 64] }
-    }
-
-    fn reset(&mut self) {
-        self.slots.fill(0);
-    }
-
-    fn read(&self, address: u64, size: u8) -> u64 {
-        read_register_slot(&self.slots, address - PIXEL_PIPE_BASE, size)
-    }
-
-    fn write(&mut self, address: u64, size: u8, value: u64) {
-        write_register_slot(&mut self.slots, address - PIXEL_PIPE_BASE, size, value);
-    }
-
-    fn command_snapshot(&self, trigger_address: u64) -> PixelCommandSnapshot {
-        PixelCommandSnapshot {
-            trigger_address,
-            registers: self.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-struct PixelCommandSnapshot {
-    trigger_address: u64,
-    registers: PixelRegisters,
-}
-
-impl PixelCommandSnapshot {
-    fn primitive(&self) -> u32 {
-        self.registers.read(PIXEL_PIPE_BASE + 0x060, 4) as u32
-    }
-
-    fn draw_mode(&self) -> u32 {
-        self.registers.read(PIXEL_PIPE_BASE + 0x018, 4) as u32
-    }
-
-    fn source_buffer_mode(&self) -> u32 {
-        self.registers.read(PIXEL_PIPE_BASE, 4) as u32
-    }
-
-    fn destination_buffer_mode(&self) -> u32 {
-        self.registers.read(PIXEL_PIPE_BASE + 0x008, 4) as u32
-    }
-
-    fn clip_mode(&self) -> u32 {
-        self.registers.read(PIXEL_PIPE_BASE + 0x010, 4) as u32
-    }
-
-    fn destination_window_offset(&self) -> u32 {
-        self.registers.read(PIXEL_PIPE_BASE + 0x058, 4) as u32
-    }
-
-    fn foreground_color(&self) -> u32 {
-        self.registers.read(PIXEL_PIPE_BASE + 0x0d0, 4) as u32
-    }
-
-    fn logic_operation(&self) -> u32 {
-        self.registers.read(PIXEL_PIPE_BASE + 0x1b0, 4) as u32
-    }
-
-    fn color_mask(&self) -> u32 {
-        self.registers.read(PIXEL_PIPE_BASE + 0x1b8, 4) as u32
-    }
-
-    fn x_vertex(&self, index: usize) -> (u16, u16) {
-        let value = self
-            .registers
-            .read(PIXEL_PIPE_BASE + 0x070 + index as u64 * 4, 4) as u32;
-        ((value >> 16) as u16, value as u16)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-enum PixelLineDirection {
-    Horizontal,
-    Vertical,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-struct PixelLineJob {
-    command: PixelCommandSnapshot,
-    entries: Box<FramebufferTlbSnapshot>,
-    direction: PixelLineDirection,
+struct PixelCandidateBatch {
     x: u16,
     y: u16,
-    end_x: u16,
-    end_y: u16,
+    candidate_count: u16,
+    enabled_count: u16,
+    stipple_index: Option<u8>,
 }
-
-impl PixelLineJob {
-    fn complete(&self) -> bool {
-        match self.direction {
-            PixelLineDirection::Horizontal => self.x > self.end_x,
-            PixelLineDirection::Vertical => self.y > self.end_y,
-        }
-    }
-
-    fn advance(&mut self, pixels: u16) {
-        match self.direction {
-            PixelLineDirection::Horizontal => self.x = self.x.saturating_add(pixels),
-            PixelLineDirection::Vertical => self.y = self.y.saturating_add(pixels),
-        }
-    }
-
-    fn endpoints(&self) -> (u16, u16, u16, u16) {
-        let (x0, y0) = self.command.x_vertex(0);
-        (x0, y0, self.end_x, self.end_y)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-struct PixelRectangleJob {
-    command: PixelCommandSnapshot,
+struct PixelPipelineJob {
+    command: DecodedPixelCommand,
     entries: Box<FramebufferTlbSnapshot>,
-    x_start: u16,
-    x: u16,
-    y: u16,
-    end_x: u16,
-    end_y: u16,
+    rasterizer: Rasterizer,
+    stipple: Option<PixelStippleCursor>,
+    pending_batch: Option<PixelCandidateBatch>,
 }
-
-impl PixelRectangleJob {
+impl PixelPipelineJob {
     fn complete(&self) -> bool {
-        self.y > self.end_y
+        self.pending_batch.is_none() && self.rasterizer.complete()
     }
-
-    fn advance(&mut self, pixels: u16) {
-        let next = u32::from(self.x) + u32::from(pixels);
-        if next > u32::from(self.end_x) {
-            self.x = self.x_start;
-            self.y = self.y.saturating_add(1);
-        } else {
-            self.x = next as u16;
+    fn endpoints(&self) -> (u16, u16, u16, u16) {
+        self.command.endpoints()
+    }
+    fn advance_candidates(&mut self, candidates: u16) {
+        self.rasterizer.advance(candidates);
+        if let Some(stipple) = self.stipple.as_mut() {
+            stipple.advance(candidates);
         }
     }
-
-    fn endpoints(&self) -> (u16, u16, u16, u16) {
-        let (x0, y0) = self.command.x_vertex(0);
-        (x0, y0, self.end_x, self.end_y)
+    fn complete_pending_batch(&mut self) -> Option<PixelCandidateBatch> {
+        let batch = self.pending_batch.take()?;
+        self.advance_candidates(batch.candidate_count);
+        Some(batch)
     }
 }
-
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct BlockedPixelCommand {
+    command: DecodedPixelCommand,
+    error: CrimeRenderError,
+}
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum PixelExecution {
-    Unsupported(PixelCommandSnapshot),
-    Line(PixelLineJob),
-    Rectangle(PixelRectangleJob),
+    Blocked(BlockedPixelCommand),
+    Running(PixelPipelineJob),
 }
-
 impl PixelExecution {
     fn complete(&self) -> bool {
         match self {
-            Self::Unsupported(_) => false,
-            Self::Line(job) => job.complete(),
-            Self::Rectangle(job) => job.complete(),
+            Self::Blocked(_) => false,
+            Self::Running(job) => job.complete(),
         }
     }
-
     fn completion_notice(&self) -> RenderNotice {
-        let (command, endpoints) = match self {
-            Self::Unsupported(_) => unreachable!("unsupported pixel command cannot complete"),
-            Self::Line(job) => (&job.command, job.endpoints()),
-            Self::Rectangle(job) => (&job.command, job.endpoints()),
+        let Self::Running(job) = self else {
+            unreachable!("blocked pixel command cannot complete")
         };
-        let (x0, y0, x1, y1) = endpoints;
+        let (x0, y0, x1, y1) = job.endpoints();
         RenderNotice::PixelCommandCompleted {
-            primitive: command.primitive(),
+            primitive: job.command.primitive_raw,
             x0,
             y0,
             x1,
             y1,
         }
     }
-
-    fn advance(&mut self, pixels: u16) {
+    fn blocked_error(&self) -> Option<&CrimeRenderError> {
         match self {
-            Self::Unsupported(_) => unreachable!("unsupported pixel command cannot advance"),
-            Self::Line(job) => job.advance(pixels),
-            Self::Rectangle(job) => job.advance(pixels),
+            Self::Blocked(blocked) => Some(&blocked.error),
+            Self::Running(_) => None,
+        }
+    }
+    fn running_mut(&mut self) -> Option<&mut PixelPipelineJob> {
+        match self {
+            Self::Blocked(_) => None,
+            Self::Running(job) => Some(job),
         }
     }
 }
-
 /// Rendering Engine execution failure.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeRenderError {
-    /// A pixel command was frozen correctly, but its behavior is not evidence-complete.
+    /// A frozen pixel command contained one or more proven-invalid fields.
+    InvalidPixelCommand {
+        /// Canonical register whose START alias submitted the command.
+        trigger_address: u64,
+        /// Primitive register captured by the command snapshot.
+        primitive: u32,
+        /// Draw-mode register captured by the command snapshot.
+        draw_mode: u32,
+        /// Source BufMode register captured by the command snapshot.
+        source_buffer_mode: u32,
+        /// Destination BufMode register captured by the command snapshot.
+        destination_buffer_mode: u32,
+        /// Decoded set of the 24 defined DrawMode feature bits.
+        feature_bits: u32,
+        /// Complete stable list of invalid fields.
+        violations: Vec<PixelCommandViolation>,
+    },
+    /// A pixel command is legal but requires unavailable evidence or behavior.
     UnsupportedPixelCommand {
         /// Canonical register whose START alias submitted the command.
         trigger_address: u64,
@@ -562,8 +644,15 @@ pub enum CrimeRenderError {
         primitive: u32,
         /// Draw-mode register captured by the command snapshot.
         draw_mode: u32,
+        /// Source BufMode register captured by the command snapshot.
+        source_buffer_mode: u32,
+        /// Destination BufMode register captured by the command snapshot.
+        destination_buffer_mode: u32,
+        /// Decoded set of the 24 defined DrawMode feature bits.
+        feature_bits: u32,
+        /// Complete stable list of missing capabilities.
+        blockers: Vec<PixelCommandBlocker>,
     },
-
     /// The committed MTE state is outside the evidence-complete zero-clear subset.
     UnsupportedMteJob {
         /// MTE mode value.
@@ -573,7 +662,6 @@ pub enum CrimeRenderError {
         /// MTE foreground value.
         foreground: u32,
     },
-
     /// The inclusive MTE destination endpoints are not valid for the selected buffer.
     InvalidMteRange {
         /// Inclusive start address.
@@ -581,27 +669,39 @@ pub enum CrimeRenderError {
         /// Inclusive end address.
         end: u32,
     },
-
     /// A memory completion arrived while no Rendering Engine write was outstanding.
     UnexpectedMemoryCompletion,
-
     /// The memory target returned a payload incompatible with a Rendering Engine write.
     UnexpectedMemoryPayload,
-
     /// The memory domain failed to transport the Rendering Engine request.
     MemoryTransport(CrimeBusError),
 }
-
 impl fmt::Display for CrimeRenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidPixelCommand {
+                trigger_address,
+                primitive,
+                draw_mode,
+                source_buffer_mode,
+                destination_buffer_mode,
+                feature_bits,
+                violations,
+            } => write!(
+                f,
+                "invalid CRIME pixel command triggered by {trigger_address:#010x}, primitive {primitive:#010x}, draw mode {draw_mode:#010x}, features {feature_bits:#08x}, source format {source_buffer_mode:#010x}, destination format {destination_buffer_mode:#010x}: {violations:?}"
+            ),
             Self::UnsupportedPixelCommand {
                 trigger_address,
                 primitive,
                 draw_mode,
+                source_buffer_mode,
+                destination_buffer_mode,
+                feature_bits,
+                blockers,
             } => write!(
                 f,
-                "unsupported CRIME pixel command triggered by {trigger_address:#010x}, primitive {primitive:#010x}, draw mode {draw_mode:#010x}"
+                "unsupported CRIME pixel command triggered by {trigger_address:#010x}, primitive {primitive:#010x}, draw mode {draw_mode:#010x}, features {feature_bits:#08x}, source format {source_buffer_mode:#010x}, destination format {destination_buffer_mode:#010x}: {blockers:?}"
             ),
             Self::UnsupportedMteJob {
                 mode,
@@ -629,16 +729,13 @@ impl fmt::Display for CrimeRenderError {
         }
     }
 }
-
 impl std::error::Error for CrimeRenderError {}
-
 /// Consumer that will resume when one RE memory request completes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) enum RenderMemoryDestination {
     Mte,
     Pixel,
 }
-
 /// One memory operation requested through the CRIME memory domain.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct RenderMemoryRequest {
@@ -652,7 +749,6 @@ pub(super) struct RenderMemoryRequest {
     pub(super) destination: RenderMemoryDestination,
     pub(super) transfer: CrimeTransfer,
 }
-
 /// A software-visible Rendering Engine transition used for tracing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) enum RenderNotice {
@@ -661,12 +757,36 @@ pub(super) enum RenderNotice {
         start: u32,
         end: u32,
     },
+    PixelCommandDecoded {
+        primitive: u32,
+        draw_mode: u32,
+        feature_bits: u32,
+        violation_count: u16,
+        blocker_count: u16,
+    },
     PixelCommandCommitted {
         primitive: u32,
         x0: u16,
         y0: u16,
         x1: u16,
         y1: u16,
+    },
+    RasterBatch {
+        x: u16,
+        y: u16,
+        candidates: u16,
+        enabled: u16,
+    },
+    FramebufferWordLayout {
+        logical_lane: u8,
+        physical_lane: u8,
+        bytes_per_pixel: u8,
+    },
+    StippleMask {
+        pattern: u32,
+        index: u8,
+        candidates: u16,
+        enabled_mask: u32,
     },
     MemoryChunk {
         destination: RenderMemoryDestination,
@@ -699,14 +819,12 @@ pub(super) enum RenderNotice {
         y1: u16,
     },
 }
-
 /// One PIU interrupt-source transition generated by the RE.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct RenderInterruptEffect {
     pub(super) mask: u32,
     pub(super) asserted: bool,
 }
-
 /// Effects produced by one RE state transition.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct RenderProgress {
@@ -715,7 +833,6 @@ pub(super) struct RenderProgress {
     pub(super) interrupts: Vec<RenderInterruptEffect>,
     pub(super) notices: Vec<RenderNotice>,
 }
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct MteRegisters {
     mode: u32,
@@ -729,7 +846,6 @@ struct MteRegisters {
     source_y_step: u32,
     destination_y_step: u32,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct MteJob {
     start: u32,
@@ -737,7 +853,6 @@ struct MteJob {
     destination: MteDestination,
     no_ecc: bool,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum MteDestination {
     Linear {
@@ -755,7 +870,6 @@ enum MteDestination {
         y: u16,
     },
 }
-
 impl MteJob {
     fn complete(&self) -> bool {
         match &self.destination {
@@ -763,7 +877,6 @@ impl MteJob {
             MteDestination::Framebuffer { y, y_end, .. } => y > y_end,
         }
     }
-
     fn advance(&mut self, length: u16) {
         match &mut self.destination {
             MteDestination::Linear { next, .. } => *next += u64::from(length),
@@ -787,66 +900,53 @@ impl MteJob {
         }
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingRenderMemory {
     destination: RenderMemoryDestination,
     virtual_address: u32,
     physical_address: u64,
     length: u16,
-    pixel_count: u16,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct MemoryRequestUnit {
     pending: Option<PendingRenderMemory>,
 }
-
 impl MemoryRequestUnit {
     const fn new() -> Self {
         Self { pending: None }
     }
-
     const fn busy(&self) -> bool {
         self.pending.is_some()
     }
-
-    fn issue(&mut self, request: &RenderMemoryRequest, pixel_count: u16) {
+    fn issue(&mut self, request: &RenderMemoryRequest) {
         debug_assert!(self.pending.is_none());
         self.pending = Some(PendingRenderMemory {
             destination: request.destination,
             virtual_address: request.virtual_address,
             physical_address: request.physical_address,
             length: request.transfer.length() as u16,
-            pixel_count,
         });
     }
-
     fn complete(&mut self) -> Option<PendingRenderMemory> {
         self.pending.take()
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct LinearTlbEntry(u32);
-
 impl LinearTlbEntry {
     const fn valid(self) -> bool {
         self.0 & 0x8000_0000 != 0
     }
-
     const fn alias_address(self, page_offset: u64) -> u64 {
         ((self.0 & LINEAR_PAGE_MASK) as u64) * LINEAR_PAGE_SIZE + page_offset
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RenderConditions {
     empty: bool,
     full: bool,
     idle: bool,
 }
-
 /// CRIME Rendering Engine front-end state.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeRender {
@@ -861,7 +961,6 @@ pub struct CrimeRender {
     conditions: RenderConditions,
     epoch: u64,
 }
-
 impl CrimeRender {
     /// Creates reset Rendering Engine state.
     pub const fn new() -> Self {
@@ -893,7 +992,6 @@ impl CrimeRender {
             epoch: 0,
         }
     }
-
     /// Resets the front end and invalidates old render events.
     pub(super) fn reset(&mut self) -> Vec<RenderInterruptEffect> {
         self.interface = HostInterface::new();
@@ -925,22 +1023,18 @@ impl CrimeRender {
             },
         ]
     }
-
     /// Returns the active Rendering Engine epoch.
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
-
     /// Returns the number of host writes waiting in the 64-entry interface buffer.
     pub fn interface_level(&self) -> usize {
         self.interface.level()
     }
-
     /// Returns whether another host register write can be accepted.
     pub(super) fn has_interface_space(&self) -> bool {
         self.interface.can_accept()
     }
-
     /// Reads a software-visible Rendering Engine register.
     pub fn read(&self, address: u64, size: u8) -> Result<u64, RenderAccessError> {
         let access = register_access(address, size, RegisterDirection::Read)?;
@@ -967,7 +1061,6 @@ impl CrimeRender {
         }
         Err(RenderAccessError::Unsupported)
     }
-
     /// Queues one software-visible Rendering Engine register write.
     pub(super) fn write(
         &mut self,
@@ -982,7 +1075,6 @@ impl CrimeRender {
             return Err(RenderWriteError::Access(RenderAccessError::Unsupported));
         }
         let previous = self.conditions;
-
         if !access.buffered {
             if self.interface.write_ram(address, value) {
                 return Ok(RenderProgress::default());
@@ -1004,11 +1096,9 @@ impl CrimeRender {
                 ..RenderProgress::default()
             });
         }
-
         if !self.has_interface_space() {
             return Err(RenderWriteError::InterfaceFull);
         }
-
         self.interface.accept(RenderRegisterWrite {
             address,
             value,
@@ -1023,22 +1113,24 @@ impl CrimeRender {
             ..RenderProgress::default()
         })
     }
-
     /// Advances one bounded RE state-machine step.
     pub(super) fn step(&mut self) -> Result<RenderProgress, CrimeRenderError> {
         let previous = self.conditions;
         self.step_scheduled = false;
         self.interface.advance_stall();
         let mut progress = RenderProgress::default();
-
         if self.active_pixel_command.is_some() {
             if self.memory_request_unit.busy() {
                 progress.schedule_step = self.ensure_step_scheduled();
                 progress.interrupts = self.update_conditions(previous);
                 return Ok(progress);
             }
-            if let Some(PixelExecution::Unsupported(command)) = &self.active_pixel_command {
-                return Err(unsupported_pixel_command(command));
+            if let Some(error) = self
+                .active_pixel_command
+                .as_ref()
+                .and_then(PixelExecution::blocked_error)
+            {
+                return Err(error.clone());
             }
             if self
                 .active_pixel_command
@@ -1052,16 +1144,16 @@ impl CrimeRender {
                 progress.notices.push(command.completion_notice());
                 progress.schedule_step = self.ensure_step_scheduled();
             } else {
-                let (memory_request, pixel_count) = self.prepare_pixel_memory_request();
-                append_memory_notices(&mut progress.notices, &memory_request);
-                self.memory_request_unit.issue(&memory_request, pixel_count);
-                progress.memory_request = Some(memory_request);
+                if let Some(memory_request) = self.prepare_pixel_batch(&mut progress.notices) {
+                    append_memory_notices(&mut progress.notices, &memory_request);
+                    self.memory_request_unit.issue(&memory_request);
+                    progress.memory_request = Some(memory_request);
+                }
                 progress.schedule_step = self.ensure_step_scheduled();
             }
             progress.interrupts = self.update_conditions(previous);
             return Ok(progress);
         }
-
         if self.active_job.is_some() {
             if self.memory_request_unit.busy() {
                 progress.schedule_step = self.ensure_step_scheduled();
@@ -1078,14 +1170,13 @@ impl CrimeRender {
             } else {
                 let memory_request = self.prepare_mte_memory_request()?;
                 append_memory_notices(&mut progress.notices, &memory_request);
-                self.memory_request_unit.issue(&memory_request, 0);
+                self.memory_request_unit.issue(&memory_request);
                 progress.memory_request = Some(memory_request);
                 progress.schedule_step = self.ensure_step_scheduled();
             }
             progress.interrupts = self.update_conditions(previous);
             return Ok(progress);
         }
-
         let Some(write) = self.interface.retire() else {
             progress.schedule_step = self.ensure_step_scheduled();
             progress.interrupts = self.update_conditions(previous);
@@ -1093,7 +1184,6 @@ impl CrimeRender {
         };
         self.apply_register_write(write);
         progress.notices.push(RenderNotice::RegisterRetired(write));
-
         if write.commit {
             if (MTE_BASE..=MTE_BASE + 0x78).contains(&write.address) {
                 if matches!(write.address - MTE_BASE, 0x70 | 0x78) {
@@ -1109,34 +1199,42 @@ impl CrimeRender {
                 self.active_job = Some(job);
                 let memory_request = self.prepare_mte_memory_request()?;
                 append_memory_notices(&mut progress.notices, &memory_request);
-                self.memory_request_unit.issue(&memory_request, 0);
+                self.memory_request_unit.issue(&memory_request);
                 progress.memory_request = Some(memory_request);
             } else {
                 let command = self.pixel.command_snapshot(write.address);
-                match self.snapshot_pixel_execution(command.clone()) {
-                    Ok(execution) => {
-                        let (x0, y0, x1, y1) = match &execution {
-                            PixelExecution::Line(job) => job.endpoints(),
-                            PixelExecution::Rectangle(job) => job.endpoints(),
-                            PixelExecution::Unsupported(_) => {
-                                unreachable!("validated command cannot be unsupported")
-                            }
-                        };
+                match self.snapshot_pixel_execution(command) {
+                    Ok(job) => {
+                        let (x0, y0, x1, y1) = job.endpoints();
+                        progress.notices.push(RenderNotice::PixelCommandDecoded {
+                            primitive: job.command.primitive_raw,
+                            draw_mode: job.command.snapshot.draw_mode(),
+                            feature_bits: job.command.features.raw(),
+                            violation_count: 0,
+                            blocker_count: 0,
+                        });
                         progress.notices.push(RenderNotice::PixelCommandCommitted {
-                            primitive: command.primitive(),
+                            primitive: job.command.primitive_raw,
                             x0,
                             y0,
                             x1,
                             y1,
                         });
-                        self.active_pixel_command = Some(execution);
-                        let (memory_request, pixel_count) = self.prepare_pixel_memory_request();
-                        append_memory_notices(&mut progress.notices, &memory_request);
-                        self.memory_request_unit.issue(&memory_request, pixel_count);
-                        progress.memory_request = Some(memory_request);
+                        self.active_pixel_command = Some(PixelExecution::Running(job));
+                        if let Some(memory_request) =
+                            self.prepare_pixel_batch(&mut progress.notices)
+                        {
+                            append_memory_notices(&mut progress.notices, &memory_request);
+                            self.memory_request_unit.issue(&memory_request);
+                            progress.memory_request = Some(memory_request);
+                        } else {
+                            progress.schedule_step = self.ensure_step_scheduled();
+                        }
                     }
-                    Err(error) => {
-                        self.active_pixel_command = Some(PixelExecution::Unsupported(command));
+                    Err(blocked) => {
+                        let blocked = *blocked;
+                        let error = blocked.error.clone();
+                        self.active_pixel_command = Some(PixelExecution::Blocked(blocked));
                         return Err(error);
                     }
                 }
@@ -1147,7 +1245,6 @@ impl CrimeRender {
         progress.interrupts = self.update_conditions(previous);
         Ok(progress)
     }
-
     /// Completes the outstanding MTE memory write.
     pub(super) fn complete_memory(
         &mut self,
@@ -1172,7 +1269,12 @@ impl CrimeRender {
                 let Some(command) = self.active_pixel_command.as_mut() else {
                     return Err(CrimeRenderError::UnexpectedMemoryCompletion);
                 };
-                command.advance(pending.pixel_count);
+                let Some(job) = command.running_mut() else {
+                    return Err(CrimeRenderError::UnexpectedMemoryCompletion);
+                };
+                if job.complete_pending_batch().is_none() {
+                    return Err(CrimeRenderError::UnexpectedMemoryCompletion);
+                }
             }
         }
         let schedule_step = self.ensure_step_scheduled();
@@ -1188,7 +1290,6 @@ impl CrimeRender {
             ..RenderProgress::default()
         })
     }
-
     fn status(&self) -> u32 {
         let setup_idle = self.interface.level == 0;
         let pixel_idle = self.active_pixel_command.is_none();
@@ -1207,14 +1308,11 @@ impl CrimeRender {
             | u32::from(self.interface.write_pointer) << STATUS_WRITE_POINTER_SHIFT
             | u32::from(self.interface.start_pointer) << STATUS_START_POINTER_SHIFT
     }
-
     fn ensure_step_scheduled(&mut self) -> bool {
         let work_ready = self.interface.stall_cycles != 0
             || (!self.memory_request_unit.busy()
-                && (matches!(
-                    self.active_pixel_command,
-                    Some(PixelExecution::Line(_) | PixelExecution::Rectangle(_))
-                ) || self.active_job.is_some()))
+                && (matches!(self.active_pixel_command, Some(PixelExecution::Running(_)))
+                    || self.active_job.is_some()))
             || (self.active_pixel_command.is_none()
                 && self.active_job.is_none()
                 && self.interface.level != 0);
@@ -1224,7 +1322,6 @@ impl CrimeRender {
         self.step_scheduled = true;
         true
     }
-
     fn update_conditions(&mut self, previous: RenderConditions) -> Vec<RenderInterruptEffect> {
         let current = RenderConditions {
             empty: self.interface.empty_condition(),
@@ -1258,7 +1355,6 @@ impl CrimeRender {
         );
         effects
     }
-
     fn apply_register_write(&mut self, write: RenderRegisterWrite) {
         if self.tlbs.write(write.address, write.value) {
             return;
@@ -1284,7 +1380,6 @@ impl CrimeRender {
             }
         }
     }
-
     const fn read_mte(&self, address: u64) -> u32 {
         match address - MTE_BASE {
             0x00 => self.mte.mode,
@@ -1297,181 +1392,203 @@ impl CrimeRender {
             _ => 0,
         }
     }
-
     fn snapshot_pixel_execution(
         &self,
         command: PixelCommandSnapshot,
-    ) -> Result<PixelExecution, CrimeRenderError> {
-        match command.primitive() {
-            X_LINE_PRIMITIVE => self.snapshot_x_line_job(command).map(PixelExecution::Line),
-            PROM_CI8_RECTANGLE_PRIMITIVE => self
-                .snapshot_prom_ci8_rectangle_job(command)
-                .map(PixelExecution::Rectangle),
-            _ => Err(unsupported_pixel_command(&command)),
-        }
-    }
-
-    fn snapshot_x_line_job(
-        &self,
-        command: PixelCommandSnapshot,
-    ) -> Result<PixelLineJob, CrimeRenderError> {
-        let (x0, y0) = command.x_vertex(0);
-        let (x1, y1) = command.x_vertex(1);
-        let direction = if y0 == y1 && x0 < x1 {
-            Some(PixelLineDirection::Horizontal)
-        } else if x0 == x1 && y0 < y1 {
-            Some(PixelLineDirection::Vertical)
+    ) -> Result<PixelPipelineJob, Box<BlockedPixelCommand>> {
+        let validation = PixelCommandValidation::decode(command);
+        let error = if validation.violations.is_empty() {
+            if validation.blockers.is_empty() {
+                None
+            } else {
+                Some(CrimeRenderError::UnsupportedPixelCommand {
+                    trigger_address: validation.decoded.snapshot.trigger_address,
+                    primitive: validation.decoded.primitive_raw,
+                    draw_mode: validation.decoded.snapshot.draw_mode(),
+                    source_buffer_mode: validation.decoded.source.raw,
+                    destination_buffer_mode: validation.decoded.destination.raw,
+                    feature_bits: validation.decoded.features.raw(),
+                    blockers: validation.blockers,
+                })
+            }
         } else {
-            None
+            Some(CrimeRenderError::InvalidPixelCommand {
+                trigger_address: validation.decoded.snapshot.trigger_address,
+                primitive: validation.decoded.primitive_raw,
+                draw_mode: validation.decoded.snapshot.draw_mode(),
+                source_buffer_mode: validation.decoded.source.raw,
+                destination_buffer_mode: validation.decoded.destination.raw,
+                feature_bits: validation.decoded.features.raw(),
+                violations: validation.violations,
+            })
         };
-        let supported = command.trigger_address == PIXEL_PIPE_NULL
-            && command.primitive() == X_LINE_PRIMITIVE
-            && command.draw_mode() == X_LINE_DRAW_MODE
-            && command.source_buffer_mode() == RGBA32_FRAMEBUFFER_B_MODE
-            && command.destination_buffer_mode() == RGBA32_FRAMEBUFFER_B_MODE
-            && command.clip_mode() == 0
-            && command.destination_window_offset() == 0
-            && command.logic_operation() == LOGIC_COPY
-            && command.color_mask() == u32::MAX
-            && x0 < FRAMEBUFFER_32_WIDTH
-            && x1 < FRAMEBUFFER_32_WIDTH
-            && y0 < FRAMEBUFFER_HEIGHT
-            && y1 < FRAMEBUFFER_HEIGHT
-            && direction.is_some();
-        if !supported {
-            return Err(unsupported_pixel_command(&command));
+        if let Some(error) = error {
+            return Err(Box::new(BlockedPixelCommand {
+                command: validation.decoded,
+                error,
+            }));
         }
-        Ok(PixelLineJob {
-            command,
+        let command = validation.decoded;
+        let rasterizer = match command.primitive_kind {
+            PixelPrimitiveKind::Line => {
+                let direction = if command.y0 == command.y1 {
+                    AxisLineDirection::Horizontal
+                } else {
+                    AxisLineDirection::Vertical
+                };
+                Rasterizer::AxisLine(AxisLineRasterizer {
+                    direction,
+                    x: command.x0,
+                    y: command.y0,
+                    end_x: command.x1,
+                    end_y: command.y1,
+                })
+            }
+            PixelPrimitiveKind::Rectangle => {
+                Rasterizer::InclusiveRectangle(InclusiveRectangleRasterizer {
+                    x_start: command.x0,
+                    x: command.x0,
+                    y: command.y0,
+                    end_x: command.x1,
+                    end_y: command.y1,
+                    row_direction: if command.edge_type == 0 {
+                        RectangleRowDirection::Descending
+                    } else {
+                        RectangleRowDirection::Ascending
+                    },
+                    finished: false,
+                })
+            }
+            _ => unreachable!("validated command has an implemented rasterizer"),
+        };
+        let selector = command
+            .destination
+            .kind
+            .framebuffer_selector()
+            .expect("validated command selects a framebuffer");
+        let stipple = command
+            .line_stipple_enabled()
+            .then(|| PixelStippleCursor::new(command.stipple_pattern, command.stipple_mode));
+        Ok(PixelPipelineJob {
             entries: Box::new(
                 self.tlbs
-                    .framebuffer_entries(1)
-                    .expect("framebuffer B selector is defined"),
+                    .framebuffer_entries(selector)
+                    .expect("validated framebuffer selector"),
             ),
-            direction: direction.expect("supported line has a direction"),
-            x: x0,
-            y: y0,
-            end_x: x1,
-            end_y: y1,
-        })
-    }
-
-    fn snapshot_prom_ci8_rectangle_job(
-        &self,
-        command: PixelCommandSnapshot,
-    ) -> Result<PixelRectangleJob, CrimeRenderError> {
-        let (x0, y0) = command.x_vertex(0);
-        let (x1, y1) = command.x_vertex(1);
-        let zero_rectangle = command.draw_mode() == PROM_CI8_ZERO_RECTANGLE_DRAW_MODE
-            && command.foreground_color() == 0
-            && x0 == 0
-            && y0 == 0
-            && x1 != 0
-            && y1 != 0;
-        let flat_rectangle = command.draw_mode() == PROM_CI8_FLAT_RECTANGLE_DRAW_MODE
-            && command.logic_operation() == LOGIC_COPY
-            && x0 <= x1
-            && y0 <= y1;
-        let supported = command.trigger_address == PIXEL_PIPE_NULL
-            && command.source_buffer_mode() == CI8_FRAMEBUFFER_A_MODE
-            && command.destination_buffer_mode() == CI8_FRAMEBUFFER_A_MODE
-            && command.clip_mode() == 0
-            && command.destination_window_offset() == 0
-            && command.color_mask() == u32::MAX
-            && x1 < FRAMEBUFFER_8_WIDTH
-            && y1 < FRAMEBUFFER_HEIGHT
-            && (zero_rectangle || flat_rectangle);
-        if !supported {
-            return Err(unsupported_pixel_command(&command));
-        }
-        Ok(PixelRectangleJob {
             command,
-            entries: Box::new(
-                self.tlbs
-                    .framebuffer_entries(0)
-                    .expect("framebuffer A selector is defined"),
-            ),
-            x_start: x0,
-            x: x0,
-            y: y0,
-            end_x: x1,
-            end_y: y1,
+            rasterizer,
+            stipple,
+            pending_batch: None,
         })
     }
-
-    fn prepare_pixel_memory_request(&self) -> (RenderMemoryRequest, u16) {
-        let (entries, bytes_per_pixel, x, y, end_x, contiguous, pixel_bytes) =
-            match self.active_pixel_command.as_ref() {
-                Some(PixelExecution::Line(job)) => (
-                    job.entries.as_ref(),
-                    4_u8,
-                    job.x,
-                    job.y,
-                    job.end_x,
-                    job.direction == PixelLineDirection::Horizontal,
-                    job.command.foreground_color().to_be_bytes(),
-                ),
-                Some(PixelExecution::Rectangle(job)) => (
-                    job.entries.as_ref(),
-                    1_u8,
-                    job.x,
-                    job.y,
-                    job.end_x,
-                    true,
-                    [job.command.foreground_color() as u8, 0, 0, 0],
-                ),
-                _ => unreachable!("pixel request requires an active supported command"),
-            };
+    fn prepare_pixel_batch(
+        &mut self,
+        notices: &mut Vec<RenderNotice>,
+    ) -> Option<RenderMemoryRequest> {
+        let Some(PixelExecution::Running(job)) = self.active_pixel_command.as_mut() else {
+            unreachable!("pixel batch requires an active running command")
+        };
+        debug_assert!(job.pending_batch.is_none());
+        let position = job.rasterizer.position();
+        let bytes_per_pixel = job
+            .command
+            .destination
+            .format
+            .bytes_per_pixel()
+            .expect("validated command has a sized pixel format");
         let tile_width = (FRAMEBUFFER_TILE_ROW_BYTES / u64::from(bytes_per_pixel)) as u16;
-        let tile_x = usize::from(x / tile_width);
-        let tile_y = usize::from(y / FRAMEBUFFER_TILE_HEIGHT);
-        let entry = entries.entry(tile_y * FRAMEBUFFER_TILES_PER_ROW + tile_x);
-        let x_in_tile = x % tile_width;
-        let y_in_tile = y % FRAMEBUFFER_TILE_HEIGHT;
+        let tile_x = usize::from(position.x / tile_width);
+        let tile_y = usize::from(position.y / FRAMEBUFFER_TILE_HEIGHT);
+        let entry = job
+            .entries
+            .entry(tile_y * FRAMEBUFFER_TILES_PER_ROW + tile_x);
+        let x_in_tile = position.x % tile_width;
+        let y_in_tile = position.y % FRAMEBUFFER_TILE_HEIGHT;
         let pixel_offset = u64::from(y_in_tile) * FRAMEBUFFER_TILE_ROW_BYTES
             + u64::from(x_in_tile) * u64::from(bytes_per_pixel);
         let pixel_alias = entry.alias_address(pixel_offset);
         let word_alias = pixel_alias & !(RENDER_MEMORY_WORD_BYTES as u64 - 1);
-        let first_lane = (pixel_alias - word_alias) as usize;
-        let pixel_count = if contiguous {
-            let remaining = usize::from(end_x - x + 1);
-            remaining.min((RENDER_MEMORY_WORD_BYTES - first_lane) / usize::from(bytes_per_pixel))
+        let first_logical_lane = (pixel_alias - word_alias) as usize;
+        let candidate_count = if job.rasterizer.contiguous() {
+            usize::from(job.rasterizer.remaining_in_row())
+                .min((RENDER_MEMORY_WORD_BYTES - first_logical_lane) / usize::from(bytes_per_pixel))
                 as u16
         } else {
             1
         };
+        let pixel_bytes = job.command.pixel_bytes();
         let mut data = vec![0; RENDER_MEMORY_WORD_BYTES];
         let mut byte_enable = vec![false; RENDER_MEMORY_WORD_BYTES];
-        for pixel in 0..usize::from(pixel_count) {
+        let first_physical_lane =
+            framebuffer::physical_pixel_lane(first_logical_lane, usize::from(bytes_per_pixel))
+                .expect("validated pixel batch starts inside one framebuffer word");
+        notices.push(RenderNotice::FramebufferWordLayout {
+            logical_lane: first_logical_lane as u8,
+            physical_lane: first_physical_lane as u8,
+            bytes_per_pixel,
+        });
+        let mut enabled_count = 0_u16;
+        let mut enabled_mask = 0_u32;
+        for candidate in 0..candidate_count {
+            let enabled = job.stipple.is_none_or(|stipple| stipple.permits(candidate));
+            if !enabled {
+                continue;
+            }
+            enabled_count += 1;
+            enabled_mask |= 1_u32 << (31 - candidate);
             let bytes = usize::from(bytes_per_pixel);
-            let lane = first_lane + pixel * bytes;
+            let logical_lane = first_logical_lane + usize::from(candidate) * bytes;
+            let lane = framebuffer::physical_pixel_lane(logical_lane, bytes)
+                .expect("validated pixel batch remains inside one framebuffer word");
             data[lane..lane + bytes].copy_from_slice(&pixel_bytes[..bytes]);
             byte_enable[lane..lane + bytes].fill(true);
         }
+        let batch = PixelCandidateBatch {
+            x: position.x,
+            y: position.y,
+            candidate_count,
+            enabled_count,
+            stipple_index: job.stipple.map(PixelStippleCursor::index),
+        };
+        notices.push(RenderNotice::RasterBatch {
+            x: position.x,
+            y: position.y,
+            candidates: candidate_count,
+            enabled: enabled_count,
+        });
+        if let Some(stipple) = job.stipple {
+            notices.push(RenderNotice::StippleMask {
+                pattern: job.command.stipple_pattern,
+                index: stipple.index(),
+                candidates: candidate_count,
+                enabled_mask,
+            });
+        }
+        if enabled_count == 0 {
+            job.advance_candidates(candidate_count);
+            return None;
+        }
+        job.pending_batch = Some(batch);
         let physical_address = super::normalize_render_memory_alias(word_alias);
         let valid = entry.valid();
-        (
-            RenderMemoryRequest {
-                virtual_address: u32::from(y) << 16 | u32::from(x),
-                raw_entry: u32::from(entry.raw()),
-                valid,
-                alias_address: word_alias,
-                physical_address,
-                bank_select: if valid {
-                    CrimeMemoryBankSelect::Decode
-                } else {
-                    CrimeMemoryBankSelect::Inhibited {
-                        reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
-                    }
-                },
-                no_ecc: false,
-                destination: RenderMemoryDestination::Pixel,
-                transfer: CrimeTransfer::write(data.into(), byte_enable.into()),
+        Some(RenderMemoryRequest {
+            virtual_address: u32::from(position.y) << 16 | u32::from(position.x),
+            raw_entry: u32::from(entry.raw()),
+            valid,
+            alias_address: word_alias,
+            physical_address,
+            bank_select: if valid {
+                CrimeMemoryBankSelect::Decode
+            } else {
+                CrimeMemoryBankSelect::Inhibited {
+                    reason: CrimeMemoryInhibitReason::InvalidRenderTlb,
+                }
             },
-            pixel_count,
-        )
+            no_ecc: false,
+            destination: RenderMemoryDestination::Pixel,
+            transfer: CrimeTransfer::write(data.into(), byte_enable.into()),
+        })
     }
-
     fn snapshot_zero_clear_job(&self) -> Result<MteJob, CrimeRenderError> {
         let mode = self.mte.mode;
         let depth = ((mode >> 8) & 3) as u8;
@@ -1491,7 +1608,6 @@ impl CrimeRender {
                 foreground: self.mte.foreground,
             });
         }
-
         let start = self.mte.destination_start;
         let end = self.mte.destination_end;
         let no_ecc = mode & 1 == 0;
@@ -1555,7 +1671,6 @@ impl CrimeRender {
             no_ecc,
         })
     }
-
     fn prepare_mte_memory_request(&self) -> Result<RenderMemoryRequest, CrimeRenderError> {
         let job = self.active_job.as_ref().expect("active MTE job exists");
         let (virtual_address, raw_entry, valid, alias_address, length) = match &job.destination {
@@ -1632,15 +1747,6 @@ impl CrimeRender {
         Ok(request)
     }
 }
-
-fn unsupported_pixel_command(command: &PixelCommandSnapshot) -> CrimeRenderError {
-    CrimeRenderError::UnsupportedPixelCommand {
-        trigger_address: command.trigger_address,
-        primitive: command.primitive(),
-        draw_mode: command.draw_mode(),
-    }
-}
-
 fn append_memory_notices(notices: &mut Vec<RenderNotice>, request: &RenderMemoryRequest) {
     notices.push(RenderNotice::TlbTranslation {
         virtual_address: request.virtual_address,
@@ -1656,33 +1762,27 @@ fn append_memory_notices(notices: &mut Vec<RenderNotice>, request: &RenderMemory
         length: request.transfer.length() as u16,
     });
 }
-
 impl Default for CrimeRender {
     fn default() -> Self {
         Self::new()
     }
 }
-
 /// Rendering Engine register-access classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum RenderAccessError {
     /// The address is defined, but the width or alignment is invalid.
     Access,
-
     /// The address is reserved, unmapped, or not readable in this direction.
     Unsupported,
 }
-
 /// Rendering Engine host-write failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum RenderWriteError {
     /// The register access was rejected before entering the host interface.
     Access(RenderAccessError),
-
     /// The 64-entry host interface buffer or its programmed stall is blocking writes.
     InterfaceFull,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RegisterAccess {
     readable: bool,
@@ -1692,16 +1792,13 @@ struct RegisterAccess {
     read_widths: u8,
     write_widths: u8,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RegisterDirection {
     Read,
     Write,
 }
-
 const WIDTH_32: u8 = 1;
 const WIDTH_64: u8 = 2;
-
 const DIRECT_READ_WRITE_64: RegisterAccess = RegisterAccess {
     readable: true,
     writable: true,
@@ -1790,7 +1887,6 @@ const BUFFERED_WRITE_ONLY_32_OR_64_START: RegisterAccess = RegisterAccess {
     read_widths: 0,
     write_widths: WIDTH_32 | WIDTH_64,
 };
-
 const fn canonical_write_address(address: u64) -> (u64, bool) {
     if (address >= PIXEL_PIPE_BASE + START_OFFSET && address < PIXEL_PIPE_BASE + 0x1000)
         || (address >= MTE_BASE + START_OFFSET && address < MTE_BASE + 0x1000)
@@ -1800,7 +1896,6 @@ const fn canonical_write_address(address: u64) -> (u64, bool) {
         (address, false)
     }
 }
-
 fn register_access(
     address: u64,
     size: u8,
@@ -1824,7 +1919,6 @@ fn register_access(
     }
     Ok(access)
 }
-
 fn register_descriptor(address: u64) -> Option<RegisterAccess> {
     if ((INTERFACE_DATA_BASE..INTERFACE_DATA_BASE + 0x200).contains(&address)
         || (INTERFACE_ADDRESS_BASE..INTERFACE_ADDRESS_BASE + 0x200).contains(&address))
@@ -1874,7 +1968,6 @@ fn register_descriptor(address: u64) -> Option<RegisterAccess> {
     }
     None
 }
-
 fn tlb_slot(address: u64) -> Option<TlbSlot> {
     if address & 7 != 0 {
         return None;
@@ -1910,7 +2003,6 @@ fn tlb_slot(address: u64) -> Option<TlbSlot> {
     }
     None
 }
-
 fn encode_interface_entry(write: RenderRegisterWrite) -> (u64, u64) {
     let relative = write.address - registers::CRIME_RENDER_BASE;
     let slot_address = relative & !7;
@@ -1928,7 +2020,6 @@ fn encode_interface_entry(write: RenderRegisterWrite) -> (u64, u64) {
         | (offset << ADDRESS_OFFSET_SHIFT);
     (data, encoded_address)
 }
-
 fn decode_interface_entry(data: u64, address: u64) -> RenderRegisterWrite {
     let page = (address >> ADDRESS_PAGE_SHIFT) & 7;
     let offset = (address >> ADDRESS_OFFSET_SHIFT) & 0xff;
@@ -1947,7 +2038,6 @@ fn decode_interface_entry(data: u64, address: u64) -> RenderRegisterWrite {
         commit: address & ADDRESS_START != 0,
     }
 }
-
 fn read_register_slot(slots: &[u64; 64], offset: u64, size: u8) -> u64 {
     let value = slots[(offset / 8) as usize];
     match (size, offset & 4) {
@@ -1957,7 +2047,6 @@ fn read_register_slot(slots: &[u64; 64], offset: u64, size: u8) -> u64 {
         _ => unreachable!("register widths are validated before slot access"),
     }
 }
-
 fn write_register_slot(slots: &mut [u64; 64], offset: u64, size: u8, value: u64) {
     let slot = &mut slots[(offset / 8) as usize];
     match (size, offset & 4) {
@@ -1967,7 +2056,6 @@ fn write_register_slot(slots: &mut [u64; 64], offset: u64, size: u8, value: u64)
         _ => unreachable!("register widths are validated before slot access"),
     }
 }
-
 fn append_condition_effects(
     effects: &mut Vec<RenderInterruptEffect>,
     previous: bool,
@@ -1989,7 +2077,6 @@ fn append_condition_effects(
         });
     }
 }
-
 /// Applies one CRIME bitwise logic operation.
 pub const fn logic_operation(operation: u8, source: u32, destination: u32) -> u32 {
     match operation & 0xf {
@@ -2011,7 +2098,6 @@ pub const fn logic_operation(operation: u8, source: u32, destination: u32) -> u3
         _ => u32::MAX,
     }
 }
-
 /// Evaluates one eight-function comparison used by alpha, depth, and stencil tests.
 pub const fn compare(function: u8, source: u32, reference: u32) -> bool {
     match function & 7 {
@@ -2025,6 +2111,5 @@ pub const fn compare(function: u8, source: u32, reference: u32) -> bool {
         _ => true,
     }
 }
-
 #[cfg(test)]
 mod tests;

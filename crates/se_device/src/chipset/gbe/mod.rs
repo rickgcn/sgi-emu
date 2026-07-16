@@ -2,7 +2,7 @@
 
 pub mod protocol;
 
-mod display;
+pub(crate) mod display;
 mod registers;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

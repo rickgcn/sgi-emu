@@ -1,5 +1,14 @@
 use super::*;
-use crate::chipset::crime::protocol::CrimeTransferView;
+use se_core::component::ComponentId;
+use se_core::role::BusDeviceRole;
+use se_core::scheduler::SimTime;
+
+use crate::chipset::crime::config::CrimeMemoryConfig;
+use crate::chipset::crime::memory::CrimeSdram;
+use crate::chipset::crime::protocol::{
+    CrimeMemoryClient, CrimeMemoryTransaction, CrimeTransactionId, CrimeTransfer, CrimeTransferView,
+};
+use crate::chipset::gbe::display::{PlaneDepth, decode_raw_pixels};
 
 const PROM_CLEAR_MODE: u32 = 0x0000_0011;
 const PIXEL_PIPE_FLUSH: u64 = PIXEL_PIPE_BASE + 0x1f8;
@@ -34,15 +43,10 @@ fn configure_zero_clear_destination(render: &mut CrimeRender, start: u32, end: u
 }
 
 fn configure_x_line(render: &mut CrimeRender, color: u32, x0: u16, y0: u16, x1: u16, y1: u16) {
-    queue_and_retire(render, PIXEL_PIPE_BASE, 4, RGBA32_FRAMEBUFFER_B_MODE.into());
-    queue_and_retire(
-        render,
-        PIXEL_PIPE_BASE + 0x008,
-        4,
-        RGBA32_FRAMEBUFFER_B_MODE.into(),
-    );
-    queue_and_retire(render, PIXEL_PIPE_BASE + 0x018, 4, X_LINE_DRAW_MODE.into());
-    queue_and_retire(render, PIXEL_PIPE_BASE + 0x060, 4, X_LINE_PRIMITIVE.into());
+    queue_and_retire(render, PIXEL_PIPE_BASE, 4, 0x0000_0628_u32.into());
+    queue_and_retire(render, PIXEL_PIPE_BASE + 0x008, 4, 0x0000_0628_u32.into());
+    queue_and_retire(render, PIXEL_PIPE_BASE + 0x018, 4, 0x0000_02f8_u32.into());
+    queue_and_retire(render, PIXEL_PIPE_BASE + 0x060, 4, 0x0100_0020_u32.into());
     queue_and_retire(render, PIXEL_PIPE_BASE + 0x0d0, 4, color.into());
     queue_and_retire(render, PIXEL_PIPE_BASE + 0x1b0, 4, LOGIC_COPY.into());
     queue_and_retire(render, PIXEL_PIPE_BASE + 0x1b8, 4, u32::MAX.into());
@@ -62,12 +66,7 @@ fn configure_x_line(render: &mut CrimeRender, color: u32, x0: u16, y0: u16, x1: 
 
 fn configure_prom_ci8_zero_rectangle(render: &mut CrimeRender, x1: u16, y1: u16) {
     queue_and_retire(render, PIXEL_PIPE_BASE + 0x0d0, 4, 0);
-    queue_and_retire(
-        render,
-        PIXEL_PIPE_BASE + 0x018,
-        4,
-        PROM_CI8_ZERO_RECTANGLE_DRAW_MODE.into(),
-    );
+    queue_and_retire(render, PIXEL_PIPE_BASE + 0x018, 4, 0x0000_00f8_u32.into());
     queue_and_retire(render, PIXEL_PIPE_BASE + 0x1b8, 4, u32::MAX.into());
     queue_and_retire(render, PIXEL_PIPE_BASE + 0x070, 4, 0);
     queue_and_retire(
@@ -76,12 +75,90 @@ fn configure_prom_ci8_zero_rectangle(render: &mut CrimeRender, x1: u16, y1: u16)
         4,
         (u32::from(x1) << 16 | u32::from(y1)).into(),
     );
-    queue_and_retire(
-        render,
-        PIXEL_PIPE_BASE + 0x060,
-        4,
-        PROM_CI8_RECTANGLE_PRIMITIVE.into(),
-    );
+    queue_and_retire(render, PIXEL_PIPE_BASE + 0x060, 4, 0x0302_0000_u32.into());
+}
+
+#[derive(Clone, Copy)]
+struct StippledLineConfig {
+    buffer_mode: u32,
+    color: u32,
+    x0: u16,
+    y: u16,
+    x1: u16,
+    stipple_mode: u32,
+    pattern: u32,
+}
+
+fn configure_stippled_line(render: &mut CrimeRender, config: StippledLineConfig) {
+    for (offset, value) in [
+        (0x000, config.buffer_mode),
+        (0x008, config.buffer_mode),
+        (0x018, 0x0008_02f8),
+        (0x060, 0x0100_0020),
+        (0x0c0, config.stipple_mode),
+        (0x0c4, config.pattern),
+        (0x0d0, config.color),
+        (0x1b0, LOGIC_COPY),
+        (0x1b8, u32::MAX),
+        (0x070, u32::from(config.x0) << 16 | u32::from(config.y)),
+        (0x074, u32::from(config.x1) << 16 | u32::from(config.y)),
+    ] {
+        queue_and_retire(render, PIXEL_PIPE_BASE + offset, 4, value.into());
+    }
+}
+
+fn collect_pixel_writes(render: &mut CrimeRender) -> Vec<(u64, Vec<u8>, Vec<bool>)> {
+    let mut writes = Vec::new();
+    loop {
+        let progress = retire(render);
+        if let Some(request) = progress.memory_request {
+            let alias_address = request.alias_address;
+            let CrimeTransferView::Write { data, byte_enable } = request.transfer.view() else {
+                panic!("PixelPipe emitted a read request")
+            };
+            writes.push((alias_address, data.to_vec(), byte_enable.iter().collect()));
+            render.complete_memory(write_completion()).unwrap();
+        }
+        if render.active_pixel_command.is_none() {
+            break;
+        }
+    }
+    writes
+}
+
+fn complete_through_sdram(
+    render: &mut CrimeRender,
+    sdram: &mut CrimeSdram,
+    request: RenderMemoryRequest,
+) {
+    let completion = sdram.accept(CrimeMemoryTransaction {
+        id: CrimeTransactionId::new(1),
+        time: SimTime::ZERO,
+        controller: ComponentId::new(1),
+        client: CrimeMemoryClient::Render,
+        address: request.physical_address,
+        bank_select: request.bank_select,
+        no_ecc: request.no_ecc,
+        transfer: request.transfer,
+    });
+    render.complete_memory(completion.result).unwrap();
+}
+
+fn read_gbe_word(sdram: &mut CrimeSdram, address: u64) -> Vec<u8> {
+    let completion = sdram.accept(CrimeMemoryTransaction {
+        id: CrimeTransactionId::new(2),
+        time: SimTime::ZERO,
+        controller: ComponentId::new(1),
+        client: CrimeMemoryClient::Gbe,
+        address,
+        bank_select: CrimeMemoryBankSelect::Decode,
+        no_ecc: false,
+        transfer: CrimeTransfer::read(RENDER_MEMORY_WORD_BYTES as u16),
+    });
+    let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap().payload else {
+        panic!("GBE memory read returned the wrong payload")
+    };
+    data.to_vec()
 }
 
 #[test]
@@ -285,17 +362,20 @@ fn tagged_mte_write_is_canonicalized_and_tagged_reads_are_rejected() {
 fn pixel_start_aliases_submit_the_frozen_primitive_state() {
     let mut render = CrimeRender::new();
     render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
-    assert_eq!(
-        render.step(),
-        Err(CrimeRenderError::UnsupportedPixelCommand {
+    let error = render.step().unwrap_err();
+    assert!(matches!(
+        error,
+        CrimeRenderError::UnsupportedPixelCommand {
             trigger_address: PIXEL_PIPE_NULL,
             primitive: 0,
             draw_mode: 0,
-        })
-    );
+            ref blockers,
+            ..
+        } if !blockers.is_empty()
+    ));
     assert!(matches!(
         render.active_pixel_command,
-        Some(PixelExecution::Unsupported(_))
+        Some(PixelExecution::Blocked(_))
     ));
 
     let mut flush = CrimeRender::new();
@@ -335,21 +415,59 @@ fn unsupported_pixel_start_preserves_an_immutable_command_snapshot() {
 
     retire(&mut render);
     let error = render.step().unwrap_err();
-    assert_eq!(
-        error,
+    assert!(matches!(
+        &error,
         CrimeRenderError::UnsupportedPixelCommand {
-            trigger_address: PIXEL_PIPE_BASE + 0x060,
-            primitive,
-            draw_mode: initial_draw_mode,
-        }
-    );
-    let Some(PixelExecution::Unsupported(snapshot)) = render.active_pixel_command.as_ref() else {
+            trigger_address,
+            primitive: captured_primitive,
+            draw_mode,
+            blockers,
+            ..
+        } if *trigger_address == PIXEL_PIPE_BASE + 0x060
+            && *captured_primitive == primitive
+            && *draw_mode == initial_draw_mode
+            && !blockers.is_empty()
+    ));
+    let Some(PixelExecution::Blocked(blocked)) = render.active_pixel_command.as_ref() else {
         panic!("unsupported command snapshot was not retained")
     };
-    assert_eq!(snapshot.primitive(), primitive);
-    assert_eq!(snapshot.draw_mode(), initial_draw_mode);
+    assert_eq!(blocked.command.snapshot.primitive(), primitive);
+    assert_eq!(blocked.command.snapshot.draw_mode(), initial_draw_mode);
+    assert_eq!(blocked.error, error);
     assert_eq!(render.interface_level(), 1);
     assert_eq!(render.status() & STATUS_PIXEL_PIPE_IDLE, 0);
+    assert_eq!(render.step(), Err(error));
+}
+
+#[test]
+fn invalid_pixel_start_reports_every_violation_before_capabilities() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE, 4, u32::MAX.into());
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x008, 4, u32::MAX.into());
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x018, 4, u32::MAX.into());
+    render
+        .write(PIXEL_PIPE_BASE + 0x060 + START_OFFSET, 4, 0x05f8_0000)
+        .unwrap();
+
+    let error = render.step().unwrap_err();
+    let CrimeRenderError::InvalidPixelCommand {
+        primitive,
+        draw_mode,
+        violations,
+        ..
+    } = &error
+    else {
+        panic!("invalid command was not distinguished from unsupported behavior")
+    };
+    assert_eq!(*primitive, 0x05f8_0000);
+    assert_eq!(*draw_mode, u32::MAX);
+    assert!(violations.len() >= 8);
+    assert!(
+        violations
+            .windows(2)
+            .all(|pair| pair[0].kind <= pair[1].kind)
+    );
+    assert_eq!(render.step(), Err(error));
 }
 
 #[test]
@@ -369,7 +487,7 @@ fn diagnostic_x_line_stream_writes_big_endian_rgba_through_framebuffer_b() {
         progress
             .notices
             .contains(&RenderNotice::PixelCommandCommitted {
-                primitive: X_LINE_PRIMITIVE,
+                primitive: 0x0100_0020,
                 x0: 0,
                 y0: 0,
                 x1: 7,
@@ -396,7 +514,7 @@ fn diagnostic_x_line_stream_writes_big_endian_rgba_through_framebuffer_b() {
         completed
             .notices
             .contains(&RenderNotice::PixelCommandCompleted {
-                primitive: X_LINE_PRIMITIVE,
+                primitive: 0x0100_0020,
                 x0: 0,
                 y0: 0,
                 x1: 7,
@@ -405,6 +523,76 @@ fn diagnostic_x_line_stream_writes_big_endian_rgba_through_framebuffer_b() {
     );
     assert!(render.active_pixel_command.is_none());
     assert_ne!(render.status() & STATUS_PIXEL_PIPE_IDLE, 0);
+}
+
+#[test]
+fn ci8_stipple_round_trips_from_crime_through_sdram_to_gbe() {
+    let mut render = CrimeRender::new();
+    let mut sdram = CrimeSdram::new(ComponentId::new(2), "SDRAM", CrimeMemoryConfig::default());
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 1) << 48,
+    );
+    configure_stippled_line(
+        &mut render,
+        StippledLineConfig {
+            buffer_mode: 0,
+            color: 0x5a,
+            x0: 0,
+            y: 0,
+            x1: 31,
+            stipple_mode: 0x001f_0000,
+            pattern: 0x8000_0001,
+        },
+    );
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let request = retire(&mut render).memory_request.unwrap();
+    let address = request.physical_address;
+    complete_through_sdram(&mut render, &mut sdram, request);
+    retire(&mut render);
+    let pixels = decode_raw_pixels(&read_gbe_word(&mut sdram, address), PlaneDepth::Eight);
+
+    let mut expected = vec![0_u32; 32];
+    expected[0] = 0x5a;
+    expected[31] = 0x5a;
+    assert_eq!(pixels, expected);
+}
+
+#[test]
+fn rgba32_pixels_round_trip_from_crime_through_sdram_to_gbe() {
+    let mut render = CrimeRender::new();
+    let mut sdram = CrimeSdram::new(ComponentId::new(2), "SDRAM", CrimeMemoryConfig::default());
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_B_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 1) << 48,
+    );
+    let colors = [
+        0x1020_3040,
+        0x1121_3141,
+        0x1222_3242,
+        0x1323_3343,
+        0x1424_3444,
+        0x1525_3545,
+        0x1626_3646,
+        0x1727_3747,
+    ];
+    let address = FRAMEBUFFER_TILE_BYTES;
+    for (x, color) in colors.into_iter().enumerate() {
+        configure_x_line(&mut render, color, x as u16, 0, x as u16, 0);
+        render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+        let request = retire(&mut render).memory_request.unwrap();
+        assert_eq!(request.physical_address, address);
+        complete_through_sdram(&mut render, &mut sdram, request);
+        retire(&mut render);
+    }
+
+    let pixels = decode_raw_pixels(&read_gbe_word(&mut sdram, address), PlaneDepth::ThirtyTwo);
+    assert_eq!(pixels, colors);
 }
 
 #[test]
@@ -424,9 +612,9 @@ fn vertical_x_line_uses_one_enabled_pixel_per_memory_word() {
     let CrimeTransferView::Write { data, byte_enable } = first.transfer.view() else {
         panic!("vertical X line emitted a read request")
     };
-    assert_eq!(&data[4..8], &[0xaa, 0xbb, 0xcc, 0xdd]);
+    assert_eq!(&data[24..28], &[0xaa, 0xbb, 0xcc, 0xdd]);
     assert_eq!(byte_enable.iter().filter(|enabled| *enabled).count(), 4);
-    assert!((4..8).all(|lane| byte_enable.is_enabled(lane) == Some(true)));
+    assert!((24..28).all(|lane| byte_enable.is_enabled(lane) == Some(true)));
 
     render.complete_memory(write_completion()).unwrap();
     let second = retire(&mut render).memory_request.unwrap();
@@ -438,6 +626,234 @@ fn vertical_x_line_uses_one_enabled_pixel_per_memory_word() {
     render.complete_memory(write_completion()).unwrap();
     retire(&mut render);
     assert!(render.active_pixel_command.is_none());
+}
+
+#[test]
+fn prom_short_stipple_patterns_generate_exact_ci8_byte_enables() {
+    for (width, pattern, expected_positions) in [
+        (1_u16, 0x0000_8000_u32, vec![0_usize]),
+        (8, 0x0000_a500, vec![0, 2, 5, 7]),
+        (16, 0x0000_8001, vec![0, 15]),
+    ] {
+        let mut render = CrimeRender::new();
+        queue_and_retire(
+            &mut render,
+            FRAMEBUFFER_A_BASE,
+            8,
+            u64::from(FRAMEBUFFER_TLB_VALID | 1) << 48,
+        );
+        configure_stippled_line(
+            &mut render,
+            StippledLineConfig {
+                buffer_mode: 0,
+                color: 0xa5,
+                x0: 0,
+                y: 0,
+                x1: width - 1,
+                stipple_mode: 0x101f_0000,
+                pattern,
+            },
+        );
+        render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+        let writes = collect_pixel_writes(&mut render);
+        assert_eq!(writes.len(), 1, "width {width}");
+        let (_, data, byte_enable) = &writes[0];
+        let mut expected_enable = [false; RENDER_MEMORY_WORD_BYTES];
+        let mut expected_data = [0; RENDER_MEMORY_WORD_BYTES];
+        for candidate in 0..usize::from(width) {
+            let expected = expected_positions.contains(&candidate);
+            let lane = framebuffer::physical_pixel_lane(candidate, 1).unwrap();
+            expected_enable[lane] = expected;
+            expected_data[lane] = if expected { 0xa5 } else { 0 };
+        }
+        assert_eq!(byte_enable.as_slice(), expected_enable, "width {width}");
+        assert_eq!(data.as_slice(), expected_data, "width {width}");
+    }
+}
+
+#[test]
+fn prom_long_stipple_patterns_generate_exact_ci8_byte_enables() {
+    for (width, pattern, expected_positions) in [
+        (17_u16, 0x8001_0000_u32, vec![0_usize, 15]),
+        (31, 0x8000_0002, vec![0, 30]),
+        (32, 0x8000_0001, vec![0, 31]),
+    ] {
+        let mut render = CrimeRender::new();
+        queue_and_retire(
+            &mut render,
+            FRAMEBUFFER_A_BASE,
+            8,
+            u64::from(FRAMEBUFFER_TLB_VALID | 2) << 48,
+        );
+        configure_stippled_line(
+            &mut render,
+            StippledLineConfig {
+                buffer_mode: 0,
+                color: 0x5a,
+                x0: 0,
+                y: 0,
+                x1: width - 1,
+                stipple_mode: 0x001f_0000,
+                pattern,
+            },
+        );
+        render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+        let writes = collect_pixel_writes(&mut render);
+        assert_eq!(writes.len(), 1, "width {width}");
+        let (_, data, byte_enable) = &writes[0];
+        let mut expected_enable = [false; RENDER_MEMORY_WORD_BYTES];
+        let mut expected_data = [0; RENDER_MEMORY_WORD_BYTES];
+        for candidate in 0..usize::from(width) {
+            let expected = expected_positions.contains(&candidate);
+            let lane = framebuffer::physical_pixel_lane(candidate, 1).unwrap();
+            expected_enable[lane] = expected;
+            expected_data[lane] = if expected { 0x5a } else { 0 };
+        }
+        assert_eq!(byte_enable.as_slice(), expected_enable, "width {width}");
+        assert_eq!(data.as_slice(), expected_data, "width {width}");
+    }
+}
+
+#[test]
+fn all_zero_stipple_advances_without_issuing_memory() {
+    let mut render = CrimeRender::new();
+    configure_stippled_line(
+        &mut render,
+        StippledLineConfig {
+            buffer_mode: 0,
+            color: 0xff,
+            x0: 0,
+            y: 0,
+            x1: 15,
+            stipple_mode: 0x101f_0000,
+            pattern: 0,
+        },
+    );
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let committed = retire(&mut render);
+    assert!(committed.memory_request.is_none());
+    assert!(committed.notices.contains(&RenderNotice::RasterBatch {
+        x: 0,
+        y: 0,
+        candidates: 16,
+        enabled: 0,
+    }));
+    let completed = retire(&mut render);
+    assert!(completed.memory_request.is_none());
+    assert!(render.active_pixel_command.is_none());
+}
+
+#[test]
+fn full_stipple_preserves_big_endian_rgba32_packing() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_C_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 3) << 48,
+    );
+    configure_stippled_line(
+        &mut render,
+        StippledLineConfig {
+            buffer_mode: 0x0000_0a28,
+            color: 0x1122_3344,
+            x0: 0,
+            y: 0,
+            x1: 7,
+            stipple_mode: 0x101f_0000,
+            pattern: 0x0000_ffff,
+        },
+    );
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let writes = collect_pixel_writes(&mut render);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].1, [0x11, 0x22, 0x33, 0x44].repeat(8));
+    assert!(writes[0].2.iter().all(|enabled| *enabled));
+}
+
+#[test]
+fn stippled_line_switches_tlb_entries_without_losing_pattern_phase() {
+    let mut render = CrimeRender::new();
+    let first_entry = FRAMEBUFFER_TLB_VALID | 4;
+    let second_entry = FRAMEBUFFER_TLB_VALID | 5;
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(first_entry) << 48 | u64::from(second_entry) << 32,
+    );
+    configure_stippled_line(
+        &mut render,
+        StippledLineConfig {
+            buffer_mode: 0,
+            color: 0x7e,
+            x0: 508,
+            y: 0,
+            x1: 523,
+            stipple_mode: 0x101f_0000,
+            pattern: 0x0000_a5a5,
+        },
+    );
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let writes = collect_pixel_writes(&mut render);
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].0, 4 * FRAMEBUFFER_TILE_BYTES + 480);
+    assert_eq!(writes[1].0, 5 * FRAMEBUFFER_TILE_BYTES);
+    let enabled = writes
+        .iter()
+        .flat_map(|(_, _, mask)| mask.iter().copied())
+        .filter(|enabled| *enabled)
+        .count();
+    assert_eq!(enabled, 8);
+}
+
+#[test]
+fn in_flight_stipple_batch_round_trips_before_cursor_commit() {
+    let mut reference = CrimeRender::new();
+    queue_and_retire(
+        &mut reference,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 6) << 48,
+    );
+    configure_stippled_line(
+        &mut reference,
+        StippledLineConfig {
+            buffer_mode: 0,
+            color: 0x3c,
+            x0: 0,
+            y: 0,
+            x1: 31,
+            stipple_mode: 0x001f_0000,
+            pattern: 0x8000_0001,
+        },
+    );
+    reference
+        .write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0)
+        .unwrap();
+    let request = retire(&mut reference).memory_request.unwrap();
+    assert_eq!(request.transfer.length(), RENDER_MEMORY_WORD_BYTES);
+    let Some(PixelExecution::Running(job)) = reference.active_pixel_command.as_ref() else {
+        panic!("stippled line was not running")
+    };
+    assert_eq!(job.stipple.map(PixelStippleCursor::index), Some(0));
+    assert_eq!(job.pending_batch.unwrap().candidate_count, 32);
+
+    let encoded = postcard::to_stdvec(&reference).unwrap();
+    let mut restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+    assert_eq!(restored, reference);
+    assert_eq!(
+        restored.complete_memory(write_completion()),
+        reference.complete_memory(write_completion())
+    );
+    assert_eq!(restored, reference);
+    assert_eq!(retire(&mut restored), retire(&mut reference));
+    assert_eq!(restored, reference);
 }
 
 #[test]
@@ -486,7 +902,7 @@ fn prom_ci8_zero_rectangle_walks_inclusive_rows_through_framebuffer_a() {
         committed
             .notices
             .contains(&RenderNotice::PixelCommandCommitted {
-                primitive: PROM_CI8_RECTANGLE_PRIMITIVE,
+                primitive: 0x0302_0000,
                 x0: 0,
                 y0: 0,
                 x1: 63,
@@ -533,7 +949,7 @@ fn prom_ci8_zero_rectangle_walks_inclusive_rows_through_framebuffer_a() {
         completed
             .notices
             .contains(&RenderNotice::PixelCommandCompleted {
-                primitive: PROM_CI8_RECTANGLE_PRIMITIVE,
+                primitive: 0x0302_0000,
                 x0: 0,
                 y0: 0,
                 x1: 63,
@@ -578,12 +994,12 @@ fn prom_ci8_flat_rectangle_uses_the_low_foreground_byte() {
     );
     for (offset, value) in [
         (0x0d0, 0x1234_56a5),
-        (0x018, PROM_CI8_FLAT_RECTANGLE_DRAW_MODE),
+        (0x018, 0x0000_02f8),
         (0x1b0, LOGIC_COPY),
         (0x1b8, u32::MAX),
         (0x070, 3 << 16 | 2),
         (0x074, 35 << 16 | 2),
-        (0x060, PROM_CI8_RECTANGLE_PRIMITIVE),
+        (0x060, 0x0302_0000),
     ] {
         queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value.into());
     }
@@ -598,10 +1014,12 @@ fn prom_ci8_flat_rectangle_uses_the_low_foreground_byte() {
     let CrimeTransferView::Write { data, byte_enable } = first.transfer.view() else {
         panic!("PROM flat rectangle emitted a read request")
     };
-    assert!(data[..3].iter().all(|value| *value == 0));
-    assert!(data[3..].iter().all(|value| *value == 0xa5));
-    assert!(byte_enable.iter().take(3).all(|enabled| !enabled));
-    assert!(byte_enable.iter().skip(3).all(|enabled| enabled));
+    assert!(data[..28].iter().all(|value| *value == 0xa5));
+    assert!(data[28..31].iter().all(|value| *value == 0));
+    assert_eq!(data[31], 0xa5);
+    assert!(byte_enable.iter().take(28).all(|enabled| enabled));
+    assert!(byte_enable.iter().skip(28).take(3).all(|enabled| !enabled));
+    assert_eq!(byte_enable.is_enabled(31), Some(true));
 
     render.complete_memory(write_completion()).unwrap();
     let second = retire(&mut render).memory_request.unwrap();
@@ -609,10 +1027,52 @@ fn prom_ci8_flat_rectangle_uses_the_low_foreground_byte() {
     let CrimeTransferView::Write { data, byte_enable } = second.transfer.view() else {
         panic!("PROM flat rectangle emitted a read request")
     };
-    assert!(data[..4].iter().all(|value| *value == 0xa5));
-    assert!(data[4..].iter().all(|value| *value == 0));
-    assert!(byte_enable.iter().take(4).all(|enabled| enabled));
-    assert!(byte_enable.iter().skip(4).all(|enabled| !enabled));
+    assert!(data[..28].iter().all(|value| *value == 0));
+    assert!(data[28..].iter().all(|value| *value == 0xa5));
+    assert!(byte_enable.iter().take(28).all(|enabled| !enabled));
+    assert!(byte_enable.iter().skip(28).all(|enabled| enabled));
+}
+
+#[test]
+fn prom_ci8_flat_rectangle_supports_evidence_backed_descending_rows() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 3) << 48,
+    );
+    for (offset, value) in [
+        (0x0d0, 0xa5),
+        (0x018, 0x0000_02f8),
+        (0x1b0, LOGIC_COPY),
+        (0x1b8, u32::MAX),
+        (0x070, 3 << 16 | 2),
+        (0x074, 5 << 16 | 1),
+        (0x060, 0x0300_0000),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value.into());
+    }
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let first = retire(&mut render).memory_request.unwrap();
+    assert_eq!(first.virtual_address, 2 << 16 | 3);
+    render.complete_memory(write_completion()).unwrap();
+    let second = retire(&mut render).memory_request.unwrap();
+    assert_eq!(second.virtual_address, 1 << 16 | 3);
+    render.complete_memory(write_completion()).unwrap();
+    let completed = retire(&mut render);
+    assert!(
+        completed
+            .notices
+            .contains(&RenderNotice::PixelCommandCompleted {
+                primitive: 0x0300_0000,
+                x0: 3,
+                y0: 2,
+                x1: 5,
+                y1: 1,
+            })
+    );
 }
 
 #[test]
@@ -623,14 +1083,16 @@ fn prom_zero_rectangle_rejects_nonzero_foreground() {
     render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
 
     let error = render.step().unwrap_err();
-    assert_eq!(
+    assert!(matches!(
         error,
         CrimeRenderError::UnsupportedPixelCommand {
             trigger_address: PIXEL_PIPE_NULL,
-            primitive: PROM_CI8_RECTANGLE_PRIMITIVE,
-            draw_mode: PROM_CI8_ZERO_RECTANGLE_DRAW_MODE,
-        }
-    );
+            primitive: 0x0302_0000,
+            draw_mode: 0x0000_00f8,
+            ref blockers,
+            ..
+        } if blockers.iter().any(|blocker| blocker.capability == PixelCapability::ZeroRectangleColor)
+    ));
 }
 
 #[test]

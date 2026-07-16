@@ -1112,6 +1112,38 @@ impl Crime {
                 ]
                 .into(),
             ),
+            RenderNotice::PixelCommandDecoded {
+                primitive,
+                draw_mode,
+                feature_bits,
+                violation_count,
+                blocker_count,
+            } => (
+                "pixel_command_decoded",
+                [
+                    OwnedTraceField {
+                        key: "primitive".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(primitive)),
+                    },
+                    OwnedTraceField {
+                        key: "draw_mode".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(draw_mode)),
+                    },
+                    OwnedTraceField {
+                        key: "feature_bits".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(feature_bits)),
+                    },
+                    OwnedTraceField {
+                        key: "violation_count".into(),
+                        value: OwnedTraceValue::U64(u64::from(violation_count)),
+                    },
+                    OwnedTraceField {
+                        key: "blocker_count".into(),
+                        value: OwnedTraceValue::U64(u64::from(blocker_count)),
+                    },
+                ]
+                .into(),
+            ),
             RenderNotice::PixelCommandCommitted {
                 primitive,
                 x0,
@@ -1140,6 +1172,82 @@ impl Crime {
                     OwnedTraceField {
                         key: "y1".into(),
                         value: OwnedTraceValue::U64(u64::from(y1)),
+                    },
+                ]
+                .into(),
+            ),
+            RenderNotice::RasterBatch {
+                x,
+                y,
+                candidates,
+                enabled,
+            } => (
+                "raster_batch",
+                [
+                    OwnedTraceField {
+                        key: "x".into(),
+                        value: OwnedTraceValue::U64(u64::from(x)),
+                    },
+                    OwnedTraceField {
+                        key: "y".into(),
+                        value: OwnedTraceValue::U64(u64::from(y)),
+                    },
+                    OwnedTraceField {
+                        key: "candidates".into(),
+                        value: OwnedTraceValue::U64(u64::from(candidates)),
+                    },
+                    OwnedTraceField {
+                        key: "enabled".into(),
+                        value: OwnedTraceValue::U64(u64::from(enabled)),
+                    },
+                ]
+                .into(),
+            ),
+            RenderNotice::FramebufferWordLayout {
+                logical_lane,
+                physical_lane,
+                bytes_per_pixel,
+            } => (
+                "framebuffer_word_layout",
+                [
+                    OwnedTraceField {
+                        key: "logical_lane".into(),
+                        value: OwnedTraceValue::U64(u64::from(logical_lane)),
+                    },
+                    OwnedTraceField {
+                        key: "physical_lane".into(),
+                        value: OwnedTraceValue::U64(u64::from(physical_lane)),
+                    },
+                    OwnedTraceField {
+                        key: "bytes_per_pixel".into(),
+                        value: OwnedTraceValue::U64(u64::from(bytes_per_pixel)),
+                    },
+                ]
+                .into(),
+            ),
+            RenderNotice::StippleMask {
+                pattern,
+                index,
+                candidates,
+                enabled_mask,
+            } => (
+                "stipple_mask",
+                [
+                    OwnedTraceField {
+                        key: "pattern".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(pattern)),
+                    },
+                    OwnedTraceField {
+                        key: "index".into(),
+                        value: OwnedTraceValue::U64(u64::from(index)),
+                    },
+                    OwnedTraceField {
+                        key: "candidates".into(),
+                        value: OwnedTraceValue::U64(u64::from(candidates)),
+                    },
+                    OwnedTraceField {
+                        key: "enabled_mask".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(enabled_mask)),
                     },
                 ]
                 .into(),
@@ -1651,10 +1759,58 @@ impl Crime {
 
     fn latch_render_error(&mut self, error: CrimeRenderError) {
         let fields: OwnedTraceFields = match &error {
+            CrimeRenderError::InvalidPixelCommand {
+                trigger_address,
+                primitive,
+                draw_mode,
+                source_buffer_mode,
+                destination_buffer_mode,
+                feature_bits,
+                violations,
+            } => [
+                OwnedTraceField {
+                    key: "kind".into(),
+                    value: OwnedTraceValue::String("invalid_pixel_command".into()),
+                },
+                OwnedTraceField {
+                    key: "trigger_address".into(),
+                    value: OwnedTraceValue::Hex64(*trigger_address),
+                },
+                OwnedTraceField {
+                    key: "primitive".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*primitive)),
+                },
+                OwnedTraceField {
+                    key: "draw_mode".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*draw_mode)),
+                },
+                OwnedTraceField {
+                    key: "source_buffer_mode".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*source_buffer_mode)),
+                },
+                OwnedTraceField {
+                    key: "destination_buffer_mode".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*destination_buffer_mode)),
+                },
+                OwnedTraceField {
+                    key: "feature_bits".into(),
+                    value: OwnedTraceValue::Hex64(u64::from(*feature_bits)),
+                },
+                OwnedTraceField {
+                    key: "violation_count".into(),
+                    value: OwnedTraceValue::U64(violations.len() as u64),
+                },
+                OwnedTraceField {
+                    key: "violations".into(),
+                    value: OwnedTraceValue::String(format!("{violations:?}").into()),
+                },
+            ]
+            .into(),
             CrimeRenderError::UnsupportedPixelCommand {
                 trigger_address,
                 primitive,
                 draw_mode,
+                ..
             } => [
                 OwnedTraceField {
                     key: "kind".into(),

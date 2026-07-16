@@ -3,7 +3,7 @@
 use super::registers::GbeRegisters;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub(super) enum PlaneDepth {
+pub(crate) enum PlaneDepth {
     Eight,
     Sixteen,
     ThirtyTwo,
@@ -43,7 +43,7 @@ pub(super) fn reorder_cgi_pixel_words(data: &[u8]) -> Vec<u8> {
     reordered
 }
 
-pub(super) fn decode_raw_pixels(data: &[u8], depth: PlaneDepth) -> Vec<u32> {
+pub(crate) fn decode_raw_pixels(data: &[u8], depth: PlaneDepth) -> Vec<u32> {
     let reordered = reorder_cgi_pixel_words(data);
     match depth {
         PlaneDepth::Eight => reordered.into_iter().map(u32::from).collect(),

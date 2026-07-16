@@ -2,6 +2,7 @@
 
 pub mod bus;
 mod ecc;
+pub(crate) mod framebuffer;
 
 use se_core::component::{Component, ComponentId};
 use se_core::role::BusDeviceRole;
