@@ -8,7 +8,6 @@ use se_device::cpu::mips4::exception::Mips4Exception;
 use se_device::cpu::mips4::execution::block::*;
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
 
-use super::fast_memory::{Mips4FastMemoryContext, Mips4NativeFastMemoryRuntime};
 use super::region::Mips4RegionSideExit;
 
 /// Stable runtime descriptor tag exposed through the native frame ABI.
@@ -159,6 +158,13 @@ const fn cp0_operation_code(operation: Mips4Cp0RuntimeOperation) -> u64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub(super) struct Mips4FastMemoryReadAbiResult {
+    value: u64,
+    retirement_limit: u64,
+}
+
 #[repr(C)]
 pub(super) struct Mips4NativeFrame {
     gpr: [u64; 32],
@@ -179,11 +185,8 @@ pub(super) struct Mips4NativeFrame {
     runtime_context: *mut (),
     runtime_call: usize,
     fast_memory_context: *mut (),
-    fast_memory_native_context: *mut Mips4FastMemoryContext,
     fast_memory_read: usize,
-    fast_memory_read_start: u64,
-    fast_memory_read_end: u64,
-    runtime_value: u64,
+    fast_memory_result: Mips4FastMemoryReadAbiResult,
     runtime_memory_big_endian: u64,
     runtime_operation_values: *const Mips4RuntimeOperation,
     runtime_operations: *const Mips4RuntimeOperationDescriptor,
@@ -211,11 +214,8 @@ impl Mips4NativeFrame {
             runtime_context: core::ptr::null_mut(),
             runtime_call: 0,
             fast_memory_context: core::ptr::null_mut(),
-            fast_memory_native_context: core::ptr::null_mut(),
             fast_memory_read: 0,
-            fast_memory_read_start: 0,
-            fast_memory_read_end: 0,
-            runtime_value: 0,
+            fast_memory_result: Mips4FastMemoryReadAbiResult::default(),
             runtime_memory_big_endian: 0,
             runtime_operation_values: core::ptr::null(),
             runtime_operations: core::ptr::null(),
@@ -259,7 +259,7 @@ impl Mips4NativeFrame {
 struct Mips4NativeRuntimeBinding<'call, 'object, R> {
     runtime: &'call mut R,
     operations: &'call [Mips4RuntimeOperation],
-    fast_memory: Option<&'call mut (dyn Mips4NativeFastMemoryRuntime + 'object)>,
+    fast_memory: Option<&'call mut (dyn Mips4FastMemoryRuntime + 'object)>,
 }
 
 pub(super) struct Mips4NativeInvocation<'call, 'object, R> {
@@ -267,9 +267,6 @@ pub(super) struct Mips4NativeInvocation<'call, 'object, R> {
     semantic_frame: &'call mut Mips4BlockFrame,
     binding: Mips4NativeRuntimeBinding<'call, 'object, R>,
     descriptors: Vec<Mips4RuntimeOperationDescriptor>,
-    native_context: *mut Mips4FastMemoryContext,
-    read_start: u64,
-    read_end: u64,
 }
 
 impl<'call, 'object, R> Mips4NativeInvocation<'call, 'object, R>
@@ -280,19 +277,9 @@ where
         semantic_frame: &'call mut Mips4BlockFrame,
         runtime: &'call mut R,
         operations: &'call [Mips4RuntimeOperation],
-        mut fast_memory: Option<&'call mut (dyn Mips4NativeFastMemoryRuntime + 'object)>,
+        fast_memory: Option<&'call mut (dyn Mips4FastMemoryRuntime + 'object)>,
     ) -> Self {
         let runtime_memory_big_endian = u64::from(runtime.runtime_memory_big_endian());
-        let (read_start, read_end, native_context) = match fast_memory.as_mut() {
-            Some(runtime) => {
-                let (read_start, read_end) = runtime.native_read_physical_range().unwrap_or((0, 0));
-                let native_context = runtime
-                    .native_context()
-                    .map_or(core::ptr::null_mut(), core::ptr::from_mut);
-                (read_start, read_end, native_context)
-            }
-            None => (0, 0, core::ptr::null_mut()),
-        };
         let descriptors = operations
             .iter()
             .copied()
@@ -309,9 +296,6 @@ where
                 fast_memory,
             },
             descriptors,
-            native_context,
-            read_start,
-            read_end,
         }
     }
 
@@ -319,12 +303,11 @@ where
         self.frame.gpr_write_through = self.frame.gpr.as_mut_ptr();
         self.frame.runtime_context = core::ptr::from_mut(&mut self.binding).cast();
         self.frame.runtime_call = mips4_runtime_trampoline::<R> as *const () as usize;
-        self.frame.fast_memory_context = core::ptr::from_mut(&mut self.binding).cast();
-        self.frame.fast_memory_native_context = self.native_context;
-        self.frame.fast_memory_read =
-            mips4_fast_memory_frame_read_trampoline::<R> as *const () as usize;
-        self.frame.fast_memory_read_start = self.read_start;
-        self.frame.fast_memory_read_end = self.read_end;
+        if self.binding.fast_memory.is_some() {
+            self.frame.fast_memory_context = core::ptr::from_mut(&mut self.binding).cast();
+            self.frame.fast_memory_read =
+                mips4_fast_memory_read_trampoline::<R> as *const () as usize;
+        }
         self.frame.runtime_operation_values = self.binding.operations.as_ptr();
         self.frame.runtime_operations = self.descriptors.as_ptr();
         self.frame.runtime_operation_count = self.binding.operations.len() as u64;
@@ -340,11 +323,11 @@ where
     }
 }
 
-fn reborrow_native_fast_memory<'call, 'object>(
-    runtime: &'call mut Option<&mut (dyn Mips4NativeFastMemoryRuntime + 'object)>,
-) -> Option<&'call mut (dyn Mips4NativeFastMemoryRuntime + 'object)> {
+fn reborrow_fast_memory<'call, 'object>(
+    runtime: &'call mut Option<&mut (dyn Mips4FastMemoryRuntime + 'object)>,
+) -> Option<&'call mut (dyn Mips4FastMemoryRuntime + 'object)> {
     runtime.as_mut().map(|runtime| {
-        let pointer: *mut (dyn Mips4NativeFastMemoryRuntime + 'object) = &mut **runtime;
+        let pointer: *mut (dyn Mips4FastMemoryRuntime + 'object) = &mut **runtime;
         // SAFETY: The returned borrow is limited to the borrow of the option.
         unsafe { &mut *pointer }
     })
@@ -354,6 +337,7 @@ extern "C" fn mips4_runtime_trampoline<R>(
     context: *mut (),
     frame: *mut Mips4NativeFrame,
     operation: u32,
+    allow_fast_memory: u32,
 ) -> u32
 where
     R: Mips4BlockRuntime,
@@ -370,35 +354,35 @@ where
             return runtime_result_code(Mips4RuntimeResult::InternalError);
         };
         let mut semantic_frame = Mips4BlockFrame::from_state(frame.export_state());
-        let result = binding.runtime.execute(
-            &mut semantic_frame,
-            operation,
-            reborrow_native_fast_memory(&mut binding.fast_memory),
-        );
+        let fast_memory = (allow_fast_memory != 0)
+            .then(|| reborrow_fast_memory(&mut binding.fast_memory))
+            .flatten();
+        let result = binding
+            .runtime
+            .execute(&mut semantic_frame, operation, fast_memory);
         frame.import_state(semantic_frame.export_state());
         runtime_result_code(result)
     }))
     .unwrap_or_else(|_| runtime_result_code(Mips4RuntimeResult::InternalError))
 }
 
-extern "C" fn mips4_fast_memory_frame_read_trampoline<R>(
+extern "C" fn mips4_fast_memory_read_trampoline<R>(
     context: *mut (),
-    frame: *mut Mips4NativeFrame,
     physical_address: u64,
+    retired_boundaries: u64,
     size: u32,
+    result: *mut Mips4FastMemoryReadAbiResult,
 ) -> u32
 where
     R: Mips4BlockRuntime,
 {
     catch_unwind(AssertUnwindSafe(|| {
-        if context.is_null() || frame.is_null() {
+        if context.is_null() || result.is_null() {
             return 3;
         }
         // SAFETY: Native invocation owns the live binding and frame for this call.
         let binding = unsafe { &mut *context.cast::<Mips4NativeRuntimeBinding<'_, '_, R>>() };
-        // SAFETY: The native entry uniquely borrows its frame during the call.
-        let frame = unsafe { &mut *frame };
-        let Some(runtime) = reborrow_native_fast_memory(&mut binding.fast_memory) else {
+        let Some(runtime) = reborrow_fast_memory(&mut binding.fast_memory) else {
             return 0;
         };
         let size = match size {
@@ -413,7 +397,7 @@ where
             size,
             Mips4ExecutionAccessKind::DataLoad,
             Mips4MemoryAccessType::Uncached,
-            frame.retired,
+            retired_boundaries,
         );
         match runtime.read(request) {
             Mips4FastMemoryReadResult::Unavailable => 0,
@@ -421,12 +405,16 @@ where
                 value,
                 retirement_limit,
             } => {
-                let remaining = retirement_limit.saturating_sub(frame.retired);
-                if remaining == 0 {
+                if retirement_limit <= retired_boundaries {
                     return 2;
                 }
-                frame.budget = frame.budget.min(remaining);
-                frame.runtime_value = value;
+                // SAFETY: The native invocation supplied a live result slot.
+                unsafe {
+                    *result = Mips4FastMemoryReadAbiResult {
+                        value,
+                        retirement_limit,
+                    };
+                }
                 1
             }
             Mips4FastMemoryReadResult::TimelineExhausted => 2,
@@ -553,16 +541,14 @@ pub(super) const MIPS4_BLOCK_FRAME_RUNTIME_CALL_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFrame, runtime_call) as i32;
 pub(super) const MIPS4_BLOCK_FRAME_FAST_MEMORY_CONTEXT_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFrame, fast_memory_context) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_FAST_MEMORY_NATIVE_CONTEXT_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, fast_memory_native_context) as i32;
 pub(super) const MIPS4_BLOCK_FRAME_FAST_MEMORY_READ_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFrame, fast_memory_read) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_FAST_MEMORY_READ_START_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, fast_memory_read_start) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_FAST_MEMORY_READ_END_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, fast_memory_read_end) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_RUNTIME_VALUE_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, runtime_value) as i32;
+pub(super) const MIPS4_BLOCK_FRAME_FAST_MEMORY_RESULT_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFrame, fast_memory_result) as i32;
+pub(super) const MIPS4_FAST_MEMORY_RESULT_VALUE_OFFSET: i32 =
+    core::mem::offset_of!(Mips4FastMemoryReadAbiResult, value) as i32;
+pub(super) const MIPS4_FAST_MEMORY_RESULT_RETIREMENT_LIMIT_OFFSET: i32 =
+    core::mem::offset_of!(Mips4FastMemoryReadAbiResult, retirement_limit) as i32;
 pub(super) const MIPS4_BLOCK_FRAME_RUNTIME_MEMORY_BIG_ENDIAN_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFrame, runtime_memory_big_endian) as i32;
 
@@ -611,9 +597,26 @@ mod tests {
         }
     }
 
-    impl Mips4NativeFastMemoryRuntime for FastMemory {
-        fn native_read_physical_range(&self) -> Option<(u64, u64)> {
-            Some((0x1000, 0x2000))
+    #[derive(Clone, Copy)]
+    enum FastMemoryFailure {
+        Unavailable,
+        TimelineExhausted,
+        InternalError,
+        Panic,
+    }
+
+    struct FailingFastMemory(FastMemoryFailure);
+
+    impl Mips4FastMemoryRuntime for FailingFastMemory {
+        fn read(&mut self, _request: Mips4FastMemoryReadRequest) -> Mips4FastMemoryReadResult {
+            match self.0 {
+                FastMemoryFailure::Unavailable => Mips4FastMemoryReadResult::Unavailable,
+                FastMemoryFailure::TimelineExhausted => {
+                    Mips4FastMemoryReadResult::TimelineExhausted
+                }
+                FastMemoryFailure::InternalError => Mips4FastMemoryReadResult::InternalError,
+                FastMemoryFailure::Panic => panic!("fast-memory test panic"),
+            }
         }
     }
 
@@ -639,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_memory_trampoline_updates_native_budget_value_and_completion_count() {
+    fn fast_memory_trampoline_returns_value_limit_and_completion_count() {
         let mut semantic = Mips4BlockFrame::new([0; 32], 0, 0, 0x1000, 0x1004, None, 10);
         let mut state = semantic.export_state();
         state.retired = 2;
@@ -651,21 +654,59 @@ mod tests {
         let frame = invocation.frame_mut_ptr();
         // SAFETY: The invocation keeps the binding and native frame live for the call.
         let outcome = unsafe {
-            mips4_fast_memory_frame_read_trampoline::<RejectRuntime>(
+            mips4_fast_memory_read_trampoline::<RejectRuntime>(
                 (*frame).fast_memory_context,
-                frame,
                 0x1000,
+                2,
                 8,
+                &mut (*frame).fast_memory_result,
             )
         };
         assert_eq!(outcome, 1);
         // SAFETY: The native frame remains uniquely owned by the invocation.
         unsafe {
-            assert_eq!((*frame).budget, 4);
-            assert_eq!((*frame).runtime_value, 0x0123_4567_89ab_cdef);
+            assert_eq!(
+                (*frame).fast_memory_result,
+                Mips4FastMemoryReadAbiResult {
+                    value: 0x0123_4567_89ab_cdef,
+                    retirement_limit: 6,
+                }
+            );
         }
         invocation.finish();
-        assert_eq!(semantic.budget(), 4);
+        assert_eq!(semantic.budget(), 10);
         assert_eq!(fast_memory.completed_transactions(), 1);
+    }
+
+    #[test]
+    fn fast_memory_trampoline_maps_failures_and_contains_panics() {
+        for (failure, expected) in [
+            (FastMemoryFailure::Unavailable, 0),
+            (FastMemoryFailure::TimelineExhausted, 2),
+            (FastMemoryFailure::InternalError, 3),
+            (FastMemoryFailure::Panic, 3),
+        ] {
+            let mut semantic = Mips4BlockFrame::new([0; 32], 0, 0, 0x1000, 0x1004, None, 1);
+            let mut runtime = RejectRuntime;
+            let mut fast_memory = FailingFastMemory(failure);
+            let mut invocation = Mips4NativeInvocation::new(
+                &mut semantic,
+                &mut runtime,
+                &[],
+                Some(&mut fast_memory),
+            );
+            let frame = invocation.frame_mut_ptr();
+            // SAFETY: The invocation keeps the binding and result slot live for the call.
+            let outcome = unsafe {
+                mips4_fast_memory_read_trampoline::<RejectRuntime>(
+                    (*frame).fast_memory_context,
+                    0x1000,
+                    0,
+                    8,
+                    &mut (*frame).fast_memory_result,
+                )
+            };
+            assert_eq!(outcome, expected);
+        }
     }
 }

@@ -286,7 +286,7 @@ fn jit_hot_loop_matches_scalar_machine_state_and_scheduler() {
 
 #[cfg(feature = "jit")]
 #[test]
-fn jit_native_mace_ust_loop_matches_scalar() {
+fn jit_fast_mace_ust_doubleword_loop_matches_scalar() {
     let program = [
         (0x00, i_type(0x0f, 0, 8, 0xbf34)),
         (0x04, i_type(0x09, 0, 9, 512)),
@@ -321,7 +321,7 @@ fn jit_native_mace_ust_loop_matches_scalar() {
     assert_eq!(
         scalar_cpu.state().gpr().read(register),
         jit_cpu.state().gpr().read(register),
-        "native UST value differs: scalar={:?}, JIT={:?}",
+        "fast UST value differs: scalar={:?}, JIT={:?}",
         scalar.performance_snapshot(),
         jit.performance_snapshot(),
     );
@@ -329,16 +329,80 @@ fn jit_native_mace_ust_loop_matches_scalar() {
         scalar.performance_snapshot().cpu.retired_instructions,
         jit.performance_snapshot().cpu.retired_instructions
     );
+    assert_eq!(
+        scalar.performance_snapshot().sysad_transactions,
+        jit.performance_snapshot().sysad_transactions
+    );
+    assert_eq!(
+        scalar.performance_snapshot().cmi_transactions,
+        jit.performance_snapshot().cmi_transactions
+    );
     assert!(
         jit.performance_snapshot().jit.fast_transaction_hits > 0,
-        "native UST lowering did not run: {:?}",
+        "fast UST callback did not run: {:?}",
         jit.performance_snapshot(),
     );
 }
 
 #[cfg(feature = "jit")]
 #[test]
-fn jit_native_crime_timer_loop_matches_scalar() {
+fn jit_fast_mace_ust_word_loop_matches_scalar() {
+    let program = [
+        (0x00, i_type(0x0f, 0, 8, 0xbf34)),
+        (0x04, i_type(0x09, 0, 9, 512)),
+        (0x08, i_type(0x23, 8, 10, 4)),
+        (0x0c, i_type(0x09, 9, 9, u16::MAX)),
+        (0x10, i_type(0x05, 9, 0, 0xfffd)),
+        (0x14, 0),
+        (0x18, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    let deadline = SimTime::new(20_000_000);
+    scalar.run_until_time(deadline).unwrap();
+    jit.run_until_time(deadline).unwrap();
+    let scalar_cpu = scalar
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let jit_cpu = jit
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    let register = Mips4GprIndex::from_u8(10).unwrap();
+    assert_eq!(
+        scalar_cpu.state().gpr().read(register),
+        jit_cpu.state().gpr().read(register),
+        "fast UST word value differs: scalar={:?}, JIT={:?}",
+        scalar.performance_snapshot(),
+        jit.performance_snapshot(),
+    );
+    assert_eq!(
+        scalar.performance_snapshot().cpu.retired_instructions,
+        jit.performance_snapshot().cpu.retired_instructions
+    );
+    assert_eq!(
+        scalar.performance_snapshot().sysad_transactions,
+        jit.performance_snapshot().sysad_transactions
+    );
+    assert_eq!(
+        scalar.performance_snapshot().cmi_transactions,
+        jit.performance_snapshot().cmi_transactions
+    );
+    assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_fast_crime_timer_loop_matches_scalar() {
     let program = [
         (0x00, i_type(0x0f, 0, 8, 0xb400)),
         (0x04, i_type(0x09, 0, 9, 512)),
@@ -373,7 +437,7 @@ fn jit_native_crime_timer_loop_matches_scalar() {
     assert_eq!(
         scalar_cpu.state().gpr().read(register),
         jit_cpu.state().gpr().read(register),
-        "native CRIME TIMER value differs: scalar={:?}, JIT={:?}",
+        "fast CRIME TIMER value differs: scalar={:?}, JIT={:?}",
         scalar.performance_snapshot(),
         jit.performance_snapshot(),
     );
@@ -381,16 +445,24 @@ fn jit_native_crime_timer_loop_matches_scalar() {
         scalar.performance_snapshot().cpu.retired_instructions,
         jit.performance_snapshot().cpu.retired_instructions
     );
+    assert_eq!(
+        scalar.performance_snapshot().sysad_transactions,
+        jit.performance_snapshot().sysad_transactions
+    );
+    assert_eq!(
+        scalar.performance_snapshot().cmi_transactions,
+        jit.performance_snapshot().cmi_transactions
+    );
     assert!(
         jit.performance_snapshot().jit.fast_transaction_hits > 0,
-        "native CRIME TIMER lowering did not run: {:?}",
+        "fast CRIME TIMER callback did not run: {:?}",
         jit.performance_snapshot(),
     );
 }
 
 #[cfg(feature = "jit")]
 #[test]
-fn jit_native_crime_timer_poll_matches_scalar() {
+fn jit_fast_crime_timer_poll_matches_scalar() {
     let program = [
         (0x00, i_type(0x0f, 0, 8, 0xb400)),
         (0x04, i_type(0x37, 8, 10, 0x0038)),
@@ -616,7 +688,7 @@ fn jit_direct_sdram_transactions_respect_uart_completion() {
 
 #[cfg(feature = "jit")]
 #[test]
-fn jit_native_timer_reads_respect_uart_completion() {
+fn jit_fast_timer_reads_respect_uart_completion() {
     let loop_address = 0xffff_ffff_9fc0_0014_u64;
     let branch_to_loop = ((loop_address as i64 - 0xffff_ffff_9fc0_0024_u64 as i64) / 4) as u16;
     let program = [
@@ -653,7 +725,7 @@ fn jit_native_timer_reads_respect_uart_completion() {
 
 #[cfg(feature = "jit")]
 #[test]
-fn jit_native_crime_timer_poll_from_ram_matches_scalar() {
+fn jit_fast_crime_timer_poll_from_ram_matches_scalar() {
     let ram_program = [
         i_type(0x0f, 0, 8, 0xb400),
         i_type(0x23, 8, 10, 0x003c),

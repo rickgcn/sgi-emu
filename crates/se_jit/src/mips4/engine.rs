@@ -11,7 +11,6 @@ use se_device::cpu::mips4::execution::port::{
     Mips4ReusableBlockExecution,
 };
 
-use super::fast_memory::Mips4NativeFastMemoryRuntime;
 use super::region::{Mips4Region, Mips4RegionNode, Mips4RegionSideExit};
 
 #[derive(Default)]
@@ -98,7 +97,7 @@ pub trait Mips4CodegenBackend {
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
         operations: &[Mips4RuntimeOperation],
-        fast_memory: Option<&mut (dyn Mips4NativeFastMemoryRuntime + 'fast)>,
+        fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
     ) -> Result<Mips4BlockExit, Self::Error>
     where
         R: Mips4BlockRuntime;
@@ -114,7 +113,7 @@ pub trait Mips4CodegenBackend {
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
         operations: &[Mips4RuntimeOperation],
-        fast_memory: Option<&mut (dyn Mips4NativeFastMemoryRuntime + 'fast)>,
+        fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
     ) -> Result<(Mips4BlockExit, Option<Mips4RegionSideExit>), Self::Error>
     where
         R: Mips4BlockRuntime;
@@ -491,7 +490,7 @@ fn execute_interpreted_tier<'fast, B, R>(
     record: &mut Mips4BlockRecord<B::CompiledBlock, B::CompiledRegion>,
     frame: &mut Mips4BlockFrame,
     runtime: &mut R,
-    fast_memory: Option<&mut (dyn Mips4NativeFastMemoryRuntime + 'fast)>,
+    fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
 ) -> Result<(Mips4BlockExit, bool), Mips4BlockEngineError<B::Error>>
 where
     B: Mips4CodegenBackend,
@@ -783,7 +782,7 @@ where
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut (dyn Mips4NativeFastMemoryRuntime + 'fast)>,
+        fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
     ) -> Result<Mips4BlockExecution, Mips4BlockEngineError<B::Error>>
     where
         R: Mips4BlockRuntime,
@@ -917,7 +916,7 @@ where
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut (dyn Mips4NativeFastMemoryRuntime + 'fast)>,
+        fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
         counters_dirty: bool,
     ) -> Result<Mips4CachedBlockExecution, Mips4BlockEngineError<B::Error>>
     where
@@ -1218,7 +1217,7 @@ where
     B::Error: fmt::Display,
 {
     type Error = Mips4BlockEngineError<B::Error>;
-    type FastMemoryRuntime = dyn Mips4NativeFastMemoryRuntime;
+    type FastMemoryRuntime = dyn Mips4FastMemoryRuntime;
 
     fn probe<R>(
         &mut self,
@@ -1372,8 +1371,6 @@ mod tests {
     use core::convert::Infallible;
 
     use super::*;
-    use crate::mips4::fast_memory::Mips4NativeFastMemoryRuntime;
-
     struct TestBackend;
 
     impl Mips4CodegenBackend for TestBackend {
@@ -1391,7 +1388,7 @@ mod tests {
             frame: &mut Mips4BlockFrame,
             runtime: &mut R,
             _operations: &[Mips4RuntimeOperation],
-            fast_memory: Option<&mut (dyn Mips4NativeFastMemoryRuntime + 'fast)>,
+            fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
         ) -> Result<Mips4BlockExit, Self::Error>
         where
             R: Mips4BlockRuntime,
@@ -1417,7 +1414,7 @@ mod tests {
             _frame: &mut Mips4BlockFrame,
             _runtime: &mut R,
             _operations: &[Mips4RuntimeOperation],
-            _fast_memory: Option<&mut (dyn Mips4NativeFastMemoryRuntime + 'fast)>,
+            _fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
         ) -> Result<(Mips4BlockExit, Option<Mips4RegionSideExit>), Self::Error>
         where
             R: Mips4BlockRuntime,
