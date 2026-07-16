@@ -227,6 +227,31 @@ fn config_with_program(words: &[(usize, u32)]) -> Ip32MachineConfig {
 }
 
 #[cfg(feature = "jit")]
+fn assert_stable_code_fetches_classified(performance: Ip32PerformanceSnapshot) {
+    assert_eq!(
+        performance
+            .jit
+            .system_flash_fetches
+            .saturating_add(performance.jit.sdram_fetches),
+        performance.jit.fast_fetches
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn ip32_rejects_unknown_stable_code_source_ids() {
+    let error = Ip32StableCodeSource::from_guard(Mips4CodeGuard {
+        source_id: Mips4CodeSourceId::new(99),
+        source_offset: 0,
+        revision: 0,
+        fingerprint: 0,
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("unknown IP32 source ID 99"));
+}
+
+#[cfg(feature = "jit")]
 #[test]
 fn jit_hot_loop_matches_scalar_machine_state_and_scheduler() {
     let loop_address = 0xffff_ffff_9fc0_0020_u64;
@@ -271,17 +296,36 @@ fn jit_hot_loop_matches_scalar_machine_state_and_scheduler() {
         scalar_performance.cpu.exceptions,
         jit_performance.cpu.exceptions
     );
+    assert!(jit_performance.jit.system_flash_fetches > 0);
+    assert_eq!(jit_performance.jit.sdram_fetches, 0);
+    assert_stable_code_fetches_classified(jit_performance);
     let jit_statistics = jit.control.jit_engine.as_ref().unwrap().statistics();
     assert!(
         jit_statistics.compiled_blocks > 0,
         "JIT did not compile the hot loop: {jit_statistics:?}"
     );
 
+    reset_jit_engine(&mut jit.control).unwrap();
+    let reset_performance = jit.performance_snapshot();
+    assert_eq!(
+        reset_performance.jit.fast_fetches,
+        jit_performance.jit.fast_fetches
+    );
+    assert_eq!(
+        reset_performance.jit.system_flash_fetches,
+        jit_performance.jit.system_flash_fetches
+    );
+    assert_stable_code_fetches_classified(reset_performance);
+
     let state = jit.save_state().unwrap();
     let restored =
         Ip32Machine::from_state_with_trace_sink(jit_config, state, NoopTraceSink).unwrap();
     assert_machine_architecture_equal(&jit, &restored);
     assert!(restored.control.jit_engine.as_ref().unwrap().is_empty());
+    let restored_performance = restored.performance_snapshot();
+    assert_eq!(restored_performance.jit.fast_fetches, 0);
+    assert_eq!(restored_performance.jit.system_flash_fetches, 0);
+    assert_eq!(restored_performance.jit.sdram_fetches, 0);
 }
 
 #[cfg(feature = "jit")]
@@ -796,8 +840,11 @@ fn jit_fast_crime_timer_poll_from_ram_matches_scalar() {
             jit_cpu.state().gpr().read(register)
         );
     }
-    assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
-    assert!(jit.performance_snapshot().jit.region_entries > 0);
+    let performance = jit.performance_snapshot();
+    assert!(performance.jit.fast_transaction_hits > 0);
+    assert!(performance.jit.region_entries > 0);
+    assert!(performance.jit.sdram_fetches > 0);
+    assert_stable_code_fetches_classified(performance);
 }
 
 #[cfg(not(feature = "jit"))]

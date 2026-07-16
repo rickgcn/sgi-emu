@@ -118,7 +118,7 @@ use super::state::{
 };
 #[cfg(feature = "jit")]
 use se_device::cpu::mips4::execution::block::{
-    MIPS4_BLOCK_MAX_INSTRUCTIONS, Mips4CodeGuard, Mips4CodeGuardKind, Mips4CodeWindow,
+    MIPS4_BLOCK_MAX_INSTRUCTIONS, Mips4CodeGuard, Mips4CodeSourceId, Mips4CodeWindow,
     Mips4SliceClock, Mips4SliceTimeline,
 };
 #[cfg(feature = "jit")]
@@ -589,6 +589,8 @@ struct MachineControl {
     fast_transaction_hits: u64,
     #[cfg(feature = "jit")]
     fast_transaction_fallbacks: u64,
+    #[cfg(feature = "jit")]
+    jit_code_fetches: Ip32StableCodeFetchStatistics,
     cpu_continuation_quantum: usize,
     inline_sysad_completion: bool,
     event_chain_policy: Ip32EventChainPolicy,
@@ -610,8 +612,56 @@ struct MachineControl {
 
 #[cfg(feature = "jit")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum Ip32StableCodeSource {
+    SystemFlash,
+    Sdram,
+}
+
+#[cfg(feature = "jit")]
+impl Ip32StableCodeSource {
+    const fn id(self) -> Mips4CodeSourceId {
+        match self {
+            Self::SystemFlash => Mips4CodeSourceId::new(1),
+            Self::Sdram => Mips4CodeSourceId::new(2),
+        }
+    }
+
+    fn from_guard(guard: Mips4CodeGuard) -> Result<Self, Ip32MachineDispatchError> {
+        match guard.source_id {
+            source_id if source_id == Self::SystemFlash.id() => Ok(Self::SystemFlash),
+            source_id if source_id == Self::Sdram.id() => Ok(Self::Sdram),
+            source_id => Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                format!(
+                    "stable code guard used unknown IP32 source ID {}",
+                    source_id.get()
+                ),
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Ip32StableCodeFetchStatistics {
+    system_flash: u64,
+    sdram: u64,
+}
+
+#[cfg(feature = "jit")]
+impl Ip32StableCodeFetchStatistics {
+    fn record(&mut self, source: Ip32StableCodeSource, fetches: u64) {
+        let counter = match source {
+            Ip32StableCodeSource::SystemFlash => &mut self.system_flash,
+            Ip32StableCodeSource::Sdram => &mut self.sdram,
+        };
+        *counter = counter.saturating_add(fetches);
+    }
+}
+
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct Mips4CodeSourceCacheKey {
-    kind: Mips4CodeGuardKind,
+    source: Ip32StableCodeSource,
     source_offset: u64,
     revision: u64,
     byte_count: u8,
@@ -1262,6 +1312,8 @@ impl<S> Ip32Machine<S> {
                 fast_transaction_hits: 0,
                 #[cfg(feature = "jit")]
                 fast_transaction_fallbacks: 0,
+                #[cfg(feature = "jit")]
+                jit_code_fetches: Ip32StableCodeFetchStatistics::default(),
                 cpu_continuation_quantum: DEFAULT_CPU_CONTINUATION_QUANTUM,
                 inline_sysad_completion: true,
                 event_chain_policy,
@@ -1489,8 +1541,8 @@ impl<S> Ip32Machine<S> {
                     runtime_calls: statistics.runtime_calls,
                     dynamic_fetches: statistics.dynamic_fetches,
                     fast_fetches: statistics.fast_fetches,
-                    system_flash_fetches: statistics.system_flash_fetches,
-                    sdram_fetches: statistics.sdram_fetches,
+                    system_flash_fetches: self.control.jit_code_fetches.system_flash,
+                    sdram_fetches: self.control.jit_code_fetches.sdram,
                     compiled_blocks: statistics.compiled_blocks,
                     cache_resets: statistics.cache_resets,
                     fast_transaction_attempts: self.control.fast_transaction_attempts,
@@ -1975,6 +2027,8 @@ impl<S> Ip32Machine<S> {
             fast_transaction_hits: 0,
             #[cfg(feature = "jit")]
             fast_transaction_fallbacks: 0,
+            #[cfg(feature = "jit")]
+            jit_code_fetches: Ip32StableCodeFetchStatistics::default(),
             cpu_continuation_quantum: state.control.cpu_continuation_quantum,
             inline_sysad_completion: state.control.inline_sysad_completion,
             event_chain_policy,
@@ -2713,7 +2767,7 @@ fn invalidate_ram_code_sources(control: &mut MachineControl, range: Option<(u64,
     let Some((address, length)) = range else {
         control
             .jit_code_sources
-            .retain(|key, _| key.kind != Mips4CodeGuardKind::Sdram);
+            .retain(|key, _| key.source != Ip32StableCodeSource::Sdram);
         control.jit_ram_code_pages.clear();
         return;
     };
@@ -2728,7 +2782,7 @@ fn invalidate_ram_code_sources(control: &mut MachineControl, range: Option<(u64,
         return;
     }
     control.jit_code_sources.retain(|key, _| {
-        if key.kind != Mips4CodeGuardKind::Sdram {
+        if key.source != Ip32StableCodeSource::Sdram {
             return true;
         }
         let source_end = key.source_offset.saturating_add(u64::from(key.byte_count));
@@ -2738,7 +2792,7 @@ fn invalidate_ram_code_sources(control: &mut MachineControl, range: Option<(u64,
     let remaining = control
         .jit_code_sources
         .keys()
-        .filter(|key| key.kind == Mips4CodeGuardKind::Sdram)
+        .filter(|key| key.source == Ip32StableCodeSource::Sdram)
         .map(|key| (key.source_offset, usize::from(key.byte_count)))
         .collect::<Vec<_>>();
     for (source_offset, byte_count) in remaining {
@@ -2906,7 +2960,7 @@ where
     let byte_count = source_instructions * 4;
     let revision = flash.persistence_revision();
     let cache_key = Mips4CodeSourceCacheKey {
-        kind: Mips4CodeGuardKind::SystemFlash,
+        source: Ip32StableCodeSource::SystemFlash,
         source_offset: offset,
         revision,
         byte_count: byte_count as u8,
@@ -2928,7 +2982,7 @@ where
             Mips4CodeSourceCacheEntry { bytes, fingerprint }
         });
     let guard = Mips4CodeGuard {
-        kind: Mips4CodeGuardKind::SystemFlash,
+        source_id: Ip32StableCodeSource::SystemFlash.id(),
         source_offset: offset,
         revision,
         fingerprint: source.fingerprint,
@@ -3015,7 +3069,7 @@ where
     };
     let byte_count = source_instructions * 4;
     let cache_key = Mips4CodeSourceCacheKey {
-        kind: Mips4CodeGuardKind::Sdram,
+        source: Ip32StableCodeSource::Sdram,
         source_offset: offset,
         revision: 0,
         byte_count: byte_count as u8,
@@ -3040,7 +3094,7 @@ where
             }
         };
         let guard = Mips4CodeGuard {
-            kind: Mips4CodeGuardKind::Sdram,
+            source_id: Ip32StableCodeSource::Sdram.id(),
             source_offset: offset,
             revision: 0,
             fingerprint: source.fingerprint,
@@ -3080,7 +3134,7 @@ where
 #[cfg(feature = "jit")]
 fn commit_stable_prom_fetches(
     registry: &mut ComponentRegistry,
-    control: &MachineControl,
+    control: &mut MachineControl,
     window: &Mips4CodeWindow,
     fetches: usize,
     slice_start: SimTime,
@@ -3140,13 +3194,16 @@ fn commit_stable_prom_fetches(
             "stable PROM fetch lost idle bus ownership".to_owned(),
         )));
     }
+    control
+        .jit_code_fetches
+        .record(Ip32StableCodeSource::SystemFlash, fetches as u64);
     Ok(())
 }
 
 #[cfg(feature = "jit")]
 fn commit_stable_ram_fetches(
     registry: &mut ComponentRegistry,
-    control: &MachineControl,
+    control: &mut MachineControl,
     window: &Mips4CodeWindow,
     fetches: usize,
     slice_start: SimTime,
@@ -3194,6 +3251,9 @@ fn commit_stable_ram_fetches(
             "stable RAM fetch lost idle bus ownership".to_owned(),
         )));
     }
+    control
+        .jit_code_fetches
+        .record(Ip32StableCodeSource::Sdram, fetches as u64);
     Ok(())
 }
 
@@ -3322,27 +3382,21 @@ where
                     "stable PROM timeline crossed a scheduler event".to_owned(),
                 )));
             }
-            match code_window
+            let window = code_window
                 .as_ref()
-                .expect("fast fetches require a code window")
-                .guard()
-                .kind
-            {
-                Mips4CodeGuardKind::SystemFlash => commit_stable_prom_fetches(
+                .expect("fast fetches require a code window");
+            match Ip32StableCodeSource::from_guard(window.guard())? {
+                Ip32StableCodeSource::SystemFlash => commit_stable_prom_fetches(
                     registry,
                     control,
-                    code_window
-                        .as_ref()
-                        .expect("fast fetches require a code window"),
+                    window,
                     slice.fast_fetches as usize,
                     slice_start,
                 )?,
-                Mips4CodeGuardKind::Sdram => commit_stable_ram_fetches(
+                Ip32StableCodeSource::Sdram => commit_stable_ram_fetches(
                     registry,
                     control,
-                    code_window
-                        .as_ref()
-                        .expect("fast fetches require a code window"),
+                    window,
                     slice.fast_fetches as usize,
                     slice_start,
                 )?,

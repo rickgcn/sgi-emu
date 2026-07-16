@@ -223,12 +223,6 @@ pub struct Mips4BlockEngineStatistics {
 
     /// Region entries rejected by a visibility or execution guard.
     pub region_guard_side_exits: u64,
-
-    /// Stable instructions fetched from System Flash.
-    pub system_flash_fetches: u64,
-
-    /// Stable instructions fetched from SDRAM.
-    pub sdram_fetches: u64,
 }
 
 fn record_region_side_exit(
@@ -295,13 +289,13 @@ fn record_successor<C, R>(record: &mut Mips4BlockRecord<C, R>, successor: Mips4B
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Mips4RegionSource {
     InstructionCache,
-    Stable(Mips4CodeGuardKind),
+    Stable(Mips4CodeSourceId),
 }
 
 pub(super) fn region_source_kind(guard: &Mips4BlockGuard) -> Option<Mips4RegionSource> {
     match (guard.lines().is_empty(), guard.code_source()) {
         (false, None) => Some(Mips4RegionSource::InstructionCache),
-        (true, Some(source)) => Some(Mips4RegionSource::Stable(source.kind)),
+        (true, Some(source)) => Some(Mips4RegionSource::Stable(source.source_id)),
         _ => None,
     }
 }
@@ -645,20 +639,8 @@ where
     }
 
     /// Records instructions supplied by a stable external code window.
-    pub fn record_fast_fetches(&mut self, instructions: u64, source: Mips4CodeGuardKind) {
+    pub fn record_fast_fetches(&mut self, instructions: u64) {
         self.statistics.fast_fetches = self.statistics.fast_fetches.saturating_add(instructions);
-        match source {
-            Mips4CodeGuardKind::SystemFlash => {
-                self.statistics.system_flash_fetches = self
-                    .statistics
-                    .system_flash_fetches
-                    .saturating_add(instructions);
-            }
-            Mips4CodeGuardKind::Sdram => {
-                self.statistics.sdram_fetches =
-                    self.statistics.sdram_fetches.saturating_add(instructions);
-            }
-        }
     }
 
     /// Removes one block after a failed visibility guard.
@@ -1297,13 +1279,13 @@ where
     where
         R: Mips4BlockRuntime,
     {
-        let source = self
+        let stable_source = self
             .block(key)
             .and_then(|block| block.guard().code_source())
-            .map(|guard| guard.kind);
+            .is_some();
         let execution = self.execute_with_runtime(key, frame, runtime, fast_memory)?;
-        if let Some(source) = source {
-            self.record_fast_fetches(execution.operations_executed, source);
+        if stable_source {
+            self.record_fast_fetches(execution.operations_executed);
         }
         if execution.exit == Mips4BlockExit::GuardInvalid
             || self
@@ -1456,7 +1438,7 @@ mod tests {
 
     fn code_guard() -> Mips4CodeGuard {
         Mips4CodeGuard {
-            kind: Mips4CodeGuardKind::SystemFlash,
+            source_id: Mips4CodeSourceId::new(1),
             source_offset: 0,
             revision: 1,
             fingerprint: 2,
@@ -1534,6 +1516,24 @@ mod tests {
         assert_eq!(statistics.interpreted_operations, MIPS4_BLOCK_HOT_THRESHOLD);
         assert_eq!(statistics.native_operations, 1);
         assert_eq!(statistics.dynamic_fetches, 1);
+    }
+
+    #[test]
+    fn stable_execution_records_only_generic_fast_fetches() {
+        let source = Mips4BlockSource::Stable(code_guard());
+        let block = block(0x1000, source);
+        let key = block.key();
+        let mut engine = Mips4BlockEngine::new(TestBackend);
+        engine.install(block, source).unwrap();
+        let mut runtime = TestRuntime {
+            guard_valid: true,
+            epoch: 0,
+        };
+
+        Mips4ExecutionPort::execute(&mut engine, key, &mut frame(key), &mut runtime, None).unwrap();
+
+        assert_eq!(engine.statistics().fast_fetches, 1);
+        assert_eq!(engine.statistics().dynamic_fetches, 0);
     }
 
     #[test]
@@ -1632,5 +1632,27 @@ mod tests {
             record.region_next_compile_hotness,
             MIPS4_REGION_HOT_THRESHOLD + MIPS4_REGION_RETRY_OPERATIONS
         );
+    }
+
+    #[test]
+    fn regions_reject_distinct_opaque_code_sources() {
+        let first_guard = code_guard();
+        let mut second_guard = Mips4CodeGuard {
+            source_id: Mips4CodeSourceId::new(2),
+            ..first_guard
+        };
+        let token_difference = first_guard.token() ^ second_guard.token();
+        second_guard.fingerprint ^= token_difference.rotate_right(47);
+        assert_eq!(first_guard.token(), second_guard.token());
+
+        let first = block(0x1000, Mips4BlockSource::Stable(first_guard));
+        let second = block(0x1004, Mips4BlockSource::Stable(second_guard));
+        assert_eq!(first.key().code_guard, second.key().code_guard);
+        let nodes = vec![
+            Mips4RegionNode::new(first, Some(1)),
+            Mips4RegionNode::new(second, Some(0)),
+        ];
+
+        assert!(Mips4Region::new(nodes).is_err());
     }
 }

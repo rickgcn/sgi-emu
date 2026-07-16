@@ -63,7 +63,7 @@ impl Ip32FastMemoryContext {
 
     pub(super) fn configure_code_fetch_timeline(
         &mut self,
-        source: Mips4CodeGuardKind,
+        source: Ip32StableCodeSource,
         auxiliary_clock: FractionalClockProjection,
         fixed_ticks_per_fetch: u64,
         fetch_limit: u64,
@@ -78,14 +78,14 @@ impl Ip32FastMemoryContext {
             return false;
         }
         self.code_timeline = Some(match source {
-            Mips4CodeGuardKind::SystemFlash if auxiliary_clock == self.cmi_clock => {
+            Ip32StableCodeSource::SystemFlash if auxiliary_clock == self.cmi_clock => {
                 Ip32FastCodeTimeline::SystemFlash {
                     clock: auxiliary_clock,
                     fixed_ticks_per_fetch,
                     fetch_limit,
                 }
             }
-            Mips4CodeGuardKind::Sdram if fixed_ticks_per_fetch == 0 => {
+            Ip32StableCodeSource::Sdram if fixed_ticks_per_fetch == 0 => {
                 Ip32FastCodeTimeline::Sdram {
                     clock: auxiliary_clock,
                     fetch_limit,
@@ -651,7 +651,8 @@ pub(super) fn configure_fast_memory_code_timeline(
     runtime: &mut Ip32FastMemoryRuntime,
     window: &Mips4CodeWindow,
 ) -> Result<(), Ip32MachineDispatchError> {
-    if window.guard().kind == Mips4CodeGuardKind::Sdram
+    let source = Ip32StableCodeSource::from_guard(window.guard())?;
+    if source == Ip32StableCodeSource::Sdram
         && let Some(deadline) = registry
             .get_resolved(control.slots.memory)?
             .stable_fetch_refresh_deadline()
@@ -662,8 +663,8 @@ pub(super) fn configure_fast_memory_code_timeline(
                 .saturating_sub(runtime.context.start_time_ticks()),
         );
     }
-    let (auxiliary_clock, fixed_ticks_per_fetch) = match window.guard().kind {
-        Mips4CodeGuardKind::SystemFlash => (
+    let (auxiliary_clock, fixed_ticks_per_fetch) = match source {
+        Ip32StableCodeSource::SystemFlash => (
             registry
                 .get_resolved(control.slots.cmi)?
                 .stable_fetch_clock()
@@ -682,7 +683,7 @@ pub(super) fn configure_fast_memory_code_timeline(
                 })?
                 .get(),
         ),
-        Mips4CodeGuardKind::Sdram => (
+        Ip32StableCodeSource::Sdram => (
             registry
                 .get_resolved(control.slots.memory)?
                 .stable_fetch_clock()
@@ -695,7 +696,7 @@ pub(super) fn configure_fast_memory_code_timeline(
         ),
     };
     if !runtime.context.configure_code_fetch_timeline(
-        window.guard().kind,
+        source,
         auxiliary_clock,
         fixed_ticks_per_fetch,
         window.fetch_count() as u64,
@@ -840,6 +841,10 @@ where
             "stable-code execution exceeded its planned fetch count".to_owned(),
         )));
     }
+    let code_source = code_window
+        .map(Mips4CodeWindow::guard)
+        .map(Ip32StableCodeSource::from_guard)
+        .transpose()?;
     let completed = runtime.context.completed();
     let total_sysad = completed.checked_add(code_fetches).ok_or_else(|| {
         Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
@@ -861,10 +866,9 @@ where
         )));
     }
     let cmi_completed = runtime.context.cmi_completed();
-    let (prom_fetches, ram_fetches) = match code_window.map(Mips4CodeWindow::guard) {
-        Some(guard) if guard.kind == Mips4CodeGuardKind::SystemFlash => (code_fetches_usize, 0),
-        Some(guard) if guard.kind == Mips4CodeGuardKind::Sdram => (0, code_fetches_usize),
-        Some(_) => unreachable!("stable code guards have an exhaustive source kind"),
+    let (prom_fetches, ram_fetches) = match code_source {
+        Some(Ip32StableCodeSource::SystemFlash) => (code_fetches_usize, 0),
+        Some(Ip32StableCodeSource::Sdram) => (0, code_fetches_usize),
         None => (0, 0),
     };
     let cmi_transactions = cmi_completed
@@ -1039,5 +1043,8 @@ where
     control.memory_transactions = control
         .memory_transactions
         .saturating_add(ram_fetches as u64);
+    if let Some(source) = code_source {
+        control.jit_code_fetches.record(source, code_fetches);
+    }
     Ok(())
 }

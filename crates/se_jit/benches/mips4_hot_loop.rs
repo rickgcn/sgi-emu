@@ -4,7 +4,7 @@ use std::time::Instant;
 use se_device::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 use se_device::cpu::mips4::execution::block::{
     Mips4Block, Mips4BlockFrame, Mips4BlockGuard, Mips4BlockInstructionMetadata, Mips4BlockKey,
-    Mips4BlockLiftedInstruction, Mips4BlockRuntime, Mips4CodeGuard, Mips4CodeGuardKind,
+    Mips4BlockLiftedInstruction, Mips4BlockRuntime, Mips4CodeGuard, Mips4CodeSourceId,
     Mips4FastMemoryRuntime, Mips4RuntimeOperation, Mips4RuntimeResult, interpret_block,
     lift_cpu_instruction,
 };
@@ -137,7 +137,7 @@ fn hot_loop() -> Mips4Block {
 
 const fn benchmark_code_guard() -> Mips4CodeGuard {
     Mips4CodeGuard {
-        kind: Mips4CodeGuardKind::SystemFlash,
+        source_id: Mips4CodeSourceId::new(1),
         source_offset: 0,
         revision: 1,
         fingerprint: 2,

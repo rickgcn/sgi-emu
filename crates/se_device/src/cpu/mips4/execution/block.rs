@@ -72,21 +72,30 @@ pub struct Mips4CodeSourceRequest {
     pub maximum_bytes: u8,
 }
 
-/// Stable external code-source class.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Mips4CodeGuardKind {
-    /// Byte-programmable system flash.
-    SystemFlash,
+/// Machine-assigned identity of a stable external code source.
+///
+/// Identifiers are opaque to the CPU and must be unique within one execution
+/// engine lifetime.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Mips4CodeSourceId(u64);
 
-    /// SDRAM contents and ECC state.
-    Sdram,
+impl Mips4CodeSourceId {
+    /// Creates a code-source identifier from a machine-assigned value.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the machine-assigned raw value.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 /// Versioned identity of a side-effect-free external code window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mips4CodeGuard {
-    /// External source class.
-    pub kind: Mips4CodeGuardKind,
+    /// Opaque external source identity.
+    pub source_id: Mips4CodeSourceId,
 
     /// Device-local byte offset of the first byte.
     pub source_offset: u64,
@@ -101,11 +110,9 @@ pub struct Mips4CodeGuard {
 impl Mips4CodeGuard {
     /// Returns a deterministic block-key token for this source image.
     pub const fn token(self) -> u64 {
-        let kind = match self.kind {
-            Mips4CodeGuardKind::SystemFlash => 0x464c_4153_4800_0001,
-            Mips4CodeGuardKind::Sdram => 0x5344_5241_4d00_0001,
-        };
-        kind ^ self.source_offset.rotate_left(11)
+        0x434f_4445_5352_4301
+            ^ self.source_id.get().wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ self.source_offset.rotate_left(11)
             ^ self.revision.rotate_left(29)
             ^ self.fingerprint.rotate_left(47)
     }
@@ -2548,6 +2555,29 @@ mod tests {
             panic!("test instruction must decode as a CPU instruction")
         };
         lift_cpu_instruction(&policy(), metadata(pc, bits), decoded)
+    }
+
+    #[test]
+    fn code_source_ids_are_opaque_and_separate_guard_tokens() {
+        let first = Mips4CodeSourceId::new(7);
+        let second = Mips4CodeSourceId::new(11);
+        assert_eq!(first.get(), 7);
+        assert_eq!(second.get(), 11);
+
+        let guard = Mips4CodeGuard {
+            source_id: first,
+            source_offset: 0x120,
+            revision: 3,
+            fingerprint: 0x1234_5678_9abc_def0,
+        };
+        assert_ne!(
+            guard.token(),
+            Mips4CodeGuard {
+                source_id: second,
+                ..guard
+            }
+            .token()
+        );
     }
 
     #[test]

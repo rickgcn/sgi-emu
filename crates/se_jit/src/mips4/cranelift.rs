@@ -1980,7 +1980,7 @@ mod tests {
     use se_device::cpu::mips4::execution::block::{
         Mips4BlockBranch, Mips4BlockGuard, Mips4BlockInstruction, Mips4BlockInstructionMetadata,
         Mips4BlockKey, Mips4BlockLiftedInstruction, Mips4BlockRetire, Mips4BlockRuntime,
-        Mips4CodeGuard, Mips4CodeGuardKind, Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult,
+        Mips4CodeGuard, Mips4CodeSourceId, Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult,
         Mips4FastMemoryRuntime, Mips4RuntimeOperation, interpret_block, lift_cpu_instruction,
     };
     use se_device::cpu::mips4::instruction::Mips4Instruction;
@@ -2171,7 +2171,7 @@ mod tests {
     #[test]
     fn native_multi_block_region_matches_boundary_interpreter() {
         let code_guard = Mips4CodeGuard {
-            kind: Mips4CodeGuardKind::SystemFlash,
+            source_id: Mips4CodeSourceId::new(1),
             source_offset: 0,
             revision: 1,
             fingerprint: 2,
