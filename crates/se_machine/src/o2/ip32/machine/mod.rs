@@ -1271,7 +1271,6 @@ impl<S> Ip32Machine<S> {
                 jit_code_sources: Mips4CodeSourceCache::default(),
                 #[cfg(feature = "jit")]
                 jit_ram_code_pages: Mips4RamCodePageSet::default(),
-                #[cfg(feature = "jit")]
                 #[cfg(test)]
                 capture_logical_transitions: false,
                 #[cfg(test)]
@@ -1985,7 +1984,6 @@ impl<S> Ip32Machine<S> {
             jit_code_sources: Mips4CodeSourceCache::default(),
             #[cfg(feature = "jit")]
             jit_ram_code_pages: Mips4RamCodePageSet::default(),
-            #[cfg(feature = "jit")]
             #[cfg(test)]
             capture_logical_transitions: false,
             #[cfg(test)]
