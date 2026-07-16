@@ -3,9 +3,8 @@
 #[cfg(test)]
 use super::super::PIXEL_PIPE_NULL;
 use super::super::{
-    LOGIC_COPY, PIXEL_PIPE_BASE, PixelBlockerKind, PixelCapability, PixelCommandBlocker,
-    PixelCommandViolation, PixelField, PixelRegister, PixelViolationKind, read_register_slot,
-    write_register_slot,
+    PIXEL_PIPE_BASE, PixelCommandViolation, PixelField, PixelRegister, PixelViolationKind,
+    read_register_slot, write_register_slot,
 };
 use super::format::{Rgba8, encode};
 use super::stipple::PixelStippleMode;
@@ -15,7 +14,6 @@ const PRIMITIVE_RESERVED_MASK: u32 = 0x00f8_0000;
 const BUFFER_MODE_RESERVED_MASK: u32 = 0xffff_e000;
 const CLIP_MODE_RESERVED_MASK: u32 = 0xffff_f000;
 
-const FEATURE_NO_CONFLICT: u8 = 23;
 const FEATURE_GL: u8 = 22;
 const FEATURE_PIXEL_TRANSFER: u8 = 21;
 const FEATURE_SCISSOR: u8 = 20;
@@ -29,113 +27,12 @@ const FEATURE_COVERAGE: u8 = 13;
 const FEATURE_ANTIALIAS_LINE: u8 = 12;
 const FEATURE_ALPHA_TEST: u8 = 11;
 const FEATURE_BLEND: u8 = 10;
-const FEATURE_LOGIC_OPERATION: u8 = 9;
-const FEATURE_DITHER: u8 = 8;
+const FEATURE_DITHER: u8 = 9;
+const FEATURE_LOGIC_OPERATION: u8 = 8;
 const FEATURE_COLOR_MASK: u8 = 7;
 const FEATURE_DEPTH_TEST: u8 = 2;
 const FEATURE_DEPTH_MASK: u8 = 1;
 const FEATURE_STENCIL_TEST: u8 = 0;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PixelFeatureEvidence {
-    A,
-    B,
-    U,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PixelFeatureDescriptor {
-    bit: u8,
-    evidence: PixelFeatureEvidence,
-    capability: Option<PixelCapability>,
-}
-
-const PIXEL_FEATURE_DESCRIPTORS: [PixelFeatureDescriptor; 24] = [
-    feature(
-        FEATURE_NO_CONFLICT,
-        PixelFeatureEvidence::A,
-        Some(PixelCapability::ConflictBypass),
-    ),
-    feature(FEATURE_GL, PixelFeatureEvidence::A, None),
-    feature(FEATURE_PIXEL_TRANSFER, PixelFeatureEvidence::A, None),
-    feature(FEATURE_SCISSOR, PixelFeatureEvidence::A, None),
-    feature(FEATURE_LINE_STIPPLE, PixelFeatureEvidence::A, None),
-    feature(FEATURE_POLYGON_STIPPLE, PixelFeatureEvidence::A, None),
-    feature(FEATURE_OPAQUE_STIPPLE, PixelFeatureEvidence::U, None),
-    feature(
-        FEATURE_SHADE,
-        PixelFeatureEvidence::A,
-        Some(PixelCapability::SmoothShade),
-    ),
-    feature(
-        FEATURE_TEXTURE,
-        PixelFeatureEvidence::A,
-        Some(PixelCapability::TextureMapping),
-    ),
-    feature(
-        FEATURE_FOG,
-        PixelFeatureEvidence::A,
-        Some(PixelCapability::Fog),
-    ),
-    feature(
-        FEATURE_COVERAGE,
-        PixelFeatureEvidence::B,
-        Some(PixelCapability::Coverage),
-    ),
-    feature(
-        FEATURE_ANTIALIAS_LINE,
-        PixelFeatureEvidence::U,
-        Some(PixelCapability::LineAntialiasing),
-    ),
-    feature(
-        FEATURE_ALPHA_TEST,
-        PixelFeatureEvidence::A,
-        Some(PixelCapability::AlphaTest),
-    ),
-    feature(
-        FEATURE_BLEND,
-        PixelFeatureEvidence::A,
-        Some(PixelCapability::Blend),
-    ),
-    feature(FEATURE_LOGIC_OPERATION, PixelFeatureEvidence::B, None),
-    feature(
-        FEATURE_DITHER,
-        PixelFeatureEvidence::U,
-        Some(PixelCapability::Dither),
-    ),
-    feature(FEATURE_COLOR_MASK, PixelFeatureEvidence::A, None),
-    feature(6, PixelFeatureEvidence::A, None),
-    feature(5, PixelFeatureEvidence::A, None),
-    feature(4, PixelFeatureEvidence::A, None),
-    feature(3, PixelFeatureEvidence::A, None),
-    feature(
-        FEATURE_DEPTH_TEST,
-        PixelFeatureEvidence::B,
-        Some(PixelCapability::Depth),
-    ),
-    feature(
-        FEATURE_DEPTH_MASK,
-        PixelFeatureEvidence::B,
-        Some(PixelCapability::Depth),
-    ),
-    feature(
-        FEATURE_STENCIL_TEST,
-        PixelFeatureEvidence::B,
-        Some(PixelCapability::Stencil),
-    ),
-];
-
-const fn feature(
-    bit: u8,
-    evidence: PixelFeatureEvidence,
-    capability: Option<PixelCapability>,
-) -> PixelFeatureDescriptor {
-    PixelFeatureDescriptor {
-        bit,
-        evidence,
-        capability,
-    }
-}
 
 /// Raw PixelPipe register storage.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -348,10 +245,6 @@ impl PixelFormat {
             _ => None,
         }
     }
-
-    pub(crate) const fn supported_for_flat_write(self) -> bool {
-        !matches!(self, Self::YCrCb(_) | Self::Invalid { .. })
-    }
 }
 
 /// Typed BufMode register.
@@ -401,6 +294,58 @@ impl PixelFeatureSet {
 
     pub(crate) const fn opaque_stipple(self) -> bool {
         self.enabled(FEATURE_OPAQUE_STIPPLE)
+    }
+
+    pub(crate) const fn smooth_shade(self) -> bool {
+        self.enabled(FEATURE_SHADE)
+    }
+
+    pub(crate) const fn texture(self) -> bool {
+        self.enabled(FEATURE_TEXTURE)
+    }
+
+    pub(crate) const fn fog(self) -> bool {
+        self.enabled(FEATURE_FOG)
+    }
+
+    pub(crate) const fn coverage(self) -> bool {
+        self.enabled(FEATURE_COVERAGE) || self.enabled(FEATURE_ANTIALIAS_LINE)
+    }
+
+    pub(crate) const fn line_antialias(self) -> bool {
+        self.enabled(FEATURE_ANTIALIAS_LINE)
+    }
+
+    pub(crate) const fn alpha_test(self) -> bool {
+        self.enabled(FEATURE_ALPHA_TEST)
+    }
+
+    pub(crate) const fn blend(self) -> bool {
+        self.enabled(FEATURE_BLEND)
+    }
+
+    pub(crate) const fn logic(self) -> bool {
+        self.enabled(FEATURE_LOGIC_OPERATION)
+    }
+
+    pub(crate) const fn dither(self) -> bool {
+        self.enabled(FEATURE_DITHER)
+    }
+
+    pub(crate) const fn color_mask(self) -> bool {
+        self.enabled(FEATURE_COLOR_MASK)
+    }
+
+    pub(crate) const fn depth_test(self) -> bool {
+        self.enabled(FEATURE_DEPTH_TEST)
+    }
+
+    pub(crate) const fn depth_mask(self) -> bool {
+        self.enabled(FEATURE_DEPTH_MASK)
+    }
+
+    pub(crate) const fn stencil_test(self) -> bool {
+        self.enabled(FEATURE_STENCIL_TEST)
     }
 }
 
@@ -497,6 +442,31 @@ impl DecodedPixelCommand {
         }
         true
     }
+
+    pub(crate) fn needs_fragment_pipeline(&self) -> bool {
+        self.features.smooth_shade()
+            || self.features.texture()
+            || self.features.fog()
+            || self.features.coverage()
+            || self.features.alpha_test()
+            || self.features.blend()
+            || self.features.dither()
+                && matches!(
+                    self.destination.format,
+                    PixelFormat::Rgb(8 | 16)
+                        | PixelFormat::Rgba(8 | 16)
+                        | PixelFormat::Abgr(8 | 16)
+                )
+            || self.features.logic() && self.snapshot.logic_operation() & 0x0f != 3
+            || self.features.color_mask() && self.snapshot.color_mask() != u32::MAX
+            || self.features.color_byte_mask() != 0x0f
+            || self.features.depth_test()
+            || self.features.depth_mask()
+            || self.features.stencil_test()
+            || self.destination.double_pixel
+            || self.destination.kind.framebuffer_selector().is_none()
+            || self.clip_mode & (1 << 11) != 0
+    }
 }
 
 /// Aggregate result of decoding and validating one command snapshot.
@@ -504,7 +474,6 @@ impl DecodedPixelCommand {
 pub(crate) struct PixelCommandValidation {
     pub(crate) decoded: DecodedPixelCommand,
     pub(crate) violations: Vec<PixelCommandViolation>,
-    pub(crate) blockers: Vec<PixelCommandBlocker>,
 }
 
 impl PixelCommandValidation {
@@ -581,11 +550,8 @@ impl PixelCommandValidation {
         let mut validation = Self {
             decoded,
             violations: Vec::new(),
-            blockers: Vec::new(),
         };
         validation.validate_encoding();
-        validation.validate_enabled_state();
-        validation.validate_capabilities();
         validation.violations.sort_by_key(|violation| {
             (
                 violation.kind,
@@ -595,15 +561,6 @@ impl PixelCommandValidation {
             )
         });
         validation.violations.dedup();
-        validation.blockers.sort_by_key(|blocker| {
-            (
-                blocker.kind,
-                blocker.capability,
-                blocker.register,
-                blocker.value,
-            )
-        });
-        validation.blockers.dedup();
         validation
     }
 
@@ -668,7 +625,7 @@ impl PixelCommandValidation {
         }
 
         if command.features.enabled(FEATURE_TEXTURE) {
-            validate_texture_mode(&command.snapshot, &mut self.violations, &mut self.blockers);
+            validate_texture_mode(&command.snapshot, &mut self.violations);
         }
         if command.features.enabled(FEATURE_ALPHA_TEST) {
             validate_alpha_test(&command.snapshot, &mut self.violations);
@@ -697,118 +654,6 @@ impl PixelCommandValidation {
         if command.features.enabled(FEATURE_STENCIL_TEST) {
             validate_stencil(&command.snapshot, &mut self.violations);
         }
-    }
-
-    fn validate_enabled_state(&mut self) {
-        let command = &self.decoded;
-        let features = command.features;
-        for descriptor in PIXEL_FEATURE_DESCRIPTORS {
-            if features.enabled(descriptor.bit) {
-                let Some(capability) = descriptor.capability else {
-                    continue;
-                };
-                add_blocker(
-                    &mut self.blockers,
-                    capability,
-                    PixelRegister::DrawMode,
-                    u64::from(features.raw()),
-                    if descriptor.evidence == PixelFeatureEvidence::U {
-                        PixelBlockerKind::Evidence
-                    } else {
-                        PixelBlockerKind::Implementation
-                    },
-                );
-            }
-        }
-        if features.enabled(FEATURE_LOGIC_OPERATION) {
-            let logic = command.snapshot.logic_operation() & 0x0f;
-            if logic != LOGIC_COPY {
-                add_blocker(
-                    &mut self.blockers,
-                    PixelCapability::LogicReadModifyWrite,
-                    PixelRegister::LogicOperation,
-                    u64::from(logic),
-                    PixelBlockerKind::Implementation,
-                );
-            }
-        }
-        if features.enabled(FEATURE_COLOR_MASK) && command.snapshot.color_mask() != u32::MAX {
-            add_blocker(
-                &mut self.blockers,
-                PixelCapability::PartialColorMask,
-                PixelRegister::ColorMask,
-                u64::from(command.snapshot.color_mask()),
-                PixelBlockerKind::Implementation,
-            );
-        }
-        if features.color_byte_mask() != 0x0f {
-            add_blocker(
-                &mut self.blockers,
-                PixelCapability::PartialColorByteMask,
-                PixelRegister::DrawMode,
-                u64::from(features.color_byte_mask()),
-                PixelBlockerKind::Implementation,
-            );
-        }
-    }
-
-    fn validate_capabilities(&mut self) {
-        let command = &self.decoded;
-        if command.source.double_pixel || command.destination.double_pixel {
-            add_blocker(
-                &mut self.blockers,
-                PixelCapability::DoublePixel,
-                PixelRegister::DestinationBufferMode,
-                u64::from(command.destination.raw),
-                PixelBlockerKind::Implementation,
-            );
-        }
-        let pixel_transfer = command.features.pixel_transfer();
-        if if pixel_transfer {
-            command.source.kind.buffer_selector().is_none()
-                || command.destination.kind.buffer_selector().is_none()
-        } else {
-            command.source.kind.framebuffer_selector().is_none()
-                || command.destination.kind.framebuffer_selector().is_none()
-        } {
-            add_blocker(
-                &mut self.blockers,
-                PixelCapability::BufferKind,
-                PixelRegister::DestinationBufferMode,
-                u64::from(command.destination.raw),
-                PixelBlockerKind::Implementation,
-            );
-        }
-        if !pixel_transfer
-            && (!command.source.format.supported_for_flat_write()
-                || !command.destination.format.supported_for_flat_write())
-        {
-            add_blocker(
-                &mut self.blockers,
-                PixelCapability::PixelFormat,
-                PixelRegister::DestinationBufferMode,
-                u64::from(command.destination.raw),
-                PixelBlockerKind::Implementation,
-            );
-        }
-        match command.primitive_kind {
-            PixelPrimitiveKind::Point
-            | PixelPrimitiveKind::Triangle
-            | PixelPrimitiveKind::Flush => {}
-            PixelPrimitiveKind::Line => self.validate_line_capabilities(),
-            PixelPrimitiveKind::Rectangle => self.validate_rectangle_capabilities(),
-            PixelPrimitiveKind::Invalid(_) => {}
-        }
-    }
-
-    fn validate_line_capabilities(&mut self) {
-        let command = &self.decoded;
-        let _ = command;
-    }
-
-    fn validate_rectangle_capabilities(&mut self) {
-        let command = &self.decoded;
-        let _ = command;
     }
 }
 
@@ -917,6 +762,19 @@ fn validate_buffer_mode(
             PixelViolationKind::InvalidCombination,
         );
     }
+    if mode.double_pixel
+        && mode.buffer_depth != 3
+        && mode.pixel_depth != 3
+        && mode.buffer_depth != mode.pixel_depth + 1
+    {
+        add_violation(
+            violations,
+            register,
+            PixelField::BufferDepth,
+            u64::from(mode.raw),
+            PixelViolationKind::InvalidCombination,
+        );
+    }
     if destination && matches!(mode.format, PixelFormat::YCrCb(_)) {
         add_violation(
             violations,
@@ -931,7 +789,6 @@ fn validate_buffer_mode(
 fn validate_texture_mode(
     snapshot: &PixelCommandSnapshot,
     violations: &mut Vec<PixelCommandViolation>,
-    blockers: &mut Vec<PixelCommandBlocker>,
 ) {
     let raw = snapshot.register32(0x110);
     add_reserved(
@@ -950,7 +807,7 @@ fn validate_texture_mode(
         );
     }
     let texel_depth = (raw >> 18) & 3;
-    if texel_depth == 3 {
+    if !matches!(texel_depth, 1 | 2) {
         add_violation(
             violations,
             PixelRegister::TextureMode,
@@ -959,6 +816,12 @@ fn validate_texture_mode(
             PixelViolationKind::InvalidEncoding,
         );
     }
+    let format = snapshot.register64(0x118);
+    add_reserved(
+        violations,
+        PixelRegister::TextureFormat,
+        format & 0xffff_0000_0000_0000,
+    );
     let base_level = (raw >> 14) & 0x0f;
     let max_level = (raw >> 10) & 0x0f;
     if base_level > max_level {
@@ -968,15 +831,6 @@ fn validate_texture_mode(
             PixelField::TextureBaseLevel,
             u64::from(base_level),
             PixelViolationKind::InvalidCombination,
-        );
-    }
-    if base_level > 10 || max_level > 10 {
-        add_blocker(
-            blockers,
-            PixelCapability::TextureLevelRange,
-            PixelRegister::TextureMode,
-            u64::from(raw),
-            PixelBlockerKind::Evidence,
         );
     }
     let min_filter = (raw >> 7) & 7;
@@ -1089,21 +943,6 @@ fn add_violation(
     });
 }
 
-fn add_blocker(
-    blockers: &mut Vec<PixelCommandBlocker>,
-    capability: PixelCapability,
-    register: PixelRegister,
-    value: u64,
-    kind: PixelBlockerKind,
-) {
-    blockers.push(PixelCommandBlocker {
-        capability,
-        register,
-        value,
-        kind,
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,9 +956,6 @@ mod tests {
 
     #[test]
     fn every_low_draw_mode_bit_is_defined() {
-        let mut described_bits = PIXEL_FEATURE_DESCRIPTORS.map(|descriptor| descriptor.bit);
-        described_bits.sort_unstable();
-        assert_eq!(described_bits, core::array::from_fn(|index| index as u8));
         for bit in 0..24 {
             let validation = PixelCommandValidation::decode(snapshot(0, 1 << bit));
             assert!(
@@ -1131,6 +967,17 @@ mod tests {
             );
             assert_eq!(validation.decoded.features.raw(), 1 << bit);
         }
+    }
+
+    #[test]
+    fn dither_and_logic_bits_follow_the_register_specification() {
+        let dither = PixelCommandValidation::decode(snapshot(0, 1 << 9));
+        assert!(dither.decoded.features.dither());
+        assert!(!dither.decoded.features.logic());
+
+        let logic = PixelCommandValidation::decode(snapshot(0, 1 << 8));
+        assert!(logic.decoded.features.logic());
+        assert!(!logic.decoded.features.dither());
     }
 
     #[test]
@@ -1158,7 +1005,6 @@ mod tests {
     #[test]
     fn flush_opcode_is_legal_and_has_no_capability_blocker() {
         let validation = PixelCommandValidation::decode(snapshot(0x0400_0000, 0x78));
-        assert!(validation.blockers.is_empty());
         assert!(validation.violations.is_empty());
     }
 
@@ -1240,11 +1086,10 @@ mod tests {
             "{:?}",
             validation.violations
         );
-        assert!(validation.blockers.len() >= 6);
     }
 
     #[test]
-    fn invalid_fields_and_capabilities_are_reported_together_in_stable_order() {
+    fn invalid_fields_are_reported_in_stable_order() {
         let mut registers = PixelRegisters::new();
         registers.write(PIXEL_PIPE_BASE, 4, 0xffff_ffff);
         registers.write(PIXEL_PIPE_BASE + 0x008, 4, 0xffff_ffff);
@@ -1256,8 +1101,6 @@ mod tests {
         let first = PixelCommandValidation::decode(registers.command_snapshot(PIXEL_PIPE_NULL));
         let second = PixelCommandValidation::decode(first.decoded.snapshot.clone());
         assert!(first.violations.len() > 4);
-        assert!(first.blockers.len() > 2);
         assert_eq!(first.violations, second.violations);
-        assert_eq!(first.blockers, second.blockers);
     }
 }

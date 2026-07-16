@@ -2,5 +2,6 @@
 
 pub(super) mod command;
 pub(super) mod format;
+pub(super) mod fragment;
 pub(super) mod raster;
 pub(super) mod stipple;

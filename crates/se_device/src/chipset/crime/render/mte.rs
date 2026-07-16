@@ -3,7 +3,8 @@
 use super::{
     FRAMEBUFFER_HEIGHT, FRAMEBUFFER_TILE_HEIGHT, FRAMEBUFFER_TILE_ROW_BYTES,
     FRAMEBUFFER_TILES_PER_ROW, FramebufferTlbEntry, LINEAR_PAGE_COUNT, LINEAR_PAGE_SIZE,
-    LinearTlbEntry, MAX_MEMORY_CHUNK_BYTES, MteInvalidField, MteRegisters, RenderTlbs, framebuffer,
+    LinearTlbEntry, MAX_MEMORY_CHUNK_BYTES, MteInvalidField, MteRegisters, RenderTlbs,
+    SemanticFallbackProvenance, framebuffer,
 };
 
 const FRAMEBUFFER_TLB_ENTRY_COUNT: usize = 256;
@@ -422,6 +423,7 @@ pub(super) struct MteJob {
     pub(super) row_buffer: Vec<u8>,
     pub(super) row_write_offset: usize,
     pub(super) processed_pixels: u64,
+    pub(super) semantic_fallbacks: SemanticFallbackProvenance,
 }
 
 impl MteJob {
@@ -507,6 +509,11 @@ impl MteJob {
             row_buffer: Vec::new(),
             row_write_offset: 0,
             processed_pixels: 0,
+            semantic_fallbacks: if reverse {
+                SemanticFallbackProvenance::mte_overlap()
+            } else {
+                SemanticFallbackProvenance::default()
+            },
         })
     }
 

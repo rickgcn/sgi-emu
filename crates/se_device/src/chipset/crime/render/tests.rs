@@ -13,9 +13,169 @@ use crate::chipset::gbe::display::{PlaneDepth, decode_raw_pixels};
 const PROM_CLEAR_MODE: u32 = 0x0000_0011;
 const PIXEL_PIPE_FLUSH: u64 = PIXEL_PIPE_BASE + 0x1f8;
 
+const IDE_SHA256: &str = "f5099f85c3917b61a7eca207f12cfa0e8cc1e5fdf411e99305fd49a2a2c933f9";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegisterWrite {
+    offset: u16,
+    value: u32,
+}
+
+const IDE_TLB_GROUP_SLOTS: [usize; 7] = [64, 64, 64, 28, 4, 16, 16];
+
+const IDE_X_POINT: [RegisterWrite; 6] = [
+    RegisterWrite {
+        offset: 0x018,
+        value: 0x0000_02f8,
+    },
+    RegisterWrite {
+        offset: 0x1b0,
+        value: 3,
+    },
+    RegisterWrite {
+        offset: 0x060,
+        value: 0x0000_0000,
+    },
+    RegisterWrite {
+        offset: 0x0d0,
+        value: 0,
+    },
+    RegisterWrite {
+        offset: 0x070,
+        value: 0,
+    },
+    RegisterWrite {
+        offset: 0x9f0,
+        value: 0,
+    },
+];
+
+const IDE_X_LINE: [RegisterWrite; 8] = [
+    RegisterWrite {
+        offset: 0x018,
+        value: 0x0000_02f8,
+    },
+    RegisterWrite {
+        offset: 0x1b0,
+        value: 3,
+    },
+    RegisterWrite {
+        offset: 0x1b8,
+        value: u32::MAX,
+    },
+    RegisterWrite {
+        offset: 0x060,
+        value: 0x0100_0020,
+    },
+    RegisterWrite {
+        offset: 0x0d0,
+        value: 0,
+    },
+    RegisterWrite {
+        offset: 0x070,
+        value: 0,
+    },
+    RegisterWrite {
+        offset: 0x074,
+        value: 0,
+    },
+    RegisterWrite {
+        offset: 0x9f0,
+        value: 0,
+    },
+];
+
+const IDE_ZERO_RECTANGLE: [RegisterWrite; 7] = [
+    RegisterWrite {
+        offset: 0x0d0,
+        value: 0,
+    },
+    RegisterWrite {
+        offset: 0x018,
+        value: 0x0000_02f8,
+    },
+    RegisterWrite {
+        offset: 0x070,
+        value: 0,
+    },
+    RegisterWrite {
+        offset: 0x074,
+        value: 0x04ff_03ff,
+    },
+    RegisterWrite {
+        offset: 0x060,
+        value: 0x0302_0000,
+    },
+    RegisterWrite {
+        offset: 0x9f0,
+        value: 0,
+    },
+    RegisterWrite {
+        offset: 0x1f8,
+        value: 0,
+    },
+];
+
+const IDE_TRANSPARENT_LINE_STIPPLE: [RegisterWrite; 4] = [
+    RegisterWrite {
+        offset: 0x018,
+        value: 0x0008_02f8,
+    },
+    RegisterWrite {
+        offset: 0x060,
+        value: 0x0100_0020,
+    },
+    RegisterWrite {
+        offset: 0x0c0,
+        value: 0x101f_0000,
+    },
+    RegisterWrite {
+        offset: 0x9f0,
+        value: 0,
+    },
+];
+
+const IDE_VISUAL_CRCS: [((u8, u8), u64); 5] = [
+    ((1, 1), 0x1dee_1dee_1dee_1dee),
+    ((4, 1), 0xe992_e992_e992_e992),
+    ((2, 2), 0x9f8b_0000_0000_0000),
+    ((8, 4), 0x0000_6bf7_0000_0000),
+    ((2, 8), 0x0000_0000_9f8b_0000),
+];
+
+fn replay_pixel_register_stream(stream: &[RegisterWrite]) -> DecodedPixelCommand {
+    let mut render = CrimeRender::new();
+    let mut decoded = None;
+    for write in stream {
+        let address = PIXEL_PIPE_BASE + u64::from(write.offset);
+        if write.offset & START_OFFSET as u16 != 0 {
+            let trigger = address - START_OFFSET;
+            let command = render.pixel.command_snapshot(trigger);
+            decoded = Some(
+                render
+                    .snapshot_pixel_execution(command)
+                    .expect("frozen IDE command must remain legal")
+                    .command,
+            );
+        } else {
+            render.write(address, 4, u64::from(write.value)).unwrap();
+            render.step().unwrap();
+        }
+    }
+    decoded.expect("frozen IDE stream must contain a START write")
+}
+
 fn write_completion() -> Result<CrimeMemoryOutcome, CrimeBusError> {
     Ok(CrimeMemoryOutcome::new(
         CrimeCompletionPayload::WriteComplete,
+        None,
+        None,
+    ))
+}
+
+fn read_completion(data: &[u8]) -> Result<CrimeMemoryOutcome, CrimeBusError> {
+    Ok(CrimeMemoryOutcome::new(
+        CrimeCompletionPayload::ReadData(data.to_vec().into()),
         None,
         None,
     ))
@@ -28,6 +188,53 @@ fn retire(render: &mut CrimeRender) -> RenderProgress {
 fn queue_and_retire(render: &mut CrimeRender, address: u64, size: u8, value: u64) {
     render.write(address, size, value).unwrap();
     retire(render);
+}
+
+#[test]
+fn qnd_gfx_test_offline_replays_the_frozen_command_corpus() {
+    assert_eq!(IDE_SHA256.len(), 64);
+    assert_eq!(IDE_TLB_GROUP_SLOTS.iter().sum::<usize>(), 256);
+
+    let mut tlb = CrimeRender::new();
+    let ranges = [
+        FRAMEBUFFER_A_BASE,
+        FRAMEBUFFER_B_BASE,
+        FRAMEBUFFER_C_BASE,
+        TEXTURE_TLB_BASE,
+        CID_TLB_BASE,
+        LINEAR_A_BASE,
+        LINEAR_B_BASE,
+    ];
+    for (group, (base, slots)) in ranges.into_iter().zip(IDE_TLB_GROUP_SLOTS).enumerate() {
+        for slot in 0..slots {
+            let address = base + slot as u64 * 8;
+            let value = (group as u64) << 56 | (slot as u64) << 32 | 0x55aa_a55a;
+            tlb.write(address, 8, value).unwrap();
+            tlb.step().unwrap();
+            assert_eq!(tlb.read(address, 8), Ok(value));
+        }
+    }
+
+    for (stream, expected_primitive) in [
+        (IDE_X_POINT.as_slice(), 0x0000_0000),
+        (IDE_X_LINE.as_slice(), 0x0100_0020),
+        (IDE_ZERO_RECTANGLE.as_slice(), 0x0302_0000),
+        (IDE_TRANSPARENT_LINE_STIPPLE.as_slice(), 0x0100_0020),
+    ] {
+        let decoded = replay_pixel_register_stream(stream);
+        assert_eq!(decoded.primitive_raw, expected_primitive);
+    }
+
+    assert_eq!(
+        IDE_VISUAL_CRCS,
+        [
+            ((1, 1), 0x1dee_1dee_1dee_1dee),
+            ((4, 1), 0xe992_e992_e992_e992),
+            ((2, 2), 0x9f8b_0000_0000_0000),
+            ((8, 4), 0x0000_6bf7_0000_0000),
+            ((2, 8), 0x0000_0000_9f8b_0000),
+        ]
+    );
 }
 
 fn configure_prom_clear(render: &mut CrimeRender, linear_a: u64, start: u32, end: u32) {
@@ -388,27 +595,107 @@ fn tagged_mte_write_is_canonicalized_and_tagged_reads_are_rejected() {
 fn pixel_start_aliases_submit_the_frozen_primitive_state() {
     let mut render = CrimeRender::new();
     render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
-    let error = render.step().unwrap_err();
-    assert!(matches!(
-        error,
-        CrimeRenderError::UnsupportedPixelCommand {
-            trigger_address: PIXEL_PIPE_NULL,
-            primitive: 0,
-            draw_mode: 0,
-            ref blockers,
-            ..
-        } if !blockers.is_empty()
-    ));
-    assert!(matches!(
-        render.active_pixel_command,
-        Some(PixelExecution::Blocked(_))
-    ));
+    let progress = retire(&mut render);
+    assert!(progress.memory_request.is_some());
+    let Some(PixelExecution::Running(job)) = render.active_pixel_command.as_ref() else {
+        panic!("legal point command did not start")
+    };
+    assert_eq!(job.command.snapshot.trigger_address, PIXEL_PIPE_NULL);
+    assert_eq!(job.command.primitive_raw, 0);
+    assert_eq!(job.command.snapshot.draw_mode(), 0);
 
     let mut flush = CrimeRender::new();
     flush.write(PIXEL_PIPE_FLUSH, 4, 0).unwrap();
     let progress = retire(&mut flush);
     assert!(progress.memory_request.is_none());
     assert!(flush.active_pixel_command.is_none());
+
+    let mut command_flush = CrimeRender::new();
+    queue_and_retire(&mut command_flush, PIXEL_PIPE_BASE + 0x060, 4, 0x0400_0000);
+    command_flush
+        .write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0)
+        .unwrap();
+    retire(&mut command_flush);
+    assert!(
+        retire(&mut command_flush)
+            .notices
+            .contains(&RenderNotice::PixelCommandCompleted {
+                primitive: 0x0400_0000,
+                x0: 0,
+                y0: 0,
+                x1: 0,
+                y1: 0,
+                reason: RenderCompletionReason::Flush,
+            })
+    );
+}
+
+#[test]
+fn semantic_fallback_is_emitted_once_and_persisted_with_the_pixel_job() {
+    let mut render = CrimeRender::new();
+    configure_x_line(&mut render, 0x1122_3344, 0, 0, 0, 0);
+    queue_and_retire(
+        &mut render,
+        PIXEL_PIPE_BASE + 0x018,
+        4,
+        u64::from(1_u32 << 22 | 0x0000_02f8),
+    );
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let committed = retire(&mut render);
+    let fallbacks = committed
+        .notices
+        .iter()
+        .filter_map(|notice| match notice {
+            RenderNotice::SemanticFallback {
+                domain: RenderMemoryDestination::Pixel,
+                command: 0x0100_0020,
+                provenance,
+            } => Some(*provenance),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fallbacks.len(), 1);
+    assert_ne!(
+        fallbacks[0].algorithm_mask() & SemanticFallbackProvenance::GL_RASTER_6BIT_TOP_LEFT_V1,
+        0
+    );
+
+    let encoded = postcard::to_stdvec(&render).unwrap();
+    let restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+    assert_eq!(restored, render);
+    let Some(PixelExecution::Running(job)) = restored.active_pixel_command.as_ref() else {
+        panic!("pixel fallback job was not restored")
+    };
+    assert_eq!(job.semantic_fallbacks, fallbacks[0]);
+}
+
+#[test]
+fn every_fragment_memory_stage_round_trips_in_active_state() {
+    let mut render = CrimeRender::new();
+    configure_x_line(&mut render, 0x1122_3344, 0, 0, 0, 0);
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x018, 4, 0x0000_03f8);
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x1b0, 4, 6);
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+    assert!(retire(&mut render).memory_request.is_some());
+
+    for stage in [
+        FragmentMemoryStage::ClipIdRead,
+        FragmentMemoryStage::DestinationRead,
+        FragmentMemoryStage::TextureRead,
+        FragmentMemoryStage::StencilDepthRead,
+        FragmentMemoryStage::Compute,
+        FragmentMemoryStage::StencilDepthWrite,
+        FragmentMemoryStage::ColorWrite,
+    ] {
+        let Some(PixelExecution::Running(job)) = render.active_pixel_command.as_mut() else {
+            panic!("fragment command was not active")
+        };
+        job.fragment.as_mut().unwrap().stage = stage;
+        let encoded = postcard::to_stdvec(&render).unwrap();
+        let restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(restored, render);
+    }
 }
 
 #[test]
@@ -425,10 +712,10 @@ fn tagged_mte_null_and_flush_retire_without_starting_a_transfer() {
 }
 
 #[test]
-fn unsupported_pixel_start_preserves_an_immutable_command_snapshot() {
+fn legal_pixel_start_preserves_an_immutable_command_snapshot() {
     let mut render = CrimeRender::new();
-    let initial_draw_mode = 0x0012_3400_u32;
-    let primitive = 0x0200_0020_u32;
+    let initial_draw_mode = 0x0000_0178_u32;
+    let primitive = 0_u32;
     render
         .write(PIXEL_PIPE_BASE + 0x018, 4, initial_draw_mode.into())
         .unwrap();
@@ -440,29 +727,19 @@ fn unsupported_pixel_start_preserves_an_immutable_command_snapshot() {
         .unwrap();
 
     retire(&mut render);
-    let error = render.step().unwrap_err();
-    assert!(matches!(
-        &error,
-        CrimeRenderError::UnsupportedPixelCommand {
-            trigger_address,
-            primitive: captured_primitive,
-            draw_mode,
-            blockers,
-            ..
-        } if *trigger_address == PIXEL_PIPE_BASE + 0x060
-            && *captured_primitive == primitive
-            && *draw_mode == initial_draw_mode
-            && !blockers.is_empty()
-    ));
-    let Some(PixelExecution::Blocked(blocked)) = render.active_pixel_command.as_ref() else {
-        panic!("unsupported command snapshot was not retained")
+    let progress = retire(&mut render);
+    assert!(progress.memory_request.is_some());
+    let Some(PixelExecution::Running(job)) = render.active_pixel_command.as_ref() else {
+        panic!("legal command snapshot was not retained")
     };
-    assert_eq!(blocked.command.snapshot.primitive(), primitive);
-    assert_eq!(blocked.command.snapshot.draw_mode(), initial_draw_mode);
-    assert_eq!(blocked.error, error);
+    assert_eq!(
+        job.command.snapshot.trigger_address,
+        PIXEL_PIPE_BASE + 0x060
+    );
+    assert_eq!(job.command.snapshot.primitive(), primitive);
+    assert_eq!(job.command.snapshot.draw_mode(), initial_draw_mode);
     assert_eq!(render.interface_level(), 1);
     assert_eq!(render.status() & STATUS_PIXEL_PIPE_IDLE, 0);
-    assert_eq!(render.step(), Err(error));
 }
 
 #[test]
@@ -545,6 +822,7 @@ fn diagnostic_x_line_stream_writes_big_endian_rgba_through_framebuffer_b() {
                 y0: 0,
                 x1: 7,
                 y1: 0,
+                reason: RenderCompletionReason::RasterizerExhausted,
             })
     );
     assert!(render.active_pixel_command.is_none());
@@ -980,6 +1258,7 @@ fn prom_ci8_zero_rectangle_walks_inclusive_rows_through_framebuffer_a() {
                 y0: 0,
                 x1: 63,
                 y1: 1,
+                reason: RenderCompletionReason::RasterizerExhausted,
             })
     );
     assert!(render.active_pixel_command.is_none());
@@ -1097,6 +1376,7 @@ fn prom_ci8_flat_rectangle_supports_evidence_backed_descending_rows() {
                 y0: 2,
                 x1: 5,
                 y1: 1,
+                reason: RenderCompletionReason::RasterizerExhausted,
             })
     );
 }
@@ -1421,11 +1701,11 @@ fn mte_flush_waits_for_the_outstanding_memory_completion() {
 
     render.complete_memory(write_completion()).unwrap();
     let completed = retire(&mut render);
-    assert!(
-        completed
-            .notices
-            .contains(&RenderNotice::JobCompleted { start: 0, end: 0 })
-    );
+    assert!(completed.notices.contains(&RenderNotice::JobCompleted {
+        start: 0,
+        end: 0,
+        reason: RenderCompletionReason::TransferComplete,
+    }));
     assert_eq!(render.interface_level(), 1);
 
     let flushed = retire(&mut render);
@@ -1747,6 +2027,13 @@ fn overlapping_mte_copy_uses_memmove_safe_reverse_order() {
     render
         .write(MTE_BASE + START_OFFSET, 4, mode.into())
         .unwrap();
+    let committed = retire(&mut render);
+    assert!(committed.notices.contains(&RenderNotice::SemanticFallback {
+        domain: RenderMemoryDestination::Mte,
+        command: mode,
+        provenance: SemanticFallbackProvenance::mte_overlap(),
+    }));
+    complete_through_sdram(&mut render, &mut sdram, committed.memory_request.unwrap());
     run_mte_through_sdram(&mut render, &mut sdram);
 
     assert_eq!(&read_gbe_word(&mut sdram, 0x1000)[..5], [1, 1, 2, 3, 4]);
@@ -1838,6 +2125,412 @@ fn pixel_dma_converts_linear_ycrcb_into_tiled_rgba() {
 }
 
 #[test]
+fn logic_operation_uses_a_serialized_destination_rmw() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 2) << 48,
+    );
+    for (offset, value) in [
+        (0x000, 0x0000_0228),
+        (0x008, 0x0000_0228),
+        (0x018, 0x0000_0178),
+        (0x060, 0),
+        (0x070, 0),
+        (0x0d0, 0x0f0f_55aa),
+        (0x1b0, 6),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value);
+    }
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let read = retire(&mut render).memory_request.unwrap();
+    assert!(matches!(
+        read.transfer.view(),
+        CrimeTransferView::Read { length: 4 }
+    ));
+    assert_eq!(read.alias_address, 2 * FRAMEBUFFER_TILE_BYTES + 28);
+    let destination = [0x33, 0x33, 0xcc, 0xcc];
+    render
+        .complete_memory(read_completion(&destination))
+        .unwrap();
+
+    let write = retire(&mut render).memory_request.unwrap();
+    let CrimeTransferView::Write { data, byte_enable } = write.transfer.view() else {
+        panic!("logic operation did not issue its write stage")
+    };
+    assert_eq!(
+        data,
+        logic_operation(6, 0x0f0f_55aa, 0x3333_cccc).to_be_bytes()
+    );
+    assert!(byte_enable.iter().all(|enabled| enabled));
+}
+
+#[test]
+fn texture_replace_reads_the_texture_tlb_before_color_write() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 2) << 48,
+    );
+    queue_and_retire(
+        &mut render,
+        TEXTURE_TLB_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 4) << 48,
+    );
+    for (offset, value) in [
+        (0x000, 0x0000_0228),
+        (0x008, 0x0000_0228),
+        (0x018, 1 << 15 | 0x78),
+        (0x060, 0),
+        (0x070, 0),
+        (0x110, 2 << 20 | 2 << 18 | 1 << 4 | 1 << 2 | 3),
+        (0x130, 1 << 12),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value);
+    }
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x118, 8, 0);
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x120, 8, 0);
+    queue_and_retire(&mut render, PIXEL_PIPE_BASE + 0x128, 8, 0);
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let destination_read = retire(&mut render).memory_request.unwrap();
+    render
+        .complete_memory(read_completion(&[0, 0, 0, 0]))
+        .unwrap();
+    let texture_read = retire(&mut render).memory_request.unwrap();
+    assert_eq!(texture_read.raw_entry, u32::from(FRAMEBUFFER_TLB_VALID | 4));
+    assert_eq!(texture_read.alias_address, 4 * FRAMEBUFFER_TILE_BYTES);
+    let texel = [0x12, 0x34, 0x56, 0x78];
+    render.complete_memory(read_completion(&texel)).unwrap();
+
+    let color_write = retire(&mut render).memory_request.unwrap();
+    assert_eq!(color_write.alias_address, destination_read.alias_address);
+    let CrimeTransferView::Write { data, .. } = color_write.transfer.view() else {
+        panic!("texture replace did not issue a color write")
+    };
+    assert_eq!(data, texel);
+}
+
+#[test]
+fn depth_update_precedes_the_color_write() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 2) << 48,
+    );
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_C_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 5) << 48,
+    );
+    for (offset, value) in [
+        (0x000, 0x0000_0228),
+        (0x008, 0x0000_0228),
+        (0x018, 0x0000_007e),
+        (0x060, 0),
+        (0x070, 0),
+        (0x0d0, 0xaabb_ccdd),
+        (0x1c0, 7 << 25),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value);
+    }
+    queue_and_retire(
+        &mut render,
+        PIXEL_PIPE_BASE + 0x1c8,
+        8,
+        u64::from(0x0012_3456_u32) << 12,
+    );
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let destination_read = retire(&mut render).memory_request.unwrap();
+    render
+        .complete_memory(read_completion(&[0, 0, 0, 0]))
+        .unwrap();
+    let depth_read = retire(&mut render).memory_request.unwrap();
+    assert_eq!(depth_read.raw_entry, u32::from(FRAMEBUFFER_TLB_VALID | 5));
+    render
+        .complete_memory(read_completion(&[0x7f, 0xff, 0xff, 0xff]))
+        .unwrap();
+
+    let depth_write = retire(&mut render).memory_request.unwrap();
+    let CrimeTransferView::Write { data, .. } = depth_write.transfer.view() else {
+        panic!("depth mask did not issue an update")
+    };
+    assert_eq!(data, [0x7f, 0x12, 0x34, 0x56]);
+    render.complete_memory(write_completion()).unwrap();
+
+    let color_write = retire(&mut render).memory_request.unwrap();
+    assert_eq!(color_write.alias_address, destination_read.alias_address);
+    let CrimeTransferView::Write { data, .. } = color_write.transfer.view() else {
+        panic!("passing depth test did not issue a color write")
+    };
+    assert_eq!(data, 0xaabb_ccdd_u32.to_be_bytes());
+}
+
+#[test]
+fn failing_alpha_test_discards_color_without_a_write() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 2) << 48,
+    );
+    for (offset, value) in [
+        (0x000, 0x0000_0228),
+        (0x008, 0x0000_0228),
+        (0x018, 1 << 11 | 0x78),
+        (0x060, 0),
+        (0x070, 0),
+        (0x0d0, 0xffff_ffff),
+        (0x198, 0),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value);
+    }
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let read = retire(&mut render).memory_request.unwrap();
+    assert!(matches!(
+        read.transfer.view(),
+        CrimeTransferView::Read { length: 4 }
+    ));
+    render
+        .complete_memory(read_completion(&[0x11, 0x22, 0x33, 0x44]))
+        .unwrap();
+    while render.active_pixel_command.is_some() {
+        assert!(retire(&mut render).memory_request.is_none());
+    }
+}
+
+#[test]
+fn pixel_dma_blend_enters_the_shared_fragment_pipeline() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        LINEAR_A_BASE,
+        8,
+        u64::from(0x8000_0001_u32) << 32,
+    );
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 2) << 48,
+    );
+    for (offset, value) in [
+        (0x000, 0x0000_1228),
+        (0x008, 0x0000_0228),
+        (0x018, 1 << 21 | 1 << 10 | 0x78),
+        (0x060, 0),
+        (0x070, 0),
+        (0x0a0, 0),
+        (0x0a8, 4),
+        (0x1a8, 0x45),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value);
+    }
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let source_read = retire(&mut render).memory_request.unwrap();
+    assert_eq!(source_read.raw_entry, 0x8000_0001);
+    render
+        .complete_memory(read_completion(&[0xff, 0x00, 0x00, 0x80]))
+        .unwrap();
+    let destination_read = retire(&mut render).memory_request.unwrap();
+    assert_eq!(
+        destination_read.raw_entry,
+        u32::from(FRAMEBUFFER_TLB_VALID | 2)
+    );
+    render
+        .complete_memory(read_completion(&[0x00, 0x00, 0xff, 0xff]))
+        .unwrap();
+
+    let write = retire(&mut render).memory_request.unwrap();
+    let CrimeTransferView::Write { data, .. } = write.transfer.view() else {
+        panic!("PixelDMA blend did not issue a color write")
+    };
+    assert_eq!(data, [0x80, 0x00, 0x7f, 0xbf]);
+}
+
+#[test]
+fn color_plane_and_byte_masks_preserve_disabled_destination_bits() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 2) << 48,
+    );
+    let source = 0xaabb_ccdd_u32;
+    let destination = 0x1122_3344_u32;
+    let plane_mask = 0x0ff0_0ff0_u32;
+    for (offset, value) in [
+        (0x000, 0x0000_0228),
+        (0x008, 0x0000_0228),
+        (0x018, 1 << 7 | 0b1010 << 3),
+        (0x060, 0),
+        (0x070, 0),
+        (0x0d0, source),
+        (0x1b8, plane_mask),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value.into());
+    }
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    retire(&mut render);
+    render
+        .complete_memory(read_completion(&destination.to_be_bytes()))
+        .unwrap();
+    let write = retire(&mut render).memory_request.unwrap();
+    let CrimeTransferView::Write { data, .. } = write.transfer.view() else {
+        panic!("masked fragment did not issue a color write")
+    };
+    let mut expected = ((source & plane_mask) | (destination & !plane_mask)).to_be_bytes();
+    expected[1] = destination.to_be_bytes()[1];
+    expected[3] = destination.to_be_bytes()[3];
+    assert_eq!(data, expected);
+}
+
+#[test]
+fn clip_id_bitmap_filters_before_destination_access() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        CID_TLB_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 3) << 48,
+    );
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 2) << 48,
+    );
+    for (offset, value) in [
+        (0x000, 0),
+        (0x008, 0),
+        (0x010, 1 << 11),
+        (0x018, 0x78),
+        (0x060, 0),
+        (0x070, 0),
+        (0x0d0, 0x5a),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value);
+    }
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let cid_read = retire(&mut render).memory_request.unwrap();
+    assert_eq!(cid_read.raw_entry, u32::from(FRAMEBUFFER_TLB_VALID | 3));
+    assert_eq!(cid_read.alias_address, 3 * FRAMEBUFFER_TILE_BYTES);
+    render.complete_memory(read_completion(&[0x80])).unwrap();
+    let destination_read = retire(&mut render).memory_request.unwrap();
+    assert_eq!(
+        destination_read.raw_entry,
+        u32::from(FRAMEBUFFER_TLB_VALID | 2)
+    );
+
+    let mut rejected = CrimeRender::new();
+    queue_and_retire(
+        &mut rejected,
+        CID_TLB_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 3) << 48,
+    );
+    for (offset, value) in [
+        (0x000, 0),
+        (0x008, 0),
+        (0x010, 1 << 11),
+        (0x018, 0x78),
+        (0x060, 0),
+        (0x070, 0),
+    ] {
+        queue_and_retire(&mut rejected, PIXEL_PIPE_BASE + offset, 4, value);
+    }
+    rejected
+        .write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0)
+        .unwrap();
+    retire(&mut rejected);
+    rejected.complete_memory(read_completion(&[0])).unwrap();
+    while rejected.active_pixel_command.is_some() {
+        assert!(retire(&mut rejected).memory_request.is_none());
+    }
+}
+
+#[test]
+fn double_pixel_select_chooses_the_requested_buffer_half() {
+    for (select, expected_alias) in [(false, 28), (true, 30)] {
+        let mut render = CrimeRender::new();
+        queue_and_retire(
+            &mut render,
+            FRAMEBUFFER_A_BASE,
+            8,
+            u64::from(FRAMEBUFFER_TLB_VALID | 2) << 48,
+        );
+        let buffer_mode = 0x0000_0226 | u32::from(select);
+        for (offset, value) in [
+            (0x000, buffer_mode),
+            (0x008, buffer_mode),
+            (0x018, 0x78),
+            (0x060, 0),
+            (0x070, 0),
+            (0x0d0, 0xaabb_ccdd),
+        ] {
+            queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value.into());
+        }
+        render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+        let read = retire(&mut render).memory_request.unwrap();
+        assert_eq!(
+            read.alias_address,
+            2 * FRAMEBUFFER_TILE_BYTES + expected_alias
+        );
+        assert!(matches!(
+            read.transfer.view(),
+            CrimeTransferView::Read { length: 2 }
+        ));
+    }
+}
+
+#[test]
+fn flat_raster_to_linear_buffer_uses_the_deterministic_row_stride() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        LINEAR_A_BASE,
+        8,
+        u64::from(0x8000_0001_u32) << 32,
+    );
+    for (offset, value) in [
+        (0x000, 0x0000_1228),
+        (0x008, 0x0000_1228),
+        (0x018, 0x78),
+        (0x060, 0),
+        (0x070, 2 << 16),
+        (0x0d0, 0xaabb_ccdd),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value);
+    }
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let read = retire(&mut render).memory_request.unwrap();
+    assert_eq!(read.virtual_address, 8);
+    assert_eq!(read.alias_address, 0x1008);
+    assert!(matches!(
+        read.transfer.view(),
+        CrimeTransferView::Read { length: 4 }
+    ));
+}
+
+#[test]
 fn all_seven_tlb_groups_preserve_their_first_and_last_raw_slots() {
     let mut render = CrimeRender::new();
     let ranges = [
@@ -1883,11 +2576,11 @@ fn job_snapshot_is_not_changed_by_later_linear_a_writes() {
     assert_eq!(render.interface_level(), 1);
     render.complete_memory(write_completion()).unwrap();
     let completion = retire(&mut render);
-    assert!(
-        completion
-            .notices
-            .contains(&RenderNotice::JobCompleted { start: 0, end: 0 })
-    );
+    assert!(completion.notices.contains(&RenderNotice::JobCompleted {
+        start: 0,
+        end: 0,
+        reason: RenderCompletionReason::TransferComplete,
+    }));
     assert!(completion.schedule_step);
     retire(&mut render);
     assert_eq!(render.tlbs.linear_a[0] >> 32, 0x8000_0002);

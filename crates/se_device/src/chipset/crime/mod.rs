@@ -1112,12 +1112,43 @@ impl Crime {
                 ]
                 .into(),
             ),
+            RenderNotice::SemanticFallback {
+                domain,
+                command,
+                provenance,
+            } => (
+                "semantic_fallback",
+                [
+                    OwnedTraceField {
+                        key: "domain".into(),
+                        value: OwnedTraceValue::String(
+                            match domain {
+                                RenderMemoryDestination::Mte => "mte",
+                                RenderMemoryDestination::Pixel => "pixel",
+                            }
+                            .into(),
+                        ),
+                    },
+                    OwnedTraceField {
+                        key: "command".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(command)),
+                    },
+                    OwnedTraceField {
+                        key: "algorithm_mask".into(),
+                        value: OwnedTraceValue::Hex64(u64::from(provenance.algorithm_mask())),
+                    },
+                    OwnedTraceField {
+                        key: "algorithms".into(),
+                        value: OwnedTraceValue::String(provenance.algorithm_names().into()),
+                    },
+                ]
+                .into(),
+            ),
             RenderNotice::PixelCommandDecoded {
                 primitive,
                 draw_mode,
                 feature_bits,
                 violation_count,
-                blocker_count,
             } => (
                 "pixel_command_decoded",
                 [
@@ -1136,10 +1167,6 @@ impl Crime {
                     OwnedTraceField {
                         key: "violation_count".into(),
                         value: OwnedTraceValue::U64(u64::from(violation_count)),
-                    },
-                    OwnedTraceField {
-                        key: "blocker_count".into(),
-                        value: OwnedTraceValue::U64(u64::from(blocker_count)),
                     },
                 ]
                 .into(),
@@ -1199,6 +1226,42 @@ impl Crime {
                     OwnedTraceField {
                         key: "enabled".into(),
                         value: OwnedTraceValue::U64(u64::from(enabled)),
+                    },
+                ]
+                .into(),
+            ),
+            RenderNotice::FragmentStage {
+                x,
+                y,
+                stage,
+                iteration,
+                read_modify_write,
+            } => (
+                "fragment_stage",
+                [
+                    OwnedTraceField {
+                        key: "x".into(),
+                        value: OwnedTraceValue::U64(u64::from(x)),
+                    },
+                    OwnedTraceField {
+                        key: "y".into(),
+                        value: OwnedTraceValue::U64(u64::from(y)),
+                    },
+                    OwnedTraceField {
+                        key: "stage".into(),
+                        value: OwnedTraceValue::String(stage.trace_name().into()),
+                    },
+                    OwnedTraceField {
+                        key: "stage_code".into(),
+                        value: OwnedTraceValue::U64(u64::from(stage.code())),
+                    },
+                    OwnedTraceField {
+                        key: "iteration".into(),
+                        value: OwnedTraceValue::U64(u64::from(iteration)),
+                    },
+                    OwnedTraceField {
+                        key: "read_modify_write".into(),
+                        value: OwnedTraceValue::Bool(read_modify_write),
                     },
                 ]
                 .into(),
@@ -1336,7 +1399,7 @@ impl Crime {
                 ]
                 .into(),
             ),
-            RenderNotice::JobCompleted { start, end } => (
+            RenderNotice::JobCompleted { start, end, reason } => (
                 "job_complete",
                 [
                     OwnedTraceField {
@@ -1347,6 +1410,14 @@ impl Crime {
                         key: "end".into(),
                         value: OwnedTraceValue::Hex64(u64::from(end)),
                     },
+                    OwnedTraceField {
+                        key: "reason".into(),
+                        value: OwnedTraceValue::String(reason.trace_name().into()),
+                    },
+                    OwnedTraceField {
+                        key: "reason_code".into(),
+                        value: OwnedTraceValue::U64(u64::from(reason.code())),
+                    },
                 ]
                 .into(),
             ),
@@ -1356,6 +1427,7 @@ impl Crime {
                 y0,
                 x1,
                 y1,
+                reason,
             } => (
                 "pixel_command_complete",
                 [
@@ -1378,6 +1450,14 @@ impl Crime {
                     OwnedTraceField {
                         key: "y1".into(),
                         value: OwnedTraceValue::U64(u64::from(y1)),
+                    },
+                    OwnedTraceField {
+                        key: "reason".into(),
+                        value: OwnedTraceValue::String(reason.trace_name().into()),
+                    },
+                    OwnedTraceField {
+                        key: "reason_code".into(),
+                        value: OwnedTraceValue::U64(u64::from(reason.code())),
                     },
                 ]
                 .into(),
@@ -1803,30 +1883,6 @@ impl Crime {
                 OwnedTraceField {
                     key: "violations".into(),
                     value: OwnedTraceValue::String(format!("{violations:?}").into()),
-                },
-            ]
-            .into(),
-            CrimeRenderError::UnsupportedPixelCommand {
-                trigger_address,
-                primitive,
-                draw_mode,
-                ..
-            } => [
-                OwnedTraceField {
-                    key: "kind".into(),
-                    value: OwnedTraceValue::String("unsupported_pixel_command".into()),
-                },
-                OwnedTraceField {
-                    key: "trigger_address".into(),
-                    value: OwnedTraceValue::Hex64(*trigger_address),
-                },
-                OwnedTraceField {
-                    key: "primitive".into(),
-                    value: OwnedTraceValue::Hex64(u64::from(*primitive)),
-                },
-                OwnedTraceField {
-                    key: "draw_mode".into(),
-                    value: OwnedTraceValue::Hex64(u64::from(*draw_mode)),
                 },
             ]
             .into(),

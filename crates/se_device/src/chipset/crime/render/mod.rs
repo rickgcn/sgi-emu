@@ -1,20 +1,26 @@
 //! CRIME Rendering Engine register front end and evidence-backed transfer path.
+
 use core::fmt;
+
 use super::memory::framebuffer;
 use super::protocol::{
     CrimeBusError, CrimeByteEnable, CrimeCompletionPayload, CrimeMemoryBankSelect,
     CrimeMemoryInhibitReason, CrimeMemoryOutcome, CrimeTransfer,
 };
 use super::registers;
+
 mod mte;
 mod pixel;
+
 use mte::{MteBufferSnapshot, MteJob, MteStage, MteTranslation};
+
 use pixel::command::{
-    DecodedPixelCommand, PixelCommandSnapshot, PixelCommandValidation, PixelPrimitiveKind,
-    PixelRegisters,
+    DecodedPixelCommand, PixelCommandSnapshot, PixelCommandValidation, PixelFormat,
+    PixelPrimitiveKind, PixelRegisters,
 };
 use pixel::raster::Rasterizer;
 use pixel::stipple::PixelStippleCursor;
+
 const INTERFACE_DATA_BASE: u64 = registers::CRIME_RENDER_BASE;
 const INTERFACE_ADDRESS_BASE: u64 = registers::CRIME_RENDER_BASE + 0x200;
 const INTERFACE_CONTROL: u64 = registers::CRIME_RENDER_BASE + 0x400;
@@ -48,7 +54,10 @@ const FRAMEBUFFER_TLB_VALID: u16 = 0x8000;
 const FRAMEBUFFER_TLB_TILE_MASK: u16 = 0x7fff;
 const RENDER_MEMORY_WORD_BYTES: usize = 32;
 const FRAMEBUFFER_HEIGHT: u16 = 2048;
+
+#[cfg(test)]
 const LOGIC_COPY: u32 = 3;
+
 const STATUS_IDLE: u32 = 0x1000_0000;
 const STATUS_SETUP_IDLE: u32 = 0x0800_0000;
 const STATUS_PIXEL_PIPE_IDLE: u32 = 0x0400_0000;
@@ -57,11 +66,13 @@ const STATUS_LEVEL_SHIFT: u32 = 18;
 const STATUS_READ_POINTER_SHIFT: u32 = 12;
 const STATUS_WRITE_POINTER_SHIFT: u32 = 6;
 const STATUS_START_POINTER_SHIFT: u32 = 0;
+
 const INTERFACE_CONTROL_MASK: u32 = 0x0fff_ffff;
 const INTERFACE_FULL_SHIFT: u32 = 21;
 const INTERFACE_EMPTY_SHIFT: u32 = 14;
 const INTERFACE_STALL_LEVEL_SHIFT: u32 = 7;
 const INTERFACE_FIELD_MASK: u32 = 0x7f;
+
 const ADDRESS_START: u64 = 1 << 45;
 const ADDRESS_WMASK_SHIFT: u32 = 43;
 const ADDRESS_PAGE_SHIFT: u32 = 40;
@@ -69,18 +80,138 @@ const ADDRESS_OFFSET_SHIFT: u32 = 32;
 const ADDRESS_WMASK_UPPER: u64 = 1;
 const ADDRESS_WMASK_LOWER: u64 = 2;
 const ADDRESS_WMASK_DOUBLE: u64 = 3;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct SemanticFallbackProvenance(u16);
+
+impl SemanticFallbackProvenance {
+    const GL_RASTER_6BIT_TOP_LEFT_V1: u16 = 1 << 0;
+    const FIXED_INTERPOLATION_32_32_RNE_V1: u16 = 1 << 1;
+    const TEXTURE_OPENGL_1X_V1: u16 = 1 << 2;
+    const COVERAGE_GRID_8X8_V1: u16 = 1 << 3;
+    const DITHER_BAYER_4X4_V1: u16 = 1 << 4;
+    const YCRCB_BT601_LIMITED_V1: u16 = 1 << 5;
+    const MTE_OVERLAP_ROW_BUFFER_V1: u16 = 1 << 6;
+    const CLIPPED_STIPPLE_CURSOR_V1: u16 = 1 << 7;
+    const LINEAR_RASTER_STRIDE_2048_V1: u16 = 1 << 8;
+
+    fn for_pixel(command: &DecodedPixelCommand) -> Self {
+        let mut algorithms = 0;
+        if command.features.gl() {
+            algorithms |= Self::GL_RASTER_6BIT_TOP_LEFT_V1;
+        }
+        if command.features.smooth_shade() || command.features.fog() {
+            algorithms |= Self::FIXED_INTERPOLATION_32_32_RNE_V1;
+        }
+        if command.features.texture() {
+            algorithms |= Self::TEXTURE_OPENGL_1X_V1;
+        }
+        if command.features.coverage() {
+            algorithms |= Self::COVERAGE_GRID_8X8_V1;
+        }
+        if command.features.dither()
+            && matches!(
+                command.destination.format,
+                PixelFormat::Rgb(8 | 16) | PixelFormat::Rgba(8 | 16) | PixelFormat::Abgr(8 | 16)
+            )
+        {
+            algorithms |= Self::DITHER_BAYER_4X4_V1;
+        }
+        if matches!(command.source.format, PixelFormat::YCrCb(_)) {
+            algorithms |= Self::YCRCB_BT601_LIMITED_V1;
+        }
+        if (command.line_stipple_enabled() || command.features.polygon_stipple())
+            && command.clip_mode != 0
+        {
+            algorithms |= Self::CLIPPED_STIPPLE_CURSOR_V1;
+        }
+        if !command.features.pixel_transfer()
+            && command
+                .destination
+                .kind
+                .buffer_selector()
+                .is_some_and(|selector| matches!(selector, 4 | 5))
+        {
+            algorithms |= Self::LINEAR_RASTER_STRIDE_2048_V1;
+        }
+        Self(algorithms)
+    }
+
+    pub(super) const fn mte_overlap() -> Self {
+        Self(Self::MTE_OVERLAP_ROW_BUFFER_V1)
+    }
+
+    pub(super) const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub(super) const fn algorithm_mask(self) -> u16 {
+        self.0
+    }
+
+    pub(super) fn algorithm_names(self) -> String {
+        const NAMES: [(u16, &str); 9] = [
+            (
+                SemanticFallbackProvenance::GL_RASTER_6BIT_TOP_LEFT_V1,
+                "gl_raster_6bit_top_left_v1",
+            ),
+            (
+                SemanticFallbackProvenance::FIXED_INTERPOLATION_32_32_RNE_V1,
+                "fixed_interpolation_32_32_rne_v1",
+            ),
+            (
+                SemanticFallbackProvenance::TEXTURE_OPENGL_1X_V1,
+                "texture_opengl_1x_v1",
+            ),
+            (
+                SemanticFallbackProvenance::COVERAGE_GRID_8X8_V1,
+                "coverage_grid_8x8_v1",
+            ),
+            (
+                SemanticFallbackProvenance::DITHER_BAYER_4X4_V1,
+                "dither_bayer_4x4_v1",
+            ),
+            (
+                SemanticFallbackProvenance::YCRCB_BT601_LIMITED_V1,
+                "ycrcb_bt601_limited_v1",
+            ),
+            (
+                SemanticFallbackProvenance::MTE_OVERLAP_ROW_BUFFER_V1,
+                "mte_overlap_row_buffer_v1",
+            ),
+            (
+                SemanticFallbackProvenance::CLIPPED_STIPPLE_CURSOR_V1,
+                "clipped_stipple_cursor_v1",
+            ),
+            (
+                SemanticFallbackProvenance::LINEAR_RASTER_STRIDE_2048_V1,
+                "linear_raster_stride_2048_v1",
+            ),
+        ];
+        NAMES
+            .into_iter()
+            .filter_map(|(bit, name)| (self.0 & bit != 0).then_some(name))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 /// One host register write retained by the Rendering Engine interface buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct RenderRegisterWrite {
     /// Canonical register address without the start tag.
     pub address: u64,
+
     /// Register value.
     pub value: u64,
+
     /// Access width in bytes.
     pub size: u8,
+
     /// Whether this write commits the current operation.
     pub commit: bool,
 }
+
 /// PixelPipe register associated with a command diagnostic.
 #[derive(
     Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
@@ -102,6 +233,8 @@ pub enum PixelRegister {
     StippleMode,
     /// Texture mode.
     TextureMode,
+    /// Texture coordinate format.
+    TextureFormat,
     /// Alpha-test mode.
     AlphaTest,
     /// Blend function.
@@ -119,6 +252,7 @@ pub enum PixelRegister {
     /// Frozen X vertices.
     XVertex,
 }
+
 /// Category of a proven-invalid PixelPipe command field.
 #[derive(
     Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
@@ -131,6 +265,7 @@ pub enum PixelViolationKind {
     /// Individually valid fields formed a documented invalid combination.
     InvalidCombination,
 }
+
 /// PixelPipe field associated with a command violation.
 #[derive(
     Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
@@ -179,6 +314,7 @@ pub enum PixelField {
     /// Stencil operation.
     StencilOperation,
 }
+
 /// One proven-invalid field in a frozen PixelPipe command.
 #[derive(
     Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
@@ -193,116 +329,7 @@ pub struct PixelCommandViolation {
     /// Reason the value is invalid.
     pub kind: PixelViolationKind,
 }
-/// Evidence or implementation capability needed by a valid PixelPipe command.
-#[derive(
-    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
-)]
-pub enum PixelCapability {
-    /// Primitive opcode 4 semantics.
-    FlushPrimitive,
-    /// A START alias other than PixPipeNull.
-    StartAlias,
-    /// Point rasterization.
-    PointRasterization,
-    /// Triangle rasterization.
-    TriangleRasterization,
-    /// Non-axis-aligned or reverse X line rasterization.
-    GeneralLineRasterization,
-    /// Line width other than the proven X-line value.
-    GeneralLineWidth,
-    /// Endpoint skipping.
-    SkipLastEndpoint,
-    /// Rectangle traversal outside the evidence-backed left-to-right row modes.
-    GeneralRectangleTraversal,
-    /// Coordinate range not covered by the current framebuffer iterator.
-    FramebufferBounds,
-    /// GL vertex and raster semantics.
-    GlRasterization,
-    /// Pixel transfer.
-    PixelTransfer,
-    /// Scissor testing.
-    ScissorTest,
-    /// Screen-mask testing.
-    ScreenMaskTest,
-    /// Clip-ID testing.
-    ClipIdTest,
-    /// Polygon stippling.
-    PolygonStipple,
-    /// Opaque stippling.
-    OpaqueStipple,
-    /// Line-stipple repetition or index wrap.
-    RepeatingLineStipple,
-    /// Line stippling combined with clipping.
-    ClippedLineStipple,
-    /// Line stippling on a non-horizontal line.
-    GeneralLineStipple,
-    /// Smooth shading.
-    SmoothShade,
-    /// Texture mapping.
-    TextureMapping,
-    /// Texture levels beyond the evidence-backed range.
-    TextureLevelRange,
-    /// Fog.
-    Fog,
-    /// Coverage.
-    Coverage,
-    /// Line antialiasing.
-    LineAntialiasing,
-    /// Alpha testing.
-    AlphaTest,
-    /// Blending.
-    Blend,
-    /// RGB dithering.
-    Dither,
-    /// Destination read-modify-write for a non-COPY logic operation.
-    LogicReadModifyWrite,
-    /// Partial color bit masking.
-    PartialColorMask,
-    /// Partial color byte masking.
-    PartialColorByteMask,
-    /// Depth testing or writes.
-    Depth,
-    /// Stencil testing or writes.
-    Stencil,
-    /// Read/write conflict bypass.
-    ConflictBypass,
-    /// Double-pixel buffer selection.
-    DoublePixel,
-    /// A legal buffer kind not supported by the current raster path.
-    BufferKind,
-    /// A legal pixel format not supported by the current raster path.
-    PixelFormat,
-    /// Source and destination conversion.
-    BufferConversion,
-    /// Destination window translation.
-    WindowOffset,
-    /// PROM zero-fill rectangle with a nonzero flat color.
-    ZeroRectangleColor,
-}
-/// Source of a capability blocker.
-#[derive(
-    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
-)]
-pub enum PixelBlockerKind {
-    /// Software-visible behavior is not yet evidence-complete.
-    Evidence,
-    /// Behavior is legal and evidence-complete but not implemented.
-    Implementation,
-}
-/// One capability missing from an otherwise legal PixelPipe command.
-#[derive(
-    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
-)]
-pub struct PixelCommandBlocker {
-    /// Missing capability.
-    pub capability: PixelCapability,
-    /// Register that enabled or selected the capability.
-    pub register: PixelRegister,
-    /// Raw enabling value.
-    pub value: u64,
-    /// Whether evidence or implementation is missing.
-    pub kind: PixelBlockerKind,
-}
+
 /// Field that makes an MTE command illegal.
 #[derive(
     Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
@@ -323,6 +350,7 @@ pub enum MteInvalidField {
     /// A framebuffer Y step cannot be represented by the execution cursor.
     YStep,
 }
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct HostInterface {
     #[serde(with = "crate::common::serde_array")]
@@ -336,6 +364,7 @@ struct HostInterface {
     level: u8,
     stall_cycles: u8,
 }
+
 impl HostInterface {
     const fn new() -> Self {
         Self {
@@ -349,6 +378,7 @@ impl HostInterface {
             stall_cycles: 0,
         }
     }
+
     fn reset(&mut self) {
         self.data.fill(0);
         self.address.fill(0);
@@ -358,36 +388,47 @@ impl HostInterface {
         self.level = 0;
         self.stall_cycles = 0;
     }
+
     const fn level(&self) -> usize {
         self.level as usize
     }
+
     const fn can_accept(&self) -> bool {
         self.level < INTERFACE_CAPACITY as u8 && self.stall_cycles == 0
     }
+
     const fn empty_level(&self) -> u8 {
         ((self.control >> INTERFACE_EMPTY_SHIFT) & INTERFACE_FIELD_MASK) as u8
     }
+
     const fn full_level(&self) -> u8 {
         ((self.control >> INTERFACE_FULL_SHIFT) & INTERFACE_FIELD_MASK) as u8
     }
+
     const fn stall_level(&self) -> u8 {
         ((self.control >> INTERFACE_STALL_LEVEL_SHIFT) & INTERFACE_FIELD_MASK) as u8
     }
+
     const fn stall_count(&self) -> u8 {
         (self.control & INTERFACE_FIELD_MASK) as u8
     }
+
     const fn empty_condition(&self) -> bool {
         self.level <= self.empty_level()
     }
+
     const fn full_condition(&self) -> bool {
         self.full_level() != 0 && self.level >= self.full_level()
     }
+
     fn set_control(&mut self, value: u32) {
         self.control = value & INTERFACE_CONTROL_MASK;
     }
+
     fn set_start_pointer(&mut self) {
         self.start_pointer = self.write_pointer;
     }
+
     fn accept(&mut self, write: RenderRegisterWrite) {
         debug_assert!(self.can_accept());
         let index = usize::from(self.write_pointer);
@@ -403,6 +444,7 @@ impl HostInterface {
             self.stall_cycles = self.stall_count();
         }
     }
+
     fn retire(&mut self) -> Option<RenderRegisterWrite> {
         if self.level == 0 {
             return None;
@@ -413,9 +455,11 @@ impl HostInterface {
         self.level -= 1;
         Some(write)
     }
+
     fn advance_stall(&mut self) {
         self.stall_cycles = self.stall_cycles.saturating_sub(1);
     }
+
     fn read_ram(&self, address: u64) -> Option<u64> {
         if (INTERFACE_DATA_BASE..INTERFACE_DATA_BASE + 0x200).contains(&address) {
             return Some(self.data[((address - INTERFACE_DATA_BASE) / 8) as usize]);
@@ -425,6 +469,7 @@ impl HostInterface {
         }
         None
     }
+
     fn write_ram(&mut self, address: u64, value: u64) -> bool {
         if (INTERFACE_DATA_BASE..INTERFACE_DATA_BASE + 0x200).contains(&address) {
             self.data[((address - INTERFACE_DATA_BASE) / 8) as usize] = value;
@@ -437,6 +482,7 @@ impl HostInterface {
         false
     }
 }
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RenderTlbs {
     #[serde(with = "crate::common::serde_array")]
@@ -450,6 +496,7 @@ struct RenderTlbs {
     linear_a: [u64; 16],
     linear_b: [u64; 16],
 }
+
 impl RenderTlbs {
     const fn new() -> Self {
         Self {
@@ -462,9 +509,11 @@ impl RenderTlbs {
             linear_b: [0; 16],
         }
     }
+
     fn reset(&mut self) {
         *self = Self::new();
     }
+
     fn read(&self, address: u64) -> Option<u64> {
         tlb_slot(address).map(|slot| match slot {
             TlbSlot::FramebufferA(index) => self.framebuffer_a[index],
@@ -476,6 +525,7 @@ impl RenderTlbs {
             TlbSlot::LinearB(index) => self.linear_b[index],
         })
     }
+
     fn write(&mut self, address: u64, value: u64) -> bool {
         let Some(slot) = tlb_slot(address) else {
             return false;
@@ -491,12 +541,15 @@ impl RenderTlbs {
         }
         true
     }
+
     fn linear_a_entries(&self) -> [u32; LINEAR_PAGE_COUNT] {
         Self::linear_entries(&self.linear_a)
     }
+
     fn linear_b_entries(&self) -> [u32; LINEAR_PAGE_COUNT] {
         Self::linear_entries(&self.linear_b)
     }
+
     fn framebuffer_entries(&self, buffer: u8) -> Option<FramebufferTlbSnapshot> {
         let slots = match buffer {
             0 => &self.framebuffer_a,
@@ -513,6 +566,7 @@ impl RenderTlbs {
         }
         Some(FramebufferTlbSnapshot(entries))
     }
+
     fn linear_entries(slots: &[u64; 16]) -> [u32; LINEAR_PAGE_COUNT] {
         let mut entries = [0; LINEAR_PAGE_COUNT];
         let mut slot = 0;
@@ -524,6 +578,7 @@ impl RenderTlbs {
         entries
     }
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TlbSlot {
     FramebufferA(usize),
@@ -534,28 +589,35 @@ enum TlbSlot {
     LinearA(usize),
     LinearB(usize),
 }
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct FramebufferTlbSnapshot(
     #[serde(with = "crate::common::serde_array")] [u16; FRAMEBUFFER_TLB_ENTRY_COUNT],
 );
+
 impl FramebufferTlbSnapshot {
     fn entry(&self, index: usize) -> FramebufferTlbEntry {
         FramebufferTlbEntry(self.0[index])
     }
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct FramebufferTlbEntry(u16);
+
 impl FramebufferTlbEntry {
     const fn raw(self) -> u16 {
         self.0
     }
+
     const fn valid(self) -> bool {
         self.0 & FRAMEBUFFER_TLB_VALID != 0
     }
+
     const fn alias_address(self, tile_offset: u64) -> u64 {
         ((self.0 & FRAMEBUFFER_TLB_TILE_MASK) as u64) * FRAMEBUFFER_TILE_BYTES + tile_offset
     }
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PixelCandidateBatch {
     x: u16,
@@ -564,39 +626,49 @@ struct PixelCandidateBatch {
     enabled_count: u16,
     stipple_index: Option<u8>,
 }
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PixelPipelineJob {
     command: DecodedPixelCommand,
+    semantic_fallbacks: SemanticFallbackProvenance,
     entries: Option<Box<FramebufferTlbSnapshot>>,
     rasterizer: Rasterizer,
     stipple: Option<PixelStippleCursor>,
     pending_batch: Option<PixelCandidateBatch>,
     pixel_dma: Option<PixelDmaState>,
+    fragment: Option<FragmentMemoryState>,
 }
+
 impl PixelPipelineJob {
     fn complete(&self) -> bool {
         self.pending_batch.is_none() && self.rasterizer.complete()
     }
+
     fn endpoints(&self) -> (u16, u16, u16, u16) {
         self.command.endpoints()
     }
+
     fn advance_candidates(&mut self, candidates: u16) {
         self.rasterizer.advance(candidates);
         if let Some(stipple) = self.stipple.as_mut() {
             stipple.advance(candidates);
         }
     }
+
     fn complete_pending_batch(&mut self) -> Option<PixelCandidateBatch> {
         let batch = self.pending_batch.take()?;
         self.advance_candidates(batch.candidate_count);
         Some(batch)
     }
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum PixelDmaStage {
     Read,
+    Fragment,
     Write,
 }
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PixelDmaState {
     source_buffer: MteBufferSnapshot,
@@ -604,16 +676,118 @@ struct PixelDmaState {
     stage: PixelDmaStage,
     source_pixel: Vec<u8>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[repr(u8)]
+pub(super) enum FragmentMemoryStage {
+    ClipIdRead,
+    DestinationRead,
+    TextureRead,
+    StencilDepthRead,
+    Compute,
+    StencilDepthWrite,
+    ColorWrite,
+}
+
+impl FragmentMemoryStage {
+    pub(super) const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub(super) const fn trace_name(self) -> &'static str {
+        match self {
+            Self::ClipIdRead => "clip_id_read",
+            Self::DestinationRead => "destination_read",
+            Self::TextureRead => "texture_read",
+            Self::StencilDepthRead => "stencil_depth_read",
+            Self::Compute => "compute",
+            Self::StencilDepthWrite => "stencil_depth_write",
+            Self::ColorWrite => "color_write",
+        }
+    }
+
+    const fn read_modify_write(self) -> bool {
+        matches!(
+            self,
+            Self::DestinationRead
+                | Self::StencilDepthRead
+                | Self::StencilDepthWrite
+                | Self::ColorWrite
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[repr(u8)]
+pub(super) enum RenderCompletionReason {
+    RasterizerExhausted,
+    Flush,
+    TransferComplete,
+}
+
+impl RenderCompletionReason {
+    pub(super) const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub(super) const fn trace_name(self) -> &'static str {
+        match self {
+            Self::RasterizerExhausted => "rasterizer_exhausted",
+            Self::Flush => "flush",
+            Self::TransferComplete => "transfer_complete",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct FragmentMemoryState {
+    destination_buffer: MteBufferSnapshot,
+    clip_id_buffer: Option<MteBufferSnapshot>,
+    texture_buffer: Option<MteBufferSnapshot>,
+    stencil_depth_buffer: Option<MteBufferSnapshot>,
+    stage: FragmentMemoryStage,
+    destination_pixel: Vec<u8>,
+    texture_plan: Option<pixel::fragment::TextureSamplePlan>,
+    texture_tap_index: usize,
+    texture_texels: Vec<Vec<u8>>,
+    stencil_depth_pixel: Vec<u8>,
+    clip_id_byte: Option<u8>,
+    incoming_pixel: Option<Vec<u8>>,
+    color_write: Option<Vec<u8>>,
+    stencil_depth_write: Option<Vec<u8>>,
+}
+
+impl FragmentMemoryState {
+    fn reset_candidate(&mut self) {
+        self.stage = if self.clip_id_buffer.is_some() {
+            FragmentMemoryStage::ClipIdRead
+        } else {
+            FragmentMemoryStage::DestinationRead
+        };
+        self.destination_pixel.clear();
+        self.texture_plan = None;
+        self.texture_tap_index = 0;
+        self.texture_texels.clear();
+        self.stencil_depth_pixel.clear();
+        self.clip_id_byte = None;
+        self.incoming_pixel = None;
+        self.color_write = None;
+        self.stencil_depth_write = None;
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct BlockedPixelCommand {
     command: DecodedPixelCommand,
     error: CrimeRenderError,
 }
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum PixelExecution {
     Blocked(Box<BlockedPixelCommand>),
     Running(Box<PixelPipelineJob>),
 }
+
 impl PixelExecution {
     fn complete(&self) -> bool {
         match self {
@@ -621,6 +795,7 @@ impl PixelExecution {
             Self::Running(job) => job.complete(),
         }
     }
+
     fn completion_notice(&self) -> RenderNotice {
         let Self::Running(job) = self else {
             unreachable!("blocked pixel command cannot complete")
@@ -632,14 +807,21 @@ impl PixelExecution {
             y0,
             x1,
             y1,
+            reason: if matches!(job.command.primitive_kind, PixelPrimitiveKind::Flush) {
+                RenderCompletionReason::Flush
+            } else {
+                RenderCompletionReason::RasterizerExhausted
+            },
         }
     }
+
     fn blocked_error(&self) -> Option<&CrimeRenderError> {
         match self {
             Self::Blocked(blocked) => Some(&blocked.error),
             Self::Running(_) => None,
         }
     }
+
     fn running_mut(&mut self) -> Option<&mut PixelPipelineJob> {
         match self {
             Self::Blocked(_) => None,
@@ -647,6 +829,7 @@ impl PixelExecution {
         }
     }
 }
+
 /// Rendering Engine execution failure.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum CrimeRenderError {
@@ -667,23 +850,7 @@ pub enum CrimeRenderError {
         /// Complete stable list of invalid fields.
         violations: Vec<PixelCommandViolation>,
     },
-    /// A pixel command is legal but requires unavailable evidence or behavior.
-    UnsupportedPixelCommand {
-        /// Canonical register whose START alias submitted the command.
-        trigger_address: u64,
-        /// Primitive register captured by the command snapshot.
-        primitive: u32,
-        /// Draw-mode register captured by the command snapshot.
-        draw_mode: u32,
-        /// Source BufMode register captured by the command snapshot.
-        source_buffer_mode: u32,
-        /// Destination BufMode register captured by the command snapshot.
-        destination_buffer_mode: u32,
-        /// Decoded set of the 24 defined DrawMode feature bits.
-        feature_bits: u32,
-        /// Complete stable list of missing capabilities.
-        blockers: Vec<PixelCommandBlocker>,
-    },
+
     /// A committed MTE command contains an illegal field or combination.
     InvalidMteJob {
         /// Frozen MTE mode value.
@@ -691,6 +858,7 @@ pub enum CrimeRenderError {
         /// Field that failed validation.
         field: MteInvalidField,
     },
+
     /// The inclusive MTE destination endpoints are not valid for the selected buffer.
     InvalidMteRange {
         /// Inclusive start address.
@@ -698,13 +866,17 @@ pub enum CrimeRenderError {
         /// Inclusive end address.
         end: u32,
     },
+
     /// A memory completion arrived while no Rendering Engine write was outstanding.
     UnexpectedMemoryCompletion,
+
     /// The memory target returned a payload incompatible with a Rendering Engine write.
     UnexpectedMemoryPayload,
+
     /// The memory domain failed to transport the Rendering Engine request.
     MemoryTransport(CrimeBusError),
 }
+
 impl fmt::Display for CrimeRenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -719,18 +891,6 @@ impl fmt::Display for CrimeRenderError {
             } => write!(
                 f,
                 "invalid CRIME pixel command triggered by {trigger_address:#010x}, primitive {primitive:#010x}, draw mode {draw_mode:#010x}, features {feature_bits:#08x}, source format {source_buffer_mode:#010x}, destination format {destination_buffer_mode:#010x}: {violations:?}"
-            ),
-            Self::UnsupportedPixelCommand {
-                trigger_address,
-                primitive,
-                draw_mode,
-                source_buffer_mode,
-                destination_buffer_mode,
-                feature_bits,
-                blockers,
-            } => write!(
-                f,
-                "unsupported CRIME pixel command triggered by {trigger_address:#010x}, primitive {primitive:#010x}, draw mode {draw_mode:#010x}, features {feature_bits:#08x}, source format {source_buffer_mode:#010x}, destination format {destination_buffer_mode:#010x}: {blockers:?}"
             ),
             Self::InvalidMteJob { mode, field } => {
                 write!(f, "invalid CRIME MTE job mode {mode:#010x}: {field:?}")
@@ -753,13 +913,16 @@ impl fmt::Display for CrimeRenderError {
         }
     }
 }
+
 impl std::error::Error for CrimeRenderError {}
+
 /// Consumer that will resume when one RE memory request completes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) enum RenderMemoryDestination {
     Mte,
     Pixel,
 }
+
 /// One memory operation requested through the CRIME memory domain.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct RenderMemoryRequest {
@@ -773,6 +936,7 @@ pub(super) struct RenderMemoryRequest {
     pub(super) destination: RenderMemoryDestination,
     pub(super) transfer: CrimeTransfer,
 }
+
 /// A software-visible Rendering Engine transition used for tracing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) enum RenderNotice {
@@ -781,12 +945,16 @@ pub(super) enum RenderNotice {
         start: u32,
         end: u32,
     },
+    SemanticFallback {
+        domain: RenderMemoryDestination,
+        command: u32,
+        provenance: SemanticFallbackProvenance,
+    },
     PixelCommandDecoded {
         primitive: u32,
         draw_mode: u32,
         feature_bits: u32,
         violation_count: u16,
-        blocker_count: u16,
     },
     PixelCommandCommitted {
         primitive: u32,
@@ -800,6 +968,13 @@ pub(super) enum RenderNotice {
         y: u16,
         candidates: u16,
         enabled: u16,
+    },
+    FragmentStage {
+        x: u16,
+        y: u16,
+        stage: FragmentMemoryStage,
+        iteration: u8,
+        read_modify_write: bool,
     },
     FramebufferWordLayout {
         logical_lane: u8,
@@ -834,6 +1009,7 @@ pub(super) enum RenderNotice {
     JobCompleted {
         start: u32,
         end: u32,
+        reason: RenderCompletionReason,
     },
     PixelCommandCompleted {
         primitive: u32,
@@ -841,14 +1017,17 @@ pub(super) enum RenderNotice {
         y0: u16,
         x1: u16,
         y1: u16,
+        reason: RenderCompletionReason,
     },
 }
+
 /// One PIU interrupt-source transition generated by the RE.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct RenderInterruptEffect {
     pub(super) mask: u32,
     pub(super) asserted: bool,
 }
+
 /// Effects produced by one RE state transition.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(super) struct RenderProgress {
@@ -857,6 +1036,7 @@ pub(super) struct RenderProgress {
     pub(super) interrupts: Vec<RenderInterruptEffect>,
     pub(super) notices: Vec<RenderNotice>,
 }
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct MteRegisters {
     mode: u32,
@@ -870,6 +1050,7 @@ struct MteRegisters {
     source_y_step: u32,
     destination_y_step: u32,
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingRenderMemory {
     destination: RenderMemoryDestination,
@@ -877,17 +1058,21 @@ struct PendingRenderMemory {
     physical_address: u64,
     length: u16,
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct MemoryRequestUnit {
     pending: Option<PendingRenderMemory>,
 }
+
 impl MemoryRequestUnit {
     const fn new() -> Self {
         Self { pending: None }
     }
+
     const fn busy(&self) -> bool {
         self.pending.is_some()
     }
+
     fn issue(&mut self, request: &RenderMemoryRequest) {
         debug_assert!(self.pending.is_none());
         self.pending = Some(PendingRenderMemory {
@@ -897,26 +1082,32 @@ impl MemoryRequestUnit {
             length: request.transfer.length() as u16,
         });
     }
+
     fn complete(&mut self) -> Option<PendingRenderMemory> {
         self.pending.take()
     }
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct LinearTlbEntry(u32);
+
 impl LinearTlbEntry {
     const fn valid(self) -> bool {
         self.0 & 0x8000_0000 != 0
     }
+
     const fn alias_address(self, page_offset: u64) -> u64 {
         ((self.0 & LINEAR_PAGE_MASK) as u64) * LINEAR_PAGE_SIZE + page_offset
     }
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RenderConditions {
     empty: bool,
     full: bool,
     idle: bool,
 }
+
 /// CRIME Rendering Engine front-end state.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct CrimeRender {
@@ -931,6 +1122,7 @@ pub struct CrimeRender {
     conditions: RenderConditions,
     epoch: u64,
 }
+
 impl CrimeRender {
     /// Creates reset Rendering Engine state.
     pub const fn new() -> Self {
@@ -962,6 +1154,7 @@ impl CrimeRender {
             epoch: 0,
         }
     }
+
     /// Resets the front end and invalidates old render events.
     pub(super) fn reset(&mut self) -> Vec<RenderInterruptEffect> {
         self.interface = HostInterface::new();
@@ -993,18 +1186,22 @@ impl CrimeRender {
             },
         ]
     }
+
     /// Returns the active Rendering Engine epoch.
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
+
     /// Returns the number of host writes waiting in the 64-entry interface buffer.
     pub fn interface_level(&self) -> usize {
         self.interface.level()
     }
+
     /// Returns whether another host register write can be accepted.
     pub(super) fn has_interface_space(&self) -> bool {
         self.interface.can_accept()
     }
+
     /// Reads a software-visible Rendering Engine register.
     pub fn read(&self, address: u64, size: u8) -> Result<u64, RenderAccessError> {
         let access = register_access(address, size, RegisterDirection::Read)?;
@@ -1031,6 +1228,7 @@ impl CrimeRender {
         }
         Err(RenderAccessError::Unsupported)
     }
+
     /// Queues one software-visible Rendering Engine register write.
     pub(super) fn write(
         &mut self,
@@ -1045,6 +1243,7 @@ impl CrimeRender {
             return Err(RenderWriteError::Access(RenderAccessError::Unsupported));
         }
         let previous = self.conditions;
+
         if !access.buffered {
             if self.interface.write_ram(address, value) {
                 return Ok(RenderProgress::default());
@@ -1066,9 +1265,11 @@ impl CrimeRender {
                 ..RenderProgress::default()
             });
         }
+
         if !self.has_interface_space() {
             return Err(RenderWriteError::InterfaceFull);
         }
+
         self.interface.accept(RenderRegisterWrite {
             address,
             value,
@@ -1083,12 +1284,14 @@ impl CrimeRender {
             ..RenderProgress::default()
         })
     }
+
     /// Advances one bounded RE state-machine step.
     pub(super) fn step(&mut self) -> Result<RenderProgress, CrimeRenderError> {
         let previous = self.conditions;
         self.step_scheduled = false;
         self.interface.advance_stall();
         let mut progress = RenderProgress::default();
+
         if self.active_pixel_command.is_some() {
             if self.memory_request_unit.busy() {
                 progress.schedule_step = self.ensure_step_scheduled();
@@ -1124,6 +1327,7 @@ impl CrimeRender {
             progress.interrupts = self.update_conditions(previous);
             return Ok(progress);
         }
+
         if self.active_job.is_some() {
             if self.memory_request_unit.busy() {
                 progress.schedule_step = self.ensure_step_scheduled();
@@ -1135,6 +1339,7 @@ impl CrimeRender {
                 progress.notices.push(RenderNotice::JobCompleted {
                     start: job.start,
                     end: job.end,
+                    reason: RenderCompletionReason::TransferComplete,
                 });
                 progress.schedule_step = self.ensure_step_scheduled();
             } else {
@@ -1147,6 +1352,7 @@ impl CrimeRender {
             progress.interrupts = self.update_conditions(previous);
             return Ok(progress);
         }
+
         let Some(write) = self.interface.retire() else {
             progress.schedule_step = self.ensure_step_scheduled();
             progress.interrupts = self.update_conditions(previous);
@@ -1154,6 +1360,7 @@ impl CrimeRender {
         };
         self.apply_register_write(write);
         progress.notices.push(RenderNotice::RegisterRetired(write));
+
         if write.commit {
             if (MTE_BASE..=MTE_BASE + 0x78).contains(&write.address) {
                 if matches!(write.address - MTE_BASE, 0x70 | 0x78) {
@@ -1166,6 +1373,13 @@ impl CrimeRender {
                     start: job.start,
                     end: job.end,
                 });
+                if !job.semantic_fallbacks.is_empty() {
+                    progress.notices.push(RenderNotice::SemanticFallback {
+                        domain: RenderMemoryDestination::Mte,
+                        command: self.mte.mode,
+                        provenance: job.semantic_fallbacks,
+                    });
+                }
                 self.active_job = Some(job);
                 let memory_request = self.prepare_mte_memory_request()?;
                 append_memory_notices(&mut progress.notices, &memory_request);
@@ -1181,7 +1395,6 @@ impl CrimeRender {
                             draw_mode: job.command.snapshot.draw_mode(),
                             feature_bits: job.command.features.raw(),
                             violation_count: 0,
-                            blocker_count: 0,
                         });
                         progress.notices.push(RenderNotice::PixelCommandCommitted {
                             primitive: job.command.primitive_raw,
@@ -1190,6 +1403,13 @@ impl CrimeRender {
                             x1,
                             y1,
                         });
+                        if !job.semantic_fallbacks.is_empty() {
+                            progress.notices.push(RenderNotice::SemanticFallback {
+                                domain: RenderMemoryDestination::Pixel,
+                                command: job.command.primitive_raw,
+                                provenance: job.semantic_fallbacks,
+                            });
+                        }
                         self.active_pixel_command = Some(PixelExecution::Running(Box::new(job)));
                         if self
                             .active_pixel_command
@@ -1222,6 +1442,7 @@ impl CrimeRender {
         progress.interrupts = self.update_conditions(previous);
         Ok(progress)
     }
+
     /// Completes the outstanding MTE memory write.
     pub(super) fn complete_memory(
         &mut self,
@@ -1259,13 +1480,35 @@ impl CrimeRender {
                 let Some(job) = command.running_mut() else {
                     return Err(CrimeRenderError::UnexpectedMemoryCompletion);
                 };
-                if let Some(dma) = job.pixel_dma.as_mut() {
+                let fragment_active = job.fragment.is_some()
+                    && job
+                        .pixel_dma
+                        .as_ref()
+                        .is_none_or(|dma| dma.stage == PixelDmaStage::Fragment);
+                if fragment_active {
+                    complete_fragment_memory(job, pending.length, outcome.payload)?;
+                } else if let Some(dma) = job.pixel_dma.as_mut() {
                     match (dma.stage, outcome.payload) {
                         (PixelDmaStage::Read, CrimeCompletionPayload::ReadData(data))
                             if data.len() == usize::from(pending.length) =>
                         {
                             dma.source_pixel = data.to_vec();
-                            dma.stage = PixelDmaStage::Write;
+                            if let Some(fragment) = job.fragment.as_mut() {
+                                let stipple_foreground =
+                                    job.stipple.is_none_or(|stipple| stipple.permits(0));
+                                fragment.incoming_pixel = Some(if stipple_foreground {
+                                    let color = pixel::format::decode(
+                                        job.command.source.format,
+                                        &dma.source_pixel,
+                                    );
+                                    pixel::format::encode(job.command.destination.format, color)
+                                } else {
+                                    job.command.background_pixel_bytes()
+                                });
+                                dma.stage = PixelDmaStage::Fragment;
+                            } else {
+                                dma.stage = PixelDmaStage::Write;
+                            }
                         }
                         (PixelDmaStage::Write, CrimeCompletionPayload::WriteComplete) => {
                             dma.source_pixel.clear();
@@ -1273,6 +1516,9 @@ impl CrimeRender {
                             if job.complete_pending_batch().is_none() {
                                 return Err(CrimeRenderError::UnexpectedMemoryCompletion);
                             }
+                        }
+                        (PixelDmaStage::Fragment, _) => {
+                            return Err(CrimeRenderError::UnexpectedMemoryPayload);
                         }
                         _ => return Err(CrimeRenderError::UnexpectedMemoryPayload),
                     }
@@ -1299,6 +1545,7 @@ impl CrimeRender {
             ..RenderProgress::default()
         })
     }
+
     fn status(&self) -> u32 {
         let setup_idle = self.interface.level == 0;
         let pixel_idle = self.active_pixel_command.is_none();
@@ -1317,6 +1564,7 @@ impl CrimeRender {
             | u32::from(self.interface.write_pointer) << STATUS_WRITE_POINTER_SHIFT
             | u32::from(self.interface.start_pointer) << STATUS_START_POINTER_SHIFT
     }
+
     fn ensure_step_scheduled(&mut self) -> bool {
         let work_ready = self.interface.stall_cycles != 0
             || (!self.memory_request_unit.busy()
@@ -1331,6 +1579,7 @@ impl CrimeRender {
         self.step_scheduled = true;
         true
     }
+
     fn update_conditions(&mut self, previous: RenderConditions) -> Vec<RenderInterruptEffect> {
         let current = RenderConditions {
             empty: self.interface.empty_condition(),
@@ -1364,6 +1613,7 @@ impl CrimeRender {
         );
         effects
     }
+
     fn apply_register_write(&mut self, write: RenderRegisterWrite) {
         if self.tlbs.write(write.address, write.value) {
             return;
@@ -1389,6 +1639,7 @@ impl CrimeRender {
             }
         }
     }
+
     const fn read_mte(&self, address: u64) -> u32 {
         match address - MTE_BASE {
             0x00 => self.mte.mode,
@@ -1401,27 +1652,14 @@ impl CrimeRender {
             _ => 0,
         }
     }
+
     fn snapshot_pixel_execution(
         &self,
         command: PixelCommandSnapshot,
     ) -> Result<PixelPipelineJob, Box<BlockedPixelCommand>> {
         let validation = PixelCommandValidation::decode(command);
-        let error = if validation.violations.is_empty() {
-            if validation.blockers.is_empty() {
-                None
-            } else {
-                Some(CrimeRenderError::UnsupportedPixelCommand {
-                    trigger_address: validation.decoded.snapshot.trigger_address,
-                    primitive: validation.decoded.primitive_raw,
-                    draw_mode: validation.decoded.snapshot.draw_mode(),
-                    source_buffer_mode: validation.decoded.source.raw,
-                    destination_buffer_mode: validation.decoded.destination.raw,
-                    feature_bits: validation.decoded.features.raw(),
-                    blockers: validation.blockers,
-                })
-            }
-        } else {
-            Some(CrimeRenderError::InvalidPixelCommand {
+        let error =
+            (!validation.violations.is_empty()).then(|| CrimeRenderError::InvalidPixelCommand {
                 trigger_address: validation.decoded.snapshot.trigger_address,
                 primitive: validation.decoded.primitive_raw,
                 draw_mode: validation.decoded.snapshot.draw_mode(),
@@ -1429,14 +1667,14 @@ impl CrimeRender {
                 destination_buffer_mode: validation.decoded.destination.raw,
                 feature_bits: validation.decoded.features.raw(),
                 violations: validation.violations,
-            })
-        };
+            });
         if let Some(error) = error {
             return Err(Box::new(BlockedPixelCommand {
                 command: validation.decoded,
                 error,
             }));
         }
+
         let command = validation.decoded;
         let rasterizer = match command.primitive_kind {
             PixelPrimitiveKind::Point => Rasterizer::point(command.x0, command.y0),
@@ -1445,7 +1683,13 @@ impl CrimeRender {
                 command.vertices_subpixel[0].1,
                 command.vertices_subpixel[1].0,
                 command.vertices_subpixel[1].1,
-                command.line_width,
+                command
+                    .line_width
+                    .saturating_add(if command.features.line_antialias() {
+                        64
+                    } else {
+                        0
+                    }),
                 command.skip_last_endpoint,
             ),
             PixelPrimitiveKind::Line => Rasterizer::line_x(
@@ -1496,6 +1740,46 @@ impl CrimeRender {
         } else {
             None
         };
+        let fragment = command.needs_fragment_pipeline().then(|| {
+            let destination_selector = command
+                .destination
+                .kind
+                .buffer_selector()
+                .expect("validated fragment destination selector");
+            FragmentMemoryState {
+                destination_buffer: MteBufferSnapshot::capture(&self.tlbs, destination_selector)
+                    .expect("validated fragment destination selector"),
+                clip_id_buffer: (command.clip_mode & (1 << 11) != 0).then(|| {
+                    MteBufferSnapshot::capture(&self.tlbs, 6)
+                        .expect("clip-ID TLB selector is defined")
+                }),
+                texture_buffer: command.features.texture().then(|| {
+                    MteBufferSnapshot::capture(&self.tlbs, 3)
+                        .expect("texture TLB selector is defined")
+                }),
+                stencil_depth_buffer: (command.features.depth_test()
+                    || command.features.depth_mask()
+                    || command.features.stencil_test())
+                .then(|| {
+                    MteBufferSnapshot::capture(&self.tlbs, 2)
+                        .expect("framebuffer C selector is defined")
+                }),
+                stage: if command.clip_mode & (1 << 11) != 0 {
+                    FragmentMemoryStage::ClipIdRead
+                } else {
+                    FragmentMemoryStage::DestinationRead
+                },
+                destination_pixel: Vec::new(),
+                texture_plan: None,
+                texture_tap_index: 0,
+                texture_texels: Vec::new(),
+                stencil_depth_pixel: Vec::new(),
+                clip_id_byte: None,
+                incoming_pixel: None,
+                color_write: None,
+                stencil_depth_write: None,
+            }
+        });
         let entries = command
             .destination
             .kind
@@ -1506,13 +1790,16 @@ impl CrimeRender {
             .then(|| PixelStippleCursor::new(command.stipple_pattern, command.stipple_mode));
         Ok(PixelPipelineJob {
             entries,
+            semantic_fallbacks: SemanticFallbackProvenance::for_pixel(&command),
             command,
             rasterizer,
             stipple,
             pending_batch: None,
             pixel_dma,
+            fragment,
         })
     }
+
     fn prepare_pixel_batch(
         &mut self,
         notices: &mut Vec<RenderNotice>,
@@ -1520,8 +1807,14 @@ impl CrimeRender {
         let Some(PixelExecution::Running(job)) = self.active_pixel_command.as_mut() else {
             unreachable!("pixel batch requires an active running command")
         };
-        if job.pixel_dma.is_some() {
-            return prepare_pixel_dma_batch(job, notices);
+        if let Some(stage) = job.pixel_dma.as_ref().map(|dma| dma.stage) {
+            return match stage {
+                PixelDmaStage::Read | PixelDmaStage::Write => prepare_pixel_dma_batch(job, notices),
+                PixelDmaStage::Fragment => prepare_fragment_batch(job, notices),
+            };
+        }
+        if job.fragment.is_some() {
+            return prepare_fragment_batch(job, notices);
         }
         debug_assert!(job.pending_batch.is_none());
         let position = job.rasterizer.position();
@@ -1652,6 +1945,7 @@ impl CrimeRender {
             transfer: CrimeTransfer::write(data.into(), byte_enable.into()),
         })
     }
+
     fn snapshot_mte_job(&self) -> Result<MteJob, CrimeRenderError> {
         MteJob::snapshot(self.mte, &self.tlbs).map_err(|field| {
             if field == MteInvalidField::Range {
@@ -1667,6 +1961,7 @@ impl CrimeRender {
             }
         })
     }
+
     fn prepare_mte_memory_request(&self) -> Result<RenderMemoryRequest, CrimeRenderError> {
         let job = self.active_job.as_ref().expect("active MTE job exists");
         let (translation, transfer, no_ecc) = match job.stage {
@@ -1720,6 +2015,386 @@ impl CrimeRender {
         })
     }
 }
+
+fn complete_fragment_memory(
+    job: &mut PixelPipelineJob,
+    pending_length: u16,
+    payload: CrimeCompletionPayload,
+) -> Result<(), CrimeRenderError> {
+    let stage = job
+        .fragment
+        .as_ref()
+        .expect("active fragment state exists")
+        .stage;
+    let batch = job
+        .pending_batch
+        .expect("fragment memory operation has a frozen candidate");
+    let mut candidate_complete = false;
+    {
+        let fragment = job.fragment.as_mut().expect("active fragment state exists");
+        match (stage, payload) {
+            (FragmentMemoryStage::ClipIdRead, CrimeCompletionPayload::ReadData(data))
+                if data.len() == usize::from(pending_length) && data.len() == 1 =>
+            {
+                fragment.clip_id_byte = Some(data[0]);
+                let pixel_bit = 0x80_u8 >> (batch.x & 7);
+                if data[0] & pixel_bit == 0 {
+                    candidate_complete = true;
+                } else {
+                    fragment.stage = FragmentMemoryStage::DestinationRead;
+                }
+            }
+            (FragmentMemoryStage::DestinationRead, CrimeCompletionPayload::ReadData(data))
+                if data.len() == usize::from(pending_length) =>
+            {
+                fragment.destination_pixel = data.to_vec();
+                fragment.stage = if fragment.texture_buffer.is_some() {
+                    FragmentMemoryStage::TextureRead
+                } else if fragment.stencil_depth_buffer.is_some() {
+                    FragmentMemoryStage::StencilDepthRead
+                } else {
+                    FragmentMemoryStage::Compute
+                };
+            }
+            (FragmentMemoryStage::TextureRead, CrimeCompletionPayload::ReadData(data))
+                if data.len() == usize::from(pending_length) =>
+            {
+                fragment.texture_texels.push(data.to_vec());
+                fragment.texture_tap_index += 1;
+                let tap_count = fragment
+                    .texture_plan
+                    .as_ref()
+                    .expect("texture read stage has a sample plan")
+                    .taps
+                    .len();
+                if fragment.texture_tap_index == tap_count {
+                    fragment.stage = if fragment.stencil_depth_buffer.is_some() {
+                        FragmentMemoryStage::StencilDepthRead
+                    } else {
+                        FragmentMemoryStage::Compute
+                    };
+                }
+            }
+            (FragmentMemoryStage::StencilDepthRead, CrimeCompletionPayload::ReadData(data))
+                if data.len() == usize::from(pending_length) =>
+            {
+                fragment.stencil_depth_pixel = data.to_vec();
+                fragment.stage = FragmentMemoryStage::Compute;
+            }
+            (FragmentMemoryStage::StencilDepthWrite, CrimeCompletionPayload::WriteComplete) => {
+                fragment.stencil_depth_write = None;
+                if fragment.color_write.is_some() {
+                    fragment.stage = FragmentMemoryStage::ColorWrite;
+                } else {
+                    candidate_complete = true;
+                }
+            }
+            (FragmentMemoryStage::ColorWrite, CrimeCompletionPayload::WriteComplete) => {
+                fragment.color_write = None;
+                candidate_complete = true;
+            }
+            _ => return Err(CrimeRenderError::UnexpectedMemoryPayload),
+        }
+    }
+    if candidate_complete {
+        finish_fragment_candidate(job)?;
+    }
+    Ok(())
+}
+
+fn finish_fragment_candidate(job: &mut PixelPipelineJob) -> Result<(), CrimeRenderError> {
+    job.fragment
+        .as_mut()
+        .expect("active fragment state exists")
+        .reset_candidate();
+    if let Some(dma) = job.pixel_dma.as_mut() {
+        if dma.stage != PixelDmaStage::Fragment {
+            return Err(CrimeRenderError::UnexpectedMemoryCompletion);
+        }
+        dma.source_pixel.clear();
+        dma.stage = PixelDmaStage::Read;
+    }
+    if job.complete_pending_batch().is_none() {
+        return Err(CrimeRenderError::UnexpectedMemoryCompletion);
+    }
+    Ok(())
+}
+
+fn prepare_fragment_batch(
+    job: &mut PixelPipelineJob,
+    notices: &mut Vec<RenderNotice>,
+) -> Option<RenderMemoryRequest> {
+    if job.pending_batch.is_none() {
+        debug_assert!(job.pixel_dma.is_none());
+        let position = job.rasterizer.position();
+        if job
+            .command
+            .framebuffer_position(position.x, position.y)
+            .is_none()
+            || !job.command.clip_passes(position.x, position.y)
+        {
+            job.advance_candidates(1);
+            return None;
+        }
+        let stipple_foreground = job.stipple.is_none_or(|stipple| stipple.permits(0));
+        let enabled = stipple_foreground || job.command.features.opaque_stipple();
+        notices.push(RenderNotice::RasterBatch {
+            x: position.x,
+            y: position.y,
+            candidates: 1,
+            enabled: u16::from(enabled),
+        });
+        if let Some(stipple) = job.stipple {
+            notices.push(RenderNotice::StippleMask {
+                pattern: job.command.stipple_pattern,
+                index: stipple.index(),
+                candidates: 1,
+                enabled_mask: u32::from(stipple_foreground) << 31,
+            });
+        }
+        if !enabled {
+            job.advance_candidates(1);
+            return None;
+        }
+        job.pending_batch = Some(PixelCandidateBatch {
+            x: position.x,
+            y: position.y,
+            candidate_count: 1,
+            enabled_count: 1,
+            stipple_index: job.stipple.map(PixelStippleCursor::index),
+        });
+        if !stipple_foreground {
+            job.fragment
+                .as_mut()
+                .expect("active fragment state exists")
+                .incoming_pixel = Some(job.command.background_pixel_bytes());
+        }
+    }
+
+    loop {
+        let batch = job
+            .pending_batch
+            .expect("fragment memory operation has a frozen candidate");
+        let stage = job
+            .fragment
+            .as_ref()
+            .expect("active fragment state exists")
+            .stage;
+        let iteration = job
+            .fragment
+            .as_ref()
+            .and_then(|fragment| u8::try_from(fragment.texture_tap_index).ok())
+            .unwrap_or(u8::MAX);
+        notices.push(RenderNotice::FragmentStage {
+            x: batch.x,
+            y: batch.y,
+            stage,
+            iteration,
+            read_modify_write: stage.read_modify_write(),
+        });
+        match stage {
+            FragmentMemoryStage::ClipIdRead => {
+                let translation = fragment_clip_id_translation(job, batch)?;
+                return Some(pixel_memory_request(translation, CrimeTransfer::read(1)));
+            }
+            FragmentMemoryStage::DestinationRead => {
+                let translation = fragment_destination_translation(job, batch)?;
+                let length = job.command.destination.format.bytes_per_pixel()?;
+                return Some(pixel_memory_request(
+                    translation,
+                    CrimeTransfer::read(u16::from(length)),
+                ));
+            }
+            FragmentMemoryStage::TextureRead => {
+                if job
+                    .fragment
+                    .as_ref()
+                    .expect("active fragment state exists")
+                    .texture_plan
+                    .is_none()
+                {
+                    let plan = pixel::fragment::texture_plan(&job.command, batch.x, batch.y);
+                    job.fragment
+                        .as_mut()
+                        .expect("active fragment state exists")
+                        .texture_plan = Some(plan);
+                }
+                let fragment = job.fragment.as_ref().expect("active fragment state exists");
+                let plan = fragment
+                    .texture_plan
+                    .as_ref()
+                    .expect("texture read stage has a sample plan");
+                let Some(tap) = plan.taps.get(fragment.texture_tap_index).copied() else {
+                    let fragment = job.fragment.as_mut().expect("active fragment state exists");
+                    fragment.stage = if fragment.stencil_depth_buffer.is_some() {
+                        FragmentMemoryStage::StencilDepthRead
+                    } else {
+                        FragmentMemoryStage::Compute
+                    };
+                    continue;
+                };
+                let translation = fragment
+                    .texture_buffer
+                    .as_ref()
+                    .expect("texture stage has a texture buffer")
+                    .translate_address(tap.address, plan.texel_bytes, false)?;
+                return Some(pixel_memory_request(
+                    translation,
+                    CrimeTransfer::read(u16::from(plan.texel_bytes)),
+                ));
+            }
+            FragmentMemoryStage::StencilDepthRead => {
+                let translation = fragment_stencil_depth_translation(job, batch)?;
+                return Some(pixel_memory_request(translation, CrimeTransfer::read(4)));
+            }
+            FragmentMemoryStage::Compute => {
+                let fragment = job.fragment.as_ref().expect("active fragment state exists");
+                let incoming = fragment
+                    .incoming_pixel
+                    .as_deref()
+                    .map(|bytes| pixel::format::decode(job.command.destination.format, bytes));
+                let texture_sample = fragment.texture_plan.as_ref().map(|plan| {
+                    pixel::fragment::resolve_texture(&job.command, plan, &fragment.texture_texels)
+                });
+                let result = pixel::fragment::run(
+                    &job.command,
+                    batch.x,
+                    batch.y,
+                    incoming,
+                    &fragment.destination_pixel,
+                    texture_sample,
+                    (!fragment.stencil_depth_pixel.is_empty())
+                        .then_some(fragment.stencil_depth_pixel.as_slice()),
+                );
+                let fragment = job.fragment.as_mut().expect("active fragment state exists");
+                fragment.color_write = result.color;
+                fragment.stencil_depth_write = result.stencil_depth;
+                fragment.stage = if fragment.stencil_depth_write.is_some() {
+                    FragmentMemoryStage::StencilDepthWrite
+                } else if fragment.color_write.is_some() {
+                    FragmentMemoryStage::ColorWrite
+                } else {
+                    finish_fragment_candidate(job).ok()?;
+                    return None;
+                };
+            }
+            FragmentMemoryStage::StencilDepthWrite => {
+                let translation = fragment_stencil_depth_translation(job, batch)?;
+                let data = job
+                    .fragment
+                    .as_ref()
+                    .expect("active fragment state exists")
+                    .stencil_depth_write
+                    .clone()
+                    .expect("stencil/depth write stage has data");
+                let length = data.len();
+                return Some(pixel_memory_request(
+                    translation,
+                    CrimeTransfer::write(data.into(), CrimeByteEnable::enabled(length)),
+                ));
+            }
+            FragmentMemoryStage::ColorWrite => {
+                let translation = fragment_destination_translation(job, batch)?;
+                let data = job
+                    .fragment
+                    .as_ref()
+                    .expect("active fragment state exists")
+                    .color_write
+                    .clone()
+                    .expect("color write stage has data");
+                let length = data.len();
+                return Some(pixel_memory_request(
+                    translation,
+                    CrimeTransfer::write(data.into(), CrimeByteEnable::enabled(length)),
+                ));
+            }
+        }
+    }
+}
+
+fn fragment_clip_id_translation(
+    job: &PixelPipelineJob,
+    batch: PixelCandidateBatch,
+) -> Option<MteTranslation> {
+    let (x, y) = job.command.framebuffer_position(batch.x, batch.y)?;
+    let map_offset = if job.command.clip_mode & (1 << 10) != 0 {
+        256
+    } else {
+        0
+    };
+    let address = u32::from(y) << 16 | (u32::from(x) / 8 + map_offset);
+    job.fragment
+        .as_ref()?
+        .clip_id_buffer
+        .as_ref()?
+        .translate_address(address, 1, false)
+}
+
+fn fragment_destination_translation(
+    job: &PixelPipelineJob,
+    batch: PixelCandidateBatch,
+) -> Option<MteTranslation> {
+    let fragment = job.fragment.as_ref()?;
+    let pixel_bytes = job.command.destination.format.bytes_per_pixel()?;
+    let storage_bytes = 1_u8 << job.command.destination.buffer_depth;
+    let address = if job.command.features.pixel_transfer() {
+        let dx = i64::from(batch.x) - i64::from(job.command.x0);
+        let dy = i64::from(batch.y) - i64::from(job.command.y0);
+        pixel_dma_destination_address(
+            &job.command,
+            &fragment.destination_buffer,
+            storage_bytes,
+            dx,
+            dy,
+        )
+    } else {
+        let (x, y) = job.command.framebuffer_position(batch.x, batch.y)?;
+        if fragment.destination_buffer.linear() {
+            (u32::from(y) * 2048 + u32::from(x)) * u32::from(storage_bytes)
+        } else {
+            (u32::from(y) * u32::from(storage_bytes)) << 16 | u32::from(x)
+        }
+    };
+    let mut translation =
+        fragment
+            .destination_buffer
+            .translate_address(address, storage_bytes, true)?;
+    if job.command.destination.double_pixel {
+        translation.alias_address +=
+            u64::from(job.command.destination.double_pixel_select) * u64::from(pixel_bytes);
+    }
+    Some(translation)
+}
+
+fn fragment_stencil_depth_translation(
+    job: &PixelPipelineJob,
+    batch: PixelCandidateBatch,
+) -> Option<MteTranslation> {
+    let (x, y) = job.command.framebuffer_position(batch.x, batch.y)?;
+    job.fragment
+        .as_ref()?
+        .stencil_depth_buffer
+        .as_ref()?
+        .translate_address((u32::from(y) * 4) << 16 | u32::from(x), 4, true)
+}
+
+fn pixel_memory_request(
+    translation: MteTranslation,
+    transfer: CrimeTransfer,
+) -> RenderMemoryRequest {
+    RenderMemoryRequest {
+        virtual_address: translation.virtual_address,
+        raw_entry: translation.raw_entry,
+        valid: translation.valid,
+        alias_address: translation.alias_address,
+        physical_address: super::normalize_render_memory_alias(translation.alias_address),
+        bank_select: render_bank_select(translation),
+        no_ecc: false,
+        destination: RenderMemoryDestination::Pixel,
+        transfer,
+    }
+}
+
 fn prepare_pixel_dma_batch(
     job: &mut PixelPipelineJob,
     notices: &mut Vec<RenderNotice>,
@@ -1728,12 +2403,14 @@ fn prepare_pixel_dma_batch(
     let source_bytes = job.command.source.format.bytes_per_pixel()?;
     let destination_bytes = job.command.destination.format.bytes_per_pixel()?;
     let dma = job.pixel_dma.as_mut().expect("PixelDMA state exists");
+
     if matches!(dma.stage, PixelDmaStage::Read) && job.pending_batch.is_none() {
         if !job.command.clip_passes(position.x, position.y) {
             job.advance_candidates(1);
             return None;
         }
-        let enabled = job.stipple.is_none_or(|stipple| stipple.permits(0));
+        let stipple_foreground = job.stipple.is_none_or(|stipple| stipple.permits(0));
+        let enabled = stipple_foreground || job.command.features.opaque_stipple();
         notices.push(RenderNotice::RasterBatch {
             x: position.x,
             y: position.y,
@@ -1752,6 +2429,7 @@ fn prepare_pixel_dma_batch(
             stipple_index: job.stipple.map(PixelStippleCursor::index),
         });
     }
+
     let batch = job
         .pending_batch
         .expect("PixelDMA memory operation has a frozen candidate");
@@ -1787,6 +2465,7 @@ fn prepare_pixel_dma_batch(
                 CrimeTransfer::write(data.into(), CrimeByteEnable::enabled(length)),
             )
         }
+        PixelDmaStage::Fragment => unreachable!("fragment stage uses the fragment memory path"),
     };
     let physical_address = super::normalize_render_memory_alias(translation.alias_address);
     Some(RenderMemoryRequest {
@@ -1801,6 +2480,7 @@ fn prepare_pixel_dma_batch(
         transfer,
     })
 }
+
 fn pixel_dma_source_address(
     command: &DecodedPixelCommand,
     buffer: &MteBufferSnapshot,
@@ -1822,6 +2502,7 @@ fn pixel_dma_source_address(
         };
         return wrapping_add_signed(base, dx * x_step + dy * y_step);
     }
+
     let x_step = match command.snapshot.pixel_transfer_source_x_step() {
         0 => 1_i64,
         value => i64::from(value),
@@ -1840,6 +2521,7 @@ fn pixel_dma_source_address(
         wrapping_add_signed(u32::from(base_y) * u32::from(bytes_per_pixel), dy * y_step) as u16;
     u32::from(y_byte) << 16 | u32::from(x)
 }
+
 fn pixel_dma_destination_address(
     command: &DecodedPixelCommand,
     buffer: &MteBufferSnapshot,
@@ -1864,9 +2546,11 @@ fn pixel_dma_destination_address(
     };
     wrapping_add_signed(base, dx * i64::from(bytes_per_pixel) + dy * stride)
 }
+
 fn wrapping_add_signed(base: u32, delta: i64) -> u32 {
     base.wrapping_add(delta as u32)
 }
+
 const fn render_bank_select(translation: MteTranslation) -> CrimeMemoryBankSelect {
     if translation.valid {
         CrimeMemoryBankSelect::Decode
@@ -1876,6 +2560,7 @@ const fn render_bank_select(translation: MteTranslation) -> CrimeMemoryBankSelec
         }
     }
 }
+
 fn append_memory_notices(notices: &mut Vec<RenderNotice>, request: &RenderMemoryRequest) {
     notices.push(RenderNotice::TlbTranslation {
         virtual_address: request.virtual_address,
@@ -1891,27 +2576,33 @@ fn append_memory_notices(notices: &mut Vec<RenderNotice>, request: &RenderMemory
         length: request.transfer.length() as u16,
     });
 }
+
 impl Default for CrimeRender {
     fn default() -> Self {
         Self::new()
     }
 }
+
 /// Rendering Engine register-access classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum RenderAccessError {
     /// The address is defined, but the width or alignment is invalid.
     Access,
+
     /// The address is reserved, unmapped, or not readable in this direction.
     Unsupported,
 }
+
 /// Rendering Engine host-write failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum RenderWriteError {
     /// The register access was rejected before entering the host interface.
     Access(RenderAccessError),
+
     /// The 64-entry host interface buffer or its programmed stall is blocking writes.
     InterfaceFull,
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RegisterAccess {
     readable: bool,
@@ -1921,13 +2612,16 @@ struct RegisterAccess {
     read_widths: u8,
     write_widths: u8,
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RegisterDirection {
     Read,
     Write,
 }
+
 const WIDTH_32: u8 = 1;
 const WIDTH_64: u8 = 2;
+
 const DIRECT_READ_WRITE_64: RegisterAccess = RegisterAccess {
     readable: true,
     writable: true,
@@ -2016,6 +2710,7 @@ const BUFFERED_WRITE_ONLY_32_OR_64_START: RegisterAccess = RegisterAccess {
     read_widths: 0,
     write_widths: WIDTH_32 | WIDTH_64,
 };
+
 const fn canonical_write_address(address: u64) -> (u64, bool) {
     if (address >= PIXEL_PIPE_BASE + START_OFFSET && address < PIXEL_PIPE_BASE + 0x1000)
         || (address >= MTE_BASE + START_OFFSET && address < MTE_BASE + 0x1000)
@@ -2025,6 +2720,7 @@ const fn canonical_write_address(address: u64) -> (u64, bool) {
         (address, false)
     }
 }
+
 fn register_access(
     address: u64,
     size: u8,
@@ -2048,6 +2744,7 @@ fn register_access(
     }
     Ok(access)
 }
+
 fn register_descriptor(address: u64) -> Option<RegisterAccess> {
     if ((INTERFACE_DATA_BASE..INTERFACE_DATA_BASE + 0x200).contains(&address)
         || (INTERFACE_ADDRESS_BASE..INTERFACE_ADDRESS_BASE + 0x200).contains(&address))
@@ -2097,6 +2794,7 @@ fn register_descriptor(address: u64) -> Option<RegisterAccess> {
     }
     None
 }
+
 fn tlb_slot(address: u64) -> Option<TlbSlot> {
     if address & 7 != 0 {
         return None;
@@ -2132,6 +2830,7 @@ fn tlb_slot(address: u64) -> Option<TlbSlot> {
     }
     None
 }
+
 fn encode_interface_entry(write: RenderRegisterWrite) -> (u64, u64) {
     let relative = write.address - registers::CRIME_RENDER_BASE;
     let slot_address = relative & !7;
@@ -2149,6 +2848,7 @@ fn encode_interface_entry(write: RenderRegisterWrite) -> (u64, u64) {
         | (offset << ADDRESS_OFFSET_SHIFT);
     (data, encoded_address)
 }
+
 fn decode_interface_entry(data: u64, address: u64) -> RenderRegisterWrite {
     let page = (address >> ADDRESS_PAGE_SHIFT) & 7;
     let offset = (address >> ADDRESS_OFFSET_SHIFT) & 0xff;
@@ -2167,6 +2867,7 @@ fn decode_interface_entry(data: u64, address: u64) -> RenderRegisterWrite {
         commit: address & ADDRESS_START != 0,
     }
 }
+
 fn read_register_slot(slots: &[u64; 64], offset: u64, size: u8) -> u64 {
     let value = slots[(offset / 8) as usize];
     match (size, offset & 4) {
@@ -2176,6 +2877,7 @@ fn read_register_slot(slots: &[u64; 64], offset: u64, size: u8) -> u64 {
         _ => unreachable!("register widths are validated before slot access"),
     }
 }
+
 fn write_register_slot(slots: &mut [u64; 64], offset: u64, size: u8, value: u64) {
     let slot = &mut slots[(offset / 8) as usize];
     match (size, offset & 4) {
@@ -2185,6 +2887,7 @@ fn write_register_slot(slots: &mut [u64; 64], offset: u64, size: u8, value: u64)
         _ => unreachable!("register widths are validated before slot access"),
     }
 }
+
 fn append_condition_effects(
     effects: &mut Vec<RenderInterruptEffect>,
     previous: bool,
@@ -2206,6 +2909,7 @@ fn append_condition_effects(
         });
     }
 }
+
 /// Applies one CRIME bitwise logic operation.
 pub const fn logic_operation(operation: u8, source: u32, destination: u32) -> u32 {
     match operation & 0xf {
@@ -2227,6 +2931,7 @@ pub const fn logic_operation(operation: u8, source: u32, destination: u32) -> u3
         _ => u32::MAX,
     }
 }
+
 /// Evaluates one eight-function comparison used by alpha, depth, and stencil tests.
 pub const fn compare(function: u8, source: u32, reference: u32) -> bool {
     match function & 7 {
@@ -2240,5 +2945,6 @@ pub const fn compare(function: u8, source: u32, reference: u32) -> bool {
         _ => true,
     }
 }
+
 #[cfg(test)]
 mod tests;
