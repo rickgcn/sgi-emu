@@ -54,6 +54,7 @@ pub(super) struct Ip32EventChainPolicy {
 }
 
 impl Ip32EventChainPolicy {
+    #[cfg(any(feature = "jit", test))]
     pub(super) const fn disabled() -> Self {
         Self {
             sysad: false,

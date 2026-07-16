@@ -70,13 +70,11 @@ use se_device::cpu::execution::protocol::{
 use se_device::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 #[cfg(feature = "jit")]
 use se_device::cpu::mips4::execution::block::{
-    Mips4FastLinearReadProjection, Mips4FastMemoryContext, Mips4FastMemoryParameters,
     Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult, Mips4FastMemoryRuntime,
 };
-use se_device::cpu::mips4::execution::bus::{
-    Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransaction,
-    Mips4ExecutionTransferSize,
-};
+#[cfg(feature = "jit")]
+use se_device::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
+use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use se_device::cpu::mips4::execution::target::Mips4ExecutionBoundary;
 use se_device::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
 use se_device::cpu::mips4::model::r5000::cpu::{
@@ -102,13 +100,20 @@ use se_runtime::runtime::{RunError, RunStatus, Runtime, RuntimeContext, RuntimeS
 
 #[cfg(feature = "jit")]
 use se_device::cpu::mips4::execution::block::{
-    MIPS4_BLOCK_CACHE_CAPACITY, MIPS4_BLOCK_MAX_INSTRUCTIONS, Mips4BlockEngine, Mips4CodeGuard,
-    Mips4CodeGuardKind, Mips4CodeWindow, Mips4SliceClock, Mips4SliceTimeline,
+    MIPS4_BLOCK_MAX_INSTRUCTIONS, Mips4CodeGuard, Mips4CodeGuardKind, Mips4CodeWindow,
+    Mips4SliceClock, Mips4SliceTimeline,
 };
 #[cfg(feature = "jit")]
 use se_device::cpu::mips4::model::r5000::cpu::R5000ExecutionSliceAction;
 #[cfg(feature = "jit")]
-use se_jit::mips4::CraneliftMips4Backend;
+use se_jit::mips4::cranelift::CraneliftMips4Backend;
+#[cfg(feature = "jit")]
+use se_jit::mips4::engine::{MIPS4_BLOCK_CACHE_CAPACITY, Mips4BlockEngine};
+#[cfg(feature = "jit")]
+use se_jit::mips4::fast_memory::{
+    Mips4FastLinearReadProjection, Mips4FastMemoryContext, Mips4FastMemoryParameters,
+    Mips4NativeFastMemoryRuntime,
+};
 
 use super::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
 #[cfg(feature = "jit")]
@@ -1032,7 +1037,10 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
     fn completed_transactions(&self) -> u64 {
         self.context.completed()
     }
+}
 
+#[cfg(feature = "jit")]
+impl Mips4NativeFastMemoryRuntime for Ip32FastMemoryRuntime {
     fn native_read_physical_range(&self) -> Option<(u64, u64)> {
         Some((
             se_device::chipset::crime::registers::CRIME_BASE,

@@ -8,9 +8,12 @@ use se_device::chipset::crime::config::{CrimeAccessPolicy, CrimeConfigError, Cri
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
 use se_device::chipset::crime::memory::bus::CrimeMemoryBus;
+#[cfg(feature = "jit")]
 use se_device::chipset::crime::protocol::{
-    CrimeCgiTransaction, CrimeCompletionPayload, CrimeLinkDeviceResponse, CrimeLinkOperation,
-    CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryTransaction, CrimePioRequest,
+    CrimeCgiTransaction, CrimeLinkDeviceResponse, CrimeLinkOperation, CrimePioRequest,
+};
+use se_device::chipset::crime::protocol::{
+    CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryTransaction,
     CrimeTransactionId, CrimeTransfer,
 };
 use se_device::chipset::crime::registers;
@@ -24,6 +27,7 @@ use se_device::memory::ds2502::Ds2502;
 use se_device::memory::flash::SystemFlash;
 use se_device::rtc::ds1687::Ds1687;
 use se_device::serial::uart16550::Uart16550;
+#[cfg(feature = "jit")]
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -727,8 +731,10 @@ fn jit_native_crime_timer_poll_from_ram_matches_scalar() {
 #[cfg(not(feature = "jit"))]
 #[test]
 fn requesting_jit_without_the_feature_is_rejected() {
-    let mut config = Ip32MachineConfig::default();
-    config.jit_enabled = true;
+    let config = Ip32MachineConfig {
+        jit_enabled: true,
+        ..Ip32MachineConfig::default()
+    };
     assert!(matches!(
         Ip32Machine::from_config(config),
         Err(Ip32MachineBuildError::JitUnavailable)
@@ -1799,6 +1805,7 @@ fn printenv_diagmode<S: TraceSink>(
     );
 }
 
+#[cfg(feature = "jit")]
 #[derive(Default)]
 struct PromDisplaySink {
     dma_events: std::collections::BTreeMap<String, u64>,
@@ -1806,6 +1813,7 @@ struct PromDisplaySink {
     capture_render: bool,
 }
 
+#[cfg(feature = "jit")]
 impl TraceSink for PromDisplaySink {
     fn interest(&self, source: TraceSource) -> TraceInterest {
         if source == TraceSource::Component(component_ids::GBE)
@@ -2281,6 +2289,7 @@ fn local_ip32_prom_environment_uses_system_flash() {
     printenv_diagmode(&mut restored, &mut terminal, max_events);
 }
 
+#[cfg(feature = "jit")]
 #[test]
 #[ignore = "requires a local proprietary IP32 PROM image"]
 fn local_ip32_prom_core_throughput_probe() {

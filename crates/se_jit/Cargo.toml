@@ -11,6 +11,7 @@ cranelift-frontend.workspace = true
 cranelift-jit.workspace = true
 cranelift-module.workspace = true
 cranelift-native.workspace = true
+se_core.workspace = true
 se_device.workspace = true
 
 [[bench]]

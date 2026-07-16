@@ -12,6 +12,7 @@ mod fpu;
 mod integer;
 mod memory;
 pub mod policy;
+pub mod port;
 pub mod state;
 pub mod target;
 

@@ -849,6 +849,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "se_core",
  "se_device",
 ]
 

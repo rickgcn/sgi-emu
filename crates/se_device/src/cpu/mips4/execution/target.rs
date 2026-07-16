@@ -45,8 +45,7 @@ use super::block::{
     Mips4BlockGuard, Mips4BlockGuardLine, Mips4BlockInstructionMetadata, Mips4BlockKey,
     Mips4BlockLiftedInstruction, Mips4BlockRuntime, Mips4CodeSourceRequest, Mips4CodeWindow,
     Mips4Cp0RuntimeOperation, Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult,
-    Mips4FastMemoryRuntime, Mips4RuntimeAbiV3, Mips4RuntimeOperation, Mips4RuntimeResult,
-    lift_cpu_instruction,
+    Mips4FastMemoryRuntime, Mips4RuntimeOperation, Mips4RuntimeResult, lift_cpu_instruction,
 };
 use super::bus::{
     Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransaction,
@@ -279,8 +278,6 @@ pub struct Mips4ExecutionTarget<P, F> {
     #[serde(skip, default)]
     block_runtime_action:
         Option<ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>>,
-    #[serde(skip, default)]
-    fast_memory_runtime: Option<Mips4RuntimeAbiV3>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -341,7 +338,6 @@ where
             code_visibility: Mips4CodeVisibility::default(),
             fetched_instruction: None,
             block_runtime_action: None,
-            fast_memory_runtime: None,
         })
     }
 
@@ -782,7 +778,7 @@ where
         self.begin_fetch()
     }
 
-    /// Copies integer and control state into the stable block ABI frame.
+    /// Copies integer and control state into a portable semantic block frame.
     pub fn block_frame(&self, budget: u64) -> Mips4BlockFrame {
         let mut gpr = [0; MIPS4_GPR_COUNT];
         for register in 1..MIPS4_GPR_COUNT as u8 {
@@ -802,23 +798,14 @@ where
         )
     }
 
-    /// Binds block GPR writes directly to the architectural register file.
-    pub fn bind_block_frame(&mut self, frame: &mut Mips4BlockFrame) {
-        frame.bind_gpr_write_through(self.state.gpr.write_through_context());
-    }
-
     /// Commits integer and control state produced by a block invocation.
     pub fn commit_block_frame(&mut self, frame: &mut Mips4BlockFrame) {
-        let gpr_context = self.state.gpr.write_through_context();
-        if frame.gpr_write_through() != gpr_context {
-            for register in 1..MIPS4_GPR_COUNT as u8 {
-                self.state.gpr.write(
-                    Mips4GprIndex::from_u8(register).unwrap(),
-                    frame.read_gpr(register),
-                );
-            }
+        for register in 1..MIPS4_GPR_COUNT as u8 {
+            self.state.gpr.write(
+                Mips4GprIndex::from_u8(register).unwrap(),
+                frame.read_gpr(register),
+            );
         }
-        frame.clear_gpr_write_through();
         self.state.hi = frame.hi();
         self.state.lo = frame.lo();
         self.state.pc = frame.pc();
@@ -865,18 +852,6 @@ where
         &mut self,
     ) -> Option<ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>> {
         self.block_runtime_action.take()
-    }
-
-    pub(crate) fn bind_fast_memory_runtime<R>(&mut self, runtime: &mut R)
-    where
-        R: Mips4FastMemoryRuntime,
-    {
-        debug_assert!(self.fast_memory_runtime.is_none());
-        self.fast_memory_runtime = Some(Mips4RuntimeAbiV3::new(runtime));
-    }
-
-    pub(crate) fn clear_fast_memory_runtime(&mut self) {
-        self.fast_memory_runtime = None;
     }
 
     fn prepare_runtime_frame(&mut self, frame: &Mips4BlockFrame, operation: Mips4RuntimeOperation) {
@@ -2752,25 +2727,26 @@ where
     P: Mips4ExecutionPolicy,
     F: FloatBackend,
 {
-    fn runtime_abi_v3(&mut self) -> Option<Mips4RuntimeAbiV3> {
-        matches!(
-            Mips4MmuPrivilegeMode::from_status(self.state.cp0.status()),
-            Some(Mips4MmuPrivilegeMode::Kernel)
-        )
-        .then_some(self.fast_memory_runtime)
-        .flatten()
-    }
-
     fn runtime_memory_big_endian(&self) -> bool {
         self.effective_endianness() == Mips4Endianness::Big
     }
 
-    fn execute(
+    fn execute<R>(
         &mut self,
         frame: &mut Mips4BlockFrame,
         operation: Mips4RuntimeOperation,
-    ) -> Mips4RuntimeResult {
+        mut fast_memory: Option<&mut R>,
+    ) -> Mips4RuntimeResult
+    where
+        R: Mips4FastMemoryRuntime + ?Sized,
+    {
         self.block_runtime_action = None;
+        if !matches!(
+            Mips4MmuPrivilegeMode::from_status(self.state.cp0.status()),
+            Some(Mips4MmuPrivilegeMode::Kernel)
+        ) {
+            fast_memory = None;
+        }
         if !matches!(operation, Mips4RuntimeOperation::Memory { .. }) {
             self.prepare_runtime_frame(frame, operation);
         }
@@ -2799,7 +2775,7 @@ where
                     ) {
                         Ok(()) => return Mips4RuntimeResult::ContinueControl,
                         Err(pending) => {
-                            if let Some(runtime) = self.fast_memory_runtime {
+                            if let Some(runtime) = fast_memory {
                                 let Mips4ExecutionTransaction::Read {
                                     physical_address,
                                     size,
@@ -3020,7 +2996,6 @@ where
         self.code_visibility = Mips4CodeVisibility::default();
         self.fetched_instruction = None;
         self.block_runtime_action = None;
-        self.fast_memory_runtime = None;
     }
 
     fn signal(&mut self, signal: Self::Signal) -> ExecutionTargetSignalAction {
@@ -3256,6 +3231,7 @@ mod block_tests {
             &mut target,
             &mut frame,
             Mips4RuntimeOperation::Cp1 { raw, decoded },
+            None::<&mut dyn Mips4FastMemoryRuntime>,
         );
 
         assert_eq!(result, Mips4RuntimeResult::ContinueControl);

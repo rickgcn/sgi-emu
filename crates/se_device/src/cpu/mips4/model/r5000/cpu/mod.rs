@@ -16,12 +16,14 @@ use crate::cpu::execution::protocol::{
 use crate::cpu::execution::target::ExecutionTargetAction;
 use crate::cpu::mips4::cp0::Mips4Cp0CacheErr;
 use crate::cpu::mips4::execution::block::{
-    Mips4BlockEngine, Mips4BlockEngineStatistics, Mips4BlockExecution, Mips4BlockExit,
-    Mips4BlockFrame, Mips4BlockKey, Mips4BlockTier, Mips4CachedBlockExecution,
-    Mips4CodeSourceRequest, Mips4CodeWindow, Mips4CodegenBackend, Mips4FastMemoryRuntime,
-    Mips4RegionSideExit,
+    Mips4BlockExit, Mips4BlockFrame, Mips4BlockKey, Mips4CodeSourceRequest, Mips4CodeWindow,
+    Mips4FastMemoryRuntime,
 };
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
+use crate::cpu::mips4::execution::port::{
+    Mips4BlockExecutionResult, Mips4BlockProbe, Mips4BlockSource, Mips4ExecutionPort,
+    Mips4ReusableBlockExecution,
+};
 use crate::cpu::mips4::execution::state::{Mips4ExecutionConfigError, Mips4ExecutionState};
 use crate::cpu::mips4::execution::target::{
     Mips4ExecutionBoundary, Mips4ExecutionSignal, Mips4ExecutionTarget, Mips4ExecutionTargetError,
@@ -101,42 +103,6 @@ pub struct R5000ExecutionSlice {
     pub action: R5000ExecutionSliceAction,
 }
 
-fn record_block_statistics(
-    statistics: &mut Mips4BlockEngineStatistics,
-    execution: Mips4BlockExecution,
-) {
-    match execution.tier {
-        Mips4BlockTier::Interpreter => {
-            statistics.interpreted_blocks += 1;
-            statistics.interpreted_operations += execution.operations_executed;
-        }
-        Mips4BlockTier::Native => {
-            statistics.native_blocks += 1;
-            statistics.native_operations += execution.operations_executed;
-        }
-        Mips4BlockTier::Region => {
-            statistics.region_entries += 1;
-            statistics.region_operations += execution.operations_executed;
-            match execution.region_side_exit {
-                Some(Mips4RegionSideExit::ColdSuccessor) => {
-                    statistics.region_cold_side_exits += 1;
-                }
-                Some(Mips4RegionSideExit::Budget) => {
-                    statistics.region_budget_side_exits += 1;
-                }
-                Some(Mips4RegionSideExit::Runtime) => {
-                    statistics.region_runtime_side_exits += 1;
-                }
-                Some(Mips4RegionSideExit::Guard) => {
-                    statistics.region_guard_side_exits += 1;
-                }
-                None => {}
-            }
-        }
-    }
-    statistics.runtime_calls += execution.runtime_calls;
-}
-
 /// R5000 external hardware interrupt input IP2.
 pub const R5000_IRQ_IP2: IrqInput = IrqInput::new(2);
 
@@ -180,7 +146,7 @@ pub enum R5000CpuError {
     /// The generic executor or MIPS IV target rejected an operation.
     Execution(FunctionalExecutorError<Mips4ExecutionTargetError>),
 
-    /// The basic-block engine violated an invariant or its native backend failed.
+    /// The translated-execution port failed or violated an invariant.
     Block(String),
 }
 
@@ -205,6 +171,10 @@ impl Clone for R5000ReusableBlockFrame {
     fn clone(&self) -> Self {
         Self::default()
     }
+}
+
+fn reborrow_optional<'a, T: ?Sized>(value: &'a mut Option<&mut T>) -> Option<&'a mut T> {
+    value.as_mut().map(|value| &mut **value)
 }
 
 /// Functional R5000 CPU with an injectable floating-point backend.
@@ -340,27 +310,26 @@ where
     }
 
     /// Runs cached typed blocks up to a retirement budget.
-    pub fn run_slice<B>(
+    pub fn run_slice<P>(
         &mut self,
-        engine: &mut Mips4BlockEngine<B>,
+        port: &mut P,
         budget: u64,
     ) -> Result<R5000ExecutionSlice, R5000CpuError>
     where
-        B: Mips4CodegenBackend,
-        B::Error: fmt::Display,
+        P: Mips4ExecutionPort,
+        P::Error: fmt::Display,
     {
-        let mut block_statistics = Mips4BlockEngineStatistics::default();
         let mut cached_retired = 0;
         let mut cached_exceptions = 0;
+        let mut fast_memory = None;
         let result = self.run_slice_inner(
-            engine,
+            port,
             budget,
             None,
-            &mut block_statistics,
+            &mut fast_memory,
             &mut cached_retired,
             &mut cached_exceptions,
         );
-        engine.record_cached_statistics(block_statistics);
         self.statistics.retired_instructions = self
             .statistics
             .retired_instructions
@@ -370,14 +339,28 @@ where
     }
 
     /// Runs queued protocol work or a reusable I-cache block before code-source probing.
-    pub fn run_reusable_slice<B>(
+    pub fn run_reusable_slice<P>(
         &mut self,
-        engine: &mut Mips4BlockEngine<B>,
+        port: &mut P,
         budget: u64,
     ) -> Result<Option<R5000ExecutionSlice>, R5000CpuError>
     where
-        B: Mips4CodegenBackend,
-        B::Error: fmt::Display,
+        P: Mips4ExecutionPort,
+        P::Error: fmt::Display,
+    {
+        let mut fast_memory = None;
+        self.run_reusable_slice_inner(port, budget, &mut fast_memory)
+    }
+
+    fn run_reusable_slice_inner<P>(
+        &mut self,
+        port: &mut P,
+        budget: u64,
+        fast_memory: &mut Option<&mut P::FastMemoryRuntime>,
+    ) -> Result<Option<R5000ExecutionSlice>, R5000CpuError>
+    where
+        P: Mips4ExecutionPort,
+        P::Error: fmt::Display,
     {
         if let Some(error) = &self.terminal_error {
             return Err(error.clone());
@@ -385,10 +368,33 @@ where
         if !self.executor.ready_for_direct_execution()
             || !self.executor.target().block_execution_ready()
         {
-            return self.run_slice(engine, budget).map(Some);
+            let mut cached_retired = 0;
+            let mut cached_exceptions = 0;
+            let result = self.run_slice_inner(
+                port,
+                budget,
+                None,
+                fast_memory,
+                &mut cached_retired,
+                &mut cached_exceptions,
+            );
+            self.statistics.retired_instructions = self
+                .statistics
+                .retired_instructions
+                .saturating_add(cached_retired);
+            self.statistics.exceptions =
+                self.statistics.exceptions.saturating_add(cached_exceptions);
+            return result.map(Some);
         }
         let key = self.executor.target().block_key();
-        if !engine.reusable_instruction_cache_block(key, self.executor.target()) {
+        if !matches!(
+            port.probe(
+                key,
+                Mips4BlockSource::InstructionCache,
+                self.executor.target(),
+            ),
+            Mips4BlockProbe::Ready { .. }
+        ) {
             return Ok(None);
         }
         if self.executor.consume_ready_continuation()
@@ -396,19 +402,16 @@ where
         {
             self.executor.target_mut().discard_dynamic_instruction();
         }
-
-        let mut block_statistics = Mips4BlockEngineStatistics::default();
         let mut cached_retired = 0;
         let mut cached_exceptions = 0;
         let result = self.run_slice_inner(
-            engine,
+            port,
             budget,
             Some(key),
-            &mut block_statistics,
+            fast_memory,
             &mut cached_retired,
             &mut cached_exceptions,
         );
-        engine.record_cached_statistics(block_statistics);
         self.statistics.retired_instructions = self
             .statistics
             .retired_instructions
@@ -418,22 +421,22 @@ where
     }
 
     /// Runs queued work or reusable blocks with a machine-proven fast-memory runtime.
-    pub fn run_reusable_slice_with_fast_memory<B, R>(
+    pub fn run_reusable_slice_with_fast_memory<P>(
         &mut self,
-        engine: &mut Mips4BlockEngine<B>,
+        port: &mut P,
         budget: u64,
-        runtime: &mut R,
+        runtime: &mut P::FastMemoryRuntime,
     ) -> Result<Option<R5000ExecutionSlice>, R5000CpuError>
     where
-        B: Mips4CodegenBackend,
-        B::Error: fmt::Display,
-        R: Mips4FastMemoryRuntime,
+        P: Mips4ExecutionPort,
+        P::Error: fmt::Display,
     {
         let before = runtime.completed_transactions();
-        self.executor.target_mut().bind_fast_memory_runtime(runtime);
-        let mut result = self.run_reusable_slice(engine, budget);
-        self.executor.target_mut().clear_fast_memory_runtime();
-        let completed = runtime
+        let mut fast_memory = Some(&mut *runtime);
+        let mut result = self.run_reusable_slice_inner(port, budget, &mut fast_memory);
+        let completed = fast_memory
+            .as_deref()
+            .expect("fast-memory runtime remains installed for the slice")
             .completed_transactions()
             .checked_sub(before)
             .ok_or_else(|| self.block_error("fast-memory transaction counter moved backwards"))?;
@@ -458,23 +461,24 @@ where
     }
 
     /// Runs a general typed slice with a machine-proven fast-memory runtime.
-    pub fn run_slice_with_code_window_and_fast_memory<B, R>(
+    pub fn run_slice_with_code_window_and_fast_memory<P>(
         &mut self,
-        engine: &mut Mips4BlockEngine<B>,
+        port: &mut P,
         budget: u64,
         code_window: Option<&Mips4CodeWindow>,
-        runtime: &mut R,
+        runtime: &mut P::FastMemoryRuntime,
     ) -> Result<R5000ExecutionSlice, R5000CpuError>
     where
-        B: Mips4CodegenBackend,
-        B::Error: fmt::Display,
-        R: Mips4FastMemoryRuntime,
+        P: Mips4ExecutionPort,
+        P::Error: fmt::Display,
     {
         let before = runtime.completed_transactions();
-        self.executor.target_mut().bind_fast_memory_runtime(runtime);
-        let mut result = self.run_slice_with_code_window(engine, budget, code_window);
-        self.executor.target_mut().clear_fast_memory_runtime();
-        let completed = runtime
+        let mut fast_memory = Some(&mut *runtime);
+        let mut result =
+            self.run_slice_with_code_window_inner(port, budget, code_window, &mut fast_memory);
+        let completed = fast_memory
+            .as_deref()
+            .expect("fast-memory runtime remains installed for the slice")
             .completed_transactions()
             .checked_sub(before)
             .ok_or_else(|| self.block_error("fast-memory transaction counter moved backwards"))?;
@@ -498,18 +502,18 @@ where
         result
     }
 
-    fn run_slice_inner<B>(
+    fn run_slice_inner<P>(
         &mut self,
-        engine: &mut Mips4BlockEngine<B>,
+        port: &mut P,
         budget: u64,
         initial_cached_block: Option<Mips4BlockKey>,
-        block_statistics: &mut Mips4BlockEngineStatistics,
+        fast_memory: &mut Option<&mut P::FastMemoryRuntime>,
         cached_retired: &mut u64,
         cached_exceptions: &mut u64,
     ) -> Result<R5000ExecutionSlice, R5000CpuError>
     where
-        B: Mips4CodegenBackend,
-        B::Error: fmt::Display,
+        P: Mips4ExecutionPort,
+        P::Error: fmt::Display,
     {
         if let Some(error) = &self.terminal_error {
             return Err(error.clone());
@@ -568,19 +572,20 @@ where
             let cached_execution = if block_key.code_guard == 0 {
                 let result = {
                     let target = self.executor.target_mut();
-                    engine.execute_cached_with_runtime(
+                    port.execute_reusable(
                         block_key,
                         &mut frame,
                         target,
+                        reborrow_optional(fast_memory),
                         deferred_boundaries != 0,
                     )
                 };
                 result.map_err(|error| self.block_error(error))?
             } else {
-                Mips4CachedBlockExecution::Missing
+                Mips4ReusableBlockExecution::Missing
             };
             let (slice, persistent_frame, counter_barrier) = match cached_execution {
-                Mips4CachedBlockExecution::Executed(block_execution)
+                Mips4ReusableBlockExecution::Executed(block_execution)
                     if matches!(
                         block_execution.exit,
                         Mips4BlockExit::BudgetExhausted
@@ -590,16 +595,12 @@ where
                     ) =>
                 {
                     self.executor.target_mut().discard_dynamic_instruction();
-                    if block_execution.exit == Mips4BlockExit::GuardInvalid {
-                        engine.invalidate(block_key);
-                    }
                     let retired_instructions = frame
                         .retired()
                         .checked_sub(previous_retired)
                         .ok_or_else(|| {
                             self.block_error("block retirement counter moved backwards")
                         })?;
-                    record_block_statistics(block_statistics, block_execution);
                     *cached_retired += retired_instructions;
                     accumulated.retired_instructions += retired_instructions;
                     accumulated.boundaries += retired_instructions;
@@ -639,30 +640,29 @@ where
                     block_key.delay_slot_branch_pc = frame.delay_slot_branch_pc();
                     continue;
                 }
-                Mips4CachedBlockExecution::Executed(block_execution) => {
+                Mips4ReusableBlockExecution::Executed(block_execution) => {
                     self.executor.target_mut().discard_dynamic_instruction();
                     let slice = self.finish_cached_block_exit(
                         &mut frame,
                         previous_retired,
                         block_execution,
                     )?;
-                    record_block_statistics(block_statistics, block_execution);
                     *cached_retired += slice.retired_instructions;
                     *cached_exceptions += u64::from(slice.exception_boundary.is_some());
                     (slice, true, block_execution.counter_barrier)
                 }
-                Mips4CachedBlockExecution::CounterSynchronization => {
+                Mips4ReusableBlockExecution::CounterSynchronization => {
                     self.advance_deferred_boundaries(&mut deferred_boundaries);
                     continue;
                 }
-                Mips4CachedBlockExecution::Missing => {
+                Mips4ReusableBlockExecution::Missing => {
                     self.advance_deferred_boundaries(&mut deferred_boundaries);
                     self.executor.target_mut().commit_block_frame(&mut frame);
                     if accumulated.boundaries != 0 {
                         return Ok(accumulated);
                     }
                     (
-                        self.run_slice_with_code_window(engine, remaining, None)?,
+                        self.run_slice_with_code_window_inner(port, remaining, None, fast_memory)?,
                         false,
                         false,
                     )
@@ -730,7 +730,7 @@ where
         &mut self,
         frame: &mut Mips4BlockFrame,
         previous_retired: u64,
-        execution: Mips4BlockExecution,
+        execution: Mips4BlockExecutionResult,
     ) -> Result<R5000ExecutionSlice, R5000CpuError> {
         let mut exception_boundary = None;
         let mut slice_action = R5000ExecutionSliceAction::Progress;
@@ -778,8 +778,8 @@ where
             }
             Mips4BlockExit::InternalError => {
                 return Err(self.block_error(format_args!(
-                    "cached block execution returned an internal error at PC {:#018x} after {} operations in {:?}",
-                    frame.pc(), execution.operations_executed, execution.tier,
+                    "cached block execution returned an internal error at PC {:#018x} after {} operations",
+                    frame.pc(), execution.operations_executed,
                 )));
             }
             Mips4BlockExit::BudgetExhausted
@@ -804,15 +804,30 @@ where
     }
 
     /// Runs a typed block with an optional versioned external code window.
-    pub fn run_slice_with_code_window<B>(
+    pub fn run_slice_with_code_window<P>(
         &mut self,
-        engine: &mut Mips4BlockEngine<B>,
+        port: &mut P,
         budget: u64,
         code_window: Option<&Mips4CodeWindow>,
     ) -> Result<R5000ExecutionSlice, R5000CpuError>
     where
-        B: Mips4CodegenBackend,
-        B::Error: fmt::Display,
+        P: Mips4ExecutionPort,
+        P::Error: fmt::Display,
+    {
+        let mut fast_memory = None;
+        self.run_slice_with_code_window_inner(port, budget, code_window, &mut fast_memory)
+    }
+
+    fn run_slice_with_code_window_inner<P>(
+        &mut self,
+        port: &mut P,
+        budget: u64,
+        code_window: Option<&Mips4CodeWindow>,
+        fast_memory: &mut Option<&mut P::FastMemoryRuntime>,
+    ) -> Result<R5000ExecutionSlice, R5000CpuError>
+    where
+        P: Mips4ExecutionPort,
+        P::Error: fmt::Display,
     {
         if let Some(error) = &self.terminal_error {
             return Err(error.clone());
@@ -844,22 +859,18 @@ where
                 .block_key_for_code_window(window)
                 .is_some()
         }) {
-            return self.run_stable_code_window_slice(engine, budget, window);
+            return self.run_stable_code_window_slice(port, budget, window, fast_memory);
         }
 
         let key = self.executor.target().block_key();
-        let cached_status = engine.block(key).map(|block| {
-            let reusable =
-                !block.guard().lines().is_empty() && block.guard().code_source().is_none();
-            let valid = reusable
-                && key.code_guard == 0
-                && self.executor.target().block_guard_valid(block.guard());
-            (reusable, valid)
-        });
-        if matches!(cached_status, Some((true, false))) {
-            engine.invalidate(key);
-        }
-        let cached_ready = matches!(cached_status, Some((true, true)));
+        let cached_ready = matches!(
+            port.probe(
+                key,
+                Mips4BlockSource::InstructionCache,
+                self.executor.target(),
+            ),
+            Mips4BlockProbe::Ready { .. }
+        );
         if cached_ready {
             self.executor.target_mut().discard_dynamic_instruction();
         } else {
@@ -870,8 +881,7 @@ where
                 .map_err(|error| self.block_error(error))?;
             if let Some(block) = cached_block {
                 self.executor.target_mut().discard_dynamic_instruction();
-                engine
-                    .insert(block)
+                port.install(block, Mips4BlockSource::InstructionCache)
                     .map_err(|error| self.block_error(error))?;
             } else {
                 if !self.executor.target().dynamic_instruction_ready() {
@@ -904,8 +914,7 @@ where
                             "instruction fetch continuation did not provide a dynamic block",
                         )
                     })?;
-                engine
-                    .insert_dynamic(block)
+                port.install(block, Mips4BlockSource::DynamicFetch)
                     .map_err(|error| self.block_error(error))?;
             }
         }
@@ -913,8 +922,7 @@ where
         let mut frame = self.take_block_frame(budget);
         let execution = {
             let target = self.executor.target_mut();
-            engine
-                .execute_with_runtime(key, &mut frame, target)
+            port.execute(key, &mut frame, target, reborrow_optional(fast_memory))
                 .map_err(|error| self.block_error(error))?
         };
         self.executor.target_mut().commit_block_frame(&mut frame);
@@ -964,23 +972,13 @@ where
                 slice_action = R5000ExecutionSliceAction::Idle;
             }
             Mips4BlockExit::TimelineExhausted => {}
-            Mips4BlockExit::GuardInvalid => {
-                engine.invalidate(key);
-            }
+            Mips4BlockExit::GuardInvalid => {}
             Mips4BlockExit::InternalError => {
                 return Err(self.block_error(format_args!(
-                    "dynamic block execution returned an internal error for {key:?} at PC {:#018x} after {} operations in {:?}",
-                    frame.pc(), execution.operations_executed, execution.tier,
+                    "dynamic block execution returned an internal error for {key:?} at PC {:#018x} after {} operations",
+                    frame.pc(), execution.operations_executed,
                 )));
             }
-        }
-
-        if engine.block(key).is_some_and(|block| {
-            !self.executor.target().block_guard_valid(block.guard())
-                || block.guard().code_source().is_some()
-                || key.code_guard != 0
-        }) {
-            engine.invalidate(key);
         }
         let retired = frame.retired();
         let boundaries = retired + u64::from(exception_boundary.is_some());
@@ -1004,15 +1002,16 @@ where
         })
     }
 
-    fn run_stable_code_window_slice<B>(
+    fn run_stable_code_window_slice<P>(
         &mut self,
-        engine: &mut Mips4BlockEngine<B>,
+        port: &mut P,
         budget: u64,
         window: &Mips4CodeWindow,
+        fast_memory: &mut Option<&mut P::FastMemoryRuntime>,
     ) -> Result<R5000ExecutionSlice, R5000CpuError>
     where
-        B: Mips4CodegenBackend,
-        B::Error: fmt::Display,
+        P: Mips4ExecutionPort,
+        P::Error: fmt::Display,
     {
         let fetch_limit = window.fetch_count() as u64;
         let mut frame = self.take_block_frame(budget.min(fetch_limit));
@@ -1032,35 +1031,43 @@ where
             else {
                 break;
             };
-            let cached_valid = engine.block(key).is_some_and(|block| {
-                block.guard().code_source() == Some(window.guard())
-                    && self.executor.target().block_guard_valid(block.guard())
-            });
-            if engine.block(key).is_some() && !cached_valid {
-                engine.invalidate(key);
-            }
-            if !cached_valid {
-                let block = self
-                    .executor
-                    .target()
-                    .build_code_window_for_key(window, key)
-                    .map_err(|error| self.block_error(error))?
-                    .ok_or_else(|| {
-                        self.block_error("stable code window did not produce a successor block")
-                    })?;
-                engine
-                    .insert(block)
-                    .map_err(|error| self.block_error(error))?;
-            }
-            if frame.retired() != 0 && engine.counter_barrier(key).unwrap_or(false) {
+            let counter_barrier = match port.probe(
+                key,
+                Mips4BlockSource::Stable(window.guard()),
+                self.executor.target(),
+            ) {
+                Mips4BlockProbe::Ready { counter_barrier } => counter_barrier,
+                Mips4BlockProbe::Missing => {
+                    let block = self
+                        .executor
+                        .target()
+                        .build_code_window_for_key(window, key)
+                        .map_err(|error| self.block_error(error))?
+                        .ok_or_else(|| {
+                            self.block_error("stable code window did not produce a successor block")
+                        })?;
+                    port.install(block, Mips4BlockSource::Stable(window.guard()))
+                        .map_err(|error| self.block_error(error))?;
+                    match port.probe(
+                        key,
+                        Mips4BlockSource::Stable(window.guard()),
+                        self.executor.target(),
+                    ) {
+                        Mips4BlockProbe::Ready { counter_barrier } => counter_barrier,
+                        Mips4BlockProbe::Missing => {
+                            return Err(self.block_error("installed stable block was not reusable"));
+                        }
+                    }
+                }
+            };
+            if frame.retired() != 0 && counter_barrier {
                 break;
             }
 
             self.executor.target_mut().discard_dynamic_instruction();
             let execution = {
                 let target = self.executor.target_mut();
-                engine
-                    .execute_with_runtime(key, &mut frame, target)
+                port.execute(key, &mut frame, target, reborrow_optional(fast_memory))
                     .map_err(|error| self.block_error(error))?
             };
             fast_fetches = fast_fetches
@@ -1131,22 +1138,13 @@ where
                 slice_action = R5000ExecutionSliceAction::Idle;
             }
             Mips4BlockExit::TimelineExhausted => {}
-            Mips4BlockExit::GuardInvalid => {
-                engine.invalidate(key);
-            }
+            Mips4BlockExit::GuardInvalid => {}
             Mips4BlockExit::InternalError => {
                 return Err(self.block_error(format_args!(
-                    "stable block execution returned an internal error for {key:?} at PC {:#018x} after {} operations in {:?}",
-                    frame.pc(), execution.operations_executed, execution.tier,
+                    "stable block execution returned an internal error for {key:?} at PC {:#018x} after {} operations",
+                    frame.pc(), execution.operations_executed,
                 )));
             }
-        }
-
-        if engine.block(key).is_some_and(|block| {
-            block.guard().code_source() != Some(window.guard())
-                || !self.executor.target().block_guard_valid(block.guard())
-        }) {
-            engine.invalidate(key);
         }
         let retired = frame.retired();
         let boundaries = retired + u64::from(exception_boundary.is_some());
@@ -1158,7 +1156,6 @@ where
         }
         self.executor.target_mut().advance_random(boundaries);
         self.advance_pclocks(boundaries);
-        engine.record_fast_fetches(fast_fetches, window.guard().kind);
         let simulated_time_ticks = window
             .fetch_time_ticks(fast_fetches as usize)
             .ok_or_else(|| self.block_error("stable fetches exceeded their planned timeline"))?;
@@ -1312,7 +1309,7 @@ where
     }
 
     fn take_block_frame(&mut self, budget: u64) -> Mips4BlockFrame {
-        let mut frame = if let Some(mut frame) = self.reusable_block_frame.0.take() {
+        if let Some(mut frame) = self.reusable_block_frame.0.take() {
             debug_assert_eq!(frame.pc(), self.state().pc());
             debug_assert_eq!(frame.next_pc(), self.state().next_pc());
             debug_assert_eq!(
@@ -1325,9 +1322,7 @@ where
             frame
         } else {
             self.executor.target().block_frame(budget)
-        };
-        self.executor.target_mut().bind_block_frame(&mut frame);
-        frame
+        }
     }
 
     fn commit_reusable_block_frame(&mut self, mut frame: Mips4BlockFrame) {

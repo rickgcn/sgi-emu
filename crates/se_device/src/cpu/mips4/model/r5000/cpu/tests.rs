@@ -5,50 +5,128 @@ use se_float::backend::native::NativeFloatBackend;
 
 use crate::cpu::execution::protocol::{ExecutionAction, ExecutionTransaction};
 use crate::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
+use crate::cpu::mips4::execution::block::{
+    Mips4Block, Mips4BlockRuntime, Mips4FastMemoryRuntime, interpret_block_with_runtime,
+};
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
+use crate::cpu::mips4::execution::port::{
+    Mips4BlockExecutionResult, Mips4BlockProbe, Mips4BlockSource, Mips4ExecutionPort,
+    Mips4ReusableBlockExecution,
+};
 use crate::cpu::mips4::model::r5000::revision::R5000Revision;
 
 use super::*;
 
-struct InterpreterOnlyBackend;
+#[derive(Default)]
+struct InterpreterPort {
+    blocks: Vec<Mips4Block>,
+    saw_fast_memory: bool,
+}
 
-impl Mips4CodegenBackend for InterpreterOnlyBackend {
-    type CompiledBlock = ();
-    type CompiledRegion = ();
+impl Mips4ExecutionPort for InterpreterPort {
     type Error = core::convert::Infallible;
+    type FastMemoryRuntime = dyn Mips4FastMemoryRuntime;
 
-    fn compile(
+    fn probe<R>(
         &mut self,
-        _block: &crate::cpu::mips4::execution::block::Mips4Block,
-    ) -> Result<Self::CompiledBlock, Self::Error> {
+        key: Mips4BlockKey,
+        source: Mips4BlockSource,
+        runtime: &R,
+    ) -> Mips4BlockProbe
+    where
+        R: Mips4BlockRuntime + ?Sized,
+    {
+        let source_matches = self
+            .blocks
+            .iter()
+            .find(|block| block.key() == key)
+            .is_some_and(|block| match source {
+                Mips4BlockSource::InstructionCache => {
+                    !block.guard().lines().is_empty() && block.guard().code_source().is_none()
+                }
+                Mips4BlockSource::DynamicFetch => {
+                    block.guard().lines().is_empty() && block.guard().code_source().is_none()
+                }
+                Mips4BlockSource::Stable(guard) => block.guard().code_source() == Some(guard),
+            });
+        let ready = source_matches
+            && self
+                .blocks
+                .iter()
+                .find(|block| block.key() == key)
+                .is_some_and(|block| runtime.block_guard_valid(block.guard()));
+        if ready {
+            Mips4BlockProbe::Ready {
+                counter_barrier: false,
+            }
+        } else {
+            if source_matches {
+                self.blocks.retain(|block| block.key() != key);
+            }
+            Mips4BlockProbe::Missing
+        }
+    }
+
+    fn install(&mut self, block: Mips4Block, _source: Mips4BlockSource) -> Result<(), Self::Error> {
+        self.blocks.retain(|cached| cached.key() != block.key());
+        self.blocks.push(block);
         Ok(())
     }
 
-    fn execute(
+    fn execute<R>(
         &mut self,
-        _compiled: &Self::CompiledBlock,
-        _frame: &mut Mips4BlockFrame,
-    ) -> Result<Mips4BlockExit, Self::Error> {
-        unreachable!("the test never reaches the native compilation threshold")
+        key: Mips4BlockKey,
+        frame: &mut Mips4BlockFrame,
+        runtime: &mut R,
+        fast_memory: Option<&mut Self::FastMemoryRuntime>,
+    ) -> Result<Mips4BlockExecutionResult, Self::Error>
+    where
+        R: Mips4BlockRuntime,
+    {
+        self.saw_fast_memory |= fast_memory.is_some();
+        let block = self
+            .blocks
+            .iter()
+            .find(|block| block.key() == key)
+            .expect("the CPU probes or installs before execution");
+        let exit = interpret_block_with_runtime(block, frame, runtime, fast_memory);
+        Ok(Mips4BlockExecutionResult {
+            exit,
+            counter_barrier: false,
+            operations_executed: frame.operations_executed(),
+        })
     }
 
-    fn compile_region(
+    fn execute_reusable<R>(
         &mut self,
-        _region: &crate::cpu::mips4::execution::block::Mips4Region,
-    ) -> Result<Self::CompiledRegion, Self::Error> {
-        unreachable!("the test never reaches the Region compilation threshold")
+        key: Mips4BlockKey,
+        frame: &mut Mips4BlockFrame,
+        runtime: &mut R,
+        fast_memory: Option<&mut Self::FastMemoryRuntime>,
+        _counters_dirty: bool,
+    ) -> Result<Mips4ReusableBlockExecution, Self::Error>
+    where
+        R: Mips4BlockRuntime,
+    {
+        if !matches!(
+            self.probe(key, Mips4BlockSource::InstructionCache, runtime),
+            Mips4BlockProbe::Ready { .. }
+        ) {
+            return Ok(Mips4ReusableBlockExecution::Missing);
+        }
+        self.execute(key, frame, runtime, fast_memory)
+            .map(Mips4ReusableBlockExecution::Executed)
     }
+}
 
-    fn execute_region(
+struct UnavailableFastMemory;
+
+impl Mips4FastMemoryRuntime for UnavailableFastMemory {
+    fn read(
         &mut self,
-        _compiled: &Self::CompiledRegion,
-        _frame: &mut Mips4BlockFrame,
-    ) -> Result<Mips4BlockExit, Self::Error> {
-        unreachable!("the test never reaches the Region compilation threshold")
-    }
-
-    fn clear(&mut self) -> Result<(), Self::Error> {
-        Ok(())
+        _request: crate::cpu::mips4::execution::block::Mips4FastMemoryReadRequest,
+    ) -> crate::cpu::mips4::execution::block::Mips4FastMemoryReadResult {
+        crate::cpu::mips4::execution::block::Mips4FastMemoryReadResult::Unavailable
     }
 }
 
@@ -162,7 +240,7 @@ fn decode_cache_keys_include_raw_bits_and_do_not_skip_uncached_fetches() {
 #[test]
 fn protocol_boundary_refreshes_the_reusable_block_frame() {
     let mut cpu = cpu();
-    let mut engine = Mips4BlockEngine::new(InterpreterOnlyBackend);
+    let mut engine = InterpreterPort::default();
     let mut bus = FakeBus {
         ram: FakeRam::new(),
     };
@@ -200,6 +278,35 @@ fn protocol_boundary_refreshes_the_reusable_block_frame() {
     assert_eq!(frame.pc(), cpu.state().pc());
     assert_eq!(frame.next_pc(), cpu.state().next_pc());
     assert_eq!(frame.read_gpr(8), 0x1234_5678);
+}
+
+#[test]
+fn fake_port_receives_fast_memory_and_reports_architectural_exceptions() {
+    let mut cpu = cpu();
+    let mut port = InterpreterPort::default();
+    let mut fast_memory = UnavailableFastMemory;
+    let R5000ExecutionSliceAction::Transaction(fetch) = cpu
+        .run_slice_with_code_window_and_fast_memory(&mut port, 1, None, &mut fast_memory)
+        .unwrap()
+        .action
+    else {
+        panic!("expected instruction fetch");
+    };
+    BusControllerRole::complete(
+        &mut cpu,
+        ExecutionCompletion {
+            id: fetch.id,
+            payload: Mips4ExecutionCompletion::ReadData(big_endian_word(0x0000_000c)),
+        },
+    );
+    let execution = cpu
+        .run_slice_with_code_window_and_fast_memory(&mut port, 1, None, &mut fast_memory)
+        .unwrap();
+    assert!(port.saw_fast_memory);
+    assert!(matches!(
+        execution.exception_boundary,
+        Some(Mips4ExecutionBoundary::Exception { .. })
+    ));
 }
 
 #[test]

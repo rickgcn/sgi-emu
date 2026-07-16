@@ -4,8 +4,9 @@ use std::time::Instant;
 use se_device::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 use se_device::cpu::mips4::execution::block::{
     Mips4Block, Mips4BlockFrame, Mips4BlockGuard, Mips4BlockInstructionMetadata, Mips4BlockKey,
-    Mips4BlockLiftedInstruction, Mips4CodeGuard, Mips4CodeGuardKind, Mips4CodegenBackend,
-    Mips4Region, Mips4RegionNode, interpret_block, lift_cpu_instruction,
+    Mips4BlockLiftedInstruction, Mips4BlockRuntime, Mips4CodeGuard, Mips4CodeGuardKind,
+    Mips4FastMemoryRuntime, Mips4RuntimeOperation, Mips4RuntimeResult, interpret_block,
+    lift_cpu_instruction,
 };
 use se_device::cpu::mips4::instruction::Mips4Instruction;
 use se_device::cpu::mips4::instruction::decode::{
@@ -15,12 +16,58 @@ use se_device::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
 use se_device::cpu::mips4::model::r5000::execution_policy::R5000ExecutionPolicy;
 use se_device::cpu::mips4::model::r5000::profile::R5000Profile;
 use se_device::cpu::mips4::model::r5000::revision::R5000Revision;
-use se_jit::mips4::CraneliftMips4Backend;
+use se_jit::mips4::cranelift::{CraneliftMips4Backend, CraneliftMips4Block, CraneliftMips4Region};
+use se_jit::mips4::engine::Mips4CodegenBackend;
+use se_jit::mips4::region::{Mips4Region, Mips4RegionNode};
 
 const BASE: u64 = 0x1000;
 const ITERATIONS: usize = 500_000;
 const REGION_ITERATIONS: usize = 100_000;
 const REGION_BUDGET: u64 = 100;
+
+struct RejectRuntime;
+
+impl Mips4BlockRuntime for RejectRuntime {
+    fn execute<F>(
+        &mut self,
+        _frame: &mut Mips4BlockFrame,
+        _operation: Mips4RuntimeOperation,
+        _fast_memory: Option<&mut F>,
+    ) -> Mips4RuntimeResult
+    where
+        F: Mips4FastMemoryRuntime + ?Sized,
+    {
+        Mips4RuntimeResult::InternalError
+    }
+}
+
+#[inline(always)]
+fn execute_native_block(
+    backend: &mut CraneliftMips4Backend,
+    compiled: &CraneliftMips4Block,
+    frame: &mut Mips4BlockFrame,
+    runtime: &mut RejectRuntime,
+) {
+    black_box(
+        backend
+            .execute(compiled, frame, runtime, &[], None)
+            .unwrap(),
+    );
+}
+
+#[inline(always)]
+fn execute_native_region(
+    backend: &mut CraneliftMips4Backend,
+    compiled: &CraneliftMips4Region,
+    frame: &mut Mips4BlockFrame,
+    runtime: &mut RejectRuntime,
+) {
+    black_box(
+        backend
+            .execute_region(compiled, frame, runtime, &[], None)
+            .unwrap(),
+    );
+}
 
 fn policy() -> R5000ExecutionPolicy {
     R5000ExecutionPolicy::new(
@@ -172,17 +219,19 @@ fn main() {
     let mut backend = CraneliftMips4Backend::new().unwrap();
     let compiled = backend.compile(&block).unwrap();
     let mut native = frame;
+    let mut runtime = RejectRuntime;
     for _ in 0..1_000 {
         native.prepare(64);
-        black_box(backend.execute(&compiled, &mut native).unwrap());
+        execute_native_block(&mut backend, &compiled, &mut native, &mut runtime);
     }
     let started = Instant::now();
     for _ in 0..ITERATIONS {
         native.prepare(64);
-        black_box(
-            backend
-                .execute(black_box(&compiled), black_box(&mut native))
-                .unwrap(),
+        execute_native_block(
+            &mut backend,
+            black_box(&compiled),
+            black_box(&mut native),
+            &mut runtime,
         );
     }
     let native_time = started.elapsed();
@@ -199,17 +248,19 @@ fn main() {
         block_native.prepare(REGION_BUDGET);
         while block_native.budget() != 0 {
             let index = usize::try_from((block_native.pc() - BASE) / 4).unwrap();
-            black_box(
-                backend
-                    .execute(&compiled_region_blocks[index], &mut block_native)
-                    .unwrap(),
+            execute_native_block(
+                &mut backend,
+                &compiled_region_blocks[index],
+                &mut block_native,
+                &mut runtime,
             );
         }
         region_native.prepare(REGION_BUDGET);
-        black_box(
-            backend
-                .execute_region(&compiled_region, &mut region_native)
-                .unwrap(),
+        execute_native_region(
+            &mut backend,
+            &compiled_region,
+            &mut region_native,
+            &mut runtime,
         );
     }
     let started = Instant::now();
@@ -217,13 +268,11 @@ fn main() {
         block_native.prepare(REGION_BUDGET);
         while block_native.budget() != 0 {
             let index = usize::try_from((block_native.pc() - BASE) / 4).unwrap();
-            black_box(
-                backend
-                    .execute(
-                        black_box(&compiled_region_blocks[index]),
-                        black_box(&mut block_native),
-                    )
-                    .unwrap(),
+            execute_native_block(
+                &mut backend,
+                black_box(&compiled_region_blocks[index]),
+                black_box(&mut block_native),
+                &mut runtime,
             );
         }
     }
@@ -231,10 +280,11 @@ fn main() {
     let started = Instant::now();
     for _ in 0..REGION_ITERATIONS {
         region_native.prepare(REGION_BUDGET);
-        black_box(
-            backend
-                .execute_region(black_box(&compiled_region), black_box(&mut region_native))
-                .unwrap(),
+        execute_native_region(
+            &mut backend,
+            black_box(&compiled_region),
+            black_box(&mut region_native),
+            &mut runtime,
         );
     }
     let region_time = started.elapsed();
