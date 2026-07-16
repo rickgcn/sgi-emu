@@ -2279,8 +2279,11 @@ fn local_ip32_prom_reaches_gbe_display_output() {
         jit_enabled: true,
         ..Ip32MachineConfig::default()
     };
-    let mut machine =
-        Ip32Machine::from_config_with_trace_sink(config, PromDisplaySink::default()).unwrap();
+    let sink = PromDisplaySink {
+        capture_render: true,
+        ..PromDisplaySink::default()
+    };
+    let mut machine = Ip32Machine::from_config_with_trace_sink(config, sink).unwrap();
     machine.schedule_power_on().unwrap();
     machine
         .schedule_gbe_external_input(SimTime::ZERO, GbeExternalInput::SenseN(false))
@@ -2302,6 +2305,8 @@ fn local_ip32_prom_reaches_gbe_display_output() {
         .unwrap_or(100_000_000);
     let mut events = 0;
     let mut last_frame = None;
+    let mut first_visible_frame = None;
+    let mut frames_after_first = 0_u64;
     let mut terminal = Vec::new();
     let diagnostic_frame_limit = std::env::var("IP32_PROM_DISPLAY_DIAGNOSTIC_FRAMES")
         .ok()
@@ -2318,14 +2323,34 @@ fn local_ip32_prom_reaches_gbe_display_output() {
                 .chunks_exact(4)
                 .any(|pixel| pixel[..3] != [0, 0, 0]);
             if has_visible_pixel {
-                return;
+                if first_visible_frame.is_none() {
+                    first_visible_frame = Some((
+                        machine.runtime().now(),
+                        frame.sequence,
+                        frame.width,
+                        frame.height,
+                    ));
+                } else {
+                    frames_after_first += 1;
+                }
             }
             last_frame = Some((events, frame.sequence, frame.width, frame.height));
-            if diagnostic_frame_limit.is_some_and(|limit| frame.sequence >= limit) {
+            if first_visible_frame.is_none()
+                && diagnostic_frame_limit.is_some_and(|limit| frame.sequence >= limit)
+            {
                 break;
             }
         }
         assert!(!matches!(status, RunStatus::Idle | RunStatus::Stopped));
+        if let Some((first_time, ..)) = first_visible_frame
+            && machine.runtime().now().get() >= first_time.get().saturating_add(IP32_TIMEBASE_HZ)
+        {
+            assert_ne!(
+                frames_after_first, 0,
+                "GBE stopped publishing visible frames after the first valid frame"
+            );
+            return;
+        }
     }
 
     let cpu = machine
@@ -2411,7 +2436,7 @@ fn local_ip32_prom_reaches_gbe_display_output() {
         }
     }
     panic!(
-        "the PROM did not publish a non-black GBE frame within {max_events} events; last_frame={last_frame:?}; dma_events={dma_events:?}; render_writes={render_writes:016x?}; terminal={terminal:?}; tile_pages={tile_pages:04x?}; nonzero_tiles={nonzero_tiles:04x?}; time={time:?}; PERFORMANCE={performance:#?}; PC={pc:#018x}; GPR={gpr:#018x?}; CODE_ADDRESS={code_address:#010x}; CODE={code:02x?}; CTRLSTAT={control_status:#010x}; DOTCLOCK={dot_clock:#010x}; VT_XY={vt_xy:#010x}; VT_XY_MAX={vt_xy_max:#010x}; VT_INTR01={vt_intr01:#010x}; VT_INTR23={vt_intr23:#010x}; VT_HPIXEN={vt_hpixen:#010x}; VT_VPIXEN={vt_vpixen:#010x}; FRM_0={frame_size_tile:#010x}; FRM_1={frame_size_pixel:#010x}; FRM_2={frame_active:#010x}; FRM_3={frame_shadow:#010x}; DID={did_active:#010x}; WID_0={wid_zero:#010x}; CMAP_0={color_zero:#010x}; CMAP_1={color_one:#010x}; GMAP_0={gamma_zero:#010x}; GMAP_1={gamma_one:#010x}; GMAP_255={gamma_max:#010x}"
+        "the PROM did not sustain non-black GBE output for one simulated second within {max_events} events; first_visible_frame={first_visible_frame:?}; frames_after_first={frames_after_first}; last_frame={last_frame:?}; dma_events={dma_events:?}; render_writes={render_writes:016x?}; terminal={terminal:?}; tile_pages={tile_pages:04x?}; nonzero_tiles={nonzero_tiles:04x?}; time={time:?}; PERFORMANCE={performance:#?}; PC={pc:#018x}; GPR={gpr:#018x?}; CODE_ADDRESS={code_address:#010x}; CODE={code:02x?}; CTRLSTAT={control_status:#010x}; DOTCLOCK={dot_clock:#010x}; VT_XY={vt_xy:#010x}; VT_XY_MAX={vt_xy_max:#010x}; VT_INTR01={vt_intr01:#010x}; VT_INTR23={vt_intr23:#010x}; VT_HPIXEN={vt_hpixen:#010x}; VT_VPIXEN={vt_vpixen:#010x}; FRM_0={frame_size_tile:#010x}; FRM_1={frame_size_pixel:#010x}; FRM_2={frame_active:#010x}; FRM_3={frame_shadow:#010x}; DID={did_active:#010x}; WID_0={wid_zero:#010x}; CMAP_0={color_zero:#010x}; CMAP_1={color_one:#010x}; GMAP_0={gamma_zero:#010x}; GMAP_1={gamma_one:#010x}; GMAP_255={gamma_max:#010x}"
     );
 }
 
@@ -2419,9 +2444,6 @@ fn local_ip32_prom_reaches_gbe_display_output() {
 #[test]
 #[ignore = "requires a local proprietary IP32 PROM image"]
 fn local_ip32_prom_initializes_classic_ps2_keyboard() {
-    use se_device::chipset::crime::{CrimeError, render::CrimeRenderError};
-    use se_runtime::runtime::RunError;
-
     let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
     let config = Ip32MachineConfig {
         prom_image: std::fs::read(&path).expect("the local PROM image must be readable"),
@@ -2456,13 +2478,6 @@ fn local_ip32_prom_initializes_classic_ps2_keyboard() {
                 panic!("PROM became inactive before PS/2 initialization: {path}")
             }
             Ok(_) => {}
-            Err(RunError::Dispatch(Ip32MachineDispatchError::Crime(CrimeError::Render(
-                CrimeRenderError::UnsupportedPixelCommand {
-                    primitive: 0x0100_0020,
-                    draw_mode: 0x0008_02f8,
-                    ..
-                },
-            )))) => break,
             Err(error) => panic!("PROM failed before PS/2 initialization: {error}"),
         }
         events += batch;
