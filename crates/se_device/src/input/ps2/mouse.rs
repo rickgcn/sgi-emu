@@ -114,6 +114,7 @@ impl Ps2Mouse {
                 if self.has_reportable_change()
                     && self.link.can_start()
                     && self.responses.is_empty()
+                    && !self.link.has_deferred_device_byte()
                 {
                     self.queue_packet();
                 }
@@ -379,11 +380,12 @@ impl Ps2Mouse {
         if !self.link.can_start() {
             return;
         }
-        let Some(byte) = self.responses.pop_front() else {
+        if let Some(byte) = self.responses.pop_front() {
+            let started = self.link.start_device_byte(byte);
+            debug_assert!(started, "an idle PS/2 link must accept one byte");
             return;
-        };
-        let started = self.link.start_device_byte(byte);
-        debug_assert!(started, "an idle PS/2 link must accept one byte");
+        }
+        self.link.resume_deferred_device_byte();
     }
 }
 

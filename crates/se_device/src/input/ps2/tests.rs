@@ -26,8 +26,30 @@ fn two_to_one_scaling_uses_the_standard_small_motion_table() {
     }
 }
 
+fn deliver_link_lines(
+    link: &mut Ps2DeviceLink,
+    bus: ComponentId,
+    source: ComponentId,
+    time: u64,
+    source_clock_low: bool,
+    source_data_low: bool,
+    clock_low: bool,
+    data_low: bool,
+) {
+    link.observe_lines(TwoWireLineDelivery {
+        bus,
+        source,
+        time: SimTime::new(time),
+        source_clock_low,
+        source_data_low,
+        clock_low,
+        data_low,
+    })
+    .unwrap();
+}
+
 #[test]
-fn device_clock_waits_while_the_host_inhibits_the_bus() {
+fn host_request_preempts_a_device_byte_before_its_first_clock() {
     let controller = ComponentId::new(1);
     let device = ComponentId::new(2);
     let bus = ComponentId::new(3);
@@ -38,44 +60,113 @@ fn device_clock_waits_while_the_host_inhibits_the_bus() {
     let Some(LinkAction::Schedule { event, .. }) = link.poll() else {
         panic!("device transmission must schedule its first clock edge");
     };
-    link.observe_lines(TwoWireLineDelivery {
-        bus,
-        source: controller,
-        time: SimTime::new(1),
-        source_clock_low: true,
-        source_data_low: false,
-        clock_low: true,
-        data_low: true,
-    })
-    .unwrap();
-    let transfer = link.transfer;
+    deliver_link_lines(&mut link, bus, controller, 1, true, false, true, true);
 
     assert_eq!(link.handle_event(event), None);
-    assert_eq!(link.transfer, transfer);
-    let Some(LinkAction::Schedule { delay, event }) = link.poll() else {
-        panic!("an inhibited device must poll for clock release");
+    assert_eq!(
+        link.transfer,
+        LinkTransfer::DeviceInhibited {
+            frame: serial_frame(0x5a),
+            started: false,
+        }
+    );
+    let Some(LinkAction::Drive(release)) = link.poll() else {
+        panic!("an inhibited device must release both lines");
     };
-    assert_eq!(delay, SimDuration::new(100_000));
+    assert!(!release.clock_low);
+    assert!(!release.data_low);
+    assert!(link.poll().is_none());
 
-    link.observe_lines(TwoWireLineDelivery {
-        bus,
-        source: controller,
-        time: SimTime::new(100_001),
-        source_clock_low: false,
-        source_data_low: false,
-        clock_low: false,
-        data_low: true,
-    })
-    .unwrap();
-    assert_eq!(link.handle_event(event), None);
+    deliver_link_lines(&mut link, bus, device, 2, false, false, true, false);
+    deliver_link_lines(&mut link, bus, controller, 3, true, true, true, true);
+    deliver_link_lines(&mut link, bus, controller, 4, false, true, false, true);
     assert!(matches!(
         link.transfer,
-        LinkTransfer::DeviceTransmit {
+        LinkTransfer::HostReceive {
             bit: 0,
-            clock_low: true,
+            clock_low: false,
             ..
         }
     ));
+    assert!(!link.has_deferred_device_byte());
+    assert!(matches!(link.poll(), Some(LinkAction::Schedule { .. })));
+}
+
+#[test]
+fn partially_transmitted_device_byte_is_deferred_during_a_host_request() {
+    let controller = ComponentId::new(1);
+    let device = ComponentId::new(2);
+    let bus = ComponentId::new(3);
+    let mut link =
+        Ps2DeviceLink::new(device, Ps2Wiring { controller, bus }, 1_000_000_000).unwrap();
+    assert!(link.start_device_byte(0x5a));
+    assert!(matches!(link.poll(), Some(LinkAction::Drive(_))));
+    let Some(LinkAction::Schedule { event, .. }) = link.poll() else {
+        panic!("device transmission must schedule its first clock edge");
+    };
+    assert_eq!(link.handle_event(event), None);
+    let Some(LinkAction::Drive(drive_low)) = link.poll() else {
+        panic!("the first device clock must drive the line low");
+    };
+    deliver_link_lines(
+        &mut link,
+        bus,
+        device,
+        1,
+        drive_low.clock_low,
+        drive_low.data_low,
+        true,
+        true,
+    );
+    let Some(LinkAction::Schedule { event, .. }) = link.poll() else {
+        panic!("the first device clock must schedule its release");
+    };
+
+    deliver_link_lines(&mut link, bus, controller, 2, true, false, true, true);
+    assert_eq!(link.handle_event(event), None);
+    let Some(LinkAction::Drive(release_clock)) = link.poll() else {
+        panic!("the device must release its first clock pulse");
+    };
+    deliver_link_lines(
+        &mut link,
+        bus,
+        device,
+        3,
+        release_clock.clock_low,
+        release_clock.data_low,
+        true,
+        release_clock.data_low,
+    );
+    let Some(LinkAction::Schedule { event, .. }) = link.poll() else {
+        panic!("the next device clock must remain scheduled");
+    };
+    assert_eq!(link.handle_event(event), None);
+    assert!(matches!(
+        link.transfer,
+        LinkTransfer::DeviceInhibited { started: true, .. }
+    ));
+    let Some(LinkAction::Drive(release_data)) = link.poll() else {
+        panic!("the inhibited device must release its data output");
+    };
+    deliver_link_lines(
+        &mut link,
+        bus,
+        device,
+        4,
+        release_data.clock_low,
+        release_data.data_low,
+        true,
+        false,
+    );
+    deliver_link_lines(&mut link, bus, controller, 5, true, true, true, true);
+    deliver_link_lines(&mut link, bus, controller, 6, false, true, false, true);
+
+    assert!(matches!(link.transfer, LinkTransfer::HostReceive { .. }));
+    assert_eq!(link.deferred_device_frame, Some(serial_frame(0x5a)));
+
+    let encoded = postcard::to_stdvec(&link).unwrap();
+    let restored: Ps2DeviceLink = postcard::from_bytes(&encoded).unwrap();
+    assert_eq!(restored, link);
 }
 
 #[test]
@@ -283,4 +374,214 @@ fn mace_and_keyboard_exchange_ide_set_three_commands_over_open_drain_lines() {
 
     assert_eq!(keyboard.scan_set(), 3);
     assert_eq!(controller.status() & 0x38, 0x08);
+}
+
+#[derive(Clone, Copy)]
+enum MouseTestEvent {
+    Controller { at: SimTime, epoch: u64 },
+    Mouse { at: SimTime, event: Ps2MouseEvent },
+}
+
+impl MouseTestEvent {
+    fn at(self) -> SimTime {
+        match self {
+            Self::Controller { at, .. } | Self::Mouse { at, .. } => at,
+        }
+    }
+}
+
+fn drain_mouse_test_lines(
+    now: SimTime,
+    controller: &mut Ps2Port,
+    mouse: &mut Ps2Mouse,
+    bus: &mut TwoWireBus,
+    events: &mut Vec<MouseTestEvent>,
+) {
+    loop {
+        let mut progressed = false;
+        while let Some(action) = controller.poll() {
+            progressed = true;
+            match action {
+                Ps2PortAction::Schedule { delay, epoch } => {
+                    events.push(MouseTestEvent::Controller {
+                        at: SimTime::new(now.get().saturating_add(delay.get())),
+                        epoch,
+                    });
+                }
+                Ps2PortAction::Drive { drive, .. } => bus.route(drive).unwrap(),
+            }
+        }
+        while let Ps2MousePoll::Action(action) = mouse.poll() {
+            progressed = true;
+            match action {
+                Ps2MouseAction::Schedule { delay, event } => {
+                    events.push(MouseTestEvent::Mouse {
+                        at: SimTime::new(now.get().saturating_add(delay.get())),
+                        event,
+                    });
+                }
+                Ps2MouseAction::Drive(drive) => bus.route(drive).unwrap(),
+            }
+        }
+        while let TwoWireBusAction::Deliver { target, delivery } = bus.poll() {
+            progressed = true;
+            if target == ComponentId::new(1) {
+                controller.observe_lines(delivery);
+            } else {
+                mouse.observe_lines(delivery).unwrap();
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
+fn run_next_mouse_test_event(
+    now: &mut SimTime,
+    controller: &mut Ps2Port,
+    mouse: &mut Ps2Mouse,
+    bus: &mut TwoWireBus,
+    events: &mut Vec<MouseTestEvent>,
+) -> bool {
+    let Some((index, _)) = events
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, event)| event.at())
+    else {
+        return false;
+    };
+    let event = events.swap_remove(index);
+    *now = event.at();
+    match event {
+        MouseTestEvent::Controller { epoch, .. } => controller.handle_event(*now, epoch),
+        MouseTestEvent::Mouse { event, .. } => mouse.handle_event(*now, event),
+    }
+    drain_mouse_test_lines(*now, controller, mouse, bus, events);
+    true
+}
+
+fn exchange_mouse_host_byte(
+    byte: u8,
+    now: &mut SimTime,
+    controller: &mut Ps2Port,
+    mouse: &mut Ps2Mouse,
+    bus: &mut TwoWireBus,
+    events: &mut Vec<MouseTestEvent>,
+) -> u8 {
+    controller.write_transmit(byte);
+    drain_mouse_test_lines(*now, controller, mouse, bus, events);
+    for _ in 0..256 {
+        if controller.status() & 0x10 != 0 {
+            let response = controller.read_receive() as u8;
+            drain_mouse_test_lines(*now, controller, mouse, bus, events);
+            while run_next_mouse_test_event(now, controller, mouse, bus, events) {}
+            return response;
+        }
+        assert!(run_next_mouse_test_event(
+            now, controller, mouse, bus, events
+        ));
+    }
+    panic!("PS/2 mouse host transaction did not complete");
+}
+
+#[test]
+fn mace_preempts_the_pending_mouse_bat_id_for_ide_initialization() {
+    let controller_id = ComponentId::new(1);
+    let mouse_id = ComponentId::new(2);
+    let bus_id = ComponentId::new(3);
+    let mut controller = Ps2Port::new(controller_id, bus_id, 1_000_000_000);
+    let mut mouse = Ps2Mouse::new(
+        mouse_id,
+        "mouse",
+        Ps2Wiring {
+            controller: controller_id,
+            bus: bus_id,
+        },
+        1_000_000_000,
+    )
+    .unwrap();
+    let mut bus = TwoWireBus::new(bus_id, "PS/2", [controller_id, mouse_id]).unwrap();
+    let mut events = Vec::new();
+    let mut now = SimTime::ZERO;
+    controller.set_control(0x12);
+    mouse.power_on(now);
+    drain_mouse_test_lines(now, &mut controller, &mut mouse, &mut bus, &mut events);
+
+    for _ in 0..256 {
+        if controller.status() & 0x10 != 0 {
+            break;
+        }
+        assert!(run_next_mouse_test_event(
+            &mut now,
+            &mut controller,
+            &mut mouse,
+            &mut bus,
+            &mut events,
+        ));
+    }
+    assert_eq!(controller.read_receive() as u8, 0xaa);
+    drain_mouse_test_lines(now, &mut controller, &mut mouse, &mut bus, &mut events);
+    if !matches!(
+        mouse.link.transfer,
+        LinkTransfer::DeviceTransmit {
+            bit: 0,
+            clock_low: false,
+            ..
+        }
+    ) {
+        assert!(run_next_mouse_test_event(
+            &mut now,
+            &mut controller,
+            &mut mouse,
+            &mut bus,
+            &mut events,
+        ));
+    }
+    assert!(matches!(
+        mouse.link.transfer,
+        LinkTransfer::DeviceTransmit {
+            bit: 0,
+            clock_low: false,
+            ..
+        }
+    ));
+
+    assert_eq!(
+        exchange_mouse_host_byte(
+            0xf6,
+            &mut now,
+            &mut controller,
+            &mut mouse,
+            &mut bus,
+            &mut events,
+        ),
+        0xfa
+    );
+    assert_eq!(
+        exchange_mouse_host_byte(
+            0xf3,
+            &mut now,
+            &mut controller,
+            &mut mouse,
+            &mut bus,
+            &mut events,
+        ),
+        0xfa
+    );
+    assert_eq!(
+        exchange_mouse_host_byte(
+            40,
+            &mut now,
+            &mut controller,
+            &mut mouse,
+            &mut bus,
+            &mut events,
+        ),
+        0xfa
+    );
+
+    assert_eq!(mouse.sample_rate(), 40);
+    assert_eq!(controller.status() & 0xf8, 0x08);
+    assert!(!mouse.link.has_deferred_device_byte());
 }

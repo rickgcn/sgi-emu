@@ -278,6 +278,7 @@ impl Ps2Keyboard {
                 {
                     if self.link.can_start()
                         && self.responses.is_empty()
+                        && !self.link.has_deferred_device_byte()
                         && self.scan_fifo.is_empty()
                     {
                         self.enqueue_key(key, true, true);
@@ -750,12 +751,18 @@ impl Ps2Keyboard {
         if !self.link.can_start() {
             return;
         }
-        let response = self.responses.pop_front();
-        let byte = response.or_else(|| self.scan_fifo.pop_front());
-        let Some(byte) = byte else {
+        if let Some(byte) = self.responses.pop_front() {
+            let started = self.link.start_device_byte(byte);
+            debug_assert!(started, "an idle PS/2 link must accept one byte");
+            return;
+        }
+        if self.link.resume_deferred_device_byte() {
+            return;
+        }
+        let Some(byte) = self.scan_fifo.pop_front() else {
             return;
         };
-        if response.is_none() && self.scan_overrun && byte == self.overrun_marker() {
+        if self.scan_overrun && byte == self.overrun_marker() {
             self.scan_overrun = false;
         }
         let started = self.link.start_device_byte(byte);

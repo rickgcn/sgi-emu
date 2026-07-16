@@ -276,6 +276,10 @@ enum LinkTransfer {
         bit: u8,
         clock_low: bool,
     },
+    DeviceInhibited {
+        frame: u16,
+        started: bool,
+    },
     HostReceive {
         bit: u8,
         byte: u8,
@@ -318,6 +322,7 @@ struct Ps2DeviceLink {
     observed_clock_low: bool,
     observed_data_low: bool,
     transfer: LinkTransfer,
+    deferred_device_frame: Option<u16>,
     actions: VecDeque<LinkAction>,
 }
 
@@ -342,6 +347,7 @@ impl Ps2DeviceLink {
             observed_clock_low: false,
             observed_data_low: false,
             transfer: LinkTransfer::Idle,
+            deferred_device_frame: None,
             actions: VecDeque::new(),
         })
     }
@@ -355,6 +361,7 @@ impl Ps2DeviceLink {
         self.observed_clock_low = false;
         self.observed_data_low = false;
         self.transfer = LinkTransfer::Idle;
+        self.deferred_device_frame = None;
         self.actions.clear();
         if release_needed {
             self.actions.push_back(LinkAction::Drive(TwoWireDrive {
@@ -378,8 +385,27 @@ impl Ps2DeviceLink {
         if !self.can_start() {
             return false;
         }
+        self.start_device_frame(serial_frame(byte));
+        true
+    }
+
+    fn resume_deferred_device_byte(&mut self) -> bool {
+        if !self.can_start() {
+            return false;
+        }
+        let Some(frame) = self.deferred_device_frame.take() else {
+            return false;
+        };
+        self.start_device_frame(frame);
+        true
+    }
+
+    fn has_deferred_device_byte(&self) -> bool {
+        self.deferred_device_frame.is_some()
+    }
+
+    fn start_device_frame(&mut self, frame: u16) {
         self.epoch = self.epoch.wrapping_add(1);
-        let frame = serial_frame(byte);
         self.transfer = LinkTransfer::DeviceTransmit {
             frame,
             bit: 0,
@@ -387,7 +413,6 @@ impl Ps2DeviceLink {
         };
         self.push_drive(false, true);
         self.schedule_half_clock();
-        true
     }
 
     fn observe_lines(
@@ -442,7 +467,34 @@ impl Ps2DeviceLink {
             };
         }
 
-        if self.transfer == LinkTransfer::Idle
+        if let LinkTransfer::DeviceInhibited { frame, started } = self.transfer
+            && previous_clock_low
+            && !delivery.clock_low
+            && delivery.source == self.wiring.controller
+        {
+            self.epoch = self.epoch.wrapping_add(1);
+            if delivery.data_low {
+                if started {
+                    debug_assert!(self.deferred_device_frame.is_none());
+                    self.deferred_device_frame = Some(frame);
+                }
+                self.transfer = LinkTransfer::HostReceive {
+                    bit: 0,
+                    byte: 0,
+                    parity_ones: 0,
+                    valid: true,
+                    clock_low: false,
+                };
+            } else {
+                self.transfer = LinkTransfer::DeviceTransmit {
+                    frame,
+                    bit: 0,
+                    clock_low: false,
+                };
+                self.push_drive(false, true);
+            }
+            self.schedule_half_clock();
+        } else if self.transfer == LinkTransfer::Idle
             && previous_clock_low
             && !delivery.clock_low
             && delivery.data_low
@@ -467,6 +519,20 @@ impl Ps2DeviceLink {
             return None;
         }
         if self.observed_clock_low && !self.output_clock_low {
+            if let LinkTransfer::DeviceTransmit {
+                frame,
+                bit,
+                clock_low: false,
+            } = self.transfer
+            {
+                self.epoch = self.epoch.wrapping_add(1);
+                self.transfer = LinkTransfer::DeviceInhibited {
+                    frame,
+                    started: bit != 0,
+                };
+                self.push_drive(false, false);
+                return None;
+            }
             self.schedule_inhibit_poll();
             return None;
         }
@@ -574,7 +640,7 @@ impl Ps2DeviceLink {
                 self.push_drive(false, false);
                 Some(LinkSignal::HostByte { byte, valid })
             }
-            LinkTransfer::Idle => None,
+            LinkTransfer::Idle | LinkTransfer::DeviceInhibited { .. } => None,
         }
     }
 
