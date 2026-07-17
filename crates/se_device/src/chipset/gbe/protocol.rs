@@ -18,6 +18,9 @@ pub struct GbeWiring {
 
     /// Flat-panel DDC open-drain bus.
     pub flat_panel_ddc: ComponentId,
+
+    /// Board-level input levels for the ten bidirectional auxiliary pins.
+    pub auxiliary_inputs: [bool; 10],
 }
 
 /// Externally supplied pixel-clock source.
@@ -53,6 +56,9 @@ pub enum GbeExternalInput {
 
     /// Disconnects one external pixel-clock input.
     DisconnectPixelClock(GbeExternalClock),
+
+    /// Replaces the board-level input levels for all auxiliary pins.
+    Auxiliary([bool; 10]),
 }
 
 /// Software-observable digital GBE output pins.
@@ -82,8 +88,8 @@ pub struct GbeOutputPins {
     /// Two-bit auxiliary WID output.
     pub aux: u8,
 
-    /// General-purpose output pin levels in register order.
-    pub gpio: [bool; 10],
+    /// General-purpose output drives in register order, or `None` when high impedance.
+    pub gpio: [Option<bool>; 10],
 }
 
 /// Field phase associated with one published display frame.

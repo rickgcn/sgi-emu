@@ -1243,6 +1243,7 @@ impl<S> Ip32Machine<S> {
                     crime: component_ids::CRIME,
                     crt_ddc: component_ids::GBE_CRT_DDC_BUS,
                     flat_panel_ddc: component_ids::GBE_FLAT_PANEL_DDC_BUS,
+                    auxiliary_inputs: [true; 10],
                 },
             )),
         )?;

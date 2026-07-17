@@ -8,13 +8,14 @@ use se_device::chipset::crime::config::{CrimeAccessPolicy, CrimeConfigError, Cri
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
 use se_device::chipset::crime::memory::bus::CrimeMemoryBus;
+#[cfg(feature = "jit")]
+use se_device::chipset::crime::protocol::{
+    CrimeByteEnable, CrimeCgiTransaction, CrimeLinkDeviceResponse, CrimeLinkOperation,
+    CrimePioRequest,
+};
 use se_device::chipset::crime::protocol::{
     CrimeCgiCompletion, CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryClient,
     CrimeMemoryTransaction, CrimeTransactionId, CrimeTransfer,
-};
-#[cfg(feature = "jit")]
-use se_device::chipset::crime::protocol::{
-    CrimeCgiTransaction, CrimeLinkDeviceResponse, CrimeLinkOperation, CrimePioRequest,
 };
 use se_device::chipset::crime::registers;
 use se_device::chipset::gbe::Gbe;
@@ -22,6 +23,8 @@ use se_device::chipset::gbe::Gbe;
 use se_device::chipset::gbe::protocol::{GbeExternalClock, GbeExternalInput};
 use se_device::chipset::mace::Mace;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
+#[cfg(feature = "jit")]
+use se_device::input::ps2::{Ps2KeyPosition, Ps2KeyboardInput};
 use se_device::input::ps2::{Ps2Keyboard, Ps2Mouse};
 use se_device::memory::ds2502::Ds2502;
 use se_device::memory::flash::SystemFlash;
@@ -2067,6 +2070,101 @@ fn enter_command_monitor<S: TraceSink>(
     );
 }
 
+#[cfg(feature = "jit")]
+fn disable_autoload_in_prom_environment(prom_image: &mut [u8]) {
+    const ENVIRONMENT_START: usize = 0x4000;
+    const ENVIRONMENT_END: usize = 0x4400;
+    const CHECKSUM_SIZE: usize = size_of::<u32>();
+    const AUTOLOAD_ENABLED: &[u8] = b"AutoLoad=Yes\0";
+    const AUTOLOAD_DISABLED: &[u8] = b"AutoLoad=No\0";
+
+    let environment = &mut prom_image[ENVIRONMENT_START..ENVIRONMENT_END];
+    let checksum_offset = environment.len() - CHECKSUM_SIZE;
+    let autoload_offset = environment
+        .windows(AUTOLOAD_ENABLED.len())
+        .position(|candidate| candidate == AUTOLOAD_ENABLED)
+        .expect("the local PROM environment must enable automatic booting");
+    let source = autoload_offset + AUTOLOAD_ENABLED.len();
+    let destination = autoload_offset + AUTOLOAD_DISABLED.len();
+    environment.copy_within(source..checksum_offset, destination);
+    environment[checksum_offset - (source - destination)..checksum_offset].fill(0);
+    environment[autoload_offset..destination].copy_from_slice(AUTOLOAD_DISABLED);
+
+    environment[checksum_offset..].fill(0);
+    let sum = environment
+        .chunks_exact(CHECKSUM_SIZE)
+        .map(|word| u32::from_be_bytes(word.try_into().unwrap()))
+        .fold(0_u32, u32::wrapping_add);
+    environment[checksum_offset..].copy_from_slice(&0_u32.wrapping_sub(sum).to_be_bytes());
+}
+
+#[cfg(feature = "jit")]
+fn read_gbe<S: TraceSink>(machine: &mut Ip32Machine<S>, address: u64) -> u32 {
+    let gbe = machine
+        .runtime_mut()
+        .registry_mut()
+        .get_typed_mut::<Gbe>(component_ids::GBE)
+        .unwrap();
+    let response = gbe.accept(CrimeCgiTransaction {
+        id: CrimeTransactionId::new(u128::MAX),
+        controller: component_ids::CRIME,
+        target: component_ids::GBE,
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address,
+            transfer: CrimeTransfer::read(4),
+        }),
+    });
+    let CrimeLinkDeviceResponse::Complete(completion) = response else {
+        panic!("diagnostic GBE read was unexpectedly deferred");
+    };
+    let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap() else {
+        panic!("diagnostic GBE read returned the wrong payload");
+    };
+    u32::from_be_bytes(data.as_ref().try_into().unwrap())
+}
+
+#[cfg(feature = "jit")]
+fn write_gbe<S: TraceSink>(machine: &mut Ip32Machine<S>, address: u64, value: u32) {
+    let gbe = machine
+        .runtime_mut()
+        .registry_mut()
+        .get_typed_mut::<Gbe>(component_ids::GBE)
+        .unwrap();
+    let response = gbe.accept(CrimeCgiTransaction {
+        id: CrimeTransactionId::new(u128::MAX),
+        controller: component_ids::CRIME,
+        target: component_ids::GBE,
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address,
+            transfer: CrimeTransfer::write(
+                value.to_be_bytes().into(),
+                CrimeByteEnable::from([true; 4]),
+            ),
+        }),
+    });
+    let CrimeLinkDeviceResponse::Complete(completion) = response else {
+        panic!("diagnostic GBE write was unexpectedly deferred");
+    };
+    completion.result.unwrap();
+}
+
+#[cfg(feature = "jit")]
+fn press_keys<S: TraceSink>(machine: &mut Ip32Machine<S>, keys: &[Ps2KeyPosition]) {
+    let mut at = machine.runtime().now();
+    let transition_delay = IP32_TIMEBASE_HZ / 20;
+    for key in keys {
+        for pressed in [true, false] {
+            machine
+                .schedule_input(
+                    at,
+                    Ip32InputEvent::Keyboard(Ps2KeyboardInput { key: *key, pressed }),
+                )
+                .unwrap();
+            at = SimTime::new(at.get().saturating_add(transition_delay));
+        }
+    }
+}
+
 fn printenv_diagmode<S: TraceSink>(
     machine: &mut Ip32Machine<S>,
     terminal: &mut Vec<u8>,
@@ -2230,30 +2328,6 @@ fn local_ip32_prom_reaches_only_an_explicit_unimplemented_boundary() {
 #[test]
 #[ignore = "requires a local proprietary IP32 PROM image"]
 fn local_ip32_prom_reaches_gbe_display_output() {
-    fn read_gbe<S: TraceSink>(machine: &mut Ip32Machine<S>, address: u64) -> u32 {
-        let gbe = machine
-            .runtime_mut()
-            .registry_mut()
-            .get_typed_mut::<Gbe>(component_ids::GBE)
-            .unwrap();
-        let response = gbe.accept(CrimeCgiTransaction {
-            id: CrimeTransactionId::new(u128::MAX),
-            controller: component_ids::CRIME,
-            target: component_ids::GBE,
-            operation: CrimeLinkOperation::Pio(CrimePioRequest {
-                address,
-                transfer: CrimeTransfer::read(4),
-            }),
-        });
-        let CrimeLinkDeviceResponse::Complete(completion) = response else {
-            panic!("diagnostic GBE read was unexpectedly deferred");
-        };
-        let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap() else {
-            panic!("diagnostic GBE read returned the wrong payload");
-        };
-        u32::from_be_bytes(data.as_ref().try_into().unwrap())
-    }
-
     fn read_ram<S: TraceSink>(machine: &Ip32Machine<S>, address: u64, length: usize) -> Vec<u8> {
         let ram = machine
             .runtime()
@@ -2438,6 +2512,188 @@ fn local_ip32_prom_reaches_gbe_display_output() {
     panic!(
         "the PROM did not sustain non-black GBE output for one simulated second within {max_events} events; first_visible_frame={first_visible_frame:?}; frames_after_first={frames_after_first}; last_frame={last_frame:?}; dma_events={dma_events:?}; render_writes={render_writes:016x?}; terminal={terminal:?}; tile_pages={tile_pages:04x?}; nonzero_tiles={nonzero_tiles:04x?}; time={time:?}; PERFORMANCE={performance:#?}; PC={pc:#018x}; GPR={gpr:#018x?}; CODE_ADDRESS={code_address:#010x}; CODE={code:02x?}; CTRLSTAT={control_status:#010x}; DOTCLOCK={dot_clock:#010x}; VT_XY={vt_xy:#010x}; VT_XY_MAX={vt_xy_max:#010x}; VT_INTR01={vt_intr01:#010x}; VT_INTR23={vt_intr23:#010x}; VT_HPIXEN={vt_hpixen:#010x}; VT_VPIXEN={vt_vpixen:#010x}; FRM_0={frame_size_tile:#010x}; FRM_1={frame_size_pixel:#010x}; FRM_2={frame_active:#010x}; FRM_3={frame_shadow:#010x}; DID={did_active:#010x}; WID_0={wid_zero:#010x}; CMAP_0={color_zero:#010x}; CMAP_1={color_one:#010x}; GMAP_0={gamma_zero:#010x}; GMAP_1={gamma_one:#010x}; GMAP_255={gamma_max:#010x}"
     );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+#[ignore = "requires a local proprietary IP32 PROM image"]
+fn local_ip32_prom_reinitializes_gbe_with_identity_gamma() {
+    let path = std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name a local image");
+    let mut prom_image = std::fs::read(path).expect("the local PROM image must be readable");
+    disable_autoload_in_prom_environment(&mut prom_image);
+    let config = Ip32MachineConfig {
+        prom_image,
+        jit_enabled: true,
+        ..Ip32MachineConfig::default()
+    };
+    let max_events = std::env::var("IP32_PROM_INTERACTION_EVENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(120_000_000);
+    let mut machine = Ip32Machine::from_config(config).unwrap();
+    machine.schedule_power_on().unwrap();
+    machine
+        .schedule_gbe_external_input(SimTime::ZERO, GbeExternalInput::SenseN(false))
+        .unwrap();
+    machine
+        .schedule_gbe_external_input(
+            SimTime::ZERO,
+            GbeExternalInput::PixelClock {
+                source: GbeExternalClock::Ttl,
+                numerator_hz: 20_000_000,
+                denominator: 1,
+            },
+        )
+        .unwrap();
+    let identity_gamma = [
+        (0x1606_0000, 0x0000_0000),
+        (0x1606_0004, 0x0101_0100),
+        (0x1606_03fc, 0xffff_ff00),
+    ];
+    let mut events = 0;
+    while events < max_events {
+        let batch = (max_events - events).min(4_096);
+        let status = machine.run_steps(batch).unwrap();
+        events += batch;
+        let gamma_ready = identity_gamma
+            .iter()
+            .all(|(address, expected)| read_gbe(&mut machine, *address) == *expected);
+        if gamma_ready {
+            break;
+        }
+        assert!(!matches!(status, RunStatus::Idle | RunStatus::Stopped));
+    }
+    if events >= max_events {
+        let gamma = identity_gamma.map(|(address, _)| read_gbe(&mut machine, address));
+        let control_status = read_gbe(&mut machine, 0x1600_0000);
+        let cpu = machine
+            .runtime()
+            .registry()
+            .get_typed::<R5000Cpu>(component_ids::CPU0)
+            .unwrap();
+        panic!(
+            "PROM did not initialize the graphics console; time={:?}; PC={:#018x}; CTRLSTAT={control_status:#010x}; gamma={gamma:08x?}",
+            machine.runtime().now(),
+            cpu.state().pc(),
+        );
+    }
+
+    let menu_settle_deadline = SimTime::new(
+        machine
+            .runtime()
+            .now()
+            .get()
+            .saturating_add(10 * IP32_TIMEBASE_HZ),
+    );
+    events = 0;
+    while machine.runtime().now() < menu_settle_deadline && events < max_events {
+        let batch = (max_events - events).min(4_096);
+        let status = machine.run_steps(batch).unwrap();
+        events += batch;
+        assert!(!matches!(status, RunStatus::Idle | RunStatus::Stopped));
+    }
+    assert!(
+        machine.runtime().now() >= menu_settle_deadline,
+        "PROM did not reach the maintenance menu settling deadline"
+    );
+    press_keys(
+        &mut machine,
+        &[Ps2KeyPosition::Digit5, Ps2KeyPosition::Enter],
+    );
+    let command_monitor_deadline = SimTime::new(
+        machine
+            .runtime()
+            .now()
+            .get()
+            .saturating_add(3 * IP32_TIMEBASE_HZ),
+    );
+    events = 0;
+    while machine.runtime().now() < command_monitor_deadline && events < max_events {
+        let batch = (max_events - events).min(4_096);
+        let status = machine.run_steps(batch).unwrap();
+        events += batch;
+        assert!(!matches!(status, RunStatus::Idle | RunStatus::Stopped));
+    }
+    assert!(
+        machine.runtime().now() >= command_monitor_deadline,
+        "PROM did not reach the Command Monitor settling deadline"
+    );
+
+    for (address, value) in [
+        (0x1606_0000, 0x0101_0100),
+        (0x1606_0004, 0xaaaa_aa00),
+        (0x1606_03fc, 0x5555_5500),
+    ] {
+        write_gbe(&mut machine, address, value);
+    }
+    press_keys(
+        &mut machine,
+        &[
+            Ps2KeyPosition::I,
+            Ps2KeyPosition::N,
+            Ps2KeyPosition::I,
+            Ps2KeyPosition::T,
+            Ps2KeyPosition::Enter,
+        ],
+    );
+
+    events = 0;
+    while events < max_events {
+        let batch = (max_events - events).min(4_096);
+        let status = machine.run_steps(batch).unwrap();
+        events += batch;
+        if identity_gamma
+            .iter()
+            .all(|(address, expected)| read_gbe(&mut machine, *address) == *expected)
+        {
+            break;
+        }
+        assert!(!matches!(status, RunStatus::Idle | RunStatus::Stopped));
+    }
+    if events >= max_events {
+        let gamma = identity_gamma.map(|(address, _)| read_gbe(&mut machine, address));
+        let cpu = machine
+            .runtime()
+            .registry()
+            .get_typed::<R5000Cpu>(component_ids::CPU0)
+            .unwrap();
+        panic!(
+            "PROM did not reprogram the gamma map after the init command; time={:?}; PC={:#018x}; gamma={gamma:08x?}",
+            machine.runtime().now(),
+            cpu.state().pc(),
+        );
+    }
+    let menu_return_deadline = SimTime::new(
+        machine
+            .runtime()
+            .now()
+            .get()
+            .saturating_add(10 * IP32_TIMEBASE_HZ),
+    );
+    events = 0;
+    while machine.runtime().now() < menu_return_deadline && events < max_events {
+        let batch = (max_events - events).min(4_096);
+        let status = machine.run_steps(batch).unwrap();
+        events += batch;
+        assert!(!matches!(status, RunStatus::Idle | RunStatus::Stopped));
+    }
+    assert!(
+        machine.runtime().now() >= menu_return_deadline,
+        "PROM did not return to the System Maintenance Menu after init"
+    );
+    let control_status = read_gbe(&mut machine, 0x1600_0000);
+    assert_eq!(
+        control_status & 0x0005_5000,
+        0x0005_5000,
+        "PROM GPIO3 through GPIO6 strap inputs did not remain high after init"
+    );
+    for (address, expected) in identity_gamma {
+        assert_eq!(
+            read_gbe(&mut machine, address),
+            expected,
+            "PROM programmed a non-identity gamma entry after init"
+        );
+    }
 }
 
 #[cfg(feature = "jit")]

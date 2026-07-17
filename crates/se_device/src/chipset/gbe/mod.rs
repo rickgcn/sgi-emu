@@ -29,9 +29,10 @@ use self::protocol::{
     GbeOutputPins, GbePoll, GbeWiring,
 };
 use self::registers::{
-    COLOR_MAP_FIFO, DOT_CLOCK_RUN, GbeRegisters, RegisterWrite, VT_F2RF_LOCK, VT_FLAGS, VT_HBLANK,
-    VT_HCMAP, VT_HPIXEN, VT_HSYNC, VT_INTR01, VT_INTR23, VT_VBLANK, VT_VCMAP, VT_VPIXEN, VT_VSYNC,
-    VT_XY, VT_XY_FREEZE, VT_XY_MAX,
+    AUXILIARY_PIN_COUNT, COLOR_MAP_FIFO, DOT_CLOCK_RUN, GbeRegisters, RegisterWrite, VT_F2RF_LOCK,
+    VT_FLAGS, VT_HBLANK, VT_HCMAP, VT_HPIXEN, VT_HSYNC, VT_INTR01, VT_INTR23, VT_VBLANK, VT_VCMAP,
+    VT_VPIXEN, VT_VSYNC, VT_XY, VT_XY_FREEZE, VT_XY_MAX, auxiliary_data_mask,
+    auxiliary_output_disable_mask,
 };
 
 const PIXEL_REFERENCE_CLOCK_HZ: u64 = 20_000_000;
@@ -164,6 +165,7 @@ pub struct Gbe {
     f2rf_level: bool,
     ddc_clock_high: [bool; 2],
     ddc_data_high: [bool; 2],
+    auxiliary_inputs: [bool; AUXILIARY_PIN_COUNT],
     color_map_fifo: VecDeque<ColorMapWrite>,
     deferred_color_map: VecDeque<DeferredColorMapWrite>,
     color_map_drain_scheduled: bool,
@@ -222,6 +224,7 @@ impl Gbe {
             f2rf_level: false,
             ddc_clock_high: [true; 2],
             ddc_data_high: [true; 2],
+            auxiliary_inputs: wiring.auxiliary_inputs,
             color_map_fifo: VecDeque::new(),
             deferred_color_map: VecDeque::new(),
             color_map_drain_scheduled: false,
@@ -305,6 +308,7 @@ impl Gbe {
                 }
                 self.restart_timing(false);
             }
+            GbeExternalInput::Auxiliary(levels) => self.auxiliary_inputs = levels,
         }
     }
 
@@ -409,23 +413,18 @@ impl Gbe {
             flat_panel_data_enable: data_enable,
             f2rf: self.f2rf_level || flags & (1 << 6) != 0,
             aux,
-            gpio: [
-                self.registers.control_status & (1 << 6) != 0,
-                self.registers.control_status & (1 << 8) != 0,
-                self.registers.control_status & (1 << 10) != 0,
-                self.registers.control_status & (1 << 12) != 0,
-                self.registers.control_status & (1 << 14) != 0,
-                self.registers.control_status & (1 << 16) != 0,
-                self.registers.control_status & (1 << 18) != 0,
-                self.registers.control_status & (1 << 20) != 0,
-                self.registers.control_status & (1 << 22) != 0,
-                self.registers.control_status & (1 << 24) != 0,
-            ],
+            gpio: std::array::from_fn(|index| {
+                (self.registers.control_status & auxiliary_output_disable_mask(index) == 0)
+                    .then_some(self.registers.control_status & auxiliary_data_mask(index) != 0)
+            }),
         }
     }
 
     fn access_read(&self, address: u64) -> Result<CrimeCompletionPayload, CrimeBusError> {
-        let value = if address == registers::VT_START {
+        let value = if address == registers::CONTROL_STATUS {
+            self.registers
+                .control_status_with_auxiliary_inputs(self.auxiliary_inputs)
+        } else if address == registers::VT_START {
             self.scan_position()
         } else if address == COLOR_MAP_FIFO {
             self.color_map_fifo.len().min(COLOR_MAP_FIFO_CAPACITY - 1) as u32
@@ -1442,6 +1441,7 @@ impl Gbe {
         self.f2rf_level = false;
         self.ddc_clock_high = [true; 2];
         self.ddc_data_high = [true; 2];
+        self.auxiliary_inputs = self.wiring.auxiliary_inputs;
         self.color_map_fifo.clear();
         self.deferred_color_map.clear();
         self.color_map_drain_scheduled = false;
@@ -1658,6 +1658,7 @@ mod tests {
                 crime: CRIME,
                 crt_ddc: ComponentId::new(3),
                 flat_panel_ddc: ComponentId::new(4),
+                auxiliary_inputs: [true; AUXILIARY_PIN_COUNT],
             },
         )
     }
@@ -1680,6 +1681,15 @@ mod tests {
             CrimeLinkDeviceResponse::Complete(completion) => completion.result,
             CrimeLinkDeviceResponse::Deferred => panic!("GBE PIO unexpectedly deferred"),
         }
+    }
+
+    fn read_word(gbe: &mut Gbe, address: u64) -> u32 {
+        let CrimeCompletionPayload::ReadData(data) =
+            result(gbe, address, CrimeTransfer::read(4)).unwrap()
+        else {
+            panic!("GBE read returned the wrong payload");
+        };
+        u32::from_be_bytes(data.as_ref().try_into().unwrap())
     }
 
     #[test]
@@ -1722,6 +1732,73 @@ mod tests {
         .unwrap();
         let read = result(&mut gbe, registers::CONTROL_STATUS, CrimeTransfer::read(4)).unwrap();
         assert!(matches!(read, CrimeCompletionPayload::ReadData(_)));
+    }
+
+    #[test]
+    fn auxiliary_inputs_resolve_control_status_and_high_impedance_outputs() {
+        let mut gbe = gbe();
+        let control = 0x020a_a000_u32;
+        result(
+            &mut gbe,
+            registers::CONTROL_STATUS,
+            CrimeTransfer::write(
+                control.to_be_bytes().into(),
+                CrimeByteEnable::from([true; 4]),
+            ),
+        )
+        .unwrap();
+
+        let input_data_mask = [3, 4, 5, 6, 9]
+            .into_iter()
+            .map(auxiliary_data_mask)
+            .fold(0, |mask, bit| mask | bit);
+        assert_eq!(
+            read_word(&mut gbe, registers::CONTROL_STATUS) & input_data_mask,
+            input_data_mask
+        );
+        assert_eq!(gbe.registers.control_status & input_data_mask, 0);
+        let outputs = gbe.output_pins();
+        assert_eq!(outputs.gpio[0], Some(false));
+        for index in [3, 4, 5, 6, 9] {
+            assert_eq!(outputs.gpio[index], None);
+        }
+
+        gbe.apply_external_input(GbeExternalInput::Auxiliary([false; AUXILIARY_PIN_COUNT]));
+        assert_eq!(
+            read_word(&mut gbe, registers::CONTROL_STATUS) & input_data_mask,
+            0
+        );
+        assert_eq!(gbe.registers.control_status, control | 0x11);
+
+        let all_inputs = (0..AUXILIARY_PIN_COUNT)
+            .map(auxiliary_output_disable_mask)
+            .fold(0, |mask, bit| mask | bit);
+        result(
+            &mut gbe,
+            registers::CONTROL_STATUS,
+            CrimeTransfer::write(
+                all_inputs.to_be_bytes().into(),
+                CrimeByteEnable::from([true; 4]),
+            ),
+        )
+        .unwrap();
+        let levels = [
+            true, false, true, false, true, false, true, false, true, false,
+        ];
+        gbe.apply_external_input(GbeExternalInput::Auxiliary(levels));
+        assert_eq!(gbe.output_pins().gpio, [None; AUXILIARY_PIN_COUNT]);
+        let resolved = read_word(&mut gbe, registers::CONTROL_STATUS);
+        for (index, expected) in levels.into_iter().enumerate() {
+            assert_eq!(resolved & auxiliary_data_mask(index) != 0, expected);
+        }
+    }
+
+    #[test]
+    fn reset_restores_board_auxiliary_input_levels() {
+        let mut gbe = gbe();
+        gbe.apply_external_input(GbeExternalInput::Auxiliary([false; AUXILIARY_PIN_COUNT]));
+        gbe.reset();
+        assert_eq!(gbe.auxiliary_inputs, [true; AUXILIARY_PIN_COUNT]);
     }
 
     #[test]
@@ -2147,6 +2224,9 @@ mod tests {
     #[test]
     fn serialized_state_preserves_partial_frame_fifo_and_inflight_dma() {
         let mut reference = gbe();
+        reference.apply_external_input(GbeExternalInput::Auxiliary([
+            true, false, true, false, true, false, true, false, true, false,
+        ]));
         reference.color_map_fifo.push_back(ColorMapWrite {
             index: 7,
             value: 0x1122_3300,
@@ -2165,6 +2245,8 @@ mod tests {
         let state: GbeState = postcard::from_bytes(&encoded).unwrap();
         let mut restored = gbe();
         restored.restore_state(state).unwrap();
+
+        assert_eq!(restored.auxiliary_inputs, reference.auxiliary_inputs);
 
         assert_eq!(
             postcard::to_stdvec(&restored.save_state()).unwrap(),

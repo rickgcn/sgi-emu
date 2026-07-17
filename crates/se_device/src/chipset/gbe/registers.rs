@@ -46,6 +46,7 @@ pub(super) const VIDEO_CAPTURE_START: u64 = GBE_BASE + 0x0008_0000;
 
 pub(super) const CONTROL_STATUS_WRITABLE_MASK: u32 = 0x3fff_ffc0;
 pub(super) const CONTROL_STATUS_RESET: u32 = 0x03ff_ffd1;
+pub(super) const AUXILIARY_PIN_COUNT: usize = 10;
 pub(super) const DEVICE_ID_VALUE: u32 = 0x0000_0666;
 pub(super) const VT_XY_FREEZE: u32 = 1 << 31;
 pub(super) const DOT_CLOCK_RUN: u32 = 1 << 20;
@@ -155,6 +156,20 @@ impl GbeRegisters {
             _ => return Err(CrimeBusError::Unsupported),
         };
         Ok(value)
+    }
+
+    pub(super) fn control_status_with_auxiliary_inputs(
+        &self,
+        auxiliary_inputs: [bool; AUXILIARY_PIN_COUNT],
+    ) -> u32 {
+        let mut value = self.control_status;
+        for (index, input_high) in auxiliary_inputs.into_iter().enumerate() {
+            let data_mask = auxiliary_data_mask(index);
+            if value & auxiliary_output_disable_mask(index) != 0 {
+                value = (value & !data_mask) | if input_high { data_mask } else { 0 };
+            }
+        }
+        value
     }
 
     pub fn write(&mut self, address: u64, value: u32) -> Result<RegisterWrite, CrimeBusError> {
@@ -327,6 +342,14 @@ fn word_index(address: u64, start: u64) -> usize {
     ((address - start) / 4) as usize
 }
 
+pub(super) const fn auxiliary_data_mask(index: usize) -> u32 {
+    1 << (6 + index * 2)
+}
+
+pub(super) const fn auxiliary_output_disable_mask(index: usize) -> u32 {
+    1 << (7 + index * 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +378,32 @@ mod tests {
 
         registers.write(CONTROL_STATUS, 0x1555_5540).unwrap();
         assert_eq!(registers.control_status & 0x3fff_ffc0, 0x1555_5540);
+    }
+
+    #[test]
+    fn control_status_resolves_bidirectional_auxiliary_pins() {
+        let mut registers = GbeRegisters::new();
+        let all_inputs = (0..AUXILIARY_PIN_COUNT)
+            .map(auxiliary_output_disable_mask)
+            .fold(0, |mask, bit| mask | bit);
+        let levels = [
+            true, false, true, false, true, false, true, false, true, false,
+        ];
+
+        registers
+            .write(CONTROL_STATUS, all_inputs | auxiliary_data_mask(1))
+            .unwrap();
+        let resolved = registers.control_status_with_auxiliary_inputs(levels);
+        for (index, expected) in levels.into_iter().enumerate() {
+            assert_eq!(resolved & auxiliary_data_mask(index) != 0, expected);
+        }
+        assert_ne!(registers.control_status & auxiliary_data_mask(1), 0);
+
+        registers
+            .write(CONTROL_STATUS, auxiliary_data_mask(1))
+            .unwrap();
+        let resolved = registers.control_status_with_auxiliary_inputs([false; AUXILIARY_PIN_COUNT]);
+        assert_ne!(resolved & auxiliary_data_mask(1), 0);
     }
 
     #[test]
