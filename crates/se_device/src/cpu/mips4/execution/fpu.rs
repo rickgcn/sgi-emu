@@ -42,6 +42,10 @@ use super::memory::{decode_u32, decode_u64, encode_lanes};
 use super::policy::{Mips4ExecutionPolicy, Mips4PrefetchPolicy, Mips4ReservedCp1ControlPolicy};
 use super::state::Mips4ExecutionState;
 
+const MIPS4_NAN_MODE: FloatNanMode = FloatNanMode::QuietBitClear;
+const MIPS4_DEFAULT_QNAN_F32: u32 = 0x7fbf_ffff;
+const MIPS4_DEFAULT_QNAN_F64: u64 = 0x7ff7_ffff_ffff_ffff;
+
 pub(super) enum Mips4FpuExecution {
     Retire,
     Branch(Mips4BranchDecision),
@@ -448,7 +452,7 @@ fn execute_single<F: FloatBackend>(
     }
     if matches!(operation, Mips4Cp1Operation::ConvertDouble) {
         let source = Float32Bits::new(state.cp1.fgr().read_word(fgr(raw.fs())));
-        if unsupported_float_class(source.classify(FloatNanMode::QuietBitSet)) {
+        if unsupported_float_class(source.classify(MIPS4_NAN_MODE)) {
             return unimplemented(state);
         }
         let result = backend.f32_to_f64(state.cp1.fcsr().float_control(), source);
@@ -460,9 +464,9 @@ fn execute_single<F: FloatBackend>(
     let fr = Float32Bits::new(state.cp1.fgr().read_word(fgr(raw.rs())));
     if operation_uses_unsupported_inputs(
         operation,
-        fs.classify(FloatNanMode::QuietBitSet),
-        ft.classify(FloatNanMode::QuietBitSet),
-        fr.classify(FloatNanMode::QuietBitSet),
+        fs.classify(MIPS4_NAN_MODE),
+        ft.classify(MIPS4_NAN_MODE),
+        fr.classify(MIPS4_NAN_MODE),
     ) {
         return unimplemented(state);
     }
@@ -514,7 +518,7 @@ fn execute_double<F: FloatBackend>(
     };
     if matches!(operation, Mips4Cp1Operation::ConvertSingle) {
         let source = Float64Bits::new(fs_bits);
-        if unsupported_float_class(source.classify(FloatNanMode::QuietBitSet)) {
+        if unsupported_float_class(source.classify(MIPS4_NAN_MODE)) {
             return unimplemented(state);
         }
         let result = backend.f64_to_f32(state.cp1.fcsr().float_control(), source);
@@ -535,9 +539,9 @@ fn execute_double<F: FloatBackend>(
     };
     if operation_uses_unsupported_inputs(
         operation,
-        fs.classify(FloatNanMode::QuietBitSet),
-        ft.classify(FloatNanMode::QuietBitSet),
-        fr.classify(FloatNanMode::QuietBitSet),
+        fs.classify(MIPS4_NAN_MODE),
+        ft.classify(MIPS4_NAN_MODE),
+        fr.classify(MIPS4_NAN_MODE),
     ) {
         return unimplemented(state);
     }
@@ -618,7 +622,7 @@ fn convert_single_to_integer<F: FloatBackend>(
     operation: Mips4Cp1Operation,
 ) -> Mips4FpuExecution {
     let source = Float32Bits::new(state.cp1.fgr().read_word(fgr(raw.fs())));
-    let class = source.classify(FloatNanMode::QuietBitSet);
+    let class = source.classify(MIPS4_NAN_MODE);
     if unsupported_float_class(class) {
         return unimplemented(state);
     }
@@ -655,7 +659,7 @@ fn convert_double_to_integer<F: FloatBackend>(
         return unimplemented(state);
     };
     let source = Float64Bits::new(bits);
-    let class = source.classify(FloatNanMode::QuietBitSet);
+    let class = source.classify(MIPS4_NAN_MODE);
     if unsupported_float_class(class) {
         return unimplemented(state);
     }
@@ -883,7 +887,7 @@ fn commit_f32(
     mut result: FloatResult<Float32Bits>,
 ) -> Mips4FpuExecution {
     let subnormal = matches!(
-        result.value.classify(FloatNanMode::QuietBitSet),
+        result.value.classify(MIPS4_NAN_MODE),
         FloatClass::PositiveSubnormal | FloatClass::NegativeSubnormal
     );
     if underflow_is_unimplemented(state, result.flags, subnormal) {
@@ -917,7 +921,7 @@ fn commit_f64(
         return unimplemented(state);
     }
     let subnormal = matches!(
-        result.value.classify(FloatNanMode::QuietBitSet),
+        result.value.classify(MIPS4_NAN_MODE),
         FloatClass::PositiveSubnormal | FloatClass::NegativeSubnormal
     );
     if underflow_is_unimplemented(state, result.flags, subnormal) {
@@ -984,14 +988,14 @@ fn commit_i64(
 }
 
 fn unary_f32(value: Float32Bits, negate: bool) -> FloatResult<Float32Bits> {
-    let class = value.classify(FloatNanMode::QuietBitSet);
+    let class = value.classify(MIPS4_NAN_MODE);
     let flags = if class.is_signaling_nan() {
         FloatExceptionFlags::INVALID
     } else {
         FloatExceptionFlags::empty()
     };
     let value = if class.is_signaling_nan() {
-        Float32Bits::new(0x7fc0_0000)
+        Float32Bits::new(MIPS4_DEFAULT_QNAN_F32)
     } else if negate {
         value.neg()
     } else {
@@ -1001,14 +1005,14 @@ fn unary_f32(value: Float32Bits, negate: bool) -> FloatResult<Float32Bits> {
 }
 
 fn unary_f64(value: Float64Bits, negate: bool) -> FloatResult<Float64Bits> {
-    let class = value.classify(FloatNanMode::QuietBitSet);
+    let class = value.classify(MIPS4_NAN_MODE);
     let flags = if class.is_signaling_nan() {
         FloatExceptionFlags::INVALID
     } else {
         FloatExceptionFlags::empty()
     };
     let value = if class.is_signaling_nan() {
-        Float64Bits::new(0x7ff8_0000_0000_0000)
+        Float64Bits::new(MIPS4_DEFAULT_QNAN_F64)
     } else if negate {
         value.neg()
     } else {
@@ -1112,7 +1116,7 @@ fn intermediate_is_unimplemented_f32(result: FloatResult<Float32Bits>) -> bool {
     result.flags.bits() & (FloatExceptionFlags::OVERFLOW | FloatExceptionFlags::UNDERFLOW).bits()
         != 0
         || matches!(
-            result.value.classify(FloatNanMode::QuietBitSet),
+            result.value.classify(MIPS4_NAN_MODE),
             FloatClass::PositiveSubnormal | FloatClass::NegativeSubnormal
         )
 }
@@ -1121,7 +1125,7 @@ fn intermediate_is_unimplemented_f64(result: FloatResult<Float64Bits>) -> bool {
     result.flags.bits() & (FloatExceptionFlags::OVERFLOW | FloatExceptionFlags::UNDERFLOW).bits()
         != 0
         || matches!(
-            result.value.classify(FloatNanMode::QuietBitSet),
+            result.value.classify(MIPS4_NAN_MODE),
             FloatClass::PositiveSubnormal | FloatClass::NegativeSubnormal
         )
 }

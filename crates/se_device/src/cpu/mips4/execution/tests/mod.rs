@@ -6,7 +6,7 @@ mod functional;
 mod integer;
 mod memory;
 
-use se_float::backend::softfloat3::SoftFloat3Backend;
+use se_float::backend::softfloat3::mips4::Mips4SoftFloatBackend;
 
 use crate::cpu::execution::functional::FunctionalExecutor;
 use crate::cpu::execution::protocol::{ExecutionAction, ExecutionCompletion, ExecutionTransaction};
@@ -32,7 +32,8 @@ use crate::cpu::mips4::tlb::{
 const RESET_PC: u64 = 0xffff_ffff_bfc0_0000;
 const RESET_PHYSICAL_PC: u64 = 0x1fc0_0000;
 
-type Executor = FunctionalExecutor<Mips4ExecutionTarget<R5000ExecutionPolicy, SoftFloat3Backend>>;
+type Executor =
+    FunctionalExecutor<Mips4ExecutionTarget<R5000ExecutionPolicy, Mips4SoftFloatBackend>>;
 
 struct ConformanceMachine {
     executor: Executor,
@@ -62,7 +63,7 @@ impl ConformanceMachine {
         let policy =
             R5000ExecutionPolicy::new(profile, R5000BootMode::from_low_bits(boot_bits).unwrap());
         policy.validate_cache_config().unwrap();
-        let target = Mips4ExecutionTarget::new(policy, SoftFloat3Backend::new()).unwrap();
+        let target = Mips4ExecutionTarget::new(policy, Mips4SoftFloatBackend::new()).unwrap();
         Self {
             executor: FunctionalExecutor::new(target),
             endianness,

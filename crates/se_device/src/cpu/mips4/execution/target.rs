@@ -3232,7 +3232,7 @@ where
 
 #[cfg(test)]
 mod block_tests {
-    use se_float::backend::softfloat3::SoftFloat3Backend;
+    use se_float::backend::softfloat3::mips4::Mips4SoftFloatBackend;
 
     use crate::cpu::mips4::config::Mips4CacheConfig;
     use crate::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
@@ -3242,7 +3242,7 @@ mod block_tests {
 
     use super::*;
 
-    fn target() -> Mips4ExecutionTarget<R5000ExecutionPolicy, SoftFloat3Backend> {
+    fn target() -> Mips4ExecutionTarget<R5000ExecutionPolicy, Mips4SoftFloatBackend> {
         let profile = R5000Profile::new(
             Mips4Endianness::Big,
             R5000Revision::from_bits(0x21),
@@ -3253,7 +3253,7 @@ mod block_tests {
         );
         Mips4ExecutionTarget::new(
             R5000ExecutionPolicy::new(profile, R5000BootMode::from_low_bits(0).unwrap()),
-            SoftFloat3Backend::new(),
+            Mips4SoftFloatBackend::new(),
         )
         .unwrap()
     }

@@ -1,12 +1,15 @@
-//! Berkeley SoftFloat 3e reference backend.
+//! Berkeley SoftFloat 3e architecture-specific backends.
 //!
 //! The backend calls the local SoftFloat source tree through a small fixed-width
 //! C wrapper. Every operation sets the requested control state, clears the
 //! SoftFloat exception state, executes the operation, and returns the generated
 //! flags with the value.
 
+pub mod mips4;
+
 use std::sync::Mutex;
 
+use self::mips4::Mips4SoftFloatBackend;
 use crate::backend::FloatBackend;
 use crate::control::{FloatControl, FloatExceptionFlags, FloatRoundingMode, FloatTininessMode};
 use crate::result::FloatResult;
@@ -54,18 +57,7 @@ unsafe extern "C" {
     fn se_softfloat_f64_lt(lhs: u64, rhs: u64) -> bool;
 }
 
-/// SoftFloat 3e reference backend.
-#[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize)]
-pub struct SoftFloat3Backend;
-
-impl SoftFloat3Backend {
-    /// Creates a SoftFloat 3e backend.
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl FloatBackend for SoftFloat3Backend {
+impl FloatBackend for Mips4SoftFloatBackend {
     fn add_f32(
         &self,
         control: FloatControl,

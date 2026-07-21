@@ -7,7 +7,7 @@ use se_core::component::{
 };
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_float::backend::FloatBackend;
-use se_float::backend::softfloat3::SoftFloat3Backend;
+use se_float::backend::softfloat3::mips4::Mips4SoftFloatBackend;
 
 use crate::bus::irq::{IrqDelivery, IrqInput};
 use crate::cpu::execution::functional::FunctionalExecutor;
@@ -182,7 +182,7 @@ fn reborrow_optional<'a, T: ?Sized>(value: &'a mut Option<&mut T>) -> Option<&'a
 
 /// Functional R5000 CPU with an injectable floating-point backend.
 #[derive(Clone)]
-pub struct R5000Cpu<F = SoftFloat3Backend>
+pub struct R5000Cpu<F = Mips4SoftFloatBackend>
 where
     F: FloatBackend,
 {
@@ -212,7 +212,7 @@ pub struct R5000CpuState {
     statistics: R5000CpuStatistics,
 }
 
-impl R5000Cpu<SoftFloat3Backend> {
+impl R5000Cpu<Mips4SoftFloatBackend> {
     /// Creates an R5000 using SoftFloat 3e as its reference FPU backend.
     pub fn new(
         id: ComponentId,
@@ -220,7 +220,7 @@ impl R5000Cpu<SoftFloat3Backend> {
         profile: R5000Profile,
         boot_mode: R5000BootMode,
     ) -> Result<Self, R5000CpuError> {
-        Self::with_float_backend(id, name, profile, boot_mode, SoftFloat3Backend::new())
+        Self::with_float_backend(id, name, profile, boot_mode, Mips4SoftFloatBackend::new())
     }
 
     /// Captures the processor's architectural and executor state.
@@ -267,7 +267,7 @@ impl R5000Cpu<SoftFloat3Backend> {
             });
         }
         let target_pending =
-            Mips4ExecutionTarget::<R5000ExecutionPolicy, SoftFloat3Backend>::state_has_pending(
+            Mips4ExecutionTarget::<R5000ExecutionPolicy, Mips4SoftFloatBackend>::state_has_pending(
                 &state.target,
             );
         let queued_transaction = matches!(
