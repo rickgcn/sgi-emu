@@ -2,7 +2,9 @@
 
 use core::fmt;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_float::backend::FloatBackend;
 use se_float::backend::softfloat3::SoftFloat3Backend;
@@ -11,7 +13,7 @@ use crate::bus::irq::{IrqDelivery, IrqInput};
 use crate::cpu::execution::functional::FunctionalExecutor;
 use crate::cpu::execution::protocol::{
     ExecutionAction, ExecutionCompletion, ExecutionTransaction, ExecutionTransactionId,
-    FunctionalExecutorError,
+    FunctionalExecutorError, FunctionalExecutorState,
 };
 use crate::cpu::execution::target::ExecutionTargetAction;
 use crate::cpu::mips4::cp0::Mips4Cp0CacheErr;
@@ -27,6 +29,7 @@ use crate::cpu::mips4::execution::port::{
 use crate::cpu::mips4::execution::state::{Mips4ExecutionConfigError, Mips4ExecutionState};
 use crate::cpu::mips4::execution::target::{
     Mips4ExecutionBoundary, Mips4ExecutionSignal, Mips4ExecutionTarget, Mips4ExecutionTargetError,
+    Mips4ExecutionTargetState,
 };
 
 use super::boot_mode::{R5000BootMode, R5000CountUpdateRate};
@@ -178,7 +181,7 @@ fn reborrow_optional<'a, T: ?Sized>(value: &'a mut Option<&mut T>) -> Option<&'a
 }
 
 /// Functional R5000 CPU with an injectable floating-point backend.
-#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Clone)]
 pub struct R5000Cpu<F = SoftFloat3Backend>
 where
     F: FloatBackend,
@@ -191,11 +194,23 @@ where
     half_pclock_remainder: u8,
     terminal_error: Option<R5000CpuError>,
     statistics: R5000CpuStatistics,
-    #[serde(skip)]
     reusable_block_frame: R5000ReusableBlockFrame,
 }
 
-se_core::component_state!(R5000CpuState, R5000Cpu);
+/// Serializable dynamic state of an R5000 CPU.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct R5000CpuState {
+    id: ComponentId,
+    profile: R5000Profile,
+    boot_mode: R5000BootMode,
+    target: Mips4ExecutionTargetState,
+    executor_state: FunctionalExecutorState,
+    next_transaction_id: u128,
+    queued_action: Option<ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>>,
+    half_pclock_remainder: u8,
+    terminal_error: Option<R5000CpuError>,
+    statistics: R5000CpuStatistics,
+}
 
 impl R5000Cpu<SoftFloat3Backend> {
     /// Creates an R5000 using SoftFloat 3e as its reference FPU backend.
@@ -206,6 +221,86 @@ impl R5000Cpu<SoftFloat3Backend> {
         boot_mode: R5000BootMode,
     ) -> Result<Self, R5000CpuError> {
         Self::with_float_backend(id, name, profile, boot_mode, SoftFloat3Backend::new())
+    }
+
+    /// Captures the processor's architectural and executor state.
+    pub fn save_state(&self) -> R5000CpuState {
+        R5000CpuState {
+            id: self.id,
+            profile: self.profile,
+            boot_mode: self.boot_mode,
+            target: self.executor.target().save_state(),
+            executor_state: self.executor.state(),
+            next_transaction_id: self.executor.next_transaction_id(),
+            queued_action: self.executor.queued_action().cloned(),
+            half_pclock_remainder: self.half_pclock_remainder,
+            terminal_error: self.terminal_error.clone(),
+            statistics: self.statistics,
+        }
+    }
+
+    /// Restores dynamic processor state while preserving the current policy and FPU backend.
+    pub fn restore_state(&mut self, state: R5000CpuState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if self.profile != state.profile {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "profile",
+            });
+        }
+        if self.boot_mode != state.boot_mode {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "boot_mode",
+            });
+        }
+        if let Err(invariant) = self.executor.target().validate_state(&state.target) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant,
+            });
+        }
+        if state.half_pclock_remainder > 1 {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "R5000 half-PClock remainder must be zero or one",
+            });
+        }
+        let target_pending =
+            Mips4ExecutionTarget::<R5000ExecutionPolicy, SoftFloat3Backend>::state_has_pending(
+                &state.target,
+            );
+        let queued_transaction = matches!(
+            state.queued_action,
+            Some(ExecutionTargetAction::Transaction(_))
+        );
+        let executor_valid = match state.executor_state {
+            FunctionalExecutorState::Ready => target_pending == queued_transaction,
+            FunctionalExecutorState::Waiting { transaction_id } => {
+                state.queued_action.is_none()
+                    && target_pending
+                    && transaction_id.get() < state.next_transaction_id
+            }
+            FunctionalExecutorState::Failed => state.queued_action.is_none(),
+        };
+        if !executor_valid {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "R5000 executor phase must match its pending target operation",
+            });
+        }
+
+        self.executor.target_mut().restore_state(state.target);
+        self.executor.restore_dynamic_state(
+            state.executor_state,
+            state.next_transaction_id,
+            state.queued_action,
+        );
+        self.half_pclock_remainder = state.half_pclock_remainder;
+        self.terminal_error = state.terminal_error;
+        self.statistics = state.statistics;
+        self.reusable_block_frame = R5000ReusableBlockFrame::default();
+        Ok(())
     }
 }
 

@@ -57,6 +57,27 @@ where
         &mut self.target
     }
 
+    pub(crate) const fn next_transaction_id(&self) -> u128 {
+        self.next_transaction_id
+    }
+
+    pub(crate) const fn queued_action(
+        &self,
+    ) -> Option<&ExecutionTargetAction<T::Transaction, T::Boundary>> {
+        self.queued_action.as_ref()
+    }
+
+    pub(crate) fn restore_dynamic_state(
+        &mut self,
+        state: FunctionalExecutorState,
+        next_transaction_id: u128,
+        queued_action: Option<ExecutionTargetAction<T::Transaction, T::Boundary>>,
+    ) {
+        self.state = state;
+        self.next_transaction_id = next_transaction_id;
+        self.queued_action = queued_action;
+    }
+
     /// Returns whether no transaction or completed target action is pending.
     pub const fn ready_for_direct_execution(&self) -> bool {
         matches!(self.state, FunctionalExecutorState::Ready)

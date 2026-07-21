@@ -321,9 +321,47 @@ fn component_state_drops_the_reusable_block_frame() {
     cpu.reusable_block_frame.0 = Some(cpu.executor.target().block_frame(1));
 
     let state = cpu.save_state();
-    assert!(state.0.reusable_block_frame.0.is_none());
     cpu.restore_state(state).unwrap();
     assert!(cpu.reusable_block_frame.0.is_none());
+}
+
+#[test]
+fn component_state_preserves_name_and_rejects_profile_and_invalid_remainder_atomically() {
+    let id = ComponentId::new(7);
+    let boot_mode = R5000BootMode::from_low_bits(0).unwrap();
+    let mut source = R5000Cpu::new(id, "source", profile(), boot_mode).unwrap();
+    source.half_pclock_remainder = 1;
+    let mut renamed = R5000Cpu::new(id, "target", profile(), boot_mode).unwrap();
+    renamed.restore_state(source.save_state()).unwrap();
+    assert_eq!(renamed.name(), "target");
+    assert_eq!(renamed.half_pclock_remainder, 1);
+
+    let mismatched_profile = R5000Profile::new(
+        Mips4Endianness::Big,
+        R5000Revision::from_bits(0x21),
+        180_000_000,
+        Mips4CacheConfig::present(32 * 1024, 32),
+        Mips4CacheConfig::present(32 * 1024, 32),
+        Mips4CacheConfig::disabled(),
+    );
+    let mismatched = R5000Cpu::new(id, "source", mismatched_profile, boot_mode)
+        .unwrap()
+        .save_state();
+    let mut target = R5000Cpu::new(id, "target", profile(), boot_mode).unwrap();
+    let before = postcard::to_stdvec(&target.save_state()).unwrap();
+    assert!(matches!(
+        target.restore_state(mismatched),
+        Err(ComponentStateError::ConfigurationMismatch { .. })
+    ));
+    assert_eq!(postcard::to_stdvec(&target.save_state()).unwrap(), before);
+
+    let mut invalid = target.save_state();
+    invalid.half_pclock_remainder = 2;
+    assert!(matches!(
+        target.restore_state(invalid),
+        Err(ComponentStateError::InvalidState { .. })
+    ));
+    assert_eq!(postcard::to_stdvec(&target.save_state()).unwrap(), before);
 }
 
 #[test]

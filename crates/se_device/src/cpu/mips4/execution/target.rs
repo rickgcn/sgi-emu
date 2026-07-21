@@ -280,6 +280,14 @@ pub struct Mips4ExecutionTarget<P, F> {
         Option<ExecutionTargetAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>>,
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub(crate) struct Mips4ExecutionTargetState {
+    state: Mips4ExecutionState,
+    pending: Option<PendingOperation>,
+    pending_error_exception: Option<PendingErrorException>,
+    fetched_instruction: Option<Mips4FetchedInstruction>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Mips4CodeVisibility {
     instruction_lines: Vec<Vec<u64>>,
@@ -354,6 +362,115 @@ where
     /// Returns architectural state.
     pub const fn state(&self) -> &Mips4ExecutionState {
         &self.state
+    }
+
+    pub(crate) fn save_state(&self) -> Mips4ExecutionTargetState {
+        Mips4ExecutionTargetState {
+            state: self.state.clone(),
+            pending: self.pending.clone(),
+            pending_error_exception: self.pending_error_exception,
+            fetched_instruction: self.fetched_instruction,
+        }
+    }
+
+    pub(crate) fn validate_state(
+        &self,
+        saved: &Mips4ExecutionTargetState,
+    ) -> Result<(), &'static str> {
+        if saved.state.config != self.policy.architecture_config()
+            || saved.state.tlb_entries.len() != self.policy.tlb_entry_count()
+        {
+            return Err("MIPS IV architecture and TLB geometry must match the execution policy");
+        }
+        saved
+            .state
+            .cache
+            .validate_state(self.policy.cache_config())?;
+        if saved.state.external_interrupts & !0x7c != 0
+            || saved.state.cp0.cause().interrupt_pending() & 0x7c != saved.state.external_interrupts
+        {
+            return Err("MIPS IV external interrupt state must match CP0 Cause");
+        }
+        if saved.pending.is_some() && saved.fetched_instruction.is_some() {
+            return Err("MIPS IV cannot retain a fetched instruction while a bus operation waits");
+        }
+        if saved.fetched_instruction.is_some_and(|fetched| {
+            fetched.virtual_address & 3 != 0 || fetched.physical_address & 3 != 0
+        }) {
+            return Err("MIPS IV fetched instruction addresses must be word aligned");
+        }
+        if saved.pending_error_exception.is_some() && saved.pending.is_some() {
+            return Err("MIPS IV error exceptions cannot coexist with a pending bus operation");
+        }
+        if saved.pending_error_exception.is_some_and(|pending| {
+            matches!(pending.reason, Mips4ErrorException::CacheError)
+                != pending.cache_error.is_some()
+        }) {
+            return Err("MIPS IV pending cache errors must carry a cache-error register image");
+        }
+        let valid_line = |line: &Mips4CacheLine| {
+            line.physical_line_base
+                .is_multiple_of(MIPS4_FUNCTIONAL_CACHE_LINE_BYTES as u64)
+                && line.virtual_index < 8
+        };
+        let pending_valid = match &saved.pending {
+            None
+            | Some(PendingOperation::InstructionFetch { .. })
+            | Some(PendingOperation::DataRead { .. })
+            | Some(PendingOperation::DataWrite { .. })
+            | Some(PendingOperation::FpuDataRead { .. })
+            | Some(PendingOperation::FpuDataWrite { .. })
+            | Some(PendingOperation::CacheRetire { .. }) => true,
+            Some(PendingOperation::Cached(pending)) => {
+                let instruction = matches!(
+                    pending.client,
+                    Mips4CachedClient::InstructionFetch { .. }
+                        | Mips4CachedClient::CacheRetire { .. }
+                );
+                let stage_valid = match pending.stage {
+                    Mips4CachedStage::Writeback { doubleword }
+                    | Mips4CachedStage::Fill { doubleword, .. } => doubleword < 4,
+                    Mips4CachedStage::WriteThrough => true,
+                };
+                stage_valid
+                    && saved.state.cache.primary_location_valid(
+                        instruction,
+                        pending.victim_set,
+                        pending.victim_way,
+                    )
+                    && valid_line(&pending.victim)
+                    && pending.secondary_source.as_ref().is_none_or(&valid_line)
+                    && (!pending.use_secondary || saved.state.cache.has_secondary())
+            }
+            Some(PendingOperation::CacheWriteback(pending)) => {
+                let target_valid = match pending.target {
+                    Mips4CacheWritebackTarget::CreateDirty { set, way, .. } => {
+                        saved.state.cache.primary_location_valid(false, set, way)
+                    }
+                    Mips4CacheWritebackTarget::PrimaryIndex { .. }
+                    | Mips4CacheWritebackTarget::PrimaryHit { .. } => true,
+                };
+                pending.doubleword < 4 && valid_line(&pending.line) && target_valid
+            }
+        };
+        if !pending_valid {
+            return Err("MIPS IV pending cache operation must use valid stages and cache indices");
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn state_has_pending(saved: &Mips4ExecutionTargetState) -> bool {
+        saved.pending.is_some()
+    }
+
+    pub(crate) fn restore_state(&mut self, saved: Mips4ExecutionTargetState) {
+        self.state = saved.state;
+        self.pending = saved.pending;
+        self.pending_error_exception = saved.pending_error_exception;
+        self.decode_cache = empty_decode_cache();
+        self.code_visibility = Mips4CodeVisibility::default();
+        self.fetched_instruction = saved.fetched_instruction;
+        self.block_runtime_action = None;
     }
 
     #[cfg(test)]

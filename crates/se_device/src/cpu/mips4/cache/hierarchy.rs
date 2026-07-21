@@ -356,6 +356,12 @@ pub(crate) struct Mips4InstructionCacheHit {
     pub(crate) line: Mips4CacheLine,
 }
 
+fn valid_cache_line_shape(line: &Mips4CacheLine) -> bool {
+    line.physical_line_base
+        .is_multiple_of(MIPS4_FUNCTIONAL_CACHE_LINE_BYTES as u64)
+        && line.virtual_index < 8
+}
+
 impl Mips4CacheHierarchy {
     pub(crate) fn new(config: Mips4CacheHierarchyConfig) -> Result<Self, Mips4CacheConfigError> {
         Ok(Self {
@@ -366,6 +372,72 @@ impl Mips4CacheHierarchy {
             data: config.data.map(Mips4SetAssociativeCache::new).transpose()?,
             secondary: config.secondary.map(Mips4SecondaryCache::new).transpose()?,
         })
+    }
+
+    pub(crate) fn validate_state(
+        &self,
+        expected: Mips4CacheHierarchyConfig,
+    ) -> Result<(), &'static str> {
+        fn validate_primary(
+            cache: &Mips4SetAssociativeCache,
+            geometry: Mips4CacheGeometry,
+        ) -> bool {
+            let Ok(set_count) = geometry.validate() else {
+                return false;
+            };
+            cache.geometry == geometry
+                && cache.sets.len() == set_count
+                && cache.next_victim.len() == set_count
+                && cache
+                    .sets
+                    .iter()
+                    .all(|set| set.len() == usize::from(geometry.ways))
+                && cache
+                    .next_victim
+                    .iter()
+                    .all(|victim| *victim < geometry.ways)
+                && cache.sets.iter().flatten().all(valid_cache_line_shape)
+        }
+
+        let primary_valid =
+            |cache: &Option<Mips4SetAssociativeCache>, geometry| match (cache, geometry) {
+                (None, None) => true,
+                (Some(cache), Some(geometry)) => validate_primary(cache, geometry),
+                _ => false,
+            };
+        if !primary_valid(&self.instruction, expected.instruction)
+            || !primary_valid(&self.data, expected.data)
+        {
+            return Err("MIPS IV primary cache geometry and storage must match the policy");
+        }
+        match (&self.secondary, expected.secondary) {
+            (None, None) => {}
+            (Some(cache), Some(geometry)) => {
+                let Ok(line_count) = geometry.validate() else {
+                    return Err("MIPS IV secondary cache geometry must be valid");
+                };
+                if geometry.ways != 1
+                    || cache.geometry != geometry
+                    || cache.lines.len() != line_count
+                    || !cache.lines.iter().all(valid_cache_line_shape)
+                {
+                    return Err(
+                        "MIPS IV secondary cache geometry and storage must match the policy",
+                    );
+                }
+            }
+            _ => return Err("MIPS IV secondary cache presence must match the policy"),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn primary_location_valid(&self, instruction: bool, set: usize, way: usize) -> bool {
+        let cache = if instruction {
+            self.instruction.as_ref()
+        } else {
+            self.data.as_ref()
+        };
+        cache.is_some_and(|cache| set < cache.sets.len() && way < usize::from(cache.geometry.ways))
     }
 
     pub(crate) fn instruction_lookup(
