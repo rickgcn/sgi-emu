@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::{BusDeviceRole, BusRole};
 use se_core::scheduler::SimDuration;
 
@@ -82,7 +84,7 @@ pub enum PciBusAction {
 }
 
 /// Deterministic PCI arbiter with fixed-priority and round-robin clients.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PciBus {
     id: ComponentId,
     name: String,
@@ -95,18 +97,38 @@ pub struct PciBus {
     actions: VecDeque<PciBusAction>,
 }
 
-se_core::component_state!(PciBusState, PciBus);
+/// Serializable dynamic state and compatibility data of a PCI bus.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct PciBusState {
+    id: ComponentId,
+    cycle: SimDuration,
+    fixed_priority: Vec<ComponentId>,
+    queues: BTreeMap<ComponentId, VecDeque<PciTransaction>>,
+    round_robin: Vec<ComponentId>,
+    cursor: usize,
+    in_flight: Option<PciTransaction>,
+    actions: VecDeque<PciBusAction>,
+}
 
 /// Protocol-correct PCI configuration endpoint with no device engine.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PciConfigurationEndpoint {
     id: ComponentId,
     name: String,
-    #[serde(with = "crate::common::serde_array")]
     configuration: [u8; 256],
 }
 
-se_core::component_state!(PciConfigurationEndpointState, PciConfigurationEndpoint);
+/// Serializable mutable configuration registers of a PCI endpoint.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct PciConfigurationEndpointState {
+    id: ComponentId,
+    identity: [u8; 9],
+    registers: Vec<u8>,
+}
+
+fn configuration_byte_writable(index: usize) -> bool {
+    index >= 4 && !(8..12).contains(&index) && index != 14
+}
 
 impl PciConfigurationEndpoint {
     /// Creates an enumerable PCI function.
@@ -131,6 +153,53 @@ impl PciConfigurationEndpoint {
             name: name.into(),
             configuration,
         }
+    }
+
+    /// Captures mutable PCI configuration registers and immutable identity proof.
+    pub fn save_state(&self) -> PciConfigurationEndpointState {
+        PciConfigurationEndpointState {
+            id: self.id,
+            identity: pci_identity(&self.configuration),
+            registers: self
+                .configuration
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(|(index, value)| configuration_byte_writable(index).then_some(value))
+                .collect(),
+        }
+    }
+
+    /// Restores mutable registers after validating the endpoint identity.
+    pub fn restore_state(
+        &mut self,
+        state: PciConfigurationEndpointState,
+    ) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if pci_identity(&self.configuration) != state.identity {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "PCI read-only device identity",
+            });
+        }
+        let mutable_length = (0..self.configuration.len())
+            .filter(|index| configuration_byte_writable(*index))
+            .count();
+        if state.registers.len() != mutable_length {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "PCI configuration register image has an invalid length",
+            });
+        }
+        let mut restored = self.configuration;
+        for (index, value) in (0..restored.len())
+            .filter(|index| configuration_byte_writable(*index))
+            .zip(state.registers)
+        {
+            restored[index] = value;
+        }
+        self.configuration = restored;
+        Ok(())
     }
 }
 
@@ -187,7 +256,7 @@ impl BusDeviceRole<PciTransaction> for PciConfigurationEndpoint {
                     .zip(&transaction.byte_enable)
                     .enumerate()
                 {
-                    if enabled && start + index >= 4 {
+                    if enabled && configuration_byte_writable(start + index) {
                         self.configuration[start + index] = value;
                     }
                 }
@@ -196,6 +265,20 @@ impl BusDeviceRole<PciTransaction> for PciConfigurationEndpoint {
         }
         completion
     }
+}
+
+fn pci_identity(configuration: &[u8; 256]) -> [u8; 9] {
+    [
+        configuration[0],
+        configuration[1],
+        configuration[2],
+        configuration[3],
+        configuration[8],
+        configuration[9],
+        configuration[10],
+        configuration[11],
+        configuration[14],
+    ]
 }
 
 impl PciBus {
@@ -212,6 +295,83 @@ impl PciBus {
             in_flight: None,
             actions: VecDeque::new(),
         }
+    }
+
+    /// Captures arbitration, queued work, and in-flight PCI state.
+    pub fn save_state(&self) -> PciBusState {
+        PciBusState {
+            id: self.id,
+            cycle: self.cycle,
+            fixed_priority: self.fixed_priority.clone(),
+            queues: self.queues.clone(),
+            round_robin: self.round_robin.clone(),
+            cursor: self.cursor,
+            in_flight: self.in_flight.clone(),
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores validated PCI arbitration state without changing configuration.
+    pub fn restore_state(&mut self, state: PciBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if state.cycle != self.cycle {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "PCI cycle",
+            });
+        }
+        if state.fixed_priority != self.fixed_priority {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "PCI fixed-priority controllers",
+            });
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        let round_robin_valid = state
+            .round_robin
+            .iter()
+            .all(|controller| unique.insert(*controller))
+            && unique.iter().copied().eq(state.queues.keys().copied())
+            && if state.round_robin.is_empty() {
+                state.cursor == 0
+            } else {
+                state.cursor < state.round_robin.len()
+            };
+        let queues_valid = state.queues.iter().all(|(controller, queue)| {
+            queue
+                .iter()
+                .all(|transaction| transaction.controller == *controller)
+        });
+        let in_flight_valid = state
+            .in_flight
+            .as_ref()
+            .is_none_or(|transaction| state.queues.contains_key(&transaction.controller));
+        let actions_valid = state.actions.iter().all(|action| match action {
+            PciBusAction::Deliver {
+                target,
+                transaction,
+            } => {
+                *target == transaction.target
+                    && state
+                        .in_flight
+                        .as_ref()
+                        .is_some_and(|active| active == transaction)
+            }
+            PciBusAction::Complete { controller, .. } => state.queues.contains_key(controller),
+            PciBusAction::Idle => false,
+        });
+        if !round_robin_valid || !queues_valid || !in_flight_valid || !actions_valid {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "PCI arbitration queues and actions must be canonical",
+            });
+        }
+        self.queues = state.queues;
+        self.round_robin = state.round_robin;
+        self.cursor = state.cursor;
+        self.in_flight = state.in_flight;
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Replaces the high-priority controller order.
@@ -391,5 +551,35 @@ mod tests {
         });
         assert_eq!(completion.status, PciStatus::Complete);
         assert_eq!(completion.data, [0x04, 0x90, 0x78, 0x80]);
+    }
+
+    #[test]
+    fn configuration_state_preserves_read_only_identity_and_rejects_malformed_images_atomically() {
+        let id = ComponentId::new(1);
+        let source = PciConfigurationEndpoint::new(id, "source", 0x9004, 0x8078, 0x010000, 0);
+        let mut target = PciConfigurationEndpoint::new(id, "target", 0x9004, 0x8078, 0x010000, 0);
+
+        target.restore_state(source.save_state()).unwrap();
+        assert_eq!(target.name(), "target");
+
+        let incompatible =
+            PciConfigurationEndpoint::new(id, "foreign", 0x9004, 0x8078, 0x020000, 1).save_state();
+        let before = target.clone();
+        assert!(matches!(
+            target.restore_state(incompatible),
+            Err(ComponentStateError::ConfigurationMismatch {
+                component,
+                field: "PCI read-only device identity"
+            }) if component == id
+        ));
+        assert_eq!(target, before);
+
+        let mut malformed = source.save_state();
+        malformed.registers.pop();
+        assert!(matches!(
+            target.restore_state(malformed),
+            Err(ComponentStateError::InvalidState { component, .. }) if component == id
+        ));
+        assert_eq!(target, before);
     }
 }

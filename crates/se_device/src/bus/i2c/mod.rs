@@ -2,7 +2,9 @@
 
 use std::collections::VecDeque;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusRole;
 use se_core::scheduler::SimDuration;
 
@@ -49,7 +51,7 @@ pub enum I2cBusAction {
 }
 
 /// Serialized I2C party-line bus.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct I2cBus {
     id: ComponentId,
     name: String,
@@ -58,7 +60,14 @@ pub struct I2cBus {
     actions: VecDeque<I2cBusAction>,
 }
 
-se_core::component_state!(I2cBusState, I2cBus);
+/// Serializable dynamic state of an I2C bus.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct I2cBusState {
+    id: ComponentId,
+    queue: VecDeque<I2cTransaction>,
+    in_flight: Option<I2cTransaction>,
+    actions: VecDeque<I2cBusAction>,
+}
 
 impl I2cBus {
     pub fn new(id: ComponentId, name: impl Into<String>) -> Self {
@@ -69,6 +78,38 @@ impl I2cBus {
             in_flight: None,
             actions: VecDeque::new(),
         }
+    }
+
+    /// Captures all queued and in-flight I2C work.
+    pub fn save_state(&self) -> I2cBusState {
+        I2cBusState {
+            id: self.id,
+            queue: self.queue.clone(),
+            in_flight: self.in_flight.clone(),
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores validated I2C work without changing component identity.
+    pub fn restore_state(&mut self, state: I2cBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if state.actions.iter().any(|action| match action {
+            I2cBusAction::Deliver {
+                target,
+                transaction,
+            } => *target != transaction.target,
+            I2cBusAction::Complete { .. } => false,
+            I2cBusAction::Idle => true,
+        }) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "I2C queued actions must be non-idle and internally routed",
+            });
+        }
+        self.queue = state.queue;
+        self.in_flight = state.in_flight;
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Delivers the next message if the bus is idle.

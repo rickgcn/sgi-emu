@@ -6,7 +6,9 @@
 use core::fmt;
 use std::collections::VecDeque;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusRole;
 use se_core::scheduler::SimTime;
 
@@ -113,7 +115,7 @@ struct ParticipantState {
 }
 
 /// Combinational two-line open-drain bus.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TwoWireBus {
     id: ComponentId,
     name: String,
@@ -121,7 +123,13 @@ pub struct TwoWireBus {
     actions: VecDeque<TwoWireBusAction>,
 }
 
-se_core::component_state!(TwoWireBusState, TwoWireBus);
+/// Serializable electrical state of a fixed-topology two-wire bus.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct TwoWireBusState {
+    id: ComponentId,
+    participants: Vec<ParticipantState>,
+    actions: VecDeque<TwoWireBusAction>,
+}
 
 impl TwoWireBus {
     /// Creates a bus with a fixed participant list.
@@ -150,6 +158,60 @@ impl TwoWireBus {
             participants: states,
             actions: VecDeque::new(),
         })
+    }
+
+    /// Captures participant line levels and pending deliveries.
+    pub fn save_state(&self) -> TwoWireBusState {
+        TwoWireBusState {
+            id: self.id,
+            participants: self.participants.clone(),
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores electrical state after validating the participant topology.
+    pub fn restore_state(&mut self, state: TwoWireBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if !self
+            .participants
+            .iter()
+            .map(|participant| participant.component)
+            .eq(state
+                .participants
+                .iter()
+                .map(|participant| participant.component))
+        {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "two-wire participants",
+            });
+        }
+        let configured = |component| {
+            self.participants
+                .iter()
+                .any(|participant| participant.component == component)
+        };
+        if state.actions.iter().any(|action| match action {
+            TwoWireBusAction::Deliver { target, delivery } => {
+                delivery.bus != self.id
+                    || !configured(*target)
+                    || !configured(delivery.source)
+                    || delivery.source_clock_low && !delivery.clock_low
+                    || delivery.source_data_low && !delivery.data_low
+            }
+            TwoWireBusAction::Idle => true,
+        }) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "two-wire deliveries must reference the configured bus topology",
+            });
+        }
+        for (current, restored) in self.participants.iter_mut().zip(state.participants) {
+            current.clock_low = restored.clock_low;
+            current.data_low = restored.data_low;
+        }
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Polls one pending line observation.
@@ -344,5 +406,20 @@ mod tests {
         assert!(restored.data_low());
         assert_eq!(restored.poll(), reference.poll());
         assert_eq!(restored.poll(), reference.poll());
+    }
+
+    #[test]
+    fn state_restore_rejects_participant_changes_without_mutating_the_bus() {
+        let state = TwoWireBus::new(component(1), "source", [component(2), component(4)])
+            .unwrap()
+            .save_state();
+        let mut target =
+            TwoWireBus::new(component(1), "target", [component(2), component(3)]).unwrap();
+        let before = target.clone();
+        assert!(matches!(
+            target.restore_state(state),
+            Err(ComponentStateError::ConfigurationMismatch { .. })
+        ));
+        assert_eq!(target, before);
     }
 }

@@ -2,7 +2,9 @@
 
 use std::collections::VecDeque;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusRole;
 
 /// External MACE port.
@@ -78,14 +80,19 @@ pub enum MediaBusAction {
 }
 
 /// Ordered point-to-point media link.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaBus {
     id: ComponentId,
     name: String,
     queue: VecDeque<MediaBusAction>,
 }
 
-se_core::component_state!(MediaBusState, MediaBus);
+/// Serializable dynamic state of an ordered media link.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct MediaBusState {
+    id: ComponentId,
+    queue: VecDeque<MediaBusAction>,
+}
 
 impl MediaBus {
     pub fn new(id: ComponentId, name: impl Into<String>) -> Self {
@@ -94,6 +101,31 @@ impl MediaBus {
             name: name.into(),
             queue: VecDeque::new(),
         }
+    }
+    /// Captures all pending media deliveries.
+    pub fn save_state(&self) -> MediaBusState {
+        MediaBusState {
+            id: self.id,
+            queue: self.queue.clone(),
+        }
+    }
+    /// Restores validated media deliveries without changing identity.
+    pub fn restore_state(&mut self, state: MediaBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if state.queue.iter().any(|action| match action {
+            MediaBusAction::Deliver {
+                target,
+                transaction,
+            } => *target != transaction.target,
+            MediaBusAction::Idle => true,
+        }) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "media actions must be non-idle and internally routed",
+            });
+        }
+        self.queue = state.queue;
+        Ok(())
     }
     pub fn poll(&mut self) -> MediaBusAction {
         self.queue.pop_front().unwrap_or(MediaBusAction::Idle)

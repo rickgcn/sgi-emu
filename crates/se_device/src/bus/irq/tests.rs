@@ -212,3 +212,17 @@ fn reset_clears_levels_and_pending_deliveries() {
     assert_level(&mut bus, SOURCE_A, true);
     assert!(matches!(bus.poll(), IrqBusAction::Deliver { .. }));
 }
+
+#[test]
+fn state_restore_rejects_route_changes_without_mutating_the_bus() {
+    let state = IrqBus::new(BUS, "source", [route(SOURCE_A, TARGET_B)])
+        .unwrap()
+        .save_state();
+    let mut target = IrqBus::new(BUS, "target", [route(SOURCE_A, TARGET_A)]).unwrap();
+    let before = target.clone();
+    assert!(matches!(
+        target.restore_state(state),
+        Err(ComponentStateError::ConfigurationMismatch { .. })
+    ));
+    assert_eq!(target, before);
+}

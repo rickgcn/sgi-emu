@@ -6,7 +6,9 @@
 use core::fmt;
 use std::collections::VecDeque;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusRole;
 use se_core::scheduler::SimTime;
 
@@ -100,7 +102,7 @@ struct ParticipantState {
 }
 
 /// Combinational open-drain 1-Wire bus.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OneWireBus {
     id: ComponentId,
     name: String,
@@ -108,7 +110,13 @@ pub struct OneWireBus {
     actions: VecDeque<OneWireBusAction>,
 }
 
-se_core::component_state!(OneWireBusState, OneWireBus);
+/// Serializable electrical state of a fixed-topology 1-Wire bus.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct OneWireBusState {
+    id: ComponentId,
+    participants: Vec<ParticipantState>,
+    actions: VecDeque<OneWireBusAction>,
+}
 
 impl OneWireBus {
     /// Creates a bus with a fixed participant list.
@@ -136,6 +144,57 @@ impl OneWireBus {
             participants: states,
             actions: VecDeque::new(),
         })
+    }
+
+    /// Captures participant line levels and pending deliveries.
+    pub fn save_state(&self) -> OneWireBusState {
+        OneWireBusState {
+            id: self.id,
+            participants: self.participants.clone(),
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores electrical state after validating the participant topology.
+    pub fn restore_state(&mut self, state: OneWireBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if !self
+            .participants
+            .iter()
+            .map(|participant| participant.component)
+            .eq(state
+                .participants
+                .iter()
+                .map(|participant| participant.component))
+        {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "1-Wire participants",
+            });
+        }
+        let configured = |component| {
+            self.participants
+                .iter()
+                .any(|participant| participant.component == component)
+        };
+        if state.actions.iter().any(|action| match action {
+            OneWireBusAction::Deliver { target, delivery } => {
+                !configured(*target)
+                    || !configured(delivery.source)
+                    || delivery.source_drive_low && !delivery.line_low
+            }
+            OneWireBusAction::Idle => true,
+        }) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "1-Wire deliveries must reference configured participants",
+            });
+        }
+        for (current, restored) in self.participants.iter_mut().zip(state.participants) {
+            current.drive_low = restored.drive_low;
+        }
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Polls one pending line observation.
@@ -295,5 +354,20 @@ mod tests {
             }),
             Err(OneWireBusRouteError::UnroutedSource(component(3)))
         );
+    }
+
+    #[test]
+    fn state_restore_rejects_participant_changes_without_mutating_the_bus() {
+        let state = OneWireBus::new(component(1), "source", [component(2), component(4)])
+            .unwrap()
+            .save_state();
+        let mut target =
+            OneWireBus::new(component(1), "target", [component(2), component(3)]).unwrap();
+        let before = target.clone();
+        assert!(matches!(
+            target.restore_state(state),
+            Err(ComponentStateError::ConfigurationMismatch { .. })
+        ));
+        assert_eq!(target, before);
     }
 }

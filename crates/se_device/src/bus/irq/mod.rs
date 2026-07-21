@@ -3,7 +3,9 @@
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusRole;
 
 /// Device-local interrupt output identifier.
@@ -167,7 +169,7 @@ struct RouteState {
 }
 
 /// Combinational level-sensitive interrupt routing domain.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrqBus {
     id: ComponentId,
     name: String,
@@ -176,7 +178,14 @@ pub struct IrqBus {
     actions: VecDeque<IrqBusAction>,
 }
 
-se_core::component_state!(IrqBusState, IrqBus);
+/// Serializable electrical state of a fixed interrupt topology.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct IrqBusState {
+    id: ComponentId,
+    routes: Vec<RouteState>,
+    target_levels: BTreeMap<IrqTarget, bool>,
+    actions: VecDeque<IrqBusAction>,
+}
 
 impl IrqBus {
     /// Creates an interrupt bus with a fixed routing table.
@@ -205,6 +214,59 @@ impl IrqBus {
             target_levels,
             actions: VecDeque::new(),
         })
+    }
+
+    /// Captures source levels, aggregate target levels, and pending deliveries.
+    pub fn save_state(&self) -> IrqBusState {
+        IrqBusState {
+            id: self.id,
+            routes: self.routes.clone(),
+            target_levels: self.target_levels.clone(),
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores electrical state after validating the fixed routing table.
+    pub fn restore_state(&mut self, state: IrqBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if !self
+            .routes
+            .iter()
+            .map(|route| route.route)
+            .eq(state.routes.iter().map(|route| route.route))
+        {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "IRQ routes",
+            });
+        }
+        let mut expected_levels = self.target_levels.clone();
+        for (target, level) in &mut expected_levels {
+            *level = state
+                .routes
+                .iter()
+                .any(|route| route.route.target == *target && route.asserted);
+        }
+        let actions_valid = state.actions.iter().all(|action| match action {
+            IrqBusAction::Deliver { target, delivery } => {
+                state.target_levels.keys().any(|configured| {
+                    configured.component == *target && configured.input == delivery.input
+                })
+            }
+            IrqBusAction::Idle => false,
+        });
+        if state.target_levels != expected_levels || !actions_valid {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "IRQ aggregate levels and deliveries must match configured routes",
+            });
+        }
+        for (current, restored) in self.routes.iter_mut().zip(state.routes) {
+            current.asserted = restored.asserted;
+        }
+        self.target_levels = state.target_levels;
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Polls one pending delivery.

@@ -6,7 +6,9 @@ use std::collections::VecDeque;
 use super::transfer::{
     CompactByteEnable, CompactByteEnableView, CompactData, CompactTransfer, CompactTransferView,
 };
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusRole;
 use se_core::scheduler::{SimDuration, SimTime};
 
@@ -334,7 +336,7 @@ pub enum IsaBusAction {
 }
 
 /// Single-transaction deterministic ISA bus.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IsaBus {
     id: ComponentId,
     name: String,
@@ -347,7 +349,18 @@ pub struct IsaBus {
     actions: VecDeque<IsaBusAction>,
 }
 
-se_core::component_state!(IsaBusState, IsaBus);
+/// Serializable dynamic state of an ISA bus.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct IsaBusState {
+    id: ComponentId,
+    cycle: SimDuration,
+    epoch: u64,
+    service_scheduled: bool,
+    queue: VecDeque<IsaTransaction>,
+    in_flight: Option<IsaTransaction>,
+    completion: Option<IsaCompletion>,
+    actions: VecDeque<IsaBusAction>,
+}
 
 impl IsaBus {
     /// Creates an ISA domain with a fixed visible bus-cycle delay.
@@ -363,6 +376,76 @@ impl IsaBus {
             completion: None,
             actions: VecDeque::new(),
         }
+    }
+
+    /// Captures all queued, active, and completed ISA work.
+    pub fn save_state(&self) -> IsaBusState {
+        IsaBusState {
+            id: self.id,
+            cycle: self.cycle,
+            epoch: self.epoch,
+            service_scheduled: self.service_scheduled,
+            queue: self.queue.clone(),
+            in_flight: self.in_flight.clone(),
+            completion: self.completion.clone(),
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores validated ISA work without changing the configured bus cycle.
+    pub fn restore_state(&mut self, state: IsaBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if state.cycle != self.cycle {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "ISA cycle",
+            });
+        }
+        let completion_valid = match (&state.in_flight, &state.completion) {
+            (_, None) => true,
+            (Some(transaction), Some(completion)) => transaction.id == completion.id,
+            (None, Some(_)) => false,
+        };
+        let actions_valid = state.actions.iter().all(|action| match action {
+            IsaBusAction::Deliver {
+                target,
+                transaction,
+            } => {
+                *target == transaction.target
+                    && state
+                        .in_flight
+                        .as_ref()
+                        .is_some_and(|active| active == transaction)
+            }
+            IsaBusAction::Complete { .. } => true,
+            IsaBusAction::Schedule { delay, event } => {
+                *delay == state.cycle
+                    && match event {
+                        IsaBusEvent::Service { epoch } => {
+                            *epoch == state.epoch && state.service_scheduled
+                        }
+                        IsaBusEvent::Complete { epoch } => {
+                            *epoch == state.epoch && state.completion.is_some()
+                        }
+                    }
+            }
+            IsaBusAction::Idle => false,
+        });
+        let service_valid = !state.service_scheduled
+            || !state.queue.is_empty() && state.in_flight.is_none() && state.completion.is_none();
+        if !completion_valid || !service_valid || !actions_valid {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "ISA transaction phase and queued actions must be consistent",
+            });
+        }
+        self.epoch = state.epoch;
+        self.service_scheduled = state.service_scheduled;
+        self.queue = state.queue;
+        self.in_flight = state.in_flight;
+        self.completion = state.completion;
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Handles a scheduled bus transition.

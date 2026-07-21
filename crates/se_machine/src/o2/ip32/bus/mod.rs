@@ -2,7 +2,9 @@
 
 use std::collections::VecDeque;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusRole;
 use se_core::scheduler::{FractionalClockProjection, SimDuration, SimTime};
 use se_device::chipset::crime::protocol::{
@@ -133,7 +135,7 @@ impl BusClock {
 }
 
 /// CPU-facing IP32 SysAD communication domain.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ip32SysAdBus {
     id: ComponentId,
     name: String,
@@ -151,7 +153,25 @@ pub struct Ip32SysAdBus {
     actions: VecDeque<Ip32SysAdBusAction>,
 }
 
-se_core::component_state!(Ip32SysAdBusState, Ip32SysAdBus);
+/// Serializable dynamic state and compatibility data of the IP32 SysAD bus.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct Ip32SysAdBusState {
+    id: ComponentId,
+    controller: ComponentId,
+    target: ComponentId,
+    timebase_hz: u64,
+    frequency_hz: u64,
+    clock_remainder: u64,
+    generation: u64,
+    service_scheduled: bool,
+    queue: VecDeque<ExecutionTransaction<Mips4ExecutionTransaction>>,
+    in_flight: Option<ExecutionTransaction<Mips4ExecutionTransaction>>,
+    pending_completion: Option<(
+        ExecutionTransaction<Mips4ExecutionTransaction>,
+        ExecutionCompletion<Mips4ExecutionCompletion>,
+    )>,
+    actions: VecDeque<Ip32SysAdBusAction>,
+}
 
 impl Ip32SysAdBus {
     /// Creates a SysAD domain connecting one CPU controller to CRIME.
@@ -176,6 +196,97 @@ impl Ip32SysAdBus {
             pending_completion: None,
             actions: VecDeque::new(),
         }
+    }
+
+    /// Captures all SysAD timing and transaction state.
+    pub fn save_state(&self) -> Ip32SysAdBusState {
+        Ip32SysAdBusState {
+            id: self.id,
+            controller: self.controller,
+            target: self.target,
+            timebase_hz: self.clock.timebase_hz,
+            frequency_hz: self.clock.frequency_hz,
+            clock_remainder: self.clock.remainder,
+            generation: self.generation,
+            service_scheduled: self.service_scheduled,
+            queue: self.queue.clone(),
+            in_flight: self.in_flight.clone(),
+            pending_completion: self.pending_completion.clone(),
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores validated SysAD state without changing endpoints or clock rates.
+    pub fn restore_state(&mut self, state: Ip32SysAdBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        for (matches, field) in [
+            (state.controller == self.controller, "SysAD controller"),
+            (state.target == self.target, "SysAD target"),
+            (
+                state.timebase_hz == self.clock.timebase_hz,
+                "SysAD timebase",
+            ),
+            (
+                state.frequency_hz == self.clock.frequency_hz,
+                "SysAD frequency",
+            ),
+        ] {
+            if !matches {
+                return Err(ComponentStateError::ConfigurationMismatch {
+                    component: self.id,
+                    field,
+                });
+            }
+        }
+        let completion_valid = !(state.in_flight.is_some() && state.pending_completion.is_some())
+            && state
+                .pending_completion
+                .as_ref()
+                .is_none_or(|(transaction, completion)| transaction.id == completion.id);
+        let actions_valid = state.actions.iter().all(|action| match action {
+            Ip32SysAdBusAction::Deliver { target, request } => {
+                *target == self.target
+                    && state.in_flight.as_ref().is_some_and(|transaction| {
+                        request.id == Self::crime_transaction_id(transaction.id)
+                    })
+            }
+            Ip32SysAdBusAction::Complete {
+                controller,
+                transaction,
+                completion,
+            } => *controller == self.controller && transaction.id == completion.id,
+            Ip32SysAdBusAction::Schedule { event, .. } => match event {
+                Ip32SysAdBusEvent::Service { generation } => {
+                    *generation == state.generation && state.service_scheduled
+                }
+                Ip32SysAdBusEvent::Complete { generation } => {
+                    *generation == state.generation && state.pending_completion.is_some()
+                }
+            },
+            Ip32SysAdBusAction::Idle => false,
+        });
+        let service_valid = !state.service_scheduled
+            || !state.queue.is_empty()
+                && state.in_flight.is_none()
+                && state.pending_completion.is_none();
+        if state.clock_remainder >= state.frequency_hz
+            || !completion_valid
+            || !service_valid
+            || !actions_valid
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "SysAD clock and transaction phases must be consistent",
+            });
+        }
+        self.clock.remainder = state.clock_remainder;
+        self.generation = state.generation;
+        self.service_scheduled = state.service_scheduled;
+        self.queue = state.queue;
+        self.in_flight = state.in_flight;
+        self.pending_completion = state.pending_completion;
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Cancels traffic and advances the bus generation.
@@ -463,13 +574,17 @@ impl BusRole<ExecutionTransaction<Mips4ExecutionTransaction>> for Ip32SysAdBus {
 }
 
 /// Identity-only endpoint for an unimplemented board device.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ip32StubEndpoint {
     id: ComponentId,
     name: String,
 }
 
-se_core::component_state!(Ip32StubEndpointState, Ip32StubEndpoint);
+/// Serializable identity proof for a stateless IP32 endpoint.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct Ip32StubEndpointState {
+    id: ComponentId,
+}
 
 impl Ip32StubEndpoint {
     /// Creates an identity-only endpoint.
@@ -478,6 +593,19 @@ impl Ip32StubEndpoint {
             id,
             name: name.into(),
         }
+    }
+
+    /// Captures the endpoint identity.
+    pub const fn save_state(&self) -> Ip32StubEndpointState {
+        Ip32StubEndpointState { id: self.id }
+    }
+
+    /// Validates endpoint identity; this component has no dynamic state.
+    pub fn restore_state(
+        &mut self,
+        state: Ip32StubEndpointState,
+    ) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)
     }
 }
 
