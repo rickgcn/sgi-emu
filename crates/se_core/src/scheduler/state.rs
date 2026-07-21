@@ -41,6 +41,13 @@ pub enum SchedulerStateError {
     },
     /// Two pending events use the same identifier.
     DuplicateEventId { event_id: ScheduledEventId },
+    /// Two adjacent events are not in deterministic delivery order.
+    EventsOutOfOrder {
+        previous_event_id: ScheduledEventId,
+        previous_event_time: SimTime,
+        event_id: ScheduledEventId,
+        event_time: SimTime,
+    },
     /// The next identifier would collide with a pending event.
     InvalidNextEventId {
         next_event_id: u64,
@@ -62,6 +69,16 @@ impl fmt::Display for SchedulerStateError {
             Self::DuplicateEventId { event_id } => {
                 write!(formatter, "duplicate scheduler event identifier {event_id}")
             }
+            Self::EventsOutOfOrder {
+                previous_event_id,
+                previous_event_time,
+                event_id,
+                event_time,
+            } => write!(
+                formatter,
+                "scheduler event {event_id} at {event_time} is out of order after \
+                 {previous_event_id} at {previous_event_time}"
+            ),
             Self::InvalidNextEventId {
                 next_event_id,
                 event_id,
@@ -115,6 +132,20 @@ impl<E> Scheduler<E> {
                 });
             }
         }
+        if let Some(events) = state
+            .events
+            .windows(2)
+            .find(|events| (events[0].time, events[0].id) >= (events[1].time, events[1].id))
+        {
+            let previous = &events[0];
+            let event = &events[1];
+            return Err(SchedulerStateError::EventsOutOfOrder {
+                previous_event_id: previous.id,
+                previous_event_time: previous.time,
+                event_id: event.id,
+                event_time: event.time,
+            });
+        }
 
         let mut events = state.events.into_iter();
         self.now = state.now;
@@ -161,5 +192,83 @@ mod tests {
                 .unwrap(),
             ScheduledEventId::new(3)
         );
+    }
+
+    #[test]
+    fn restore_rejects_events_out_of_time_order_without_mutation() {
+        let state = SchedulerState {
+            now: SimTime::ZERO,
+            next_event_id: 2,
+            events: vec![
+                ScheduledEvent {
+                    id: ScheduledEventId::new(0),
+                    time: SimTime::new(10),
+                    target: ComponentId::new(1),
+                    payload: 1_u8,
+                },
+                ScheduledEvent {
+                    id: ScheduledEventId::new(1),
+                    time: SimTime::new(5),
+                    target: ComponentId::new(2),
+                    payload: 2,
+                },
+            ],
+        };
+        let mut scheduler = Scheduler::new();
+        scheduler
+            .schedule_at(SimTime::new(3), ComponentId::new(3), 3_u8)
+            .unwrap();
+        scheduler.advance_to(SimTime::new(2)).unwrap();
+        let original = scheduler.save_state();
+
+        assert_eq!(
+            scheduler.restore_state(state),
+            Err(SchedulerStateError::EventsOutOfOrder {
+                previous_event_id: ScheduledEventId::new(0),
+                previous_event_time: SimTime::new(10),
+                event_id: ScheduledEventId::new(1),
+                event_time: SimTime::new(5),
+            })
+        );
+        assert_eq!(scheduler.save_state(), original);
+    }
+
+    #[test]
+    fn restore_rejects_equal_time_events_out_of_id_order_without_mutation() {
+        let state = SchedulerState {
+            now: SimTime::ZERO,
+            next_event_id: 2,
+            events: vec![
+                ScheduledEvent {
+                    id: ScheduledEventId::new(1),
+                    time: SimTime::new(5),
+                    target: ComponentId::new(1),
+                    payload: 1_u8,
+                },
+                ScheduledEvent {
+                    id: ScheduledEventId::new(0),
+                    time: SimTime::new(5),
+                    target: ComponentId::new(2),
+                    payload: 2,
+                },
+            ],
+        };
+        let mut scheduler = Scheduler::new();
+        scheduler
+            .schedule_at(SimTime::new(3), ComponentId::new(3), 3_u8)
+            .unwrap();
+        scheduler.advance_to(SimTime::new(2)).unwrap();
+        let original = scheduler.save_state();
+
+        assert_eq!(
+            scheduler.restore_state(state),
+            Err(SchedulerStateError::EventsOutOfOrder {
+                previous_event_id: ScheduledEventId::new(1),
+                previous_event_time: SimTime::new(5),
+                event_id: ScheduledEventId::new(0),
+                event_time: SimTime::new(5),
+            })
+        );
+        assert_eq!(scheduler.save_state(), original);
     }
 }
