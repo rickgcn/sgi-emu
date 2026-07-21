@@ -75,7 +75,7 @@ pub(super) enum RegisterWrite {
 }
 
 /// GBE Revision 1.1 register file and on-chip memories.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct GbeRegisters {
     pub control_status: u32,
     pub dot_clock: u32,
@@ -87,14 +87,33 @@ pub(super) struct GbeRegisters {
     pub frame: [u32; 4],
     pub did: [u32; 2],
     pub wid: [u32; 32],
-    #[serde(with = "crate::common::serde_array")]
     pub color_map: [u32; 4_608],
-    #[serde(with = "crate::common::serde_array")]
     pub gamma_map: [u32; 256],
     pub cursor: [u32; 5],
-    #[serde(with = "crate::common::serde_array")]
     pub cursor_glyph: [u32; 64],
     pub video_capture: [u32; 9],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct GbeRegistersState {
+    pub(super) control_status: u32,
+    pub(super) dot_clock: u32,
+    pub(super) crt_ddc: u32,
+    pub(super) system_clock: u32,
+    pub(super) flat_panel_ddc: u32,
+    pub(super) vt: [u32; 20],
+    pub(super) overlay: [u32; 3],
+    pub(super) frame: [u32; 4],
+    pub(super) did: [u32; 2],
+    pub(super) wid: [u32; 32],
+    #[serde(with = "crate::common::serde_array")]
+    pub(super) color_map: [u32; 4_608],
+    #[serde(with = "crate::common::serde_array")]
+    pub(super) gamma_map: [u32; 256],
+    pub(super) cursor: [u32; 5],
+    #[serde(with = "crate::common::serde_array")]
+    pub(super) cursor_glyph: [u32; 64],
+    pub(super) video_capture: [u32; 9],
 }
 
 impl GbeRegisters {
@@ -120,6 +139,46 @@ impl GbeRegisters {
         registers.video_capture[2] = (1 << 1) | (1 << 2);
         registers.video_capture[3] = 1 << 4;
         registers
+    }
+
+    pub(super) fn save_state(&self) -> GbeRegistersState {
+        GbeRegistersState {
+            control_status: self.control_status,
+            dot_clock: self.dot_clock,
+            crt_ddc: self.crt_ddc,
+            system_clock: self.system_clock,
+            flat_panel_ddc: self.flat_panel_ddc,
+            vt: self.vt,
+            overlay: self.overlay,
+            frame: self.frame,
+            did: self.did,
+            wid: self.wid,
+            color_map: self.color_map,
+            gamma_map: self.gamma_map,
+            cursor: self.cursor,
+            cursor_glyph: self.cursor_glyph,
+            video_capture: self.video_capture,
+        }
+    }
+
+    pub(super) fn from_state(state: GbeRegistersState) -> Self {
+        Self {
+            control_status: state.control_status,
+            dot_clock: state.dot_clock,
+            crt_ddc: state.crt_ddc,
+            system_clock: state.system_clock,
+            flat_panel_ddc: state.flat_panel_ddc,
+            vt: state.vt,
+            overlay: state.overlay,
+            frame: state.frame,
+            did: state.did,
+            wid: state.wid,
+            color_map: state.color_map,
+            gamma_map: state.gamma_map,
+            cursor: state.cursor,
+            cursor_glyph: state.cursor_glyph,
+            video_capture: state.video_capture,
+        }
     }
 
     pub fn read(&self, address: u64) -> Result<u32, CrimeBusError> {
@@ -156,6 +215,49 @@ impl GbeRegisters {
             _ => return Err(CrimeBusError::Unsupported),
         };
         Ok(value)
+    }
+
+    pub(super) fn validate_state(&self) -> Result<(), &'static str> {
+        let fixed_control = CONTROL_STATUS_RESET & !CONTROL_STATUS_WRITABLE_MASK & !(1 << 4);
+        if self.control_status & !CONTROL_STATUS_WRITABLE_MASK & !(1 << 4) != fixed_control
+            || self.dot_clock & !0x0310_ffff != 0
+            || self.crt_ddc & !3 != 0
+            || self.flat_panel_ddc & !3 != 0
+            || self.system_clock & !0x0000_7f0f != 0
+            || self.vt.iter().enumerate().any(|(index, value)| {
+                *value
+                    & if index == VT_XY {
+                        !0x80ff_ffff
+                    } else {
+                        !0x00ff_ffff
+                    }
+                    != 0
+            })
+            || self.overlay[0] & !0x3fff != 0
+            || self.overlay[1..]
+                .iter()
+                .any(|value| value & !0xffff_ffe1 != 0)
+            || self.frame[0] & !0xffff != 0
+            || self.frame[1] & !0xffff_0000 != 0
+            || self.frame[2..]
+                .iter()
+                .any(|value| value & !0xffff_ffe1 != 0)
+            || self.did.iter().any(|value| value & !0x0001_ffff != 0)
+            || self.wid.iter().any(|value| value & !0x1fff != 0)
+            || self.color_map.iter().any(|value| value & !0xffff_ff00 != 0)
+            || self.gamma_map.iter().any(|value| value & !0xffff_ff00 != 0)
+            || self.cursor[1] & !3 != 0
+            || self.cursor[2..]
+                .iter()
+                .any(|value| value & !0xffff_ff00 != 0)
+            || self.video_capture[0..=1]
+                .iter()
+                .any(|value| value & !0x00ff_ffff != 0)
+            || self.video_capture[2] & !0x1f != 0
+        {
+            return Err("GBE registers must use implemented bit encodings");
+        }
+        Ok(())
     }
 
     pub(super) fn control_status_with_auxiliary_inputs(

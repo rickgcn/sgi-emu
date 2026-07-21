@@ -7,7 +7,9 @@ mod registers;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::scheduler::{RationalClockProjection, SimDuration, SimTime};
 use se_core::tracing::{OwnedTraceEvent, OwnedTraceField, OwnedTraceValue, TraceLevel};
@@ -29,10 +31,10 @@ use self::protocol::{
     GbeOutputPins, GbePoll, GbeWiring,
 };
 use self::registers::{
-    AUXILIARY_PIN_COUNT, COLOR_MAP_FIFO, DOT_CLOCK_RUN, GbeRegisters, RegisterWrite, VT_F2RF_LOCK,
-    VT_FLAGS, VT_HBLANK, VT_HCMAP, VT_HPIXEN, VT_HSYNC, VT_INTR01, VT_INTR23, VT_VBLANK, VT_VCMAP,
-    VT_VPIXEN, VT_VSYNC, VT_XY, VT_XY_FREEZE, VT_XY_MAX, auxiliary_data_mask,
-    auxiliary_output_disable_mask,
+    AUXILIARY_PIN_COUNT, COLOR_MAP_FIFO, DOT_CLOCK_RUN, GbeRegisters, GbeRegistersState,
+    RegisterWrite, VT_F2RF_LOCK, VT_FLAGS, VT_HBLANK, VT_HCMAP, VT_HPIXEN, VT_HSYNC, VT_INTR01,
+    VT_INTR23, VT_VBLANK, VT_VCMAP, VT_VPIXEN, VT_VSYNC, VT_XY, VT_XY_FREEZE, VT_XY_MAX,
+    auxiliary_data_mask, auxiliary_output_disable_mask,
 };
 
 const PIXEL_REFERENCE_CLOCK_HZ: u64 = 20_000_000;
@@ -142,7 +144,7 @@ struct WorkingFrame {
 }
 
 /// SGI Graphics Back End connected bidirectionally to the CRIME CGI link.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Gbe {
     id: ComponentId,
     name: String,
@@ -191,7 +193,542 @@ pub struct Gbe {
     capture_writes_remaining: usize,
 }
 
-se_core::component_state!(GbeState, Gbe);
+/// Serializable dynamic state of the Graphics Back End.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct GbeState {
+    id: ComponentId,
+    wiring: GbeWiring,
+    registers: GbeRegistersState,
+    timebase_hz: u64,
+    observed_time: SimTime,
+    scan_origin_time: SimTime,
+    scan_origin_pixel: u64,
+    pixel_clock_remainder: u64,
+    timing_epoch: u64,
+    scheduled_scanline_cycles: Option<u64>,
+    ttl_clock: Option<ExternalClockState>,
+    differential_clock: Option<ExternalClockState>,
+    sense_n: bool,
+    frame_lock: bool,
+    frame_lock_pending: bool,
+    frame_lock_last_rising: Option<SimTime>,
+    frame_lock_period_ticks: Option<u64>,
+    f2rf_level: bool,
+    ddc_clock_high: [bool; 2],
+    ddc_data_high: [bool; 2],
+    auxiliary_inputs: [bool; AUXILIARY_PIN_COUNT],
+    color_map_fifo: VecDeque<ColorMapWrite>,
+    deferred_color_map: VecDeque<DeferredColorMapWrite>,
+    color_map_drain_scheduled: bool,
+    actions: VecDeque<GbeAction>,
+    next_transaction: u128,
+    next_read_order: u64,
+    next_read_commit: u64,
+    pending_dma: VecDeque<DmaJob>,
+    outstanding_dma: BTreeMap<CrimeTransactionId, PendingDma>,
+    outstanding_interrupt_posts: BTreeSet<CrimeTransactionId>,
+    completed_reads: BTreeMap<u64, CompletedRead>,
+    reads_in_flight: usize,
+    writes_in_flight: usize,
+    normal_tile_pointers: Vec<u8>,
+    overlay_tile_pointers: Vec<u8>,
+    did_frame_table: Vec<u8>,
+    did_frame_chunks_remaining: usize,
+    did_line_blocks: BTreeMap<u8, Vec<u8>>,
+    line_fetches: BTreeMap<(u64, u16), LineFetch>,
+    working_frame: Option<WorkingFrame>,
+    next_frame_sequence: u64,
+    interrupt_posted: [bool; 4],
+    capture_writes_remaining: usize,
+}
+
+impl GbeState {
+    fn invalid(component: ComponentId, invariant: &'static str) -> ComponentStateError {
+        ComponentStateError::InvalidState {
+            component,
+            invariant,
+        }
+    }
+
+    fn pixel_frequency_numerator(&self) -> Option<u64> {
+        match (self.registers.control_status >> 28) & 3 {
+            0 => self.ttl_clock.map(|clock| clock.numerator_hz),
+            1 => self.differential_clock.map(|clock| clock.numerator_hz),
+            2 => None,
+            _ if self.registers.dot_clock & DOT_CLOCK_RUN != 0 => {
+                let multiplier = u64::from((self.registers.dot_clock & 0xff) + 1);
+                Some(PIXEL_REFERENCE_CLOCK_HZ * multiplier)
+            }
+            _ => None,
+        }
+    }
+
+    fn validate_frame(frame: &GbeFrame, observed_time: SimTime) -> bool {
+        let Some(stride) = frame.width.checked_mul(4) else {
+            return false;
+        };
+        let Some(bytes) = usize::try_from(stride)
+            .ok()
+            .and_then(|stride| stride.checked_mul(frame.height as usize))
+        else {
+            return false;
+        };
+        frame.width <= 4_096
+            && frame.height <= 4_096
+            && frame.stride == stride
+            && frame.rgba.len() == bytes
+            && frame.completed_at <= observed_time
+    }
+
+    fn destination_bounds(
+        &self,
+        destination: &DmaDestination,
+        offset: usize,
+        length: usize,
+    ) -> bool {
+        let within = |target_length: usize| {
+            offset <= target_length
+                && offset
+                    .checked_add(length)
+                    .is_some_and(|end| end <= target_length)
+        };
+        match destination {
+            DmaDestination::TilePointers(Plane::Normal) => within(self.normal_tile_pointers.len()),
+            DmaDestination::TilePointers(Plane::Overlay) => {
+                within(self.overlay_tile_pointers.len())
+            }
+            DmaDestination::DidFrame => within(self.did_frame_table.len()),
+            DmaDestination::DidBlock(block) => self
+                .did_line_blocks
+                .get(block)
+                .is_none_or(|target| within(target.len())),
+            DmaDestination::Line {
+                frame,
+                y,
+                plane,
+                segment,
+            } => self
+                .line_fetches
+                .get(&(*frame, *y))
+                .and_then(|fetch| match plane {
+                    Plane::Normal => fetch.normal.segments.get(usize::from(*segment)),
+                    Plane::Overlay => fetch.overlay.segments.get(usize::from(*segment)),
+                })
+                .is_none_or(|target| within(target.data.len())),
+            DmaDestination::Capture => true,
+        }
+    }
+
+    fn validate_dma_job(&self, job: &DmaJob) -> bool {
+        if !job.address.is_multiple_of(DMA_ALIGNMENT) {
+            return false;
+        }
+        let (length, write) = match job.transfer.view() {
+            CrimeTransferView::Read { length } => (usize::from(length), false),
+            CrimeTransferView::Write { data, byte_enable } => {
+                if data.len() != byte_enable.len() || byte_enable.iter().any(|enabled| !enabled) {
+                    return false;
+                }
+                (data.len(), true)
+            }
+        };
+        if length == 0
+            || length > PIXEL_BURST_SIZE
+            || !length.is_multiple_of(DMA_ALIGNMENT as usize)
+            || job
+                .address
+                .checked_add(length as u64 - 1)
+                .is_none_or(|end| job.address / DMA_PAGE_SIZE != end / DMA_PAGE_SIZE)
+            || write != matches!(job.destination, DmaDestination::Capture)
+            || !matches!(job.destination, DmaDestination::Line { .. })
+                && !write
+                && length != DMA_ALIGNMENT as usize
+        {
+            return false;
+        }
+        self.destination_bounds(&job.destination, job.destination_offset, length)
+    }
+
+    fn validate(&self, component: ComponentId) -> Result<(), ComponentStateError> {
+        if let Err(invariant) = GbeRegisters::from_state(self.registers.clone()).validate_state() {
+            return Err(Self::invalid(component, invariant));
+        }
+        if self.timebase_hz == 0
+            || self.scan_origin_time > self.observed_time
+            || self
+                .frame_lock_last_rising
+                .is_some_and(|time| time > self.observed_time)
+            || self.frame_lock_period_ticks == Some(0)
+        {
+            return Err(Self::invalid(
+                component,
+                "GBE timebase, timing anchors, and frame-lock period must be valid",
+            ));
+        }
+        if [self.ttl_clock, self.differential_clock]
+            .into_iter()
+            .flatten()
+            .any(|clock| clock.numerator_hz == 0 || clock.denominator == 0)
+        {
+            return Err(Self::invalid(
+                component,
+                "GBE external clock numerator and denominator must be nonzero",
+            ));
+        }
+        let pixel_frequency = self.pixel_frequency_numerator();
+        if match pixel_frequency {
+            Some(frequency) => self.pixel_clock_remainder >= frequency,
+            None => self.pixel_clock_remainder != 0,
+        } {
+            return Err(Self::invalid(
+                component,
+                "GBE pixel-clock remainder must be normalized",
+            ));
+        }
+        let scan_width = u64::from((self.registers.vt[VT_XY_MAX] & 0x0fff) + 1);
+        let scan_height = u64::from(((self.registers.vt[VT_XY_MAX] >> 12) & 0x0fff) + 1);
+        let frame_pixels = scan_width * scan_height;
+        if self.scan_origin_pixel >= frame_pixels
+            || self.scheduled_scanline_cycles.is_some_and(|cycles| {
+                pixel_frequency.is_none() || cycles == 0 || cycles > scan_width
+            })
+            || self.color_map_drain_scheduled
+                && (pixel_frequency.is_none() || self.color_map_fifo.is_empty())
+        {
+            return Err(Self::invalid(
+                component,
+                "GBE scan origin and scheduled timing work must be in range",
+            ));
+        }
+        if (self.registers.control_status & (1 << 4) != 0) != self.sense_n {
+            return Err(Self::invalid(
+                component,
+                "GBE monitor sense register must match the external input",
+            ));
+        }
+        let color_write_valid = |write: &ColorMapWrite| {
+            usize::from(write.index) < self.registers.color_map.len()
+                && write.value & !0xffff_ff00 == 0
+        };
+        if self.color_map_fifo.len() > COLOR_MAP_FIFO_CAPACITY
+            || self
+                .color_map_fifo
+                .iter()
+                .any(|write| !color_write_valid(write))
+            || self.deferred_color_map.iter().any(|deferred| {
+                deferred.controller != self.wiring.crime || !color_write_valid(&deferred.write)
+            })
+        {
+            return Err(Self::invalid(
+                component,
+                "GBE color-map queues must fit capacity and contain valid writes",
+            ));
+        }
+        if self
+            .pending_dma
+            .iter()
+            .any(|job| !self.validate_dma_job(job))
+        {
+            return Err(Self::invalid(
+                component,
+                "GBE queued DMA transfers must have valid type, shape, and destination bounds",
+            ));
+        }
+        if self.outstanding_dma.values().any(|pending| {
+            pending.write == pending.read_order.is_some()
+                || !self.destination_bounds(&pending.destination, pending.destination_offset, 0)
+        }) {
+            return Err(Self::invalid(
+                component,
+                "GBE outstanding DMA type and read order must agree",
+            ));
+        }
+        if self.completed_reads.iter().any(|(order, completed)| {
+            completed.pending.write
+                || completed.pending.read_order != Some(*order)
+                || !self.destination_bounds(
+                    &completed.pending.destination,
+                    completed.pending.destination_offset,
+                    match &completed.completion.result {
+                        Ok(CrimeCompletionPayload::ReadData(data)) => data.len(),
+                        _ => 0,
+                    },
+                )
+                || matches!(
+                    &completed.completion.result,
+                    Ok(CrimeCompletionPayload::ReadData(data))
+                        if data.is_empty()
+                            || data.len() > PIXEL_BURST_SIZE
+                            || !data.len().is_multiple_of(DMA_ALIGNMENT as usize)
+                )
+        }) {
+            return Err(Self::invalid(
+                component,
+                "GBE completed reads must retain their order and destination bounds",
+            ));
+        }
+        let outstanding_reads = self
+            .outstanding_dma
+            .values()
+            .filter(|pending| !pending.write)
+            .count();
+        let outstanding_writes = self
+            .outstanding_dma
+            .values()
+            .filter(|pending| pending.write)
+            .count();
+        if self.reads_in_flight != outstanding_reads
+            || self.writes_in_flight != outstanding_writes
+            || self.reads_in_flight > MAX_DMA_READS
+            || self.writes_in_flight > MAX_DMA_WRITES
+        {
+            return Err(Self::invalid(
+                component,
+                "GBE in-flight DMA counters must match the outstanding transaction table",
+            ));
+        }
+        let mut read_orders = BTreeSet::new();
+        for pending in self
+            .outstanding_dma
+            .values()
+            .filter(|pending| !pending.write)
+        {
+            if !read_orders.insert(pending.read_order.expect("read order was validated")) {
+                return Err(Self::invalid(
+                    component,
+                    "GBE outstanding read orders must be unique",
+                ));
+            }
+        }
+        for order in self.completed_reads.keys() {
+            if !read_orders.insert(*order) {
+                return Err(Self::invalid(
+                    component,
+                    "GBE outstanding and completed read orders must be unique",
+                ));
+            }
+        }
+        let read_span = self.next_read_order.wrapping_sub(self.next_read_commit);
+        if u64::try_from(read_orders.len()) != Ok(read_span)
+            || read_orders
+                .iter()
+                .any(|order| order.wrapping_sub(self.next_read_commit) >= read_span)
+        {
+            return Err(Self::invalid(
+                component,
+                "GBE read commit cursor must cover every uncommitted read exactly once",
+            ));
+        }
+        let mut transaction_ids: BTreeSet<_> = self.outstanding_dma.keys().copied().collect();
+        if transaction_ids.len() != self.outstanding_dma.len()
+            || self
+                .outstanding_interrupt_posts
+                .iter()
+                .any(|id| !transaction_ids.insert(*id))
+            || self
+                .completed_reads
+                .values()
+                .any(|completed| !transaction_ids.insert(completed.completion.id))
+            || transaction_ids
+                .iter()
+                .any(|id| id.get() == self.next_transaction)
+        {
+            return Err(Self::invalid(
+                component,
+                "GBE active transaction identifiers must be unique",
+            ));
+        }
+        let capture_jobs = self
+            .pending_dma
+            .iter()
+            .filter(|job| matches!(job.destination, DmaDestination::Capture))
+            .count()
+            + self
+                .outstanding_dma
+                .values()
+                .filter(|pending| matches!(pending.destination, DmaDestination::Capture))
+                .count();
+        if self.capture_writes_remaining != capture_jobs {
+            return Err(Self::invalid(
+                component,
+                "GBE capture write count must match pending and outstanding DMA work",
+            ));
+        }
+        let did_frame_jobs = self
+            .pending_dma
+            .iter()
+            .filter(|job| matches!(job.destination, DmaDestination::DidFrame))
+            .count()
+            + self
+                .outstanding_dma
+                .values()
+                .filter(|pending| matches!(pending.destination, DmaDestination::DidFrame))
+                .count()
+            + self
+                .completed_reads
+                .values()
+                .filter(|completed| {
+                    matches!(completed.pending.destination, DmaDestination::DidFrame)
+                })
+                .count();
+        if self.did_frame_chunks_remaining != did_frame_jobs
+            || !matches!(self.did_frame_table.len(), 0 | 256)
+            || self
+                .did_line_blocks
+                .values()
+                .any(|block| block.len() != PIXEL_BURST_SIZE)
+            || !self
+                .normal_tile_pointers
+                .len()
+                .is_multiple_of(DMA_ALIGNMENT as usize)
+            || !self
+                .overlay_tile_pointers
+                .len()
+                .is_multiple_of(DMA_ALIGNMENT as usize)
+        {
+            return Err(Self::invalid(
+                component,
+                "GBE DID and tile-pointer buffers must match outstanding DMA chunks",
+            ));
+        }
+        if let Some(frame) = &self.working_frame {
+            let Some(bytes) = frame
+                .width
+                .checked_mul(frame.height)
+                .and_then(|pixels| pixels.checked_mul(4))
+            else {
+                return Err(Self::invalid(
+                    component,
+                    "GBE working frame dimensions must not overflow",
+                ));
+            };
+            if frame.width == 0
+                || frame.height == 0
+                || frame.width > 4_096
+                || frame.height > 4_096
+                || frame.rgba.len() != bytes
+                || self.next_frame_sequence.wrapping_sub(frame.sequence) != 1
+            {
+                return Err(Self::invalid(
+                    component,
+                    "GBE working frame dimensions and RGBA length must agree",
+                ));
+            }
+        } else if !self.line_fetches.is_empty() {
+            return Err(Self::invalid(
+                component,
+                "GBE line fetches require a working frame",
+            ));
+        }
+        for ((sequence, y), fetch) in &self.line_fetches {
+            let Some(frame) = self.working_frame.as_ref() else {
+                unreachable!("line fetch ownership was validated");
+            };
+            if *sequence != frame.sequence || usize::from(*y) >= frame.height {
+                return Err(Self::invalid(
+                    component,
+                    "GBE line fetch keys must identify the working frame",
+                ));
+            }
+            for (plane, segments) in [
+                (Plane::Normal, &fetch.normal.segments),
+                (Plane::Overlay, &fetch.overlay.segments),
+            ] {
+                if segments.len() > usize::from(u16::MAX) {
+                    return Err(Self::invalid(
+                        component,
+                        "GBE line segment index must fit its DMA destination",
+                    ));
+                }
+                let depth = match plane {
+                    Plane::Normal => PlaneDepth::from_frame_register(self.registers.frame[0]),
+                    Plane::Overlay => PlaneDepth::Eight,
+                };
+                for (index, segment) in segments.iter().enumerate() {
+                    let destination = DmaDestination::Line {
+                        frame: *sequence,
+                        y: *y,
+                        plane,
+                        segment: index as u16,
+                    };
+                    let remaining = self
+                        .pending_dma
+                        .iter()
+                        .filter(|job| job.destination == destination)
+                        .count()
+                        + self
+                            .outstanding_dma
+                            .values()
+                            .filter(|pending| pending.destination == destination)
+                            .count()
+                        + self
+                            .completed_reads
+                            .values()
+                            .filter(|completed| completed.pending.destination == destination)
+                            .count();
+                    if segment.data.len() != PIXEL_BURST_SIZE
+                        || segment.pixels == 0
+                        || segment
+                            .source_pixel
+                            .checked_add(segment.pixels)
+                            .is_none_or(|end| end > depth.tile_width())
+                        || segment
+                            .output_pixel
+                            .checked_add(segment.pixels)
+                            .is_none_or(|end| end > frame.width)
+                        || usize::from(segment.remaining) != remaining
+                    {
+                        return Err(Self::invalid(
+                            component,
+                            "GBE line segments and remaining DMA chunks must be in bounds",
+                        ));
+                    }
+                }
+            }
+        }
+        if self.actions.iter().any(|action| match action {
+            GbeAction::Schedule { .. } | GbeAction::CompleteCgiDevice(_) | GbeAction::Trace(_) => {
+                false
+            }
+            GbeAction::SetDdc { bus, drive } => {
+                !matches!(
+                    *bus,
+                    bus if bus == self.wiring.crt_ddc || bus == self.wiring.flat_panel_ddc
+                ) || drive.source != component
+                    || drive.time > self.observed_time
+            }
+            GbeAction::PublishFrame(frame) => !Self::validate_frame(frame, self.observed_time),
+            GbeAction::StartCgi(transaction) => {
+                if transaction.controller != component || transaction.target != self.wiring.crime {
+                    return true;
+                }
+                match &transaction.operation {
+                    CrimeLinkOperation::Dma(request) => self
+                        .outstanding_dma
+                        .get(&transaction.id)
+                        .is_none_or(|pending| {
+                            pending.write
+                                != matches!(
+                                    request.transfer.view(),
+                                    CrimeTransferView::Write { .. }
+                                )
+                        }),
+                    CrimeLinkOperation::InterruptPost(post) => {
+                        !self.outstanding_interrupt_posts.contains(&transaction.id)
+                            || !(16..20).contains(&post.interrupt_bit)
+                    }
+                    CrimeLinkOperation::Pio(_) => true,
+                }
+            }
+        }) {
+            return Err(Self::invalid(
+                component,
+                "GBE actions must use configured endpoints and valid frame or transaction state",
+            ));
+        }
+        Ok(())
+    }
+}
 
 impl Gbe {
     /// Creates a reset GBE with no connected external clocks or monitor endpoint.
@@ -249,6 +786,117 @@ impl Gbe {
             interrupt_posted: [false; 4],
             capture_writes_remaining: 0,
         }
+    }
+
+    /// Captures the GBE's dynamic hardware state.
+    pub fn save_state(&self) -> GbeState {
+        GbeState {
+            id: self.id,
+            wiring: self.wiring,
+            registers: self.registers.save_state(),
+            timebase_hz: self.timebase_hz,
+            observed_time: self.observed_time,
+            scan_origin_time: self.scan_origin_time,
+            scan_origin_pixel: self.scan_origin_pixel,
+            pixel_clock_remainder: self.pixel_clock_remainder,
+            timing_epoch: self.timing_epoch,
+            scheduled_scanline_cycles: self.scheduled_scanline_cycles,
+            ttl_clock: self.ttl_clock,
+            differential_clock: self.differential_clock,
+            sense_n: self.sense_n,
+            frame_lock: self.frame_lock,
+            frame_lock_pending: self.frame_lock_pending,
+            frame_lock_last_rising: self.frame_lock_last_rising,
+            frame_lock_period_ticks: self.frame_lock_period_ticks,
+            f2rf_level: self.f2rf_level,
+            ddc_clock_high: self.ddc_clock_high,
+            ddc_data_high: self.ddc_data_high,
+            auxiliary_inputs: self.auxiliary_inputs,
+            color_map_fifo: self.color_map_fifo.clone(),
+            deferred_color_map: self.deferred_color_map.clone(),
+            color_map_drain_scheduled: self.color_map_drain_scheduled,
+            actions: self.actions.clone(),
+            next_transaction: self.next_transaction,
+            next_read_order: self.next_read_order,
+            next_read_commit: self.next_read_commit,
+            pending_dma: self.pending_dma.clone(),
+            outstanding_dma: self.outstanding_dma.clone(),
+            outstanding_interrupt_posts: self.outstanding_interrupt_posts.clone(),
+            completed_reads: self.completed_reads.clone(),
+            reads_in_flight: self.reads_in_flight,
+            writes_in_flight: self.writes_in_flight,
+            normal_tile_pointers: self.normal_tile_pointers.clone(),
+            overlay_tile_pointers: self.overlay_tile_pointers.clone(),
+            did_frame_table: self.did_frame_table.clone(),
+            did_frame_chunks_remaining: self.did_frame_chunks_remaining,
+            did_line_blocks: self.did_line_blocks.clone(),
+            line_fetches: self.line_fetches.clone(),
+            working_frame: self.working_frame.clone(),
+            next_frame_sequence: self.next_frame_sequence,
+            interrupt_posted: self.interrupt_posted,
+            capture_writes_remaining: self.capture_writes_remaining,
+        }
+    }
+
+    /// Restores dynamic state after validating wiring, timing, DMA, and frame invariants.
+    pub fn restore_state(&mut self, state: GbeState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if self.wiring != state.wiring {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "wiring",
+            });
+        }
+        if self.timebase_hz != state.timebase_hz {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "timebase_hz",
+            });
+        }
+        state.validate(self.id)?;
+
+        self.registers = GbeRegisters::from_state(state.registers);
+        self.observed_time = state.observed_time;
+        self.scan_origin_time = state.scan_origin_time;
+        self.scan_origin_pixel = state.scan_origin_pixel;
+        self.pixel_clock_remainder = state.pixel_clock_remainder;
+        self.timing_epoch = state.timing_epoch;
+        self.scheduled_scanline_cycles = state.scheduled_scanline_cycles;
+        self.ttl_clock = state.ttl_clock;
+        self.differential_clock = state.differential_clock;
+        self.sense_n = state.sense_n;
+        self.frame_lock = state.frame_lock;
+        self.frame_lock_pending = state.frame_lock_pending;
+        self.frame_lock_last_rising = state.frame_lock_last_rising;
+        self.frame_lock_period_ticks = state.frame_lock_period_ticks;
+        self.f2rf_level = state.f2rf_level;
+        self.ddc_clock_high = state.ddc_clock_high;
+        self.ddc_data_high = state.ddc_data_high;
+        self.auxiliary_inputs = state.auxiliary_inputs;
+        self.color_map_fifo = state.color_map_fifo;
+        self.deferred_color_map = state.deferred_color_map;
+        self.color_map_drain_scheduled = state.color_map_drain_scheduled;
+        self.actions = state.actions;
+        self.next_transaction = state.next_transaction;
+        self.next_read_order = state.next_read_order;
+        self.next_read_commit = state.next_read_commit;
+        self.pending_dma = state.pending_dma;
+        self.outstanding_dma = state.outstanding_dma;
+        self.outstanding_interrupt_posts = state.outstanding_interrupt_posts;
+        self.completed_reads = state.completed_reads;
+        self.reads_in_flight = state.reads_in_flight;
+        self.writes_in_flight = state.writes_in_flight;
+        self.normal_tile_pointers = state.normal_tile_pointers;
+        self.overlay_tile_pointers = state.overlay_tile_pointers;
+        self.did_frame_table = state.did_frame_table;
+        self.did_frame_chunks_remaining = state.did_frame_chunks_remaining;
+        self.did_line_blocks = state.did_line_blocks;
+        self.line_fetches = state.line_fetches;
+        self.working_frame = state.working_frame;
+        self.next_frame_sequence = state.next_frame_sequence;
+        self.interrupt_posted = state.interrupt_posted;
+        self.capture_writes_remaining = state.capture_writes_remaining;
+        Ok(())
     }
 
     /// Updates the simulated time observed by lazy display counters.
@@ -2237,6 +2885,7 @@ mod tests {
             height: 2,
             rgba: vec![1; 16],
         });
+        reference.next_frame_sequence = 10;
         reference.normal_tile_pointers.resize(32, 0);
         reference.queue_dma_read(0x2_0000, 32, DmaDestination::TilePointers(Plane::Normal));
         reference.pump_dma();
@@ -2279,6 +2928,80 @@ mod tests {
             GbePoll::Action(GbeAction::Trace(event))
                 if event.target == "gbe.dma" && event.event == "unexpected-completion"
         ));
+    }
+
+    #[test]
+    fn state_restore_preserves_name_and_rejects_wiring_and_timebase_changes_atomically() {
+        let mut source = gbe();
+        source.apply_external_input(GbeExternalInput::Auxiliary([false; AUXILIARY_PIN_COUNT]));
+        let mut renamed = Gbe::new(GBE, "replacement name", source.timebase_hz, source.wiring);
+        renamed.restore_state(source.save_state()).unwrap();
+        assert_eq!(renamed.name(), "replacement name");
+        assert_eq!(renamed.auxiliary_inputs, [false; AUXILIARY_PIN_COUNT]);
+
+        let mismatched = [
+            Gbe::new(
+                GBE,
+                "source",
+                source.timebase_hz,
+                GbeWiring {
+                    crime: ComponentId::new(99),
+                    ..source.wiring
+                },
+            )
+            .save_state(),
+            Gbe::new(GBE, "source", source.timebase_hz / 2, source.wiring).save_state(),
+        ];
+        for state in mismatched {
+            let mut target = gbe();
+            let before = target.clone();
+            assert!(matches!(
+                target.restore_state(state),
+                Err(ComponentStateError::ConfigurationMismatch { .. })
+            ));
+            assert_eq!(target, before);
+        }
+    }
+
+    #[test]
+    fn state_restore_rejects_malformed_clock_dma_counters_and_frame_atomically() {
+        let mut dma = gbe();
+        dma.normal_tile_pointers.resize(32, 0);
+        dma.queue_dma_read(0x2_0000, 32, DmaDestination::TilePointers(Plane::Normal));
+        dma.pump_dma();
+
+        let mut zero_clock = gbe().save_state();
+        zero_clock.ttl_clock = Some(ExternalClockState {
+            numerator_hz: 0,
+            denominator: 1,
+        });
+        let mut missing_order = dma.save_state();
+        missing_order
+            .outstanding_dma
+            .values_mut()
+            .next()
+            .unwrap()
+            .read_order = None;
+        let mut wrong_count = dma.save_state();
+        wrong_count.reads_in_flight += 1;
+        let mut bad_frame = gbe().save_state();
+        bad_frame.working_frame = Some(WorkingFrame {
+            sequence: 0,
+            width: 2,
+            height: 2,
+            rgba: vec![0; 15],
+        });
+        bad_frame.next_frame_sequence = 1;
+
+        for state in [zero_clock, missing_order, wrong_count, bad_frame] {
+            let mut target = gbe();
+            let before = target.clone();
+            assert!(matches!(
+                target.restore_state(state),
+                Err(ComponentStateError::InvalidState { .. })
+            ));
+            assert_eq!(target, before);
+        }
     }
 
     #[test]
