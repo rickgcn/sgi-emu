@@ -28,6 +28,20 @@ pub enum ComponentStateError {
         /// Identifier stored in the serialized component state.
         actual: ComponentId,
     },
+    /// Serialized state was captured for a different immutable configuration.
+    ConfigurationMismatch {
+        /// Component whose configuration did not match.
+        component: ComponentId,
+        /// Immutable field or configuration group that differed.
+        field: &'static str,
+    },
+    /// Serialized dynamic state violates a component invariant.
+    InvalidState {
+        /// Component whose serialized state is invalid.
+        component: ComponentId,
+        /// Invariant rejected by the component.
+        invariant: &'static str,
+    },
 }
 
 impl fmt::Display for ComponentStateError {
@@ -36,6 +50,17 @@ impl fmt::Display for ComponentStateError {
             Self::ComponentIdMismatch { expected, actual } => write!(
                 formatter,
                 "component state identifier mismatch: expected {expected}, got {actual}"
+            ),
+            Self::ConfigurationMismatch { component, field } => write!(
+                formatter,
+                "component state configuration mismatch for {component}: {field}"
+            ),
+            Self::InvalidState {
+                component,
+                invariant,
+            } => write!(
+                formatter,
+                "invalid serialized state for {component}: {invariant}"
             ),
         }
     }
@@ -75,6 +100,18 @@ pub trait Component: Any {
 
     /// Resets the component to its deterministic initial state.
     fn reset(&mut self);
+}
+
+/// Validates the topology identity stored in one explicit component state.
+pub fn validate_component_state_id(
+    expected: ComponentId,
+    actual: ComponentId,
+) -> Result<(), ComponentStateError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ComponentStateError::ComponentIdMismatch { expected, actual })
+    }
 }
 
 /// Defines a serializable deterministic state wrapper for a component.
@@ -174,5 +211,22 @@ mod tests {
             })
         );
         assert_eq!(target, original);
+    }
+
+    #[test]
+    fn component_state_identity_accepts_a_match() {
+        let id = ComponentId::new(1);
+        assert_eq!(validate_component_state_id(id, id), Ok(()));
+    }
+
+    #[test]
+    fn component_state_identity_rejects_a_mismatch() {
+        assert_eq!(
+            validate_component_state_id(ComponentId::new(1), ComponentId::new(2)),
+            Err(ComponentStateError::ComponentIdMismatch {
+                expected: ComponentId::new(1),
+                actual: ComponentId::new(2),
+            })
+        );
     }
 }
