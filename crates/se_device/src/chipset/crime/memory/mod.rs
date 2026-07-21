@@ -4,7 +4,9 @@ pub mod bus;
 mod ecc;
 pub(crate) mod framebuffer;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusDeviceRole;
 
 use super::config::{CrimeMemoryConfig, CrimeSdramBankConfig};
@@ -29,8 +31,14 @@ enum BankSelection {
     Unpopulated,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SparseBank {
+    config: CrimeSdramBankConfig,
+    pages: Vec<Option<Box<SparsePage>>>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct SparseBankState {
     config: CrimeSdramBankConfig,
     pages: Vec<Option<Box<SparsePage>>>,
 }
@@ -109,7 +117,7 @@ impl SparseBank {
 /// Reads from a bank selected by its control register but lacking physical
 /// DIMMs return zero-filled data. This is a deterministic functional-model
 /// convention and does not claim to reproduce undriven electrical bus levels.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrimeSdram {
     id: ComponentId,
     name: String,
@@ -120,7 +128,16 @@ pub struct CrimeSdram {
     replacement: u8,
 }
 
-se_core::component_state!(CrimeSdramState, CrimeSdram);
+/// Serializable sparse contents and programmable state of CRIME SDRAM.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct CrimeSdramState {
+    id: ComponentId,
+    banks: [Option<SparseBankState>; 8],
+    bank_control: [u16; 8],
+    ecc_enabled: bool,
+    use_replacement: bool,
+    replacement: u8,
+}
 
 impl CrimeSdram {
     /// Creates zero-filled SDRAM from an explicit physical topology.
@@ -135,6 +152,68 @@ impl CrimeSdram {
             use_replacement: false,
             replacement: 0,
         }
+    }
+
+    /// Captures sparse memory contents and programmable controller-facing state.
+    pub fn save_state(&self) -> CrimeSdramState {
+        CrimeSdramState {
+            id: self.id,
+            banks: std::array::from_fn(|index| {
+                self.banks[index].as_ref().map(|bank| SparseBankState {
+                    config: bank.config,
+                    pages: bank.pages.clone(),
+                })
+            }),
+            bank_control: self.bank_control,
+            ecc_enabled: self.ecc_enabled,
+            use_replacement: self.use_replacement,
+            replacement: self.replacement,
+        }
+    }
+
+    /// Restores sparse contents after validating the physical bank topology.
+    pub fn restore_state(&mut self, state: CrimeSdramState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        for (current, restored) in self.banks.iter().zip(&state.banks) {
+            match (current, restored) {
+                (Some(current), Some(restored)) if current.config == restored.config => {
+                    let expected_pages = current.config.size.bytes() as usize / PAGE_SIZE;
+                    if restored.pages.len() != expected_pages {
+                        return Err(ComponentStateError::InvalidState {
+                            component: self.id,
+                            invariant: "SDRAM sparse page table length must match bank capacity",
+                        });
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(ComponentStateError::ConfigurationMismatch {
+                        component: self.id,
+                        field: "SDRAM physical bank topology",
+                    });
+                }
+            }
+        }
+        if state
+            .bank_control
+            .iter()
+            .any(|control| control & !registers::MEMORY_BANK_CONTROL_MASK != 0)
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "SDRAM bank controls must use implemented bit encodings",
+            });
+        }
+        for (current, restored) in self.banks.iter_mut().zip(state.banks) {
+            if let (Some(current), Some(restored)) = (current, restored) {
+                current.pages = restored.pages;
+            }
+        }
+        self.bank_control = state.bank_control;
+        self.ecc_enabled = state.ecc_enabled;
+        self.use_replacement = state.use_replacement;
+        self.replacement = state.replacement;
+        Ok(())
     }
 
     /// Returns total installed physical capacity.

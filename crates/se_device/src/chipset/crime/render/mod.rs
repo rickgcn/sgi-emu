@@ -1109,8 +1109,22 @@ struct RenderConditions {
 }
 
 /// CRIME Rendering Engine front-end state.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrimeRender {
+    interface: HostInterface,
+    tlbs: RenderTlbs,
+    pixel: PixelRegisters,
+    mte: MteRegisters,
+    active_pixel_command: Option<PixelExecution>,
+    active_job: Option<MteJob>,
+    memory_request_unit: MemoryRequestUnit,
+    step_scheduled: bool,
+    conditions: RenderConditions,
+    epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct CrimeRenderState {
     interface: HostInterface,
     tlbs: RenderTlbs,
     pixel: PixelRegisters,
@@ -1155,6 +1169,36 @@ impl CrimeRender {
         }
     }
 
+    pub(super) fn save_state(&self) -> CrimeRenderState {
+        CrimeRenderState {
+            interface: self.interface.clone(),
+            tlbs: self.tlbs.clone(),
+            pixel: self.pixel.clone(),
+            mte: self.mte,
+            active_pixel_command: self.active_pixel_command.clone(),
+            active_job: self.active_job.clone(),
+            memory_request_unit: self.memory_request_unit,
+            step_scheduled: self.step_scheduled,
+            conditions: self.conditions,
+            epoch: self.epoch,
+        }
+    }
+
+    pub(super) fn from_state(state: CrimeRenderState) -> Self {
+        Self {
+            interface: state.interface,
+            tlbs: state.tlbs,
+            pixel: state.pixel,
+            mte: state.mte,
+            active_pixel_command: state.active_pixel_command,
+            active_job: state.active_job,
+            memory_request_unit: state.memory_request_unit,
+            step_scheduled: state.step_scheduled,
+            conditions: state.conditions,
+            epoch: state.epoch,
+        }
+    }
+
     /// Resets the front end and invalidates old render events.
     pub(super) fn reset(&mut self) -> Vec<RenderInterruptEffect> {
         self.interface = HostInterface::new();
@@ -1195,6 +1239,54 @@ impl CrimeRender {
     /// Returns the number of host writes waiting in the 64-entry interface buffer.
     pub fn interface_level(&self) -> usize {
         self.interface.level()
+    }
+
+    pub(super) fn validate_state(&self) -> Result<(), &'static str> {
+        if self.interface.read_pointer >= INTERFACE_CAPACITY as u8
+            || self.interface.write_pointer >= INTERFACE_CAPACITY as u8
+            || self.interface.start_pointer >= INTERFACE_CAPACITY as u8
+            || self.interface.level > INTERFACE_CAPACITY as u8
+            || self.interface.control & !INTERFACE_CONTROL_MASK != 0
+        {
+            return Err("CRIME render interface pointers and level must be in range");
+        }
+        if self.active_pixel_command.is_some() && self.active_job.is_some() {
+            return Err("CRIME render cannot execute pixel and MTE jobs concurrently");
+        }
+        if let Some(pending) = self.memory_request_unit.pending {
+            if pending.length == 0 {
+                return Err("CRIME render memory operations must have nonzero length");
+            }
+            let matching_owner = match pending.destination {
+                RenderMemoryDestination::Mte => self.active_job.is_some(),
+                RenderMemoryDestination::Pixel => self.active_pixel_command.is_some(),
+            };
+            if !matching_owner {
+                return Err("CRIME render memory operation must have an active owner");
+            }
+        }
+        let conditions = RenderConditions {
+            empty: self.interface.empty_condition(),
+            full: self.interface.full_condition(),
+            idle: self.interface.level == 0
+                && self.active_pixel_command.is_none()
+                && self.active_job.is_none(),
+        };
+        if conditions != self.conditions {
+            return Err("CRIME render interrupt conditions must match engine state");
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_deferred_write(address: u64, size: u8) -> bool {
+        let (address, commit) = canonical_write_address(address);
+        register_access(address, size, RegisterDirection::Write).is_ok_and(|access| {
+            access.writable && access.buffered && (!commit || access.start_eligible)
+        })
+    }
+
+    pub(super) const fn has_pending_memory(&self) -> bool {
+        self.memory_request_unit.pending.is_some()
     }
 
     /// Returns whether another host register write can be accepted.

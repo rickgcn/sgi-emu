@@ -123,6 +123,10 @@ where
         self.0.is_empty()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn spilled(&self) -> bool {
         self.0.spilled()
@@ -234,6 +238,17 @@ where
 
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn iter<'a, K: 'a>(&'a self) -> impl Iterator<Item = &'a K>
+    where
+        A: Array<Item = K>,
+    {
+        self.0.iter()
     }
 
     #[cfg(test)]

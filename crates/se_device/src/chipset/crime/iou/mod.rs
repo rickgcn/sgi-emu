@@ -2,10 +2,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusRole;
 
-use super::clock::CrimeClock;
+use super::clock::{CrimeClock, CrimeClockState};
 use super::protocol::{
     CrimeBusAction, CrimeBusDisposition, CrimeCgiCompletion, CrimeCgiTransaction,
     CrimeCmiCompletion, CrimeCmiTransaction, CrimeLinkOperation, CrimeTransactionId,
@@ -49,9 +51,20 @@ pub enum CrimeCgiBusEvent {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LinkBus<T, C> {
     clock: CrimeClock,
+    epoch: u64,
+    service_scheduled: bool,
+    queue: VecDeque<T>,
+    in_flight: Option<T>,
+    pending_completion: Option<(ComponentId, C)>,
+    actions: VecDeque<CrimeBusAction<T, C>>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct LinkBusState<T, C> {
+    clock: CrimeClockState,
     epoch: u64,
     service_scheduled: bool,
     queue: VecDeque<T>,
@@ -84,6 +97,31 @@ where
         self.in_flight = None;
         self.pending_completion = None;
         self.actions.clear();
+    }
+
+    fn save_state(&self) -> LinkBusState<T, C>
+    where
+        C: Clone,
+    {
+        LinkBusState {
+            clock: self.clock.save_state(),
+            epoch: self.epoch,
+            service_scheduled: self.service_scheduled,
+            queue: self.queue.clone(),
+            in_flight: self.in_flight.clone(),
+            pending_completion: self.pending_completion.clone(),
+            actions: self.actions.clone(),
+        }
+    }
+
+    fn apply_state(&mut self, state: LinkBusState<T, C>) {
+        self.clock.restore_state(state.clock);
+        self.epoch = state.epoch;
+        self.service_scheduled = state.service_scheduled;
+        self.queue = state.queue;
+        self.in_flight = state.in_flight;
+        self.pending_completion = state.pending_completion;
+        self.actions = state.actions;
     }
 
     fn route(&mut self, transaction: T) -> CrimeBusDisposition {
@@ -156,14 +194,19 @@ where
 }
 
 /// CRIME-to-MACE CMI bus.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrimeCmiBus {
     id: ComponentId,
     name: String,
     inner: LinkBus<CrimeCmiTransaction, CrimeCmiCompletion>,
 }
 
-se_core::component_state!(CrimeCmiBusState, CrimeCmiBus);
+/// Serializable dynamic state of the CRIME CMI bus.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct CrimeCmiBusState {
+    id: ComponentId,
+    inner: LinkBusState<CrimeCmiTransaction, CrimeCmiCompletion>,
+}
 
 impl CrimeCmiBus {
     /// Creates a CMI domain.
@@ -173,6 +216,52 @@ impl CrimeCmiBus {
             name: name.into(),
             inner: LinkBus::new(timebase_hz),
         }
+    }
+
+    /// Captures CMI clock and transaction state.
+    pub fn save_state(&self) -> CrimeCmiBusState {
+        CrimeCmiBusState {
+            id: self.id,
+            inner: self.inner.save_state(),
+        }
+    }
+
+    /// Restores validated CMI state without changing its timebase.
+    pub fn restore_state(&mut self, state: CrimeCmiBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        self.inner
+            .clock
+            .validate_state(self.id, state.inner.clock)?;
+        let pending_valid =
+            state
+                .inner
+                .pending_completion
+                .as_ref()
+                .is_none_or(|(controller, completion)| {
+                    state.inner.in_flight.is_none()
+                        && state.inner.queue.iter().all(|transaction| {
+                            transaction.controller != *controller || transaction.id != completion.id
+                        })
+                });
+        let actions_valid = state.inner.actions.iter().all(|action| match action {
+            CrimeBusAction::Deliver {
+                target,
+                transaction,
+            } => *target == transaction.target,
+            CrimeBusAction::Complete { .. } | CrimeBusAction::ScheduleService { .. } => true,
+            CrimeBusAction::Idle => false,
+        });
+        if state.inner.in_flight.is_some() && state.inner.pending_completion.is_some()
+            || !pending_valid
+            || !actions_valid
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "CMI transaction phases and actions must be consistent",
+            });
+        }
+        self.inner.apply_state(state.inner);
+        Ok(())
     }
 
     /// Handles a scheduled CMI event.
@@ -296,7 +385,7 @@ impl BusRole<CrimeCmiTransaction> for CrimeCmiBus {
 }
 
 /// CRIME-to-GBE CGI bus.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrimeCgiBus {
     id: ComponentId,
     name: String,
@@ -311,7 +400,20 @@ pub struct CrimeCgiBus {
     actions: VecDeque<CrimeBusAction<CrimeCgiTransaction, CrimeCgiCompletion>>,
 }
 
-se_core::component_state!(CrimeCgiBusState, CrimeCgiBus);
+/// Serializable dynamic state of the CRIME CGI bus.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct CrimeCgiBusState {
+    id: ComponentId,
+    clock: CrimeClockState,
+    epoch: u64,
+    service_scheduled: bool,
+    queue: VecDeque<CrimeCgiTransaction>,
+    in_flight: BTreeMap<(ComponentId, CrimeTransactionId), CrimeCgiTransaction>,
+    pending_completions:
+        BTreeMap<(ComponentId, CrimeTransactionId), (ComponentId, CrimeCgiCompletion)>,
+    scheduled_events: VecDeque<CrimeCgiBusEvent>,
+    actions: VecDeque<CrimeBusAction<CrimeCgiTransaction, CrimeCgiCompletion>>,
+}
 
 impl CrimeCgiBus {
     /// Creates a CGI domain.
@@ -328,6 +430,64 @@ impl CrimeCgiBus {
             scheduled_events: VecDeque::new(),
             actions: VecDeque::new(),
         }
+    }
+
+    /// Captures CGI clock, arbitration, and transaction state.
+    pub fn save_state(&self) -> CrimeCgiBusState {
+        CrimeCgiBusState {
+            id: self.id,
+            clock: self.clock.save_state(),
+            epoch: self.epoch,
+            service_scheduled: self.service_scheduled,
+            queue: self.queue.clone(),
+            in_flight: self.in_flight.clone(),
+            pending_completions: self.pending_completions.clone(),
+            scheduled_events: self.scheduled_events.clone(),
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores validated CGI state without changing its timebase.
+    pub fn restore_state(&mut self, state: CrimeCgiBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        self.clock.validate_state(self.id, state.clock)?;
+        let in_flight_valid = state.in_flight.iter().all(|(key, transaction)| {
+            *key == (transaction.target, transaction.id)
+                && !state.pending_completions.contains_key(key)
+        });
+        let pending_valid = state
+            .pending_completions
+            .iter()
+            .all(|((_, id), (_, completion))| *id == completion.id);
+        let events_valid = state.scheduled_events.iter().all(|event| match event {
+            CrimeCgiBusEvent::Service { epoch } => *epoch == state.epoch,
+            CrimeCgiBusEvent::Complete { epoch, target, id } => {
+                *epoch == state.epoch && state.pending_completions.contains_key(&(*target, *id))
+            }
+        });
+        let actions_valid = state.actions.iter().all(|action| match action {
+            CrimeBusAction::Deliver {
+                target,
+                transaction,
+            } => *target == transaction.target,
+            CrimeBusAction::Complete { .. } | CrimeBusAction::ScheduleService { .. } => true,
+            CrimeBusAction::Idle => false,
+        });
+        if !in_flight_valid || !pending_valid || !events_valid || !actions_valid {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "CGI transaction maps, events, and actions must be consistent",
+            });
+        }
+        self.clock.restore_state(state.clock);
+        self.epoch = state.epoch;
+        self.service_scheduled = state.service_scheduled;
+        self.queue = state.queue;
+        self.in_flight = state.in_flight;
+        self.pending_completions = state.pending_completions;
+        self.scheduled_events = state.scheduled_events;
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Handles a scheduled CGI event.

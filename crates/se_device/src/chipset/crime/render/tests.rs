@@ -661,8 +661,8 @@ fn semantic_fallback_is_emitted_once_and_persisted_with_the_pixel_job() {
         0
     );
 
-    let encoded = postcard::to_stdvec(&render).unwrap();
-    let restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+    let encoded = postcard::to_stdvec(&render.save_state()).unwrap();
+    let restored = CrimeRender::from_state(postcard::from_bytes(&encoded).unwrap());
     assert_eq!(restored, render);
     let Some(PixelExecution::Running(job)) = restored.active_pixel_command.as_ref() else {
         panic!("pixel fallback job was not restored")
@@ -692,8 +692,8 @@ fn every_fragment_memory_stage_round_trips_in_active_state() {
             panic!("fragment command was not active")
         };
         job.fragment.as_mut().unwrap().stage = stage;
-        let encoded = postcard::to_stdvec(&render).unwrap();
-        let restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+        let encoded = postcard::to_stdvec(&render.save_state()).unwrap();
+        let restored = CrimeRender::from_state(postcard::from_bytes(&encoded).unwrap());
         assert_eq!(restored, render);
     }
 }
@@ -1148,8 +1148,8 @@ fn in_flight_stipple_batch_round_trips_before_cursor_commit() {
     assert_eq!(job.stipple.map(PixelStippleCursor::index), Some(0));
     assert_eq!(job.pending_batch.unwrap().candidate_count, 32);
 
-    let encoded = postcard::to_stdvec(&reference).unwrap();
-    let mut restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+    let encoded = postcard::to_stdvec(&reference.save_state()).unwrap();
+    let mut restored = CrimeRender::from_state(postcard::from_bytes(&encoded).unwrap());
     assert_eq!(restored, reference);
     assert_eq!(
         restored.complete_memory(write_completion()),
@@ -1176,8 +1176,8 @@ fn in_flight_x_line_round_trips_with_pixel_progress() {
     let first = retire(&mut reference).memory_request.unwrap();
     assert_eq!(first.transfer.length(), RENDER_MEMORY_WORD_BYTES);
 
-    let encoded = postcard::to_stdvec(&reference).unwrap();
-    let mut restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+    let encoded = postcard::to_stdvec(&reference.save_state()).unwrap();
+    let mut restored = CrimeRender::from_state(postcard::from_bytes(&encoded).unwrap());
     assert_eq!(restored, reference);
 
     assert_eq!(
@@ -1595,8 +1595,8 @@ fn in_flight_prom_zero_rectangle_round_trips_with_row_progress() {
         .unwrap();
     retire(&mut reference);
 
-    let encoded = postcard::to_stdvec(&reference).unwrap();
-    let mut restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+    let encoded = postcard::to_stdvec(&reference.save_state()).unwrap();
+    let mut restored = CrimeRender::from_state(postcard::from_bytes(&encoded).unwrap());
     assert_eq!(restored, reference);
     assert_eq!(
         restored.complete_memory(write_completion()),
@@ -1918,8 +1918,8 @@ fn in_flight_mte_state_round_trips_with_the_memory_correlation() {
     assert_eq!(request.transfer.length(), 512);
     assert!(reference.memory_request_unit.busy());
 
-    let encoded = postcard::to_stdvec(&reference).unwrap();
-    let mut restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+    let encoded = postcard::to_stdvec(&reference.save_state()).unwrap();
+    let mut restored = CrimeRender::from_state(postcard::from_bytes(&encoded).unwrap());
     assert_eq!(restored, reference);
 
     let reference_progress = reference.complete_memory(write_completion()).unwrap();
@@ -2068,8 +2068,8 @@ fn mte_copy_read_stage_round_trips_with_row_buffer_state() {
         )))
         .unwrap();
 
-    let encoded = postcard::to_stdvec(&render).unwrap();
-    let restored: CrimeRender = postcard::from_bytes(&encoded).unwrap();
+    let encoded = postcard::to_stdvec(&render.save_state()).unwrap();
+    let restored = CrimeRender::from_state(postcard::from_bytes(&encoded).unwrap());
     assert_eq!(restored, render);
     let job = restored.active_job.as_ref().unwrap();
     assert_eq!(job.row_buffer, [0xaa]);

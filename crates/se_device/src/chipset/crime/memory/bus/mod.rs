@@ -2,11 +2,13 @@
 
 use std::collections::VecDeque;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusRole;
 use se_core::scheduler::{SimDuration, SimTime};
 
-use super::super::clock::CrimeClock;
+use super::super::clock::{CrimeClock, CrimeClockState};
 use super::super::protocol::{
     CrimeBusAction, CrimeBusDisposition, CrimeMemoryClient, CrimeMemoryCompletion,
     CrimeMemoryTransaction, CrimeTransactionId,
@@ -71,7 +73,7 @@ impl CrimeDirectMemoryPlan {
 }
 
 /// CRIME MIU arbitration and ordering domain.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrimeMemoryBus {
     id: ComponentId,
     name: String,
@@ -93,7 +95,27 @@ pub struct CrimeMemoryBus {
     actions: VecDeque<CrimeBusAction<CrimeMemoryTransaction, CrimeMemoryCompletion>>,
 }
 
-se_core::component_state!(CrimeMemoryBusState, CrimeMemoryBus);
+/// Serializable dynamic state and compatibility data of the CRIME memory bus.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct CrimeMemoryBusState {
+    id: ComponentId,
+    target: ComponentId,
+    clock: CrimeClockState,
+    refresh_delay: SimDuration,
+    epoch: u64,
+    slot: u8,
+    service_scheduled: bool,
+    next_refresh_time: SimTime,
+    refresh_debt: u64,
+    gbe: VecDeque<CrimeMemoryTransaction>,
+    mace: VecDeque<CrimeMemoryTransaction>,
+    vice: VecDeque<CrimeMemoryTransaction>,
+    render: VecDeque<CrimeMemoryTransaction>,
+    cpu: VecDeque<CrimeMemoryTransaction>,
+    in_flight: Option<InFlightMemory>,
+    pending_completion: Option<PendingCompletion>,
+    actions: VecDeque<CrimeBusAction<CrimeMemoryTransaction, CrimeMemoryCompletion>>,
+}
 
 impl CrimeMemoryBus {
     /// Creates a memory domain with machine-calculated CRIME timing.
@@ -124,6 +146,86 @@ impl CrimeMemoryBus {
             pending_completion: None,
             actions: VecDeque::new(),
         }
+    }
+
+    /// Captures memory arbitration, refresh, and transaction state.
+    pub fn save_state(&self) -> CrimeMemoryBusState {
+        CrimeMemoryBusState {
+            id: self.id,
+            target: self.target,
+            clock: self.clock.save_state(),
+            refresh_delay: self.refresh_delay,
+            epoch: self.epoch,
+            slot: self.slot,
+            service_scheduled: self.service_scheduled,
+            next_refresh_time: self.next_refresh_time,
+            refresh_debt: self.refresh_debt,
+            gbe: self.gbe.clone(),
+            mace: self.mace.clone(),
+            vice: self.vice.clone(),
+            render: self.render.clone(),
+            cpu: self.cpu.clone(),
+            in_flight: self.in_flight,
+            pending_completion: self.pending_completion.clone(),
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores validated memory-bus state without changing topology or timing.
+    pub fn restore_state(&mut self, state: CrimeMemoryBusState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if state.target != self.target {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "CRIME memory target",
+            });
+        }
+        if state.refresh_delay != self.refresh_delay {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "CRIME memory refresh delay",
+            });
+        }
+        self.clock.validate_state(self.id, state.clock)?;
+        let queues_valid = [
+            (&state.gbe, CrimeMemoryClient::Gbe),
+            (&state.mace, CrimeMemoryClient::Mace),
+            (&state.vice, CrimeMemoryClient::Vice),
+            (&state.render, CrimeMemoryClient::Render),
+            (&state.cpu, CrimeMemoryClient::Cpu),
+        ]
+        .into_iter()
+        .all(|(queue, client)| queue.iter().all(|transaction| transaction.client == client));
+        let actions_valid = state.actions.iter().all(|action| match action {
+            CrimeBusAction::Deliver { target, .. } => *target == self.target,
+            CrimeBusAction::Complete { .. } | CrimeBusAction::ScheduleService { .. } => true,
+            CrimeBusAction::Idle => false,
+        });
+        if state.slot >= 64
+            || state.in_flight.is_some() && state.pending_completion.is_some()
+            || !queues_valid
+            || !actions_valid
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "CRIME memory arbitration and transaction state must be consistent",
+            });
+        }
+        self.clock.restore_state(state.clock);
+        self.epoch = state.epoch;
+        self.slot = state.slot;
+        self.service_scheduled = state.service_scheduled;
+        self.next_refresh_time = state.next_refresh_time;
+        self.refresh_debt = state.refresh_debt;
+        self.gbe = state.gbe;
+        self.mace = state.mace;
+        self.vice = state.vice;
+        self.render = state.render;
+        self.cpu = state.cpu;
+        self.in_flight = state.in_flight;
+        self.pending_completion = state.pending_completion;
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Resets transient state and begins lazy refresh accounting.

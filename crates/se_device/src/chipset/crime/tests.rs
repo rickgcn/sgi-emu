@@ -26,6 +26,59 @@ fn crime() -> Crime {
     .unwrap()
 }
 
+#[test]
+fn state_restore_preserves_name_and_trace_policy_and_rejects_config_and_invalid_registers() {
+    let source = crime();
+    let encoded = postcard::to_stdvec(&source.save_state()).unwrap();
+    let decoded: CrimeState = postcard::from_bytes(&encoded).unwrap();
+    let mut target = Crime::new(
+        CRIME,
+        "target",
+        CrimeConfig::default(),
+        TIMEBASE_HZ,
+        RAM,
+        MACE,
+        GBE,
+    )
+    .unwrap();
+    target.set_trace_interest(TraceInterest::None);
+    target.restore_state(decoded).unwrap();
+    assert_eq!(target.name(), "target");
+    assert_eq!(target.trace_interest, TraceInterest::None);
+
+    let incompatible = Crime::new(
+        CRIME,
+        "foreign",
+        CrimeConfig::default(),
+        TIMEBASE_HZ,
+        ComponentId::new(99),
+        MACE,
+        GBE,
+    )
+    .unwrap()
+    .save_state();
+    let before = target.clone();
+    assert!(matches!(
+        target.restore_state(incompatible),
+        Err(ComponentStateError::ConfigurationMismatch {
+            component: CRIME,
+            field: "memory_target"
+        })
+    ));
+    assert_eq!(target, before);
+
+    let mut malformed = source.save_state();
+    malformed.memory_control = 4;
+    assert!(matches!(
+        target.restore_state(malformed),
+        Err(ComponentStateError::InvalidState {
+            component: CRIME,
+            ..
+        })
+    ));
+    assert_eq!(target, before);
+}
+
 fn read(id: u128, address: u64, size: u16) -> CrimeSysAdRequest {
     CrimeSysAdRequest {
         id: CrimeTransactionId::new(id),

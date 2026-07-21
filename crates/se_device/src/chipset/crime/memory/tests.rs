@@ -403,3 +403,49 @@ fn hard_reset_preserves_data_but_power_on_clears_it() {
         CrimeCompletionPayload::ReadData(vec![0].into())
     );
 }
+
+#[test]
+fn state_restore_preserves_name_and_rejects_topology_and_page_shape_atomically() {
+    let source = small_memory();
+    let mut renamed = CrimeSdram::new(
+        RAM,
+        "replacement",
+        CrimeMemoryConfig {
+            banks: [
+                Some(CrimeSdramBankConfig {
+                    size: CrimeSdramBankSize::MiB32,
+                }),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        },
+    );
+    renamed.restore_state(source.save_state()).unwrap();
+    assert_eq!(renamed.name(), "replacement");
+
+    let mut large_config = CrimeMemoryConfig::default();
+    large_config.banks[0] = Some(CrimeSdramBankConfig {
+        size: CrimeSdramBankSize::MiB128,
+    });
+    let mismatched = CrimeSdram::new(RAM, "source", large_config).save_state();
+    let mut target = small_memory();
+    let before = target.clone();
+    assert!(matches!(
+        target.restore_state(mismatched),
+        Err(ComponentStateError::ConfigurationMismatch { .. })
+    ));
+    assert_eq!(target, before);
+
+    let mut invalid = source.save_state();
+    invalid.banks[0].as_mut().unwrap().pages.pop();
+    assert!(matches!(
+        target.restore_state(invalid),
+        Err(ComponentStateError::InvalidState { .. })
+    ));
+    assert_eq!(target, before);
+}

@@ -18,16 +18,18 @@ pub mod trace;
 use core::fmt;
 use std::collections::{BTreeSet, VecDeque};
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::scheduler::SimTime;
 use se_core::tracing::{
     OwnedTraceEvent, OwnedTraceField, OwnedTraceFields, OwnedTraceValue, TraceInterest, TraceLevel,
 };
 
-use self::clock::CrimeClock;
+use self::clock::{CrimeClock, CrimeClockState};
 use self::config::{CrimeAccessPolicy, CrimeConfig, CrimeConfigError};
-use self::piu::{CRIME_MASTER_FREQUENCY_HZ, CrimePiu, PiuEffect};
+use self::piu::{CRIME_MASTER_FREQUENCY_HZ, CrimePiu, CrimePiuState, PiuEffect};
 use self::protocol::{
     CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusError, CrimeCgiCompletion, CrimeCgiTransaction,
     CrimeCmiCompletion, CrimeCmiTransaction, CrimeCompletionPayload, CrimeCpuSignal, CrimeData,
@@ -38,7 +40,7 @@ use self::protocol::{
     CrimeTransactionId, CrimeTransfer, CrimeTransferView,
 };
 use self::render::{
-    CrimeRender, CrimeRenderError, RenderAccessError, RenderInterruptEffect,
+    CrimeRender, CrimeRenderError, CrimeRenderState, RenderAccessError, RenderInterruptEffect,
     RenderMemoryDestination, RenderMemoryRequest, RenderNotice, RenderProgress, RenderWriteError,
 };
 use crate::bus::irq::{IrqSource, IrqTransaction};
@@ -151,7 +153,7 @@ impl fmt::Display for CrimeError {
 impl std::error::Error for CrimeError {}
 
 /// SGI CRIME 1.1 chipset component.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Crime {
     id: ComponentId,
     name: String,
@@ -180,9 +182,7 @@ pub struct Crime {
     cancelled_memory: BTreeSet<CrimeTransactionId>,
     cancelled_cmi: BTreeSet<CrimeTransactionId>,
     cancelled_cgi: BTreeSet<CrimeTransactionId>,
-    #[serde(skip)]
     actions: VecDeque<CrimeAction>,
-    #[serde(skip, default = "default_trace_interest")]
     trace_interest: TraceInterest,
     terminal_error: Option<CrimeError>,
     current_time: SimTime,
@@ -261,10 +261,37 @@ impl CrimeSynchronousReadSnapshot {
     }
 }
 
-se_core::component_state!(CrimeState, Crime);
-
-const fn default_trace_interest() -> TraceInterest {
-    TraceInterest::All
+/// Serializable dynamic state of the CRIME chipset.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CrimeState {
+    id: ComponentId,
+    config: CrimeConfig,
+    timebase_hz: u64,
+    memory_target: ComponentId,
+    mace_target: ComponentId,
+    gbe_target: ComponentId,
+    piu: CrimePiuState,
+    render: CrimeRenderState,
+    render_clock: CrimeClockState,
+    memory_control: u64,
+    bank_control: [u16; 8],
+    refresh_counter: u16,
+    memory_error_status: u32,
+    memory_error_address: u64,
+    memory_ecc_syndrome: u32,
+    memory_ecc_check: u32,
+    memory_ecc_replacement: u8,
+    next_transaction_id: u128,
+    pending_sysad: Option<CrimeTransactionId>,
+    pending_render_write: Option<PendingRenderWrite>,
+    pending_memory: PendingMemoryTable,
+    pending_cmi: PendingLinkTable,
+    pending_cgi: PendingLinkTable,
+    cancelled_memory: BTreeSet<CrimeTransactionId>,
+    cancelled_cmi: BTreeSet<CrimeTransactionId>,
+    cancelled_cgi: BTreeSet<CrimeTransactionId>,
+    terminal_error: Option<CrimeError>,
+    current_time: SimTime,
 }
 
 impl Crime {
@@ -320,6 +347,224 @@ impl Crime {
     /// Returns the immutable construction input.
     pub const fn config(&self) -> CrimeConfig {
         self.config
+    }
+
+    /// Captures CRIME's dynamic hardware state.
+    pub fn save_state(&self) -> CrimeState {
+        CrimeState {
+            id: self.id,
+            config: self.config,
+            timebase_hz: self.timebase_hz,
+            memory_target: self.memory_target,
+            mace_target: self.mace_target,
+            gbe_target: self.gbe_target,
+            piu: self.piu.save_state(),
+            render: self.render.save_state(),
+            render_clock: self.render_clock.save_state(),
+            memory_control: self.memory_control,
+            bank_control: self.bank_control,
+            refresh_counter: self.refresh_counter,
+            memory_error_status: self.memory_error_status,
+            memory_error_address: self.memory_error_address,
+            memory_ecc_syndrome: self.memory_ecc_syndrome,
+            memory_ecc_check: self.memory_ecc_check,
+            memory_ecc_replacement: self.memory_ecc_replacement,
+            next_transaction_id: self.next_transaction_id,
+            pending_sysad: self.pending_sysad,
+            pending_render_write: self.pending_render_write.clone(),
+            pending_memory: self.pending_memory.clone(),
+            pending_cmi: self.pending_cmi.clone(),
+            pending_cgi: self.pending_cgi.clone(),
+            cancelled_memory: self.cancelled_memory.clone(),
+            cancelled_cmi: self.cancelled_cmi.clone(),
+            cancelled_cgi: self.cancelled_cgi.clone(),
+            terminal_error: self.terminal_error.clone(),
+            current_time: self.current_time,
+        }
+    }
+
+    /// Restores dynamic state after validating configuration and transaction invariants.
+    pub fn restore_state(&mut self, state: CrimeState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        for (matches, field) in [
+            (self.config == state.config, "config"),
+            (self.timebase_hz == state.timebase_hz, "timebase_hz"),
+            (self.memory_target == state.memory_target, "memory_target"),
+            (self.mace_target == state.mace_target, "mace_target"),
+            (self.gbe_target == state.gbe_target, "gbe_target"),
+        ] {
+            if !matches {
+                return Err(ComponentStateError::ConfigurationMismatch {
+                    component: self.id,
+                    field,
+                });
+            }
+        }
+        self.render_clock
+            .validate_state(self.id, state.render_clock)?;
+        let restored_piu = CrimePiu::from_state(state.piu);
+        if let Err(invariant) = restored_piu.validate_state(state.current_time) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant,
+            });
+        }
+        let restored_render = CrimeRender::from_state(state.render);
+        if let Err(invariant) = restored_render.validate_state() {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant,
+            });
+        }
+        if state.memory_control & !0x3 != 0
+            || state
+                .bank_control
+                .iter()
+                .any(|value| value & !registers::MEMORY_BANK_CONTROL_MASK != 0)
+            || state.refresh_counter & !0x03ff != 0
+            || state.memory_error_status & !registers::MEMORY_ERROR_STATUS_MASK != 0
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "CRIME memory registers must use implemented bit encodings",
+            });
+        }
+        if state.pending_memory.len() > 8
+            || state.pending_cmi.len() > 8
+            || state.pending_cgi.len() > 8
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "CRIME pending transaction tables must fit their fixed capacity",
+            });
+        }
+        let memory_ids: BTreeSet<_> = state.pending_memory.iter().map(|(id, _)| *id).collect();
+        let cmi_ids: BTreeSet<_> = state.pending_cmi.iter().map(|(id, _)| *id).collect();
+        let cgi_ids: BTreeSet<_> = state.pending_cgi.iter().map(|(id, _)| *id).collect();
+        if memory_ids.len() != state.pending_memory.len()
+            || cmi_ids.len() != state.pending_cmi.len()
+            || cgi_ids.len() != state.pending_cgi.len()
+            || memory_ids
+                .iter()
+                .any(|id| state.cancelled_memory.contains(id))
+            || cmi_ids.iter().any(|id| state.cancelled_cmi.contains(id))
+            || cgi_ids.iter().any(|id| state.cancelled_cgi.contains(id))
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "CRIME pending and cancelled transaction identifiers must be unique",
+            });
+        }
+        let all_internal_ids = memory_ids
+            .iter()
+            .chain(cmi_ids.iter())
+            .chain(cgi_ids.iter())
+            .chain(state.cancelled_memory.iter())
+            .chain(state.cancelled_cmi.iter())
+            .chain(state.cancelled_cgi.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let unique_internal_ids: BTreeSet<_> = all_internal_ids.iter().copied().collect();
+        if unique_internal_ids.len() != all_internal_ids.len()
+            || all_internal_ids
+                .iter()
+                .any(|id| id.get() >= state.next_transaction_id)
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "CRIME transaction identifiers must be unique and precede the allocation cursor",
+            });
+        }
+        let mut sysad_references = Vec::new();
+        for (_, origin) in state.pending_memory.iter() {
+            if let PendingMemoryOrigin::SysAd { sysad_id, .. } = origin {
+                sysad_references.push(*sysad_id);
+            }
+        }
+        sysad_references.extend(
+            state
+                .pending_cmi
+                .iter()
+                .map(|(_, pending)| pending.sysad_id),
+        );
+        sysad_references.extend(
+            state
+                .pending_cgi
+                .iter()
+                .map(|(_, pending)| pending.sysad_id),
+        );
+        if let Some(pending) = &state.pending_render_write {
+            sysad_references.push(pending.sysad_id);
+            let CrimeTransferView::Write { data, byte_enable } = pending.transfer.view() else {
+                return Err(ComponentStateError::InvalidState {
+                    component: self.id,
+                    invariant: "deferred CRIME render access must be a write",
+                });
+            };
+            let Ok(size) = u8::try_from(data.len()) else {
+                return Err(ComponentStateError::InvalidState {
+                    component: self.id,
+                    invariant: "deferred CRIME render write size must fit the register ABI",
+                });
+            };
+            if data.len() != byte_enable.len()
+                || byte_enable.iter().any(|enabled| !enabled)
+                || decode_register_data(data).is_none()
+                || !CrimeRender::validate_deferred_write(pending.address, size)
+            {
+                return Err(ComponentStateError::InvalidState {
+                    component: self.id,
+                    invariant: "deferred CRIME render write must remain a valid buffered access",
+                });
+            }
+        }
+        if match state.pending_sysad {
+            Some(id) => sysad_references.len() != 1 || sysad_references[0] != id,
+            None => !sysad_references.is_empty(),
+        } {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "CRIME pending SysAD state must have exactly one matching operation",
+            });
+        }
+        let render_pending_count = state
+            .pending_memory
+            .iter()
+            .filter(|(_, origin)| matches!(origin, PendingMemoryOrigin::Render))
+            .count();
+        if render_pending_count != usize::from(restored_render.has_pending_memory()) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "CRIME render memory state must match the transaction table",
+            });
+        }
+
+        let mut restored = self.clone();
+        restored.piu = restored_piu;
+        restored.render = restored_render;
+        restored.render_clock.restore_state(state.render_clock);
+        restored.memory_control = state.memory_control;
+        restored.bank_control = state.bank_control;
+        restored.refresh_counter = state.refresh_counter;
+        restored.memory_error_status = state.memory_error_status;
+        restored.memory_error_address = state.memory_error_address;
+        restored.memory_ecc_syndrome = state.memory_ecc_syndrome;
+        restored.memory_ecc_check = state.memory_ecc_check;
+        restored.memory_ecc_replacement = state.memory_ecc_replacement;
+        restored.next_transaction_id = state.next_transaction_id;
+        restored.pending_sysad = state.pending_sysad;
+        restored.pending_render_write = state.pending_render_write;
+        restored.pending_memory = state.pending_memory;
+        restored.pending_cmi = state.pending_cmi;
+        restored.pending_cgi = state.pending_cgi;
+        restored.cancelled_memory = state.cancelled_memory;
+        restored.cancelled_cmi = state.cancelled_cmi;
+        restored.cancelled_cgi = state.cancelled_cgi;
+        restored.terminal_error = state.terminal_error;
+        restored.current_time = state.current_time;
+        restored.actions.clear();
+        *self = restored;
+        Ok(())
     }
 
     /// Observes machine time before accepting an untimed peer-link request.

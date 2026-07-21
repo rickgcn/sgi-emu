@@ -59,8 +59,23 @@ impl PiuWriteResult {
 }
 
 /// CRIME 1.1 processor-interface state.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrimePiu {
+    control: u64,
+    interrupt_enable: u32,
+    software_interrupt: u32,
+    hardware_interrupt: u32,
+    watchdog: u64,
+    watchdog_epoch: u64,
+    timer_base: u32,
+    timer_base_time: SimTime,
+    cpu_error_address: u64,
+    cpu_error_status: u64,
+    interrupt_output_asserted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct CrimePiuState {
     control: u64,
     interrupt_enable: u32,
     software_interrupt: u32,
@@ -89,6 +104,38 @@ impl CrimePiu {
             cpu_error_address: 0,
             cpu_error_status: 0,
             interrupt_output_asserted: false,
+        }
+    }
+
+    pub(super) fn save_state(&self) -> CrimePiuState {
+        CrimePiuState {
+            control: self.control,
+            interrupt_enable: self.interrupt_enable,
+            software_interrupt: self.software_interrupt,
+            hardware_interrupt: self.hardware_interrupt,
+            watchdog: self.watchdog,
+            watchdog_epoch: self.watchdog_epoch,
+            timer_base: self.timer_base,
+            timer_base_time: self.timer_base_time,
+            cpu_error_address: self.cpu_error_address,
+            cpu_error_status: self.cpu_error_status,
+            interrupt_output_asserted: self.interrupt_output_asserted,
+        }
+    }
+
+    pub(super) fn from_state(state: CrimePiuState) -> Self {
+        Self {
+            control: state.control,
+            interrupt_enable: state.interrupt_enable,
+            software_interrupt: state.software_interrupt,
+            hardware_interrupt: state.hardware_interrupt,
+            watchdog: state.watchdog,
+            watchdog_epoch: state.watchdog_epoch,
+            timer_base: state.timer_base,
+            timer_base_time: state.timer_base_time,
+            cpu_error_address: state.cpu_error_address,
+            cpu_error_status: state.cpu_error_status,
+            interrupt_output_asserted: state.interrupt_output_asserted,
         }
     }
 
@@ -124,6 +171,27 @@ impl CrimePiu {
 
     pub(super) const fn timer_projection(&self) -> (u32, SimTime) {
         (self.timer_base, self.timer_base_time)
+    }
+
+    pub(super) fn validate_state(&self, current_time: SimTime) -> Result<(), &'static str> {
+        let watchdog_mask = registers::WATCHDOG_POWER_ON_RESET
+            | registers::WATCHDOG_WARM_RESET
+            | registers::WATCHDOG_VALUE_MASK;
+        if self.control & !registers::CONTROL_MASK != 0
+            || self.control & registers::CONTROL_BIG_ENDIAN == 0
+            || self.watchdog & !watchdog_mask != 0
+            || self.cpu_error_status & !registers::CPU_ERROR_MASK != 0
+        {
+            return Err("CRIME PIU registers must use implemented bit encodings");
+        }
+        if self.timer_base_time > current_time {
+            return Err("CRIME timer anchor must not be in the future");
+        }
+        let asserted = self.interrupt_status() & self.interrupt_enable != 0;
+        if asserted != self.interrupt_output_asserted {
+            return Err("CRIME interrupt output must match enabled interrupt state");
+        }
+        Ok(())
     }
 
     /// Reads a defined PIU register.
