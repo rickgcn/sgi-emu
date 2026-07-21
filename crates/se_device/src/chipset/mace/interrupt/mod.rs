@@ -23,8 +23,16 @@ pub enum MaceInterruptGroup {
 }
 
 /// Internal interrupt state and last values posted to CRIME.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaceInterruptController {
+    peripheral_status: u32,
+    peripheral_mask: u32,
+    groups: u16,
+    posted: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct MaceInterruptControllerState {
     peripheral_status: u32,
     peripheral_mask: u32,
     groups: u16,
@@ -39,6 +47,36 @@ impl MaceInterruptController {
             groups: 0,
             posted: 0,
         }
+    }
+
+    pub(super) fn save_state(&self) -> MaceInterruptControllerState {
+        MaceInterruptControllerState {
+            peripheral_status: self.peripheral_status,
+            peripheral_mask: self.peripheral_mask,
+            groups: self.groups,
+            posted: self.posted,
+        }
+    }
+
+    pub(super) fn validate_state(state: &MaceInterruptControllerState) -> Result<(), &'static str> {
+        let active = state.peripheral_status & state.peripheral_mask;
+        let expected = u16::from(active & 0x0000_00ff != 0) << MaceInterruptGroup::Audio as u8
+            | u16::from(active & 0x0000_ff00 != 0) << MaceInterruptGroup::Miscellaneous as u8
+            | u16::from(active & 0xffff_0000 != 0) << MaceInterruptGroup::SerialParallel as u8;
+        let peripheral_groups = (1 << MaceInterruptGroup::Audio as u8)
+            | (1 << MaceInterruptGroup::Miscellaneous as u8)
+            | (1 << MaceInterruptGroup::SerialParallel as u8);
+        if state.groups & peripheral_groups != expected {
+            return Err("MACE peripheral interrupt groups must match status and mask registers");
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_state(&mut self, state: MaceInterruptControllerState) {
+        self.peripheral_status = state.peripheral_status;
+        self.peripheral_mask = state.peripheral_mask;
+        self.groups = state.groups;
+        self.posted = state.posted;
     }
 
     pub const fn peripheral_status(&self) -> u32 {

@@ -19,8 +19,18 @@ pub struct MaceUstProjection {
 }
 
 /// MACE 32-bit UST and three compare registers.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaceTimers {
+    timebase_hz: u64,
+    base_time: SimTime,
+    base_ust: u32,
+    compare: [u32; 3],
+    pending: [bool; 3],
+    media: [(u32, u32); 6],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct MaceTimersState {
     timebase_hz: u64,
     base_time: SimTime,
     base_ust: u32,
@@ -111,11 +121,65 @@ impl MaceTimers {
         self.media[index].0 = self.ust(now);
         self.media[index].1 = self.media[index].1.wrapping_add(1);
     }
+
+    pub(super) fn save_state(&self) -> MaceTimersState {
+        MaceTimersState {
+            timebase_hz: self.timebase_hz,
+            base_time: self.base_time,
+            base_ust: self.base_ust,
+            compare: self.compare,
+            pending: self.pending,
+            media: self.media,
+        }
+    }
+
+    pub(super) const fn configuration_matches(&self, state: &MaceTimersState) -> bool {
+        self.timebase_hz == state.timebase_hz
+    }
+
+    pub(super) fn validate_state(
+        state: &MaceTimersState,
+        now: SimTime,
+    ) -> Result<(), &'static str> {
+        if state.timebase_hz == 0 || state.base_time > now {
+            return Err("MACE timer timebase and anchor must be valid");
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_state(&mut self, state: MaceTimersState) {
+        self.base_time = state.base_time;
+        self.base_ust = state.base_ust;
+        self.compare = state.compare;
+        self.pending = state.pending;
+        self.media = state.media;
+    }
 }
 
 /// One integrated PS/2 controller.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ps2Port {
+    controller: se_core::component::ComponentId,
+    bus: se_core::component::ComponentId,
+    timebase_hz: u64,
+    now: SimTime,
+    epoch: u64,
+    transmit: Option<u8>,
+    receive: Option<u8>,
+    control: u8,
+    parity_error: bool,
+    framing_error: bool,
+    post_transmit_inhibit: bool,
+    transfer: Ps2ControllerTransfer,
+    observed_clock_low: bool,
+    observed_data_low: bool,
+    output_clock_low: bool,
+    output_data_low: bool,
+    actions: std::collections::VecDeque<Ps2PortAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct Ps2PortState {
     controller: se_core::component::ComponentId,
     bus: se_core::component::ComponentId,
     timebase_hz: u64,
@@ -366,6 +430,91 @@ impl Ps2Port {
         self.actions.pop_front()
     }
 
+    pub(super) fn save_state(&self) -> Ps2PortState {
+        Ps2PortState {
+            controller: self.controller,
+            bus: self.bus,
+            timebase_hz: self.timebase_hz,
+            now: self.now,
+            epoch: self.epoch,
+            transmit: self.transmit,
+            receive: self.receive,
+            control: self.control,
+            parity_error: self.parity_error,
+            framing_error: self.framing_error,
+            post_transmit_inhibit: self.post_transmit_inhibit,
+            transfer: self.transfer,
+            observed_clock_low: self.observed_clock_low,
+            observed_data_low: self.observed_data_low,
+            output_clock_low: self.output_clock_low,
+            output_data_low: self.output_data_low,
+            actions: self.actions.clone(),
+        }
+    }
+
+    pub(super) fn configuration_matches(&self, state: &Ps2PortState) -> bool {
+        self.controller == state.controller
+            && self.bus == state.bus
+            && self.timebase_hz == state.timebase_hz
+    }
+
+    pub(super) fn validate_state(&self, current_time: SimTime) -> Result<(), &'static str> {
+        if self.timebase_hz == 0 || self.now > current_time || self.control & !0x3f != 0 {
+            return Err("MACE PS/2 control and timebase must be valid");
+        }
+        let transfer_valid = match self.transfer {
+            Ps2ControllerTransfer::Idle => true,
+            Ps2ControllerTransfer::RequestToSend | Ps2ControllerTransfer::AwaitAcknowledge => {
+                self.transmit.is_some()
+            }
+            Ps2ControllerTransfer::Transmit { bit } => bit <= 10 && self.transmit.is_some(),
+            Ps2ControllerTransfer::Receive {
+                bit, parity_ones, ..
+            } => (1..=10).contains(&bit) && parity_ones <= 9,
+        };
+        if !transfer_valid {
+            return Err("MACE PS/2 transfer state and bit counters must agree");
+        }
+        if self.actions.iter().any(|action| match action {
+            Ps2PortAction::Schedule { delay, epoch } => {
+                *epoch != self.epoch || *delay != SimDuration::new(self.timebase_hz / 10_000)
+            }
+            Ps2PortAction::Drive { bus, drive } => {
+                *bus != self.bus || drive.source != self.controller || drive.time > self.now
+            }
+        }) {
+            return Err("MACE PS/2 actions must use the configured bus and controller");
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_saved_state(
+        &self,
+        state: &Ps2PortState,
+        current_time: SimTime,
+    ) -> Result<(), &'static str> {
+        let mut candidate = self.clone();
+        candidate.restore_state(state.clone());
+        candidate.validate_state(current_time)
+    }
+
+    pub(super) fn restore_state(&mut self, state: Ps2PortState) {
+        self.now = state.now;
+        self.epoch = state.epoch;
+        self.transmit = state.transmit;
+        self.receive = state.receive;
+        self.control = state.control;
+        self.parity_error = state.parity_error;
+        self.framing_error = state.framing_error;
+        self.post_transmit_inhibit = state.post_transmit_inhibit;
+        self.transfer = state.transfer;
+        self.observed_clock_low = state.observed_clock_low;
+        self.observed_data_low = state.observed_data_low;
+        self.output_clock_low = state.output_clock_low;
+        self.output_data_low = state.output_data_low;
+        self.actions = state.actions;
+    }
+
     fn try_start_transmit(&mut self) {
         if self.transmit.is_some()
             && self.control & 2 != 0
@@ -446,11 +595,18 @@ fn ps2_serial_frame(byte: u8) -> u16 {
 }
 
 /// One MACE I2C controller register set.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct I2cPort {
     pub config: u8,
     pub control: u8,
     pub data: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct I2cPortState {
+    config: u8,
+    control: u8,
+    data: u8,
 }
 
 impl I2cPort {
@@ -483,6 +639,27 @@ impl I2cPort {
             self.control |= 0x80;
         }
     }
+
+    pub(super) const fn save_state(self) -> I2cPortState {
+        I2cPortState {
+            config: self.config,
+            control: self.control,
+            data: self.data,
+        }
+    }
+
+    pub(super) fn validate_state(state: I2cPortState) -> Result<(), &'static str> {
+        if state.config & !0x3f != 0 || state.control & !0xbf != 0 {
+            return Err("MACE I2C registers must use implemented bit encodings");
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_state(&mut self, state: I2cPortState) {
+        self.config = state.config;
+        self.control = state.control;
+        self.data = state.data;
+    }
 }
 
 impl Default for I2cPort {
@@ -492,7 +669,7 @@ impl Default for I2cPort {
 }
 
 /// ISA control, DP-RAM, and DMA ring base state.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IsaController {
     pub ring_base_reset: u32,
     misc: u16,
@@ -500,6 +677,16 @@ pub struct IsaController {
     pub dp_ram: Vec<u8>,
     pub parallel: ParallelDma,
     pub serial_dma: [PeripheralDmaChannel; 4],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct IsaControllerState {
+    ring_base_reset: u32,
+    misc: u16,
+    nic_line_high: bool,
+    dp_ram: Vec<u8>,
+    parallel: ParallelDma,
+    serial_dma: [PeripheralDmaChannel; 4],
 }
 
 impl IsaController {
@@ -541,6 +728,42 @@ impl IsaController {
     }
     pub const fn dp_ram_write_enabled(&self) -> bool {
         self.misc & (1 << 6) != 0
+    }
+
+    pub(super) fn save_state(&self) -> IsaControllerState {
+        IsaControllerState {
+            ring_base_reset: self.ring_base_reset,
+            misc: self.misc,
+            nic_line_high: self.nic_line_high,
+            dp_ram: self.dp_ram.clone(),
+            parallel: self.parallel,
+            serial_dma: self.serial_dma,
+        }
+    }
+
+    pub(super) fn validate_state(state: &IsaControllerState) -> Result<(), &'static str> {
+        if state.dp_ram.len() != 8192
+            || state.ring_base_reset & !0xffff_8001 != 0
+            || state.misc & !0x01f5 != 0
+            || state.parallel.control & !0x1f != 0
+            || state.serial_dma.iter().any(|channel| {
+                channel.control & !0x06e0 != 0
+                    || channel.read_pointer & !0x0fe0 != 0
+                    || channel.write_pointer & !0x0fe0 != 0
+            })
+        {
+            return Err("MACE ISA RAM, control, and DMA rings must have valid shapes");
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_state(&mut self, state: IsaControllerState) {
+        self.ring_base_reset = state.ring_base_reset;
+        self.misc = state.misc;
+        self.nic_line_high = state.nic_line_high;
+        self.dp_ram = state.dp_ram;
+        self.parallel = state.parallel;
+        self.serial_dma = state.serial_dma;
     }
 }
 

@@ -12,7 +12,7 @@ pub enum VideoPixelFormat {
 }
 
 /// One video channel register set.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VideoChannel {
     pub output: bool,
     pub control: u16,
@@ -24,6 +24,20 @@ pub struct VideoChannel {
     pub geometry: [u64; 6],
     pub descriptors: [u64; 8],
     pub field_counter: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct VideoChannelState {
+    output: bool,
+    control: u16,
+    status: u16,
+    config: u32,
+    next_descriptor: u32,
+    field_offset: u16,
+    line_or_field_size: u32,
+    geometry: [u64; 6],
+    descriptors: [u64; 8],
+    field_counter: u32,
 }
 
 impl VideoChannel {
@@ -44,6 +58,56 @@ impl VideoChannel {
 
     pub fn reset(&mut self) {
         *self = Self::new(self.output);
+    }
+
+    pub(super) fn save_state(&self) -> VideoChannelState {
+        VideoChannelState {
+            output: self.output,
+            control: self.control,
+            status: self.status,
+            config: self.config,
+            next_descriptor: self.next_descriptor,
+            field_offset: self.field_offset,
+            line_or_field_size: self.line_or_field_size,
+            geometry: self.geometry,
+            descriptors: self.descriptors,
+            field_counter: self.field_counter,
+        }
+    }
+
+    pub(super) const fn configuration_matches(&self, state: &VideoChannelState) -> bool {
+        self.output == state.output
+    }
+
+    pub(super) fn validate_state(state: &VideoChannelState) -> Result<(), &'static str> {
+        let config_mask = if state.output {
+            0x003f_ffff
+        } else {
+            0x0001_ffff
+        };
+        let size_mask = if state.output { 0x003f_ffff } else { 0x0ff8 };
+        if state.control & !0x03ff != 0
+            || state.status & !0x07ff != 0
+            || state.config & !config_mask != 0
+            || state.next_descriptor & !0xffff_ffc7 != 0
+            || state.field_offset & !0xfff8 != 0
+            || state.line_or_field_size & !size_mask != 0
+        {
+            return Err("MACE video registers must use implemented bit encodings");
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_state(&mut self, state: VideoChannelState) {
+        self.control = state.control;
+        self.status = state.status;
+        self.config = state.config;
+        self.next_descriptor = state.next_descriptor;
+        self.field_offset = state.field_offset;
+        self.line_or_field_size = state.line_or_field_size;
+        self.geometry = state.geometry;
+        self.descriptors = state.descriptors;
+        self.field_counter = state.field_counter;
     }
     pub const fn enabled(&self) -> bool {
         self.control & 2 != 0 && self.control & 1 == 0

@@ -12,7 +12,9 @@
 use core::fmt;
 use std::collections::VecDeque;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::scheduler::SimTime;
 use se_core::tracing::{
@@ -34,15 +36,18 @@ use crate::chipset::crime::protocol::{
     CrimeTransactionId, CrimeTransfer, CrimeTransferView,
 };
 
-use self::audio::MaceAudio;
+use self::audio::{MaceAudio, MaceAudioState};
 use self::config::MaceConfig;
-use self::ethernet::MaceEthernet;
-use self::interrupt::{MaceInterruptController, MaceInterruptGroup};
-use self::pci::MacePci;
-use self::peripheral::{I2cPort, IsaController, MaceTimers, Ps2Port, Ps2PortAction};
+use self::ethernet::{MaceEthernet, MaceEthernetState};
+use self::interrupt::{MaceInterruptController, MaceInterruptControllerState, MaceInterruptGroup};
+use self::pci::{MacePci, MacePciState};
+use self::peripheral::{
+    I2cPort, I2cPortState, IsaController, IsaControllerState, MaceTimers, MaceTimersState, Ps2Port,
+    Ps2PortAction, Ps2PortState,
+};
 use self::protocol::{MaceAction, MaceEvent, MacePoll, MaceWiring};
 use self::system::{MaceAddressTarget, MaceExternalIsaTarget};
-use self::video::VideoChannel;
+use self::video::{VideoChannel, VideoChannelState};
 use crate::common::pending::{InlineMap16, InlineSet16};
 
 pub mod audio;
@@ -133,7 +138,7 @@ type PendingPciTable = InlineMap16<CrimeTransactionId, PendingPci>;
 type PendingCmiSet = InlineSet16<CrimeTransactionId>;
 
 /// MACE 2.0 component.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mace {
     id: ComponentId,
     name: String,
@@ -143,9 +148,7 @@ pub struct Mace {
     now: SimTime,
     epoch: u64,
     next_transaction_id: u128,
-    #[serde(skip)]
     actions: VecDeque<MaceAction>,
-    #[serde(skip, default = "default_trace_interest")]
     trace_interest: TraceInterest,
     pending_isa: PendingIsaTable,
     pending_pci: PendingPciTable,
@@ -164,10 +167,31 @@ pub struct Mace {
     host_outputs: VecDeque<MediaTransaction>,
 }
 
-se_core::component_state!(MaceState, Mace);
-
-const fn default_trace_interest() -> TraceInterest {
-    TraceInterest::All
+/// Serializable dynamic state of the MACE chipset.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct MaceState {
+    id: ComponentId,
+    config: MaceConfig,
+    wiring: MaceWiring,
+    timebase_hz: u64,
+    now: SimTime,
+    epoch: u64,
+    next_transaction_id: u128,
+    pending_isa: PendingIsaTable,
+    pending_pci: PendingPciTable,
+    pending_cmi: PendingCmiSet,
+    terminal_error: Option<MaceError>,
+    interrupts: MaceInterruptControllerState,
+    timers: MaceTimersState,
+    isa: IsaControllerState,
+    ps2: [Ps2PortState; 2],
+    i2c: [I2cPortState; 2],
+    audio: MaceAudioState,
+    ethernet: MaceEthernetState,
+    video: [VideoChannelState; 3],
+    pci: MacePciState,
+    host_inputs: VecDeque<MediaTransaction>,
+    host_outputs: VecDeque<MediaTransaction>,
 }
 
 impl Mace {
@@ -216,6 +240,214 @@ impl Mace {
             host_inputs: VecDeque::new(),
             host_outputs: VecDeque::new(),
         })
+    }
+
+    /// Captures MACE's dynamic hardware state.
+    pub fn save_state(&self) -> MaceState {
+        MaceState {
+            id: self.id,
+            config: self.config,
+            wiring: self.wiring,
+            timebase_hz: self.timebase_hz,
+            now: self.now,
+            epoch: self.epoch,
+            next_transaction_id: self.next_transaction_id,
+            pending_isa: self.pending_isa.clone(),
+            pending_pci: self.pending_pci.clone(),
+            pending_cmi: self.pending_cmi.clone(),
+            terminal_error: self.terminal_error.clone(),
+            interrupts: self.interrupts.save_state(),
+            timers: self.timers.save_state(),
+            isa: self.isa.save_state(),
+            ps2: self.ps2.each_ref().map(|port| port.save_state()),
+            i2c: self.i2c.map(I2cPort::save_state),
+            audio: self.audio.save_state(),
+            ethernet: self.ethernet.save_state(),
+            video: self.video.each_ref().map(|channel| channel.save_state()),
+            pci: self.pci.save_state(),
+            host_inputs: self.host_inputs.clone(),
+            host_outputs: self.host_outputs.clone(),
+        }
+    }
+
+    /// Restores dynamic state after validating configuration and internal relationships.
+    pub fn restore_state(&mut self, state: MaceState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        for (matches, field) in [
+            (self.config == state.config, "config"),
+            (self.wiring == state.wiring, "wiring"),
+            (self.timebase_hz == state.timebase_hz, "timebase_hz"),
+            (
+                self.timers.configuration_matches(&state.timers),
+                "timer timebase",
+            ),
+            (
+                self.ps2
+                    .iter()
+                    .zip(&state.ps2)
+                    .all(|(current, saved)| current.configuration_matches(saved)),
+                "PS/2 port wiring",
+            ),
+            (
+                self.audio.configuration_matches(&state.audio),
+                "audio channel topology",
+            ),
+            (
+                self.video
+                    .iter()
+                    .zip(&state.video)
+                    .all(|(current, saved)| current.configuration_matches(saved)),
+                "video channel topology",
+            ),
+            (
+                self.ethernet.configuration_matches(&state.ethernet),
+                "Ethernet PHY identity",
+            ),
+        ] {
+            if !matches {
+                return Err(ComponentStateError::ConfigurationMismatch {
+                    component: self.id,
+                    field,
+                });
+            }
+        }
+        let validate = |result: Result<(), &'static str>| {
+            result.map_err(|invariant| ComponentStateError::InvalidState {
+                component: self.id,
+                invariant,
+            })
+        };
+        validate(MaceInterruptController::validate_state(&state.interrupts))?;
+        validate(MaceTimers::validate_state(&state.timers, state.now))?;
+        validate(IsaController::validate_state(&state.isa))?;
+        for (current, saved) in self.ps2.iter().zip(&state.ps2) {
+            validate(current.validate_saved_state(saved, state.now))?;
+        }
+        for port in state.i2c {
+            validate(I2cPort::validate_state(port))?;
+        }
+        validate(MaceAudio::validate_state(&state.audio))?;
+        validate(MaceEthernet::validate_state(&state.ethernet))?;
+        for channel in &state.video {
+            validate(VideoChannel::validate_state(channel))?;
+        }
+        if state.pending_isa.len() > 16
+            || state.pending_pci.len() > 16
+            || state.pending_cmi.len() > 16
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "MACE pending transaction tables must fit their fixed capacity",
+            });
+        }
+        let isa_ids: std::collections::BTreeSet<_> =
+            state.pending_isa.iter().map(|(id, _)| *id).collect();
+        let pci_ids: std::collections::BTreeSet<_> =
+            state.pending_pci.iter().map(|(id, _)| *id).collect();
+        let cmi_ids: std::collections::BTreeSet<_> = state.pending_cmi.iter().copied().collect();
+        let isa_cmi_ids: std::collections::BTreeSet<_> = state
+            .pending_isa
+            .iter()
+            .map(|(_, pending)| pending.cmi_id)
+            .collect();
+        if isa_ids.len() != state.pending_isa.len()
+            || pci_ids.len() != state.pending_pci.len()
+            || cmi_ids.len() != state.pending_cmi.len()
+            || isa_cmi_ids.len() != state.pending_isa.len()
+            || isa_ids
+                .iter()
+                .any(|id| cmi_ids.iter().any(|cmi_id| cmi_id.get() == id.get()))
+            || isa_cmi_ids.iter().any(|id| pci_ids.contains(id))
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "MACE transaction identifiers must be unique and unambiguous",
+            });
+        }
+        if isa_ids
+            .iter()
+            .any(|id| id.get() >= state.next_transaction_id)
+            || cmi_ids
+                .iter()
+                .any(|id| id.get() >= state.next_transaction_id)
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "MACE-owned transaction identifiers must precede the allocation cursor",
+            });
+        }
+        if state.pending_pci.iter().any(|(_, pending)| {
+            pending.transfer_length == 0
+                || pending.transfer_length > if pending.configuration_cycle { 4 } else { 8 }
+                || !matches!(
+                    pending.command,
+                    PciCommand::IoRead
+                        | PciCommand::IoWrite
+                        | PciCommand::MemoryRead
+                        | PciCommand::MemoryWrite
+                        | PciCommand::ConfigurationRead
+                        | PciCommand::ConfigurationWrite
+                )
+        }) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "MACE pending PCI transfers must have supported commands and lengths",
+            });
+        }
+        let capacity = |port| match port {
+            MediaPort::Ethernet => state.config.ports.ethernet_frames,
+            MediaPort::AudioInput | MediaPort::AudioOutput1 | MediaPort::AudioOutput2 => {
+                state.config.ports.audio_sample_pairs
+            }
+            MediaPort::VideoInputAb | MediaPort::VideoInputCd | MediaPort::VideoOutput => {
+                state.config.ports.video_fields
+            }
+            _ => state.config.ports.byte_stream_bytes,
+        };
+        let queue_is_reachable = |queue: &VecDeque<MediaTransaction>, input: bool| {
+            queue.iter().enumerate().all(|(index, transaction)| {
+                index < capacity(transaction.port)
+                    && (!input
+                        || !matches!(transaction.port, MediaPort::Keyboard | MediaPort::Mouse))
+            })
+        };
+        if !queue_is_reachable(&state.host_inputs, true)
+            || !queue_is_reachable(&state.host_outputs, false)
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "MACE host queues must be reachable under configured port capacities",
+            });
+        }
+
+        let mut restored = self.clone();
+        restored.now = state.now;
+        restored.epoch = state.epoch;
+        restored.next_transaction_id = state.next_transaction_id;
+        restored.pending_isa = state.pending_isa;
+        restored.pending_pci = state.pending_pci;
+        restored.pending_cmi = state.pending_cmi;
+        restored.terminal_error = state.terminal_error;
+        restored.interrupts.restore_state(state.interrupts);
+        restored.timers.restore_state(state.timers);
+        restored.isa.restore_state(state.isa);
+        for (current, saved) in restored.ps2.iter_mut().zip(state.ps2) {
+            current.restore_state(saved);
+        }
+        for (current, saved) in restored.i2c.iter_mut().zip(state.i2c) {
+            current.restore_state(saved);
+        }
+        restored.audio.restore_state(state.audio);
+        restored.ethernet.restore_state(state.ethernet);
+        for (current, saved) in restored.video.iter_mut().zip(state.video) {
+            current.restore_state(saved);
+        }
+        restored.pci.restore_state(state.pci);
+        restored.host_inputs = state.host_inputs;
+        restored.host_outputs = state.host_outputs;
+        restored.actions.clear();
+        *self = restored;
+        Ok(())
     }
 
     /// Observes the current simulation time before accepting work.

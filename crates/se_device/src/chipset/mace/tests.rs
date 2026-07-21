@@ -1,4 +1,4 @@
-use se_core::component::{Component, ComponentId};
+use se_core::component::{Component, ComponentId, ComponentStateError};
 use se_core::role::{BusControllerRole, BusDeviceRole};
 use se_core::tracing::TraceInterest;
 
@@ -90,6 +90,46 @@ fn component_reset_restores_revision_register() {
     .expect("MACE must build");
     mace.reset();
     assert_eq!(mace.id(), component(15));
+}
+
+#[test]
+fn state_restore_preserves_name_and_rejects_config_and_invalid_queues_atomically() {
+    let id = component(15);
+    let source = Mace::new(id, "source", MaceConfig::default(), wiring(), 1_000_000_000)
+        .expect("MACE must build");
+    let mut target = Mace::new(id, "target", MaceConfig::default(), wiring(), 1_000_000_000)
+        .expect("MACE must build");
+
+    target.restore_state(source.save_state()).unwrap();
+    assert_eq!(target.name(), "target");
+
+    let mut incompatible_config = MaceConfig::default();
+    incompatible_config.ports.ethernet_frames += 1;
+    let incompatible = Mace::new(id, "foreign", incompatible_config, wiring(), 1_000_000_000)
+        .expect("MACE must build")
+        .save_state();
+    let before = target.clone();
+    assert!(matches!(
+        target.restore_state(incompatible),
+        Err(ComponentStateError::ConfigurationMismatch {
+            component,
+            field: "config"
+        }) if component == id
+    ));
+    assert_eq!(target, before);
+
+    let mut malformed = source.save_state();
+    malformed.host_inputs.push_back(MediaTransaction {
+        source: component(16),
+        target: id,
+        port: MediaPort::Keyboard,
+        payload: MediaPayload::Bytes(vec![0xaa]),
+    });
+    assert!(matches!(
+        target.restore_state(malformed),
+        Err(ComponentStateError::InvalidState { component, .. }) if component == id
+    ));
+    assert_eq!(target, before);
 }
 
 #[test]

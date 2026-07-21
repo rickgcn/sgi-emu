@@ -30,7 +30,7 @@ pub struct ReceiveStatus {
 }
 
 /// MACE Fast Ethernet interface.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaceEthernet {
     pub mac_control: u32,
     pub interrupt_status: u32,
@@ -44,6 +44,28 @@ pub struct MaceEthernet {
     pub rx_clusters: VecDeque<u32>,
     pub sequence: u8,
     pub last_tx_vector: u64,
+    phy_address: u16,
+    phy_data: u16,
+    phy_busy: bool,
+    phy_operation: Option<PhyOperation>,
+    phy_registers: [u16; 32],
+    backoff_state: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct MaceEthernetState {
+    mac_control: u32,
+    interrupt_status: u32,
+    dma_control: u16,
+    interrupt_delay: u8,
+    tx_info: u32,
+    station_address: [u8; 6],
+    secondary_address: [u8; 6],
+    multicast_filter: u64,
+    tx_ring_base: u32,
+    rx_clusters: VecDeque<u32>,
+    sequence: u8,
+    last_tx_vector: u64,
     phy_address: u16,
     phy_data: u16,
     phy_busy: bool,
@@ -81,6 +103,71 @@ impl MaceEthernet {
 
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    pub(super) fn save_state(&self) -> MaceEthernetState {
+        MaceEthernetState {
+            mac_control: self.mac_control,
+            interrupt_status: self.interrupt_status,
+            dma_control: self.dma_control,
+            interrupt_delay: self.interrupt_delay,
+            tx_info: self.tx_info,
+            station_address: self.station_address,
+            secondary_address: self.secondary_address,
+            multicast_filter: self.multicast_filter,
+            tx_ring_base: self.tx_ring_base,
+            rx_clusters: self.rx_clusters.clone(),
+            sequence: self.sequence,
+            last_tx_vector: self.last_tx_vector,
+            phy_address: self.phy_address,
+            phy_data: self.phy_data,
+            phy_busy: self.phy_busy,
+            phy_operation: self.phy_operation,
+            phy_registers: self.phy_registers,
+            backoff_state: self.backoff_state,
+        }
+    }
+
+    pub(super) fn configuration_matches(&self, state: &MaceEthernetState) -> bool {
+        self.phy_registers[2..=3] == state.phy_registers[2..=3]
+    }
+
+    pub(super) fn validate_state(state: &MaceEthernetState) -> Result<(), &'static str> {
+        if state.interrupt_delay & !0x3f != 0
+            || state.phy_address & !0x03ff != 0
+            || state.phy_busy != state.phy_operation.is_some()
+            || state.rx_clusters.len() > 16
+            || state.rx_clusters.iter().any(|address| address & 0xfff != 0)
+            || state.sequence & !0x1f != 0
+            || state.backoff_state & !0x07ff != 0
+        {
+            return Err("MACE Ethernet queues and PHY state must be valid");
+        }
+        Ok(())
+    }
+
+    pub(super) fn restore_state(&mut self, state: MaceEthernetState) {
+        let identity = [self.phy_registers[2], self.phy_registers[3]];
+        self.mac_control = state.mac_control;
+        self.interrupt_status = state.interrupt_status;
+        self.dma_control = state.dma_control;
+        self.interrupt_delay = state.interrupt_delay;
+        self.tx_info = state.tx_info;
+        self.station_address = state.station_address;
+        self.secondary_address = state.secondary_address;
+        self.multicast_filter = state.multicast_filter;
+        self.tx_ring_base = state.tx_ring_base;
+        self.rx_clusters = state.rx_clusters;
+        self.sequence = state.sequence;
+        self.last_tx_vector = state.last_tx_vector;
+        self.phy_address = state.phy_address;
+        self.phy_data = state.phy_data;
+        self.phy_busy = state.phy_busy;
+        self.phy_operation = state.phy_operation;
+        self.phy_registers = state.phy_registers;
+        self.backoff_state = state.backoff_state;
+        self.phy_registers[2] = identity[0];
+        self.phy_registers[3] = identity[1];
     }
     pub const fn interrupt(&self) -> bool {
         self.interrupt_status & 0xff != 0

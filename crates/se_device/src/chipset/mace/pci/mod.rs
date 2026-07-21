@@ -35,13 +35,22 @@ pub mod error {
 }
 
 /// MACE PCI host bridge state.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MacePci {
     pub error_address: u32,
     pub error_flags: u32,
     pub control: u32,
     pub config_address: u32,
     pub prefetch_valid: [bool; 16],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct MacePciState {
+    error_address: u32,
+    error_flags: u32,
+    control: u32,
+    config_address: u32,
+    prefetch_valid: [bool; 16],
 }
 
 impl MacePci {
@@ -53,6 +62,22 @@ impl MacePci {
             config_address: 0,
             prefetch_valid: [false; 16],
         }
+    }
+    pub(super) fn save_state(&self) -> MacePciState {
+        MacePciState {
+            error_address: self.error_address,
+            error_flags: self.error_flags,
+            control: self.control,
+            config_address: self.config_address,
+            prefetch_valid: self.prefetch_valid,
+        }
+    }
+    pub(super) fn restore_state(&mut self, state: MacePciState) {
+        self.error_address = state.error_address;
+        self.error_flags = state.error_flags;
+        self.control = state.control;
+        self.config_address = state.config_address;
+        self.prefetch_valid = state.prefetch_valid;
     }
     pub fn reset(&mut self) {
         *self = Self::new();
