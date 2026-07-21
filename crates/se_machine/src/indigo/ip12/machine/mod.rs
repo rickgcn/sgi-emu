@@ -14,6 +14,16 @@ use super::component_ids;
 use super::event::Ip12Event;
 
 /// SGI Indigo IP12 machine shell.
+///
+/// Mutable runtime access is intentionally unavailable so machine-level
+/// invariants remain owned by this type.
+///
+/// ```compile_fail
+/// use se_machine::indigo::ip12::machine::Ip12Machine;
+///
+/// let mut machine = Ip12Machine::new();
+/// let _ = machine.runtime_mut();
+/// ```
 pub struct Ip12Machine<S = NoopTraceSink> {
     runtime: Runtime<Ip12Event, S>,
 }
@@ -42,11 +52,6 @@ impl<S> Ip12Machine<S> {
     /// Returns an immutable runtime reference.
     pub const fn runtime(&self) -> &Runtime<Ip12Event, S> {
         &self.runtime
-    }
-
-    /// Returns a mutable runtime reference.
-    pub const fn runtime_mut(&mut self) -> &mut Runtime<Ip12Event, S> {
-        &mut self.runtime
     }
 
     /// Consumes the machine shell and returns the owned runtime.

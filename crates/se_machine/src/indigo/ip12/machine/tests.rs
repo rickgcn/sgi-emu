@@ -12,7 +12,7 @@ fn schedule_power_on_queues_zero_time_event() {
     let mut machine = Ip12Machine::new();
 
     machine.schedule_power_on().unwrap();
-    let event = machine.runtime_mut().scheduler_mut().pop_next().unwrap();
+    let event = machine.runtime.scheduler_mut().pop_next().unwrap();
 
     assert_eq!(event.time, SimTime::ZERO);
     assert_eq!(event.target, component_ids::MACHINE);

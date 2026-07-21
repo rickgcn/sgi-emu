@@ -897,6 +897,19 @@ pub struct Ip32JitPerformanceSnapshot {
 }
 
 /// SGI O2 IP32 machine with runtime-owned hardware components.
+///
+/// Mutable runtime access is intentionally unavailable because the cached
+/// component slots require the constructed topology to remain fixed.
+///
+/// ```compile_fail
+/// use se_machine::o2::ip32::{component_ids, machine::Ip32Machine};
+///
+/// let mut machine = Ip32Machine::new();
+/// machine
+///     .runtime_mut()
+///     .registry_mut()
+///     .remove(component_ids::CPU0);
+/// ```
 pub struct Ip32Machine<S = NoopTraceSink> {
     runtime: Runtime<Ip32Event, S>,
     control: MachineControl,
@@ -1335,11 +1348,6 @@ impl<S> Ip32Machine<S> {
     /// Returns an immutable runtime reference.
     pub const fn runtime(&self) -> &Runtime<Ip32Event, S> {
         &self.runtime
-    }
-
-    /// Returns a mutable runtime reference.
-    pub const fn runtime_mut(&mut self) -> &mut Runtime<Ip32Event, S> {
-        &mut self.runtime
     }
 
     /// Consumes the machine and returns the owned runtime.

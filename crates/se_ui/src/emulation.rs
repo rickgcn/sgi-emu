@@ -1827,19 +1827,8 @@ fn lock_state(shared: &SharedController) -> std::sync::MutexGuard<'_, Controller
 mod tests {
     use std::time::{Duration, Instant};
 
-    use se_core::role::BusDeviceRole;
     use se_core::scheduler::SimTime;
-    use se_device::chipset::{
-        crime::protocol::{
-            CrimeByteEnable, CrimeCgiTransaction, CrimeCompletionPayload, CrimeLinkDeviceResponse,
-            CrimeLinkOperation, CrimePioRequest, CrimeTransactionId, CrimeTransfer,
-        },
-        gbe::{
-            Gbe,
-            protocol::{GbeAction, GbePoll},
-        },
-    };
-    use se_machine::o2::ip32::{component_ids, machine::Ip32MachineConfig};
+    use se_machine::o2::ip32::{component_ids, event::Ip32Event, machine::Ip32MachineConfig};
 
     use super::*;
 
@@ -1929,7 +1918,7 @@ mod tests {
     }
 
     #[test]
-    fn crt_display_connection_applies_inputs_after_power_on() {
+    fn crt_display_connection_schedules_inputs_after_power_on() {
         let mut prom = vec![0; IP32_PROM_IMAGE_SIZE_BYTES];
         prom[..4].copy_from_slice(&WAIT.to_be_bytes());
         let config = Ip32MachineConfig {
@@ -1940,73 +1929,29 @@ mod tests {
             Ip32Machine::from_config_with_trace_sink(config, UiTraceSink::application()).unwrap();
         machine.schedule_power_on().unwrap();
         connect_crt_display(&mut machine).unwrap();
-        machine.run_steps(3).unwrap();
 
-        let gbe = machine
-            .runtime_mut()
-            .registry_mut()
-            .get_typed_mut::<Gbe>(component_ids::GBE)
-            .unwrap();
-        let response = gbe.accept(CrimeCgiTransaction {
-            id: CrimeTransactionId::new(1),
-            controller: component_ids::CRIME,
-            target: component_ids::GBE,
-            operation: CrimeLinkOperation::Pio(CrimePioRequest {
-                address: 0x1600_0000,
-                transfer: CrimeTransfer::read(4),
-            }),
-        });
-        let CrimeLinkDeviceResponse::Complete(completion) = response else {
-            panic!("GBE control status read was unexpectedly deferred");
-        };
-        let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap() else {
-            panic!("GBE control status read returned the wrong payload");
-        };
-        let control_status = u32::from_be_bytes(data.as_ref().try_into().unwrap());
-        assert_eq!(control_status & (1 << 4), 0);
-
-        for (id, address, value) in [(2, 0x1603_000c, 1_u32), (3, 0x1601_0000, 0)] {
-            let response = gbe.accept(CrimeCgiTransaction {
-                id: CrimeTransactionId::new(id),
-                controller: component_ids::CRIME,
-                target: component_ids::GBE,
-                operation: CrimeLinkOperation::Pio(CrimePioRequest {
-                    address,
-                    transfer: CrimeTransfer::write(
-                        value.to_be_bytes().into(),
-                        CrimeByteEnable::from([true; 4]),
-                    ),
-                }),
-            });
-            assert!(matches!(response, CrimeLinkDeviceResponse::Complete(_)));
-        }
-        let (delay, event) = loop {
-            let GbePoll::Action(action) = gbe.poll() else {
-                panic!("the connected pixel clock did not schedule GBE timing");
-            };
-            if let GbeAction::Schedule { delay, event } = action {
-                break (delay, event);
-            }
-        };
-        gbe.observe_time(SimTime::new(delay.get()));
-        gbe.handle_event(event);
-
-        let response = gbe.accept(CrimeCgiTransaction {
-            id: CrimeTransactionId::new(4),
-            controller: component_ids::CRIME,
-            target: component_ids::GBE,
-            operation: CrimeLinkOperation::Pio(CrimePioRequest {
-                address: 0x1603_0008,
-                transfer: CrimeTransfer::read(4),
-            }),
-        });
-        let CrimeLinkDeviceResponse::Complete(completion) = response else {
-            panic!("GBE frame control read was unexpectedly deferred");
-        };
-        let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap() else {
-            panic!("GBE frame control read returned the wrong payload");
-        };
-        assert_eq!(u32::from_be_bytes(data.as_ref().try_into().unwrap()), 1);
+        let scheduler = machine.runtime().scheduler().save_state();
+        let events = scheduler.events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].time, SimTime::ZERO);
+        assert_eq!(events[0].target, component_ids::MACHINE);
+        assert_eq!(events[0].payload, Ip32Event::PowerOn);
+        assert_eq!(events[1].time, SimTime::ZERO);
+        assert_eq!(events[1].target, component_ids::GBE);
+        assert_eq!(
+            events[1].payload,
+            Ip32Event::GbeInput(GbeExternalInput::SenseN(false))
+        );
+        assert_eq!(events[2].time, SimTime::ZERO);
+        assert_eq!(events[2].target, component_ids::GBE);
+        assert_eq!(
+            events[2].payload,
+            Ip32Event::GbeInput(GbeExternalInput::PixelClock {
+                source: GbeExternalClock::Ttl,
+                numerator_hz: CRT_INITIAL_PIXEL_CLOCK_HZ,
+                denominator: 1,
+            })
+        );
     }
 
     #[test]

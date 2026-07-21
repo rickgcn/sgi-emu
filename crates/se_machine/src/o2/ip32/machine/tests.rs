@@ -8,19 +8,14 @@ use se_device::chipset::crime::config::{CrimeAccessPolicy, CrimeConfigError, Cri
 use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
 use se_device::chipset::crime::memory::bus::CrimeMemoryBus;
-#[cfg(feature = "jit")]
 use se_device::chipset::crime::protocol::{
-    CrimeByteEnable, CrimeCgiTransaction, CrimeLinkDeviceResponse, CrimeLinkOperation,
-    CrimePioRequest,
-};
-use se_device::chipset::crime::protocol::{
-    CrimeCgiCompletion, CrimeCompletionPayload, CrimeMemoryBankSelect, CrimeMemoryClient,
-    CrimeMemoryTransaction, CrimeTransactionId, CrimeTransfer,
+    CrimeByteEnable, CrimeCgiCompletion, CrimeCgiTransaction, CrimeCompletionPayload,
+    CrimeLinkDeviceResponse, CrimeLinkOperation, CrimeMemoryBankSelect, CrimeMemoryClient,
+    CrimeMemoryTransaction, CrimePioRequest, CrimeTransactionId, CrimeTransfer,
 };
 use se_device::chipset::crime::registers;
 use se_device::chipset::gbe::Gbe;
-#[cfg(feature = "jit")]
-use se_device::chipset::gbe::protocol::{GbeExternalClock, GbeExternalInput};
+use se_device::chipset::gbe::protocol::{GbeAction, GbeExternalClock, GbeExternalInput, GbePoll};
 use se_device::chipset::mace::Mace;
 use se_device::cpu::mips4::gpr::Mips4GprIndex;
 #[cfg(feature = "jit")]
@@ -924,7 +919,7 @@ fn requesting_jit_without_the_feature_is_rejected() {
 }
 
 fn drive_crime_irq(machine: &mut Ip32Machine, asserted: bool) {
-    let registry = machine.runtime_mut().registry_mut();
+    let registry = machine.runtime.registry_mut();
     registry
         .get_typed_mut::<IrqBus>(component_ids::CPU_IRQ_BUS)
         .unwrap()
@@ -956,6 +951,92 @@ fn default_config_matches_the_o2_r5000sc_and_crime_baseline() {
         CrimeAccessPolicy::Strict
     );
     assert_eq!(config.prom_image.len(), IP32_PROM_IMAGE_SIZE_BYTES);
+}
+
+#[test]
+fn scheduled_gbe_external_inputs_apply_after_power_on() {
+    let mut machine = Ip32Machine::from_config(config_with_program(&[(0, WAIT)])).unwrap();
+    machine.schedule_power_on().unwrap();
+    machine
+        .schedule_gbe_external_input(SimTime::ZERO, GbeExternalInput::SenseN(false))
+        .unwrap();
+    machine
+        .schedule_gbe_external_input(
+            SimTime::ZERO,
+            GbeExternalInput::PixelClock {
+                source: GbeExternalClock::Ttl,
+                numerator_hz: 20_000_000,
+                denominator: 1,
+            },
+        )
+        .unwrap();
+    machine.run_steps(3).unwrap();
+
+    let gbe = machine
+        .runtime
+        .registry_mut()
+        .get_typed_mut::<Gbe>(component_ids::GBE)
+        .unwrap();
+    let response = gbe.accept(CrimeCgiTransaction {
+        id: CrimeTransactionId::new(1),
+        controller: component_ids::CRIME,
+        target: component_ids::GBE,
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address: 0x1600_0000,
+            transfer: CrimeTransfer::read(4),
+        }),
+    });
+    let CrimeLinkDeviceResponse::Complete(completion) = response else {
+        panic!("GBE control status read was unexpectedly deferred");
+    };
+    let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap() else {
+        panic!("GBE control status read returned the wrong payload");
+    };
+    let control_status = u32::from_be_bytes(data.as_ref().try_into().unwrap());
+    assert_eq!(control_status & (1 << 4), 0);
+
+    for (id, address, value) in [(2, 0x1603_000c, 1_u32), (3, 0x1601_0000, 0)] {
+        let response = gbe.accept(CrimeCgiTransaction {
+            id: CrimeTransactionId::new(id),
+            controller: component_ids::CRIME,
+            target: component_ids::GBE,
+            operation: CrimeLinkOperation::Pio(CrimePioRequest {
+                address,
+                transfer: CrimeTransfer::write(
+                    value.to_be_bytes().into(),
+                    CrimeByteEnable::from([true; 4]),
+                ),
+            }),
+        });
+        assert!(matches!(response, CrimeLinkDeviceResponse::Complete(_)));
+    }
+    let (delay, event) = loop {
+        let GbePoll::Action(action) = gbe.poll() else {
+            panic!("the connected pixel clock did not schedule GBE timing");
+        };
+        if let GbeAction::Schedule { delay, event } = action {
+            break (delay, event);
+        }
+    };
+    gbe.observe_time(SimTime::new(delay.get()));
+    gbe.handle_event(event);
+
+    let response = gbe.accept(CrimeCgiTransaction {
+        id: CrimeTransactionId::new(4),
+        controller: component_ids::CRIME,
+        target: component_ids::GBE,
+        operation: CrimeLinkOperation::Pio(CrimePioRequest {
+            address: 0x1603_0008,
+            transfer: CrimeTransfer::read(4),
+        }),
+    });
+    let CrimeLinkDeviceResponse::Complete(completion) = response else {
+        panic!("GBE frame control read was unexpectedly deferred");
+    };
+    let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap() else {
+        panic!("GBE frame control read returned the wrong payload");
+    };
+    assert_eq!(u32::from_be_bytes(data.as_ref().try_into().unwrap()), 1);
 }
 
 #[test]
@@ -1429,7 +1510,7 @@ fn cpu_prom_and_ram_accesses_cross_all_required_buses() {
     );
 
     let completion = machine
-        .runtime_mut()
+        .runtime
         .registry_mut()
         .get_typed_mut::<CrimeSdram>(component_ids::RAM)
         .unwrap()
@@ -1794,7 +1875,7 @@ fn synthetic_prom_clears_linear_a_range_through_the_render_memory_client() {
 
     let now = machine.runtime().now();
     let completion = machine
-        .runtime_mut()
+        .runtime
         .registry_mut()
         .get_typed_mut::<CrimeSdram>(component_ids::RAM)
         .unwrap()
@@ -1878,7 +1959,7 @@ fn hard_reset_preserves_sdram_and_advances_the_cpu_generation() {
     assert_eq!(machine.control.cpu_generation, generation + 1);
     let now = machine.runtime().now();
     let completion = machine
-        .runtime_mut()
+        .runtime
         .registry_mut()
         .get_typed_mut::<CrimeSdram>(component_ids::RAM)
         .unwrap()
@@ -2101,7 +2182,7 @@ fn disable_autoload_in_prom_environment(prom_image: &mut [u8]) {
 #[cfg(feature = "jit")]
 fn read_gbe<S: TraceSink>(machine: &mut Ip32Machine<S>, address: u64) -> u32 {
     let gbe = machine
-        .runtime_mut()
+        .runtime
         .registry_mut()
         .get_typed_mut::<Gbe>(component_ids::GBE)
         .unwrap();
@@ -2126,7 +2207,7 @@ fn read_gbe<S: TraceSink>(machine: &mut Ip32Machine<S>, address: u64) -> u32 {
 #[cfg(feature = "jit")]
 fn write_gbe<S: TraceSink>(machine: &mut Ip32Machine<S>, address: u64, value: u32) {
     let gbe = machine
-        .runtime_mut()
+        .runtime
         .registry_mut()
         .get_typed_mut::<Gbe>(component_ids::GBE)
         .unwrap();

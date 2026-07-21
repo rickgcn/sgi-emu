@@ -275,7 +275,7 @@ mod tests {
     use se_device::bus::isa::{
         IsaCompletionPayload, IsaDeviceResponse, IsaTransaction, IsaTransactionId, IsaTransfer,
     };
-    use se_device::memory::flash::SystemFlash;
+    use se_device::memory::flash::{SystemFlash, SystemFlashPersistentState};
     use se_device::rtc::ds1687::state::Ds1687PersistentState;
 
     #[test]
@@ -316,13 +316,18 @@ mod tests {
         let mut config = Ip32MachineConfig::default();
         config.prom_image.fill(0xff);
         config.rtc.nvram[0x20] = 0x3c;
+        let expected_flash = programmed_flash_state(&config, 0x4000, 0x5a);
+        let replacement_flash = programmed_flash_state(&config, 0x4000, 0xa5);
         let mut machine = Ip32Machine::from_config(config.clone()).unwrap();
-        program_flash_byte(&mut machine, 0x4000, 0x5a);
-        let expected_flash = machine.system_flash_persistent_state().unwrap();
+        machine
+            .restore_system_flash_persistent_state(&expected_flash)
+            .unwrap();
         let expected_rtc = machine.rtc_persistent_state().unwrap();
         let state = machine.save_state().unwrap();
 
-        program_flash_byte(&mut machine, 0x4000, 0xa5);
+        machine
+            .restore_system_flash_persistent_state(&replacement_flash)
+            .unwrap();
         machine
             .restore_rtc_persistent_state(
                 &Ds1687PersistentState::new(123, vec![0x77; 256], 9).unwrap(),
@@ -356,24 +361,24 @@ mod tests {
         ));
     }
 
-    fn program_flash_byte(
-        machine: &mut Ip32Machine<se_core::tracing::NoopTraceSink>,
+    fn programmed_flash_state(
+        config: &Ip32MachineConfig,
         address: u32,
         value: u8,
-    ) {
-        let response = machine
-            .runtime_mut()
-            .registry_mut()
-            .get_typed_mut::<SystemFlash>(component_ids::PROM)
-            .unwrap()
-            .accept(IsaTransaction {
-                id: IsaTransactionId::new(1),
-                time: SimTime::ZERO,
-                controller: component_ids::MACE,
-                target: component_ids::PROM,
-                address,
-                transfer: IsaTransfer::write([value].into(), [true].into()),
-            });
+    ) -> SystemFlashPersistentState {
+        let mut flash = SystemFlash::new(
+            component_ids::PROM,
+            "System Flash",
+            config.prom_image.clone(),
+        );
+        let response = flash.accept(IsaTransaction {
+            id: IsaTransactionId::new(1),
+            time: SimTime::ZERO,
+            controller: component_ids::MACE,
+            target: component_ids::PROM,
+            address,
+            transfer: IsaTransfer::write([value].into(), [true].into()),
+        });
         assert!(matches!(
             response,
             IsaDeviceResponse::Complete(se_device::bus::isa::IsaCompletion {
@@ -381,5 +386,6 @@ mod tests {
                 ..
             })
         ));
+        flash.persistent_state()
     }
 }
