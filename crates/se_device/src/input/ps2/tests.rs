@@ -164,8 +164,11 @@ fn partially_transmitted_device_byte_is_deferred_during_a_host_request() {
     assert!(matches!(link.transfer, LinkTransfer::HostReceive { .. }));
     assert_eq!(link.deferred_device_frame, Some(serial_frame(0x5a)));
 
-    let encoded = postcard::to_stdvec(&link).unwrap();
-    let restored: Ps2DeviceLink = postcard::from_bytes(&encoded).unwrap();
+    let encoded = postcard::to_stdvec(&link.save_state()).unwrap();
+    let state: Ps2DeviceLinkState = postcard::from_bytes(&encoded).unwrap();
+    let mut restored = Ps2DeviceLink::new(device, link.wiring, link.timebase_hz).unwrap();
+    restored.validate_state(&state).unwrap();
+    restored.apply_state(state);
     assert_eq!(restored, link);
 }
 
@@ -222,6 +225,53 @@ fn keyboard_state_round_trip_preserves_mid_frame_and_typematic_work() {
         postcard::to_stdvec(&restored.save_state()).unwrap(),
         encoded
     );
+}
+
+#[test]
+fn keyboard_restore_preserves_name_and_rejects_wiring_and_malformed_frames_atomically() {
+    let id = ComponentId::new(2);
+    let wiring = Ps2Wiring {
+        controller: ComponentId::new(1),
+        bus: ComponentId::new(3),
+    };
+    let source = Ps2Keyboard::new(id, "source", wiring, 1_000_000_000).unwrap();
+    let mut target = Ps2Keyboard::new(id, "target", wiring, 1_000_000_000).unwrap();
+
+    target.restore_state(source.save_state()).unwrap();
+    assert_eq!(target.name(), "target");
+
+    let incompatible = Ps2Keyboard::new(
+        id,
+        "foreign",
+        Ps2Wiring {
+            controller: wiring.controller,
+            bus: ComponentId::new(4),
+        },
+        1_000_000_000,
+    )
+    .unwrap()
+    .save_state();
+    let before = target.clone();
+    assert!(matches!(
+        target.restore_state(incompatible),
+        Err(ComponentStateError::ConfigurationMismatch {
+            component,
+            field: "wiring"
+        }) if component == id
+    ));
+    assert_eq!(target, before);
+
+    let mut malformed = source.save_state();
+    malformed.link.transfer = LinkTransfer::DeviceTransmit {
+        frame: serial_frame(0xaa),
+        bit: 11,
+        clock_low: false,
+    };
+    assert!(matches!(
+        target.restore_state(malformed),
+        Err(ComponentStateError::InvalidState { component, .. }) if component == id
+    ));
+    assert_eq!(target, before);
 }
 
 #[derive(Clone, Copy)]

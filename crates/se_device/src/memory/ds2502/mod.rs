@@ -7,7 +7,9 @@
 use core::fmt;
 use std::collections::VecDeque;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusDeviceRole;
 use se_core::scheduler::{SimDuration, SimTime};
 
@@ -147,7 +149,7 @@ struct MasterLowSlot {
 }
 
 /// Read-only DS2502 device attached to one 1-Wire master.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ds2502 {
     id: ComponentId,
     name: String,
@@ -164,7 +166,22 @@ pub struct Ds2502 {
     actions: VecDeque<Ds2502Action>,
 }
 
-se_core::component_state!(Ds2502State, Ds2502);
+/// Serializable protocol state and compatibility data of a DS2502.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct Ds2502State {
+    id: ComponentId,
+    master: ComponentId,
+    timebase_hz: u64,
+    config: Ds2502Config,
+    now: SimTime,
+    epoch: u64,
+    phase: ProtocolPhase,
+    receive_byte: u8,
+    receive_bits: u8,
+    master_low: Option<MasterLowSlot>,
+    driving_low: bool,
+    actions: VecDeque<Ds2502Action>,
+}
 
 impl Ds2502 {
     /// Creates a DS2502 with immutable ROM and EPROM data.
@@ -193,6 +210,85 @@ impl Ds2502 {
             driving_low: false,
             actions: VecDeque::new(),
         })
+    }
+
+    /// Captures 1-Wire protocol state and immutable-device compatibility data.
+    pub fn save_state(&self) -> Ds2502State {
+        Ds2502State {
+            id: self.id,
+            master: self.master,
+            timebase_hz: self.timebase_hz,
+            config: self.config.clone(),
+            now: self.now,
+            epoch: self.epoch,
+            phase: self.phase,
+            receive_byte: self.receive_byte,
+            receive_bits: self.receive_bits,
+            master_low: self.master_low,
+            driving_low: self.driving_low,
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores validated protocol state without changing wiring or ROM contents.
+    pub fn restore_state(&mut self, state: Ds2502State) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        for (matches, field) in [
+            (state.master == self.master, "DS2502 master"),
+            (state.timebase_hz == self.timebase_hz, "DS2502 timebase"),
+            (
+                state.config == self.config,
+                "DS2502 ROM and EPROM configuration",
+            ),
+        ] {
+            if !matches {
+                return Err(ComponentStateError::ConfigurationMismatch {
+                    component: self.id,
+                    field,
+                });
+            }
+        }
+        let phase_valid = match state.phase {
+            ProtocolPhase::TransmitRom { bit_index } => bit_index < 64,
+            ProtocolPhase::ReceiveMemoryAddress { received, .. } => received < 2,
+            ProtocolPhase::TransmitCommandCrc { bit_index, .. }
+            | ProtocolPhase::TransmitDataCrc { bit_index, .. } => bit_index < 8,
+            ProtocolPhase::TransmitMemory {
+                address, bit_index, ..
+            } => usize::from(address) < EPROM_SIZE_BYTES && bit_index < 8,
+            ProtocolPhase::AwaitRomCommand
+            | ProtocolPhase::AwaitMemoryCommand
+            | ProtocolPhase::TransmitOnes
+            | ProtocolPhase::Inactive => true,
+        };
+        let actions_valid = state.actions.iter().all(|action| match action {
+            Ds2502Action::Schedule { event, .. } => match event {
+                Ds2502Event::PresenceAssert { epoch }
+                | Ds2502Event::PresenceRelease { epoch }
+                | Ds2502Event::ReadSlotRelease { epoch } => *epoch == state.epoch,
+            },
+            Ds2502Action::Drive(drive) => drive.source == self.id && drive.time <= state.now,
+            Ds2502Action::Idle => false,
+        });
+        if state.receive_bits >= 8
+            || state.master_low.is_some_and(|slot| slot.start > state.now)
+            || !phase_valid
+            || !actions_valid
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "DS2502 protocol phase, bit indexes, and actions must be valid",
+            });
+        }
+        self.now = state.now;
+        self.epoch = state.epoch;
+        self.phase = state.phase;
+        self.receive_byte = state.receive_byte;
+        self.receive_bits = state.receive_bits;
+        self.master_low = state.master_low;
+        self.driving_low = state.driving_low;
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Resets volatile protocol state without changing identity or EPROM data.

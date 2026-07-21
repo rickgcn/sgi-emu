@@ -2,7 +2,9 @@
 
 use std::{collections::VecDeque, fmt};
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusDeviceRole;
 use se_core::scheduler::SimDuration;
 
@@ -126,7 +128,7 @@ impl SerialClock {
 }
 
 /// Software-visible 16550 register file, FIFOs, and serial shift registers.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Uart16550 {
     id: ComponentId,
     name: String,
@@ -155,7 +157,34 @@ pub struct Uart16550 {
     actions: VecDeque<Uart16550Action>,
 }
 
-se_core::component_state!(Uart16550State, Uart16550);
+/// Serializable dynamic state and compatibility data of a 16550 UART.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct Uart16550State {
+    id: ComponentId,
+    config: Uart16550Config,
+    divisor: u16,
+    interrupt_enable: u8,
+    fifo_control: u8,
+    line_control: u8,
+    modem_control: u8,
+    line_status_errors: u8,
+    modem_status: u8,
+    scratch: u8,
+    infrared_control: u8,
+    receive: VecDeque<u8>,
+    transmit: VecDeque<u8>,
+    external_receive: VecDeque<u8>,
+    receive_shift: Option<u8>,
+    transmit_shift: Option<u8>,
+    receive_clock: SerialClock,
+    transmit_clock: SerialClock,
+    epoch: u64,
+    timeout_generation: u64,
+    receive_timeout_pending: bool,
+    thre_interrupt_pending: bool,
+    irq_asserted: bool,
+    actions: VecDeque<Uart16550Action>,
+}
 
 impl Uart16550 {
     /// Creates a reset UART.
@@ -192,6 +221,123 @@ impl Uart16550 {
             irq_asserted: false,
             actions: VecDeque::new(),
         })
+    }
+
+    /// Captures registers, FIFOs, serial clocks, and pending actions.
+    pub fn save_state(&self) -> Uart16550State {
+        Uart16550State {
+            id: self.id,
+            config: self.config,
+            divisor: self.divisor,
+            interrupt_enable: self.interrupt_enable,
+            fifo_control: self.fifo_control,
+            line_control: self.line_control,
+            modem_control: self.modem_control,
+            line_status_errors: self.line_status_errors,
+            modem_status: self.modem_status,
+            scratch: self.scratch,
+            infrared_control: self.infrared_control,
+            receive: self.receive.clone(),
+            transmit: self.transmit.clone(),
+            external_receive: self.external_receive.clone(),
+            receive_shift: self.receive_shift,
+            transmit_shift: self.transmit_shift,
+            receive_clock: self.receive_clock,
+            transmit_clock: self.transmit_clock,
+            epoch: self.epoch,
+            timeout_generation: self.timeout_generation,
+            receive_timeout_pending: self.receive_timeout_pending,
+            thre_interrupt_pending: self.thre_interrupt_pending,
+            irq_asserted: self.irq_asserted,
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores validated UART state without changing its hardware configuration.
+    pub fn restore_state(&mut self, state: Uart16550State) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if state.config != self.config {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "UART configuration",
+            });
+        }
+        let actions_valid = state.actions.iter().all(|action| match action {
+            Uart16550Action::Schedule { event, .. } => match event {
+                Uart16550Event::TransmitComplete { epoch }
+                | Uart16550Event::ReceiveComplete { epoch } => *epoch == state.epoch,
+                Uart16550Event::ReceiveTimeout { epoch, generation } => {
+                    *epoch == state.epoch && *generation == state.timeout_generation
+                }
+            },
+            Uart16550Action::SetIrq(transaction) => {
+                transaction.source.component == self.id
+                    && transaction.source.output == UART16550_IRQ_OUTPUT
+            }
+            Uart16550Action::Transmit { .. } => true,
+            Uart16550Action::Idle => false,
+        });
+        let fifo_capacity = if state.fifo_control & 1 != 0 {
+            FIFO_CAPACITY
+        } else {
+            1
+        };
+        if state.interrupt_enable & !0x0f != 0
+            || state.fifo_control & !0xc9 != 0
+            || state.modem_control & !0x1f != 0
+            || state.infrared_control & 0x40 != 0
+            || state.receive.len() > fifo_capacity
+            || state.transmit.len() > fifo_capacity
+            || state.external_receive.len() + usize::from(state.receive_shift.is_some())
+                > self.config.external_queue_capacity
+            || state.receive_clock.remainder >= u128::from(self.config.input_clock_hz)
+            || state.transmit_clock.remainder >= u128::from(self.config.input_clock_hz)
+            || !actions_valid
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "UART registers, queues, clocks, and actions must be canonical",
+            });
+        }
+        let mut restored = self.clone();
+        restored.divisor = state.divisor;
+        restored.interrupt_enable = state.interrupt_enable;
+        restored.fifo_control = state.fifo_control;
+        restored.line_control = state.line_control;
+        restored.modem_control = state.modem_control;
+        restored.line_status_errors = state.line_status_errors;
+        restored.modem_status = state.modem_status;
+        restored.scratch = state.scratch;
+        restored.infrared_control = state.infrared_control;
+        restored.receive = state.receive;
+        restored.transmit = state.transmit;
+        restored.external_receive = state.external_receive;
+        restored.receive_shift = state.receive_shift;
+        restored.transmit_shift = state.transmit_shift;
+        restored.receive_clock = state.receive_clock;
+        restored.transmit_clock = state.transmit_clock;
+        restored.epoch = state.epoch;
+        restored.timeout_generation = state.timeout_generation;
+        restored.receive_timeout_pending = state.receive_timeout_pending;
+        restored.thre_interrupt_pending = state.thre_interrupt_pending;
+        restored.irq_asserted = state.irq_asserted;
+        restored.actions = state.actions;
+        let timeout_valid = !restored.receive_timeout_pending
+            || restored.fifo_enabled()
+                && !restored.receive.is_empty()
+                && restored.receive.len() < restored.receive_trigger();
+        let thre_valid = !restored.thre_interrupt_pending || restored.transmit.is_empty();
+        if !timeout_valid
+            || !thre_valid
+            || restored.irq_asserted != (restored.interrupt_identification() & 1 == 0)
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "UART timeout and interrupt state must match register and FIFO state",
+            });
+        }
+        *self = restored;
+        Ok(())
     }
 
     /// Queues externally received bytes atomically.
@@ -674,6 +820,56 @@ mod tests {
         write(uart, 1, 0);
         write(uart, 7, 3);
         write(uart, 3, 0x03);
+    }
+
+    #[test]
+    fn state_restore_preserves_name_and_rejects_config_and_invalid_fifo_atomically() {
+        let source = uart();
+        let mut target = Uart16550::new(
+            UART,
+            "target",
+            Uart16550Config {
+                input_clock_hz: 22_000_000,
+                timebase_hz: 1_000_000_000,
+                external_queue_capacity: 65_536,
+            },
+        )
+        .unwrap();
+
+        target.restore_state(source.save_state()).unwrap();
+        assert_eq!(target.name(), "target");
+
+        let incompatible = Uart16550::new(
+            UART,
+            "foreign",
+            Uart16550Config {
+                input_clock_hz: 24_000_000,
+                timebase_hz: 1_000_000_000,
+                external_queue_capacity: 65_536,
+            },
+        )
+        .unwrap()
+        .save_state();
+        let before = target.clone();
+        assert!(matches!(
+            target.restore_state(incompatible),
+            Err(ComponentStateError::ConfigurationMismatch {
+                component: UART,
+                field: "UART configuration"
+            })
+        ));
+        assert_eq!(target, before);
+
+        let mut malformed = source.save_state();
+        malformed.receive.extend([0; FIFO_CAPACITY + 1]);
+        assert!(matches!(
+            target.restore_state(malformed),
+            Err(ComponentStateError::InvalidState {
+                component: UART,
+                ..
+            })
+        ));
+        assert_eq!(target, before);
     }
 
     #[test]

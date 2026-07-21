@@ -13,7 +13,9 @@ mod tests;
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::scheduler::{RationalClockProjection, SimDuration, SimTime};
 
 use crate::bus::two_wire::{TwoWireDrive, TwoWireLineDelivery};
@@ -309,8 +311,25 @@ enum LinkAction {
     Drive(TwoWireDrive),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Ps2DeviceLink {
+    id: ComponentId,
+    wiring: Ps2Wiring,
+    timebase_hz: u64,
+    half_clock_remainder: u64,
+    now: SimTime,
+    epoch: u64,
+    output_clock_low: bool,
+    output_data_low: bool,
+    observed_clock_low: bool,
+    observed_data_low: bool,
+    transfer: LinkTransfer,
+    deferred_device_frame: Option<u16>,
+    actions: VecDeque<LinkAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct Ps2DeviceLinkState {
     id: ComponentId,
     wiring: Ps2Wiring,
     timebase_hz: u64,
@@ -371,6 +390,94 @@ impl Ps2DeviceLink {
                 data_low: false,
             }));
         }
+    }
+
+    fn save_state(&self) -> Ps2DeviceLinkState {
+        Ps2DeviceLinkState {
+            id: self.id,
+            wiring: self.wiring,
+            timebase_hz: self.timebase_hz,
+            half_clock_remainder: self.half_clock_remainder,
+            now: self.now,
+            epoch: self.epoch,
+            output_clock_low: self.output_clock_low,
+            output_data_low: self.output_data_low,
+            observed_clock_low: self.observed_clock_low,
+            observed_data_low: self.observed_data_low,
+            transfer: self.transfer,
+            deferred_device_frame: self.deferred_device_frame,
+            actions: self.actions.clone(),
+        }
+    }
+
+    fn validate_state(&self, state: &Ps2DeviceLinkState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        if self.wiring != state.wiring {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "wiring",
+            });
+        }
+        if self.timebase_hz != state.timebase_hz {
+            return Err(ComponentStateError::ConfigurationMismatch {
+                component: self.id,
+                field: "timebase_hz",
+            });
+        }
+        if state.half_clock_remainder >= DEVICE_CLOCK_HZ * 2 {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "PS/2 clock remainder must be normalized",
+            });
+        }
+        let valid_frame = |frame: u16| {
+            let byte = ((frame >> 1) & 0xff) as u8;
+            frame == serial_frame(byte)
+        };
+        let valid_transfer = match state.transfer {
+            LinkTransfer::Idle | LinkTransfer::HostAcknowledge { .. } => true,
+            LinkTransfer::DeviceTransmit { frame, bit, .. } => bit <= 10 && valid_frame(frame),
+            LinkTransfer::DeviceInhibited { frame, .. } => valid_frame(frame),
+            LinkTransfer::HostReceive {
+                bit, parity_ones, ..
+            } => bit <= 10 && parity_ones <= 9,
+        };
+        if !valid_transfer
+            || state
+                .deferred_device_frame
+                .is_some_and(|frame| !valid_frame(frame))
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "PS/2 transfer frame and bit counters must be valid",
+            });
+        }
+        if state.actions.iter().any(|action| match action {
+            LinkAction::Schedule {
+                event: Ps2LinkEvent::Clock { epoch },
+                ..
+            } => *epoch != state.epoch,
+            LinkAction::Drive(drive) => drive.source != self.id || drive.time > state.now,
+        }) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "PS/2 link actions must originate from the device",
+            });
+        }
+        Ok(())
+    }
+
+    fn apply_state(&mut self, state: Ps2DeviceLinkState) {
+        self.half_clock_remainder = state.half_clock_remainder;
+        self.now = state.now;
+        self.epoch = state.epoch;
+        self.output_clock_low = state.output_clock_low;
+        self.output_data_low = state.output_data_low;
+        self.observed_clock_low = state.observed_clock_low;
+        self.observed_data_low = state.observed_data_low;
+        self.transfer = state.transfer;
+        self.deferred_device_frame = state.deferred_device_frame;
+        self.actions = state.actions;
     }
 
     fn observe_time(&mut self, now: SimTime) {
@@ -697,7 +804,7 @@ fn milliseconds(timebase_hz: u64, value: u64) -> SimDuration {
 }
 
 /// IBM enhanced PS/2 keyboard.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ps2Keyboard {
     id: ComponentId,
     name: String,
@@ -721,10 +828,117 @@ pub struct Ps2Keyboard {
     actions: VecDeque<Ps2KeyboardAction>,
 }
 
-se_core::component_state!(Ps2KeyboardState, Ps2Keyboard);
+/// Serializable dynamic state of a PS/2 keyboard.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Ps2KeyboardState {
+    id: ComponentId,
+    link: Ps2DeviceLinkState,
+    responses: VecDeque<u8>,
+    scan_fifo: VecDeque<u8>,
+    scan_overrun: bool,
+    pressed: BTreeSet<Ps2KeyPosition>,
+    set3_types: BTreeMap<Ps2KeyPosition, Ps2KeyType>,
+    command_parameter: KeyboardParameter,
+    scan_set: u8,
+    leds: u8,
+    typematic_parameter: u8,
+    typematic_key: Option<Ps2KeyPosition>,
+    typematic_epoch: u64,
+    scanning_enabled: bool,
+    resume_scanning_after_id: bool,
+    bat_epoch: u64,
+    bat_active: bool,
+    last_sent: Option<u8>,
+    actions: VecDeque<Ps2KeyboardAction>,
+}
+
+impl Ps2Keyboard {
+    /// Captures the keyboard's dynamic hardware state.
+    pub fn save_state(&self) -> Ps2KeyboardState {
+        Ps2KeyboardState {
+            id: self.id,
+            link: self.link.save_state(),
+            responses: self.responses.clone(),
+            scan_fifo: self.scan_fifo.clone(),
+            scan_overrun: self.scan_overrun,
+            pressed: self.pressed.clone(),
+            set3_types: self.set3_types.clone(),
+            command_parameter: self.command_parameter,
+            scan_set: self.scan_set,
+            leds: self.leds,
+            typematic_parameter: self.typematic_parameter,
+            typematic_key: self.typematic_key,
+            typematic_epoch: self.typematic_epoch,
+            scanning_enabled: self.scanning_enabled,
+            resume_scanning_after_id: self.resume_scanning_after_id,
+            bat_epoch: self.bat_epoch,
+            bat_active: self.bat_active,
+            last_sent: self.last_sent,
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores dynamic state after validating identity, wiring, and invariants.
+    pub fn restore_state(&mut self, state: Ps2KeyboardState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        self.link.validate_state(&state.link)?;
+        if state.scan_fifo.len() > KEYBOARD_FIFO_CAPACITY {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "keyboard scan FIFO must fit its fixed capacity",
+            });
+        }
+        if !(1..=3).contains(&state.scan_set)
+            || state.leds & !0x07 != 0
+            || state.typematic_parameter & 0x80 != 0
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "keyboard programmable fields must use supported encodings",
+            });
+        }
+        if state.actions.iter().any(|action| match action {
+            Ps2KeyboardAction::Schedule { event, .. } => match event {
+                Ps2KeyboardEvent::Link(Ps2LinkEvent::Clock { epoch }) => *epoch != state.link.epoch,
+                Ps2KeyboardEvent::BatComplete { epoch } => *epoch != state.bat_epoch,
+                Ps2KeyboardEvent::Typematic { epoch } => *epoch != state.typematic_epoch,
+            },
+            Ps2KeyboardAction::Drive(drive) => {
+                drive.source != self.id || drive.time > state.link.now
+            }
+        }) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "keyboard actions must originate from the keyboard",
+            });
+        }
+
+        let mut restored = self.clone();
+        restored.link.apply_state(state.link);
+        restored.responses = state.responses;
+        restored.scan_fifo = state.scan_fifo;
+        restored.scan_overrun = state.scan_overrun;
+        restored.pressed = state.pressed;
+        restored.set3_types = state.set3_types;
+        restored.command_parameter = state.command_parameter;
+        restored.scan_set = state.scan_set;
+        restored.leds = state.leds;
+        restored.typematic_parameter = state.typematic_parameter;
+        restored.typematic_key = state.typematic_key;
+        restored.typematic_epoch = state.typematic_epoch;
+        restored.scanning_enabled = state.scanning_enabled;
+        restored.resume_scanning_after_id = state.resume_scanning_after_id;
+        restored.bat_epoch = state.bat_epoch;
+        restored.bat_active = state.bat_active;
+        restored.last_sent = state.last_sent;
+        restored.actions = state.actions;
+        *self = restored;
+        Ok(())
+    }
+}
 
 /// Standard three-button PS/2 mouse.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ps2Mouse {
     id: ComponentId,
     name: String,
@@ -750,7 +964,118 @@ pub struct Ps2Mouse {
     actions: VecDeque<Ps2MouseAction>,
 }
 
-se_core::component_state!(Ps2MouseState, Ps2Mouse);
+/// Serializable dynamic state of a PS/2 mouse.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Ps2MouseState {
+    id: ComponentId,
+    link: Ps2DeviceLinkState,
+    responses: VecDeque<u8>,
+    mode: MouseMode,
+    wrap_mode: bool,
+    reporting_enabled: bool,
+    scaling_2_to_1: bool,
+    resolution: u8,
+    sample_rate: u16,
+    parameter: MouseParameter,
+    accumulated_x_eighths: i64,
+    accumulated_y_eighths: i64,
+    buttons: Ps2MouseButtons,
+    last_reported_buttons: Ps2MouseButtons,
+    last_packet: [u8; 3],
+    last_packet_valid: bool,
+    sample_epoch: u64,
+    sample_remainder: u64,
+    bat_epoch: u64,
+    bat_active: bool,
+    actions: VecDeque<Ps2MouseAction>,
+}
+
+impl Ps2Mouse {
+    /// Captures the mouse's dynamic hardware state.
+    pub fn save_state(&self) -> Ps2MouseState {
+        Ps2MouseState {
+            id: self.id,
+            link: self.link.save_state(),
+            responses: self.responses.clone(),
+            mode: self.mode,
+            wrap_mode: self.wrap_mode,
+            reporting_enabled: self.reporting_enabled,
+            scaling_2_to_1: self.scaling_2_to_1,
+            resolution: self.resolution,
+            sample_rate: self.sample_rate,
+            parameter: self.parameter,
+            accumulated_x_eighths: self.accumulated_x_eighths,
+            accumulated_y_eighths: self.accumulated_y_eighths,
+            buttons: self.buttons,
+            last_reported_buttons: self.last_reported_buttons,
+            last_packet: self.last_packet,
+            last_packet_valid: self.last_packet_valid,
+            sample_epoch: self.sample_epoch,
+            sample_remainder: self.sample_remainder,
+            bat_epoch: self.bat_epoch,
+            bat_active: self.bat_active,
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores dynamic state after validating identity, wiring, and invariants.
+    pub fn restore_state(&mut self, state: Ps2MouseState) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        self.link.validate_state(&state.link)?;
+        if state.resolution > 3
+            || !matches!(state.sample_rate, 10 | 20 | 40 | 60 | 80 | 100 | 200)
+            || state.sample_remainder >= u64::from(state.sample_rate)
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "mouse resolution, sample rate, and clock remainder must be valid",
+            });
+        }
+        if state.last_packet_valid && state.last_packet[0] & 0x08 == 0 {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "valid mouse packets must contain the fixed status bit",
+            });
+        }
+        if state.actions.iter().any(|action| match action {
+            Ps2MouseAction::Schedule { event, .. } => match event {
+                Ps2MouseEvent::Link(Ps2LinkEvent::Clock { epoch }) => *epoch != state.link.epoch,
+                Ps2MouseEvent::BatComplete { epoch } => *epoch != state.bat_epoch,
+                Ps2MouseEvent::Sample { epoch } => *epoch != state.sample_epoch,
+            },
+            Ps2MouseAction::Drive(drive) => drive.source != self.id || drive.time > state.link.now,
+        }) {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "mouse actions must originate from the mouse",
+            });
+        }
+
+        let mut restored = self.clone();
+        restored.link.apply_state(state.link);
+        restored.responses = state.responses;
+        restored.mode = state.mode;
+        restored.wrap_mode = state.wrap_mode;
+        restored.reporting_enabled = state.reporting_enabled;
+        restored.scaling_2_to_1 = state.scaling_2_to_1;
+        restored.resolution = state.resolution;
+        restored.sample_rate = state.sample_rate;
+        restored.parameter = state.parameter;
+        restored.accumulated_x_eighths = state.accumulated_x_eighths;
+        restored.accumulated_y_eighths = state.accumulated_y_eighths;
+        restored.buttons = state.buttons;
+        restored.last_reported_buttons = state.last_reported_buttons;
+        restored.last_packet = state.last_packet;
+        restored.last_packet_valid = state.last_packet_valid;
+        restored.sample_epoch = state.sample_epoch;
+        restored.sample_remainder = state.sample_remainder;
+        restored.bat_epoch = state.bat_epoch;
+        restored.bat_active = state.bat_active;
+        restored.actions = state.actions;
+        *self = restored;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 enum KeyboardParameter {

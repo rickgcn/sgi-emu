@@ -2,7 +2,9 @@
 
 use std::collections::VecDeque;
 
-use se_core::component::{Component, ComponentId};
+use se_core::component::{
+    Component, ComponentId, ComponentStateError, validate_component_state_id,
+};
 use se_core::role::BusDeviceRole;
 
 use crate::bus::irq::{IrqOutput, IrqSource, IrqTransaction};
@@ -22,7 +24,7 @@ pub enum Ieee1284Action {
 }
 
 /// Software-visible byte registers for the external Super I/O parallel port.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ieee1284 {
     id: ComponentId,
     name: String,
@@ -35,7 +37,18 @@ pub struct Ieee1284 {
     actions: VecDeque<Ieee1284Action>,
 }
 
-se_core::component_state!(Ieee1284State, Ieee1284);
+/// Serializable dynamic state of an IEEE 1284 endpoint.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct Ieee1284State {
+    id: ComponentId,
+    data: u8,
+    status: u8,
+    control: u8,
+    epp_address: u8,
+    epp_data: u8,
+    irq_asserted: bool,
+    actions: VecDeque<Ieee1284Action>,
+}
 
 impl Ieee1284 {
     /// Creates a reset parallel port.
@@ -51,6 +64,48 @@ impl Ieee1284 {
             irq_asserted: false,
             actions: VecDeque::new(),
         }
+    }
+
+    /// Captures all software-visible and pending interrupt state.
+    pub fn save_state(&self) -> Ieee1284State {
+        Ieee1284State {
+            id: self.id,
+            data: self.data,
+            status: self.status,
+            control: self.control,
+            epp_address: self.epp_address,
+            epp_data: self.epp_data,
+            irq_asserted: self.irq_asserted,
+            actions: self.actions.clone(),
+        }
+    }
+
+    /// Restores validated register state without changing identity.
+    pub fn restore_state(&mut self, state: Ieee1284State) -> Result<(), ComponentStateError> {
+        validate_component_state_id(self.id, state.id)?;
+        let expected_irq = state.control & 0x10 != 0 && state.status & 0x40 == 0;
+        if state.irq_asserted != expected_irq
+            || state.actions.iter().any(|action| match action {
+                Ieee1284Action::SetIrq(transaction) => {
+                    transaction.source.component != self.id
+                        || transaction.source.output != IEEE1284_IRQ_OUTPUT
+                }
+                Ieee1284Action::Idle => true,
+            })
+        {
+            return Err(ComponentStateError::InvalidState {
+                component: self.id,
+                invariant: "parallel interrupt state is inconsistent",
+            });
+        }
+        self.data = state.data;
+        self.status = state.status;
+        self.control = state.control;
+        self.epp_address = state.epp_address;
+        self.epp_data = state.epp_data;
+        self.irq_asserted = state.irq_asserted;
+        self.actions = state.actions;
+        Ok(())
     }
 
     /// Updates externally driven status inputs.
