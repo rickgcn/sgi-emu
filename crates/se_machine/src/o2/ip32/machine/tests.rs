@@ -152,19 +152,27 @@ impl TraceSink for DeviceTraceCaptureSink {
 }
 
 fn assert_machine_architecture_equal<A, B>(reference: &Ip32Machine<A>, optimized: &Ip32Machine<B>) {
-    macro_rules! assert_component_eq {
+    macro_rules! assert_component_state_eq {
         ($type:ty, $id:expr) => {
             assert_eq!(
-                reference
-                    .runtime()
-                    .registry()
-                    .get_typed::<$type>($id)
-                    .unwrap(),
-                optimized
-                    .runtime()
-                    .registry()
-                    .get_typed::<$type>($id)
-                    .unwrap()
+                postcard::to_stdvec(
+                    &reference
+                        .runtime()
+                        .registry()
+                        .get_typed::<$type>($id)
+                        .unwrap()
+                        .save_state()
+                )
+                .unwrap(),
+                postcard::to_stdvec(
+                    &optimized
+                        .runtime()
+                        .registry()
+                        .get_typed::<$type>($id)
+                        .unwrap()
+                        .save_state()
+                )
+                .unwrap()
             );
         };
     }
@@ -188,26 +196,26 @@ fn assert_machine_architecture_equal<A, B>(reference: &Ip32Machine<A>, optimized
             .unwrap()
             .state()
     );
-    assert_component_eq!(Ip32SysAdBus, component_ids::CPU_SYSAD_BUS);
-    assert_component_eq!(CrimeMemoryBus, component_ids::CRIME_MEMORY_DOMAIN);
-    assert_component_eq!(CrimeCmiBus, component_ids::CRIME_MACE_LINK);
-    assert_component_eq!(CrimeCgiBus, component_ids::CRIME_GBE_LINK);
-    assert_component_eq!(IsaBus, component_ids::ISA_BUS);
-    assert_component_eq!(CrimeSdram, component_ids::RAM);
-    assert_component_eq!(Crime, component_ids::CRIME);
-    assert_component_eq!(Mace, component_ids::MACE);
-    assert_component_eq!(IrqBus, component_ids::CPU_IRQ_BUS);
-    assert_component_eq!(IrqBus, component_ids::MACE_IRQ_BUS);
-    assert_component_eq!(OneWireBus, component_ids::ONE_WIRE_BUS);
-    assert_component_eq!(TwoWireBus, component_ids::GBE_CRT_DDC_BUS);
-    assert_component_eq!(TwoWireBus, component_ids::GBE_FLAT_PANEL_DDC_BUS);
-    assert_component_eq!(TwoWireBus, component_ids::KEYBOARD_PS2_BUS);
-    assert_component_eq!(TwoWireBus, component_ids::MOUSE_PS2_BUS);
-    assert_component_eq!(Ps2Keyboard, component_ids::KEYBOARD);
-    assert_component_eq!(Ps2Mouse, component_ids::MOUSE);
-    assert_component_eq!(Gbe, component_ids::GBE);
-    assert_component_eq!(Ds2502, component_ids::NIC_IDENTITY);
-    assert_component_eq!(SystemFlash, component_ids::PROM);
+    assert_component_state_eq!(Ip32SysAdBus, component_ids::CPU_SYSAD_BUS);
+    assert_component_state_eq!(CrimeMemoryBus, component_ids::CRIME_MEMORY_DOMAIN);
+    assert_component_state_eq!(CrimeCmiBus, component_ids::CRIME_MACE_LINK);
+    assert_component_state_eq!(CrimeCgiBus, component_ids::CRIME_GBE_LINK);
+    assert_component_state_eq!(IsaBus, component_ids::ISA_BUS);
+    assert_component_state_eq!(CrimeSdram, component_ids::RAM);
+    assert_component_state_eq!(Crime, component_ids::CRIME);
+    assert_component_state_eq!(Mace, component_ids::MACE);
+    assert_component_state_eq!(IrqBus, component_ids::CPU_IRQ_BUS);
+    assert_component_state_eq!(IrqBus, component_ids::MACE_IRQ_BUS);
+    assert_component_state_eq!(OneWireBus, component_ids::ONE_WIRE_BUS);
+    assert_component_state_eq!(TwoWireBus, component_ids::GBE_CRT_DDC_BUS);
+    assert_component_state_eq!(TwoWireBus, component_ids::GBE_FLAT_PANEL_DDC_BUS);
+    assert_component_state_eq!(TwoWireBus, component_ids::KEYBOARD_PS2_BUS);
+    assert_component_state_eq!(TwoWireBus, component_ids::MOUSE_PS2_BUS);
+    assert_component_state_eq!(Ps2Keyboard, component_ids::KEYBOARD);
+    assert_component_state_eq!(Ps2Mouse, component_ids::MOUSE);
+    assert_component_state_eq!(Gbe, component_ids::GBE);
+    assert_component_state_eq!(Ds2502, component_ids::NIC_IDENTITY);
+    assert_component_state_eq!(SystemFlash, component_ids::PROM);
     assert_eq!(
         reference.control.cpu_generation,
         optimized.control.cpu_generation

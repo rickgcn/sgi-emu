@@ -275,6 +275,8 @@ mod tests {
     use se_device::bus::isa::{
         IsaCompletionPayload, IsaDeviceResponse, IsaTransaction, IsaTransactionId, IsaTransfer,
     };
+    use se_device::chipset::gbe::Gbe;
+    use se_device::chipset::gbe::protocol::GbeWiring;
     use se_device::memory::flash::{SystemFlash, SystemFlashPersistentState};
     use se_device::rtc::ds1687::state::Ds1687PersistentState;
 
@@ -359,6 +361,56 @@ mod tests {
                 se_core::component::ComponentStateError::ComponentIdMismatch { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn restore_rejects_replaced_gbe_state_when_outer_config_still_matches() {
+        let config = Ip32MachineConfig::default();
+        let machine = Ip32Machine::from_config(config.clone()).unwrap();
+        let foreign_states = [
+            Gbe::new(
+                component_ids::GBE,
+                "foreign wiring",
+                IP32_TIMEBASE_HZ,
+                GbeWiring {
+                    crime: component_ids::CRIME,
+                    crt_ddc: ComponentId::new(0xdead_beef),
+                    flat_panel_ddc: component_ids::GBE_FLAT_PANEL_DDC_BUS,
+                    auxiliary_inputs: [true; 10],
+                },
+            )
+            .save_state(),
+            Gbe::new(
+                component_ids::GBE,
+                "foreign timebase",
+                IP32_TIMEBASE_HZ / 2,
+                GbeWiring {
+                    crime: component_ids::CRIME,
+                    crt_ddc: component_ids::GBE_CRT_DDC_BUS,
+                    flat_panel_ddc: component_ids::GBE_FLAT_PANEL_DDC_BUS,
+                    auxiliary_inputs: [true; 10],
+                },
+            )
+            .save_state(),
+        ];
+
+        for foreign in foreign_states {
+            let mut state = machine.save_state().unwrap();
+            state.gbe = foreign;
+            assert!(matches!(
+                Ip32Machine::from_state_with_trace_sink(
+                    config.clone(),
+                    state,
+                    se_core::tracing::NoopTraceSink,
+                ),
+                Err(Ip32StateError::Component(
+                    se_core::component::ComponentStateError::ConfigurationMismatch {
+                        component: component_ids::GBE,
+                        ..
+                    }
+                ))
+            ));
+        }
     }
 
     fn programmed_flash_state(
