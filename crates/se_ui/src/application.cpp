@@ -13,6 +13,7 @@
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
 #include <QtCore/QLocale>
+#include <QtCore/QResource>
 #include <QtCore/QSettings>
 #include <QtCore/QSignalBlocker>
 #include <QtCore/QSize>
@@ -20,7 +21,6 @@
 #include <QtCore/QTimer>
 #include <QtCore/QTranslator>
 #include <QtCore/QtGlobal>
-#include <QtCore/QtResource>
 #include <QtGui/QAction>
 #include <QtGui/QCloseEvent>
 #include <QtGui/QIcon>

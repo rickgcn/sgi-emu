@@ -16,6 +16,7 @@
 #include <QtCore/QSortFilterProxyModel>
 #include <QtCore/QStringList>
 #include <QtCore/QTimer>
+#include <QtCore/QtGlobal>
 #include <QtGui/QAction>
 #include <QtGui/QClipboard>
 #include <QtGui/QColor>
@@ -407,26 +408,22 @@ public:
 
   void set_search(QString search)
   {
-    search_ = std::move(search);
-    refilter();
+    update_filter(search_, std::move(search));
   }
 
   void set_level(int level)
   {
-    level_ = level;
-    refilter();
+    update_filter(level_, level);
   }
 
   void set_source(int source)
   {
-    source_ = source;
-    refilter();
+    update_filter(source_, source);
   }
 
   void set_target(QString target)
   {
-    target_ = std::move(target);
-    refilter();
+    update_filter(target_, std::move(target));
   }
 
 protected:
@@ -464,10 +461,18 @@ protected:
   }
 
 private:
-  void refilter()
+  template<typename T>
+  void update_filter(T& filter, T value)
   {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
     beginFilterChange();
+#endif
+    filter = std::move(value);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
     endFilterChange(QSortFilterProxyModel::Direction::Rows);
+#else
+    invalidateRowsFilter();
+#endif
   }
 
   QString search_;
