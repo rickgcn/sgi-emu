@@ -296,11 +296,9 @@ impl Ps2Port {
                 let mut next_valid = valid;
                 match bit {
                     0 => next_valid &= !data_high,
-                    1..=8 => {
-                        if data_high {
-                            next_byte |= 1 << (bit - 1);
-                            next_ones += 1;
-                        }
+                    1..=8 if data_high => {
+                        next_byte |= 1 << (bit - 1);
+                        next_ones += 1;
                     }
                     9 => {
                         if data_high {

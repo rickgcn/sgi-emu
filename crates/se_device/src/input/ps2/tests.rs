@@ -26,26 +26,8 @@ fn two_to_one_scaling_uses_the_standard_small_motion_table() {
     }
 }
 
-fn deliver_link_lines(
-    link: &mut Ps2DeviceLink,
-    bus: ComponentId,
-    source: ComponentId,
-    time: u64,
-    source_clock_low: bool,
-    source_data_low: bool,
-    clock_low: bool,
-    data_low: bool,
-) {
-    link.observe_lines(TwoWireLineDelivery {
-        bus,
-        source,
-        time: SimTime::new(time),
-        source_clock_low,
-        source_data_low,
-        clock_low,
-        data_low,
-    })
-    .unwrap();
+fn deliver_link_lines(link: &mut Ps2DeviceLink, delivery: TwoWireLineDelivery) {
+    link.observe_lines(delivery).unwrap();
 }
 
 #[test]
@@ -60,7 +42,18 @@ fn host_request_preempts_a_device_byte_before_its_first_clock() {
     let Some(LinkAction::Schedule { event, .. }) = link.poll() else {
         panic!("device transmission must schedule its first clock edge");
     };
-    deliver_link_lines(&mut link, bus, controller, 1, true, false, true, true);
+    deliver_link_lines(
+        &mut link,
+        TwoWireLineDelivery {
+            bus,
+            source: controller,
+            time: SimTime::new(1),
+            source_clock_low: true,
+            source_data_low: false,
+            clock_low: true,
+            data_low: true,
+        },
+    );
 
     assert_eq!(link.handle_event(event), None);
     assert_eq!(
@@ -77,9 +70,42 @@ fn host_request_preempts_a_device_byte_before_its_first_clock() {
     assert!(!release.data_low);
     assert!(link.poll().is_none());
 
-    deliver_link_lines(&mut link, bus, device, 2, false, false, true, false);
-    deliver_link_lines(&mut link, bus, controller, 3, true, true, true, true);
-    deliver_link_lines(&mut link, bus, controller, 4, false, true, false, true);
+    deliver_link_lines(
+        &mut link,
+        TwoWireLineDelivery {
+            bus,
+            source: device,
+            time: SimTime::new(2),
+            source_clock_low: false,
+            source_data_low: false,
+            clock_low: true,
+            data_low: false,
+        },
+    );
+    deliver_link_lines(
+        &mut link,
+        TwoWireLineDelivery {
+            bus,
+            source: controller,
+            time: SimTime::new(3),
+            source_clock_low: true,
+            source_data_low: true,
+            clock_low: true,
+            data_low: true,
+        },
+    );
+    deliver_link_lines(
+        &mut link,
+        TwoWireLineDelivery {
+            bus,
+            source: controller,
+            time: SimTime::new(4),
+            source_clock_low: false,
+            source_data_low: true,
+            clock_low: false,
+            data_low: true,
+        },
+    );
     assert!(matches!(
         link.transfer,
         LinkTransfer::HostReceive {
@@ -110,32 +136,47 @@ fn partially_transmitted_device_byte_is_deferred_during_a_host_request() {
     };
     deliver_link_lines(
         &mut link,
-        bus,
-        device,
-        1,
-        drive_low.clock_low,
-        drive_low.data_low,
-        true,
-        true,
+        TwoWireLineDelivery {
+            bus,
+            source: device,
+            time: SimTime::new(1),
+            source_clock_low: drive_low.clock_low,
+            source_data_low: drive_low.data_low,
+            clock_low: true,
+            data_low: true,
+        },
     );
     let Some(LinkAction::Schedule { event, .. }) = link.poll() else {
         panic!("the first device clock must schedule its release");
     };
 
-    deliver_link_lines(&mut link, bus, controller, 2, true, false, true, true);
+    deliver_link_lines(
+        &mut link,
+        TwoWireLineDelivery {
+            bus,
+            source: controller,
+            time: SimTime::new(2),
+            source_clock_low: true,
+            source_data_low: false,
+            clock_low: true,
+            data_low: true,
+        },
+    );
     assert_eq!(link.handle_event(event), None);
     let Some(LinkAction::Drive(release_clock)) = link.poll() else {
         panic!("the device must release its first clock pulse");
     };
     deliver_link_lines(
         &mut link,
-        bus,
-        device,
-        3,
-        release_clock.clock_low,
-        release_clock.data_low,
-        true,
-        release_clock.data_low,
+        TwoWireLineDelivery {
+            bus,
+            source: device,
+            time: SimTime::new(3),
+            source_clock_low: release_clock.clock_low,
+            source_data_low: release_clock.data_low,
+            clock_low: true,
+            data_low: release_clock.data_low,
+        },
     );
     let Some(LinkAction::Schedule { event, .. }) = link.poll() else {
         panic!("the next device clock must remain scheduled");
@@ -150,16 +191,40 @@ fn partially_transmitted_device_byte_is_deferred_during_a_host_request() {
     };
     deliver_link_lines(
         &mut link,
-        bus,
-        device,
-        4,
-        release_data.clock_low,
-        release_data.data_low,
-        true,
-        false,
+        TwoWireLineDelivery {
+            bus,
+            source: device,
+            time: SimTime::new(4),
+            source_clock_low: release_data.clock_low,
+            source_data_low: release_data.data_low,
+            clock_low: true,
+            data_low: false,
+        },
     );
-    deliver_link_lines(&mut link, bus, controller, 5, true, true, true, true);
-    deliver_link_lines(&mut link, bus, controller, 6, false, true, false, true);
+    deliver_link_lines(
+        &mut link,
+        TwoWireLineDelivery {
+            bus,
+            source: controller,
+            time: SimTime::new(5),
+            source_clock_low: true,
+            source_data_low: true,
+            clock_low: true,
+            data_low: true,
+        },
+    );
+    deliver_link_lines(
+        &mut link,
+        TwoWireLineDelivery {
+            bus,
+            source: controller,
+            time: SimTime::new(6),
+            source_clock_low: false,
+            source_data_low: true,
+            clock_low: false,
+            data_low: true,
+        },
+    );
 
     assert!(matches!(link.transfer, LinkTransfer::HostReceive { .. }));
     assert_eq!(link.deferred_device_frame, Some(serial_frame(0x5a)));
