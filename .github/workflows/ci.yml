@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  core-quality:
+    name: Core quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify pinned Rust toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: >-
+          cargo clippy --locked
+          --workspace
+          --exclude se_ui
+          --all-targets
+          --all-features
+          -- -D warnings
+
+      - name: Build and test default members without Qt
+        env:
+          QMAKE: /nonexistent/sgi-emu-qmake
+        run: |
+          cargo build --locked
+          cargo test --locked
+
+      - name: Test se_machine without default features
+        run: cargo test --locked -p se_machine --no-default-features
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --exclude se_ui --no-deps
+
+  core-tests:
+    name: Core tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - windows-2025
+          - macos-15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify pinned Rust toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version
+
+      - name: Test core workspace
+        run: cargo test --locked --workspace --exclude se_ui
+
+      - name: Test se_machine with all features
+        run: cargo test --locked -p se_machine --all-features
+
+  linux-qt:
+    name: Linux Qt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      QMAKE: qmake6
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify pinned Rust toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version
+
+      - name: Install Qt
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            qmake6 \
+            qt6-base-dev \
+            libqt6svg6-dev \
+            qt6-l10n-tools
+
+      - name: Verify Qt installation
+        run: |
+          qmake6 -query QT_VERSION
+          qmake6 -query QT_HOST_BINS
+          test -x "$(qmake6 -query QT_HOST_BINS)/lrelease"
+
+      - name: Build release UI
+        run: cargo build --locked -p se_ui --release
+
+      - name: Test UI
+        run: cargo test --locked -p se_ui
