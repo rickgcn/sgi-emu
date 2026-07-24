@@ -222,6 +222,20 @@ pub struct CrimeSynchronousTimerProjection {
     pub timebase_hz: u64,
 }
 
+impl CrimeSynchronousTimerProjection {
+    /// Completes a defined, aligned TIMER read at an exact delivery time.
+    pub fn read(&self, address: u64, length: u16, delivery_time: SimTime) -> Option<CrimeData> {
+        control_register_read_data(address, length, |address| {
+            (address == self.physical_address).then(|| {
+                let elapsed = delivery_time.get().saturating_sub(self.base_time.get());
+                let increments = u128::from(elapsed) * u128::from(self.frequency_hz)
+                    / u128::from(self.timebase_hz);
+                u64::from(self.base.wrapping_add(increments as u32))
+            })
+        })
+    }
+}
+
 impl CrimeSynchronousReadSnapshot {
     /// Completes a defined, aligned control-register read at an exact delivery time.
     pub fn read(&self, address: u64, length: u16, delivery_time: SimTime) -> Option<CrimeData> {
@@ -637,6 +651,20 @@ impl Crime {
                 .is_some()
     }
 
+    /// Returns whether an idle full-width TIMER write can complete synchronously.
+    pub fn synchronous_timer_write_ready(&self, address: u64, transfer: &CrimeTransfer) -> bool {
+        if !self.stable_cpu_fetch_ready() || address != registers::TIMER {
+            return false;
+        }
+        matches!(
+            transfer.view(),
+            CrimeTransferView::Write { data, byte_enable }
+                if data.len() == 8
+                    && byte_enable.len() == 8
+                    && byte_enable.iter().all(|enabled| enabled)
+        )
+    }
+
     /// Captures the immutable register image needed by direct read batches.
     pub fn synchronous_read_snapshot(&self) -> Option<CrimeSynchronousReadSnapshot> {
         self.stable_cpu_fetch_ready()
@@ -652,6 +680,21 @@ impl Crime {
                 memory_ecc_check: self.memory_ecc_check,
                 memory_ecc_replacement: self.memory_ecc_replacement,
             })
+    }
+
+    /// Captures the affine TIMER model needed by direct TIMER read batches.
+    pub fn synchronous_timer_projection(&self) -> Option<CrimeSynchronousTimerProjection> {
+        if !self.stable_cpu_fetch_ready() {
+            return None;
+        }
+        let (base, base_time) = self.piu.timer_projection();
+        Some(CrimeSynchronousTimerProjection {
+            physical_address: registers::TIMER,
+            base,
+            base_time,
+            frequency_hz: CRIME_MASTER_FREQUENCY_HZ,
+            timebase_hz: self.timebase_hz,
+        })
     }
 
     /// Commits the time observed by a proven batch of side-effect-free reads.
@@ -694,6 +737,16 @@ impl Crime {
                 .is_some()
     }
 
+    /// Accounts for CGI transaction IDs consumed by proven synchronous reads.
+    pub fn commit_synchronous_cgi_reads(&mut self, reads: u64) -> Result<bool, CrimeError> {
+        self.commit_synchronous_cmi_reads(reads)
+    }
+
+    /// Returns whether a synchronous CGI batch can allocate all transaction IDs.
+    pub fn synchronous_cgi_reads_ready(&self, reads: u64) -> bool {
+        self.synchronous_cmi_reads_ready(reads)
+    }
+
     /// Completes a previously planned synchronous control-register read.
     ///
     /// The caller must retain exclusive ownership of the idle SysAD path from
@@ -711,6 +764,46 @@ impl Crime {
                     .expect("a validated synchronous CRIME read must remain defined"),
             )),
         }
+    }
+
+    /// Completes a previously planned synchronous TIMER write.
+    ///
+    /// The caller must retain exclusive ownership of the idle SysAD path from
+    /// planning through commit.
+    pub fn commit_synchronous_timer_write(
+        &mut self,
+        request: &CrimeSysAdRequest,
+    ) -> CrimeSysAdCompletion {
+        debug_assert!(self.synchronous_timer_write_ready(request.address, &request.transfer));
+        self.current_time = request.time;
+        CrimeSysAdCompletion {
+            id: request.id,
+            result: self.access_control_register(request.address, &request.transfer, request.time),
+        }
+    }
+
+    /// Commits the final TIMER anchor produced by a proven synchronous batch.
+    pub fn commit_synchronous_timer_projection(
+        &mut self,
+        projection: CrimeSynchronousTimerProjection,
+    ) -> bool {
+        if !self.stable_cpu_fetch_ready()
+            || projection.physical_address != registers::TIMER
+            || projection.frequency_hz != CRIME_MASTER_FREQUENCY_HZ
+            || projection.timebase_hz != self.timebase_hz
+        {
+            return false;
+        }
+        let result = self.piu.write(
+            registers::TIMER,
+            u64::from(projection.base),
+            projection.base_time,
+            self.timebase_hz,
+        );
+        debug_assert!(result.handled);
+        debug_assert!(result.effects.is_empty());
+        self.current_time = self.current_time.max(projection.base_time);
+        true
     }
 
     /// Accounts for bypassed stable CPU requests at the last SysAD delivery time.
