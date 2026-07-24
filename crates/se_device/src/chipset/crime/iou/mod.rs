@@ -550,6 +550,29 @@ impl CrimeCgiBus {
         self.reset_state();
     }
 
+    /// Returns whether idle PIO transactions may bypass the CGI event path.
+    pub fn stable_pio_ready(&self) -> bool {
+        !self.service_scheduled
+            && self.queue.is_empty()
+            && self.in_flight.is_empty()
+            && self.pending_completions.is_empty()
+            && self.scheduled_events.is_empty()
+            && self.actions.is_empty()
+    }
+
+    /// Returns the exact current fractional clock used by stable CGI PIO.
+    pub fn stable_pio_clock(&self) -> Option<se_core::scheduler::FractionalClockProjection> {
+        self.stable_pio_ready().then(|| self.clock.projection())
+    }
+
+    /// Commits idle request/completion cycle pairs consumed by stable CGI PIO.
+    pub fn commit_stable_pios(&mut self, transactions: usize) {
+        assert!(self.stable_pio_ready());
+        let _ = self
+            .clock
+            .advance_cycles((transactions as u64).saturating_mul(2));
+    }
+
     fn reset_state(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.clock.reset();
