@@ -8,6 +8,7 @@ use se_device::cpu::mips4::cp1::decode::{Mips4Cp1Decode, Mips4Cp1InstructionClas
 use se_device::cpu::mips4::execution::block::*;
 use se_device::cpu::mips4::execution::port::{
     Mips4BlockExecutionResult, Mips4BlockProbe, Mips4BlockSource, Mips4ExecutionPort,
+    Mips4ReusableBatchExecution, Mips4ReusableBatchResult, Mips4ReusableBatchStop,
     Mips4ReusableBlockExecution,
 };
 
@@ -153,6 +154,9 @@ pub struct Mips4BlockExecution {
     /// Typed runtime helpers entered by this block invocation.
     pub runtime_calls: u64,
 
+    /// Fast-memory reads completed directly by native code.
+    pub native_fast_memory_reads: u64,
+
     /// Native Region side-exit reason, when the Region tier executed.
     pub region_side_exit: Option<Mips4RegionSideExit>,
 }
@@ -173,6 +177,12 @@ pub enum Mips4CachedBlockExecution {
 /// Derived block-engine counters.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Mips4BlockEngineStatistics {
+    /// Reusable cached-dispatch batches that executed at least one entry.
+    pub cached_dispatch_batches: u64,
+
+    /// Reusable block or Region entries consumed inside cached-dispatch batches.
+    pub cached_dispatch_entries: u64,
+
     /// Blocks executed by the IR interpreter.
     pub interpreted_blocks: u64,
 
@@ -187,6 +197,9 @@ pub struct Mips4BlockEngineStatistics {
 
     /// Typed runtime helper calls made by either tier.
     pub runtime_calls: u64,
+
+    /// Fast-memory reads completed directly by native code.
+    pub native_fast_memory_reads: u64,
 
     /// Dynamically fetched instructions translated as single-instruction blocks.
     pub dynamic_fetches: u64,
@@ -610,6 +623,7 @@ where
             compiled_region: None,
         };
         if let Some(index) = self.indices.get(&key).copied() {
+            self.remove_dispatch_entry(key);
             self.invalidate_regions_depending_on(key);
             if self.records[index]
                 .as_ref()
@@ -684,7 +698,10 @@ where
     }
 
     fn invalidate_regions_depending_on(&mut self, key: Mips4BlockKey) {
-        for record in self.records.iter_mut().flatten() {
+        for record in self.records.iter_mut() {
+            let Some(record) = record.as_mut() else {
+                continue;
+            };
             let depends_on_key = record
                 .compiled_region
                 .as_ref()
@@ -875,6 +892,10 @@ where
             .statistics
             .runtime_calls
             .saturating_add(frame.runtime_calls());
+        self.statistics.native_fast_memory_reads = self
+            .statistics
+            .native_fast_memory_reads
+            .saturating_add(frame.native_fast_memory_reads());
 
         if tier != Mips4BlockTier::Region {
             let record = self.records[index]
@@ -901,6 +922,7 @@ where
             counter_barrier,
             operations_executed: frame.operations_executed(),
             runtime_calls: frame.runtime_calls(),
+            native_fast_memory_reads: frame.native_fast_memory_reads(),
             region_side_exit,
         })
     }
@@ -1004,6 +1026,7 @@ where
                         counter_barrier: record.counter_barrier,
                         operations_executed: frame.operations_executed(),
                         runtime_calls: frame.runtime_calls(),
+                        native_fast_memory_reads: frame.native_fast_memory_reads(),
                         region_side_exit,
                     }),
                     record.guard_mutating && !cached_guard_valid(record, runtime),
@@ -1061,8 +1084,57 @@ where
         })
     }
 
+    fn record_reusable_execution_statistics(&mut self, execution: Mips4BlockExecution) {
+        let mut statistics = Mips4BlockEngineStatistics::default();
+        match execution.tier {
+            Mips4BlockTier::Interpreter => {
+                statistics.interpreted_blocks = 1;
+                statistics.interpreted_operations = execution.operations_executed;
+            }
+            Mips4BlockTier::Native => {
+                statistics.native_blocks = 1;
+                statistics.native_operations = execution.operations_executed;
+            }
+            Mips4BlockTier::Region => {
+                statistics.region_entries = 1;
+                statistics.region_operations = execution.operations_executed;
+                record_region_side_exit(&mut statistics, execution.region_side_exit);
+            }
+        }
+        statistics.runtime_calls = execution.runtime_calls;
+        statistics.native_fast_memory_reads = execution.native_fast_memory_reads;
+        self.record_cached_statistics(statistics);
+    }
+
+    fn finish_reusable_batch(
+        &mut self,
+        execution: Mips4BlockExecutionResult,
+        stop: Mips4ReusableBatchStop,
+        entries: u64,
+    ) -> Mips4ReusableBatchExecution {
+        self.statistics.cached_dispatch_batches =
+            self.statistics.cached_dispatch_batches.saturating_add(1);
+        self.statistics.cached_dispatch_entries = self
+            .statistics
+            .cached_dispatch_entries
+            .saturating_add(entries);
+        Mips4ReusableBatchExecution::Executed(Mips4ReusableBatchResult {
+            execution,
+            stop,
+            entries,
+        })
+    }
+
     /// Commits execution counters accumulated by a cached-block dispatcher.
     pub fn record_cached_statistics(&mut self, statistics: Mips4BlockEngineStatistics) {
+        self.statistics.cached_dispatch_batches = self
+            .statistics
+            .cached_dispatch_batches
+            .saturating_add(statistics.cached_dispatch_batches);
+        self.statistics.cached_dispatch_entries = self
+            .statistics
+            .cached_dispatch_entries
+            .saturating_add(statistics.cached_dispatch_entries);
         self.statistics.interpreted_blocks = self
             .statistics
             .interpreted_blocks
@@ -1083,6 +1155,10 @@ where
             .statistics
             .runtime_calls
             .saturating_add(statistics.runtime_calls);
+        self.statistics.native_fast_memory_reads = self
+            .statistics
+            .native_fast_memory_reads
+            .saturating_add(statistics.native_fast_memory_reads);
         self.statistics.region_entries = self
             .statistics
             .region_entries
@@ -1331,24 +1407,7 @@ where
                 Ok(Mips4ReusableBlockExecution::CounterSynchronization)
             }
             Mips4CachedBlockExecution::Executed(execution) => {
-                let mut statistics = Mips4BlockEngineStatistics::default();
-                match execution.tier {
-                    Mips4BlockTier::Interpreter => {
-                        statistics.interpreted_blocks = 1;
-                        statistics.interpreted_operations = execution.operations_executed;
-                    }
-                    Mips4BlockTier::Native => {
-                        statistics.native_blocks = 1;
-                        statistics.native_operations = execution.operations_executed;
-                    }
-                    Mips4BlockTier::Region => {
-                        statistics.region_entries = 1;
-                        statistics.region_operations = execution.operations_executed;
-                        record_region_side_exit(&mut statistics, execution.region_side_exit);
-                    }
-                }
-                statistics.runtime_calls = execution.runtime_calls;
-                self.record_cached_statistics(statistics);
+                self.record_reusable_execution_statistics(execution);
                 Ok(Mips4ReusableBlockExecution::Executed(
                     Mips4BlockExecutionResult {
                         exit: execution.exit,
@@ -1357,6 +1416,87 @@ where
                     },
                 ))
             }
+        }
+    }
+
+    fn execute_reusable_batch<R>(
+        &mut self,
+        key: Mips4BlockKey,
+        frame: &mut Mips4BlockFrame,
+        runtime: &mut R,
+        fast_memory: Option<&mut Self::FastMemoryRuntime>,
+        counters_dirty: bool,
+    ) -> Result<Mips4ReusableBatchExecution, Self::Error>
+    where
+        R: Mips4BlockRuntime,
+    {
+        let mut key = key;
+        let mut fast_memory = fast_memory;
+        let mut counters_dirty = counters_dirty;
+        let mut entries = 0_u64;
+        let mut operations_executed = 0_u64;
+        let mut last_execution = None;
+
+        loop {
+            let previous_retired = frame.retired();
+            let execution = self.execute_cached_with_runtime(
+                key,
+                frame,
+                runtime,
+                fast_memory.as_deref_mut(),
+                counters_dirty,
+            )?;
+            let execution = match execution {
+                Mips4CachedBlockExecution::Missing => {
+                    let Some(execution) = last_execution else {
+                        return Ok(Mips4ReusableBatchExecution::Missing);
+                    };
+                    return Ok(self.finish_reusable_batch(
+                        execution,
+                        Mips4ReusableBatchStop::MissingSuccessor,
+                        entries,
+                    ));
+                }
+                Mips4CachedBlockExecution::CounterSynchronization => {
+                    let Some(execution) = last_execution else {
+                        return Ok(Mips4ReusableBatchExecution::CounterSynchronization);
+                    };
+                    return Ok(self.finish_reusable_batch(
+                        execution,
+                        Mips4ReusableBatchStop::CounterSynchronization,
+                        entries,
+                    ));
+                }
+                Mips4CachedBlockExecution::Executed(execution) => execution,
+            };
+
+            self.record_reusable_execution_statistics(execution);
+            entries = entries.saturating_add(1);
+            operations_executed = operations_executed.saturating_add(execution.operations_executed);
+            let made_retirement = frame.retired() != previous_retired;
+            counters_dirty |= made_retirement;
+            let aggregate = Mips4BlockExecutionResult {
+                exit: execution.exit,
+                counter_barrier: execution.counter_barrier,
+                operations_executed,
+            };
+            last_execution = Some(aggregate);
+
+            if execution.exit != Mips4BlockExit::Dispatch
+                || execution.counter_barrier
+                || frame.budget() == 0
+                || !made_retirement
+            {
+                return Ok(self.finish_reusable_batch(
+                    aggregate,
+                    Mips4ReusableBatchStop::BlockExit,
+                    entries,
+                ));
+            }
+
+            key.pc = frame.pc();
+            key.next_pc = frame.next_pc();
+            key.delay_slot_branch_pc = frame.delay_slot_branch_pc();
         }
     }
 }
@@ -1616,6 +1756,127 @@ mod tests {
             Mips4ReusableBlockExecution::Executed(_)
         ));
         assert_eq!(ordinary.statistics(), reusable.statistics());
+    }
+
+    #[test]
+    fn reusable_batch_matches_scalar_entries_and_reports_missing_successor() {
+        let source = Mips4BlockSource::InstructionCache;
+        let blocks = [
+            block(0x1000, source),
+            block(0x1004, source),
+            block(0x1008, source),
+        ];
+        let key = blocks[0].key();
+        let mut batch_engine = Mips4BlockEngine::new(TestBackend);
+        let mut scalar_engine = Mips4BlockEngine::new(TestBackend);
+        for block in blocks {
+            batch_engine.install(block.clone(), source).unwrap();
+            scalar_engine.install(block, source).unwrap();
+        }
+        let mut batch_runtime = TestRuntime {
+            guard_valid: true,
+            epoch: 0,
+        };
+        let mut scalar_runtime = TestRuntime {
+            guard_valid: true,
+            epoch: 0,
+        };
+        let mut batch_frame = Mips4BlockFrame::new([0; 32], 0, 0, 0x1000, 0x1004, None, 4);
+        let batch = Mips4ExecutionPort::execute_reusable_batch(
+            &mut batch_engine,
+            key,
+            &mut batch_frame,
+            &mut batch_runtime,
+            None,
+            false,
+        )
+        .unwrap();
+        let Mips4ReusableBatchExecution::Executed(batch) = batch else {
+            panic!("expected a completed cached batch");
+        };
+        assert_eq!(batch.stop, Mips4ReusableBatchStop::MissingSuccessor);
+        assert_eq!(batch.entries, 3);
+        assert_eq!(batch.execution.operations_executed, 3);
+
+        let mut scalar_frame = Mips4BlockFrame::new([0; 32], 0, 0, 0x1000, 0x1004, None, 4);
+        let mut scalar_key = key;
+        for _ in 0..3 {
+            assert!(matches!(
+                Mips4ExecutionPort::execute_reusable(
+                    &mut scalar_engine,
+                    scalar_key,
+                    &mut scalar_frame,
+                    &mut scalar_runtime,
+                    None,
+                    false,
+                )
+                .unwrap(),
+                Mips4ReusableBlockExecution::Executed(_)
+            ));
+            scalar_key.pc = scalar_frame.pc();
+            scalar_key.next_pc = scalar_frame.next_pc();
+        }
+        assert_eq!(batch_frame.export_state(), scalar_frame.export_state());
+        assert_eq!(batch_engine.statistics().interpreted_blocks, 3);
+        assert_eq!(
+            batch_engine.statistics().interpreted_blocks,
+            scalar_engine.statistics().interpreted_blocks
+        );
+        assert_eq!(batch_engine.statistics().cached_dispatch_batches, 1);
+        assert_eq!(batch_engine.statistics().cached_dispatch_entries, 3);
+    }
+
+    #[test]
+    fn reusable_batch_stops_before_a_dirty_counter_barrier() {
+        let source = Mips4BlockSource::InstructionCache;
+        let first = block(0x1000, source);
+        let second = block(0x1004, source);
+        let first_key = first.key();
+        let second_key = second.key();
+        let mut engine = Mips4BlockEngine::new(TestBackend);
+        engine.install(first, source).unwrap();
+        engine.install(second, source).unwrap();
+        let second_index = engine.record_index(second_key).unwrap();
+        engine.records[second_index]
+            .as_mut()
+            .unwrap()
+            .counter_barrier = true;
+        let mut runtime = TestRuntime {
+            guard_valid: true,
+            epoch: 0,
+        };
+        let mut frame = Mips4BlockFrame::new([0; 32], 0, 0, 0x1000, 0x1004, None, 3);
+
+        let batch = Mips4ExecutionPort::execute_reusable_batch(
+            &mut engine,
+            first_key,
+            &mut frame,
+            &mut runtime,
+            None,
+            false,
+        )
+        .unwrap();
+        let Mips4ReusableBatchExecution::Executed(batch) = batch else {
+            panic!("expected the prefix before the counter barrier");
+        };
+        assert_eq!(batch.stop, Mips4ReusableBatchStop::CounterSynchronization);
+        assert_eq!(batch.entries, 1);
+        assert_eq!(frame.pc(), second_key.pc);
+
+        assert!(matches!(
+            Mips4ExecutionPort::execute_reusable_batch(
+                &mut engine,
+                second_key,
+                &mut frame,
+                &mut runtime,
+                None,
+                true,
+            )
+            .unwrap(),
+            Mips4ReusableBatchExecution::CounterSynchronization
+        ));
+        assert_eq!(engine.statistics().cached_dispatch_batches, 1);
+        assert_eq!(engine.statistics().cached_dispatch_entries, 1);
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::cpu::mips4::execution::block::{
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use crate::cpu::mips4::execution::port::{
     Mips4BlockExecutionResult, Mips4BlockProbe, Mips4BlockSource, Mips4ExecutionPort,
-    Mips4ReusableBlockExecution,
+    Mips4ReusableBatchExecution, Mips4ReusableBatchStop,
 };
 use crate::cpu::mips4::execution::state::{Mips4ExecutionConfigError, Mips4ExecutionState};
 use crate::cpu::mips4::execution::target::{
@@ -667,7 +667,7 @@ where
             let cached_execution = if block_key.code_guard == 0 {
                 let result = {
                     let target = self.executor.target_mut();
-                    port.execute_reusable(
+                    port.execute_reusable_batch(
                         block_key,
                         &mut frame,
                         target,
@@ -677,12 +677,12 @@ where
                 };
                 result.map_err(|error| self.block_error(error))?
             } else {
-                Mips4ReusableBlockExecution::Missing
+                Mips4ReusableBatchExecution::Missing
             };
             let (slice, persistent_frame, counter_barrier) = match cached_execution {
-                Mips4ReusableBlockExecution::Executed(block_execution)
+                Mips4ReusableBatchExecution::Executed(batch)
                     if matches!(
-                        block_execution.exit,
+                        batch.execution.exit,
                         Mips4BlockExit::BudgetExhausted
                             | Mips4BlockExit::Dispatch
                             | Mips4BlockExit::TimelineExhausted
@@ -701,12 +701,25 @@ where
                     accumulated.boundaries += retired_instructions;
                     deferred_boundaries += retired_instructions;
 
-                    if block_execution.exit == Mips4BlockExit::TimelineExhausted {
+                    block_key.pc = frame.pc();
+                    block_key.next_pc = frame.next_pc();
+                    block_key.delay_slot_branch_pc = frame.delay_slot_branch_pc();
+
+                    if batch.stop == Mips4ReusableBatchStop::MissingSuccessor {
+                        self.advance_deferred_boundaries(&mut deferred_boundaries);
+                        self.executor.target_mut().commit_block_frame(&mut frame);
+                        return Ok(accumulated);
+                    }
+                    if batch.stop == Mips4ReusableBatchStop::CounterSynchronization {
+                        self.advance_deferred_boundaries(&mut deferred_boundaries);
+                        continue;
+                    }
+                    if batch.execution.exit == Mips4BlockExit::TimelineExhausted {
                         self.advance_deferred_boundaries(&mut deferred_boundaries);
                         self.commit_reusable_block_frame(frame);
                         return Ok(accumulated);
                     }
-                    if block_execution.counter_barrier {
+                    if batch.execution.counter_barrier {
                         self.advance_deferred_boundaries(&mut deferred_boundaries);
                         self.commit_reusable_block_frame(frame);
                         return Ok(accumulated);
@@ -730,27 +743,24 @@ where
                     } else {
                         no_progress_retries = 0;
                     }
-                    block_key.pc = frame.pc();
-                    block_key.next_pc = frame.next_pc();
-                    block_key.delay_slot_branch_pc = frame.delay_slot_branch_pc();
                     continue;
                 }
-                Mips4ReusableBlockExecution::Executed(block_execution) => {
+                Mips4ReusableBatchExecution::Executed(batch) => {
                     self.executor.target_mut().discard_dynamic_instruction();
                     let slice = self.finish_cached_block_exit(
                         &mut frame,
                         previous_retired,
-                        block_execution,
+                        batch.execution,
                     )?;
                     *cached_retired += slice.retired_instructions;
                     *cached_exceptions += u64::from(slice.exception_boundary.is_some());
-                    (slice, true, block_execution.counter_barrier)
+                    (slice, true, batch.execution.counter_barrier)
                 }
-                Mips4ReusableBlockExecution::CounterSynchronization => {
+                Mips4ReusableBatchExecution::CounterSynchronization => {
                     self.advance_deferred_boundaries(&mut deferred_boundaries);
                     continue;
                 }
-                Mips4ReusableBlockExecution::Missing => {
+                Mips4ReusableBatchExecution::Missing => {
                     self.advance_deferred_boundaries(&mut deferred_boundaries);
                     self.executor.target_mut().commit_block_frame(&mut frame);
                     if accumulated.boundaries != 0 {
