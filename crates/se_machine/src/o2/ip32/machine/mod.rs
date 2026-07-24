@@ -33,7 +33,7 @@ use se_device::bus::two_wire::{
     TwoWireBus, TwoWireBusAction, TwoWireBusBuildError, TwoWireBusRouteError,
 };
 #[cfg(feature = "jit")]
-use se_device::chipset::crime::CrimeSynchronousReadSnapshot;
+use se_device::chipset::crime::CrimeSynchronousTimerProjection;
 use se_device::chipset::crime::config::CrimeConfig;
 use se_device::chipset::crime::iou::{
     CrimeCgiBus, CrimeCgiBusEvent, CrimeCmiBus, CrimeCmiBusEvent,
@@ -53,6 +53,8 @@ use se_device::chipset::crime::protocol::{
 use se_device::chipset::crime::protocol::{CrimeSysAdRequest, CrimeSysAdRoute};
 use se_device::chipset::crime::{Crime, CrimeError};
 use se_device::chipset::gbe::Gbe;
+#[cfg(feature = "jit")]
+use se_device::chipset::gbe::GbeSynchronousReadProjection;
 use se_device::chipset::gbe::protocol::{
     GbeAction, GbeExternalInput, GbeFrame, GbeOutputPins, GbePoll, GbeWiring,
 };
@@ -68,6 +70,8 @@ use se_device::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 #[cfg(feature = "jit")]
 use se_device::cpu::mips4::execution::block::{
     Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult, Mips4FastMemoryRuntime,
+    Mips4NativeAffineReadProjection, Mips4NativeFastMemoryContext,
+    Mips4NativeFractionalClockProjection,
 };
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use se_device::cpu::mips4::execution::target::Mips4ExecutionBoundary;
@@ -684,6 +688,7 @@ struct Ip32CpuTransactionPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Ip32CpuTransactionRoute {
     InternalRegister,
+    TimerWrite,
     Memory {
         plan: CrimeDirectMemoryPlan,
         transaction: CrimeMemoryTransaction,
@@ -838,6 +843,12 @@ pub struct Ip32PerformanceSnapshot {
 /// Derived basic-block execution counters for one IP32 machine.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Ip32JitPerformanceSnapshot {
+    /// Reusable cached-dispatch batches that executed at least one entry.
+    pub cached_dispatch_batches: u64,
+
+    /// Reusable block or Region entries consumed inside cached-dispatch batches.
+    pub cached_dispatch_entries: u64,
+
     /// Guest operations entered by the IR interpreter.
     pub interpreted_operations: u64,
 
@@ -867,6 +878,9 @@ pub struct Ip32JitPerformanceSnapshot {
 
     /// Typed runtime helper calls.
     pub runtime_calls: u64,
+
+    /// Fast-memory reads completed directly by native code.
+    pub native_fast_memory_reads: u64,
 
     /// Instructions translated after real dynamic fetches.
     pub dynamic_fetches: u64,
@@ -1534,6 +1548,8 @@ impl<S> Ip32Machine<S> {
             .map(|engine| {
                 let statistics = engine.statistics();
                 Ip32JitPerformanceSnapshot {
+                    cached_dispatch_batches: statistics.cached_dispatch_batches,
+                    cached_dispatch_entries: statistics.cached_dispatch_entries,
                     interpreted_operations: statistics.interpreted_operations,
                     native_operations: statistics.native_operations,
                     region_entries: statistics.region_entries,
@@ -1544,6 +1560,7 @@ impl<S> Ip32Machine<S> {
                     region_runtime_side_exits: statistics.region_runtime_side_exits,
                     region_guard_side_exits: statistics.region_guard_side_exits,
                     runtime_calls: statistics.runtime_calls,
+                    native_fast_memory_reads: statistics.native_fast_memory_reads,
                     dynamic_fetches: statistics.dynamic_fetches,
                     fast_fetches: statistics.fast_fetches,
                     system_flash_fetches: self.control.jit_code_fetches.system_flash,
@@ -3515,6 +3532,9 @@ where
         Ip32CpuTransactionRoute::InternalRegister => registry
             .get_resolved_mut(control.slots.crime)?
             .commit_synchronous_sysad_read(&plan.request),
+        Ip32CpuTransactionRoute::TimerWrite => registry
+            .get_resolved_mut(control.slots.crime)?
+            .commit_synchronous_timer_write(&plan.request),
         Ip32CpuTransactionRoute::Memory {
             plan: memory_plan,
             transaction: memory_transaction,
@@ -3638,6 +3658,13 @@ where
         {
             Ip32CpuTransactionRoute::InternalRegister
         }
+        CrimeSysAdRoute::SynchronousInternalRegister
+            if registry
+                .get_resolved(control.slots.crime)?
+                .synchronous_timer_write_ready(request.address, &request.transfer) =>
+        {
+            Ip32CpuTransactionRoute::TimerWrite
+        }
         CrimeSysAdRoute::Memory => {
             let Some(memory_transaction) = registry
                 .get_resolved(control.slots.crime)?
@@ -3665,7 +3692,9 @@ where
         _ => return Ok(None),
     };
     let device_completion_time = match &route {
-        Ip32CpuTransactionRoute::InternalRegister => delivery_time,
+        Ip32CpuTransactionRoute::InternalRegister | Ip32CpuTransactionRoute::TimerWrite => {
+            delivery_time
+        }
         Ip32CpuTransactionRoute::Memory { plan, .. } => delivery_time
             .checked_add(plan.service_delay())
             .ok_or(SchedulerError::TimeOverflow {

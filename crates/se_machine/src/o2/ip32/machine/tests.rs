@@ -452,6 +452,11 @@ fn jit_fast_mace_ust_doubleword_loop_matches_scalar() {
         "fast UST callback did not run: {:?}",
         jit.performance_snapshot(),
     );
+    assert!(
+        jit.performance_snapshot().jit.native_fast_memory_reads > 0,
+        "fast UST reads did not enter the native affine path: {:?}",
+        jit.performance_snapshot(),
+    );
 }
 
 #[cfg(feature = "jit")]
@@ -508,6 +513,11 @@ fn jit_fast_mace_ust_word_loop_matches_scalar() {
         jit.performance_snapshot().cmi_transactions
     );
     assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
+    assert!(
+        jit.performance_snapshot().jit.native_fast_memory_reads > 0,
+        "fast UST word reads did not enter the native affine path: {:?}",
+        jit.performance_snapshot(),
+    );
 }
 
 #[cfg(feature = "jit")]
@@ -567,6 +577,56 @@ fn jit_fast_crime_timer_loop_matches_scalar() {
         jit.performance_snapshot().jit.fast_transaction_hits > 0,
         "fast CRIME TIMER callback did not run: {:?}",
         jit.performance_snapshot(),
+    );
+    assert!(
+        jit.performance_snapshot().jit.native_fast_memory_reads > 0,
+        "fast CRIME TIMER reads did not enter the native affine path: {:?}",
+        jit.performance_snapshot(),
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_fast_gbe_frame_active_loop_matches_scalar() {
+    let program = [
+        (0x00, i_type(0x0f, 0, 8, 0xb603)),
+        (0x04, i_type(0x09, 0, 9, 512)),
+        (0x08, i_type(0x23, 8, 10, 0x0008)),
+        (0x0c, i_type(0x09, 9, 9, u16::MAX)),
+        (0x10, i_type(0x05, 9, 0, 0xfffd)),
+        (0x14, 0),
+        (0x18, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+
+    let deadline = SimTime::new(20_000_000);
+    scalar.run_until_time(deadline).unwrap();
+    jit.run_until_time(deadline).unwrap();
+
+    assert_machine_architecture_equal(&scalar, &jit);
+    let scalar_performance = scalar.performance_snapshot();
+    let jit_performance = jit.performance_snapshot();
+    assert_eq!(
+        scalar_performance.cpu.retired_instructions,
+        jit_performance.cpu.retired_instructions
+    );
+    assert_eq!(
+        scalar_performance.sysad_transactions,
+        jit_performance.sysad_transactions
+    );
+    assert_eq!(
+        scalar_performance.cgi_transactions,
+        jit_performance.cgi_transactions
+    );
+    assert!(
+        jit_performance.jit.fast_transaction_hits > 0,
+        "fast GBE frame-active reads did not run: {jit_performance:?}",
     );
 }
 

@@ -13,51 +13,112 @@ enum Ip32FastCodeTimeline {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Ip32FastMemorySecondaryBus {
+    None,
+    Cmi,
+    Cgi,
+}
+
+fn native_clock_projection(
+    clock: FractionalClockProjection,
+) -> Mips4NativeFractionalClockProjection {
+    Mips4NativeFractionalClockProjection::new(
+        clock.timebase_hz(),
+        clock.frequency_hz(),
+        clock.remainder(),
+    )
+    .expect("a scheduler clock projection always has a normalized nonzero frequency")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_affine_projection(
+    doubleword_address: u64,
+    word_lane_mask: u8,
+    uses_auxiliary_bus: bool,
+    writable: bool,
+    base: u32,
+    base_time: SimTime,
+    frequency_hz: u64,
+    timebase_hz: u64,
+) -> Mips4NativeAffineReadProjection {
+    Mips4NativeAffineReadProjection::new(
+        doubleword_address,
+        word_lane_mask,
+        uses_auxiliary_bus,
+        writable,
+        base,
+        base_time.get(),
+        frequency_hz,
+        timebase_hz,
+    )
+    .expect("an IP32 affine register projection always has a valid aligned shape")
+}
+
 pub(super) struct Ip32FastMemoryContext {
-    start_time_ticks: u64,
-    available_ticks: u64,
     cpu_clock: FractionalClockProjection,
     sysad_clock: FractionalClockProjection,
     cmi_clock: FractionalClockProjection,
+    cgi_clock: FractionalClockProjection,
     mace_ust: se_device::chipset::mace::peripheral::MaceUstProjection,
     code_timeline: Option<Ip32FastCodeTimeline>,
-    full_budget_admitted: bool,
-    attempts: u64,
-    completed: u64,
-    cmi_completed: u64,
-    last_transaction_fetch: u64,
-    last_cmi_transaction_fetch: u64,
-    last_delivery_ticks: u64,
-    last_cmi_delivery_ticks: u64,
+    native: Mips4NativeFastMemoryContext,
 }
 
 impl Ip32FastMemoryContext {
     #[allow(clippy::too_many_arguments)]
-    pub(super) const fn new(
+    pub(super) fn new(
         start_time_ticks: u64,
         available_ticks: u64,
+        maximum_retirement_boundaries: u64,
         cpu_clock: FractionalClockProjection,
         sysad_clock: FractionalClockProjection,
         cmi_clock: FractionalClockProjection,
+        cgi_clock: FractionalClockProjection,
+        crime_timer: CrimeSynchronousTimerProjection,
         mace_ust: se_device::chipset::mace::peripheral::MaceUstProjection,
         full_budget_admitted: bool,
     ) -> Self {
-        Self {
+        let native = Mips4NativeFastMemoryContext::new(
             start_time_ticks,
             available_ticks,
+            maximum_retirement_boundaries,
+            full_budget_admitted,
+            native_clock_projection(cpu_clock),
+            native_clock_projection(sysad_clock),
+            native_clock_projection(cmi_clock),
+            native_clock_projection(cgi_clock),
+            [
+                native_affine_projection(
+                    crime_timer.physical_address,
+                    0x03,
+                    false,
+                    true,
+                    crime_timer.base,
+                    crime_timer.base_time,
+                    crime_timer.frequency_hz,
+                    crime_timer.timebase_hz,
+                ),
+                native_affine_projection(
+                    se_device::chipset::mace::registers::UST,
+                    0x02,
+                    true,
+                    false,
+                    mace_ust.base,
+                    mace_ust.base_time,
+                    mace_ust.frequency_hz,
+                    mace_ust.timebase_hz,
+                ),
+            ],
+        );
+        Self {
             cpu_clock,
             sysad_clock,
             cmi_clock,
+            cgi_clock,
             mace_ust,
             code_timeline: None,
-            full_budget_admitted,
-            attempts: 0,
-            completed: 0,
-            cmi_completed: 0,
-            last_transaction_fetch: 0,
-            last_cmi_transaction_fetch: 0,
-            last_delivery_ticks: 0,
-            last_cmi_delivery_ticks: 0,
+            native,
         }
     }
 
@@ -77,7 +138,7 @@ impl Ip32FastMemoryContext {
         {
             return false;
         }
-        self.code_timeline = Some(match source {
+        let timeline = match source {
             Ip32StableCodeSource::SystemFlash if auxiliary_clock == self.cmi_clock => {
                 Ip32FastCodeTimeline::SystemFlash {
                     clock: auxiliary_clock,
@@ -92,7 +153,13 @@ impl Ip32FastMemoryContext {
                 }
             }
             _ => return false,
-        });
+        };
+        self.native.configure_code_timeline(
+            matches!(timeline, Ip32FastCodeTimeline::SystemFlash { .. }),
+            native_clock_projection(auxiliary_clock),
+            fixed_ticks_per_fetch,
+        );
+        self.code_timeline = Some(timeline);
         true
     }
 
@@ -106,6 +173,10 @@ impl Ip32FastMemoryContext {
 
     pub(super) const fn cmi_clock(&self) -> FractionalClockProjection {
         self.cmi_clock
+    }
+
+    pub(super) const fn cgi_clock(&self) -> FractionalClockProjection {
+        self.cgi_clock
     }
 
     pub(super) const fn code_fetch_active(&self) -> bool {
@@ -146,71 +217,101 @@ impl Ip32FastMemoryContext {
     }
 
     pub(super) const fn start_time_ticks(&self) -> u64 {
-        self.start_time_ticks
+        self.native.start_time_ticks()
     }
 
     pub(super) const fn available_ticks(&self) -> u64 {
-        self.available_ticks
+        self.native.available_ticks()
     }
 
     pub(super) const fn full_budget_admitted(&self) -> bool {
-        self.full_budget_admitted
+        self.native.full_budget_admitted()
     }
 
     pub(super) fn limit_available_ticks(&mut self, available_ticks: u64) {
-        if available_ticks < self.available_ticks {
-            self.available_ticks = available_ticks;
-            self.full_budget_admitted = false;
-        }
+        self.native.limit_available_ticks(available_ticks);
     }
 
     pub(super) fn record_attempt(&mut self) {
-        self.attempts = self.attempts.saturating_add(1);
+        self.native.record_attempt();
     }
 
-    pub(super) fn record_completion(&mut self, delivery_ticks: u64, fetches: u64, uses_cmi: bool) {
-        self.completed = self.completed.saturating_add(1);
-        self.last_delivery_ticks = delivery_ticks;
-        self.last_transaction_fetch = fetches;
-        if uses_cmi {
-            self.cmi_completed = self.cmi_completed.saturating_add(1);
-            self.last_cmi_delivery_ticks = delivery_ticks;
-            self.last_cmi_transaction_fetch = fetches;
-        }
+    fn record_completion(
+        &mut self,
+        delivery_ticks: u64,
+        fetches: u64,
+        secondary_bus: Ip32FastMemorySecondaryBus,
+    ) {
+        self.native.record_completion(
+            delivery_ticks,
+            fetches,
+            secondary_bus == Ip32FastMemorySecondaryBus::Cmi,
+            secondary_bus == Ip32FastMemorySecondaryBus::Cgi,
+        );
     }
 
     pub(super) const fn attempts(&self) -> u64 {
-        self.attempts
+        self.native.attempts()
     }
 
     pub(super) const fn completed(&self) -> u64 {
-        self.completed
+        self.native.completed()
+    }
+
+    pub(super) const fn timer_writes(&self) -> u64 {
+        self.native.writes()
+    }
+
+    pub(super) fn crime_timer_projection(&self) -> CrimeSynchronousTimerProjection {
+        let projection = self
+            .native
+            .projection(0)
+            .expect("the first IP32 native affine projection is always CRIME TIMER");
+        CrimeSynchronousTimerProjection {
+            physical_address: projection.doubleword_address(),
+            base: projection.base(),
+            base_time: SimTime::new(projection.base_time_ticks()),
+            frequency_hz: projection.frequency_hz(),
+            timebase_hz: projection.timebase_hz(),
+        }
     }
 
     pub(super) const fn cmi_completed(&self) -> u64 {
-        self.cmi_completed
+        self.native.auxiliary_completed()
+    }
+
+    pub(super) const fn cgi_completed(&self) -> u64 {
+        self.native.graphics_completed()
     }
 
     pub(super) const fn last_delivery_ticks(&self) -> u64 {
-        self.last_delivery_ticks
+        self.native.last_delivery_ticks()
     }
 
     pub(super) const fn last_cmi_delivery_ticks(&self) -> u64 {
-        self.last_cmi_delivery_ticks
+        self.native.last_auxiliary_delivery_ticks()
+    }
+
+    pub(super) const fn last_cgi_delivery_ticks(&self) -> u64 {
+        self.native.last_graphics_delivery_ticks()
     }
 
     pub(super) const fn last_transaction_fetch(&self) -> u64 {
-        self.last_transaction_fetch
+        self.native.last_transaction_fetch()
     }
 
     pub(super) const fn last_cmi_transaction_fetch(&self) -> u64 {
-        self.last_cmi_transaction_fetch
+        self.native.last_auxiliary_transaction_fetch()
+    }
+
+    pub(super) const fn last_cgi_transaction_fetch(&self) -> u64 {
+        self.native.last_graphics_transaction_fetch()
     }
 }
 
 pub(super) struct Ip32FastMemoryRuntime {
     pub(super) context: Ip32FastMemoryContext,
-    pub(super) crime: CrimeSynchronousReadSnapshot,
+    pub(super) gbe_frame_active: GbeSynchronousReadProjection,
 }
 
 impl Ip32FastMemoryRuntime {
@@ -245,6 +346,11 @@ impl Ip32FastMemoryRuntime {
                     .checked_mul(2)?,
             )
             .map(SimDuration::get)?;
+        let cgi = self
+            .context
+            .cgi_clock()
+            .elapsed(self.context.cgi_completed().checked_mul(2)?)
+            .map(SimDuration::get)?;
         let auxiliary = if self.context.code_fetch_active() && !self.context.code_fetch_shares_cmi()
         {
             self.context
@@ -260,6 +366,7 @@ impl Ip32FastMemoryRuntime {
             .checked_mul(code_fetches)?;
         sysad
             .checked_add(cmi)?
+            .checked_add(cgi)?
             .checked_add(auxiliary)?
             .checked_add(fixed)
     }
@@ -267,8 +374,10 @@ impl Ip32FastMemoryRuntime {
     fn transaction_timeline(
         &self,
         retired_boundaries: u64,
-        uses_cmi: bool,
+        secondary_bus: Ip32FastMemorySecondaryBus,
     ) -> Option<(u64, u64, u64)> {
+        let uses_cmi = secondary_bus == Ip32FastMemorySecondaryBus::Cmi;
+        let uses_cgi = secondary_bus == Ip32FastMemorySecondaryBus::Cgi;
         let cpu = self
             .context
             .cpu_clock()
@@ -315,6 +424,25 @@ impl Ip32FastMemoryRuntime {
                     .checked_add(u64::from(uses_cmi).checked_mul(2)?)?,
             )
             .map(SimDuration::get)?;
+        let cgi_prefix = self.context.cgi_completed();
+        let cgi_request = self
+            .context
+            .cgi_clock()
+            .elapsed(
+                cgi_prefix
+                    .checked_mul(2)?
+                    .checked_add(u64::from(uses_cgi))?,
+            )
+            .map(SimDuration::get)?;
+        let cgi_completion = self
+            .context
+            .cgi_clock()
+            .elapsed(
+                cgi_prefix
+                    .checked_mul(2)?
+                    .checked_add(u64::from(uses_cgi).checked_mul(2)?)?,
+            )
+            .map(SimDuration::get)?;
         let auxiliary = if self.context.code_fetch_active() && !self.context.code_fetch_shares_cmi()
         {
             self.context
@@ -331,10 +459,12 @@ impl Ip32FastMemoryRuntime {
         let common = cpu.checked_add(auxiliary)?.checked_add(fixed)?;
         let delivery = common
             .checked_add(sysad_request)?
-            .checked_add(cmi_request)?;
+            .checked_add(cmi_request)?
+            .checked_add(cgi_request)?;
         let completion = common
             .checked_add(sysad_completion)?
-            .checked_add(cmi_completion)?;
+            .checked_add(cmi_completion)?
+            .checked_add(cgi_completion)?;
         Some((delivery, completion, code_fetches))
     }
 
@@ -343,6 +473,7 @@ impl Ip32FastMemoryRuntime {
         retirements: u64,
         completed: u64,
         cmi_completed: u64,
+        cgi_completed: u64,
     ) -> Option<u64> {
         let code_fetches = if self.context.code_fetch_active() {
             retirements
@@ -369,6 +500,11 @@ impl Ip32FastMemoryRuntime {
             .cmi_clock()
             .elapsed(shared_fetches.checked_add(cmi_completed)?.checked_mul(2)?)
             .map(SimDuration::get)?;
+        let cgi = self
+            .context
+            .cgi_clock()
+            .elapsed(cgi_completed.checked_mul(2)?)
+            .map(SimDuration::get)?;
         let auxiliary = if self.context.code_fetch_active() && !self.context.code_fetch_shares_cmi()
         {
             self.context
@@ -384,6 +520,7 @@ impl Ip32FastMemoryRuntime {
             .checked_mul(code_fetches)?;
         cpu.checked_add(sysad)?
             .checked_add(cmi)?
+            .checked_add(cgi)?
             .checked_add(auxiliary)?
             .checked_add(fixed)
     }
@@ -393,20 +530,21 @@ impl Ip32FastMemoryRuntime {
         retired: u64,
         completed: u64,
         cmi_completed: u64,
+        cgi_completed: u64,
     ) -> Option<u64> {
         let mut lower = retired;
         let mut upper = self.context.code_fetch_limit();
         if self.context.full_budget_admitted() {
             return Some(upper);
         }
-        if self.combined_elapsed_ticks(upper, completed, cmi_completed)?
+        if self.combined_elapsed_ticks(upper, completed, cmi_completed, cgi_completed)?
             < self.context.available_ticks()
         {
             return Some(upper);
         }
         while lower < upper {
             let candidate = lower + (upper - lower).div_ceil(2);
-            if self.combined_elapsed_ticks(candidate, completed, cmi_completed)?
+            if self.combined_elapsed_ticks(candidate, completed, cmi_completed, cgi_completed)?
                 < self.context.available_ticks()
             {
                 lower = candidate;
@@ -427,6 +565,11 @@ impl Ip32FastMemoryRuntime {
             .checked_add(SimDuration::new(self.context.last_cmi_delivery_ticks()))
     }
 
+    pub(super) fn last_cgi_delivery_time(&self) -> Option<SimTime> {
+        SimTime::new(self.context.start_time_ticks())
+            .checked_add(SimDuration::new(self.context.last_cgi_delivery_ticks()))
+    }
+
     pub(super) fn last_code_delivery_time(
         &self,
         code_fetches: u64,
@@ -441,6 +584,9 @@ impl Ip32FastMemoryRuntime {
         ))?;
         let cmi_before = self.context.cmi_completed().checked_sub(u64::from(
             self.context.last_cmi_transaction_fetch() == code_fetches,
+        ))?;
+        let cgi_before = self.context.cgi_completed().checked_sub(u64::from(
+            self.context.last_cgi_transaction_fetch() == code_fetches,
         ))?;
         let cpu = self
             .context
@@ -488,9 +634,15 @@ impl Ip32FastMemoryRuntime {
             .context
             .code_fetch_fixed_ticks()
             .checked_mul(previous_fetches)?;
+        let cgi = self
+            .context
+            .cgi_clock()
+            .elapsed(cgi_before.checked_mul(2)?)
+            .map(SimDuration::get)?;
         let ticks = cpu
             .checked_add(sysad)?
             .checked_add(auxiliary)?
+            .checked_add(cgi)?
             .checked_add(fixed)?;
         SimTime::new(self.context.start_time_ticks()).checked_add(SimDuration::new(ticks))
     }
@@ -499,7 +651,7 @@ impl Ip32FastMemoryRuntime {
         &self,
         request: Mips4FastMemoryReadRequest,
         completion_ticks: u64,
-        uses_cmi: bool,
+        secondary_bus: Ip32FastMemorySecondaryBus,
     ) -> Option<u64> {
         if self.context.code_fetch_active() {
             return self.combined_retirement_limit(
@@ -507,7 +659,10 @@ impl Ip32FastMemoryRuntime {
                 self.context.completed().checked_add(1)?,
                 self.context
                     .cmi_completed()
-                    .checked_add(u64::from(uses_cmi))?,
+                    .checked_add(u64::from(secondary_bus == Ip32FastMemorySecondaryBus::Cmi))?,
+                self.context
+                    .cgi_completed()
+                    .checked_add(u64::from(secondary_bus == Ip32FastMemorySecondaryBus::Cgi))?,
             );
         }
         let cpu_ticks = self
@@ -574,16 +729,24 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
             8 => request.physical_address() == se_device::chipset::mace::registers::UST,
             _ => false,
         };
-        if !crime_timer && !mace_ust {
+        let gbe_frame_active = request.size() == 4
+            && request.physical_address() == self.gbe_frame_active.physical_address;
+        if !crime_timer && !mace_ust && !gbe_frame_active {
             return Mips4FastMemoryReadResult::Unavailable;
         }
-        let uses_cmi = mace_ust;
+        let secondary_bus = if mace_ust {
+            Ip32FastMemorySecondaryBus::Cmi
+        } else if gbe_frame_active {
+            Ip32FastMemorySecondaryBus::Cgi
+        } else {
+            Ip32FastMemorySecondaryBus::None
+        };
         let length = match request.size() {
             1 | 2 | 4 | 8 => request.size() as u16,
             _ => return Mips4FastMemoryReadResult::InternalError,
         };
         let Some((delivery_ticks, completion_ticks, code_fetches)) =
-            self.transaction_timeline(request.retired_boundaries(), uses_cmi)
+            self.transaction_timeline(request.retired_boundaries(), secondary_bus)
         else {
             return Mips4FastMemoryReadResult::InternalError;
         };
@@ -594,7 +757,8 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
                 Mips4FastMemoryReadResult::TimelineExhausted
             };
         }
-        let Some(retirement_limit) = self.retirement_limit(request, completion_ticks, uses_cmi)
+        let Some(retirement_limit) =
+            self.retirement_limit(request, completion_ticks, secondary_bus)
         else {
             return Mips4FastMemoryReadResult::InternalError;
         };
@@ -615,11 +779,23 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
                 return Mips4FastMemoryReadResult::Unavailable;
             };
             value
-        } else {
+        } else if gbe_frame_active {
             let Some(data) = self
-                .crime
-                .read(request.physical_address(), length, delivery_time)
+                .gbe_frame_active
+                .read(request.physical_address(), length)
             else {
+                return Mips4FastMemoryReadResult::Unavailable;
+            };
+            let Some(value) = Ip32SysAdBus::pack_read_data(&data) else {
+                return Mips4FastMemoryReadResult::InternalError;
+            };
+            value
+        } else {
+            let Some(data) = self.context.crime_timer_projection().read(
+                request.physical_address(),
+                length,
+                delivery_time,
+            ) else {
                 return Mips4FastMemoryReadResult::Unavailable;
             };
             let Some(value) = Ip32SysAdBus::pack_read_data(&data) else {
@@ -628,7 +804,7 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
             value
         };
         self.context
-            .record_completion(delivery_ticks, code_fetches, uses_cmi);
+            .record_completion(delivery_ticks, code_fetches, secondary_bus);
         Mips4FastMemoryReadResult::Complete {
             value,
             retirement_limit,
@@ -637,6 +813,11 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
 
     fn completed_transactions(&self) -> u64 {
         self.context.completed()
+    }
+
+    fn native_context(&mut self) -> Option<&mut Mips4NativeFastMemoryContext> {
+        (self.context.full_budget_admitted() && self.context.native.native_arithmetic_safe())
+            .then_some(&mut self.context.native)
     }
 }
 
@@ -727,18 +908,24 @@ where
     else {
         return Ok(None);
     };
+    let Some(cgi_clock) = registry.get_resolved(control.slots.cgi)?.stable_pio_clock() else {
+        return Ok(None);
+    };
     let Some(mace_ust) = registry
         .get_resolved(control.slots.mace)?
         .synchronous_ust_projection()
     else {
         return Ok(None);
     };
-    let Some(crime) = registry
+    let Some(crime_timer) = registry
         .get_resolved(control.slots.crime)?
-        .synchronous_read_snapshot()
+        .synchronous_timer_projection()
     else {
         return Ok(None);
     };
+    let gbe_frame_active = registry
+        .get_resolved(control.slots.gbe)?
+        .synchronous_frame_active_projection();
     let limit = context
         .next_event_time()
         .map_or(context.deadline(), |event| event.min(context.deadline()));
@@ -769,6 +956,11 @@ where
                 .elapsed(maximum_shared_bus_cycles)
                 .and_then(|cmi| ticks.checked_add(cmi.get()))
         })
+        .and_then(|ticks| {
+            cgi_clock
+                .elapsed(maximum_code_bus_cycles)
+                .and_then(|cgi| ticks.checked_add(cgi.get()))
+        })
         .and_then(|ticks| match memory_clock {
             Some(memory) => memory
                 .elapsed(maximum_code_bus_cycles)
@@ -786,15 +978,18 @@ where
     let fast_context = Ip32FastMemoryContext::new(
         context.now().get(),
         available_ticks,
+        maximum_boundaries,
         cpu_clock,
         sysad_clock,
         cmi_clock,
+        cgi_clock,
+        crime_timer,
         mace_ust,
         fast_horizon_ticks <= external_available_ticks,
     );
     Ok(Some(Ip32FastMemoryRuntime {
         context: fast_context,
-        crime,
+        gbe_frame_active,
     }))
 }
 
@@ -861,6 +1056,7 @@ where
         )));
     }
     let cmi_completed = runtime.context.cmi_completed();
+    let cgi_completed = runtime.context.cgi_completed();
     let (prom_fetches, ram_fetches) = match code_source {
         Some(Ip32StableCodeSource::SystemFlash) => (code_fetches_usize, 0),
         Some(Ip32StableCodeSource::Sdram) => (0, code_fetches_usize),
@@ -879,6 +1075,11 @@ where
                 "fast-memory CMI count did not fit the host ABI".to_owned(),
             ))
         })?)
+        .and_then(|transactions| {
+            usize::try_from(cgi_completed)
+                .ok()
+                .and_then(|cgi| transactions.checked_add(cgi))
+        })
         .ok_or_else(|| {
             Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
                 "combined CRIME transaction ID count overflowed".to_owned(),
@@ -905,6 +1106,11 @@ where
     {
         return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
             "a fast-memory CMI batch lost idle link ownership".to_owned(),
+        )));
+    }
+    if cgi_completed != 0 && !registry.get_resolved(control.slots.cgi)?.stable_pio_ready() {
+        return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+            "a fast-memory CGI batch lost idle link ownership".to_owned(),
         )));
     }
     if ram_fetches != 0
@@ -955,6 +1161,15 @@ where
                 ))
             })?);
     }
+    if cgi_completed != 0 {
+        registry
+            .get_resolved_mut(control.slots.cgi)?
+            .commit_stable_pios(usize::try_from(cgi_completed).map_err(|_| {
+                Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                    "fast-memory CGI count did not fit the host ABI".to_owned(),
+                ))
+            })?);
+    }
     if ram_fetches != 0 {
         registry
             .get_resolved_mut(control.slots.memory)?
@@ -976,6 +1191,15 @@ where
                 "a stable-code batch lost CRIME ownership during commit".to_owned(),
             )));
         }
+    }
+    if runtime.context.timer_writes() != 0
+        && !registry
+            .get_resolved_mut(control.slots.crime)?
+            .commit_synchronous_timer_projection(runtime.context.crime_timer_projection())
+    {
+        return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+            "a fast-memory batch lost CRIME TIMER ownership during commit".to_owned(),
+        )));
     }
     if completed != 0 {
         let last_delivery = runtime.last_delivery_time().ok_or_else(|| {
@@ -999,6 +1223,15 @@ where
     {
         return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
             "a fast-memory CMI batch lost CRIME ownership during commit".to_owned(),
+        )));
+    }
+    if cgi_completed != 0
+        && !registry
+            .get_resolved_mut(control.slots.crime)?
+            .commit_synchronous_cgi_reads(cgi_completed)?
+    {
+        return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+            "a fast-memory CGI batch lost CRIME ownership during commit".to_owned(),
         )));
     }
     if prom_fetches != 0 {
@@ -1033,8 +1266,19 @@ where
             )));
         }
     }
+    if cgi_completed != 0 {
+        let last_cgi_delivery = runtime.last_cgi_delivery_time().ok_or_else(|| {
+            Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                "a fast-memory CGI batch lost its final delivery time".to_owned(),
+            ))
+        })?;
+        registry
+            .get_resolved_mut(control.slots.gbe)?
+            .commit_synchronous_frame_active_reads(cgi_completed, last_cgi_delivery);
+    }
     control.sysad_transactions = control.sysad_transactions.saturating_add(total_sysad);
     control.cmi_transactions = control.cmi_transactions.saturating_add(cmi_transactions);
+    control.cgi_transactions = control.cgi_transactions.saturating_add(cgi_completed);
     control.memory_transactions = control
         .memory_transactions
         .saturating_add(ram_fetches as u64);
