@@ -23,7 +23,7 @@ pub struct Mips4RegionKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mips4RegionNode {
     block: Mips4Block,
-    hot_successor: Option<usize>,
+    successors: Vec<usize>,
 }
 
 impl Mips4RegionNode {
@@ -31,7 +31,7 @@ impl Mips4RegionNode {
     pub fn new(block: Mips4Block, hot_successor: Option<usize>) -> Self {
         Self {
             block,
-            hot_successor,
+            successors: hot_successor.into_iter().collect(),
         }
     }
 
@@ -41,12 +41,17 @@ impl Mips4RegionNode {
     }
 
     /// Returns the hot in-Region successor node.
-    pub const fn hot_successor(&self) -> Option<usize> {
-        self.hot_successor
+    pub fn hot_successor(&self) -> Option<usize> {
+        self.successors.first().copied()
     }
 
-    pub(super) fn set_hot_successor(&mut self, hot_successor: Option<usize>) {
-        self.hot_successor = hot_successor;
+    /// Returns ordered in-Region successor nodes.
+    pub fn successors(&self) -> &[usize] {
+        &self.successors
+    }
+
+    pub(super) fn set_successors(&mut self, successors: Vec<usize>) {
+        self.successors = successors;
     }
 }
 
@@ -114,14 +119,14 @@ impl Mips4Region {
     }
 
     fn has_internal_edge(&self) -> bool {
-        self.nodes.iter().any(|node| node.hot_successor.is_some())
+        self.nodes.iter().any(|node| !node.successors.is_empty())
     }
 
     fn has_cycle(&self) -> bool {
-        self.nodes.iter().enumerate().any(|(index, node)| {
-            node.hot_successor
-                .is_some_and(|successor| successor <= index)
-        })
+        self.nodes
+            .iter()
+            .enumerate()
+            .any(|(index, node)| node.successors.iter().any(|successor| *successor <= index))
     }
 
     fn contains_counter_barrier(&self) -> bool {
@@ -204,8 +209,9 @@ impl Mips4Region {
             operations = operations.saturating_add(node.block.instruction_count());
             if operations > MIPS4_REGION_MAX_OPERATIONS
                 || node
-                    .hot_successor
-                    .is_some_and(|successor| successor >= self.nodes.len())
+                    .successors
+                    .iter()
+                    .any(|successor| *successor >= self.nodes.len())
             {
                 return Err(Mips4RegionBuildError::InvalidTopology);
             }

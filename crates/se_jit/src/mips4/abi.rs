@@ -3,160 +3,10 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use se_device::cpu::mips4::cache::Mips4MemoryAccessType;
-use se_device::cpu::mips4::cp1::decode::Mips4Cp1Decode;
-use se_device::cpu::mips4::exception::Mips4Exception;
 use se_device::cpu::mips4::execution::block::*;
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
 
 use super::region::Mips4RegionSideExit;
-
-/// Stable runtime descriptor tag exposed through the native frame ABI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub(super) enum Mips4RuntimeOperationTag {
-    /// Integer memory access.
-    Memory = 1,
-    /// Integer prefetch.
-    Prefetch = 2,
-    /// CP0, TLB, ERET, or WAIT operation.
-    Cp0 = 3,
-    /// CP1 operation.
-    Cp1 = 4,
-    /// Processor-specific CACHE operation.
-    Cache = 5,
-    /// CP2 or CP3 access.
-    Coprocessor = 6,
-    /// Preselected architectural exception.
-    Raise = 7,
-}
-
-/// Stable normalized runtime operation record referenced by native blocks.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(C)]
-pub(super) struct Mips4RuntimeOperationDescriptor {
-    tag: Mips4RuntimeOperationTag,
-    flags: u32,
-    operands: [u64; 6],
-}
-
-impl Mips4RuntimeOperationDescriptor {
-    fn from_operation(operation: Mips4RuntimeOperation) -> Self {
-        let mut descriptor = Self {
-            tag: Mips4RuntimeOperationTag::Raise,
-            flags: 0,
-            operands: [0; 6],
-        };
-        match operation {
-            Mips4RuntimeOperation::Memory { instruction, raw } => {
-                descriptor.tag = Mips4RuntimeOperationTag::Memory;
-                descriptor.operands = [
-                    instruction as u64,
-                    u64::from(raw.bits()),
-                    u64::from(raw.rs()),
-                    u64::from(raw.rt()),
-                    raw.signed_immediate() as i64 as u64,
-                    0,
-                ];
-            }
-            Mips4RuntimeOperation::Prefetch { raw } => {
-                descriptor.tag = Mips4RuntimeOperationTag::Prefetch;
-                descriptor.operands = [
-                    u64::from(raw.bits()),
-                    u64::from(raw.rs()),
-                    u64::from(raw.rt()),
-                    raw.signed_immediate() as i64 as u64,
-                    0,
-                    0,
-                ];
-            }
-            Mips4RuntimeOperation::Cp0 { raw, operation } => {
-                descriptor.tag = Mips4RuntimeOperationTag::Cp0;
-                descriptor.operands[0] = u64::from(raw.bits());
-                descriptor.operands[1] = cp0_operation_code(operation);
-            }
-            Mips4RuntimeOperation::Cp1 { raw, decoded } => {
-                descriptor.tag = Mips4RuntimeOperationTag::Cp1;
-                descriptor.operands[0] = u64::from(raw.bits());
-                descriptor.operands[1] = match decoded {
-                    Mips4Cp1Decode::Instruction(_) => 1,
-                    Mips4Cp1Decode::ReservedOrUnimplementedOperation => 2,
-                };
-            }
-            Mips4RuntimeOperation::Cache {
-                raw,
-                base,
-                offset,
-                selector,
-                operation,
-            } => {
-                descriptor.tag = Mips4RuntimeOperationTag::Cache;
-                descriptor.operands = [
-                    u64::from(raw.bits()),
-                    u64::from(base),
-                    offset as i64 as u64,
-                    u64::from(selector),
-                    u64::from(operation),
-                    0,
-                ];
-            }
-            Mips4RuntimeOperation::Coprocessor {
-                coprocessor,
-                requirements,
-            } => {
-                descriptor.tag = Mips4RuntimeOperationTag::Coprocessor;
-                descriptor.operands[0] = u64::from(coprocessor.number());
-                descriptor.operands[1] = architecture_level_code(requirements.architecture_level);
-                descriptor.operands[2] = disabled_action_code(requirements.disabled_action);
-            }
-            Mips4RuntimeOperation::Raise(exception) => {
-                descriptor.tag = Mips4RuntimeOperationTag::Raise;
-                descriptor.operands[0] = u64::from(exception.cause_code());
-                if let Mips4Exception::CoprocessorUnusable { coprocessor } = exception {
-                    descriptor.operands[1] = u64::from(coprocessor.number());
-                }
-            }
-        }
-        descriptor
-    }
-}
-
-const fn architecture_level_code(
-    level: se_device::cpu::mips4::instruction::requirements::Mips4ArchitectureLevel,
-) -> u64 {
-    use se_device::cpu::mips4::instruction::requirements::Mips4ArchitectureLevel;
-
-    match level {
-        Mips4ArchitectureLevel::Mips1 => 1,
-        Mips4ArchitectureLevel::Mips2 => 2,
-        Mips4ArchitectureLevel::Mips3 => 3,
-        Mips4ArchitectureLevel::Mips4 => 4,
-    }
-}
-
-const fn disabled_action_code(
-    action: se_device::cpu::mips4::instruction::requirements::Mips4DisabledInstructionAction,
-) -> u64 {
-    use se_device::cpu::mips4::instruction::requirements::Mips4DisabledInstructionAction;
-
-    match action {
-        Mips4DisabledInstructionAction::ReservedInstruction => 1,
-        Mips4DisabledInstructionAction::FloatingPointUnimplemented => 2,
-    }
-}
-
-const fn cp0_operation_code(operation: Mips4Cp0RuntimeOperation) -> u64 {
-    match operation {
-        Mips4Cp0RuntimeOperation::TransferFrom { .. } => 1,
-        Mips4Cp0RuntimeOperation::TransferTo { .. } => 2,
-        Mips4Cp0RuntimeOperation::TlbRead => 3,
-        Mips4Cp0RuntimeOperation::TlbWriteIndexed => 4,
-        Mips4Cp0RuntimeOperation::TlbWriteRandom => 5,
-        Mips4Cp0RuntimeOperation::TlbProbe => 6,
-        Mips4Cp0RuntimeOperation::Eret => 7,
-        Mips4Cp0RuntimeOperation::Wait => 8,
-        Mips4Cp0RuntimeOperation::Reserved => 9,
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -166,93 +16,31 @@ pub(super) struct Mips4FastMemoryReadAbiResult {
 }
 
 #[repr(C)]
-pub(super) struct Mips4NativeFrame {
-    gpr: [u64; 32],
-    gpr_write_through: *mut u64,
-    hi: u64,
-    lo: u64,
-    pc: u64,
-    next_pc: u64,
-    delay_slot_branch_pc: u64,
-    delay_slot_valid: u64,
-    budget: u64,
-    retired: u64,
-    exception: u64,
-    operations_executed: u64,
-    runtime_calls: u64,
+pub(super) struct Mips4NativeCallContext {
     operation_base: u64,
     region_side_exit: u64,
     runtime_context: *mut (),
     runtime_call: usize,
     fast_memory_context: *mut (),
     fast_memory_read: usize,
+    native_fast_memory_context: *mut Mips4NativeFastMemoryContext,
     fast_memory_result: Mips4FastMemoryReadAbiResult,
     runtime_memory_big_endian: u64,
-    runtime_operation_values: *const Mips4RuntimeOperation,
-    runtime_operations: *const Mips4RuntimeOperationDescriptor,
-    runtime_operation_count: u64,
 }
 
-impl Mips4NativeFrame {
-    fn from_state(state: Mips4BlockFrameState) -> Self {
+impl Mips4NativeCallContext {
+    fn new(runtime_memory_big_endian: bool) -> Self {
         Self {
-            gpr: state.gpr,
-            gpr_write_through: core::ptr::null_mut(),
-            hi: state.hi,
-            lo: state.lo,
-            pc: state.pc,
-            next_pc: state.next_pc,
-            delay_slot_branch_pc: state.delay_slot_branch_pc.unwrap_or(0),
-            delay_slot_valid: u64::from(state.delay_slot_branch_pc.is_some()),
-            budget: state.budget,
-            retired: state.retired,
-            exception: state.exception.map_or(0, block_exception_code),
-            operations_executed: state.operations_executed,
-            runtime_calls: state.runtime_calls,
             operation_base: 0,
             region_side_exit: 0,
             runtime_context: core::ptr::null_mut(),
             runtime_call: 0,
             fast_memory_context: core::ptr::null_mut(),
             fast_memory_read: 0,
+            native_fast_memory_context: core::ptr::null_mut(),
             fast_memory_result: Mips4FastMemoryReadAbiResult::default(),
-            runtime_memory_big_endian: 0,
-            runtime_operation_values: core::ptr::null(),
-            runtime_operations: core::ptr::null(),
-            runtime_operation_count: 0,
+            runtime_memory_big_endian: u64::from(runtime_memory_big_endian),
         }
-    }
-
-    fn export_state(&self) -> Mips4BlockFrameState {
-        Mips4BlockFrameState {
-            gpr: self.gpr,
-            hi: self.hi,
-            lo: self.lo,
-            pc: self.pc,
-            next_pc: self.next_pc,
-            delay_slot_branch_pc: (self.delay_slot_valid != 0).then_some(self.delay_slot_branch_pc),
-            budget: self.budget,
-            retired: self.retired,
-            exception: block_exception_from_code(self.exception),
-            operations_executed: self.operations_executed,
-            runtime_calls: self.runtime_calls,
-        }
-    }
-
-    fn import_state(&mut self, state: Mips4BlockFrameState) {
-        self.gpr = state.gpr;
-        self.gpr[0] = 0;
-        self.hi = state.hi;
-        self.lo = state.lo;
-        self.pc = state.pc;
-        self.next_pc = state.next_pc;
-        self.delay_slot_branch_pc = state.delay_slot_branch_pc.unwrap_or(0);
-        self.delay_slot_valid = u64::from(state.delay_slot_branch_pc.is_some());
-        self.budget = state.budget;
-        self.retired = state.retired;
-        self.exception = state.exception.map_or(0, block_exception_code);
-        self.operations_executed = state.operations_executed;
-        self.runtime_calls = state.runtime_calls;
     }
 }
 
@@ -263,10 +51,8 @@ struct Mips4NativeRuntimeBinding<'call, 'object, R> {
 }
 
 pub(super) struct Mips4NativeInvocation<'call, 'object, R> {
-    frame: Mips4NativeFrame,
-    semantic_frame: &'call mut Mips4BlockFrame,
+    context: Mips4NativeCallContext,
     binding: Mips4NativeRuntimeBinding<'call, 'object, R>,
-    descriptors: Vec<Mips4RuntimeOperationDescriptor>,
 }
 
 impl<'call, 'object, R> Mips4NativeInvocation<'call, 'object, R>
@@ -274,52 +60,37 @@ where
     R: Mips4BlockRuntime,
 {
     pub(super) fn new(
-        semantic_frame: &'call mut Mips4BlockFrame,
         runtime: &'call mut R,
         operations: &'call [Mips4RuntimeOperation],
         fast_memory: Option<&'call mut (dyn Mips4FastMemoryRuntime + 'object)>,
     ) -> Self {
-        let runtime_memory_big_endian = u64::from(runtime.runtime_memory_big_endian());
-        let descriptors = operations
-            .iter()
-            .copied()
-            .map(Mips4RuntimeOperationDescriptor::from_operation)
-            .collect();
-        let mut frame = Mips4NativeFrame::from_state(semantic_frame.export_state());
-        frame.runtime_memory_big_endian = runtime_memory_big_endian;
         Self {
-            frame,
-            semantic_frame,
+            context: Mips4NativeCallContext::new(runtime.runtime_memory_big_endian()),
             binding: Mips4NativeRuntimeBinding {
                 runtime,
                 operations,
                 fast_memory,
             },
-            descriptors,
         }
     }
 
-    pub(super) fn frame_mut_ptr(&mut self) -> *mut Mips4NativeFrame {
-        self.frame.gpr_write_through = self.frame.gpr.as_mut_ptr();
-        self.frame.runtime_context = core::ptr::from_mut(&mut self.binding).cast();
-        self.frame.runtime_call = mips4_runtime_trampoline::<R> as *const () as usize;
+    pub(super) fn context_mut_ptr(&mut self) -> *mut Mips4NativeCallContext {
+        self.context.runtime_context = core::ptr::from_mut(&mut self.binding).cast();
+        self.context.runtime_call = mips4_runtime_trampoline::<R> as *const () as usize;
         if self.binding.fast_memory.is_some() {
-            self.frame.fast_memory_context = core::ptr::from_mut(&mut self.binding).cast();
-            self.frame.fast_memory_read =
+            self.context.fast_memory_context = core::ptr::from_mut(&mut self.binding).cast();
+            self.context.fast_memory_read =
                 mips4_fast_memory_read_trampoline::<R> as *const () as usize;
+            self.context.native_fast_memory_context =
+                reborrow_fast_memory(&mut self.binding.fast_memory)
+                    .and_then(Mips4FastMemoryRuntime::native_context)
+                    .map_or(core::ptr::null_mut(), core::ptr::from_mut);
         }
-        self.frame.runtime_operation_values = self.binding.operations.as_ptr();
-        self.frame.runtime_operations = self.descriptors.as_ptr();
-        self.frame.runtime_operation_count = self.binding.operations.len() as u64;
-        &mut self.frame
+        &mut self.context
     }
 
     pub(super) fn region_side_exit(&self) -> Option<Mips4RegionSideExit> {
-        region_side_exit_from_code(self.frame.region_side_exit)
-    }
-
-    pub(super) fn finish(self) {
-        self.semantic_frame.import_state(self.frame.export_state());
+        region_side_exit_from_code(self.context.region_side_exit)
     }
 }
 
@@ -335,7 +106,7 @@ fn reborrow_fast_memory<'call, 'object>(
 
 extern "C" fn mips4_runtime_trampoline<R>(
     context: *mut (),
-    frame: *mut Mips4NativeFrame,
+    frame: *mut Mips4BlockFrame,
     operation: u32,
     allow_fast_memory: u32,
 ) -> u32
@@ -348,20 +119,15 @@ where
         }
         // SAFETY: Native invocation owns the live binding and frame for this call.
         let binding = unsafe { &mut *context.cast::<Mips4NativeRuntimeBinding<'_, '_, R>>() };
-        // SAFETY: The native entry uniquely borrows its frame during the call.
+        // SAFETY: The native entry uniquely borrows the canonical frame during the call.
         let frame = unsafe { &mut *frame };
         let Some(operation) = binding.operations.get(operation as usize).copied() else {
             return runtime_result_code(Mips4RuntimeResult::InternalError);
         };
-        let mut semantic_frame = Mips4BlockFrame::from_state(frame.export_state());
         let fast_memory = (allow_fast_memory != 0)
             .then(|| reborrow_fast_memory(&mut binding.fast_memory))
             .flatten();
-        let result = binding
-            .runtime
-            .execute(&mut semantic_frame, operation, fast_memory);
-        frame.import_state(semantic_frame.export_state());
-        runtime_result_code(result)
+        runtime_result_code(binding.runtime.execute(frame, operation, fast_memory))
     }))
     .unwrap_or_else(|_| runtime_result_code(Mips4RuntimeResult::InternalError))
 }
@@ -466,24 +232,7 @@ pub(super) const fn runtime_result_code(result: Mips4RuntimeResult) -> u32 {
 }
 
 pub(super) const fn block_exception_code(exception: Mips4BlockException) -> u64 {
-    match exception {
-        Mips4BlockException::ArithmeticOverflow => 1,
-        Mips4BlockException::AddressErrorLoad => 2,
-        Mips4BlockException::Trap => 3,
-        Mips4BlockException::SystemCall => 4,
-        Mips4BlockException::Breakpoint => 5,
-    }
-}
-
-const fn block_exception_from_code(code: u64) -> Option<Mips4BlockException> {
-    match code {
-        1 => Some(Mips4BlockException::ArithmeticOverflow),
-        2 => Some(Mips4BlockException::AddressErrorLoad),
-        3 => Some(Mips4BlockException::Trap),
-        4 => Some(Mips4BlockException::SystemCall),
-        5 => Some(Mips4BlockException::Breakpoint),
-        _ => None,
-    }
+    exception as u64
 }
 
 pub(super) const fn region_side_exit_code(side_exit: Mips4RegionSideExit) -> u64 {
@@ -505,52 +254,28 @@ pub(super) const fn region_side_exit_from_code(code: u64) -> Option<Mips4RegionS
     }
 }
 
-pub(super) const MIPS4_BLOCK_FRAME_GPR_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, gpr) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_GPR_WRITE_THROUGH_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, gpr_write_through) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_HI_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, hi) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_LO_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, lo) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_PC_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, pc) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_NEXT_PC_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, next_pc) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_DELAY_PC_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, delay_slot_branch_pc) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_DELAY_VALID_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, delay_slot_valid) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_BUDGET_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, budget) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_RETIRED_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, retired) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_EXCEPTION_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, exception) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_OPERATIONS_EXECUTED_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, operations_executed) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_RUNTIME_CALLS_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, runtime_calls) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_OPERATION_BASE_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, operation_base) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_REGION_SIDE_EXIT_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, region_side_exit) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_RUNTIME_CONTEXT_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, runtime_context) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_RUNTIME_CALL_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, runtime_call) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_FAST_MEMORY_CONTEXT_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, fast_memory_context) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_FAST_MEMORY_READ_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, fast_memory_read) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_FAST_MEMORY_RESULT_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, fast_memory_result) as i32;
+pub(super) const MIPS4_NATIVE_CALL_OPERATION_BASE_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, operation_base) as i32;
+pub(super) const MIPS4_NATIVE_CALL_REGION_SIDE_EXIT_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, region_side_exit) as i32;
+pub(super) const MIPS4_NATIVE_CALL_RUNTIME_CONTEXT_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, runtime_context) as i32;
+pub(super) const MIPS4_NATIVE_CALL_RUNTIME_CALL_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, runtime_call) as i32;
+pub(super) const MIPS4_NATIVE_CALL_FAST_MEMORY_CONTEXT_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, fast_memory_context) as i32;
+pub(super) const MIPS4_NATIVE_CALL_FAST_MEMORY_READ_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, fast_memory_read) as i32;
+pub(super) const MIPS4_NATIVE_CALL_NATIVE_FAST_MEMORY_CONTEXT_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, native_fast_memory_context) as i32;
+pub(super) const MIPS4_NATIVE_CALL_FAST_MEMORY_RESULT_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, fast_memory_result) as i32;
 pub(super) const MIPS4_FAST_MEMORY_RESULT_VALUE_OFFSET: i32 =
     core::mem::offset_of!(Mips4FastMemoryReadAbiResult, value) as i32;
 pub(super) const MIPS4_FAST_MEMORY_RESULT_RETIREMENT_LIMIT_OFFSET: i32 =
     core::mem::offset_of!(Mips4FastMemoryReadAbiResult, retirement_limit) as i32;
-pub(super) const MIPS4_BLOCK_FRAME_RUNTIME_MEMORY_BIG_ENDIAN_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFrame, runtime_memory_big_endian) as i32;
+pub(super) const MIPS4_NATIVE_CALL_RUNTIME_MEMORY_BIG_ENDIAN_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, runtime_memory_big_endian) as i32;
 
 pub(super) const fn mips4_block_frame_gpr_offset(register: u8) -> i32 {
     MIPS4_BLOCK_FRAME_GPR_OFFSET + register as i32 * 8
@@ -621,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_state_round_trips_through_the_private_native_frame() {
+    fn canonical_frame_preserves_portable_state_and_abi_codes() {
         let mut gpr = [0; 32];
         gpr[1] = 11;
         let state = Mips4BlockFrameState {
@@ -636,9 +361,14 @@ mod tests {
             exception: Some(Mips4BlockException::Trap),
             operations_executed: 5,
             runtime_calls: 2,
+            native_fast_memory_reads: 7,
         };
-        let native = Mips4NativeFrame::from_state(state.clone());
-        assert_eq!(native.export_state(), state);
+        let frame = Mips4BlockFrame::from_state(state.clone());
+        assert_eq!(frame.export_state(), state);
+        assert_eq!(
+            block_exception_code(Mips4BlockException::Trap),
+            Mips4BlockException::Trap as u64
+        );
     }
 
     #[test]
@@ -649,31 +379,29 @@ mod tests {
         semantic.import_state(state);
         let mut runtime = RejectRuntime;
         let mut fast_memory = FastMemory::default();
-        let mut invocation =
-            Mips4NativeInvocation::new(&mut semantic, &mut runtime, &[], Some(&mut fast_memory));
-        let frame = invocation.frame_mut_ptr();
-        // SAFETY: The invocation keeps the binding and native frame live for the call.
+        let mut invocation = Mips4NativeInvocation::new(&mut runtime, &[], Some(&mut fast_memory));
+        let context = invocation.context_mut_ptr();
+        // SAFETY: The invocation keeps the binding and call context live for the call.
         let outcome = unsafe {
             mips4_fast_memory_read_trampoline::<RejectRuntime>(
-                (*frame).fast_memory_context,
+                (*context).fast_memory_context,
                 0x1000,
                 2,
                 8,
-                &mut (*frame).fast_memory_result,
+                &mut (*context).fast_memory_result,
             )
         };
         assert_eq!(outcome, 1);
-        // SAFETY: The native frame remains uniquely owned by the invocation.
+        // SAFETY: The call context remains uniquely owned by the invocation.
         unsafe {
             assert_eq!(
-                (*frame).fast_memory_result,
+                (*context).fast_memory_result,
                 Mips4FastMemoryReadAbiResult {
                     value: 0x0123_4567_89ab_cdef,
                     retirement_limit: 6,
                 }
             );
         }
-        invocation.finish();
         assert_eq!(semantic.budget(), 10);
         assert_eq!(fast_memory.completed_transactions(), 1);
     }
@@ -686,27 +414,24 @@ mod tests {
             (FastMemoryFailure::InternalError, 3),
             (FastMemoryFailure::Panic, 3),
         ] {
-            let mut semantic = Mips4BlockFrame::new([0; 32], 0, 0, 0x1000, 0x1004, None, 1);
+            let semantic = Mips4BlockFrame::new([0; 32], 0, 0, 0x1000, 0x1004, None, 1);
             let mut runtime = RejectRuntime;
             let mut fast_memory = FailingFastMemory(failure);
-            let mut invocation = Mips4NativeInvocation::new(
-                &mut semantic,
-                &mut runtime,
-                &[],
-                Some(&mut fast_memory),
-            );
-            let frame = invocation.frame_mut_ptr();
+            let mut invocation =
+                Mips4NativeInvocation::new(&mut runtime, &[], Some(&mut fast_memory));
+            let context = invocation.context_mut_ptr();
             // SAFETY: The invocation keeps the binding and result slot live for the call.
             let outcome = unsafe {
                 mips4_fast_memory_read_trampoline::<RejectRuntime>(
-                    (*frame).fast_memory_context,
+                    (*context).fast_memory_context,
                     0x1000,
                     0,
                     8,
-                    &mut (*frame).fast_memory_result,
+                    &mut (*context).fast_memory_result,
                 )
             };
             assert_eq!(outcome, expected);
+            assert_eq!(semantic.budget(), 1);
         }
     }
 }

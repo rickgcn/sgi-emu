@@ -345,6 +345,28 @@ fn dominant_successor<C, R>(record: &Mips4BlockRecord<C, R>) -> Option<Mips4Bloc
     .then_some(dominant.key?)
 }
 
+fn profiled_region_successors<C, R>(record: &Mips4BlockRecord<C, R>) -> Vec<Mips4BlockKey> {
+    if record
+        .block
+        .branch()
+        .is_some_and(|branch| matches!(branch.target, Mips4BlockBranchTarget::Register(_)))
+    {
+        return dominant_successor(record).into_iter().collect();
+    }
+
+    let mut successors = record
+        .successors
+        .iter()
+        .filter(|profile| profile.key.is_some() && profile.observations != 0)
+        .copied()
+        .collect::<Vec<_>>();
+    successors.sort_unstable_by_key(|successor| core::cmp::Reverse(successor.observations));
+    successors
+        .into_iter()
+        .filter_map(|profile| profile.key)
+        .collect()
+}
+
 fn build_profiled_region<C, R>(
     entry_index: usize,
     indices: &Mips4BlockIndexMap,
@@ -359,60 +381,51 @@ fn build_profiled_region<C, R>(
     }
     let entry_key = entry_record.block.key();
     let entry_source = region_source_kind(entry_record.block.guard())?;
-    let mut nodes = Vec::new();
-    let mut node_keys = Vec::new();
-    let mut operation_count = 0_usize;
-    let mut current_index = entry_index;
+    let mut nodes = vec![Mips4RegionNode::new(entry_record.block.clone(), None)];
+    let mut node_keys = vec![entry_key];
+    let mut node_records = vec![entry_index];
+    let mut operation_count = entry_record.block.instruction_count();
+    let mut current_node = 0_usize;
 
-    loop {
-        let record = records.get(current_index)?.as_ref()?;
-        let key = record.block.key();
-        if nodes.len() == MIPS4_REGION_MAX_NODES
-            || !region_record_executable(record)
-            || key.fetch_context != entry_key.fetch_context
-            || key.translation_generation != entry_key.translation_generation
-            || key.code_guard != entry_key.code_guard
-            || region_source_kind(record.block.guard()) != Some(entry_source)
-        {
-            break;
+    while current_node < nodes.len() {
+        let record = records.get(node_records[current_node])?.as_ref()?;
+        let mut region_successors = Vec::new();
+        for successor in profiled_region_successors(record) {
+            if let Some(successor_node) = node_keys.iter().position(|key| *key == successor) {
+                region_successors.push(successor_node);
+                continue;
+            }
+            if nodes.len() == MIPS4_REGION_MAX_NODES {
+                continue;
+            }
+            let Some(successor_index) = indices.get(&successor).copied() else {
+                continue;
+            };
+            let Some(successor_record) = records.get(successor_index).and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            let successor_key = successor_record.block.key();
+            let successor_operations = successor_record.block.instruction_count();
+            if !region_record_executable(successor_record)
+                || successor_key.fetch_context != entry_key.fetch_context
+                || successor_key.translation_generation != entry_key.translation_generation
+                || successor_key.code_guard != entry_key.code_guard
+                || region_source_kind(successor_record.block.guard()) != Some(entry_source)
+                || operation_count.saturating_add(successor_operations)
+                    > MIPS4_REGION_MAX_OPERATIONS
+            {
+                continue;
+            }
+            let successor_node = nodes.len();
+            operation_count = operation_count.saturating_add(successor_operations);
+            node_keys.push(successor_key);
+            node_records.push(successor_index);
+            nodes.push(Mips4RegionNode::new(successor_record.block.clone(), None));
+            region_successors.push(successor_node);
         }
-        let next_operation_count = operation_count.checked_add(record.block.instruction_count())?;
-        if next_operation_count > MIPS4_REGION_MAX_OPERATIONS {
-            break;
-        }
-        operation_count = next_operation_count;
-        let node_index = nodes.len();
-        node_keys.push(key);
-        nodes.push(Mips4RegionNode::new(record.block.clone(), None));
-
-        let Some(successor) = dominant_successor(record) else {
-            break;
-        };
-        if let Some(successor_node) = node_keys.iter().position(|key| *key == successor) {
-            nodes[node_index].set_hot_successor(Some(successor_node));
-            break;
-        }
-        let Some(successor_index) = indices.get(&successor).copied() else {
-            break;
-        };
-        let Some(successor_record) = records.get(successor_index).and_then(Option::as_ref) else {
-            break;
-        };
-        let successor_key = successor_record.block.key();
-        let successor_operations = successor_record.block.instruction_count();
-        if nodes.len() == MIPS4_REGION_MAX_NODES
-            || !region_record_executable(successor_record)
-            || successor_key.fetch_context != entry_key.fetch_context
-            || successor_key.translation_generation != entry_key.translation_generation
-            || successor_key.code_guard != entry_key.code_guard
-            || region_source_kind(successor_record.block.guard()) != Some(entry_source)
-            || operation_count.saturating_add(successor_operations) > MIPS4_REGION_MAX_OPERATIONS
-        {
-            break;
-        }
-        let successor_node = nodes.len();
-        nodes[node_index].set_hot_successor(Some(successor_node));
-        current_index = successor_index;
+        nodes[current_node].set_successors(region_successors);
+        current_node += 1;
     }
 
     Mips4Region::new(nodes).ok()
@@ -1632,6 +1645,48 @@ mod tests {
             record.region_next_compile_hotness,
             MIPS4_REGION_HOT_THRESHOLD + MIPS4_REGION_RETRY_OPERATIONS
         );
+    }
+
+    #[test]
+    fn region_construction_links_multiple_observed_direct_successors() {
+        let source = Mips4BlockSource::Stable(code_guard());
+        let first = block(0x1000, source);
+        let second = block(0x1004, source);
+        let third = block(0x1008, source);
+        let first_key = first.key();
+        let second_key = second.key();
+        let third_key = third.key();
+        let mut engine = Mips4BlockEngine::new(TestBackend);
+        for block in [first, second, third] {
+            engine.insert(block).unwrap();
+        }
+        let first_index = engine.record_index(first_key).unwrap();
+        let second_index = engine.record_index(second_key).unwrap();
+        let third_index = engine.record_index(third_key).unwrap();
+        engine.records[first_index].as_mut().unwrap().region_hotness = MIPS4_REGION_HOT_THRESHOLD;
+        engine.records[first_index].as_mut().unwrap().successors[0] = Mips4SuccessorProfile {
+            key: Some(second_key),
+            observations: 600,
+        };
+        engine.records[first_index].as_mut().unwrap().successors[1] = Mips4SuccessorProfile {
+            key: Some(third_key),
+            observations: 400,
+        };
+        engine.records[second_index].as_mut().unwrap().successors[0] = Mips4SuccessorProfile {
+            key: Some(first_key),
+            observations: MIPS4_REGION_MIN_SUCCESSOR_OBSERVATIONS,
+        };
+        engine.records[third_index].as_mut().unwrap().successors[0] = Mips4SuccessorProfile {
+            key: Some(first_key),
+            observations: MIPS4_REGION_MIN_SUCCESSOR_OBSERVATIONS,
+        };
+
+        let region = build_profiled_region(first_index, &engine.indices, &engine.records).unwrap();
+
+        assert_eq!(region.nodes().len(), 3);
+        assert_eq!(region.nodes()[0].successors(), &[1, 2]);
+        assert_eq!(region.nodes()[1].successors(), &[0]);
+        assert_eq!(region.nodes()[2].successors(), &[0]);
     }
 
     #[test]

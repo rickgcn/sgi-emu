@@ -679,6 +679,350 @@ pub enum Mips4FastMemoryReadResult {
     InternalError,
 }
 
+/// Native ABI projection of one fractional simulated clock.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct Mips4NativeFractionalClockProjection {
+    timebase_hz: u64,
+    frequency_hz: u64,
+    remainder: u64,
+}
+
+impl Mips4NativeFractionalClockProjection {
+    /// Creates a validated native clock projection.
+    pub const fn new(timebase_hz: u64, frequency_hz: u64, remainder: u64) -> Option<Self> {
+        if timebase_hz == 0 || frequency_hz == 0 || remainder >= frequency_hz {
+            return None;
+        }
+        Some(Self {
+            timebase_hz,
+            frequency_hz,
+            remainder,
+        })
+    }
+
+    const fn supports_cycles(self, cycles: u64) -> bool {
+        let Some(fraction) = (self.timebase_hz % self.frequency_hz).checked_mul(cycles) else {
+            return false;
+        };
+        let Some(numerator) = self.remainder.checked_add(fraction) else {
+            return false;
+        };
+        let Some(base) = (self.timebase_hz / self.frequency_hz).checked_mul(cycles) else {
+            return false;
+        };
+        base.checked_add(numerator / self.frequency_hz).is_some()
+    }
+}
+
+/// Native ABI projection of one side-effect-free affine 32-bit register.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct Mips4NativeAffineReadProjection {
+    doubleword_address: u64,
+    word_lane_mask: u64,
+    uses_auxiliary_bus: u64,
+    writable: u64,
+    base: u64,
+    base_time_ticks: u64,
+    frequency_hz: u64,
+    timebase_hz: u64,
+}
+
+impl Mips4NativeAffineReadProjection {
+    /// Creates a native affine register projection.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        doubleword_address: u64,
+        word_lane_mask: u8,
+        uses_auxiliary_bus: bool,
+        writable: bool,
+        base: u32,
+        base_time_ticks: u64,
+        frequency_hz: u64,
+        timebase_hz: u64,
+    ) -> Option<Self> {
+        if doubleword_address & 7 != 0
+            || word_lane_mask & !0x03 != 0
+            || frequency_hz == 0
+            || timebase_hz == 0
+        {
+            return None;
+        }
+        Some(Self {
+            doubleword_address,
+            word_lane_mask: word_lane_mask as u64,
+            uses_auxiliary_bus: uses_auxiliary_bus as u64,
+            writable: writable as u64,
+            base: base as u64,
+            base_time_ticks,
+            frequency_hz,
+            timebase_hz,
+        })
+    }
+
+    /// Returns whether every projected counter multiplication fits in 64 bits.
+    pub const fn supports_time(self, latest_time_ticks: u64) -> bool {
+        latest_time_ticks
+            .saturating_sub(self.base_time_ticks)
+            .checked_mul(self.frequency_hz)
+            .is_some()
+    }
+
+    /// Returns the projected doubleword address.
+    pub const fn doubleword_address(self) -> u64 {
+        self.doubleword_address
+    }
+
+    /// Returns the current affine counter base.
+    pub const fn base(self) -> u32 {
+        self.base as u32
+    }
+
+    /// Returns the simulated time at which the current base was programmed.
+    pub const fn base_time_ticks(self) -> u64 {
+        self.base_time_ticks
+    }
+
+    /// Returns the projected counter frequency.
+    pub const fn frequency_hz(self) -> u64 {
+        self.frequency_hz
+    }
+
+    /// Returns the simulated timebase frequency.
+    pub const fn timebase_hz(self) -> u64 {
+        self.timebase_hz
+    }
+}
+
+/// Mutable native ABI state for a proven affine fast-memory slice.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct Mips4NativeFastMemoryContext {
+    start_time_ticks: u64,
+    available_ticks: u64,
+    maximum_retirement_boundaries: u64,
+    full_budget_admitted: u64,
+    code_fetch_active: u64,
+    code_fetch_shares_auxiliary: u64,
+    code_fetch_fixed_ticks: u64,
+    attempts: u64,
+    completed: u64,
+    writes: u64,
+    auxiliary_completed: u64,
+    graphics_completed: u64,
+    last_transaction_fetch: u64,
+    last_auxiliary_transaction_fetch: u64,
+    last_graphics_transaction_fetch: u64,
+    last_delivery_ticks: u64,
+    last_auxiliary_delivery_ticks: u64,
+    last_graphics_delivery_ticks: u64,
+    cpu_clock: Mips4NativeFractionalClockProjection,
+    bus_clock: Mips4NativeFractionalClockProjection,
+    auxiliary_clock: Mips4NativeFractionalClockProjection,
+    graphics_clock: Mips4NativeFractionalClockProjection,
+    code_auxiliary_clock: Mips4NativeFractionalClockProjection,
+    reads: [Mips4NativeAffineReadProjection; 2],
+}
+
+impl Mips4NativeFastMemoryContext {
+    /// Creates native state for one conservatively bounded execution slice.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        start_time_ticks: u64,
+        available_ticks: u64,
+        maximum_retirement_boundaries: u64,
+        full_budget_admitted: bool,
+        cpu_clock: Mips4NativeFractionalClockProjection,
+        bus_clock: Mips4NativeFractionalClockProjection,
+        auxiliary_clock: Mips4NativeFractionalClockProjection,
+        graphics_clock: Mips4NativeFractionalClockProjection,
+        reads: [Mips4NativeAffineReadProjection; 2],
+    ) -> Self {
+        Self {
+            start_time_ticks,
+            available_ticks,
+            maximum_retirement_boundaries,
+            full_budget_admitted: full_budget_admitted as u64,
+            code_fetch_active: 0,
+            code_fetch_shares_auxiliary: 0,
+            code_fetch_fixed_ticks: 0,
+            attempts: 0,
+            completed: 0,
+            writes: 0,
+            auxiliary_completed: 0,
+            graphics_completed: 0,
+            last_transaction_fetch: 0,
+            last_auxiliary_transaction_fetch: 0,
+            last_graphics_transaction_fetch: 0,
+            last_delivery_ticks: 0,
+            last_auxiliary_delivery_ticks: 0,
+            last_graphics_delivery_ticks: 0,
+            cpu_clock,
+            bus_clock,
+            auxiliary_clock,
+            graphics_clock,
+            code_auxiliary_clock: auxiliary_clock,
+            reads,
+        }
+    }
+
+    /// Configures the stable-code portion of the native timeline.
+    pub fn configure_code_timeline(
+        &mut self,
+        shares_auxiliary: bool,
+        auxiliary_clock: Mips4NativeFractionalClockProjection,
+        fixed_ticks_per_fetch: u64,
+    ) {
+        self.code_fetch_active = 1;
+        self.code_fetch_shares_auxiliary = shares_auxiliary as u64;
+        self.code_fetch_fixed_ticks = fixed_ticks_per_fetch;
+        self.code_auxiliary_clock = auxiliary_clock;
+    }
+
+    /// Restricts the proven slice horizon.
+    pub fn limit_available_ticks(&mut self, available_ticks: u64) {
+        if available_ticks < self.available_ticks {
+            self.available_ticks = available_ticks;
+            self.full_budget_admitted = 0;
+        }
+    }
+
+    /// Returns whether the complete execution budget was proven safe.
+    pub const fn full_budget_admitted(&self) -> bool {
+        self.full_budget_admitted != 0
+    }
+
+    /// Returns the slice time origin.
+    pub const fn start_time_ticks(&self) -> u64 {
+        self.start_time_ticks
+    }
+
+    /// Returns the proven duration available to the slice.
+    pub const fn available_ticks(&self) -> u64 {
+        self.available_ticks
+    }
+
+    /// Records one generic fast-memory attempt.
+    pub fn record_attempt(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+    }
+
+    /// Records one completed generic fast-memory transaction.
+    pub fn record_completion(
+        &mut self,
+        delivery_ticks: u64,
+        fetches: u64,
+        uses_auxiliary: bool,
+        uses_graphics: bool,
+    ) {
+        self.completed = self.completed.saturating_add(1);
+        self.last_delivery_ticks = delivery_ticks;
+        self.last_transaction_fetch = fetches;
+        if uses_auxiliary {
+            self.auxiliary_completed = self.auxiliary_completed.saturating_add(1);
+            self.last_auxiliary_delivery_ticks = delivery_ticks;
+            self.last_auxiliary_transaction_fetch = fetches;
+        }
+        if uses_graphics {
+            self.graphics_completed = self.graphics_completed.saturating_add(1);
+            self.last_graphics_delivery_ticks = delivery_ticks;
+            self.last_graphics_transaction_fetch = fetches;
+        }
+    }
+
+    /// Returns attempted fast-memory transactions.
+    pub const fn attempts(&self) -> u64 {
+        self.attempts
+    }
+
+    /// Returns completed fast-memory transactions.
+    pub const fn completed(&self) -> u64 {
+        self.completed
+    }
+
+    /// Returns completed native affine writes.
+    pub const fn writes(&self) -> u64 {
+        self.writes
+    }
+
+    /// Returns one current native affine projection.
+    pub const fn projection(&self, index: usize) -> Option<Mips4NativeAffineReadProjection> {
+        if index >= self.reads.len() {
+            return None;
+        }
+        Some(self.reads[index])
+    }
+
+    /// Returns completed transactions using the auxiliary bus.
+    pub const fn auxiliary_completed(&self) -> u64 {
+        self.auxiliary_completed
+    }
+
+    /// Returns completed transactions using the graphics bus.
+    pub const fn graphics_completed(&self) -> u64 {
+        self.graphics_completed
+    }
+
+    /// Returns the last completed transaction's code-fetch position.
+    pub const fn last_transaction_fetch(&self) -> u64 {
+        self.last_transaction_fetch
+    }
+
+    /// Returns the last auxiliary transaction's code-fetch position.
+    pub const fn last_auxiliary_transaction_fetch(&self) -> u64 {
+        self.last_auxiliary_transaction_fetch
+    }
+
+    /// Returns the last graphics transaction's code-fetch position.
+    pub const fn last_graphics_transaction_fetch(&self) -> u64 {
+        self.last_graphics_transaction_fetch
+    }
+
+    /// Returns the last completed transaction's delivery offset.
+    pub const fn last_delivery_ticks(&self) -> u64 {
+        self.last_delivery_ticks
+    }
+
+    /// Returns the last auxiliary transaction's delivery offset.
+    pub const fn last_auxiliary_delivery_ticks(&self) -> u64 {
+        self.last_auxiliary_delivery_ticks
+    }
+
+    /// Returns the last graphics transaction's delivery offset.
+    pub const fn last_graphics_delivery_ticks(&self) -> u64 {
+        self.last_graphics_delivery_ticks
+    }
+
+    /// Returns whether native arithmetic is safe through the slice horizon.
+    pub const fn native_arithmetic_safe(&self) -> bool {
+        let Some(latest) = self.start_time_ticks.checked_add(self.available_ticks) else {
+            return false;
+        };
+        let maximum = self.maximum_retirement_boundaries;
+        let Some(shared_cycles) = maximum.checked_mul(4) else {
+            return false;
+        };
+        let Some(shared_cycles) = shared_cycles.checked_add(2) else {
+            return false;
+        };
+        let Some(code_cycles) = maximum.checked_mul(2) else {
+            return false;
+        };
+        self.reads[0].supports_time(latest)
+            && self.reads[1].supports_time(latest)
+            && self.cpu_clock.supports_cycles(maximum)
+            && self.bus_clock.supports_cycles(shared_cycles)
+            && self.auxiliary_clock.supports_cycles(shared_cycles)
+            && self.graphics_clock.supports_cycles(shared_cycles)
+            && self.code_auxiliary_clock.supports_cycles(code_cycles)
+            && self.code_fetch_fixed_ticks.checked_mul(maximum).is_some()
+    }
+}
+
 /// Machine-owned runtime used for proven synchronous memory completion.
 pub trait Mips4FastMemoryRuntime {
     /// Attempts one already translated, aligned read.
@@ -688,7 +1032,117 @@ pub trait Mips4FastMemoryRuntime {
     fn completed_transactions(&self) -> u64 {
         0
     }
+
+    /// Returns mutable native affine state when the entire slice is proven safe.
+    #[doc(hidden)]
+    fn native_context(&mut self) -> Option<&mut Mips4NativeFastMemoryContext> {
+        None
+    }
 }
+
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CLOCK_TIMEBASE_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFractionalClockProjection, timebase_hz) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CLOCK_FREQUENCY_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFractionalClockProjection, frequency_hz) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CLOCK_REMAINDER_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFractionalClockProjection, remainder) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_AFFINE_READ_SIZE: i32 =
+    core::mem::size_of::<Mips4NativeAffineReadProjection>() as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_AFFINE_ADDRESS_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffineReadProjection, doubleword_address) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_AFFINE_WORD_MASK_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffineReadProjection, word_lane_mask) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_AFFINE_AUXILIARY_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffineReadProjection, uses_auxiliary_bus) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_AFFINE_WRITABLE_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffineReadProjection, writable) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_AFFINE_BASE_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffineReadProjection, base) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_AFFINE_BASE_TIME_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffineReadProjection, base_time_ticks) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_AFFINE_FREQUENCY_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffineReadProjection, frequency_hz) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_AFFINE_TIMEBASE_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffineReadProjection, timebase_hz) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_START_TIME_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, start_time_ticks) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_CODE_ACTIVE_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, code_fetch_active) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_CODE_SHARES_AUXILIARY_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, code_fetch_shares_auxiliary) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_CODE_FIXED_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, code_fetch_fixed_ticks) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_ATTEMPTS_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, attempts) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_COMPLETED_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, completed) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_WRITES_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, writes) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_AUXILIARY_COMPLETED_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, auxiliary_completed) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_GRAPHICS_COMPLETED_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, graphics_completed) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_LAST_FETCH_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, last_transaction_fetch) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_LAST_AUXILIARY_FETCH_OFFSET: i32 = core::mem::offset_of!(
+    Mips4NativeFastMemoryContext,
+    last_auxiliary_transaction_fetch
+) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_LAST_GRAPHICS_FETCH_OFFSET: i32 = core::mem::offset_of!(
+    Mips4NativeFastMemoryContext,
+    last_graphics_transaction_fetch
+) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_LAST_DELIVERY_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, last_delivery_ticks) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_LAST_AUXILIARY_DELIVERY_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, last_auxiliary_delivery_ticks) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_LAST_GRAPHICS_DELIVERY_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, last_graphics_delivery_ticks) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_CPU_CLOCK_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, cpu_clock) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_BUS_CLOCK_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, bus_clock) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_AUXILIARY_CLOCK_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, auxiliary_clock) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_GRAPHICS_CLOCK_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, graphics_clock) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_CODE_AUXILIARY_CLOCK_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, code_auxiliary_clock) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_READS_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, reads) as i32;
 
 /// Shared runtime semantics invoked by translated execution.
 pub trait Mips4BlockRuntime {
@@ -1195,15 +1649,15 @@ impl std::error::Error for Mips4BlockBuildError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mips4BlockException {
     /// Signed arithmetic overflow.
-    ArithmeticOverflow,
+    ArithmeticOverflow = 1,
     /// Misaligned instruction target.
-    AddressErrorLoad,
+    AddressErrorLoad = 2,
     /// Integer trap condition.
-    Trap,
+    Trap = 3,
     /// SYSCALL instruction.
-    SystemCall,
+    SystemCall = 4,
     /// BREAK instruction.
-    Breakpoint,
+    Breakpoint = 5,
 }
 
 impl Mips4BlockException {
@@ -1215,6 +1669,18 @@ impl Mips4BlockException {
             Self::Trap => Mips4Exception::Trap,
             Self::SystemCall => Mips4Exception::Syscall,
             Self::Breakpoint => Mips4Exception::Breakpoint,
+        }
+    }
+
+    #[doc(hidden)]
+    pub const fn from_abi_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::ArithmeticOverflow),
+            2 => Some(Self::AddressErrorLoad),
+            3 => Some(Self::Trap),
+            4 => Some(Self::SystemCall),
+            5 => Some(Self::Breakpoint),
+            _ => None,
         }
     }
 }
@@ -1265,10 +1731,13 @@ pub struct Mips4BlockFrameState {
     pub operations_executed: u64,
     /// Typed runtime helpers entered by the current invocation.
     pub runtime_calls: u64,
+    /// Fast-memory reads completed entirely by native code.
+    pub native_fast_memory_reads: u64,
 }
 
 /// Portable semantic frame shared by MIPS IV execution implementations.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
 pub struct Mips4BlockFrame {
     gpr: [u64; MIPS4_GPR_COUNT],
     hi: u64,
@@ -1276,12 +1745,13 @@ pub struct Mips4BlockFrame {
     pc: u64,
     next_pc: u64,
     delay_slot_branch_pc: u64,
-    delay_slot_valid: bool,
+    delay_slot_valid: u64,
     budget: u64,
     retired: u64,
-    exception: Option<Mips4BlockException>,
+    exception: u64,
     operations_executed: u64,
     runtime_calls: u64,
+    native_fast_memory_reads: u64,
 }
 
 impl Mips4BlockFrame {
@@ -1303,12 +1773,13 @@ impl Mips4BlockFrame {
             pc,
             next_pc,
             delay_slot_branch_pc: delay_slot_branch_pc.unwrap_or(0),
-            delay_slot_valid: delay_slot_branch_pc.is_some(),
+            delay_slot_valid: u64::from(delay_slot_branch_pc.is_some()),
             budget,
             retired: 0,
-            exception: None,
+            exception: 0,
             operations_executed: 0,
             runtime_calls: 0,
+            native_fast_memory_reads: 0,
         }
     }
 
@@ -1324,9 +1795,10 @@ impl Mips4BlockFrame {
             state.budget,
         );
         frame.retired = state.retired;
-        frame.exception = state.exception;
+        frame.exception = state.exception.map_or(0, |exception| exception as u64);
         frame.operations_executed = state.operations_executed;
         frame.runtime_calls = state.runtime_calls;
+        frame.native_fast_memory_reads = state.native_fast_memory_reads;
         frame
     }
 
@@ -1341,9 +1813,10 @@ impl Mips4BlockFrame {
             delay_slot_branch_pc: self.delay_slot_branch_pc(),
             budget: self.budget,
             retired: self.retired,
-            exception: self.exception,
+            exception: Mips4BlockException::from_abi_code(self.exception),
             operations_executed: self.operations_executed,
             runtime_calls: self.runtime_calls,
+            native_fast_memory_reads: self.native_fast_memory_reads,
         }
     }
 
@@ -1356,12 +1829,13 @@ impl Mips4BlockFrame {
         self.pc = state.pc;
         self.next_pc = state.next_pc;
         self.delay_slot_branch_pc = state.delay_slot_branch_pc.unwrap_or(0);
-        self.delay_slot_valid = state.delay_slot_branch_pc.is_some();
+        self.delay_slot_valid = u64::from(state.delay_slot_branch_pc.is_some());
         self.budget = state.budget;
         self.retired = state.retired;
-        self.exception = state.exception;
+        self.exception = state.exception.map_or(0, |exception| exception as u64);
         self.operations_executed = state.operations_executed;
         self.runtime_calls = state.runtime_calls;
+        self.native_fast_memory_reads = state.native_fast_memory_reads;
     }
 
     /// Reads a guest GPR.
@@ -1407,7 +1881,7 @@ impl Mips4BlockFrame {
 
     /// Returns the branch owning the current delay slot.
     pub const fn delay_slot_branch_pc(&self) -> Option<u64> {
-        if self.delay_slot_valid {
+        if self.delay_slot_valid != 0 {
             Some(self.delay_slot_branch_pc)
         } else {
             None
@@ -1434,24 +1908,31 @@ impl Mips4BlockFrame {
         self.runtime_calls
     }
 
+    /// Returns fast-memory reads completed entirely by native code.
+    pub const fn native_fast_memory_reads(&self) -> u64 {
+        self.native_fast_memory_reads
+    }
+
     /// Resets per-invocation accounting fields.
     pub fn reset_execution_accounting(&mut self) {
         self.operations_executed = 0;
         self.runtime_calls = 0;
+        self.native_fast_memory_reads = 0;
     }
 
     /// Returns the recorded block exception.
     pub const fn exception(&self) -> Option<Mips4BlockException> {
-        self.exception
+        Mips4BlockException::from_abi_code(self.exception)
     }
 
     /// Resets per-invocation budget and result fields.
     pub fn prepare(&mut self, budget: u64) {
         self.budget = budget;
         self.retired = 0;
-        self.exception = None;
+        self.exception = 0;
         self.operations_executed = 0;
         self.runtime_calls = 0;
+        self.native_fast_memory_reads = 0;
         self.gpr[0] = 0;
     }
 
@@ -1469,9 +1950,45 @@ impl Mips4BlockFrame {
         self.pc = pc;
         self.next_pc = next_pc;
         self.delay_slot_branch_pc = delay_slot_branch_pc.unwrap_or(0);
-        self.delay_slot_valid = delay_slot_branch_pc.is_some();
+        self.delay_slot_valid = u64::from(delay_slot_branch_pc.is_some());
     }
 }
+
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_GPR_OFFSET: i32 = core::mem::offset_of!(Mips4BlockFrame, gpr) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_HI_OFFSET: i32 = core::mem::offset_of!(Mips4BlockFrame, hi) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_LO_OFFSET: i32 = core::mem::offset_of!(Mips4BlockFrame, lo) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_PC_OFFSET: i32 = core::mem::offset_of!(Mips4BlockFrame, pc) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_NEXT_PC_OFFSET: i32 =
+    core::mem::offset_of!(Mips4BlockFrame, next_pc) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_DELAY_PC_OFFSET: i32 =
+    core::mem::offset_of!(Mips4BlockFrame, delay_slot_branch_pc) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_DELAY_VALID_OFFSET: i32 =
+    core::mem::offset_of!(Mips4BlockFrame, delay_slot_valid) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_BUDGET_OFFSET: i32 =
+    core::mem::offset_of!(Mips4BlockFrame, budget) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_RETIRED_OFFSET: i32 =
+    core::mem::offset_of!(Mips4BlockFrame, retired) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_EXCEPTION_OFFSET: i32 =
+    core::mem::offset_of!(Mips4BlockFrame, exception) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_OPERATIONS_EXECUTED_OFFSET: i32 =
+    core::mem::offset_of!(Mips4BlockFrame, operations_executed) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_RUNTIME_CALLS_OFFSET: i32 =
+    core::mem::offset_of!(Mips4BlockFrame, runtime_calls) as i32;
+#[doc(hidden)]
+pub const MIPS4_BLOCK_FRAME_NATIVE_FAST_MEMORY_READS_OFFSET: i32 =
+    core::mem::offset_of!(Mips4BlockFrame, native_fast_memory_reads) as i32;
 
 /// Lifts one decoded CPU instruction to typed block form.
 pub fn lift_cpu_instruction(
@@ -2105,7 +2622,7 @@ where
             }
             Ok(Mips4RuntimeResult::InternalError) => return Mips4BlockExit::InternalError,
             Err(exception) => {
-                frame.exception = Some(exception);
+                frame.exception = exception as u64;
                 return Mips4BlockExit::Exception;
             }
         }
@@ -2127,7 +2644,7 @@ where
         Mips4BlockBranchTarget::Register(register) => {
             let target = frame.read_gpr(register);
             if target & 0x3 != 0 {
-                frame.exception = Some(Mips4BlockException::AddressErrorLoad);
+                frame.exception = Mips4BlockException::AddressErrorLoad as u64;
                 return Mips4BlockExit::Exception;
             }
             target
@@ -2193,7 +2710,7 @@ where
         }
         Ok(Mips4RuntimeResult::InternalError) => return Mips4BlockExit::InternalError,
         Err(exception) => {
-            frame.exception = Some(exception);
+            frame.exception = exception as u64;
             return Mips4BlockExit::Exception;
         }
     }
@@ -2485,7 +3002,7 @@ fn retire_sequential(frame: &mut Mips4BlockFrame) {
     frame.pc = frame.next_pc;
     frame.next_pc = frame.next_pc.wrapping_add(4);
     frame.delay_slot_branch_pc = 0;
-    frame.delay_slot_valid = false;
+    frame.delay_slot_valid = 0;
 }
 
 fn retire_branch(
@@ -2499,7 +3016,7 @@ fn retire_branch(
         frame.pc = frame.next_pc.wrapping_add(4);
         frame.next_pc = frame.pc.wrapping_add(4);
         frame.delay_slot_branch_pc = 0;
-        frame.delay_slot_valid = false;
+        frame.delay_slot_valid = 0;
         return;
     }
     frame.pc = frame.next_pc;
@@ -2509,7 +3026,7 @@ fn retire_branch(
         frame.next_pc.wrapping_add(4)
     };
     frame.delay_slot_branch_pc = branch_pc;
-    frame.delay_slot_valid = true;
+    frame.delay_slot_valid = 1;
 }
 
 #[cfg(test)]
