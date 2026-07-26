@@ -31,31 +31,67 @@ impl PlaneDepth {
     }
 }
 
+#[cfg(test)]
 pub(super) fn reorder_cgi_pixel_words(data: &[u8]) -> Vec<u8> {
-    let mut reordered = Vec::with_capacity(data.len());
-    for block in data.chunks(32) {
-        for word in (0..block.len().div_ceil(4)).rev() {
-            let start = word * 4;
-            let end = (start + 4).min(block.len());
-            reordered.extend_from_slice(&block[start..end]);
-        }
-    }
-    reordered
+    reordered_cgi_pixel_bytes(data).collect()
 }
 
+#[cfg(test)]
 pub(crate) fn decode_raw_pixels(data: &[u8], depth: PlaneDepth) -> Vec<u32> {
-    let reordered = reorder_cgi_pixel_words(data);
-    match depth {
-        PlaneDepth::Eight => reordered.into_iter().map(u32::from).collect(),
-        PlaneDepth::Sixteen => reordered
-            .chunks_exact(2)
-            .map(|bytes| u32::from(u16::from_be_bytes([bytes[0], bytes[1]])))
-            .collect(),
-        PlaneDepth::ThirtyTwo => reordered
-            .chunks_exact(4)
-            .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four-byte pixel")))
-            .collect(),
+    let mut output = vec![0; data.len() / depth.bytes_per_pixel()];
+    let decoded = decode_raw_pixels_into(data, depth, 0, &mut output);
+    output.truncate(decoded);
+    output
+}
+
+pub(super) fn decode_raw_pixels_into(
+    data: &[u8],
+    depth: PlaneDepth,
+    source_pixel: usize,
+    output: &mut [u32],
+) -> usize {
+    let Some(byte_offset) = source_pixel.checked_mul(depth.bytes_per_pixel()) else {
+        return 0;
+    };
+    let mut bytes = reordered_cgi_pixel_bytes(data).skip(byte_offset);
+    let mut decoded = 0;
+    for pixel in output {
+        let value = match depth {
+            PlaneDepth::Eight => {
+                let Some(byte) = bytes.next() else {
+                    break;
+                };
+                u32::from(byte)
+            }
+            PlaneDepth::Sixteen => {
+                let (Some(high), Some(low)) = (bytes.next(), bytes.next()) else {
+                    break;
+                };
+                u32::from(u16::from_be_bytes([high, low]))
+            }
+            PlaneDepth::ThirtyTwo => {
+                let (Some(first), Some(second), Some(third), Some(fourth)) =
+                    (bytes.next(), bytes.next(), bytes.next(), bytes.next())
+                else {
+                    break;
+                };
+                u32::from_be_bytes([first, second, third, fourth])
+            }
+        };
+        *pixel = value;
+        decoded += 1;
     }
+    decoded
+}
+
+fn reordered_cgi_pixel_bytes(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    data.chunks(32).flat_map(|block| {
+        (0..block.len().div_ceil(4)).rev().flat_map(move |word| {
+            let start = word * 4;
+            let end = (start + 4).min(block.len());
+            block[start..end].iter().copied()
+        })
+    })
 }
 
 pub(super) fn visible_dimensions(registers: &GbeRegisters) -> (usize, usize) {
@@ -152,8 +188,8 @@ pub(super) fn cursor_color(
         return (visible_x == cursor_x || visible_y == cursor_y)
             .then(|| packed_rgb(registers.cursor[2]));
     }
-    let x = visible_x.saturating_add(31).checked_sub(cursor_x)?;
-    let y = visible_y.saturating_add(31).checked_sub(cursor_y)?;
+    let x = visible_x.checked_sub(cursor_x)?;
+    let y = visible_y.checked_sub(cursor_y)?;
     if x >= 32 || y >= 32 {
         return None;
     }
@@ -514,7 +550,7 @@ mod tests {
         registers.gamma_map[30] = 0x0000_cc00;
         assert_eq!(color_from_overlay(&registers, 1), Some([0xaa, 0xbb, 0xcc]));
 
-        registers.cursor[0] = (31 << 16) | 31;
+        registers.cursor[0] = 0;
         registers.cursor[1] = 1;
         registers.cursor[2] = 0x0a14_1e00;
         registers.cursor_glyph[0] = 1 << 30;
@@ -522,13 +558,15 @@ mod tests {
     }
 
     #[test]
-    fn cursor_position_zero_exposes_only_the_lower_right_glyph_pixel_at_origin() {
+    fn cursor_position_is_the_upper_left_glyph_origin() {
         let mut registers = GbeRegisters::new();
+        registers.cursor[0] = (7 << 16) | 5;
         registers.cursor[1] = 1;
         registers.cursor[2] = 0x4455_6600;
-        registers.cursor_glyph[63] = 1;
-        assert_eq!(cursor_color(&registers, 0, 0), Some([0x44, 0x55, 0x66]));
-        assert_eq!(cursor_color(&registers, 1, 0), None);
+        registers.cursor_glyph[0] = 1 << 30;
+        assert_eq!(cursor_color(&registers, 5, 7), Some([0x44, 0x55, 0x66]));
+        assert_eq!(cursor_color(&registers, 4, 7), None);
+        assert_eq!(cursor_color(&registers, 5, 6), None);
     }
 
     #[test]

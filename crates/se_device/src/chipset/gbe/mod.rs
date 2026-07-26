@@ -23,7 +23,7 @@ use crate::chipset::crime::protocol::{
 };
 
 use self::display::{
-    PlaneDepth, color_from_normal, color_from_overlay, cursor_color, decode_raw_pixels,
+    PlaneDepth, color_from_normal, color_from_overlay, cursor_color, decode_raw_pixels_into,
     did_block_for_line, did_for_pixel, filter_fullscreen_rgba, visible_dimensions,
 };
 use self::protocol::{
@@ -1425,50 +1425,58 @@ impl Gbe {
         let did_y =
             active_y.wrapping_add(upper_endpoint(self.registers.vt[registers::DID_START_XY]));
         let did_x_start = lower_endpoint(self.registers.vt[registers::DID_START_XY]);
-        let cursor_y = active_y.wrapping_add(upper_endpoint(
-            self.registers.vt[registers::CURSOR_START_XY],
-        ));
-        let cursor_x_start = lower_endpoint(self.registers.vt[registers::CURSOR_START_XY]);
+        let cursor_start = self.registers.vt[registers::CURSOR_START_XY];
+        let cursor_y = triggered_counter(
+            y,
+            upper_endpoint(self.registers.vt[VT_VBLANK]),
+            upper_endpoint(cursor_start),
+            self.scan_height(),
+        );
+        let active_x_start = upper_endpoint(self.registers.vt[VT_HPIXEN]);
+        let scan_width = self.scan_width();
+        let cursor_x_start = triggered_counter(
+            active_x_start,
+            lower_endpoint(cursor_start),
+            0x0fe0,
+            scan_width,
+        );
         let did_block = did_block_for_line(&self.did_frame_table, did_y)
             .and_then(|block| self.did_line_blocks.get(&block));
-        let mut row = vec![0; width * 4];
+        let registers = &self.registers;
+        let did_frame_table = &self.did_frame_table;
+        let Some(frame) = self.working_frame.as_mut() else {
+            return;
+        };
+        let offset = usize::from(active_y) * width * 4;
+        let row = &mut frame.rgba[offset..offset + width * 4];
         for x in 0..width {
             let did = did_block
                 .map(|table| {
                     did_for_pixel(
-                        &self.did_frame_table,
+                        did_frame_table,
                         table,
                         did_y,
                         (x.min(u16::MAX as usize) as u16).wrapping_add(did_x_start),
                     )
                 })
                 .unwrap_or(0);
-            let (mut rgb, _) = color_from_normal(
-                &self.registers,
-                normal.get(x).copied().unwrap_or(0),
-                depth,
-                did,
-            );
+            let (mut rgb, _) =
+                color_from_normal(registers, normal.get(x).copied().unwrap_or(0), depth, did);
             if let Some(overlay) = overlay
                 .get(x)
-                .and_then(|value| color_from_overlay(&self.registers, *value as u8))
+                .and_then(|value| color_from_overlay(registers, *value as u8))
             {
                 rgb = overlay;
             }
-            if let Some(cursor) = cursor_color(
-                &self.registers,
-                x.saturating_add(usize::from(cursor_x_start)),
-                usize::from(cursor_y),
-            ) {
+            let cursor_x = (u64::from(cursor_x_start) + x as u64) as u16 & 0x0fff;
+            if let Some(cursor) =
+                cursor_color(registers, usize::from(cursor_x), usize::from(cursor_y))
+            {
                 rgb = cursor;
             }
             let offset = x * 4;
             row[offset..offset + 3].copy_from_slice(&rgb);
             row[offset + 3] = 0xff;
-        }
-        if let Some(frame) = self.working_frame.as_mut() {
-            let offset = usize::from(active_y) * width * 4;
-            frame.rgba[offset..offset + row.len()].copy_from_slice(&row);
         }
     }
 
@@ -2229,6 +2237,14 @@ fn upper_endpoint(value: u32) -> u16 {
     ((value >> 12) & 0x0fff) as u16
 }
 
+fn triggered_counter(position: u16, trigger: u16, preset: u16, modulus: u64) -> u16 {
+    let modulus = u32::try_from(modulus).unwrap_or(4_096).clamp(1, 4_096);
+    let position = u32::from(position) % modulus;
+    let trigger = u32::from(trigger) % modulus;
+    let distance = (position + modulus - trigger) % modulus;
+    (u32::from(preset) + distance) as u16 & 0x0fff
+}
+
 fn interval_contains(value: u32, position: u16) -> bool {
     let off = lower_endpoint(value);
     let on = upper_endpoint(value);
@@ -2302,8 +2318,12 @@ fn plane_width(size_register: u32, depth: PlaneDepth) -> usize {
 fn decode_plane_line(fetch: &PlaneLineFetch, depth: PlaneDepth, width: usize) -> Vec<u32> {
     let mut output = vec![0; width];
     for segment in &fetch.segments {
-        let decoded = decode_raw_pixels(&segment.data, depth);
-        let available = decoded.len().saturating_sub(segment.source_pixel);
+        let available = segment
+            .data
+            .len()
+            .checked_div(depth.bytes_per_pixel())
+            .unwrap_or(0)
+            .saturating_sub(segment.source_pixel);
         let pixels = segment
             .pixels
             .min(available)
@@ -2311,8 +2331,13 @@ fn decode_plane_line(fetch: &PlaneLineFetch, depth: PlaneDepth, width: usize) ->
         if pixels == 0 {
             continue;
         }
-        output[segment.output_pixel..segment.output_pixel + pixels]
-            .copy_from_slice(&decoded[segment.source_pixel..segment.source_pixel + pixels]);
+        let decoded = decode_raw_pixels_into(
+            &segment.data,
+            depth,
+            segment.source_pixel,
+            &mut output[segment.output_pixel..segment.output_pixel + pixels],
+        );
+        debug_assert_eq!(decoded, pixels);
     }
     output
 }
@@ -2733,6 +2758,51 @@ mod tests {
         let frame = gbe.working_frame.unwrap();
         assert_eq!(&frame.rgba[..8], &[0xff, 0, 0, 0xff, 0xff, 0, 0, 0xff]);
         assert_eq!(&frame.rgba[8..], &[0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn prom_cursor_timing_projects_the_active_origin_to_counter_zero() {
+        let mut gbe = gbe();
+        gbe.registers.vt[VT_XY_MAX] = (106 << 12) | 1_679;
+        gbe.registers.vt[VT_VBLANK] = 64 << 12;
+        gbe.registers.vt[VT_HPIXEN] = (1_658 << 12) | 1_659;
+        gbe.registers.vt[VT_VPIXEN] = (105 << 12) | 106;
+        gbe.registers.vt[registers::CURSOR_START_XY] = 0x00fd_765a;
+        gbe.registers.cursor[1] = 1;
+        gbe.registers.cursor[2] = 0xff00_0000;
+        gbe.registers.cursor_glyph[0] = 1 << 30;
+        gbe.working_frame = Some(WorkingFrame {
+            sequence: 0,
+            width: 1,
+            height: 1,
+            rgba: vec![0; 4],
+        });
+        gbe.line_fetches.insert((0, 0), LineFetch::new());
+
+        gbe.finish_scanline(105);
+
+        assert_eq!(triggered_counter(1_658, 0x65a, 0x0fe0, 1_680), 0);
+        assert_eq!(triggered_counter(0, 0x65a, 0x0fe0, 1_680), 22);
+        assert_eq!(triggered_counter(105, 64, 0x0fd7, 107), 0);
+        assert_eq!(triggered_counter(0, 64, 0x0fd7, 107), 2);
+        assert_eq!(gbe.working_frame.unwrap().rgba, [0xff, 0, 0, 0xff]);
+    }
+
+    #[test]
+    fn cursor_counter_advances_linearly_across_the_scan_wrap() {
+        let scan_width = 1_680;
+        let active_x_start = 1_658;
+        let trigger = 0x65a;
+        let start = triggered_counter(active_x_start, trigger, 0x0fe0, scan_width);
+
+        for offset in 0..128 {
+            let scan_x = (u64::from(active_x_start) + offset) % scan_width;
+            let projected = (u64::from(start) + offset) as u16 & 0x0fff;
+            assert_eq!(
+                projected,
+                triggered_counter(scan_x as u16, trigger, 0x0fe0, scan_width)
+            );
+        }
     }
 
     #[test]
