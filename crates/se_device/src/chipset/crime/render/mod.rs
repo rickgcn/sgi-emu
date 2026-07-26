@@ -2603,8 +2603,8 @@ fn pixel_dma_source_address(
         0 => i64::from(bytes_per_pixel),
         value => i64::from(value),
     };
-    let base_x = base as u16;
-    let base_y = (base >> 16) as u16 / u16::from(bytes_per_pixel);
+    let base_x = (base >> 16) as u16;
+    let base_y = base as u16;
     let (base_x, base_y) = command
         .source_framebuffer_position(base_x, base_y)
         .unwrap_or((u16::MAX, u16::MAX));

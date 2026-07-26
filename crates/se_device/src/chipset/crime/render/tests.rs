@@ -2077,6 +2077,45 @@ fn mte_copy_read_stage_round_trips_with_row_buffer_state() {
 }
 
 #[test]
+fn prom_tiled_screen_copy_unpacks_the_source_as_x_then_y() {
+    let mut render = CrimeRender::new();
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 1) << 48,
+    );
+    for (offset, value) in [
+        (0x000, 0),
+        (0x008, 0),
+        (0x018, 0x0020_02f8),
+        (0x060, 0x0302_0000),
+        (0x070, 20 << 16 | 30),
+        (0x074, 20 << 16 | 30),
+        (0x0a8, 1),
+        (0x0ac, 1),
+        (0x1b0, LOGIC_COPY),
+        (0x1b8, u32::MAX),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value.into());
+    }
+    render
+        .write(
+            PIXEL_PIPE_BASE + 0x0a0 + START_OFFSET,
+            4,
+            u64::from(5_u32 << 16 | 7),
+        )
+        .unwrap();
+
+    let source_read = retire(&mut render).memory_request.unwrap();
+    assert!(matches!(
+        source_read.transfer.view(),
+        CrimeTransferView::Read { length: 1 }
+    ));
+    assert_eq!(source_read.virtual_address, 7 << 16 | 5);
+}
+
+#[test]
 fn pixel_dma_converts_linear_ycrcb_into_tiled_rgba() {
     let mut render = CrimeRender::new();
     let mut sdram = CrimeSdram::new(ComponentId::new(2), "SDRAM", CrimeMemoryConfig::default());
