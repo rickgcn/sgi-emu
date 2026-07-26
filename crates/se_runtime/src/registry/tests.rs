@@ -176,3 +176,23 @@ fn resolved_slots_are_typed_and_invalidated_by_topology_changes() {
         RegistryLookupError::StaleSlot { id }
     );
 }
+
+#[test]
+fn resolved_slots_cannot_cross_registry_instances() {
+    let resets = Rc::new(RefCell::new(Vec::new()));
+    let id = ComponentId::new(20);
+    let mut first = ComponentRegistry::new();
+    first
+        .insert(Box::new(TestComponent::new(20, "first", resets.clone())))
+        .unwrap();
+    let slot = first.resolve::<TestComponent>(id).unwrap();
+
+    let mut second = ComponentRegistry::new();
+    second
+        .insert(Box::new(TestComponent::new(20, "second", resets)))
+        .unwrap();
+    assert_eq!(
+        second.get_resolved(slot).err().unwrap(),
+        RegistryLookupError::StaleSlot { id }
+    );
+}

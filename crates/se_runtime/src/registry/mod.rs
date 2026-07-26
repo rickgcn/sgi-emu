@@ -54,6 +54,12 @@ pub enum RegistryLookupError {
         /// Component identifier held by the stale slot.
         id: ComponentId,
     },
+
+    /// Two mutable lookups selected the same component.
+    AliasedMutableAccess {
+        /// Component identifier selected more than once.
+        id: ComponentId,
+    },
 }
 
 impl fmt::Display for RegistryLookupError {
@@ -64,6 +70,9 @@ impl fmt::Display for RegistryLookupError {
                 write!(f, "component {id} is not of type {expected}")
             }
             Self::StaleSlot { id } => write!(f, "component slot for {id} is stale"),
+            Self::AliasedMutableAccess { id } => {
+                write!(f, "component {id} cannot be mutably borrowed twice")
+            }
         }
     }
 }
@@ -74,6 +83,7 @@ impl std::error::Error for RegistryLookupError {}
 pub struct ComponentRegistry {
     components: Vec<Box<dyn Component>>,
     topology_generation: u64,
+    identity: Box<u8>,
 }
 
 impl Default for ComponentRegistry {
@@ -87,6 +97,7 @@ pub struct ComponentSlot<T> {
     index: usize,
     id: ComponentId,
     generation: u64,
+    registry_identity: usize,
     marker: PhantomData<fn() -> T>,
 }
 
@@ -126,10 +137,11 @@ impl<T> ComponentSlot<T> {
 
 impl ComponentRegistry {
     /// Creates an empty component registry.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             components: Vec::new(),
             topology_generation: 0,
+            identity: Box::new(0),
         }
     }
 
@@ -148,7 +160,7 @@ impl ComponentRegistry {
             Err(index) => index,
         };
         self.components.insert(index, component);
-        self.topology_generation = self.topology_generation.wrapping_add(1);
+        self.advance_topology_generation();
         Ok(())
     }
 
@@ -203,7 +215,7 @@ impl ComponentRegistry {
     /// Removes and returns a component.
     pub fn remove(&mut self, id: ComponentId) -> Option<Box<dyn Component>> {
         let index = self.index_of(id)?;
-        self.topology_generation = self.topology_generation.wrapping_add(1);
+        self.advance_topology_generation();
         Some(self.components.remove(index))
     }
 
@@ -248,6 +260,7 @@ impl ComponentRegistry {
             index,
             id,
             generation: self.topology_generation,
+            registry_identity: self.identity.as_ref() as *const u8 as usize,
             marker: PhantomData,
         })
     }
@@ -258,13 +271,14 @@ impl ComponentRegistry {
         T: Component,
     {
         self.validate_slot(slot)?;
-        let component: &dyn core::any::Any = self.components[slot.index].as_ref();
-        component
-            .downcast_ref::<T>()
-            .ok_or(RegistryLookupError::TypeMismatch {
-                id: slot.id,
-                expected: type_name::<T>(),
-            })
+        let component = self.components[slot.index].as_ref();
+        debug_assert_eq!(component.id(), slot.id);
+        let component: &dyn core::any::Any = component;
+        debug_assert!(component.is::<T>());
+        // SAFETY: `resolve` established the concrete type at this index. The
+        // registry identity and topology generation prove that neither another
+        // registry nor a topology mutation can reuse the resolved slot.
+        Ok(unsafe { &*(component as *const dyn core::any::Any as *const T) })
     }
 
     /// Returns a mutable component through a resolved slot.
@@ -276,13 +290,60 @@ impl ComponentRegistry {
         T: Component,
     {
         self.validate_slot(slot)?;
-        let component: &mut dyn core::any::Any = self.components[slot.index].as_mut();
-        component
-            .downcast_mut::<T>()
-            .ok_or(RegistryLookupError::TypeMismatch {
-                id: slot.id,
-                expected: type_name::<T>(),
-            })
+        let component = self.components[slot.index].as_mut();
+        debug_assert_eq!(component.id(), slot.id);
+        let component: &mut dyn core::any::Any = component;
+        debug_assert!(component.is::<T>());
+        // SAFETY: `resolve` established the concrete type at this index. The
+        // registry identity and topology generation prove that neither another
+        // registry nor a topology mutation can reuse the resolved slot.
+        Ok(unsafe { &mut *(component as *mut dyn core::any::Any as *mut T) })
+    }
+
+    /// Returns two distinct mutable components through resolved slots.
+    pub fn get_resolved_pair_mut<T, U>(
+        &mut self,
+        first: ComponentSlot<T>,
+        second: ComponentSlot<U>,
+    ) -> Result<(&mut T, &mut U), RegistryLookupError>
+    where
+        T: Component,
+        U: Component,
+    {
+        self.validate_slot(first)?;
+        self.validate_slot(second)?;
+        if first.index == second.index {
+            return Err(RegistryLookupError::AliasedMutableAccess { id: first.id });
+        }
+        let (first_component, second_component) = if first.index < second.index {
+            let (before_second, from_second) = self.components.split_at_mut(second.index);
+            (before_second[first.index].as_mut(), from_second[0].as_mut())
+        } else {
+            let (before_first, from_first) = self.components.split_at_mut(first.index);
+            (from_first[0].as_mut(), before_first[second.index].as_mut())
+        };
+        debug_assert_eq!(first_component.id(), first.id);
+        debug_assert_eq!(second_component.id(), second.id);
+        let first_component: &mut dyn core::any::Any = first_component;
+        let second_component: &mut dyn core::any::Any = second_component;
+        debug_assert!(first_component.is::<T>());
+        debug_assert!(second_component.is::<U>());
+        // SAFETY: Both slots were resolved against this registry and validated
+        // against its unchanged topology. The split above also proves that the
+        // two resulting mutable references do not alias.
+        let first_component =
+            unsafe { &mut *(first_component as *mut dyn core::any::Any as *mut T) };
+        // SAFETY: The same slot and split invariants apply to the second type.
+        let second_component =
+            unsafe { &mut *(second_component as *mut dyn core::any::Any as *mut U) };
+        Ok((first_component, second_component))
+    }
+
+    fn advance_topology_generation(&mut self) {
+        self.topology_generation = self
+            .topology_generation
+            .checked_add(1)
+            .expect("component registry topology generation exhausted");
     }
 
     fn index_of(&self, id: ComponentId) -> Option<usize> {
@@ -292,11 +353,9 @@ impl ComponentRegistry {
     }
 
     fn validate_slot<T>(&self, slot: ComponentSlot<T>) -> Result<(), RegistryLookupError> {
-        if slot.generation != self.topology_generation
-            || self
-                .components
-                .get(slot.index)
-                .is_none_or(|component| component.id() != slot.id)
+        if slot.registry_identity != self.identity.as_ref() as *const u8 as usize
+            || slot.generation != self.topology_generation
+            || slot.index >= self.components.len()
         {
             return Err(RegistryLookupError::StaleSlot { id: slot.id });
         }
