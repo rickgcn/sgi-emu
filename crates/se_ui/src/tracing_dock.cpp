@@ -556,9 +556,9 @@ private:
     controls_->addWidget(target_);
 
     capture_ = new QCheckBox(translate(capture_text), this);
-    capture_->setChecked(true);
+    capture_->setChecked(false);
     capture_->setMinimumWidth(capture_->sizeHint().width());
-    set_trace_capture_enabled(true);
+    set_trace_capture_enabled(false);
     controls_->addWidget(capture_);
     controls_->addSpacing(10);
 

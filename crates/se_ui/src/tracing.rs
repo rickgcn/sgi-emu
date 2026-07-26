@@ -87,7 +87,7 @@ struct TraceQueue {
 }
 
 impl TraceQueue {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, capture_enabled: bool) -> Self {
         assert!(capacity > 0, "trace queue capacity must be nonzero");
         Self {
             capacity,
@@ -95,7 +95,7 @@ impl TraceQueue {
             session: AtomicU64::new(0),
             captured: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
-            capture_enabled: AtomicBool::new(true),
+            capture_enabled: AtomicBool::new(capture_enabled),
             scheduler_capture_enabled: AtomicBool::new(false),
         }
     }
@@ -147,7 +147,7 @@ impl TraceQueue {
 }
 
 static APPLICATION_TRACE_QUEUE: LazyLock<Arc<TraceQueue>> =
-    LazyLock::new(|| Arc::new(TraceQueue::new(APPLICATION_QUEUE_CAPACITY)));
+    LazyLock::new(|| Arc::new(TraceQueue::new(APPLICATION_QUEUE_CAPACITY, false)));
 
 /// Trace sink used by the native application tracing window.
 ///
@@ -170,7 +170,7 @@ impl UiTraceSink {
     #[cfg(test)]
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            queue: Arc::new(TraceQueue::new(capacity)),
+            queue: Arc::new(TraceQueue::new(capacity, true)),
         }
     }
 }
@@ -319,7 +319,7 @@ pub(crate) fn begin_application_trace_session() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{sync::Arc, time::Instant};
 
     use se_core::{
         component::ComponentId,
@@ -328,7 +328,7 @@ mod tests {
     };
     use se_machine::o2::ip32::machine::{Ip32Machine, Ip32MachineConfig};
 
-    use super::{Ordering, UiTraceSink, ffi};
+    use super::{Ordering, TraceQueue, UiTraceSink, ffi};
 
     fn record<'a>(fields: &'a [TraceField<'a>]) -> TraceRecord<'a> {
         TraceRecord {
@@ -340,6 +340,21 @@ mod tests {
             event: "access",
             fields,
         }
+    }
+
+    #[test]
+    fn capture_is_opt_in() {
+        let mut sink = UiTraceSink {
+            queue: Arc::new(TraceQueue::new(8, false)),
+        };
+
+        assert_eq!(
+            sink.interest(TraceSource::Component(ComponentId::new(7))),
+            TraceInterest::None
+        );
+        sink.record(record(&[]));
+        assert!(sink.queue.drain(8).is_empty());
+        assert_eq!(sink.queue.stats().captured, 0);
     }
 
     #[test]
