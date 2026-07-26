@@ -36,7 +36,7 @@ use crate::cpu::mips4::memory::operation::{
     Mips4InstructionFetch, Mips4MemoryAccessError, Mips4Prefetch, Mips4PrefetchHint,
     Mips4PrefetchResult,
 };
-use crate::cpu::mips4::mmu::Mips4MmuPrivilegeMode;
+use crate::cpu::mips4::mmu::{Mips4Mmu, Mips4MmuPrivilegeMode};
 use crate::cpu::mips4::tlb::{Mips4TlbAddressMode, Mips4TlbAsid};
 
 use super::access::{Mips4InstructionAccess, check_architecture_level, check_coprocessor_access};
@@ -545,17 +545,7 @@ where
     }
 
     fn code_source_request_at(&self, pc: u64) -> Option<Mips4CodeSourceRequest> {
-        let status = self.state.cp0.status();
-        let asid = Mips4TlbAsid::new(self.state.cp0.entry_hi().address_space_identifier());
-        let tlb_entries = self.state.deterministic_tlb_entries(&self.policy, pc);
-        let fetch = Mips4InstructionFetch::prepare(
-            pc,
-            self.policy.mmu_config(self.state.cp0.config()),
-            status,
-            asid,
-            tlb_entries,
-        )
-        .ok()?;
+        let fetch = self.instruction_fetch_at(pc)?;
         if self
             .policy
             .resolve_cache_policy(fetch.cache_attribute())
@@ -569,6 +559,23 @@ where
             physical_address: fetch.physical_address(),
             maximum_bytes: page_remaining.min(128) as u8,
         })
+    }
+
+    fn instruction_fetch_at(&self, pc: u64) -> Option<Mips4InstructionFetch> {
+        if pc & 3 != 0 {
+            return None;
+        }
+        let status = self.state.cp0.status();
+        let mmu_config = self.policy.mmu_config(self.state.cp0.config());
+        if let Some(translation) = Mips4Mmu::direct_mapped_translation(mmu_config, status, pc) {
+            return Some(Mips4InstructionFetch {
+                virtual_address: pc,
+                translation,
+            });
+        }
+        let asid = Mips4TlbAsid::new(self.state.cp0.entry_hi().address_space_identifier());
+        let tlb_entries = self.state.deterministic_tlb_entries(&self.policy, pc);
+        Mips4InstructionFetch::prepare(pc, mmu_config, status, asid, tlb_entries).ok()
     }
 
     /// Returns the block identity associated with one current code window.
@@ -1052,16 +1059,7 @@ where
 
     fn probe_cached_instruction(&self, pc: u64) -> Option<Mips4CachedInstructionProbe> {
         let status = self.state.cp0.status();
-        let asid = Mips4TlbAsid::new(self.state.cp0.entry_hi().address_space_identifier());
-        let tlb_entries = self.state.deterministic_tlb_entries(&self.policy, pc);
-        let fetch = Mips4InstructionFetch::prepare(
-            pc,
-            self.policy.mmu_config(self.state.cp0.config()),
-            status,
-            asid,
-            tlb_entries,
-        )
-        .ok()?;
+        let fetch = self.instruction_fetch_at(pc)?;
         let cache_policy = self.policy.resolve_cache_policy(fetch.cache_attribute());
         if !cache_policy.is_cached() || !self.state.cache.has_instruction() {
             return None;
