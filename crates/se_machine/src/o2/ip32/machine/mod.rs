@@ -6,6 +6,8 @@ use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "jit")]
 use std::hash::{BuildHasherDefault, Hasher};
+#[cfg(feature = "jit")]
+use std::sync::Arc;
 
 use se_core::component::{Component, ComponentId, ComponentStateError};
 use se_core::role::{BusControllerRole, BusDeviceRole, BusRole};
@@ -67,6 +69,7 @@ use se_device::cpu::execution::protocol::{
     ExecutionAction, ExecutionCompletion, ExecutionTransaction,
 };
 use se_device::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
+use se_device::cpu::mips4::execution::block::MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES;
 #[cfg(feature = "jit")]
 use se_device::cpu::mips4::execution::block::{
     Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult, Mips4FastMemoryRuntime,
@@ -145,7 +148,9 @@ const SDRAM_INITIALIZATION_TICKS: u64 = 120_000;
 const ISA_CYCLE_TICKS: u64 = 1_000;
 const PCI_CYCLE_TICKS: u64 = 30;
 const UART_INPUT_CLOCK_HZ: u64 = 22_000_000;
-const DEFAULT_CPU_CONTINUATION_QUANTUM: usize = 256;
+const DEFAULT_CPU_CONTINUATION_QUANTUM: usize = MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES;
+#[cfg(feature = "jit")]
+const FAST_MEMORY_SLICE_MAX_BOUNDARIES: usize = MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES;
 const TRACE_NAMESPACE: &str = "ip32";
 
 /// Complete construction input for one IP32 machine.
@@ -590,6 +595,10 @@ struct MachineControl {
     #[cfg(feature = "jit")]
     fast_transaction_fallbacks: u64,
     #[cfg(feature = "jit")]
+    fast_transaction_reads: u64,
+    #[cfg(feature = "jit")]
+    fast_transaction_writes: u64,
+    #[cfg(feature = "jit")]
     jit_code_fetches: Ip32StableCodeFetchStatistics,
     cpu_continuation_quantum: usize,
     inline_sysad_completion: bool,
@@ -671,7 +680,7 @@ struct Mips4CodeSourceCacheKey {
 #[cfg(feature = "jit")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Mips4CodeSourceCacheEntry {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     fingerprint: u64,
 }
 
@@ -864,6 +873,15 @@ pub struct Ip32JitPerformanceSnapshot {
     /// Regions compiled since the latest engine reset.
     pub region_compilations: u64,
 
+    /// Host nanoseconds spent compiling baseline blocks.
+    pub block_compile_nanos: u64,
+
+    /// Host nanoseconds spent lifting profiled Regions.
+    pub region_lifting_nanos: u64,
+
+    /// Host nanoseconds spent compiling Regions.
+    pub region_compile_nanos: u64,
+
     /// Region exits through an uncompiled successor edge.
     pub region_cold_side_exits: u64,
 
@@ -908,6 +926,12 @@ pub struct Ip32JitPerformanceSnapshot {
 
     /// CPU transactions retained on the exact scheduled path.
     pub fast_transaction_fallbacks: u64,
+
+    /// Directly completed CPU read transactions.
+    pub fast_transaction_reads: u64,
+
+    /// Directly completed CPU write transactions.
+    pub fast_transaction_writes: u64,
 }
 
 /// SGI O2 IP32 machine with runtime-owned hardware components.
@@ -1337,6 +1361,10 @@ impl<S> Ip32Machine<S> {
                 #[cfg(feature = "jit")]
                 fast_transaction_fallbacks: 0,
                 #[cfg(feature = "jit")]
+                fast_transaction_reads: 0,
+                #[cfg(feature = "jit")]
+                fast_transaction_writes: 0,
+                #[cfg(feature = "jit")]
                 jit_code_fetches: Ip32StableCodeFetchStatistics::default(),
                 cpu_continuation_quantum: DEFAULT_CPU_CONTINUATION_QUANTUM,
                 inline_sysad_completion: true,
@@ -1555,6 +1583,9 @@ impl<S> Ip32Machine<S> {
                     region_entries: statistics.region_entries,
                     region_operations: statistics.region_operations,
                     region_compilations: statistics.region_compilations,
+                    block_compile_nanos: statistics.block_compile_nanos,
+                    region_lifting_nanos: statistics.region_lifting_nanos,
+                    region_compile_nanos: statistics.region_compile_nanos,
                     region_cold_side_exits: statistics.region_cold_side_exits,
                     region_budget_side_exits: statistics.region_budget_side_exits,
                     region_runtime_side_exits: statistics.region_runtime_side_exits,
@@ -1570,6 +1601,8 @@ impl<S> Ip32Machine<S> {
                     fast_transaction_attempts: self.control.fast_transaction_attempts,
                     fast_transaction_hits: self.control.fast_transaction_hits,
                     fast_transaction_fallbacks: self.control.fast_transaction_fallbacks,
+                    fast_transaction_reads: self.control.fast_transaction_reads,
+                    fast_transaction_writes: self.control.fast_transaction_writes,
                 }
             })
             .unwrap_or_default();
@@ -2049,6 +2082,10 @@ impl<S> Ip32Machine<S> {
             fast_transaction_hits: 0,
             #[cfg(feature = "jit")]
             fast_transaction_fallbacks: 0,
+            #[cfg(feature = "jit")]
+            fast_transaction_reads: 0,
+            #[cfg(feature = "jit")]
+            fast_transaction_writes: 0,
             #[cfg(feature = "jit")]
             jit_code_fetches: Ip32StableCodeFetchStatistics::default(),
             cpu_continuation_quantum: state.control.cpu_continuation_quantum,
@@ -2758,7 +2795,9 @@ fn advance_cpu_generation(control: &mut MachineControl) -> Result<(), Ip32Machin
 #[cfg(feature = "jit")]
 fn reset_jit_engine(control: &mut MachineControl) -> Result<(), Ip32MachineDispatchError> {
     clear_jit_code_sources(control);
-    if let Some(engine) = &mut control.jit_engine {
+    if let Some(engine) = &mut control.jit_engine
+        && !engine.is_empty()
+    {
         engine.reset().map_err(|error| {
             Ip32MachineDispatchError::Cpu(R5000CpuError::Block(error.to_string()))
         })?;
@@ -2865,36 +2904,36 @@ where
     S: TraceSink,
 {
     let timeline = Mips4SliceTimeline::new(maximum_fetches, clocks, fixed_ticks_per_fetch)?;
-    let pclock = control.cpu_clock.projection();
-    let fits = |candidate: usize| {
+    let pclock = Mips4SliceClock::new(control.cpu_clock.projection(), 1)?;
+    let total_ticks = |candidate: usize| {
         let fetch_ticks = timeline.prefix_ticks(candidate)?;
-        let pclock_ticks = pclock.elapsed(candidate as u64)?.get();
-        let total = fetch_ticks.checked_add(pclock_ticks)?;
-        Some(
-            context
-                .now()
-                .checked_add(SimDuration::new(total))
-                .is_some_and(|end| {
-                    end <= context.deadline()
-                        && context.next_event_time().is_none_or(|event| event > end)
-                        && stable_deadline.is_none_or(|deadline| end <= deadline)
-                }),
-        )
+        let pclock_ticks = pclock.elapsed_fetches(candidate as u64)?;
+        fetch_ticks.checked_add(pclock_ticks)
     };
-    if fits(maximum_fetches)? {
-        return Some(timeline);
+    let now = context.now().get();
+    let mut limit = context.deadline().get();
+    if let Some(event) = context.next_event_time() {
+        limit = limit.min(event.get().checked_sub(1)?);
     }
-    let mut lower = 0;
-    let mut upper = maximum_fetches - 1;
-    while lower < upper {
-        let candidate = lower + (upper - lower).div_ceil(2);
-        if fits(candidate)? {
-            lower = candidate;
-        } else {
-            upper = candidate - 1;
+    if let Some(deadline) = stable_deadline {
+        limit = limit.min(deadline.get());
+    }
+    let available_ticks = limit.checked_sub(now)?;
+    let average_ticks = timeline.average_ticks_per_fetch() + pclock.average_ticks_per_fetch();
+    let mut admitted = (available_ticks as f64 / average_ticks) as usize;
+    if admitted >= maximum_fetches {
+        if total_ticks(maximum_fetches)? <= available_ticks {
+            return Some(timeline);
         }
+        admitted = maximum_fetches - 1;
     }
-    Mips4SliceTimeline::new(lower, clocks, fixed_ticks_per_fetch)
+    while admitted != 0 && total_ticks(admitted)? > available_ticks {
+        admitted -= 1;
+    }
+    while admitted < maximum_fetches - 1 && total_ticks(admitted + 1)? <= available_ticks {
+        admitted += 1;
+    }
+    Mips4SliceTimeline::new(admitted, clocks, fixed_ticks_per_fetch)
 }
 
 #[cfg(feature = "jit")]
@@ -2949,8 +2988,8 @@ where
     let source_instructions = (usize::from(request.maximum_bytes) / 4)
         .min(available / 4)
         .min(MIPS4_BLOCK_MAX_INSTRUCTIONS);
-    let requested_instructions = maximum_instructions.min(source_instructions);
-    if requested_instructions == 0 {
+    let timeline_instructions = maximum_instructions.min(MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES);
+    if source_instructions == 0 || timeline_instructions == 0 {
         return Ok(None);
     }
     let sysad = registry
@@ -2971,7 +3010,7 @@ where
     let Some(timeline) = plan_stable_timeline(
         context,
         control,
-        requested_instructions,
+        timeline_instructions,
         &[sysad, cmi],
         isa,
         None,
@@ -2997,7 +3036,8 @@ where
         .jit_code_sources
         .entry(cache_key)
         .or_insert_with(|| {
-            let bytes = flash.bytes()[offset as usize..offset as usize + byte_count].to_vec();
+            let bytes: Arc<[u8]> =
+                Arc::from(&flash.bytes()[offset as usize..offset as usize + byte_count]);
             let fingerprint = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
             });
@@ -3009,10 +3049,10 @@ where
         revision,
         fingerprint: source.fingerprint,
     };
-    Ok(Mips4CodeWindow::new(
+    Ok(Mips4CodeWindow::from_shared(
         request,
         guard,
-        &source.bytes,
+        Arc::clone(&source.bytes),
         timeline,
     ))
 }
@@ -3065,8 +3105,8 @@ where
     };
     let source_instructions =
         (usize::from(request.maximum_bytes) / 4).min(MIPS4_BLOCK_MAX_INSTRUCTIONS);
-    let requested_instructions = maximum_instructions.min(source_instructions);
-    if requested_instructions == 0 {
+    let timeline_instructions = maximum_instructions.min(MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES);
+    if source_instructions == 0 || timeline_instructions == 0 {
         return Ok(None);
     }
     let sysad = registry
@@ -3082,7 +3122,7 @@ where
     let Some(timeline) = plan_stable_timeline(
         context,
         control,
-        requested_instructions,
+        timeline_instructions,
         &[sysad, memory],
         0,
         refresh_deadline,
@@ -3112,7 +3152,10 @@ where
                 else {
                     return Ok(None);
                 };
-                entry.insert(Mips4CodeSourceCacheEntry { bytes, fingerprint })
+                entry.insert(Mips4CodeSourceCacheEntry {
+                    bytes: bytes.into(),
+                    fingerprint,
+                })
             }
         };
         let guard = Mips4CodeGuard {
@@ -3121,7 +3164,7 @@ where
             revision: 0,
             fingerprint: source.fingerprint,
         };
-        Mips4CodeWindow::new(request, guard, &source.bytes, timeline)
+        Mips4CodeWindow::from_shared(request, guard, Arc::clone(&source.bytes), timeline)
     };
     if window.is_some() {
         remember_ram_code_source(control, offset, byte_count);
@@ -3310,12 +3353,15 @@ where
     loop {
         let slice_start = context.now();
         let remaining = control.cpu_continuation_quantum - boundaries;
-        let planned = control.cpu_clock.plan_boundary_budget(
-            context.now(),
-            context.deadline(),
-            context.next_event_time(),
-            remaining,
-        );
+        let planned = control
+            .cpu_clock
+            .plan_boundary_budget(
+                context.now(),
+                context.deadline(),
+                context.next_event_time(),
+                remaining,
+            )
+            .min(FAST_MEMORY_SLICE_MAX_BOUNDARIES);
         let mut fast_memory_runtime = plan_fast_memory_runtime(
             registry,
             context,
@@ -3553,6 +3599,14 @@ where
         .complete(completion);
     control.sysad_transactions = control.sysad_transactions.saturating_add(1);
     control.fast_transaction_hits = control.fast_transaction_hits.saturating_add(1);
+    match transaction.payload {
+        Mips4ExecutionTransaction::Read { .. } => {
+            control.fast_transaction_reads = control.fast_transaction_reads.saturating_add(1);
+        }
+        Mips4ExecutionTransaction::Write { .. } => {
+            control.fast_transaction_writes = control.fast_transaction_writes.saturating_add(1);
+        }
+    }
     Ok(true)
 }
 

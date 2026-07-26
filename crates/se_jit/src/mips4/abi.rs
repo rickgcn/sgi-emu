@@ -15,6 +15,15 @@ pub(super) struct Mips4FastMemoryReadAbiResult {
     retirement_limit: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub(super) struct Mips4NativeAffinePollAbiResult {
+    iterations: u64,
+    counter: u64,
+    last_source: u64,
+    remaining_budget: u64,
+}
+
 #[repr(C)]
 pub(super) struct Mips4NativeCallContext {
     operation_base: u64,
@@ -24,7 +33,9 @@ pub(super) struct Mips4NativeCallContext {
     fast_memory_context: *mut (),
     fast_memory_read: usize,
     native_fast_memory_context: *mut Mips4NativeFastMemoryContext,
+    native_affine_poll: usize,
     fast_memory_result: Mips4FastMemoryReadAbiResult,
+    native_affine_poll_result: Mips4NativeAffinePollAbiResult,
     runtime_memory_big_endian: u64,
 }
 
@@ -38,10 +49,51 @@ impl Mips4NativeCallContext {
             fast_memory_context: core::ptr::null_mut(),
             fast_memory_read: 0,
             native_fast_memory_context: core::ptr::null_mut(),
+            native_affine_poll: mips4_native_affine_poll_trampoline as *const () as usize,
             fast_memory_result: Mips4FastMemoryReadAbiResult::default(),
+            native_affine_poll_result: Mips4NativeAffinePollAbiResult::default(),
             runtime_memory_big_endian: u64::from(runtime_memory_big_endian),
         }
     }
+}
+
+extern "C" fn mips4_native_affine_poll_trampoline(
+    context: *mut Mips4NativeFastMemoryContext,
+    physical_address: u64,
+    counter: u64,
+    target: u64,
+    retired: u64,
+    budget: u64,
+    result: *mut Mips4NativeAffinePollAbiResult,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null() || result.is_null() {
+            return 4;
+        }
+        // SAFETY: Native invocation owns the uniquely borrowed context during the call.
+        let context = unsafe { &mut *context };
+        let batch =
+            context.execute_affine_poll_batch(physical_address, counter, target, retired, budget);
+        if batch.disposition == Mips4NativeAffinePollDisposition::Unsupported {
+            return 0;
+        }
+        // SAFETY: The native invocation supplied a live result slot.
+        unsafe {
+            *result = Mips4NativeAffinePollAbiResult {
+                iterations: batch.iterations,
+                counter: batch.counter,
+                last_source: batch.last_source,
+                remaining_budget: batch.remaining_budget,
+            };
+        }
+        match batch.disposition {
+            Mips4NativeAffinePollDisposition::Unsupported => 0,
+            Mips4NativeAffinePollDisposition::Continue => 1,
+            Mips4NativeAffinePollDisposition::BudgetExhausted => 2,
+            Mips4NativeAffinePollDisposition::TimelineExhausted => 3,
+        }
+    }))
+    .unwrap_or(4)
 }
 
 struct Mips4NativeRuntimeBinding<'call, 'object, R> {
@@ -268,12 +320,24 @@ pub(super) const MIPS4_NATIVE_CALL_FAST_MEMORY_READ_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeCallContext, fast_memory_read) as i32;
 pub(super) const MIPS4_NATIVE_CALL_NATIVE_FAST_MEMORY_CONTEXT_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeCallContext, native_fast_memory_context) as i32;
+pub(super) const MIPS4_NATIVE_CALL_NATIVE_AFFINE_POLL_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, native_affine_poll) as i32;
 pub(super) const MIPS4_NATIVE_CALL_FAST_MEMORY_RESULT_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeCallContext, fast_memory_result) as i32;
+pub(super) const MIPS4_NATIVE_CALL_NATIVE_AFFINE_POLL_RESULT_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, native_affine_poll_result) as i32;
 pub(super) const MIPS4_FAST_MEMORY_RESULT_VALUE_OFFSET: i32 =
     core::mem::offset_of!(Mips4FastMemoryReadAbiResult, value) as i32;
 pub(super) const MIPS4_FAST_MEMORY_RESULT_RETIREMENT_LIMIT_OFFSET: i32 =
     core::mem::offset_of!(Mips4FastMemoryReadAbiResult, retirement_limit) as i32;
+pub(super) const MIPS4_NATIVE_AFFINE_POLL_ITERATIONS_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffinePollAbiResult, iterations) as i32;
+pub(super) const MIPS4_NATIVE_AFFINE_POLL_COUNTER_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffinePollAbiResult, counter) as i32;
+pub(super) const MIPS4_NATIVE_AFFINE_POLL_LAST_SOURCE_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffinePollAbiResult, last_source) as i32;
+pub(super) const MIPS4_NATIVE_AFFINE_POLL_REMAINING_BUDGET_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeAffinePollAbiResult, remaining_budget) as i32;
 pub(super) const MIPS4_NATIVE_CALL_RUNTIME_MEMORY_BIG_ENDIAN_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeCallContext, runtime_memory_big_endian) as i32;
 

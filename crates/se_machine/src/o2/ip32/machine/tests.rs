@@ -304,6 +304,53 @@ fn assert_stable_code_fetches_classified(performance: Ip32PerformanceSnapshot) {
 }
 
 #[cfg(feature = "jit")]
+#[derive(Clone, Copy)]
+enum JitCompilationTier {
+    Baseline,
+    Region,
+}
+
+#[cfg(feature = "jit")]
+fn finish_jit_compilation_tier(machine: &mut Ip32Machine, tier: JitCompilationTier) {
+    const MAX_EVENTS: usize = 100_000;
+    const WARMUP_CPU_QUANTUM: usize = 16;
+
+    let cpu_quantum = machine.control.cpu_continuation_quantum;
+    machine.control.cpu_continuation_quantum = WARMUP_CPU_QUANTUM;
+    for _ in 0..MAX_EVENTS {
+        let statistics = machine
+            .control
+            .jit_engine
+            .as_ref()
+            .expect("the test machine must contain a JIT engine")
+            .statistics();
+        let requested = match tier {
+            JitCompilationTier::Baseline => statistics.compiled_blocks > 0,
+            JitCompilationTier::Region => statistics.region_compilations > 0,
+        };
+        if requested {
+            machine
+                .control
+                .jit_engine
+                .as_mut()
+                .expect("the test machine must contain a JIT engine")
+                .finish_compilations()
+                .expect("the requested JIT tier must finish compiling");
+            machine.control.cpu_continuation_quantum = cpu_quantum;
+            return;
+        }
+        let status = machine
+            .run_steps(1)
+            .expect("the synthetic program must run while warming the JIT");
+        assert!(
+            !matches!(status, RunStatus::Idle | RunStatus::Stopped),
+            "the synthetic program stopped before requesting the expected JIT tier"
+        );
+    }
+    panic!("the synthetic program did not request the expected JIT tier");
+}
+
+#[cfg(feature = "jit")]
 #[test]
 fn ip32_rejects_unknown_stable_code_source_ids() {
     let error = Ip32StableCodeSource::from_guard(Mips4CodeGuard {
@@ -399,7 +446,7 @@ fn jit_hot_loop_matches_scalar_machine_state_and_scheduler() {
 fn jit_fast_mace_ust_doubleword_loop_matches_scalar() {
     let program = [
         (0x00, i_type(0x0f, 0, 8, 0xbf34)),
-        (0x04, i_type(0x09, 0, 9, 512)),
+        (0x04, i_type(0x09, 0, 9, 1024)),
         (0x08, i_type(0x37, 8, 10, 0)),
         (0x0c, i_type(0x09, 9, 9, u16::MAX)),
         (0x10, i_type(0x05, 9, 0, 0xfffd)),
@@ -413,6 +460,8 @@ fn jit_fast_mace_ust_doubleword_loop_matches_scalar() {
     let mut jit = Ip32Machine::from_config(jit_config).unwrap();
     scalar.schedule_power_on().unwrap();
     jit.schedule_power_on().unwrap();
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Baseline);
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Region);
 
     let deadline = SimTime::new(20_000_000);
     scalar.run_until_time(deadline).unwrap();
@@ -464,7 +513,7 @@ fn jit_fast_mace_ust_doubleword_loop_matches_scalar() {
 fn jit_fast_mace_ust_word_loop_matches_scalar() {
     let program = [
         (0x00, i_type(0x0f, 0, 8, 0xbf34)),
-        (0x04, i_type(0x09, 0, 9, 512)),
+        (0x04, i_type(0x09, 0, 9, 1024)),
         (0x08, i_type(0x23, 8, 10, 4)),
         (0x0c, i_type(0x09, 9, 9, u16::MAX)),
         (0x10, i_type(0x05, 9, 0, 0xfffd)),
@@ -478,6 +527,8 @@ fn jit_fast_mace_ust_word_loop_matches_scalar() {
     let mut jit = Ip32Machine::from_config(jit_config).unwrap();
     scalar.schedule_power_on().unwrap();
     jit.schedule_power_on().unwrap();
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Baseline);
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Region);
 
     let deadline = SimTime::new(20_000_000);
     scalar.run_until_time(deadline).unwrap();
@@ -525,7 +576,7 @@ fn jit_fast_mace_ust_word_loop_matches_scalar() {
 fn jit_fast_crime_timer_loop_matches_scalar() {
     let program = [
         (0x00, i_type(0x0f, 0, 8, 0xb400)),
-        (0x04, i_type(0x09, 0, 9, 512)),
+        (0x04, i_type(0x09, 0, 9, 1024)),
         (0x08, i_type(0x37, 8, 10, 0x0038)),
         (0x0c, i_type(0x09, 9, 9, u16::MAX)),
         (0x10, i_type(0x05, 9, 0, 0xfffd)),
@@ -539,6 +590,8 @@ fn jit_fast_crime_timer_loop_matches_scalar() {
     let mut jit = Ip32Machine::from_config(jit_config).unwrap();
     scalar.schedule_power_on().unwrap();
     jit.schedule_power_on().unwrap();
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Baseline);
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Region);
 
     let deadline = SimTime::new(20_000_000);
     scalar.run_until_time(deadline).unwrap();
@@ -701,6 +754,8 @@ fn jit_crime_timer_write_then_poll_reaches_wait_at_scalar_time() {
     let mut jit = Ip32Machine::from_config(jit_config).unwrap();
     scalar.schedule_power_on().unwrap();
     jit.schedule_power_on().unwrap();
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Baseline);
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Region);
 
     scalar.run_until_time(SimTime::new(60_000_000)).unwrap();
     jit.run_until_time(SimTime::new(60_000_000)).unwrap();
@@ -929,6 +984,8 @@ fn jit_fast_crime_timer_poll_from_ram_matches_scalar() {
     let mut jit = Ip32Machine::from_config(jit_config).unwrap();
     scalar.schedule_power_on().unwrap();
     jit.schedule_power_on().unwrap();
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Baseline);
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Region);
 
     let deadline = SimTime::new(100_000_000);
     scalar.run_until_time(deadline).unwrap();
@@ -3004,6 +3061,7 @@ fn local_ip32_prom_core_throughput_probe() {
 
     struct Sample {
         elapsed: Duration,
+        compilation_drain: Duration,
         performance: Ip32PerformanceSnapshot,
         interpreted_blocks: u64,
         native_blocks: u64,
@@ -3047,6 +3105,12 @@ fn local_ip32_prom_core_throughput_probe() {
                 }
             }
         }
+        let execution_elapsed = started.elapsed();
+        if let Some(engine) = &mut machine.control.jit_engine {
+            engine
+                .finish_compilations()
+                .expect("all requested JIT compilations must finish");
+        }
         let engine_statistics = machine
             .control
             .jit_engine
@@ -3055,6 +3119,7 @@ fn local_ip32_prom_core_throughput_probe() {
             .unwrap_or_default();
         Sample {
             elapsed: started.elapsed(),
+            compilation_drain: started.elapsed().saturating_sub(execution_elapsed),
             performance: machine.performance_snapshot(),
             interpreted_blocks: engine_statistics.interpreted_blocks,
             native_blocks: engine_statistics.native_blocks,
@@ -3069,8 +3134,9 @@ fn local_ip32_prom_core_throughput_probe() {
         let instructions = sample.performance.cpu.retired_instructions;
         let events = sample.performance.runtime.dispatched_events;
         eprintln!(
-            "{label}/{mode}: median_elapsed={:?}, simulated_seconds={simulated_seconds:.6}, rtf={:.4}, instructions/s={:.0}, events/s={:.0}, events/instruction={:.3}, sysad={}, memory={}, cmi={}, cgi={}, interpreted-blocks={}, native-blocks={}, native-operations/block={:.3}, jit={:?}",
+            "{label}/{mode}: median_elapsed={:?}, compilation_drain={:?}, simulated_seconds={simulated_seconds:.6}, rtf={:.4}, instructions/s={:.0}, events/s={:.0}, events/instruction={:.3}, sysad={}, memory={}, cmi={}, cgi={}, interpreted-blocks={}, native-blocks={}, native-operations/block={:.3}, jit={:?}",
             sample.elapsed,
+            sample.compilation_drain,
             simulated_seconds / host_seconds,
             instructions as f64 / host_seconds,
             events as f64 / host_seconds,
@@ -3163,6 +3229,14 @@ fn local_ip32_prom_core_throughput_probe() {
             if selected_limit.as_deref().is_some_and(|limit| limit != mode) {
                 continue;
             }
+            let _ = run_sample(
+                &prom,
+                jit_enabled,
+                quantum,
+                inline,
+                event_chain_policy,
+                limit,
+            );
             let samples = (0..runs)
                 .map(|_| {
                     run_sample(
@@ -3433,8 +3507,8 @@ fn local_ip32_prom_jit_first_serial_acceptance() {
 
 #[cfg(feature = "jit")]
 #[test]
-#[ignore = "requires the local rev4.3 IP32 PROM image and a release build"]
-fn local_ip32_prom_jit_instruction_acceptance() {
+#[ignore = "requires local rev4.3 and rev4.18 IP32 PROM images and a release build"]
+fn local_ip32_prom_jit_cold_start_instruction_acceptance() {
     #[derive(Clone)]
     struct Sample {
         elapsed: Duration,
@@ -3450,22 +3524,41 @@ fn local_ip32_prom_jit_instruction_acceptance() {
         .unwrap();
         machine.schedule_power_on().unwrap();
         let started = Instant::now();
-        loop {
-            let retired = machine.performance_snapshot().cpu.retired_instructions;
-            if retired >= target {
-                break;
-            }
-            let events = if target - retired > 1_000_000 {
-                4_096
-            } else {
-                1
-            };
+        let mut retired = 0_u64;
+        while retired < target {
+            let remaining = target - retired;
+            let events = usize::try_from(
+                remaining
+                    .div_ceil(DEFAULT_CPU_CONTINUATION_QUANTUM as u64)
+                    .clamp(1, 4_096),
+            )
+            .expect("the bounded event batch must fit usize");
+            machine.control.cpu_continuation_quantum = usize::try_from(
+                (remaining / events as u64).min(DEFAULT_CPU_CONTINUATION_QUANTUM as u64),
+            )
+            .expect("the bounded CPU quantum must fit usize");
             match machine.run_steps(events).unwrap() {
                 RunStatus::Dispatched | RunStatus::StepLimitReached => {}
                 status => panic!(
                     "PROM became inactive before reaching {target} retired instructions: {status:?}"
                 ),
             }
+            retired = machine
+                .runtime
+                .registry()
+                .get_typed::<R5000Cpu>(component_ids::CPU0)
+                .expect("the benchmark machine must contain its CPU")
+                .statistics()
+                .retired_instructions;
+        }
+        assert_eq!(
+            retired, target,
+            "the bounded CPU quantum must stop at the requested retirement count"
+        );
+        if let Some(engine) = &mut machine.control.jit_engine {
+            engine
+                .finish_compilations()
+                .expect("all requested JIT compilations must finish");
         }
         Sample {
             elapsed: started.elapsed(),
@@ -3479,13 +3572,51 @@ fn local_ip32_prom_jit_instruction_acceptance() {
         samples.remove(middle)
     }
 
-    if cfg!(debug_assertions) {
-        panic!("the instruction-count JIT acceptance must run with --release");
+    fn run_acceptance(path: &str, prom: &[u8], target: u64, runs: usize) {
+        const MINIMUM_MIPS: f64 = 50.0;
+
+        let _ = run(prom, target);
+        let sample = median((0..runs).map(|_| run(prom, target)).collect());
+        let simulated_seconds = sample.performance.sim_time.get() as f64 / IP32_TIMEBASE_HZ as f64;
+        let rtf = simulated_seconds / sample.elapsed.as_secs_f64();
+        let mips = sample.performance.cpu.retired_instructions as f64
+            / sample.elapsed.as_secs_f64()
+            / 1_000_000.0;
+        eprintln!(
+            "{path}: target={target}, elapsed={:?}, simulated-ticks={}, retired={}, rtf={rtf:.3}, throughput={mips:.3} MIPS, jit={:?}",
+            sample.elapsed,
+            sample.performance.sim_time.get(),
+            sample.performance.cpu.retired_instructions,
+            sample.performance.jit,
+        );
+        assert!(
+            mips >= MINIMUM_MIPS,
+            "{target}-instruction cold-start benchmark for {path} reached only {mips:.3} MIPS"
+        );
     }
-    const TARGET: u64 = 120_000_000;
-    let path =
-        std::env::var("IP32_PROM_PATH").expect("IP32_PROM_PATH must name the local rev4.3 image");
-    let prom = std::fs::read(&path).expect("the local PROM image must be readable");
+
+    if cfg!(debug_assertions) {
+        panic!("the cold-start instruction-count JIT acceptance must run with --release");
+    }
+    const SHORT_TARGET: u64 = 10_000_000;
+    const LONG_TARGET: u64 = 120_000_000;
+    let paths = std::env::var("IP32_PROM_PATHS")
+        .ok()
+        .map(|paths| {
+            paths
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|paths| !paths.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                std::env::var("IP32_PROM_PATH")
+                    .expect("IP32_PROM_PATHS or IP32_PROM_PATH must name local images"),
+            ]
+        });
     let requested_runs = std::env::var("IP32_PROM_BENCH_RUNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -3497,22 +3628,14 @@ fn local_ip32_prom_jit_instruction_acceptance() {
         requested_runs
     };
 
-    let _ = run(&prom, TARGET);
-    let sample = median((0..runs).map(|_| run(&prom, TARGET)).collect());
-    let simulated_seconds = sample.performance.sim_time.get() as f64 / IP32_TIMEBASE_HZ as f64;
-    let rtf = simulated_seconds / sample.elapsed.as_secs_f64();
-    let mips = sample.performance.cpu.retired_instructions as f64
-        / sample.elapsed.as_secs_f64()
-        / 1_000_000.0;
-    eprintln!(
-        "{path}: elapsed={:?}, simulated-ticks={}, retired={}, rtf={rtf:.3}, throughput={mips:.3} MIPS, jit={:?}",
-        sample.elapsed,
-        sample.performance.sim_time.get(),
-        sample.performance.cpu.retired_instructions,
-        sample.performance.jit,
-    );
-    assert!(
-        rtf >= 1.5,
-        "120,000,000-instruction benchmark reached only RTF {rtf:.3}"
-    );
+    let mut images = Vec::with_capacity(paths.len());
+    for path in paths {
+        let prom = std::fs::read(&path).expect("the local PROM image must be readable");
+        run_acceptance(&path, &prom, SHORT_TARGET, runs);
+        images.push((path, prom));
+    }
+    let (rev43_path, rev43_prom) = images
+        .first()
+        .expect("at least the rev4.3 PROM image must be configured");
+    run_acceptance(rev43_path, rev43_prom, LONG_TARGET, runs);
 }

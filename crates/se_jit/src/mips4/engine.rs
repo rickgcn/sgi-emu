@@ -58,15 +58,15 @@ impl Hasher for Mips4BlockKeyHasher {
 type Mips4BlockIndexMap = HashMap<Mips4BlockKey, usize, BuildHasherDefault<Mips4BlockKeyHasher>>;
 
 /// Number of block entries before a native backend compiles a block.
-pub const MIPS4_BLOCK_HOT_THRESHOLD: u64 = 256;
+pub const MIPS4_BLOCK_HOT_THRESHOLD: u64 = 64;
 /// Maximum number of cached block records in one execution engine.
 pub const MIPS4_BLOCK_CACHE_CAPACITY: usize = 16_384;
 /// Guest operations observed at one entry before Region construction.
-pub const MIPS4_REGION_HOT_THRESHOLD: u64 = 4_096;
+pub const MIPS4_REGION_HOT_THRESHOLD: u64 = 2_048;
 /// Maximum number of unique block nodes in one Region.
-pub const MIPS4_REGION_MAX_NODES: usize = 16;
+pub const MIPS4_REGION_MAX_NODES: usize = 64;
 /// Maximum number of unique guest operations in one Region.
-pub const MIPS4_REGION_MAX_OPERATIONS: usize = 128;
+pub const MIPS4_REGION_MAX_OPERATIONS: usize = 512;
 /// Maximum number of derived Region records.
 pub const MIPS4_REGION_CACHE_CAPACITY: usize = 4_096;
 
@@ -91,6 +91,15 @@ pub trait Mips4CodegenBackend {
     /// Compiles one verified domain block.
     fn compile(&mut self, block: &Mips4Block) -> Result<Self::CompiledBlock, Self::Error>;
 
+    /// Polls one baseline compilation without blocking.
+    fn block_compilation_status(
+        &mut self,
+        _compiled: &Self::CompiledBlock,
+        _wait: bool,
+    ) -> Result<Mips4CompilationStatus, Self::Error> {
+        Ok(Mips4CompilationStatus::ready())
+    }
+
     /// Executes one compiled block against the stable frame ABI.
     fn execute<'fast, R>(
         &mut self,
@@ -107,6 +116,15 @@ pub trait Mips4CodegenBackend {
     fn compile_region(&mut self, region: &Mips4Region)
     -> Result<Self::CompiledRegion, Self::Error>;
 
+    /// Polls one Region compilation without blocking.
+    fn region_compilation_status(
+        &mut self,
+        _compiled: &Self::CompiledRegion,
+        _wait: bool,
+    ) -> Result<Mips4CompilationStatus, Self::Error> {
+        Ok(Mips4CompilationStatus::ready())
+    }
+
     /// Executes one compiled Region against the stable frame ABI.
     fn execute_region<'fast, R>(
         &mut self,
@@ -119,8 +137,27 @@ pub trait Mips4CodegenBackend {
     where
         R: Mips4BlockRuntime;
 
-    /// Drops all native code and resets backend allocation state.
+    /// Invalidates all native code and schedules a backend allocation reset.
     fn clear(&mut self) -> Result<(), Self::Error>;
+}
+
+/// Availability and newly reported cost of one native compilation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mips4CompilationStatus {
+    /// Whether the native entry point is ready to execute.
+    pub ready: bool,
+
+    /// Compilation nanoseconds reported since the previous poll.
+    pub compilation_nanos: u64,
+}
+
+impl Mips4CompilationStatus {
+    const fn ready() -> Self {
+        Self {
+            ready: true,
+            compilation_nanos: 0,
+        }
+    }
 }
 
 /// Execution tier selected for one block entry.
@@ -210,6 +247,9 @@ pub struct Mips4BlockEngineStatistics {
     /// Blocks compiled by the native backend.
     pub compiled_blocks: u64,
 
+    /// Host nanoseconds spent compiling baseline blocks.
+    pub block_compile_nanos: u64,
+
     /// Cached blocks removed by guard invalidation.
     pub invalidated_blocks: u64,
 
@@ -224,6 +264,12 @@ pub struct Mips4BlockEngineStatistics {
 
     /// Regions compiled since the latest engine reset.
     pub region_compilations: u64,
+
+    /// Host nanoseconds spent lifting profiled Regions.
+    pub region_lifting_nanos: u64,
+
+    /// Host nanoseconds spent compiling Regions.
+    pub region_compile_nanos: u64,
 
     /// Region exits caused by an uncompiled successor edge.
     pub region_cold_side_exits: u64,
@@ -511,7 +557,7 @@ fn execute_interpreted_tier<'fast, B, R>(
     frame: &mut Mips4BlockFrame,
     runtime: &mut R,
     fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
-) -> Result<(Mips4BlockExit, bool), Mips4BlockEngineError<B::Error>>
+) -> Result<(Mips4BlockExit, bool, u64), Mips4BlockEngineError<B::Error>>
 where
     B: Mips4CodegenBackend,
     R: Mips4BlockRuntime,
@@ -520,15 +566,23 @@ where
     record.operation_hotness = record
         .operation_hotness
         .saturating_add(frame.operations_executed());
-    let promoted = record.operation_hotness >= MIPS4_BLOCK_HOT_THRESHOLD;
+    let promoted =
+        record.compiled.is_none() && record.operation_hotness >= MIPS4_BLOCK_HOT_THRESHOLD;
+    let mut compile_nanos = 0;
     if promoted {
+        let started = std::time::Instant::now();
         record.compiled = Some(
             backend
                 .compile(&record.block)
                 .map_err(Mips4BlockEngineError::Backend)?,
         );
+        compile_nanos = duration_nanos(started.elapsed());
     }
-    Ok((exit, promoted))
+    Ok((exit, promoted, compile_nanos))
+}
+
+fn duration_nanos(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy)]
@@ -728,7 +782,13 @@ where
             self.reset()?;
             return Ok(());
         }
-        let Some(region) = build_profiled_region(entry_index, &self.indices, &self.records) else {
+        let lifting_started = std::time::Instant::now();
+        let region = build_profiled_region(entry_index, &self.indices, &self.records);
+        self.statistics.region_lifting_nanos = self
+            .statistics
+            .region_lifting_nanos
+            .saturating_add(duration_nanos(lifting_started.elapsed()));
+        let Some(region) = region else {
             if let Some(record) = self.records.get_mut(entry_index).and_then(Option::as_mut) {
                 record.region_next_compile_hotness = record
                     .region_hotness
@@ -740,10 +800,15 @@ where
         let member_keys = region.member_keys();
         let guards = region.guards();
         let entry_key = region.key().entry;
+        let compile_started = std::time::Instant::now();
         let compiled = self
             .backend
             .compile_region(&region)
             .map_err(Mips4BlockEngineError::Backend)?;
+        self.statistics.region_compile_nanos = self
+            .statistics
+            .region_compile_nanos
+            .saturating_add(duration_nanos(compile_started.elapsed()));
         let Some(record) = self.records.get_mut(entry_index).and_then(Option::as_mut) else {
             return Err(Mips4BlockEngineError::MissingBlock(Box::new(entry_key)));
         };
@@ -808,7 +873,31 @@ where
             let record = records[index]
                 .as_mut()
                 .ok_or_else(|| Mips4BlockEngineError::MissingBlock(Box::new(key)))?;
-            if let Some(region) = &record.compiled_region {
+            let region_status = record
+                .compiled_region
+                .as_ref()
+                .map(|region| backend.region_compilation_status(&region.compiled, false))
+                .transpose()
+                .map_err(Mips4BlockEngineError::Backend)?;
+            let block_status = record
+                .compiled
+                .as_ref()
+                .map(|compiled| backend.block_compilation_status(compiled, false))
+                .transpose()
+                .map_err(Mips4BlockEngineError::Backend)?;
+            self.statistics.region_compile_nanos = self
+                .statistics
+                .region_compile_nanos
+                .saturating_add(region_status.map_or(0, |status| status.compilation_nanos));
+            self.statistics.block_compile_nanos = self
+                .statistics
+                .block_compile_nanos
+                .saturating_add(block_status.map_or(0, |status| status.compilation_nanos));
+            if region_status.is_some_and(|status| status.ready) {
+                let region = record
+                    .compiled_region
+                    .as_ref()
+                    .expect("a ready Region status requires a compiled record");
                 let (exit, region_side_exit) = backend
                     .execute_region(
                         &region.compiled,
@@ -825,7 +914,11 @@ where
                     false,
                     region_side_exit,
                 )
-            } else if let Some(compiled) = &record.compiled {
+            } else if block_status.is_some_and(|status| status.ready) {
+                let compiled = record
+                    .compiled
+                    .as_ref()
+                    .expect("a ready block status requires a compiled record");
                 let exit = backend
                     .execute(
                         compiled,
@@ -843,8 +936,12 @@ where
                     None,
                 )
             } else {
-                let (exit, promoted) =
+                let (exit, promoted, compile_nanos) =
                     execute_interpreted_tier(backend, record, frame, runtime, fast_memory)?;
+                self.statistics.block_compile_nanos = self
+                    .statistics
+                    .block_compile_nanos
+                    .saturating_add(compile_nanos);
                 (
                     exit,
                     Mips4BlockTier::Interpreter,
@@ -969,8 +1066,32 @@ where
                 (Mips4CachedBlockExecution::CounterSynchronization, false)
             } else {
                 frame.reset_execution_accounting();
+                let region_status = record
+                    .compiled_region
+                    .as_ref()
+                    .map(|region| backend.region_compilation_status(&region.compiled, false))
+                    .transpose()
+                    .map_err(Mips4BlockEngineError::Backend)?;
+                let block_status = record
+                    .compiled
+                    .as_ref()
+                    .map(|compiled| backend.block_compilation_status(compiled, false))
+                    .transpose()
+                    .map_err(Mips4BlockEngineError::Backend)?;
+                self.statistics.region_compile_nanos = self
+                    .statistics
+                    .region_compile_nanos
+                    .saturating_add(region_status.map_or(0, |status| status.compilation_nanos));
+                self.statistics.block_compile_nanos = self
+                    .statistics
+                    .block_compile_nanos
+                    .saturating_add(block_status.map_or(0, |status| status.compilation_nanos));
                 let (exit, tier, mut region_side_exit) =
-                    if let Some(region) = &record.compiled_region {
+                    if region_status.is_some_and(|status| status.ready) {
+                        let region = record
+                            .compiled_region
+                            .as_ref()
+                            .expect("a ready Region status requires a compiled record");
                         let (exit, region_side_exit) = backend
                             .execute_region(
                                 &region.compiled,
@@ -981,7 +1102,11 @@ where
                             )
                             .map_err(Mips4BlockEngineError::Backend)?;
                         (exit, Mips4BlockTier::Region, region_side_exit)
-                    } else if let Some(compiled) = &record.compiled {
+                    } else if block_status.is_some_and(|status| status.ready) {
+                        let compiled = record
+                            .compiled
+                            .as_ref()
+                            .expect("a ready block status requires a compiled record");
                         let exit = backend
                             .execute(
                                 compiled,
@@ -993,8 +1118,12 @@ where
                             .map_err(Mips4BlockEngineError::Backend)?;
                         (exit, Mips4BlockTier::Native, None)
                     } else {
-                        let (exit, promoted) =
+                        let (exit, promoted, compile_nanos) =
                             execute_interpreted_tier(backend, record, frame, runtime, fast_memory)?;
+                        self.statistics.block_compile_nanos = self
+                            .statistics
+                            .block_compile_nanos
+                            .saturating_add(compile_nanos);
                         if promoted {
                             self.statistics.compiled_blocks =
                                 self.statistics.compiled_blocks.saturating_add(1);
@@ -1159,6 +1288,10 @@ where
             .statistics
             .native_fast_memory_reads
             .saturating_add(statistics.native_fast_memory_reads);
+        self.statistics.block_compile_nanos = self
+            .statistics
+            .block_compile_nanos
+            .saturating_add(statistics.block_compile_nanos);
         self.statistics.region_entries = self
             .statistics
             .region_entries
@@ -1183,6 +1316,48 @@ where
             .statistics
             .region_guard_side_exits
             .saturating_add(statistics.region_guard_side_exits);
+        self.statistics.region_lifting_nanos = self
+            .statistics
+            .region_lifting_nanos
+            .saturating_add(statistics.region_lifting_nanos);
+        self.statistics.region_compile_nanos = self
+            .statistics
+            .region_compile_nanos
+            .saturating_add(statistics.region_compile_nanos);
+    }
+
+    /// Waits for every requested native compilation and records its host cost.
+    pub fn finish_compilations(&mut self) -> Result<(), Mips4BlockEngineError<B::Error>> {
+        let mut block_compile_nanos = 0_u64;
+        let mut region_compile_nanos = 0_u64;
+        for record in self.records.iter().filter_map(Option::as_ref) {
+            if let Some(compiled) = &record.compiled {
+                let status = self
+                    .backend
+                    .block_compilation_status(compiled, true)
+                    .map_err(Mips4BlockEngineError::Backend)?;
+                debug_assert!(status.ready);
+                block_compile_nanos = block_compile_nanos.saturating_add(status.compilation_nanos);
+            }
+            if let Some(region) = &record.compiled_region {
+                let status = self
+                    .backend
+                    .region_compilation_status(&region.compiled, true)
+                    .map_err(Mips4BlockEngineError::Backend)?;
+                debug_assert!(status.ready);
+                region_compile_nanos =
+                    region_compile_nanos.saturating_add(status.compilation_nanos);
+            }
+        }
+        self.statistics.block_compile_nanos = self
+            .statistics
+            .block_compile_nanos
+            .saturating_add(block_compile_nanos);
+        self.statistics.region_compile_nanos = self
+            .statistics
+            .region_compile_nanos
+            .saturating_add(region_compile_nanos);
+        Ok(())
     }
 
     /// Returns the number of cached block records.
@@ -1562,6 +1737,73 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PendingBackend {
+        polls: usize,
+    }
+
+    impl Mips4CodegenBackend for PendingBackend {
+        type CompiledBlock = Mips4Block;
+        type CompiledRegion = Mips4Region;
+        type Error = Infallible;
+
+        fn compile(&mut self, block: &Mips4Block) -> Result<Self::CompiledBlock, Self::Error> {
+            Ok(block.clone())
+        }
+
+        fn block_compilation_status(
+            &mut self,
+            _compiled: &Self::CompiledBlock,
+            wait: bool,
+        ) -> Result<Mips4CompilationStatus, Self::Error> {
+            assert!(!wait, "the execution path waited for native compilation");
+            self.polls += 1;
+            Ok(Mips4CompilationStatus {
+                ready: false,
+                compilation_nanos: 0,
+            })
+        }
+
+        fn execute<'fast, R>(
+            &mut self,
+            _compiled: &Self::CompiledBlock,
+            _frame: &mut Mips4BlockFrame,
+            _runtime: &mut R,
+            _operations: &[Mips4RuntimeOperation],
+            _fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
+        ) -> Result<Mips4BlockExit, Self::Error>
+        where
+            R: Mips4BlockRuntime,
+        {
+            unreachable!("a pending compilation cannot execute")
+        }
+
+        fn compile_region(
+            &mut self,
+            region: &Mips4Region,
+        ) -> Result<Self::CompiledRegion, Self::Error> {
+            Ok(region.clone())
+        }
+
+        fn execute_region<'fast, R>(
+            &mut self,
+            _compiled: &Self::CompiledRegion,
+            _frame: &mut Mips4BlockFrame,
+            _runtime: &mut R,
+            _operations: &[Mips4RuntimeOperation],
+            _fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
+        ) -> Result<(Mips4BlockExit, Option<Mips4RegionSideExit>), Self::Error>
+        where
+            R: Mips4BlockRuntime,
+        {
+            unreachable!("a pending Region compilation cannot execute")
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     struct TestRuntime {
         guard_valid: bool,
         epoch: u64,
@@ -1643,6 +1885,51 @@ mod tests {
         block
     }
 
+    fn direct_self_loop_block(pc: u64) -> Mips4Block {
+        let key = Mips4BlockKey {
+            pc,
+            next_pc: pc + 4,
+            delay_slot_branch_pc: None,
+            fetch_context: 0,
+            translation_generation: 0,
+            code_guard: 0,
+        };
+        let mut guard = Mips4BlockGuard::new();
+        guard.insert(Mips4BlockGuardLine {
+            set: 0,
+            way: 0,
+            physical_line_base: pc & !31,
+            generation: 1,
+        });
+        let mut block = Mips4Block::new(key, guard);
+        block
+            .terminate_with_branch(
+                Mips4BlockBranch {
+                    metadata: Mips4BlockInstructionMetadata {
+                        pc,
+                        instruction: 0,
+                        delay_slot_branch_pc: None,
+                    },
+                    condition: Mips4BlockBranchCondition::Always,
+                    target: Mips4BlockBranchTarget::Direct(pc),
+                    likely: false,
+                    link: None,
+                    retire: Mips4BlockRetire { pc },
+                },
+                Mips4BlockInstruction {
+                    metadata: Mips4BlockInstructionMetadata {
+                        pc: pc + 4,
+                        instruction: 0,
+                        delay_slot_branch_pc: Some(pc),
+                    },
+                    operation: Mips4BlockOperation::NoOperation,
+                    retire: Mips4BlockRetire { pc: pc + 4 },
+                },
+            )
+            .unwrap();
+        block
+    }
+
     fn frame(key: Mips4BlockKey) -> Mips4BlockFrame {
         Mips4BlockFrame::new([0; 32], 0, 0, key.pc, key.next_pc, None, 1)
     }
@@ -1669,6 +1956,36 @@ mod tests {
         assert_eq!(statistics.interpreted_operations, MIPS4_BLOCK_HOT_THRESHOLD);
         assert_eq!(statistics.native_operations, 1);
         assert_eq!(statistics.dynamic_fetches, 1);
+    }
+
+    #[test]
+    fn pending_self_loop_compilation_never_blocks_execution_entries() {
+        let source = Mips4BlockSource::InstructionCache;
+        let block = direct_self_loop_block(0x1000);
+        let key = block.key();
+        let mut engine = Mips4BlockEngine::new(PendingBackend::default());
+        engine.install(block.clone(), source).unwrap();
+        let index = engine.record_index(key).unwrap();
+        engine.records[index].as_mut().unwrap().compiled = Some(block);
+        let mut runtime = TestRuntime {
+            guard_valid: true,
+            epoch: 0,
+        };
+
+        let execution = engine
+            .execute_with_runtime(key, &mut frame(key), &mut runtime, None)
+            .unwrap();
+        assert_eq!(execution.tier, Mips4BlockTier::Interpreter);
+        assert!(matches!(
+            engine
+                .execute_cached_with_runtime(key, &mut frame(key), &mut runtime, None, false,)
+                .unwrap(),
+            Mips4CachedBlockExecution::Executed(Mips4BlockExecution {
+                tier: Mips4BlockTier::Interpreter,
+                ..
+            })
+        ));
+        assert_eq!(engine.backend.polls, 2);
     }
 
     #[test]

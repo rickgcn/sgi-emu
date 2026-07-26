@@ -1,6 +1,15 @@
 //! Cranelift backend for typed MIPS IV basic blocks.
 
-use core::{fmt, mem, ptr::NonNull};
+use core::{cell::Cell, fmt, mem, ptr::NonNull};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError},
+    },
+    thread::{self, JoinHandle},
+    time::Instant,
+};
 
 use cranelift_codegen::ir::{
     AbiParam, BlockArg, Function, InstBuilder, MemFlagsData, Signature, Value, condcodes::IntCC,
@@ -22,10 +31,11 @@ use se_device::cpu::mips4::execution::block::{
     MIPS4_NATIVE_AFFINE_BASE_OFFSET, MIPS4_NATIVE_AFFINE_BASE_TIME_OFFSET,
     MIPS4_NATIVE_AFFINE_FREQUENCY_OFFSET, MIPS4_NATIVE_AFFINE_READ_SIZE,
     MIPS4_NATIVE_AFFINE_TIMEBASE_OFFSET, MIPS4_NATIVE_AFFINE_WORD_MASK_OFFSET,
-    MIPS4_NATIVE_AFFINE_WRITABLE_OFFSET, MIPS4_NATIVE_CLOCK_FREQUENCY_OFFSET,
-    MIPS4_NATIVE_CLOCK_REMAINDER_OFFSET, MIPS4_NATIVE_CLOCK_TIMEBASE_OFFSET,
-    MIPS4_NATIVE_CONTEXT_ATTEMPTS_OFFSET, MIPS4_NATIVE_CONTEXT_AUXILIARY_CLOCK_OFFSET,
-    MIPS4_NATIVE_CONTEXT_AUXILIARY_COMPLETED_OFFSET, MIPS4_NATIVE_CONTEXT_BUS_CLOCK_OFFSET,
+    MIPS4_NATIVE_AFFINE_WRITABLE_OFFSET, MIPS4_NATIVE_CLOCK_FRACTIONAL_OFFSET,
+    MIPS4_NATIVE_CLOCK_FREQUENCY_OFFSET, MIPS4_NATIVE_CLOCK_REMAINDER_OFFSET,
+    MIPS4_NATIVE_CLOCK_WHOLE_OFFSET, MIPS4_NATIVE_CONTEXT_ATTEMPTS_OFFSET,
+    MIPS4_NATIVE_CONTEXT_AUXILIARY_CLOCK_OFFSET, MIPS4_NATIVE_CONTEXT_AUXILIARY_COMPLETED_OFFSET,
+    MIPS4_NATIVE_CONTEXT_AVAILABLE_TICKS_OFFSET, MIPS4_NATIVE_CONTEXT_BUS_CLOCK_OFFSET,
     MIPS4_NATIVE_CONTEXT_CODE_ACTIVE_OFFSET, MIPS4_NATIVE_CONTEXT_CODE_AUXILIARY_CLOCK_OFFSET,
     MIPS4_NATIVE_CONTEXT_CODE_FIXED_OFFSET, MIPS4_NATIVE_CONTEXT_CODE_SHARES_AUXILIARY_OFFSET,
     MIPS4_NATIVE_CONTEXT_COMPLETED_OFFSET, MIPS4_NATIVE_CONTEXT_CPU_CLOCK_OFFSET,
@@ -33,28 +43,166 @@ use se_device::cpu::mips4::execution::block::{
     MIPS4_NATIVE_CONTEXT_LAST_AUXILIARY_DELIVERY_OFFSET,
     MIPS4_NATIVE_CONTEXT_LAST_AUXILIARY_FETCH_OFFSET, MIPS4_NATIVE_CONTEXT_LAST_DELIVERY_OFFSET,
     MIPS4_NATIVE_CONTEXT_LAST_FETCH_OFFSET, MIPS4_NATIVE_CONTEXT_READS_OFFSET,
-    MIPS4_NATIVE_CONTEXT_START_TIME_OFFSET, MIPS4_NATIVE_CONTEXT_WRITES_OFFSET, Mips4Block,
-    Mips4BlockArithmetic, Mips4BlockBranchCondition, Mips4BlockBranchTarget, Mips4BlockComparison,
-    Mips4BlockException, Mips4BlockExit, Mips4BlockFrame, Mips4BlockLogical, Mips4BlockOperand,
-    Mips4BlockOperation, Mips4BlockRuntime, Mips4BlockShift, Mips4BlockShiftAmount, Mips4BlockTrap,
-    Mips4BlockWidth, Mips4FastMemoryRuntime, Mips4RuntimeOperation, Mips4RuntimeResult,
+    MIPS4_NATIVE_CONTEXT_RETIREMENT_TICKS_OFFSET, MIPS4_NATIVE_CONTEXT_START_TIME_OFFSET,
+    MIPS4_NATIVE_CONTEXT_WRITES_OFFSET, Mips4Block, Mips4BlockArithmetic,
+    Mips4BlockBranchCondition, Mips4BlockBranchTarget, Mips4BlockComparison, Mips4BlockException,
+    Mips4BlockExit, Mips4BlockFrame, Mips4BlockLogical, Mips4BlockOperand, Mips4BlockOperation,
+    Mips4BlockRuntime, Mips4BlockShift, Mips4BlockShiftAmount, Mips4BlockTrap, Mips4BlockWidth,
+    Mips4FastMemoryRuntime, Mips4RuntimeOperation, Mips4RuntimeResult,
 };
 use se_device::cpu::mips4::instruction::decode::Mips4CpuInstruction;
 
 use super::abi::*;
-use super::engine::Mips4CodegenBackend;
+use super::engine::{Mips4CodegenBackend, Mips4CompilationStatus};
 use super::region::{Mips4Region, Mips4RegionSideExit};
 
 /// Compiled host entry point owned by one Cranelift module generation.
 #[derive(Debug)]
 pub struct CraneliftMips4Block {
-    entry: NonNull<u8>,
+    compilation: NativeCompilation,
 }
 
 /// Compiled host entry point for one bounded MIPS IV Region.
 #[derive(Debug)]
 pub struct CraneliftMips4Region {
-    entry: NonNull<u8>,
+    compilation: NativeCompilation,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeCompilationResult {
+    entry: usize,
+    compilation_nanos: u64,
+}
+
+#[derive(Debug)]
+struct NativeCompilation {
+    receiver: Receiver<Result<NativeCompilationResult, CraneliftMips4Error>>,
+    entry: Cell<Option<NonNull<u8>>>,
+    compilation_nanos: Cell<u64>,
+    reported: Cell<bool>,
+}
+
+impl NativeCompilation {
+    fn new(receiver: Receiver<Result<NativeCompilationResult, CraneliftMips4Error>>) -> Self {
+        Self {
+            receiver,
+            entry: Cell::new(None),
+            compilation_nanos: Cell::new(0),
+            reported: Cell::new(false),
+        }
+    }
+
+    fn status(&self, wait: bool) -> Result<Mips4CompilationStatus, CraneliftMips4Error> {
+        if self.entry.get().is_none() {
+            let result = if wait {
+                Some(self.receiver.recv().map_err(|error| {
+                    CraneliftMips4Error::message(format!(
+                        "native compiler worker disconnected: {error}"
+                    ))
+                })?)
+            } else {
+                match self.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        return Err(CraneliftMips4Error::message(
+                            "native compiler worker disconnected",
+                        ));
+                    }
+                }
+            };
+            if let Some(result) = result {
+                let result = result?;
+                self.entry.set(NonNull::new(result.entry as *mut u8));
+                self.compilation_nanos.set(result.compilation_nanos);
+            }
+        }
+        let ready = self.entry.get().is_some();
+        let compilation_nanos = if ready && !self.reported.replace(true) {
+            self.compilation_nanos.get()
+        } else {
+            0
+        };
+        Ok(Mips4CompilationStatus {
+            ready,
+            compilation_nanos,
+        })
+    }
+
+    fn entry(&self) -> Result<NonNull<u8>, CraneliftMips4Error> {
+        self.status(true)?;
+        self.entry
+            .get()
+            .ok_or_else(|| CraneliftMips4Error::message("native compilation produced no entry"))
+    }
+}
+
+enum BaselineCompilerCommand {
+    Compile {
+        generation: u64,
+        block: Box<Mips4Block>,
+        result: Sender<Result<NativeCompilationResult, CraneliftMips4Error>>,
+    },
+    Clear,
+    Shutdown,
+}
+
+enum RegionCompilerCommand {
+    Compile {
+        generation: u64,
+        region: Mips4Region,
+        result: Sender<Result<NativeCompilationResult, CraneliftMips4Error>>,
+    },
+    Clear,
+    Shutdown,
+}
+
+const MIPS4_BASELINE_COMPILER_ARENAS: usize = 1;
+const MIPS4_REGION_COMPILER_ARENAS: usize = 1;
+
+struct CompilerModule {
+    module: Option<JITModule>,
+    error: Option<CraneliftMips4Error>,
+    next_function: u64,
+}
+
+impl CompilerModule {
+    fn new(module: JITModule) -> Self {
+        Self {
+            module: Some(module),
+            error: None,
+            next_function: 0,
+        }
+    }
+
+    fn compile_with(
+        &mut self,
+        compile: impl FnOnce(
+            &mut JITModule,
+            &mut u64,
+        ) -> Result<NativeCompilationResult, CraneliftMips4Error>,
+    ) -> Result<NativeCompilationResult, CraneliftMips4Error> {
+        let Some(module) = self.module.as_mut() else {
+            return Err(self.error.clone().unwrap_or_else(|| {
+                CraneliftMips4Error::message("native compiler module is unavailable")
+            }));
+        };
+        compile(module, &mut self.next_function)
+    }
+
+    fn reset(&mut self, optimization_level: &str, register_allocator: &str) {
+        self.next_function = 0;
+        match create_module(optimization_level, register_allocator) {
+            Ok(module) => {
+                self.module = Some(module);
+                self.error = None;
+            }
+            Err(error) => {
+                self.module = None;
+                self.error = Some(error);
+            }
+        }
+    }
 }
 
 /// Cranelift construction, compilation, or execution failure.
@@ -87,16 +235,58 @@ impl std::error::Error for CraneliftMips4Error {}
 
 /// Native MIPS IV block backend using the current host ISA.
 pub struct CraneliftMips4Backend {
-    module: JITModule,
-    next_function: u64,
+    baseline_senders: Vec<Sender<BaselineCompilerCommand>>,
+    baseline_generations: Vec<Arc<AtomicU64>>,
+    region_senders: Vec<Sender<RegionCompilerCommand>>,
+    region_generations: Vec<Arc<AtomicU64>>,
+    workers: Vec<JoinHandle<()>>,
+    next_baseline_arena: usize,
+    next_region_arena: usize,
 }
 
 impl CraneliftMips4Backend {
     /// Creates an empty native backend for the current host.
     pub fn new() -> Result<Self, CraneliftMips4Error> {
+        let mut baseline_senders = Vec::with_capacity(MIPS4_BASELINE_COMPILER_ARENAS);
+        let mut baseline_generations = Vec::with_capacity(MIPS4_BASELINE_COMPILER_ARENAS);
+        let mut region_senders = Vec::with_capacity(MIPS4_REGION_COMPILER_ARENAS);
+        let mut region_generations = Vec::with_capacity(MIPS4_REGION_COMPILER_ARENAS);
+        let mut workers =
+            Vec::with_capacity(MIPS4_BASELINE_COMPILER_ARENAS + MIPS4_REGION_COMPILER_ARENAS);
+        for arena in 0..MIPS4_BASELINE_COMPILER_ARENAS {
+            let module = create_module("none", "single_pass")?;
+            let generation = Arc::new(AtomicU64::new(0));
+            let (sender, receiver) = mpsc::channel();
+            let worker_generation = Arc::clone(&generation);
+            let worker = thread::Builder::new()
+                .name(format!("mips4-baseline-compiler-{arena}"))
+                .spawn(move || run_baseline_compiler(module, worker_generation, receiver))
+                .map_err(CraneliftMips4Error::new)?;
+            baseline_senders.push(sender);
+            baseline_generations.push(generation);
+            workers.push(worker);
+        }
+        for arena in 0..MIPS4_REGION_COMPILER_ARENAS {
+            let module = create_module("none", "single_pass")?;
+            let generation = Arc::new(AtomicU64::new(0));
+            let (sender, receiver) = mpsc::channel();
+            let worker_generation = Arc::clone(&generation);
+            let worker = thread::Builder::new()
+                .name(format!("mips4-region-compiler-{arena}"))
+                .spawn(move || run_region_compiler(module, worker_generation, receiver))
+                .map_err(CraneliftMips4Error::new)?;
+            region_senders.push(sender);
+            region_generations.push(generation);
+            workers.push(worker);
+        }
         Ok(Self {
-            module: create_module()?,
-            next_function: 0,
+            baseline_senders,
+            baseline_generations,
+            region_senders,
+            region_generations,
+            workers,
+            next_baseline_arena: 0,
+            next_region_arena: 0,
         })
     }
 }
@@ -108,55 +298,31 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
 
     fn compile(&mut self, block: &Mips4Block) -> Result<Self::CompiledBlock, Self::Error> {
         block.verify().map_err(CraneliftMips4Error::new)?;
-        let mut context = self.module.make_context();
-        let pointer_type = self.module.target_config().pointer_type();
-        context.func = Function::with_name_signature(
-            cranelift_codegen::ir::UserFuncName::user(0, self.next_function as u32),
-            Signature {
-                params: vec![AbiParam::new(pointer_type), AbiParam::new(pointer_type)],
-                returns: vec![AbiParam::new(types::I32)],
-                call_conv: self.module.target_config().default_call_conv,
-            },
-        );
+        let (sender, receiver) = mpsc::channel();
+        let arena = self.next_baseline_arena;
+        self.next_baseline_arena = (self.next_baseline_arena + 1) % self.baseline_senders.len();
+        self.baseline_senders[arena]
+            .send(BaselineCompilerCommand::Compile {
+                generation: self.baseline_generations[arena].load(Ordering::Acquire),
+                block: Box::new(block.clone()),
+                result: sender,
+            })
+            .map_err(|error| {
+                CraneliftMips4Error::message(format!(
+                    "baseline compiler worker disconnected: {error}"
+                ))
+            })?;
+        Ok(CraneliftMips4Block {
+            compilation: NativeCompilation::new(receiver),
+        })
+    }
 
-        let mut function_builder_context = FunctionBuilderContext::new();
-        {
-            let mut builder =
-                FunctionBuilder::new(&mut context.func, &mut function_builder_context);
-            let entry = builder.create_block();
-            builder.append_block_params_for_function_params(entry);
-            builder.switch_to_block(entry);
-            builder.seal_block(entry);
-            let frame = builder.block_params(entry)[0];
-            let call_context = builder.block_params(entry)[1];
-            lower_block(
-                &mut builder,
-                frame,
-                call_context,
-                block,
-                pointer_type,
-                self.module.target_config().default_call_conv,
-            );
-            builder.seal_all_blocks();
-            builder.finalize();
-        }
-
-        let name = format!("mips4_block_{}", self.next_function);
-        self.next_function = self.next_function.wrapping_add(1);
-        let function = self
-            .module
-            .declare_function(&name, Linkage::Local, &context.func.signature)
-            .map_err(CraneliftMips4Error::new)?;
-        self.module
-            .define_function(function, &mut context)
-            .map_err(|error| CraneliftMips4Error::message(format!("{error:?}")))?;
-        self.module.clear_context(&mut context);
-        self.module
-            .finalize_definitions()
-            .map_err(CraneliftMips4Error::new)?;
-        let entry = NonNull::new(self.module.get_finalized_function(function).cast_mut())
-            .ok_or_else(|| CraneliftMips4Error::message("Cranelift returned a null entry point"))?;
-        Ok(CraneliftMips4Block { entry })
+    fn block_compilation_status(
+        &mut self,
+        compiled: &Self::CompiledBlock,
+        wait: bool,
+    ) -> Result<Mips4CompilationStatus, Self::Error> {
+        compiled.compilation.status(wait)
     }
 
     fn execute<'fast, R>(
@@ -176,7 +342,8 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
         let mut invocation = Mips4NativeInvocation::new(runtime, operations, fast_memory);
         // SAFETY: Cranelift emitted this entry with the exact NativeBlock signature,
         // and the module remains alive while every compiled handle is cached.
-        let function: NativeBlock = unsafe { mem::transmute(compiled.entry.as_ptr()) };
+        let entry = compiled.compilation.entry()?;
+        let function: NativeBlock = unsafe { mem::transmute(entry.as_ptr()) };
         // SAFETY: The frame is uniquely borrowed for the duration of native execution.
         let code = unsafe { function(core::ptr::from_mut(frame), invocation.context_mut_ptr()) };
         block_exit_from_code(code).ok_or_else(|| {
@@ -189,55 +356,31 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
         region: &Mips4Region,
     ) -> Result<Self::CompiledRegion, Self::Error> {
         region.verify().map_err(CraneliftMips4Error::new)?;
-        let mut context = self.module.make_context();
-        let pointer_type = self.module.target_config().pointer_type();
-        context.func = Function::with_name_signature(
-            cranelift_codegen::ir::UserFuncName::user(0, self.next_function as u32),
-            Signature {
-                params: vec![AbiParam::new(pointer_type), AbiParam::new(pointer_type)],
-                returns: vec![AbiParam::new(types::I32)],
-                call_conv: self.module.target_config().default_call_conv,
-            },
-        );
+        let (sender, receiver) = mpsc::channel();
+        let arena = self.next_region_arena;
+        self.next_region_arena = (self.next_region_arena + 1) % self.region_senders.len();
+        self.region_senders[arena]
+            .send(RegionCompilerCommand::Compile {
+                generation: self.region_generations[arena].load(Ordering::Acquire),
+                region: region.clone(),
+                result: sender,
+            })
+            .map_err(|error| {
+                CraneliftMips4Error::message(format!(
+                    "Region compiler worker disconnected: {error}"
+                ))
+            })?;
+        Ok(CraneliftMips4Region {
+            compilation: NativeCompilation::new(receiver),
+        })
+    }
 
-        let mut function_builder_context = FunctionBuilderContext::new();
-        {
-            let mut builder =
-                FunctionBuilder::new(&mut context.func, &mut function_builder_context);
-            let entry = builder.create_block();
-            builder.append_block_params_for_function_params(entry);
-            builder.switch_to_block(entry);
-            builder.seal_block(entry);
-            let frame = builder.block_params(entry)[0];
-            let call_context = builder.block_params(entry)[1];
-            lower_region(
-                &mut builder,
-                frame,
-                call_context,
-                region,
-                pointer_type,
-                self.module.target_config().default_call_conv,
-            );
-            builder.seal_all_blocks();
-            builder.finalize();
-        }
-
-        let name = format!("mips4_region_{}", self.next_function);
-        self.next_function = self.next_function.wrapping_add(1);
-        let function = self
-            .module
-            .declare_function(&name, Linkage::Local, &context.func.signature)
-            .map_err(CraneliftMips4Error::new)?;
-        self.module
-            .define_function(function, &mut context)
-            .map_err(|error| CraneliftMips4Error::message(format!("{error:?}")))?;
-        self.module.clear_context(&mut context);
-        self.module
-            .finalize_definitions()
-            .map_err(CraneliftMips4Error::new)?;
-        let entry = NonNull::new(self.module.get_finalized_function(function).cast_mut())
-            .ok_or_else(|| CraneliftMips4Error::message("Cranelift returned a null entry point"))?;
-        Ok(CraneliftMips4Region { entry })
+    fn region_compilation_status(
+        &mut self,
+        compiled: &Self::CompiledRegion,
+        wait: bool,
+    ) -> Result<Mips4CompilationStatus, Self::Error> {
+        compiled.compilation.status(wait)
     }
 
     fn execute_region<'fast, R>(
@@ -257,7 +400,8 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
         let mut invocation = Mips4NativeInvocation::new(runtime, operations, fast_memory);
         // SAFETY: Cranelift emitted this entry with the exact NativeRegion signature,
         // and the module remains alive while every compiled handle is cached.
-        let function: NativeRegion = unsafe { mem::transmute(compiled.entry.as_ptr()) };
+        let entry = compiled.compilation.entry()?;
+        let function: NativeRegion = unsafe { mem::transmute(entry.as_ptr()) };
         // SAFETY: The frame is uniquely borrowed for the duration of native execution.
         let code = unsafe { function(core::ptr::from_mut(frame), invocation.context_mut_ptr()) };
         let side_exit = invocation.region_side_exit();
@@ -271,16 +415,241 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
     }
 
     fn clear(&mut self) -> Result<(), Self::Error> {
-        self.module = create_module()?;
-        self.next_function = 0;
+        // Generation changes let workers discard queued obsolete compilations.
+        // FIFO Clear commands replace each module before new work can begin.
+        for (sender, generation) in self.baseline_senders.iter().zip(&self.baseline_generations) {
+            generation.fetch_add(1, Ordering::AcqRel);
+            sender
+                .send(BaselineCompilerCommand::Clear)
+                .map_err(|error| {
+                    CraneliftMips4Error::message(format!(
+                        "baseline compiler worker disconnected: {error}"
+                    ))
+                })?;
+        }
+        for (sender, generation) in self.region_senders.iter().zip(&self.region_generations) {
+            generation.fetch_add(1, Ordering::AcqRel);
+            sender.send(RegionCompilerCommand::Clear).map_err(|error| {
+                CraneliftMips4Error::message(format!(
+                    "Region compiler worker disconnected: {error}"
+                ))
+            })?;
+        }
+        self.next_baseline_arena = 0;
+        self.next_region_arena = 0;
         Ok(())
     }
 }
 
-fn create_module() -> Result<JITModule, CraneliftMips4Error> {
+impl Drop for CraneliftMips4Backend {
+    fn drop(&mut self) {
+        for (sender, generation) in self.baseline_senders.iter().zip(&self.baseline_generations) {
+            generation.fetch_add(1, Ordering::AcqRel);
+            let _ = sender.send(BaselineCompilerCommand::Shutdown);
+        }
+        for (sender, generation) in self.region_senders.iter().zip(&self.region_generations) {
+            generation.fetch_add(1, Ordering::AcqRel);
+            let _ = sender.send(RegionCompilerCommand::Shutdown);
+        }
+        for worker in self.workers.drain(..) {
+            // Host code generation cannot be interrupted safely. Do not make
+            // machine shutdown wait for a compiler that is already running.
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+fn run_baseline_compiler(
+    module: JITModule,
+    active_generation: Arc<AtomicU64>,
+    receiver: Receiver<BaselineCompilerCommand>,
+) {
+    let mut compiler = CompilerModule::new(module);
+    while let Ok(command) = receiver.recv() {
+        match command {
+            BaselineCompilerCommand::Compile {
+                generation,
+                block,
+                result,
+            } => {
+                let compiled = if generation == active_generation.load(Ordering::Acquire) {
+                    compiler.compile_with(|module, next_function| {
+                        compile_block(module, next_function, &block)
+                    })
+                } else {
+                    Err(CraneliftMips4Error::message(
+                        "baseline compilation canceled by cache reset",
+                    ))
+                };
+                let _ = result.send(compiled);
+            }
+            BaselineCompilerCommand::Clear => {
+                compiler.reset("none", "single_pass");
+            }
+            BaselineCompilerCommand::Shutdown => break,
+        }
+    }
+}
+
+fn run_region_compiler(
+    module: JITModule,
+    active_generation: Arc<AtomicU64>,
+    receiver: Receiver<RegionCompilerCommand>,
+) {
+    let mut compiler = CompilerModule::new(module);
+    while let Ok(command) = receiver.recv() {
+        match command {
+            RegionCompilerCommand::Compile {
+                generation,
+                region,
+                result,
+            } => {
+                let compiled = if generation == active_generation.load(Ordering::Acquire) {
+                    compiler.compile_with(|module, next_function| {
+                        compile_region(module, next_function, &region)
+                    })
+                } else {
+                    Err(CraneliftMips4Error::message(
+                        "Region compilation canceled by cache reset",
+                    ))
+                };
+                let _ = result.send(compiled);
+            }
+            RegionCompilerCommand::Clear => {
+                compiler.reset("none", "single_pass");
+            }
+            RegionCompilerCommand::Shutdown => break,
+        }
+    }
+}
+
+fn compile_block(
+    module: &mut JITModule,
+    next_function: &mut u64,
+    block: &Mips4Block,
+) -> Result<NativeCompilationResult, CraneliftMips4Error> {
+    let started = Instant::now();
+    let mut context = module.make_context();
+    let pointer_type = module.target_config().pointer_type();
+    context.func = Function::with_name_signature(
+        cranelift_codegen::ir::UserFuncName::user(0, *next_function as u32),
+        Signature {
+            params: vec![AbiParam::new(pointer_type), AbiParam::new(pointer_type)],
+            returns: vec![AbiParam::new(types::I32)],
+            call_conv: module.target_config().default_call_conv,
+        },
+    );
+    let mut function_builder_context = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut function_builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let frame = builder.block_params(entry)[0];
+        let call_context = builder.block_params(entry)[1];
+        lower_block(
+            &mut builder,
+            frame,
+            call_context,
+            block,
+            pointer_type,
+            module.target_config().default_call_conv,
+        );
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+    let name = format!("mips4_block_{next_function}");
+    *next_function = next_function.wrapping_add(1);
+    let function = module
+        .declare_function(&name, Linkage::Local, &context.func.signature)
+        .map_err(CraneliftMips4Error::new)?;
+    module
+        .define_function(function, &mut context)
+        .map_err(|error| CraneliftMips4Error::message(format!("{error:?}")))?;
+    module.clear_context(&mut context);
+    module
+        .finalize_definitions()
+        .map_err(CraneliftMips4Error::new)?;
+    let entry = NonNull::new(module.get_finalized_function(function).cast_mut())
+        .ok_or_else(|| CraneliftMips4Error::message("Cranelift returned a null entry point"))?;
+    Ok(NativeCompilationResult {
+        entry: entry.as_ptr() as usize,
+        compilation_nanos: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    })
+}
+
+fn compile_region(
+    module: &mut JITModule,
+    next_function: &mut u64,
+    region: &Mips4Region,
+) -> Result<NativeCompilationResult, CraneliftMips4Error> {
+    let started = Instant::now();
+    let mut context = module.make_context();
+    let pointer_type = module.target_config().pointer_type();
+    context.func = Function::with_name_signature(
+        cranelift_codegen::ir::UserFuncName::user(0, *next_function as u32),
+        Signature {
+            params: vec![AbiParam::new(pointer_type), AbiParam::new(pointer_type)],
+            returns: vec![AbiParam::new(types::I32)],
+            call_conv: module.target_config().default_call_conv,
+        },
+    );
+    let mut function_builder_context = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut function_builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let frame = builder.block_params(entry)[0];
+        let call_context = builder.block_params(entry)[1];
+        lower_region(
+            &mut builder,
+            frame,
+            call_context,
+            region,
+            pointer_type,
+            module.target_config().default_call_conv,
+        );
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+    let name = format!("mips4_region_{next_function}");
+    *next_function = next_function.wrapping_add(1);
+    let function = module
+        .declare_function(&name, Linkage::Local, &context.func.signature)
+        .map_err(CraneliftMips4Error::new)?;
+    module
+        .define_function(function, &mut context)
+        .map_err(|error| CraneliftMips4Error::message(format!("{error:?}")))?;
+    module.clear_context(&mut context);
+    module
+        .finalize_definitions()
+        .map_err(CraneliftMips4Error::new)?;
+    let entry = NonNull::new(module.get_finalized_function(function).cast_mut())
+        .ok_or_else(|| CraneliftMips4Error::message("Cranelift returned a null entry point"))?;
+    Ok(NativeCompilationResult {
+        entry: entry.as_ptr() as usize,
+        compilation_nanos: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    })
+}
+
+fn create_module(
+    optimization_level: &str,
+    register_allocator: &str,
+) -> Result<JITModule, CraneliftMips4Error> {
     let mut settings_builder = settings::builder();
     settings_builder
-        .set("opt_level", "speed")
+        .set("opt_level", optimization_level)
+        .map_err(CraneliftMips4Error::new)?;
+    settings_builder
+        .set("regalloc_algorithm", register_allocator)
+        .map_err(CraneliftMips4Error::new)?;
+    settings_builder
+        .set("enable_verifier", "false")
         .map_err(CraneliftMips4Error::new)?;
     let flags = settings::Flags::new(settings_builder);
     let isa_builder = cranelift_native::builder().map_err(CraneliftMips4Error::new)?;
@@ -332,6 +701,19 @@ fn lower_region(
         MIPS4_NATIVE_CALL_REGION_SIDE_EXIT_OFFSET,
         runtime_side_exit,
     );
+    if let Some(poll) = native_affine_poll_loop(region) {
+        let generic_entry = builder.create_block();
+        lower_native_affine_poll_prefix(
+            builder,
+            frame,
+            call_context,
+            pointer_type,
+            call_conv,
+            poll,
+            generic_entry,
+        );
+        builder.switch_to_block(generic_entry);
+    }
     let headers = region
         .nodes()
         .iter()
@@ -369,6 +751,359 @@ fn lower_region(
 struct NativeRegionEdge {
     header: cranelift_codegen::ir::Block,
     entry: se_device::cpu::mips4::execution::block::Mips4BlockKey,
+}
+
+#[derive(Clone, Copy)]
+struct NativeAffinePollLoop {
+    entry_pc: u64,
+    base_register: u8,
+    counter_register: u8,
+    target_register: u8,
+    mask_register: u8,
+    masked_register: u8,
+    condition_register: u8,
+    offset: i16,
+}
+
+fn native_affine_poll_loop(region: &Mips4Region) -> Option<NativeAffinePollLoop> {
+    let entry = region.nodes().first()?;
+    if !entry.successors().contains(&0) {
+        return None;
+    }
+    let block = entry.block();
+    let [mask, masked, compare] = block.body() else {
+        return None;
+    };
+    let Mips4BlockOperation::Arithmetic {
+        operation: Mips4BlockArithmetic::Add,
+        width: Mips4BlockWidth::Word,
+        trap_on_overflow: false,
+        noop_on_invalid_word: false,
+        destination: mask_register,
+        lhs: 0,
+        rhs: Mips4BlockOperand::SignedImmediate(-1),
+    } = mask.operation
+    else {
+        return None;
+    };
+    let Mips4BlockOperation::Logical {
+        operation: Mips4BlockLogical::And,
+        destination: masked_register,
+        lhs: counter_register,
+        rhs: Mips4BlockOperand::Register(logical_mask_register),
+    } = masked.operation
+    else {
+        return None;
+    };
+    let Mips4BlockOperation::Compare {
+        comparison: Mips4BlockComparison::UnsignedLessThan,
+        destination: condition_register,
+        lhs: comparison_source,
+        rhs: Mips4BlockOperand::Register(target_register),
+    } = compare.operation
+    else {
+        return None;
+    };
+    let branch = block.branch()?;
+    let Mips4BlockBranchCondition::NotEqual {
+        lhs: branch_condition,
+        rhs: 0,
+    } = branch.condition
+    else {
+        return None;
+    };
+    let Mips4BlockBranchTarget::Direct(target) = branch.target else {
+        return None;
+    };
+    let delay = block.delay_slot()?;
+    let Mips4BlockOperation::Runtime(Mips4RuntimeOperation::Memory {
+        instruction: Mips4CpuInstruction::Ld,
+        raw,
+    }) = delay.operation
+    else {
+        return None;
+    };
+    if logical_mask_register != mask_register
+        || comparison_source != masked_register
+        || branch_condition != condition_register
+        || target != block.key().pc
+        || !branch.likely
+        || branch.link.is_some()
+        || raw.rt() != counter_register
+        || mask_register == 0
+        || masked_register == 0
+        || condition_register == 0
+        || counter_register == 0
+        || target_register == 0
+    {
+        return None;
+    }
+    Some(NativeAffinePollLoop {
+        entry_pc: block.key().pc,
+        base_register: raw.rs(),
+        counter_register,
+        target_register,
+        mask_register,
+        masked_register,
+        condition_register,
+        offset: raw.signed_immediate(),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct NativeAffinePollState {
+    budget: Value,
+    retired: Value,
+    counter: Value,
+    operations: Value,
+    iterations: Value,
+    last_source: Value,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_native_affine_poll_prefix(
+    builder: &mut FunctionBuilder<'_>,
+    frame: Value,
+    call_context: Value,
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: CallConv,
+    poll: NativeAffinePollLoop,
+    generic_entry: cranelift_codegen::ir::Block,
+) {
+    const KSEG1_START: u64 = 0xffff_ffff_a000_0000;
+    const KSEG1_END: u64 = 0xffff_ffff_bfff_ffff;
+
+    let native_context = builder.ins().load(
+        pointer_type,
+        MemFlagsData::trusted(),
+        call_context,
+        MIPS4_NATIVE_CALL_NATIVE_FAST_MEMORY_CONTEXT_OFFSET,
+    );
+    let native_available = builder.ins().icmp_imm(IntCC::NotEqual, native_context, 0);
+    let probe = builder.create_block();
+    builder
+        .ins()
+        .brif(native_available, probe, &[], generic_entry, &[]);
+
+    builder.switch_to_block(probe);
+    let base = load_gpr(builder, frame, poll.base_register);
+    let virtual_address = builder.ins().iadd_imm(base, i64::from(poll.offset));
+    let kseg1_start = builder.ins().iconst(types::I64, KSEG1_START as i64);
+    let physical_address = builder.ins().isub(virtual_address, kseg1_start);
+    let aligned_bits = builder.ins().band_imm(virtual_address, 7);
+    let aligned = builder.ins().icmp_imm(IntCC::Equal, aligned_bits, 0);
+    let above_start = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        virtual_address,
+        KSEG1_START as i64,
+    );
+    let below_end = builder.ins().icmp_imm(
+        IntCC::UnsignedLessThanOrEqual,
+        virtual_address,
+        KSEG1_END as i64,
+    );
+    let eligible = builder.ins().band(aligned, above_start);
+    let eligible = builder.ins().band(eligible, below_end);
+    let projection_probe = builder.create_block();
+    builder
+        .ins()
+        .brif(eligible, projection_probe, &[], generic_entry, &[]);
+
+    builder.switch_to_block(projection_probe);
+    lower_native_affine_poll_batch(
+        builder,
+        frame,
+        call_context,
+        native_context,
+        physical_address,
+        pointer_type,
+        call_conv,
+        poll,
+        generic_entry,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_native_affine_poll_batch(
+    builder: &mut FunctionBuilder<'_>,
+    frame: Value,
+    call_context: Value,
+    native_context: Value,
+    physical_address: Value,
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: CallConv,
+    poll: NativeAffinePollLoop,
+    generic_entry: cranelift_codegen::ir::Block,
+) {
+    let budget = load_i64(builder, frame, MIPS4_BLOCK_FRAME_BUDGET_OFFSET);
+    let retired = load_i64(builder, frame, MIPS4_BLOCK_FRAME_RETIRED_OFFSET);
+    let counter = load_gpr(builder, frame, poll.counter_register);
+    let target = load_gpr(builder, frame, poll.target_register);
+    let operations = load_i64(
+        builder,
+        call_context,
+        MIPS4_NATIVE_CALL_OPERATION_BASE_OFFSET,
+    );
+    let entry = builder.ins().load(
+        pointer_type,
+        MemFlagsData::trusted(),
+        call_context,
+        MIPS4_NATIVE_CALL_NATIVE_AFFINE_POLL_OFFSET,
+    );
+    let result_pointer = builder.ins().iadd_imm(
+        call_context,
+        i64::from(MIPS4_NATIVE_CALL_NATIVE_AFFINE_POLL_RESULT_OFFSET),
+    );
+    let mut signature = Signature::new(call_conv);
+    signature.params.extend([
+        AbiParam::new(pointer_type),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I64),
+        AbiParam::new(pointer_type),
+    ]);
+    signature.returns.push(AbiParam::new(types::I32));
+    let signature = builder.import_signature(signature);
+    let call = builder.ins().call_indirect(
+        signature,
+        entry,
+        &[
+            native_context,
+            physical_address,
+            counter,
+            target,
+            retired,
+            budget,
+            result_pointer,
+        ],
+    );
+    let disposition = builder.inst_results(call)[0];
+    let iterations = load_i64(
+        builder,
+        result_pointer,
+        MIPS4_NATIVE_AFFINE_POLL_ITERATIONS_OFFSET,
+    );
+    let retired_delta = builder.ins().imul_imm(iterations, 5);
+    let state = NativeAffinePollState {
+        budget: load_i64(
+            builder,
+            result_pointer,
+            MIPS4_NATIVE_AFFINE_POLL_REMAINING_BUDGET_OFFSET,
+        ),
+        retired: builder.ins().iadd(retired, retired_delta),
+        counter: load_i64(
+            builder,
+            result_pointer,
+            MIPS4_NATIVE_AFFINE_POLL_COUNTER_OFFSET,
+        ),
+        operations: builder.ins().iadd(operations, retired_delta),
+        iterations,
+        last_source: load_i64(
+            builder,
+            result_pointer,
+            MIPS4_NATIVE_AFFINE_POLL_LAST_SOURCE_OFFSET,
+        ),
+    };
+    let continue_block = builder.create_block();
+    let budget_block = builder.create_block();
+    let timeline_block = builder.create_block();
+    let invalid = builder.create_block();
+    let mut switch = Switch::new();
+    switch.set_entry(0, generic_entry);
+    switch.set_entry(1, continue_block);
+    switch.set_entry(2, budget_block);
+    switch.set_entry(3, timeline_block);
+    switch.set_entry(4, invalid);
+    switch.emit(builder, disposition, invalid);
+
+    builder.switch_to_block(continue_block);
+    lower_flush_native_affine_poll(builder, frame, call_context, poll, state);
+    builder.ins().jump(generic_entry, &[]);
+
+    builder.switch_to_block(budget_block);
+    lower_flush_native_affine_poll(builder, frame, call_context, poll, state);
+    store_region_budget_side_exit(builder, call_context);
+    return_exit(builder, Mips4BlockExit::BudgetExhausted);
+
+    builder.switch_to_block(timeline_block);
+    lower_flush_native_affine_poll(builder, frame, call_context, poll, state);
+    return_exit(builder, Mips4BlockExit::TimelineExhausted);
+
+    builder.switch_to_block(invalid);
+    return_exit(builder, Mips4BlockExit::InternalError);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_flush_native_affine_poll(
+    builder: &mut FunctionBuilder<'_>,
+    frame: Value,
+    call_context: Value,
+    poll: NativeAffinePollLoop,
+    state: NativeAffinePollState,
+) {
+    let zero = builder.ins().iconst(types::I64, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    let minus_one = builder.ins().iconst(types::I64, -1);
+    let progressed = builder.ins().icmp_imm(IntCC::NotEqual, state.iterations, 0);
+    let old_mask = load_gpr(builder, frame, poll.mask_register);
+    let mask = builder.ins().select(progressed, minus_one, old_mask);
+    store_gpr(builder, frame, poll.mask_register, mask);
+    let old_masked = load_gpr(builder, frame, poll.masked_register);
+    let masked = builder
+        .ins()
+        .select(progressed, state.last_source, old_masked);
+    store_gpr(builder, frame, poll.masked_register, masked);
+    let old_condition = load_gpr(builder, frame, poll.condition_register);
+    let condition = builder.ins().select(progressed, one, old_condition);
+    store_gpr(builder, frame, poll.condition_register, condition);
+    store_gpr(builder, frame, poll.counter_register, state.counter);
+    store_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_BUDGET_OFFSET,
+        state.budget,
+    );
+    store_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_RETIRED_OFFSET,
+        state.retired,
+    );
+    store_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_OPERATIONS_EXECUTED_OFFSET,
+        state.operations,
+    );
+    store_i64(
+        builder,
+        call_context,
+        MIPS4_NATIVE_CALL_OPERATION_BASE_OFFSET,
+        state.operations,
+    );
+    let pc = builder.ins().iconst(types::I64, poll.entry_pc as i64);
+    let next_pc = builder
+        .ins()
+        .iconst(types::I64, poll.entry_pc.wrapping_add(4) as i64);
+    store_i64(builder, frame, MIPS4_BLOCK_FRAME_PC_OFFSET, pc);
+    store_i64(builder, frame, MIPS4_BLOCK_FRAME_NEXT_PC_OFFSET, next_pc);
+    store_i64(builder, frame, MIPS4_BLOCK_FRAME_DELAY_PC_OFFSET, zero);
+    store_i64(builder, frame, MIPS4_BLOCK_FRAME_DELAY_VALID_OFFSET, zero);
+
+    let native_reads = load_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_NATIVE_FAST_MEMORY_READS_OFFSET,
+    );
+    let native_reads = builder.ins().iadd(native_reads, state.iterations);
+    store_i64(
+        builder,
+        frame,
+        MIPS4_BLOCK_FRAME_NATIVE_FAST_MEMORY_READS_OFFSET,
+        native_reads,
+    );
 }
 
 fn block_runtime_operation_count(block: &Mips4Block) -> u32 {
@@ -1014,6 +1749,9 @@ fn lower_fast_timer_store(
 
     let probe = builder.create_block();
     let native = builder.create_block();
+    let native_rejected = builder.create_block();
+    let native_commit = builder.create_block();
+    let timeline_exhausted = builder.create_block();
     let fallback = builder.create_block();
     let done = builder.create_block();
     builder.ins().brif(eligible, probe, &[], fallback, &[]);
@@ -1029,6 +1767,28 @@ fn lower_fast_timer_store(
     builder.switch_to_block(native);
     let retired = load_i64(builder, frame, MIPS4_BLOCK_FRAME_RETIRED_OFFSET);
     let timeline = lower_native_fast_memory_timeline(builder, native_context, projection, retired);
+    let (admitted, retirement_limit) =
+        lower_native_retirement_limit(builder, frame, native_context, retired, timeline.completion);
+    builder
+        .ins()
+        .brif(admitted, native_commit, &[], native_rejected, &[]);
+
+    builder.switch_to_block(native_rejected);
+    let no_retirements = builder.ins().icmp_imm(IntCC::Equal, retired, 0);
+    let no_transactions = builder.ins().icmp_imm(IntCC::Equal, timeline.completed, 0);
+    let no_progress = builder.ins().band(no_retirements, no_transactions);
+    builder
+        .ins()
+        .brif(no_progress, fallback, &[], timeline_exhausted, &[]);
+
+    builder.switch_to_block(native_commit);
+    let remaining = builder.ins().isub(retirement_limit, retired);
+    let current_budget = load_i64(builder, frame, MIPS4_BLOCK_FRAME_BUDGET_OFFSET);
+    let tighter = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, remaining, current_budget);
+    let budget = builder.ins().select(tighter, remaining, current_budget);
+    store_i64(builder, frame, MIPS4_BLOCK_FRAME_BUDGET_OFFSET, budget);
     let value = load_gpr(builder, frame, source_register);
     let big_endian = load_i64(
         builder,
@@ -1072,6 +1832,15 @@ fn lower_fast_timer_store(
     );
     store_accounting(builder, frame, continued_accounting);
     builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(timeline_exhausted);
+    lower_enter_operation(
+        builder,
+        frame,
+        runtime_abi.call_context,
+        entered_operations.saturating_sub(1),
+    );
+    return_exit(builder, Mips4BlockExit::TimelineExhausted);
 
     builder.switch_to_block(fallback);
     let allow_fast_memory = builder.ins().iconst(types::I32, 1);
@@ -1142,6 +1911,8 @@ fn lower_fast_integer_load(
     let fast_dispatch = builder.create_block();
     let native_probe = builder.create_block();
     let native = builder.create_block();
+    let native_rejected = builder.create_block();
+    let native_commit = builder.create_block();
     let direct = builder.create_block();
     let fallback = builder.create_block();
     builder.append_block_param(fallback, types::I32);
@@ -1192,13 +1963,36 @@ fn lower_fast_integer_load(
 
     builder.switch_to_block(native);
     if matches!(size, 4 | 8) {
+        let timeline =
+            lower_native_fast_memory_timeline(builder, native_context, projection, retired);
+        let (admitted, retirement_limit) = lower_native_retirement_limit(
+            builder,
+            frame,
+            native_context,
+            retired,
+            timeline.completion,
+        );
+        builder
+            .ins()
+            .brif(admitted, native_commit, &[], native_rejected, &[]);
+
+        builder.switch_to_block(native_rejected);
+        let no_retirements = builder.ins().icmp_imm(IntCC::Equal, retired, 0);
+        let no_transactions = builder.ins().icmp_imm(IntCC::Equal, timeline.completed, 0);
+        let no_progress = builder.ins().band(no_retirements, no_transactions);
+        builder
+            .ins()
+            .brif(no_progress, direct, &[], timeline_exhausted, &[]);
+
+        builder.switch_to_block(native_commit);
         lower_native_affine_read(
             builder,
             frame,
             native_context,
             projection,
             physical_address,
-            retired,
+            timeline,
+            retirement_limit,
             result_pointer,
             size,
         );
@@ -1389,6 +2183,7 @@ struct NativeFastMemoryTimeline {
     auxiliary_completed: Value,
     uses_auxiliary: Value,
     delivery: Value,
+    completion: Value,
     delivery_time: Value,
 }
 
@@ -1398,13 +2193,36 @@ fn lower_native_fast_memory_timeline(
     projection: Value,
     retired: Value,
 ) -> NativeFastMemoryTimeline {
+    let completed = load_i64(builder, context, MIPS4_NATIVE_CONTEXT_COMPLETED_OFFSET);
+    let auxiliary_completed = load_i64(
+        builder,
+        context,
+        MIPS4_NATIVE_CONTEXT_AUXILIARY_COMPLETED_OFFSET,
+    );
+    lower_native_fast_memory_timeline_with_counts(
+        builder,
+        context,
+        projection,
+        retired,
+        completed,
+        auxiliary_completed,
+    )
+}
+
+fn lower_native_fast_memory_timeline_with_counts(
+    builder: &mut FunctionBuilder<'_>,
+    context: Value,
+    projection: Value,
+    retired: Value,
+    completed: Value,
+    auxiliary_completed: Value,
+) -> NativeFastMemoryTimeline {
     let zero = builder.ins().iconst(types::I64, 0);
     let code_active = load_i64(builder, context, MIPS4_NATIVE_CONTEXT_CODE_ACTIVE_OFFSET);
     let code_active = builder.ins().icmp_imm(IntCC::NotEqual, code_active, 0);
     let code_fetches = builder.ins().iadd_imm(retired, 1);
     let code_fetches = builder.ins().select(code_active, code_fetches, zero);
 
-    let completed = load_i64(builder, context, MIPS4_NATIVE_CONTEXT_COMPLETED_OFFSET);
     let sysad_prefix = builder.ins().iadd(code_fetches, completed);
     let sysad_cycles = builder.ins().ishl_imm(sysad_prefix, 1);
     let sysad_cycles = builder.ins().iadd_imm(sysad_cycles, 1);
@@ -1414,6 +2232,13 @@ fn lower_native_fast_memory_timeline(
         MIPS4_NATIVE_CONTEXT_BUS_CLOCK_OFFSET,
         sysad_cycles,
     );
+    let sysad_completion_cycles = builder.ins().iadd_imm(sysad_cycles, 1);
+    let sysad_completion = lower_native_clock_elapsed(
+        builder,
+        context,
+        MIPS4_NATIVE_CONTEXT_BUS_CLOCK_OFFSET,
+        sysad_completion_cycles,
+    );
 
     let shares_auxiliary = load_i64(
         builder,
@@ -1422,11 +2247,6 @@ fn lower_native_fast_memory_timeline(
     );
     let shares_auxiliary = builder.ins().icmp_imm(IntCC::NotEqual, shares_auxiliary, 0);
     let shared_fetches = builder.ins().select(shares_auxiliary, code_fetches, zero);
-    let auxiliary_completed = load_i64(
-        builder,
-        context,
-        MIPS4_NATIVE_CONTEXT_AUXILIARY_COMPLETED_OFFSET,
-    );
     let auxiliary_prefix = builder.ins().iadd(shared_fetches, auxiliary_completed);
     let auxiliary_cycles = builder.ins().ishl_imm(auxiliary_prefix, 1);
     let uses_auxiliary = load_i64(builder, projection, MIPS4_NATIVE_AFFINE_AUXILIARY_OFFSET);
@@ -1436,6 +2256,13 @@ fn lower_native_fast_memory_timeline(
         context,
         MIPS4_NATIVE_CONTEXT_AUXILIARY_CLOCK_OFFSET,
         auxiliary_cycles,
+    );
+    let auxiliary_completion_cycles = builder.ins().iadd(auxiliary_cycles, uses_auxiliary);
+    let auxiliary_completion = lower_native_clock_elapsed(
+        builder,
+        context,
+        MIPS4_NATIVE_CONTEXT_AUXILIARY_CLOCK_OFFSET,
+        auxiliary_completion_cycles,
     );
     let graphics_completed = load_i64(
         builder,
@@ -1475,6 +2302,11 @@ fn lower_native_fast_memory_timeline(
     let delivery = builder.ins().iadd(delivery, graphics_request);
     let delivery = builder.ins().iadd(delivery, code_auxiliary);
     let delivery = builder.ins().iadd(delivery, fixed);
+    let completion = builder.ins().iadd(cpu, sysad_completion);
+    let completion = builder.ins().iadd(completion, auxiliary_completion);
+    let completion = builder.ins().iadd(completion, graphics_request);
+    let completion = builder.ins().iadd(completion, code_auxiliary);
+    let completion = builder.ins().iadd(completion, fixed);
     let start = load_i64(builder, context, MIPS4_NATIVE_CONTEXT_START_TIME_OFFSET);
     let delivery_time = builder.ins().iadd(start, delivery);
     NativeFastMemoryTimeline {
@@ -1483,8 +2315,56 @@ fn lower_native_fast_memory_timeline(
         auxiliary_completed,
         uses_auxiliary,
         delivery,
+        completion,
         delivery_time,
     }
+}
+
+fn lower_native_retirement_limit(
+    builder: &mut FunctionBuilder<'_>,
+    frame: Value,
+    context: Value,
+    retired: Value,
+    completion: Value,
+) -> (Value, Value) {
+    let budget = load_i64(builder, frame, MIPS4_BLOCK_FRAME_BUDGET_OFFSET);
+    lower_native_retirement_limit_with_budget(builder, context, retired, completion, budget)
+}
+
+fn lower_native_retirement_limit_with_budget(
+    builder: &mut FunctionBuilder<'_>,
+    context: Value,
+    retired: Value,
+    completion: Value,
+    budget: Value,
+) -> (Value, Value) {
+    let available = load_i64(
+        builder,
+        context,
+        MIPS4_NATIVE_CONTEXT_AVAILABLE_TICKS_OFFSET,
+    );
+    let admitted = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, completion, available);
+    let remaining_ticks = builder.ins().isub(available, completion);
+    let remaining_ticks = builder.ins().iadd_imm(remaining_ticks, -1);
+    let ticks_per_retirement = load_i64(
+        builder,
+        context,
+        MIPS4_NATIVE_CONTEXT_RETIREMENT_TICKS_OFFSET,
+    );
+    let additional = builder.ins().udiv(remaining_ticks, ticks_per_retirement);
+    let first_retirement = builder.ins().iadd_imm(retired, 1);
+    let timeline_limit = builder.ins().iadd(first_retirement, additional);
+    let budget_limit = builder.ins().iadd(retired, budget);
+    let timeline_is_tighter =
+        builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, timeline_limit, budget_limit);
+    let retirement_limit = builder
+        .ins()
+        .select(timeline_is_tighter, timeline_limit, budget_limit);
+    (admitted, retirement_limit)
 }
 
 fn lower_record_native_fast_memory_transaction(
@@ -1575,27 +2455,13 @@ fn lower_native_affine_read(
     context: Value,
     projection: Value,
     physical_address: Value,
-    retired: Value,
+    timeline: NativeFastMemoryTimeline,
+    retirement_limit: Value,
     result_pointer: Value,
     size: u8,
 ) {
     let zero = builder.ins().iconst(types::I64, 0);
-    let timeline = lower_native_fast_memory_timeline(builder, context, projection, retired);
-    let base_time = load_i64(builder, projection, MIPS4_NATIVE_AFFINE_BASE_TIME_OFFSET);
-    let after_base = builder.ins().icmp(
-        IntCC::UnsignedGreaterThan,
-        timeline.delivery_time,
-        base_time,
-    );
-    let elapsed = builder.ins().isub(timeline.delivery_time, base_time);
-    let elapsed = builder.ins().select(after_base, elapsed, zero);
-    let frequency = load_i64(builder, projection, MIPS4_NATIVE_AFFINE_FREQUENCY_OFFSET);
-    let timebase = load_i64(builder, projection, MIPS4_NATIVE_AFFINE_TIMEBASE_OFFSET);
-    let increments = builder.ins().imul(elapsed, frequency);
-    let increments = builder.ins().udiv(increments, timebase);
-    let base = load_i64(builder, projection, MIPS4_NATIVE_AFFINE_BASE_OFFSET);
-    let counter = builder.ins().iadd(base, increments);
-    let counter = builder.ins().band_imm(counter, i64::from(u32::MAX));
+    let counter = lower_native_affine_counter(builder, projection, timeline.delivery_time);
     let lanes = if size == 8 {
         builder.ins().bswap(counter)
     } else {
@@ -1614,8 +2480,6 @@ fn lower_native_affine_read(
     lower_record_native_fast_memory_transaction(builder, context, timeline);
     record_native_fast_memory_read(builder, frame);
 
-    let budget = load_i64(builder, frame, MIPS4_BLOCK_FRAME_BUDGET_OFFSET);
-    let retirement_limit = builder.ins().iadd(retired, budget);
     store_i64(
         builder,
         result_pointer,
@@ -1630,6 +2494,27 @@ fn lower_native_affine_read(
     );
 }
 
+fn lower_native_affine_counter(
+    builder: &mut FunctionBuilder<'_>,
+    projection: Value,
+    delivery_time: Value,
+) -> Value {
+    let zero = builder.ins().iconst(types::I64, 0);
+    let base_time = load_i64(builder, projection, MIPS4_NATIVE_AFFINE_BASE_TIME_OFFSET);
+    let after_base = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, delivery_time, base_time);
+    let elapsed = builder.ins().isub(delivery_time, base_time);
+    let elapsed = builder.ins().select(after_base, elapsed, zero);
+    let frequency = load_i64(builder, projection, MIPS4_NATIVE_AFFINE_FREQUENCY_OFFSET);
+    let timebase = load_i64(builder, projection, MIPS4_NATIVE_AFFINE_TIMEBASE_OFFSET);
+    let increments = builder.ins().imul(elapsed, frequency);
+    let increments = builder.ins().udiv(increments, timebase);
+    let base = load_i64(builder, projection, MIPS4_NATIVE_AFFINE_BASE_OFFSET);
+    let counter = builder.ins().iadd(base, increments);
+    builder.ins().band_imm(counter, i64::from(u32::MAX))
+}
+
 fn lower_native_clock_elapsed(
     builder: &mut FunctionBuilder<'_>,
     context: Value,
@@ -1637,11 +2522,10 @@ fn lower_native_clock_elapsed(
     cycles: Value,
 ) -> Value {
     let clock = builder.ins().iadd_imm(context, i64::from(clock_offset));
-    let timebase = load_i64(builder, clock, MIPS4_NATIVE_CLOCK_TIMEBASE_OFFSET);
+    let whole = load_i64(builder, clock, MIPS4_NATIVE_CLOCK_WHOLE_OFFSET);
+    let fraction = load_i64(builder, clock, MIPS4_NATIVE_CLOCK_FRACTIONAL_OFFSET);
     let frequency = load_i64(builder, clock, MIPS4_NATIVE_CLOCK_FREQUENCY_OFFSET);
     let remainder = load_i64(builder, clock, MIPS4_NATIVE_CLOCK_REMAINDER_OFFSET);
-    let whole = builder.ins().udiv(timebase, frequency);
-    let fraction = builder.ins().urem(timebase, frequency);
     let base = builder.ins().imul(whole, cycles);
     let numerator = builder.ins().imul(fraction, cycles);
     let numerator = builder.ins().iadd(remainder, numerator);
@@ -3492,20 +4376,26 @@ mod tests {
         let mut runtime = Runtime {
             result: Mips4RuntimeResult::Continue,
         };
-        for entry in 0..257 {
+        for entry in 0..=super::super::engine::MIPS4_BLOCK_HOT_THRESHOLD {
             let mut frame = Mips4BlockFrame::new([0; 32], 0, 0, 0x4000, 0x4004, None, 1);
             let execution = engine
                 .execute_with_runtime(key, &mut frame, &mut runtime, None)
                 .unwrap();
             assert_eq!(frame.read_gpr(7), 1);
             assert_eq!(frame.runtime_calls(), 1);
-            if entry == 256 {
+            if entry + 1 == super::super::engine::MIPS4_BLOCK_HOT_THRESHOLD {
+                engine.finish_compilations().unwrap();
+            }
+            if entry == super::super::engine::MIPS4_BLOCK_HOT_THRESHOLD {
                 assert_eq!(execution.tier, Mips4BlockTier::Native);
             }
         }
         assert_eq!(engine.statistics().compiled_blocks, 1);
         assert_eq!(engine.statistics().native_operations, 1);
-        assert_eq!(engine.statistics().runtime_calls, 257);
+        assert_eq!(
+            engine.statistics().runtime_calls,
+            super::super::engine::MIPS4_BLOCK_HOT_THRESHOLD + 1
+        );
 
         runtime.result = Mips4RuntimeResult::Idle;
         let mut frame = Mips4BlockFrame::new([0; 32], 0, 0, 0x4000, 0x4004, None, 1);

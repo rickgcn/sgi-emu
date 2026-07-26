@@ -131,10 +131,12 @@ impl Ip32FastMemoryContext {
     ) -> bool {
         if self.code_timeline.is_some()
             || fetch_limit == 0
-            || fetch_limit > 256
+            || fetch_limit > FAST_MEMORY_SLICE_MAX_BOUNDARIES as u64
             || auxiliary_clock.frequency_hz() <= 1
             || auxiliary_clock.timebase_hz() <= 1
-            || auxiliary_clock.elapsed(512).is_none()
+            || auxiliary_clock
+                .elapsed((FAST_MEMORY_SLICE_MAX_BOUNDARIES as u64).saturating_mul(2))
+                .is_none()
         {
             return false;
         }
@@ -816,7 +818,9 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
     }
 
     fn native_context(&mut self) -> Option<&mut Mips4NativeFastMemoryContext> {
-        (self.context.full_budget_admitted() && self.context.native.native_arithmetic_safe())
+        self.context
+            .native
+            .native_arithmetic_safe()
             .then_some(&mut self.context.native)
     }
 }
@@ -934,7 +938,9 @@ where
         return Ok(None);
     }
     let cpu_clock = control.cpu_clock.projection();
-    let maximum_boundaries = (control.cpu_continuation_quantum.min(256)) as u64;
+    let maximum_boundaries = control
+        .cpu_continuation_quantum
+        .min(FAST_MEMORY_SLICE_MAX_BOUNDARIES) as u64;
     let maximum_shared_bus_cycles = maximum_boundaries.saturating_mul(4);
     let maximum_code_bus_cycles = maximum_boundaries.saturating_mul(2);
     let memory_clock = registry

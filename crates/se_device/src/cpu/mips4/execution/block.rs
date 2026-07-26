@@ -2,6 +2,7 @@
 
 use core::fmt;
 use se_core::scheduler::FractionalClockProjection;
+use std::sync::Arc;
 
 use crate::cpu::mips4::alu::Mips4Alu;
 use crate::cpu::mips4::cache::Mips4MemoryAccessType;
@@ -21,6 +22,9 @@ use super::policy::{Mips4ExecutionPolicy, Mips4NotWordValuePolicy};
 
 /// Maximum number of guest instructions represented by one basic block.
 pub const MIPS4_BLOCK_MAX_INSTRUCTIONS: usize = 32;
+
+/// Maximum number of execution boundaries reserved by one native slice.
+pub const MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES: usize = 4_096;
 
 /// Stable metadata identifying one guest instruction inside a block.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -118,29 +122,31 @@ impl Mips4CodeGuard {
     }
 }
 
-/// Versioned bytes and timing supplied by a stable external code source.
+/// Versioned bytes and independent timing supplied by a stable external code source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mips4CodeWindow {
     request: Mips4CodeSourceRequest,
     guard: Mips4CodeGuard,
-    bytes: [u8; MIPS4_BLOCK_MAX_INSTRUCTIONS * 4],
-    byte_count: u8,
+    bytes: Arc<[u8]>,
     timeline: Mips4SliceTimeline,
 }
 
-/// Per-operation simulated-time reservations for one block invocation.
+/// Per-operation simulated-time reservations for one bounded execution slice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mips4SliceTimeline {
-    clocks: [Option<Mips4SliceClock>; 2],
+    clocks: [Mips4SliceClock; 2],
     fixed_ticks_per_fetch: u64,
-    len: u8,
+    len: u16,
+    clock_count: u8,
 }
 
 /// One fractional clock consumed a fixed number of times by each fast fetch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mips4SliceClock {
-    projection: FractionalClockProjection,
-    cycles_per_fetch: u8,
+    whole_ticks_per_fetch: u64,
+    fractional_ticks_per_fetch: u64,
+    frequency_hz: u64,
+    remainder: u64,
 }
 
 impl Mips4SliceClock {
@@ -149,10 +155,49 @@ impl Mips4SliceClock {
         if cycles_per_fetch == 0 {
             return None;
         }
+        let cycles_per_fetch = cycles_per_fetch as u64;
+        let frequency_hz = projection.frequency_hz();
+        let whole_ticks_per_fetch =
+            match (projection.timebase_hz() / frequency_hz).checked_mul(cycles_per_fetch) {
+                Some(value) => value,
+                None => return None,
+            };
+        let fractional_ticks_per_fetch =
+            match (projection.timebase_hz() % frequency_hz).checked_mul(cycles_per_fetch) {
+                Some(value) => value,
+                None => return None,
+            };
         Some(Self {
-            projection,
-            cycles_per_fetch,
+            whole_ticks_per_fetch,
+            fractional_ticks_per_fetch,
+            frequency_hz,
+            remainder: projection.remainder(),
         })
+    }
+
+    /// Projects exact elapsed ticks for a number of fetches.
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn elapsed_fetches(self, fetches: u64) -> Option<u64> {
+        if let Some(fraction) = self
+            .fractional_ticks_per_fetch
+            .checked_mul(fetches)
+            .and_then(|fraction| self.remainder.checked_add(fraction))
+            && let Some(whole) = self.whole_ticks_per_fetch.checked_mul(fetches)
+        {
+            return whole.checked_add(fraction / self.frequency_hz);
+        }
+        let fraction = u128::from(self.remainder).checked_add(
+            u128::from(self.fractional_ticks_per_fetch).checked_mul(u128::from(fetches))?,
+        )?;
+        let whole = u128::from(self.whole_ticks_per_fetch).checked_mul(u128::from(fetches))?;
+        u64::try_from(whole.checked_add(fraction / u128::from(self.frequency_hz))?).ok()
+    }
+
+    #[doc(hidden)]
+    pub fn average_ticks_per_fetch(self) -> f64 {
+        self.whole_ticks_per_fetch as f64
+            + self.fractional_ticks_per_fetch as f64 / self.frequency_hz as f64
     }
 }
 
@@ -164,20 +209,27 @@ impl Mips4SliceTimeline {
         fixed_ticks_per_fetch: u64,
     ) -> Option<Self> {
         if fetches == 0
-            || fetches > MIPS4_BLOCK_MAX_INSTRUCTIONS
+            || fetches > MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES
             || clocks.len() > 2
             || (clocks.is_empty() && fixed_ticks_per_fetch == 0)
         {
             return None;
         }
-        let mut values = [None; 2];
+        const EMPTY_CLOCK: Mips4SliceClock = Mips4SliceClock {
+            whole_ticks_per_fetch: 0,
+            fractional_ticks_per_fetch: 0,
+            frequency_hz: 1,
+            remainder: 0,
+        };
+        let mut values = [EMPTY_CLOCK; 2];
         for (destination, clock) in values.iter_mut().zip(clocks.iter().copied()) {
-            *destination = Some(clock);
+            *destination = clock;
         }
         let timeline = Self {
             clocks: values,
             fixed_ticks_per_fetch,
-            len: fetches as u8,
+            len: fetches as u16,
+            clock_count: clocks.len() as u8,
         };
         if timeline.prefix_ticks(1)? == 0 {
             return None;
@@ -196,16 +248,27 @@ impl Mips4SliceTimeline {
     }
 
     /// Returns simulated ticks consumed by a prefix of fetch reservations.
+    #[inline(always)]
     pub fn prefix_ticks(&self, fetches: usize) -> Option<u64> {
         if fetches > self.len() {
             return None;
         }
-        let mut total = self.fixed_ticks_per_fetch.checked_mul(fetches as u64)?;
-        for clock in self.clocks.into_iter().flatten() {
-            let cycles = u64::from(clock.cycles_per_fetch).checked_mul(fetches as u64)?;
-            total = total.checked_add(clock.projection.elapsed(cycles)?.get())?;
+        let fetches = fetches as u64;
+        let mut total = self.fixed_ticks_per_fetch.checked_mul(fetches)?;
+        for clock in &self.clocks[..usize::from(self.clock_count)] {
+            total = total.checked_add(clock.elapsed_fetches(fetches)?)?;
         }
         Some(total)
+    }
+
+    /// Returns the average tick slope used to estimate an exact prefix.
+    #[doc(hidden)]
+    pub fn average_ticks_per_fetch(&self) -> f64 {
+        self.fixed_ticks_per_fetch as f64
+            + self.clocks[..usize::from(self.clock_count)]
+                .iter()
+                .map(|clock| clock.average_ticks_per_fetch())
+                .sum::<f64>()
     }
 }
 
@@ -217,21 +280,28 @@ impl Mips4CodeWindow {
         bytes: &[u8],
         timeline: Mips4SliceTimeline,
     ) -> Option<Self> {
+        Self::from_shared(request, guard, Arc::from(bytes), timeline)
+    }
+
+    /// Creates a validated code window over shared immutable source bytes.
+    #[doc(hidden)]
+    pub fn from_shared(
+        request: Mips4CodeSourceRequest,
+        guard: Mips4CodeGuard,
+        bytes: Arc<[u8]>,
+        timeline: Mips4SliceTimeline,
+    ) -> Option<Self> {
         if bytes.len() < 4
             || bytes.len() > usize::from(request.maximum_bytes)
             || bytes.len() > MIPS4_BLOCK_MAX_INSTRUCTIONS * 4
             || !bytes.len().is_multiple_of(4)
-            || timeline.len() > bytes.len() / 4
         {
             return None;
         }
-        let mut source = [0; MIPS4_BLOCK_MAX_INSTRUCTIONS * 4];
-        source[..bytes.len()].copy_from_slice(bytes);
         Some(Self {
             request,
             guard,
-            bytes: source,
-            byte_count: bytes.len() as u8,
+            bytes,
             timeline,
         })
     }
@@ -248,7 +318,7 @@ impl Mips4CodeWindow {
 
     /// Returns physical-order source bytes.
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.byte_count)]
+        &self.bytes
     }
 
     /// Returns the number of fetches reserved for this invocation.
@@ -684,7 +754,8 @@ pub enum Mips4FastMemoryReadResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct Mips4NativeFractionalClockProjection {
-    timebase_hz: u64,
+    whole_ticks_per_cycle: u64,
+    fractional_ticks_per_cycle: u64,
     frequency_hz: u64,
     remainder: u64,
 }
@@ -696,23 +767,33 @@ impl Mips4NativeFractionalClockProjection {
             return None;
         }
         Some(Self {
-            timebase_hz,
+            whole_ticks_per_cycle: timebase_hz / frequency_hz,
+            fractional_ticks_per_cycle: timebase_hz % frequency_hz,
             frequency_hz,
             remainder,
         })
     }
 
     const fn supports_cycles(self, cycles: u64) -> bool {
-        let Some(fraction) = (self.timebase_hz % self.frequency_hz).checked_mul(cycles) else {
+        let Some(fraction) = self.fractional_ticks_per_cycle.checked_mul(cycles) else {
             return false;
         };
         let Some(numerator) = self.remainder.checked_add(fraction) else {
             return false;
         };
-        let Some(base) = (self.timebase_hz / self.frequency_hz).checked_mul(cycles) else {
+        let Some(base) = self.whole_ticks_per_cycle.checked_mul(cycles) else {
             return false;
         };
         base.checked_add(numerator / self.frequency_hz).is_some()
+    }
+
+    const fn maximum_ticks_per_cycle(self) -> u64 {
+        self.whole_ticks_per_cycle
+            + if self.fractional_ticks_per_cycle == 0 {
+                0
+            } else {
+                1
+            }
     }
 }
 
@@ -795,6 +876,51 @@ impl Mips4NativeAffineReadProjection {
     pub const fn timebase_hz(self) -> u64 {
         self.timebase_hz
     }
+
+    fn counter_at(self, time_ticks: u64) -> Option<(u64, u64)> {
+        let elapsed = time_ticks.saturating_sub(self.base_time_ticks);
+        let increments = elapsed.checked_mul(self.frequency_hz)? / self.timebase_hz;
+        let unmasked = self.base.checked_add(increments)?;
+        Some((unmasked, unmasked & u64::from(u32::MAX)))
+    }
+}
+
+/// Result disposition for one native affine polling batch.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mips4NativeAffinePollDisposition {
+    /// The loop shape or counter range requires the ordinary native path.
+    Unsupported,
+    /// Continue at the loop header through the ordinary native path.
+    Continue,
+    /// The retirement budget ended exactly after the batch.
+    BudgetExhausted,
+    /// The next affine read cannot complete inside the proven timeline.
+    TimelineExhausted,
+}
+
+/// Exact aggregate result for one native affine polling batch.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mips4NativeAffinePollBatch {
+    /// Number of complete taken loop iterations.
+    pub iterations: u64,
+    /// Counter value produced by the final completed load.
+    pub counter: u64,
+    /// Counter value consumed by the final comparison.
+    pub last_source: u64,
+    /// Conservatively safe retirement budget after the final load.
+    pub remaining_budget: u64,
+    /// Required control disposition after materialization.
+    pub disposition: Mips4NativeAffinePollDisposition,
+}
+
+#[derive(Clone, Copy)]
+struct Mips4NativeFastMemoryTimeline {
+    code_fetches: u64,
+    delivery: u64,
+    completion: u64,
+    delivery_time: u64,
 }
 
 /// Mutable native ABI state for a proven affine fast-memory slice.
@@ -805,6 +931,7 @@ pub struct Mips4NativeFastMemoryContext {
     start_time_ticks: u64,
     available_ticks: u64,
     maximum_retirement_boundaries: u64,
+    retirement_ticks_upper_bound: u64,
     full_budget_admitted: u64,
     code_fetch_active: u64,
     code_fetch_shares_auxiliary: u64,
@@ -846,6 +973,7 @@ impl Mips4NativeFastMemoryContext {
             start_time_ticks,
             available_ticks,
             maximum_retirement_boundaries,
+            retirement_ticks_upper_bound: cpu_clock.maximum_ticks_per_cycle(),
             full_budget_admitted: full_budget_admitted as u64,
             code_fetch_active: 0,
             code_fetch_shares_auxiliary: 0,
@@ -877,6 +1005,14 @@ impl Mips4NativeFastMemoryContext {
         auxiliary_clock: Mips4NativeFractionalClockProjection,
         fixed_ticks_per_fetch: u64,
     ) {
+        self.retirement_ticks_upper_bound = self
+            .retirement_ticks_upper_bound
+            .checked_add(self.bus_clock.maximum_ticks_per_cycle().saturating_mul(2))
+            .and_then(|ticks| {
+                ticks.checked_add(auxiliary_clock.maximum_ticks_per_cycle().saturating_mul(2))
+            })
+            .and_then(|ticks| ticks.checked_add(fixed_ticks_per_fetch))
+            .unwrap_or(u64::MAX);
         self.code_fetch_active = 1;
         self.code_fetch_shares_auxiliary = shares_auxiliary as u64;
         self.code_fetch_fixed_ticks = fixed_ticks_per_fetch;
@@ -1014,12 +1150,276 @@ impl Mips4NativeFastMemoryContext {
         };
         self.reads[0].supports_time(latest)
             && self.reads[1].supports_time(latest)
+            && self.retirement_ticks_upper_bound != 0
+            && self.retirement_ticks_upper_bound != u64::MAX
             && self.cpu_clock.supports_cycles(maximum)
             && self.bus_clock.supports_cycles(shared_cycles)
             && self.auxiliary_clock.supports_cycles(shared_cycles)
             && self.graphics_clock.supports_cycles(shared_cycles)
             && self.code_auxiliary_clock.supports_cycles(code_cycles)
             && self.code_fetch_fixed_ticks.checked_mul(maximum).is_some()
+    }
+
+    /// Executes complete iterations of a recognized affine polling loop.
+    #[doc(hidden)]
+    pub fn execute_affine_poll_batch(
+        &mut self,
+        physical_address: u64,
+        counter: u64,
+        target: u64,
+        retired: u64,
+        budget: u64,
+    ) -> Mips4NativeAffinePollBatch {
+        let unsupported = || Mips4NativeAffinePollBatch {
+            iterations: 0,
+            counter,
+            last_source: counter,
+            remaining_budget: budget,
+            disposition: Mips4NativeAffinePollDisposition::Unsupported,
+        };
+        let Some(projection) = self
+            .reads
+            .iter()
+            .copied()
+            .find(|projection| projection.doubleword_address == physical_address)
+        else {
+            return unsupported();
+        };
+        let candidate = budget / 5;
+        if candidate == 0 || counter >= target {
+            return Mips4NativeAffinePollBatch {
+                disposition: Mips4NativeAffinePollDisposition::Continue,
+                ..unsupported()
+            };
+        }
+
+        let Some(first_timeline) = self.affine_poll_timeline(projection, retired, 1) else {
+            return unsupported();
+        };
+        if first_timeline.completion >= self.available_ticks {
+            return unsupported();
+        }
+        let candidate_timeline = if candidate == 1 {
+            first_timeline
+        } else {
+            let Some(timeline) = self.affine_poll_timeline(projection, retired, candidate) else {
+                return unsupported();
+            };
+            timeline
+        };
+        let (admitted, final_timeline) = if candidate_timeline.completion < self.available_ticks {
+            (candidate, candidate_timeline)
+        } else {
+            let completion_span = candidate_timeline
+                .completion
+                .saturating_sub(first_timeline.completion);
+            if completion_span == 0 {
+                return unsupported();
+            }
+            let available_span = self
+                .available_ticks
+                .saturating_sub(1)
+                .saturating_sub(first_timeline.completion);
+            let estimate_span = u128::from(available_span)
+                .saturating_mul(u128::from(candidate - 1))
+                / u128::from(completion_span);
+            let estimate = 1_u64.saturating_add(
+                u64::try_from(estimate_span)
+                    .unwrap_or(u64::MAX)
+                    .min(candidate - 1),
+            );
+            let estimate_timeline = if estimate == 1 {
+                first_timeline
+            } else {
+                let Some(timeline) = self.affine_poll_timeline(projection, retired, estimate)
+                else {
+                    return unsupported();
+                };
+                timeline
+            };
+            let (mut lower, mut upper, mut lower_timeline) =
+                if estimate_timeline.completion < self.available_ticks {
+                    (estimate, candidate - 1, estimate_timeline)
+                } else {
+                    (1, estimate - 1, first_timeline)
+                };
+            while lower < upper {
+                let middle = lower + (upper - lower).div_ceil(2);
+                let Some(timeline) = self.affine_poll_timeline(projection, retired, middle) else {
+                    return unsupported();
+                };
+                if timeline.completion < self.available_ticks {
+                    lower = middle;
+                    lower_timeline = timeline;
+                } else {
+                    upper = middle - 1;
+                }
+            }
+            (lower, lower_timeline)
+        };
+        let Some((final_unmasked, final_counter)) =
+            projection.counter_at(final_timeline.delivery_time)
+        else {
+            return unsupported();
+        };
+        if final_unmasked > u64::from(u32::MAX) || final_counter < counter {
+            return unsupported();
+        }
+
+        let iterations = if final_counter < target {
+            admitted
+        } else {
+            let mut lower = 1;
+            let mut upper = admitted;
+            while lower < upper {
+                let middle = lower + (upper - lower) / 2;
+                let Some(timeline) = self.affine_poll_timeline(projection, retired, middle) else {
+                    return unsupported();
+                };
+                let Some((unmasked, value)) = projection.counter_at(timeline.delivery_time) else {
+                    return unsupported();
+                };
+                if unmasked > u64::from(u32::MAX) {
+                    return unsupported();
+                }
+                if value >= target {
+                    upper = middle;
+                } else {
+                    lower = middle + 1;
+                }
+            }
+            lower
+        };
+        let timeline = if iterations == admitted {
+            final_timeline
+        } else {
+            let Some(timeline) = self.affine_poll_timeline(projection, retired, iterations) else {
+                return unsupported();
+            };
+            timeline
+        };
+        let Some((_, next_counter)) = projection.counter_at(timeline.delivery_time) else {
+            return unsupported();
+        };
+        let last_source = if iterations == 1 {
+            counter
+        } else {
+            let Some(previous) = self.affine_poll_timeline(projection, retired, iterations - 1)
+            else {
+                return unsupported();
+            };
+            let Some((_, previous_counter)) = projection.counter_at(previous.delivery_time) else {
+                return unsupported();
+            };
+            previous_counter
+        };
+
+        self.attempts = self.attempts.saturating_add(iterations);
+        self.completed = self.completed.saturating_add(iterations);
+        self.last_transaction_fetch = timeline.code_fetches;
+        self.last_delivery_ticks = timeline.delivery;
+        if projection.uses_auxiliary_bus != 0 {
+            self.auxiliary_completed = self.auxiliary_completed.saturating_add(iterations);
+            self.last_auxiliary_transaction_fetch = timeline.code_fetches;
+            self.last_auxiliary_delivery_ticks = timeline.delivery;
+        }
+        let retired_boundaries = iterations.saturating_mul(5);
+        let architectural_budget = budget.saturating_sub(retired_boundaries);
+        let timeline_budget = self
+            .available_ticks
+            .saturating_sub(timeline.completion)
+            .saturating_sub(1)
+            / self.retirement_ticks_upper_bound;
+        let remaining_budget = architectural_budget.min(timeline_budget);
+        let disposition = if remaining_budget == 0 {
+            Mips4NativeAffinePollDisposition::BudgetExhausted
+        } else {
+            Mips4NativeAffinePollDisposition::Continue
+        };
+        Mips4NativeAffinePollBatch {
+            iterations,
+            counter: next_counter,
+            last_source,
+            remaining_budget,
+            disposition,
+        }
+    }
+
+    fn affine_poll_timeline(
+        &self,
+        projection: Mips4NativeAffineReadProjection,
+        retired: u64,
+        iteration: u64,
+    ) -> Option<Mips4NativeFastMemoryTimeline> {
+        let previous = iteration.checked_sub(1)?;
+        let retired_at_load = retired
+            .checked_add(previous.checked_mul(5)?)?
+            .checked_add(4)?;
+        let code_fetches = if self.code_fetch_active != 0 {
+            retired_at_load.checked_add(1)?
+        } else {
+            0
+        };
+        let completed = self.completed.checked_add(previous)?;
+        let sysad_prefix = code_fetches.checked_add(completed)?;
+        let sysad_cycles = sysad_prefix.checked_mul(2)?.checked_add(1)?;
+        let sysad_request = self.bus_clock.elapsed(sysad_cycles)?;
+        let sysad_completion = self.bus_clock.elapsed(sysad_cycles.checked_add(1)?)?;
+
+        let shared_fetches = if self.code_fetch_shares_auxiliary != 0 {
+            code_fetches
+        } else {
+            0
+        };
+        let auxiliary_completed = self
+            .auxiliary_completed
+            .checked_add(previous.checked_mul(projection.uses_auxiliary_bus)?)?;
+        let auxiliary_prefix = shared_fetches.checked_add(auxiliary_completed)?;
+        let auxiliary_cycles = auxiliary_prefix
+            .checked_mul(2)?
+            .checked_add(projection.uses_auxiliary_bus)?;
+        let auxiliary_request = self.auxiliary_clock.elapsed(auxiliary_cycles)?;
+        let auxiliary_completion = self
+            .auxiliary_clock
+            .elapsed(auxiliary_cycles.checked_add(projection.uses_auxiliary_bus)?)?;
+        let graphics_request = self
+            .graphics_clock
+            .elapsed(self.graphics_completed.checked_mul(2)?)?;
+        let code_auxiliary = if self.code_fetch_active != 0 && self.code_fetch_shares_auxiliary == 0
+        {
+            self.code_auxiliary_clock
+                .elapsed(code_fetches.checked_mul(2)?)?
+        } else {
+            0
+        };
+        let fixed = self.code_fetch_fixed_ticks.checked_mul(code_fetches)?;
+        let cpu = self.cpu_clock.elapsed(retired_at_load)?;
+        let common = cpu
+            .checked_add(graphics_request)?
+            .checked_add(code_auxiliary)?
+            .checked_add(fixed)?;
+        let delivery = common
+            .checked_add(sysad_request)?
+            .checked_add(auxiliary_request)?;
+        let completion = common
+            .checked_add(sysad_completion)?
+            .checked_add(auxiliary_completion)?;
+        Some(Mips4NativeFastMemoryTimeline {
+            code_fetches,
+            delivery,
+            completion,
+            delivery_time: self.start_time_ticks.checked_add(delivery)?,
+        })
+    }
+}
+
+impl Mips4NativeFractionalClockProjection {
+    fn elapsed(self, cycles: u64) -> Option<u64> {
+        let fraction = self.fractional_ticks_per_cycle.checked_mul(cycles)?;
+        let numerator = self.remainder.checked_add(fraction)?;
+        self.whole_ticks_per_cycle
+            .checked_mul(cycles)?
+            .checked_add(numerator / self.frequency_hz)
     }
 }
 
@@ -1041,8 +1441,13 @@ pub trait Mips4FastMemoryRuntime {
 }
 
 #[doc(hidden)]
-pub const MIPS4_NATIVE_CLOCK_TIMEBASE_OFFSET: i32 =
-    core::mem::offset_of!(Mips4NativeFractionalClockProjection, timebase_hz) as i32;
+pub const MIPS4_NATIVE_CLOCK_WHOLE_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFractionalClockProjection, whole_ticks_per_cycle) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CLOCK_FRACTIONAL_OFFSET: i32 = core::mem::offset_of!(
+    Mips4NativeFractionalClockProjection,
+    fractional_ticks_per_cycle
+) as i32;
 #[doc(hidden)]
 pub const MIPS4_NATIVE_CLOCK_FREQUENCY_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFractionalClockProjection, frequency_hz) as i32;
@@ -1079,6 +1484,12 @@ pub const MIPS4_NATIVE_AFFINE_TIMEBASE_OFFSET: i32 =
 #[doc(hidden)]
 pub const MIPS4_NATIVE_CONTEXT_START_TIME_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFastMemoryContext, start_time_ticks) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_AVAILABLE_TICKS_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, available_ticks) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_RETIREMENT_TICKS_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, retirement_ticks_upper_bound) as i32;
 #[doc(hidden)]
 pub const MIPS4_NATIVE_CONTEXT_CODE_ACTIVE_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFastMemoryContext, code_fetch_active) as i32;
@@ -3095,6 +3506,56 @@ mod tests {
             }
             .token()
         );
+    }
+
+    #[test]
+    fn code_window_keeps_source_bytes_independent_from_execution_timeline() {
+        let request = Mips4CodeSourceRequest {
+            virtual_address: 0xffff_ffff_bfc0_0000,
+            physical_address: 0x1fc0_0000,
+            maximum_bytes: 4,
+        };
+        let guard = Mips4CodeGuard {
+            source_id: Mips4CodeSourceId::new(1),
+            source_offset: 0,
+            revision: 0,
+            fingerprint: 1,
+        };
+        let timeline = Mips4SliceTimeline::new(256, &[], 1).unwrap();
+        let window = Mips4CodeWindow::new(request, guard, &[0, 0, 0, 0], timeline).unwrap();
+
+        assert_eq!(window.bytes(), &[0, 0, 0, 0]);
+        assert_eq!(window.fetch_count(), 256);
+        assert_eq!(window.fetch_time_ticks(256), Some(256));
+        assert_eq!(window.fetch_time_ticks(257), None);
+    }
+
+    #[test]
+    fn execution_timeline_enforces_horizon_capacity() {
+        assert!(Mips4SliceTimeline::new(MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES, &[], 1).is_some());
+        assert!(
+            Mips4SliceTimeline::new(MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES + 1, &[], 1).is_none()
+        );
+    }
+
+    #[test]
+    fn execution_timeline_precomputed_clocks_match_fractional_projections() {
+        let first = FractionalClockProjection::new(1_000_000_000, 180_000_000, 17);
+        let second = FractionalClockProjection::new(1_000_000_000, 66_000_000, 29);
+        let clocks = [
+            Mips4SliceClock::new(first, 2).unwrap(),
+            Mips4SliceClock::new(second, 3).unwrap(),
+        ];
+        let timeline =
+            Mips4SliceTimeline::new(MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES, &clocks, 7).unwrap();
+
+        for fetches in 0..=MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES {
+            let expected = 7_u64
+                .checked_mul(fetches as u64)
+                .and_then(|ticks| ticks.checked_add(first.elapsed((fetches as u64) * 2)?.get()))
+                .and_then(|ticks| ticks.checked_add(second.elapsed((fetches as u64) * 3)?.get()));
+            assert_eq!(timeline.prefix_ticks(fetches), expected);
+        }
     }
 
     #[test]
