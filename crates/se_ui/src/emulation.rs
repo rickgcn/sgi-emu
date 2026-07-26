@@ -676,6 +676,7 @@ fn worker_main(shared: &Arc<SharedController>) {
     let mut active_config = None;
     let mut battery = BatteryCheckpoint::new();
     let mut system_flash = SystemFlashCheckpoint::new();
+    let mut run_after_input = false;
 
     auto_configure_machine(
         shared,
@@ -686,7 +687,8 @@ fn worker_main(shared: &Arc<SharedController>) {
     );
 
     loop {
-        let action = next_action(shared, machine.is_some());
+        let action = next_action(shared, machine.is_some(), run_after_input);
+        run_after_input = false;
         match action {
             WorkerAction::Shutdown => {
                 force_battery_checkpoint(shared, machine.as_ref(), &mut battery);
@@ -722,6 +724,7 @@ fn worker_main(shared: &Arc<SharedController>) {
             }
             WorkerAction::Input(request) => {
                 submit_machine_input(shared, machine.as_mut(), request);
+                run_after_input = true;
             }
             WorkerAction::TerminalInput(request) => {
                 submit_machine_terminal_input(shared, machine.as_mut(), request);
@@ -749,7 +752,11 @@ fn worker_main(shared: &Arc<SharedController>) {
     }
 }
 
-fn next_action(shared: &Arc<SharedController>, has_machine: bool) -> WorkerAction {
+fn next_action(
+    shared: &Arc<SharedController>,
+    has_machine: bool,
+    run_after_input: bool,
+) -> WorkerAction {
     let mut state = lock_state(shared);
     loop {
         if state.shutdown_requested {
@@ -767,6 +774,10 @@ fn next_action(shared: &Arc<SharedController>, has_machine: bool) -> WorkerActio
             if has_machine {
                 return WorkerAction::HardReset;
             }
+        }
+        if run_after_input && state.desired_running && has_machine {
+            state.snapshot.state = EmulationState::Running;
+            return WorkerAction::RunBatch;
         }
         if let Some(request) = state.inputs.pop_front() {
             return WorkerAction::Input(request);
@@ -2117,6 +2128,38 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn running_machine_advances_one_batch_between_queued_inputs() {
+        let controller = EmulationController::new();
+        controller.shutdown();
+        {
+            let mut state = lock_state(&controller.shared);
+            state.shutdown_requested = false;
+            state.desired_running = true;
+            state.snapshot.has_machine = true;
+            state.snapshot.state = EmulationState::Running;
+            state.inputs.extend([
+                InputRequest {
+                    input: Ip32InputEvent::ReleaseAll,
+                },
+                InputRequest {
+                    input: Ip32InputEvent::ReleaseAll,
+                },
+            ]);
+        }
+
+        assert!(matches!(
+            next_action(&controller.shared, true, true),
+            WorkerAction::RunBatch
+        ));
+        assert_eq!(lock_state(&controller.shared).inputs.len(), 2);
+        assert!(matches!(
+            next_action(&controller.shared, true, false),
+            WorkerAction::Input(_)
+        ));
+        assert_eq!(lock_state(&controller.shared).inputs.len(), 1);
     }
 
     #[test]
