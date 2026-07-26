@@ -158,6 +158,79 @@ fn partial_write_uses_read_modify_write_and_regenerates_ecc() {
 }
 
 #[test]
+fn synchronous_cpu_access_matches_regular_memory_semantics() {
+    let mut initial = small_memory();
+    successful(initial.accept(transaction(
+        1,
+        0,
+        CrimeTransfer::write((0_u8..24).collect::<Vec<_>>().into(), vec![true; 24].into()),
+    )));
+
+    let mut id = 2;
+    for length in [1_usize, 2, 4, 8] {
+        for address in 0_u64..=9 {
+            for byte_enable in [(1_u16 << length) - 1, 0x55_u16 & ((1 << length) - 1)] {
+                let mut regular = initial.clone();
+                let mut synchronous = initial.clone();
+                let data = 0xfedc_ba98_7654_3210_u64;
+                let data_bytes = data.to_le_bytes();
+                let enabled = (0..length)
+                    .map(|lane| byte_enable & (1 << lane) != 0)
+                    .collect::<Vec<_>>();
+                let outcome = successful(regular.accept(transaction(
+                    id,
+                    address,
+                    CrimeTransfer::write(data_bytes[..length].to_vec().into(), enabled.into()),
+                )));
+                id += 1;
+                assert_eq!(outcome.fault, None);
+                assert_eq!(outcome.diagnostic(), None);
+
+                assert!(synchronous.write_synchronous_cpu(
+                    CrimeSynchronousMemoryTarget::new(address, false),
+                    length,
+                    data,
+                    byte_enable as u8,
+                ));
+                assert_eq!(synchronous, regular);
+
+                let regular_read = successful(regular.accept(transaction(
+                    id,
+                    address,
+                    CrimeTransfer::read(length as u16),
+                )));
+                id += 1;
+                let CrimeCompletionPayload::ReadData(regular_data) = regular_read.payload else {
+                    panic!("a regular memory read must return data")
+                };
+                let synchronous_data = synchronous
+                    .read_synchronous_cpu(CrimeSynchronousMemoryTarget::new(address, false), length)
+                    .expect("a clean synchronous memory read must complete")
+                    .to_le_bytes();
+                assert_eq!(&synchronous_data[..length], regular_data.as_ref());
+            }
+        }
+    }
+}
+
+#[test]
+fn synchronous_cpu_access_refuses_ecc_diagnostics_before_mutation() {
+    let mut memory = small_memory();
+    successful(memory.accept(transaction(
+        1,
+        0,
+        CrimeTransfer::write(vec![0x5a; 8].into(), vec![true; 8].into()),
+    )));
+    memory.inject_data_bit(0, 0).unwrap();
+    let before = memory.clone();
+    let target = CrimeSynchronousMemoryTarget::new(0, false);
+
+    assert_eq!(memory.read_synchronous_cpu(target, 8), None);
+    assert!(!memory.write_synchronous_cpu(target, 1, 0xaa, 1));
+    assert_eq!(memory, before);
+}
+
+#[test]
 fn overlapping_bank_controls_select_the_lowest_bank() {
     let mut config = CrimeMemoryConfig::default();
     config.banks[1] = Some(CrimeSdramBankConfig {

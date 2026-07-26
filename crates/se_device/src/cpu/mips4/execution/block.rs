@@ -749,6 +749,94 @@ pub enum Mips4FastMemoryReadResult {
     InternalError,
 }
 
+/// Portable request passed to a fast-memory write runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mips4FastMemoryWriteRequest {
+    physical_address: u64,
+    data: u64,
+    retired_boundaries: u64,
+    size: u32,
+    byte_enable: u8,
+    access_type: u32,
+}
+
+impl Mips4FastMemoryWriteRequest {
+    /// Creates a portable request for one translated memory write.
+    pub const fn new(
+        physical_address: u64,
+        size: Mips4ExecutionTransferSize,
+        data: u64,
+        byte_enable: u8,
+        access_type: Mips4MemoryAccessType,
+        retired_boundaries: u64,
+    ) -> Self {
+        Self {
+            physical_address,
+            data,
+            retired_boundaries,
+            size: match size {
+                Mips4ExecutionTransferSize::Byte => 1,
+                Mips4ExecutionTransferSize::Halfword => 2,
+                Mips4ExecutionTransferSize::Word => 4,
+                Mips4ExecutionTransferSize::Doubleword => 8,
+            },
+            byte_enable,
+            access_type: match access_type {
+                Mips4MemoryAccessType::Uncached => 1,
+                Mips4MemoryAccessType::CachedNoncoherent => 2,
+                Mips4MemoryAccessType::CachedCoherent => 3,
+                Mips4MemoryAccessType::ImplementationSpecific => 4,
+            },
+        }
+    }
+
+    /// Returns the physical byte address.
+    pub const fn physical_address(self) -> u64 {
+        self.physical_address
+    }
+
+    /// Returns the transfer width in bytes.
+    pub const fn size(self) -> u32 {
+        self.size
+    }
+
+    /// Returns physical byte-lane data.
+    pub const fn data(self) -> u64 {
+        self.data
+    }
+
+    /// Returns enabled physical byte lanes.
+    pub const fn byte_enable(self) -> u8 {
+        self.byte_enable
+    }
+
+    /// Returns the number of earlier retirement boundaries in this slice.
+    pub const fn retired_boundaries(self) -> u64 {
+        self.retired_boundaries
+    }
+
+    /// Returns whether this is an uncached data store.
+    pub const fn is_uncached_data_store(self) -> bool {
+        self.access_type == 1
+    }
+}
+
+/// Result of one portable fast-memory write attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mips4FastMemoryWriteResult {
+    /// The machine cannot prove this request safe for direct completion.
+    Unavailable,
+    /// The write completed synchronously.
+    Complete {
+        /// Maximum total retirement boundaries admitted by the timeline.
+        retirement_limit: u64,
+    },
+    /// The next event or deadline prevents starting the request.
+    TimelineExhausted,
+    /// The runtime detected an invariant failure.
+    InternalError,
+}
+
 /// Native ABI projection of one fractional simulated clock.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -935,12 +1023,14 @@ pub struct Mips4NativeFastMemoryContext {
     full_budget_admitted: u64,
     code_fetch_active: u64,
     code_fetch_shares_auxiliary: u64,
+    code_fetch_shares_memory: u64,
     code_fetch_fixed_ticks: u64,
     attempts: u64,
     completed: u64,
     writes: u64,
     auxiliary_completed: u64,
     graphics_completed: u64,
+    memory_completed: u64,
     last_transaction_fetch: u64,
     last_auxiliary_transaction_fetch: u64,
     last_graphics_transaction_fetch: u64,
@@ -951,6 +1041,7 @@ pub struct Mips4NativeFastMemoryContext {
     bus_clock: Mips4NativeFractionalClockProjection,
     auxiliary_clock: Mips4NativeFractionalClockProjection,
     graphics_clock: Mips4NativeFractionalClockProjection,
+    memory_clock: Mips4NativeFractionalClockProjection,
     code_auxiliary_clock: Mips4NativeFractionalClockProjection,
     reads: [Mips4NativeAffineReadProjection; 2],
 }
@@ -967,6 +1058,7 @@ impl Mips4NativeFastMemoryContext {
         bus_clock: Mips4NativeFractionalClockProjection,
         auxiliary_clock: Mips4NativeFractionalClockProjection,
         graphics_clock: Mips4NativeFractionalClockProjection,
+        memory_clock: Mips4NativeFractionalClockProjection,
         reads: [Mips4NativeAffineReadProjection; 2],
     ) -> Self {
         Self {
@@ -977,12 +1069,14 @@ impl Mips4NativeFastMemoryContext {
             full_budget_admitted: full_budget_admitted as u64,
             code_fetch_active: 0,
             code_fetch_shares_auxiliary: 0,
+            code_fetch_shares_memory: 0,
             code_fetch_fixed_ticks: 0,
             attempts: 0,
             completed: 0,
             writes: 0,
             auxiliary_completed: 0,
             graphics_completed: 0,
+            memory_completed: 0,
             last_transaction_fetch: 0,
             last_auxiliary_transaction_fetch: 0,
             last_graphics_transaction_fetch: 0,
@@ -993,6 +1087,7 @@ impl Mips4NativeFastMemoryContext {
             bus_clock,
             auxiliary_clock,
             graphics_clock,
+            memory_clock,
             code_auxiliary_clock: auxiliary_clock,
             reads,
         }
@@ -1002,6 +1097,7 @@ impl Mips4NativeFastMemoryContext {
     pub fn configure_code_timeline(
         &mut self,
         shares_auxiliary: bool,
+        shares_memory: bool,
         auxiliary_clock: Mips4NativeFractionalClockProjection,
         fixed_ticks_per_fetch: u64,
     ) {
@@ -1015,6 +1111,7 @@ impl Mips4NativeFastMemoryContext {
             .unwrap_or(u64::MAX);
         self.code_fetch_active = 1;
         self.code_fetch_shares_auxiliary = shares_auxiliary as u64;
+        self.code_fetch_shares_memory = shares_memory as u64;
         self.code_fetch_fixed_ticks = fixed_ticks_per_fetch;
         self.code_auxiliary_clock = auxiliary_clock;
     }
@@ -1103,6 +1200,16 @@ impl Mips4NativeFastMemoryContext {
         self.graphics_completed
     }
 
+    /// Returns completed transactions using the memory bus.
+    pub const fn memory_completed(&self) -> u64 {
+        self.memory_completed
+    }
+
+    /// Records one completed transaction using the memory bus.
+    pub fn record_memory_completion(&mut self) {
+        self.memory_completed = self.memory_completed.saturating_add(1);
+    }
+
     /// Returns the last completed transaction's code-fetch position.
     pub const fn last_transaction_fetch(&self) -> u64 {
         self.last_transaction_fetch
@@ -1156,6 +1263,7 @@ impl Mips4NativeFastMemoryContext {
             && self.bus_clock.supports_cycles(shared_cycles)
             && self.auxiliary_clock.supports_cycles(shared_cycles)
             && self.graphics_clock.supports_cycles(shared_cycles)
+            && self.memory_clock.supports_cycles(shared_cycles)
             && self.code_auxiliary_clock.supports_cycles(code_cycles)
             && self.code_fetch_fixed_ticks.checked_mul(maximum).is_some()
     }
@@ -1385,7 +1493,19 @@ impl Mips4NativeFastMemoryContext {
         let graphics_request = self
             .graphics_clock
             .elapsed(self.graphics_completed.checked_mul(2)?)?;
-        let code_auxiliary = if self.code_fetch_active != 0 && self.code_fetch_shares_auxiliary == 0
+        let memory_fetches = if self.code_fetch_shares_memory != 0 {
+            code_fetches
+        } else {
+            0
+        };
+        let memory = self.memory_clock.elapsed(
+            memory_fetches
+                .checked_add(self.memory_completed)?
+                .checked_mul(2)?,
+        )?;
+        let code_auxiliary = if self.code_fetch_active != 0
+            && self.code_fetch_shares_auxiliary == 0
+            && self.code_fetch_shares_memory == 0
         {
             self.code_auxiliary_clock
                 .elapsed(code_fetches.checked_mul(2)?)?
@@ -1396,6 +1516,7 @@ impl Mips4NativeFastMemoryContext {
         let cpu = self.cpu_clock.elapsed(retired_at_load)?;
         let common = cpu
             .checked_add(graphics_request)?
+            .checked_add(memory)?
             .checked_add(code_auxiliary)?
             .checked_add(fixed)?;
         let delivery = common
@@ -1427,6 +1548,11 @@ impl Mips4NativeFractionalClockProjection {
 pub trait Mips4FastMemoryRuntime {
     /// Attempts one already translated, aligned read.
     fn read(&mut self, request: Mips4FastMemoryReadRequest) -> Mips4FastMemoryReadResult;
+
+    /// Attempts one already translated write.
+    fn write(&mut self, _request: Mips4FastMemoryWriteRequest) -> Mips4FastMemoryWriteResult {
+        Mips4FastMemoryWriteResult::Unavailable
+    }
 
     /// Returns logical transactions completed since this runtime was created.
     fn completed_transactions(&self) -> u64 {
@@ -1497,6 +1623,9 @@ pub const MIPS4_NATIVE_CONTEXT_CODE_ACTIVE_OFFSET: i32 =
 pub const MIPS4_NATIVE_CONTEXT_CODE_SHARES_AUXILIARY_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFastMemoryContext, code_fetch_shares_auxiliary) as i32;
 #[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_CODE_SHARES_MEMORY_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, code_fetch_shares_memory) as i32;
+#[doc(hidden)]
 pub const MIPS4_NATIVE_CONTEXT_CODE_FIXED_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFastMemoryContext, code_fetch_fixed_ticks) as i32;
 #[doc(hidden)]
@@ -1514,6 +1643,9 @@ pub const MIPS4_NATIVE_CONTEXT_AUXILIARY_COMPLETED_OFFSET: i32 =
 #[doc(hidden)]
 pub const MIPS4_NATIVE_CONTEXT_GRAPHICS_COMPLETED_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFastMemoryContext, graphics_completed) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_MEMORY_COMPLETED_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, memory_completed) as i32;
 #[doc(hidden)]
 pub const MIPS4_NATIVE_CONTEXT_LAST_FETCH_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFastMemoryContext, last_transaction_fetch) as i32;
@@ -1548,6 +1680,9 @@ pub const MIPS4_NATIVE_CONTEXT_AUXILIARY_CLOCK_OFFSET: i32 =
 #[doc(hidden)]
 pub const MIPS4_NATIVE_CONTEXT_GRAPHICS_CLOCK_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFastMemoryContext, graphics_clock) as i32;
+#[doc(hidden)]
+pub const MIPS4_NATIVE_CONTEXT_MEMORY_CLOCK_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeFastMemoryContext, memory_clock) as i32;
 #[doc(hidden)]
 pub const MIPS4_NATIVE_CONTEXT_CODE_AUXILIARY_CLOCK_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeFastMemoryContext, code_auxiliary_clock) as i32;

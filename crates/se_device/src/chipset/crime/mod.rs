@@ -36,8 +36,8 @@ use self::protocol::{
     CrimeDmaRequest, CrimeEvent, CrimeInterruptPost, CrimeLinkDeviceResponse, CrimeLinkOperation,
     CrimeMemoryBankSelect, CrimeMemoryClient, CrimeMemoryCompletion, CrimeMemoryFault,
     CrimeMemoryInhibitReason, CrimeMemoryOutcome, CrimeMemoryTransaction, CrimePioRequest,
-    CrimePoll, CrimeSdramSignal, CrimeSysAdCompletion, CrimeSysAdRequest, CrimeSysAdRoute,
-    CrimeTransactionId, CrimeTransfer, CrimeTransferView,
+    CrimePoll, CrimeSdramSignal, CrimeSynchronousMemoryTarget, CrimeSysAdCompletion,
+    CrimeSysAdRequest, CrimeSysAdRoute, CrimeTransactionId, CrimeTransfer, CrimeTransferView,
 };
 use self::render::{
     CrimeRender, CrimeRenderError, CrimeRenderState, RenderAccessError, RenderInterruptEffect,
@@ -616,6 +616,15 @@ impl Crime {
         }
     }
 
+    /// Decodes one complete CPU transfer into the SDRAM address domain.
+    pub fn synchronous_memory_target(
+        address: u64,
+        size: usize,
+    ) -> Option<CrimeSynchronousMemoryTarget> {
+        decode_memory(address, size)
+            .map(|(address, no_ecc)| CrimeSynchronousMemoryTarget::new(address, no_ecc))
+    }
+
     /// Previews the exact memory-domain request produced by an idle CPU access.
     pub fn preview_synchronous_memory_request(
         &self,
@@ -822,6 +831,26 @@ impl Crime {
         self.next_transaction_id = self
             .next_transaction_id
             .checked_add(fetches)
+            .ok_or(CrimeError::TransactionIdOverflow)?;
+        self.current_time = self.current_time.max(last_delivery_time);
+        Ok(true)
+    }
+
+    /// Accounts for bypassed synchronous CPU memory transactions.
+    pub fn account_synchronous_cpu_memory_transactions(
+        &mut self,
+        transactions: u64,
+        last_delivery_time: SimTime,
+    ) -> Result<bool, CrimeError> {
+        if transactions == 0 {
+            return Ok(true);
+        }
+        if !self.stable_cpu_fetch_ready() {
+            return Ok(false);
+        }
+        self.next_transaction_id = self
+            .next_transaction_id
+            .checked_add(u128::from(transactions))
             .ok_or(CrimeError::TransactionIdOverflow)?;
         self.current_time = self.current_time.max(last_delivery_time);
         Ok(true)

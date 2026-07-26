@@ -45,7 +45,8 @@ use super::block::{
     Mips4BlockGuard, Mips4BlockGuardLine, Mips4BlockInstructionMetadata, Mips4BlockKey,
     Mips4BlockLiftedInstruction, Mips4BlockRuntime, Mips4CodeSourceRequest, Mips4CodeWindow,
     Mips4Cp0RuntimeOperation, Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult,
-    Mips4FastMemoryRuntime, Mips4RuntimeOperation, Mips4RuntimeResult, lift_cpu_instruction,
+    Mips4FastMemoryRuntime, Mips4FastMemoryWriteRequest, Mips4FastMemoryWriteResult,
+    Mips4RuntimeOperation, Mips4RuntimeResult, lift_cpu_instruction,
 };
 use super::bus::{
     Mips4ExecutionAccessKind, Mips4ExecutionCompletion, Mips4ExecutionTransaction,
@@ -2964,6 +2965,50 @@ where
                     ) {
                         Ok(()) => return Mips4RuntimeResult::ContinueControl,
                         Err(pending) => {
+                            if let Some(runtime) = fast_memory {
+                                let Mips4ExecutionTransaction::Write {
+                                    physical_address,
+                                    size,
+                                    data,
+                                    byte_enable,
+                                    access_type,
+                                } = transaction
+                                else {
+                                    return Mips4RuntimeResult::InternalError;
+                                };
+                                let request = Mips4FastMemoryWriteRequest::new(
+                                    physical_address,
+                                    size,
+                                    data,
+                                    byte_enable,
+                                    access_type,
+                                    frame.retired(),
+                                );
+                                match runtime.write(request) {
+                                    Mips4FastMemoryWriteResult::Complete { retirement_limit } => {
+                                        let remaining = retirement_limit
+                                            .saturating_sub(request.retired_boundaries());
+                                        if remaining == 0 {
+                                            return Mips4RuntimeResult::TimelineExhausted;
+                                        }
+                                        frame.limit_budget(remaining);
+                                        if let Some((register, value)) =
+                                            complete_write_value(&mut self.state, pending)
+                                        {
+                                            frame.write_gpr(register, value);
+                                        }
+                                        retire_block_frame_control(frame);
+                                        return Mips4RuntimeResult::ContinueControl;
+                                    }
+                                    Mips4FastMemoryWriteResult::TimelineExhausted => {
+                                        return Mips4RuntimeResult::TimelineExhausted;
+                                    }
+                                    Mips4FastMemoryWriteResult::InternalError => {
+                                        return Mips4RuntimeResult::InternalError;
+                                    }
+                                    Mips4FastMemoryWriteResult::Unavailable => {}
+                                }
+                            }
                             self.prepare_runtime_frame(frame, operation);
                             self.start_memory_access(
                                 Mips4CachedClient::DataWrite {

@@ -13,7 +13,7 @@ use super::config::{CrimeMemoryConfig, CrimeSdramBankConfig};
 use super::protocol::{
     CrimeBusError, CrimeByteEnableView, CrimeCompletionPayload, CrimeData, CrimeMemoryBankSelect,
     CrimeMemoryCompletion, CrimeMemoryDiagnostic, CrimeMemoryFault, CrimeMemoryOutcome,
-    CrimeMemoryTransaction, CrimeSdramSignal, CrimeTransferView,
+    CrimeMemoryTransaction, CrimeSdramSignal, CrimeSynchronousMemoryTarget, CrimeTransferView,
 };
 use super::registers;
 
@@ -314,6 +314,232 @@ impl CrimeSdram {
         }
     }
 
+    /// Completes one previously decoded synchronous CPU read.
+    pub fn read_synchronous_cpu(
+        &mut self,
+        target: CrimeSynchronousMemoryTarget,
+        length: usize,
+    ) -> Option<u64> {
+        if !matches!(length, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        let in_lane = target.address() as usize & 7;
+        if in_lane + length <= 8 {
+            target
+                .address()
+                .checked_add(length.saturating_sub(1) as u64)?;
+            let selection = self.decode(target.address())?;
+            let BankSelection::Populated {
+                index: bank_index,
+                offset: bank_offset,
+            } = selection
+            else {
+                return Some(0);
+            };
+            let (data, stored_check) = self.banks[bank_index]
+                .as_ref()
+                .expect("decoded bank exists")
+                .read_lane(bank_offset & !7);
+            if self.ecc_enabled
+                && !target.no_ecc()
+                && !matches!(ecc::check(data, stored_check), ecc::EccCheck::Clean { .. })
+            {
+                return None;
+            }
+            let shifted = data >> (in_lane * 8);
+            let mask = if length == 8 {
+                u64::MAX
+            } else {
+                (1_u64 << (length * 8)) - 1
+            };
+            return Some(shifted & mask);
+        }
+        let mut output = [0; 8];
+        let mut position = 0;
+        while position < length {
+            let current = target.address().checked_add(position as u64)?;
+            let selection = self.decode(current)?;
+            let BankSelection::Populated {
+                index: bank_index,
+                offset: bank_offset,
+            } = selection
+            else {
+                position += (8 - (current as usize & 7)).min(length - position);
+                continue;
+            };
+            let lane_offset = bank_offset & !7;
+            let in_lane = bank_offset as usize & 7;
+            let count = (8 - in_lane).min(length - position);
+            let (data, stored_check) = self.banks[bank_index]
+                .as_ref()
+                .expect("decoded bank exists")
+                .read_lane(lane_offset);
+            if self.ecc_enabled
+                && !target.no_ecc()
+                && !matches!(ecc::check(data, stored_check), ecc::EccCheck::Clean { .. })
+            {
+                return None;
+            }
+            output[position..position + count]
+                .copy_from_slice(&data.to_le_bytes()[in_lane..in_lane + count]);
+            position += count;
+        }
+        Some(u64::from_le_bytes(output))
+    }
+
+    /// Completes one previously decoded synchronous CPU write.
+    pub fn write_synchronous_cpu(
+        &mut self,
+        target: CrimeSynchronousMemoryTarget,
+        length: usize,
+        data: u64,
+        byte_enable: u8,
+    ) -> bool {
+        if !matches!(length, 1 | 2 | 4 | 8) {
+            return false;
+        }
+        let data = data.to_le_bytes();
+        let in_lane = target.address() as usize & 7;
+        if in_lane + length <= 8 {
+            if target
+                .address()
+                .checked_add(length.saturating_sub(1) as u64)
+                .is_none()
+            {
+                return false;
+            }
+            let Some(selection) = self.decode(target.address()) else {
+                return false;
+            };
+            let BankSelection::Populated {
+                index: bank_index,
+                offset: bank_offset,
+            } = selection
+            else {
+                return true;
+            };
+            let lane_offset = bank_offset & !7;
+            let read_modify_write = in_lane != 0
+                || length != 8
+                || (0..length).any(|index| byte_enable & (1 << index) == 0);
+            let mut bytes = if read_modify_write {
+                let (old_data, stored_check) = self.banks[bank_index]
+                    .as_ref()
+                    .expect("decoded bank exists")
+                    .read_lane(lane_offset);
+                if self.ecc_enabled
+                    && !matches!(
+                        ecc::check(old_data, stored_check),
+                        ecc::EccCheck::Clean { .. }
+                    )
+                {
+                    return false;
+                }
+                old_data.to_le_bytes()
+            } else {
+                [0; 8]
+            };
+            for index in 0..length {
+                if byte_enable & (1 << index) != 0 {
+                    bytes[in_lane + index] = data[index];
+                }
+            }
+            let data = u64::from_le_bytes(bytes);
+            let check = if self.use_replacement {
+                self.replacement
+            } else {
+                ecc::generate(data)
+            };
+            self.banks[bank_index]
+                .as_mut()
+                .expect("decoded bank exists")
+                .write_lane(lane_offset, data, check);
+            return true;
+        }
+        let mut position = 0;
+        while position < length {
+            let Some(current) = target.address().checked_add(position as u64) else {
+                return false;
+            };
+            let in_lane = current as usize & 7;
+            let count = (8 - in_lane).min(length - position);
+            let read_modify_write = in_lane != 0
+                || count != 8
+                || (position..position + count).any(|index| byte_enable & (1 << index) == 0);
+            let Some(selection) = self.decode(current) else {
+                return false;
+            };
+            if let BankSelection::Populated {
+                index: bank,
+                offset,
+            } = selection
+                && read_modify_write
+                && self.ecc_enabled
+            {
+                let (old_data, stored_check) = self.banks[bank]
+                    .as_ref()
+                    .expect("decoded bank exists")
+                    .read_lane(offset & !7);
+                if !matches!(
+                    ecc::check(old_data, stored_check),
+                    ecc::EccCheck::Clean { .. }
+                ) {
+                    return false;
+                }
+            }
+            position += count;
+        }
+
+        position = 0;
+        while position < length {
+            let current = target.address() + position as u64;
+            let in_lane = current as usize & 7;
+            let count = (8 - in_lane).min(length - position);
+            let selection = self
+                .decode(current)
+                .expect("the synchronous write was validated before mutation");
+            let BankSelection::Populated {
+                index: bank_index,
+                offset: bank_offset,
+            } = selection
+            else {
+                position += count;
+                continue;
+            };
+            let lane_offset = bank_offset & !7;
+            let read_modify_write = in_lane != 0
+                || count != 8
+                || (position..position + count).any(|index| byte_enable & (1 << index) == 0);
+            let mut bytes = if read_modify_write {
+                self.banks[bank_index]
+                    .as_ref()
+                    .expect("decoded bank exists")
+                    .read_lane(lane_offset)
+                    .0
+                    .to_le_bytes()
+            } else {
+                [0; 8]
+            };
+            for index in 0..count {
+                if byte_enable & (1 << (position + index)) != 0 {
+                    bytes[in_lane + index] = data[position + index];
+                }
+            }
+            let data = u64::from_le_bytes(bytes);
+            let check = if self.use_replacement {
+                self.replacement
+            } else {
+                ecc::generate(data)
+            };
+            self.banks[bank_index]
+                .as_mut()
+                .expect("decoded bank exists")
+                .write_lane(lane_offset, data, check);
+            position += count;
+        }
+        true
+    }
+
     fn synchronous_read_ready(&self, address: u64, length: usize, no_ecc: bool) -> bool {
         let mut position = 0;
         while position < length {
@@ -448,6 +674,15 @@ impl CrimeSdram {
         length: usize,
         no_ecc: bool,
     ) -> Result<CrimeMemoryOutcome, CrimeBusError> {
+        if length > 8
+            && let Some(output) = self.read_clean_sparse_page(address, length, no_ecc)
+        {
+            return Ok(CrimeMemoryOutcome::new(
+                CrimeCompletionPayload::ReadData(output),
+                None,
+                None,
+            ));
+        }
         let mut output = CrimeData::zeroed(length);
         let mut diagnostic = None;
         let mut fault = None;
@@ -510,6 +745,71 @@ impl CrimeSdram {
             fault,
             diagnostic,
         ))
+    }
+
+    fn read_clean_sparse_page(
+        &self,
+        address: u64,
+        length: usize,
+        no_ecc: bool,
+    ) -> Option<CrimeData> {
+        let last_address = address.checked_add(length.checked_sub(1)? as u64)?;
+        let BankSelection::Populated {
+            index: first_bank,
+            offset: first_offset,
+        } = self.decode(address)?
+        else {
+            return None;
+        };
+        let BankSelection::Populated {
+            index: last_bank,
+            offset: last_offset,
+        } = self.decode(last_address)?
+        else {
+            return None;
+        };
+        if first_bank != last_bank || last_offset != first_offset.checked_add(length as u64 - 1)? {
+            return None;
+        }
+        let first_offset = first_offset as usize;
+        let last_offset = last_offset as usize;
+        let page_index = first_offset / PAGE_SIZE;
+        if last_offset / PAGE_SIZE != page_index {
+            return None;
+        }
+        let Some(page) = self.banks[first_bank]
+            .as_ref()
+            .expect("decoded bank exists")
+            .pages[page_index]
+            .as_ref()
+        else {
+            return Some(CrimeData::zeroed(length));
+        };
+        if self.ecc_enabled && !no_ecc {
+            let first_lane = (first_offset % PAGE_SIZE) / 8;
+            let last_lane = (last_offset % PAGE_SIZE) / 8;
+            for lane in first_lane..=last_lane {
+                let start = lane * 8;
+                let data = u64::from_le_bytes(
+                    page.data[start..start + 8]
+                        .try_into()
+                        .expect("one sparse ECC lane is eight bytes"),
+                );
+                if !matches!(
+                    ecc::check(data, page.ecc[lane]),
+                    ecc::EccCheck::Clean { .. }
+                ) {
+                    return None;
+                }
+            }
+        }
+        let in_page = first_offset % PAGE_SIZE;
+        Some(
+            page.data[in_page..in_page + length]
+                .iter()
+                .copied()
+                .collect(),
+        )
     }
 
     fn write(

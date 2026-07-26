@@ -73,8 +73,8 @@ use se_device::cpu::mips4::execution::block::MIPS4_EXECUTION_HORIZON_MAX_BOUNDAR
 #[cfg(feature = "jit")]
 use se_device::cpu::mips4::execution::block::{
     Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult, Mips4FastMemoryRuntime,
-    Mips4NativeAffineReadProjection, Mips4NativeFastMemoryContext,
-    Mips4NativeFractionalClockProjection,
+    Mips4FastMemoryWriteRequest, Mips4FastMemoryWriteResult, Mips4NativeAffineReadProjection,
+    Mips4NativeFastMemoryContext, Mips4NativeFractionalClockProjection,
 };
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use se_device::cpu::mips4::execution::target::Mips4ExecutionBoundary;
@@ -133,6 +133,7 @@ use se_jit::mips4::engine::{MIPS4_BLOCK_CACHE_CAPACITY, Mips4BlockEngine};
 #[cfg(feature = "jit")]
 mod fast_memory;
 use super::timing::IP32_TIMEBASE_HZ;
+
 #[cfg(feature = "jit")]
 use fast_memory::{
     commit_fast_memory_runtime, configure_fast_memory_code_timeline, plan_fast_memory_runtime,
@@ -3369,19 +3370,28 @@ where
             fast_transaction_tracing_disabled,
         )?;
         let (requested, cached_slice) = {
+            let cpu_slot = control.slots.cpu;
+            let sdram_slot = control.slots.sdram;
             let engine = control
                 .jit_engine
                 .as_mut()
                 .expect("JIT dispatch requires an initialized engine");
-            let cpu = registry.get_resolved_mut(control.slots.cpu)?;
-            let requested = cpu.limit_slice_budget(planned as u64);
-            let cached_slice = match fast_memory_runtime.as_mut() {
+            match fast_memory_runtime.as_mut() {
                 Some(runtime) => {
-                    cpu.run_reusable_slice_with_fast_memory(engine, requested, runtime)?
+                    let (cpu, sdram) = registry.get_resolved_pair_mut(cpu_slot, sdram_slot)?;
+                    let requested = cpu.limit_slice_budget(planned as u64);
+                    let cached_slice = runtime.with_sdram(sdram, |runtime| {
+                        cpu.run_reusable_slice_with_fast_memory(engine, requested, runtime)
+                    })?;
+                    (requested, cached_slice)
                 }
-                None => cpu.run_reusable_slice(engine, requested)?,
-            };
-            (requested, cached_slice)
+                None => {
+                    let cpu = registry.get_resolved_mut(cpu_slot)?;
+                    let requested = cpu.limit_slice_budget(planned as u64);
+                    let cached_slice = cpu.run_reusable_slice(engine, requested)?;
+                    (requested, cached_slice)
+                }
+            }
         };
         let (code_window, slice) = if let Some(slice) = cached_slice {
             (None, slice)
@@ -3399,24 +3409,33 @@ where
             let requested = code_window.as_ref().map_or(requested, |window| {
                 requested.min(window.fetch_count() as u64)
             });
+            let cpu_slot = control.slots.cpu;
+            let sdram_slot = control.slots.sdram;
             let engine = control
                 .jit_engine
                 .as_mut()
                 .expect("JIT dispatch requires an initialized engine");
-            let cpu = registry.get_resolved_mut(control.slots.cpu)?;
             let slice = match fast_memory_runtime.as_mut() {
-                Some(runtime) => cpu.run_slice_with_code_window_and_fast_memory(
-                    engine,
-                    requested,
-                    code_window.as_ref(),
-                    runtime,
-                )?,
-                None => match code_window.as_ref() {
-                    Some(window) => {
-                        cpu.run_slice_with_code_window(engine, requested, Some(window))?
+                Some(runtime) => {
+                    let (cpu, sdram) = registry.get_resolved_pair_mut(cpu_slot, sdram_slot)?;
+                    runtime.with_sdram(sdram, |runtime| {
+                        cpu.run_slice_with_code_window_and_fast_memory(
+                            engine,
+                            requested,
+                            code_window.as_ref(),
+                            runtime,
+                        )
+                    })?
+                }
+                None => {
+                    let cpu = registry.get_resolved_mut(cpu_slot)?;
+                    match code_window.as_ref() {
+                        Some(window) => {
+                            cpu.run_slice_with_code_window(engine, requested, Some(window))?
+                        }
+                        None => cpu.run_slice(engine, requested)?,
                     }
-                    None => cpu.run_slice(engine, requested)?,
-                },
+                }
             };
             (code_window, slice)
         };

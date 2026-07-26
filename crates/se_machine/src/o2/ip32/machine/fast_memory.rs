@@ -18,6 +18,72 @@ enum Ip32FastMemorySecondaryBus {
     None,
     Cmi,
     Cgi,
+    Memory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Ip32FastMemoryAdmission {
+    Complete {
+        delivery_ticks: u64,
+        code_fetches: u64,
+        retirement_limit: u64,
+    },
+    Unavailable,
+    TimelineExhausted,
+    InternalError,
+}
+
+const FAST_MEMORY_WRITE_RANGE_CAPACITY: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ip32FastMemoryWriteRanges {
+    ranges: [(u64, u64); FAST_MEMORY_WRITE_RANGE_CAPACITY],
+    len: usize,
+    overflowed: bool,
+}
+
+impl Ip32FastMemoryWriteRanges {
+    const fn new() -> Self {
+        Self {
+            ranges: [(0, 0); FAST_MEMORY_WRITE_RANGE_CAPACITY],
+            len: 0,
+            overflowed: false,
+        }
+    }
+
+    fn record(&mut self, address: u64, length: usize) {
+        if length == 0 || self.overflowed {
+            return;
+        }
+        let mut start = address;
+        let mut end = address.saturating_add(length as u64);
+        let mut index = 0;
+        while index < self.len {
+            let (range_start, range_end) = self.ranges[index];
+            if end < range_start || range_end < start {
+                index += 1;
+                continue;
+            }
+            start = start.min(range_start);
+            end = end.max(range_end);
+            self.len -= 1;
+            self.ranges[index] = self.ranges[self.len];
+        }
+        if self.len == self.ranges.len() {
+            self.overflowed = true;
+            return;
+        }
+        self.ranges[self.len] = (start, end);
+        self.len += 1;
+    }
+
+    const fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    fn ranges(&self) -> &[(u64, u64)] {
+        &self.ranges[..self.len]
+    }
 }
 
 fn native_clock_projection(
@@ -60,8 +126,13 @@ pub(super) struct Ip32FastMemoryContext {
     sysad_clock: FractionalClockProjection,
     cmi_clock: FractionalClockProjection,
     cgi_clock: FractionalClockProjection,
+    memory_clock: FractionalClockProjection,
     mace_ust: se_device::chipset::mace::peripheral::MaceUstProjection,
+    mace_ps2_status: [se_device::chipset::mace::MaceSynchronousReadProjection; 2],
     code_timeline: Option<Ip32FastCodeTimeline>,
+    memory_completed: u64,
+    last_memory_delivery_ticks: u64,
+    last_memory_transaction_fetch: u64,
     native: Mips4NativeFastMemoryContext,
 }
 
@@ -75,8 +146,10 @@ impl Ip32FastMemoryContext {
         sysad_clock: FractionalClockProjection,
         cmi_clock: FractionalClockProjection,
         cgi_clock: FractionalClockProjection,
+        memory_clock: FractionalClockProjection,
         crime_timer: CrimeSynchronousTimerProjection,
         mace_ust: se_device::chipset::mace::peripheral::MaceUstProjection,
+        mace_ps2_status: [se_device::chipset::mace::MaceSynchronousReadProjection; 2],
         full_budget_admitted: bool,
     ) -> Self {
         let native = Mips4NativeFastMemoryContext::new(
@@ -88,6 +161,7 @@ impl Ip32FastMemoryContext {
             native_clock_projection(sysad_clock),
             native_clock_projection(cmi_clock),
             native_clock_projection(cgi_clock),
+            native_clock_projection(memory_clock),
             [
                 native_affine_projection(
                     crime_timer.physical_address,
@@ -116,8 +190,13 @@ impl Ip32FastMemoryContext {
             sysad_clock,
             cmi_clock,
             cgi_clock,
+            memory_clock,
             mace_ust,
+            mace_ps2_status,
             code_timeline: None,
+            memory_completed: 0,
+            last_memory_delivery_ticks: 0,
+            last_memory_transaction_fetch: 0,
             native,
         }
     }
@@ -158,6 +237,7 @@ impl Ip32FastMemoryContext {
         };
         self.native.configure_code_timeline(
             matches!(timeline, Ip32FastCodeTimeline::SystemFlash { .. }),
+            matches!(timeline, Ip32FastCodeTimeline::Sdram { .. }),
             native_clock_projection(auxiliary_clock),
             fixed_ticks_per_fetch,
         );
@@ -181,6 +261,10 @@ impl Ip32FastMemoryContext {
         self.cgi_clock
     }
 
+    pub(super) const fn memory_clock(&self) -> FractionalClockProjection {
+        self.memory_clock
+    }
+
     pub(super) const fn code_fetch_active(&self) -> bool {
         self.code_timeline.is_some()
     }
@@ -190,6 +274,10 @@ impl Ip32FastMemoryContext {
             self.code_timeline,
             Some(Ip32FastCodeTimeline::SystemFlash { .. })
         )
+    }
+
+    pub(super) const fn code_fetch_shares_memory(&self) -> bool {
+        matches!(self.code_timeline, Some(Ip32FastCodeTimeline::Sdram { .. }))
     }
 
     pub(super) const fn code_aux_clock(&self) -> FractionalClockProjection {
@@ -250,6 +338,12 @@ impl Ip32FastMemoryContext {
             secondary_bus == Ip32FastMemorySecondaryBus::Cmi,
             secondary_bus == Ip32FastMemorySecondaryBus::Cgi,
         );
+        if secondary_bus == Ip32FastMemorySecondaryBus::Memory {
+            self.native.record_memory_completion();
+            self.memory_completed = self.memory_completed.saturating_add(1);
+            self.last_memory_delivery_ticks = delivery_ticks;
+            self.last_memory_transaction_fetch = fetches;
+        }
     }
 
     pub(super) const fn attempts(&self) -> u64 {
@@ -286,6 +380,10 @@ impl Ip32FastMemoryContext {
         self.native.graphics_completed()
     }
 
+    pub(super) const fn memory_completed(&self) -> u64 {
+        self.memory_completed
+    }
+
     pub(super) const fn last_delivery_ticks(&self) -> u64 {
         self.native.last_delivery_ticks()
     }
@@ -296,6 +394,10 @@ impl Ip32FastMemoryContext {
 
     pub(super) const fn last_cgi_delivery_ticks(&self) -> u64 {
         self.native.last_graphics_delivery_ticks()
+    }
+
+    pub(super) const fn last_memory_delivery_ticks(&self) -> u64 {
+        self.last_memory_delivery_ticks
     }
 
     pub(super) const fn last_transaction_fetch(&self) -> u64 {
@@ -309,14 +411,186 @@ impl Ip32FastMemoryContext {
     pub(super) const fn last_cgi_transaction_fetch(&self) -> u64 {
         self.native.last_graphics_transaction_fetch()
     }
+
+    pub(super) const fn last_memory_transaction_fetch(&self) -> u64 {
+        self.last_memory_transaction_fetch
+    }
 }
 
 pub(super) struct Ip32FastMemoryRuntime {
     pub(super) context: Ip32FastMemoryContext,
     pub(super) gbe_frame_active: GbeSynchronousReadProjection,
+    sdram: Option<core::ptr::NonNull<CrimeSdram>>,
+    memory_available_ticks: u64,
+    memory_reads: u64,
+    memory_writes: u64,
+    memory_write_ranges: Ip32FastMemoryWriteRanges,
 }
 
 impl Ip32FastMemoryRuntime {
+    fn admission(
+        &self,
+        retired_boundaries: u64,
+        secondary_bus: Ip32FastMemorySecondaryBus,
+        available_ticks: u64,
+    ) -> Ip32FastMemoryAdmission {
+        let Some((delivery_ticks, completion_ticks, code_fetches)) =
+            self.transaction_timeline(retired_boundaries, secondary_bus)
+        else {
+            return Ip32FastMemoryAdmission::InternalError;
+        };
+        if completion_ticks >= available_ticks {
+            return if self.context.completed() == 0 && retired_boundaries == 0 {
+                Ip32FastMemoryAdmission::Unavailable
+            } else {
+                Ip32FastMemoryAdmission::TimelineExhausted
+            };
+        }
+        let Some(retirement_limit) = self.retirement_limit(
+            retired_boundaries,
+            completion_ticks,
+            secondary_bus,
+            available_ticks,
+        ) else {
+            return Ip32FastMemoryAdmission::InternalError;
+        };
+        if retirement_limit <= retired_boundaries {
+            return if self.context.completed() == 0 && retired_boundaries == 0 {
+                Ip32FastMemoryAdmission::Unavailable
+            } else {
+                Ip32FastMemoryAdmission::TimelineExhausted
+            };
+        }
+        Ip32FastMemoryAdmission::Complete {
+            delivery_ticks,
+            code_fetches,
+            retirement_limit,
+        }
+    }
+
+    pub(super) fn with_sdram<R>(
+        &mut self,
+        sdram: &mut CrimeSdram,
+        execute: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        debug_assert!(self.sdram.is_none());
+        self.sdram = Some(core::ptr::NonNull::from(sdram));
+        let result = execute(self);
+        self.sdram = None;
+        result
+    }
+
+    fn record_memory_write(&mut self, address: u64, length: usize) {
+        self.memory_writes = self.memory_writes.saturating_add(1);
+        self.memory_write_ranges.record(address, length);
+    }
+
+    fn read_sdram(
+        &mut self,
+        request: Mips4FastMemoryReadRequest,
+    ) -> Option<Mips4FastMemoryReadResult> {
+        let length = match request.size() {
+            1 | 2 | 4 | 8 => request.size() as usize,
+            _ => return Some(Mips4FastMemoryReadResult::InternalError),
+        };
+        let target = request
+            .is_uncached_data_load()
+            .then(|| Crime::synchronous_memory_target(request.physical_address(), length))
+            .flatten()?;
+        let mut sdram = self.sdram?;
+        self.context.record_attempt();
+        let admission = self.admission(
+            request.retired_boundaries(),
+            Ip32FastMemorySecondaryBus::Memory,
+            self.memory_available_ticks,
+        );
+        let Ip32FastMemoryAdmission::Complete {
+            delivery_ticks,
+            code_fetches,
+            retirement_limit,
+        } = admission
+        else {
+            return Some(match admission {
+                Ip32FastMemoryAdmission::Unavailable => Mips4FastMemoryReadResult::Unavailable,
+                Ip32FastMemoryAdmission::TimelineExhausted => {
+                    Mips4FastMemoryReadResult::TimelineExhausted
+                }
+                Ip32FastMemoryAdmission::InternalError => Mips4FastMemoryReadResult::InternalError,
+                Ip32FastMemoryAdmission::Complete { .. } => unreachable!(),
+            });
+        };
+        // SAFETY: `with_sdram` installs this pointer only while the caller
+        // uniquely borrows both the runtime and the SDRAM component.
+        let value = unsafe { sdram.as_mut() }.read_synchronous_cpu(target, length);
+        let Some(value) = value else {
+            return Some(Mips4FastMemoryReadResult::Unavailable);
+        };
+        self.memory_reads = self.memory_reads.saturating_add(1);
+        self.context.record_completion(
+            delivery_ticks,
+            code_fetches,
+            Ip32FastMemorySecondaryBus::Memory,
+        );
+        Some(Mips4FastMemoryReadResult::Complete {
+            value,
+            retirement_limit,
+        })
+    }
+
+    fn write_sdram(
+        &mut self,
+        request: Mips4FastMemoryWriteRequest,
+    ) -> Option<Mips4FastMemoryWriteResult> {
+        let length = match request.size() {
+            1 | 2 | 4 | 8 => request.size() as usize,
+            _ => return Some(Mips4FastMemoryWriteResult::InternalError),
+        };
+        let target = request
+            .is_uncached_data_store()
+            .then(|| Crime::synchronous_memory_target(request.physical_address(), length))
+            .flatten()?;
+        let mut sdram = self.sdram?;
+        self.context.record_attempt();
+        let admission = self.admission(
+            request.retired_boundaries(),
+            Ip32FastMemorySecondaryBus::Memory,
+            self.memory_available_ticks,
+        );
+        let Ip32FastMemoryAdmission::Complete {
+            delivery_ticks,
+            code_fetches,
+            retirement_limit,
+        } = admission
+        else {
+            return Some(match admission {
+                Ip32FastMemoryAdmission::Unavailable => Mips4FastMemoryWriteResult::Unavailable,
+                Ip32FastMemoryAdmission::TimelineExhausted => {
+                    Mips4FastMemoryWriteResult::TimelineExhausted
+                }
+                Ip32FastMemoryAdmission::InternalError => Mips4FastMemoryWriteResult::InternalError,
+                Ip32FastMemoryAdmission::Complete { .. } => unreachable!(),
+            });
+        };
+        // SAFETY: `with_sdram` installs this pointer only while the caller
+        // uniquely borrows both the runtime and the SDRAM component.
+        let completed = unsafe { sdram.as_mut() }.write_synchronous_cpu(
+            target,
+            length,
+            request.data(),
+            request.byte_enable(),
+        );
+        if !completed {
+            return Some(Mips4FastMemoryWriteResult::Unavailable);
+        }
+        self.record_memory_write(target.address(), length);
+        self.context.record_completion(
+            delivery_ticks,
+            code_fetches,
+            Ip32FastMemorySecondaryBus::Memory,
+        );
+        Some(Mips4FastMemoryWriteResult::Complete { retirement_limit })
+    }
+
     pub(super) fn elapsed_ticks(&self, code_fetches: u64) -> Option<u64> {
         let code_fetches = if self.context.code_fetch_active() {
             code_fetches
@@ -353,7 +627,24 @@ impl Ip32FastMemoryRuntime {
             .cgi_clock()
             .elapsed(self.context.cgi_completed().checked_mul(2)?)
             .map(SimDuration::get)?;
-        let auxiliary = if self.context.code_fetch_active() && !self.context.code_fetch_shares_cmi()
+        let memory_fetches = if self.context.code_fetch_shares_memory() {
+            code_fetches
+        } else {
+            0
+        };
+        let memory = self
+            .context
+            .memory_clock()
+            .elapsed(
+                self.context
+                    .memory_completed()
+                    .checked_add(memory_fetches)?
+                    .checked_mul(2)?,
+            )
+            .map(SimDuration::get)?;
+        let auxiliary = if self.context.code_fetch_active()
+            && !self.context.code_fetch_shares_cmi()
+            && !self.context.code_fetch_shares_memory()
         {
             self.context
                 .code_aux_clock()
@@ -369,6 +660,7 @@ impl Ip32FastMemoryRuntime {
         sysad
             .checked_add(cmi)?
             .checked_add(cgi)?
+            .checked_add(memory)?
             .checked_add(auxiliary)?
             .checked_add(fixed)
     }
@@ -380,6 +672,7 @@ impl Ip32FastMemoryRuntime {
     ) -> Option<(u64, u64, u64)> {
         let uses_cmi = secondary_bus == Ip32FastMemorySecondaryBus::Cmi;
         let uses_cgi = secondary_bus == Ip32FastMemorySecondaryBus::Cgi;
+        let uses_memory = secondary_bus == Ip32FastMemorySecondaryBus::Memory;
         let cpu = self
             .context
             .cpu_clock()
@@ -445,7 +738,33 @@ impl Ip32FastMemoryRuntime {
                     .checked_add(u64::from(uses_cgi).checked_mul(2)?)?,
             )
             .map(SimDuration::get)?;
-        let auxiliary = if self.context.code_fetch_active() && !self.context.code_fetch_shares_cmi()
+        let shared_memory_fetches = if self.context.code_fetch_shares_memory() {
+            code_fetches
+        } else {
+            0
+        };
+        let memory_prefix = shared_memory_fetches.checked_add(self.context.memory_completed())?;
+        let memory_request = self
+            .context
+            .memory_clock()
+            .elapsed(
+                memory_prefix
+                    .checked_mul(2)?
+                    .checked_add(u64::from(uses_memory))?,
+            )
+            .map(SimDuration::get)?;
+        let memory_completion = self
+            .context
+            .memory_clock()
+            .elapsed(
+                memory_prefix
+                    .checked_mul(2)?
+                    .checked_add(u64::from(uses_memory).checked_mul(2)?)?,
+            )
+            .map(SimDuration::get)?;
+        let auxiliary = if self.context.code_fetch_active()
+            && !self.context.code_fetch_shares_cmi()
+            && !self.context.code_fetch_shares_memory()
         {
             self.context
                 .code_aux_clock()
@@ -462,11 +781,13 @@ impl Ip32FastMemoryRuntime {
         let delivery = common
             .checked_add(sysad_request)?
             .checked_add(cmi_request)?
-            .checked_add(cgi_request)?;
+            .checked_add(cgi_request)?
+            .checked_add(memory_request)?;
         let completion = common
             .checked_add(sysad_completion)?
             .checked_add(cmi_completion)?
-            .checked_add(cgi_completion)?;
+            .checked_add(cgi_completion)?
+            .checked_add(memory_completion)?;
         Some((delivery, completion, code_fetches))
     }
 
@@ -476,6 +797,7 @@ impl Ip32FastMemoryRuntime {
         completed: u64,
         cmi_completed: u64,
         cgi_completed: u64,
+        memory_completed: u64,
     ) -> Option<u64> {
         let code_fetches = if self.context.code_fetch_active() {
             retirements
@@ -507,7 +829,23 @@ impl Ip32FastMemoryRuntime {
             .cgi_clock()
             .elapsed(cgi_completed.checked_mul(2)?)
             .map(SimDuration::get)?;
-        let auxiliary = if self.context.code_fetch_active() && !self.context.code_fetch_shares_cmi()
+        let shared_memory_fetches = if self.context.code_fetch_shares_memory() {
+            code_fetches
+        } else {
+            0
+        };
+        let memory = self
+            .context
+            .memory_clock()
+            .elapsed(
+                shared_memory_fetches
+                    .checked_add(memory_completed)?
+                    .checked_mul(2)?,
+            )
+            .map(SimDuration::get)?;
+        let auxiliary = if self.context.code_fetch_active()
+            && !self.context.code_fetch_shares_cmi()
+            && !self.context.code_fetch_shares_memory()
         {
             self.context
                 .code_aux_clock()
@@ -523,6 +861,7 @@ impl Ip32FastMemoryRuntime {
         cpu.checked_add(sysad)?
             .checked_add(cmi)?
             .checked_add(cgi)?
+            .checked_add(memory)?
             .checked_add(auxiliary)?
             .checked_add(fixed)
     }
@@ -533,21 +872,34 @@ impl Ip32FastMemoryRuntime {
         completed: u64,
         cmi_completed: u64,
         cgi_completed: u64,
+        memory_completed: u64,
+        available_ticks: u64,
     ) -> Option<u64> {
         let mut lower = retired;
         let mut upper = self.context.code_fetch_limit();
-        if self.context.full_budget_admitted() {
+        if self.context.full_budget_admitted() && available_ticks == self.context.available_ticks()
+        {
             return Some(upper);
         }
-        if self.combined_elapsed_ticks(upper, completed, cmi_completed, cgi_completed)?
-            < self.context.available_ticks()
+        if self.combined_elapsed_ticks(
+            upper,
+            completed,
+            cmi_completed,
+            cgi_completed,
+            memory_completed,
+        )? < available_ticks
         {
             return Some(upper);
         }
         while lower < upper {
             let candidate = lower + (upper - lower).div_ceil(2);
-            if self.combined_elapsed_ticks(candidate, completed, cmi_completed, cgi_completed)?
-                < self.context.available_ticks()
+            if self.combined_elapsed_ticks(
+                candidate,
+                completed,
+                cmi_completed,
+                cgi_completed,
+                memory_completed,
+            )? < available_ticks
             {
                 lower = candidate;
             } else {
@@ -572,6 +924,11 @@ impl Ip32FastMemoryRuntime {
             .checked_add(SimDuration::new(self.context.last_cgi_delivery_ticks()))
     }
 
+    pub(super) fn last_memory_delivery_time(&self) -> Option<SimTime> {
+        SimTime::new(self.context.start_time_ticks())
+            .checked_add(SimDuration::new(self.context.last_memory_delivery_ticks()))
+    }
+
     pub(super) fn last_code_delivery_time(
         &self,
         code_fetches: u64,
@@ -589,6 +946,9 @@ impl Ip32FastMemoryRuntime {
         ))?;
         let cgi_before = self.context.cgi_completed().checked_sub(u64::from(
             self.context.last_cgi_transaction_fetch() == code_fetches,
+        ))?;
+        let memory_before = self.context.memory_completed().checked_sub(u64::from(
+            self.context.last_memory_transaction_fetch() == code_fetches,
         ))?;
         let cpu = self
             .context
@@ -615,6 +975,23 @@ impl Ip32FastMemoryRuntime {
                         .checked_add(u64::from(auxiliary_delivery))?,
                 )
                 .map(SimDuration::get)?
+        } else if self.context.code_fetch_shares_memory() {
+            let memory = self
+                .context
+                .memory_clock()
+                .elapsed(
+                    previous_fetches
+                        .checked_add(memory_before)?
+                        .checked_mul(2)?
+                        .checked_add(u64::from(auxiliary_delivery))?,
+                )
+                .map(SimDuration::get)?;
+            let cmi = self
+                .context
+                .cmi_clock()
+                .elapsed(cmi_before.checked_mul(2)?)
+                .map(SimDuration::get)?;
+            memory.checked_add(cmi)?
         } else {
             let code = self
                 .context
@@ -651,13 +1028,14 @@ impl Ip32FastMemoryRuntime {
 
     fn retirement_limit(
         &self,
-        request: Mips4FastMemoryReadRequest,
+        retired_boundaries: u64,
         completion_ticks: u64,
         secondary_bus: Ip32FastMemorySecondaryBus,
+        available_ticks: u64,
     ) -> Option<u64> {
         if self.context.code_fetch_active() {
             return self.combined_retirement_limit(
-                request.retired_boundaries(),
+                retired_boundaries,
                 self.context.completed().checked_add(1)?,
                 self.context
                     .cmi_completed()
@@ -665,16 +1043,14 @@ impl Ip32FastMemoryRuntime {
                 self.context
                     .cgi_completed()
                     .checked_add(u64::from(secondary_bus == Ip32FastMemorySecondaryBus::Cgi))?,
+                self.context.memory_completed().checked_add(u64::from(
+                    secondary_bus == Ip32FastMemorySecondaryBus::Memory,
+                ))?,
+                available_ticks,
             );
         }
-        let cpu_ticks = self
-            .context
-            .cpu_clock()
-            .elapsed(request.retired_boundaries())?
-            .get();
-        let cpu_tick_limit = self
-            .context
-            .available_ticks()
+        let cpu_ticks = self.context.cpu_clock().elapsed(retired_boundaries)?.get();
+        let cpu_tick_limit = available_ticks
             .checked_sub(completion_ticks.saturating_sub(cpu_ticks))?
             .checked_sub(1)?;
         cpu_tick_limit
@@ -710,6 +1086,9 @@ impl Ip32FastMemoryRuntime {
 
 impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
     fn read(&mut self, request: Mips4FastMemoryReadRequest) -> Mips4FastMemoryReadResult {
+        if let Some(result) = self.read_sdram(request) {
+            return result;
+        }
         const CANDIDATE_RANGE: core::ops::Range<u64> =
             se_device::chipset::crime::registers::CRIME_BASE
                 ..se_device::chipset::mace::registers::PRIMARY_END;
@@ -731,12 +1110,17 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
             8 => request.physical_address() == se_device::chipset::mace::registers::UST,
             _ => false,
         };
+        let mace_ps2_status = self
+            .context
+            .mace_ps2_status
+            .iter()
+            .find_map(|projection| projection.read(request.physical_address(), request.size()));
         let gbe_frame_active = request.size() == 4
             && request.physical_address() == self.gbe_frame_active.physical_address;
-        if !crime_timer && !mace_ust && !gbe_frame_active {
+        if !crime_timer && !mace_ust && mace_ps2_status.is_none() && !gbe_frame_active {
             return Mips4FastMemoryReadResult::Unavailable;
         }
-        let secondary_bus = if mace_ust {
+        let secondary_bus = if mace_ust || mace_ps2_status.is_some() {
             Ip32FastMemorySecondaryBus::Cmi
         } else if gbe_frame_active {
             Ip32FastMemorySecondaryBus::Cgi
@@ -759,9 +1143,12 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
                 Mips4FastMemoryReadResult::TimelineExhausted
             };
         }
-        let Some(retirement_limit) =
-            self.retirement_limit(request, completion_ticks, secondary_bus)
-        else {
+        let Some(retirement_limit) = self.retirement_limit(
+            request.retired_boundaries(),
+            completion_ticks,
+            secondary_bus,
+            self.context.available_ticks(),
+        ) else {
             return Mips4FastMemoryReadResult::InternalError;
         };
         if retirement_limit <= request.retired_boundaries() {
@@ -776,7 +1163,9 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
         else {
             return Mips4FastMemoryReadResult::InternalError;
         };
-        let value = if mace_ust {
+        let value = if let Some(value) = mace_ps2_status {
+            value
+        } else if mace_ust {
             let Some(value) = self.mace_ust_value(delivery_time, request.size()) else {
                 return Mips4FastMemoryReadResult::Unavailable;
             };
@@ -811,6 +1200,11 @@ impl Mips4FastMemoryRuntime for Ip32FastMemoryRuntime {
             value,
             retirement_limit,
         }
+    }
+
+    fn write(&mut self, request: Mips4FastMemoryWriteRequest) -> Mips4FastMemoryWriteResult {
+        let result = self.write_sdram(request);
+        result.unwrap_or(Mips4FastMemoryWriteResult::Unavailable)
     }
 
     fn completed_transactions(&self) -> u64 {
@@ -921,6 +1315,12 @@ where
     else {
         return Ok(None);
     };
+    let Some(mace_ps2_status) = registry
+        .get_resolved(control.slots.mace)?
+        .synchronous_ps2_status_projections()
+    else {
+        return Ok(None);
+    };
     let Some(crime_timer) = registry
         .get_resolved(control.slots.crime)?
         .synchronous_timer_projection()
@@ -933,6 +1333,12 @@ where
     let limit = context
         .next_event_time()
         .map_or(context.deadline(), |event| event.min(context.deadline()));
+    let memory_refresh_available_ticks = registry
+        .get_resolved(control.slots.memory)?
+        .stable_fetch_refresh_deadline()
+        .map_or(u64::MAX, |refresh| {
+            refresh.get().saturating_sub(context.now().get())
+        });
     let external_available_ticks = limit.get().saturating_sub(context.now().get());
     if external_available_ticks == 0 {
         return Ok(None);
@@ -943,9 +1349,12 @@ where
         .min(FAST_MEMORY_SLICE_MAX_BOUNDARIES) as u64;
     let maximum_shared_bus_cycles = maximum_boundaries.saturating_mul(4);
     let maximum_code_bus_cycles = maximum_boundaries.saturating_mul(2);
-    let memory_clock = registry
+    let Some(memory_clock) = registry
         .get_resolved(control.slots.memory)?
-        .stable_fetch_clock();
+        .stable_fetch_clock()
+    else {
+        return Ok(None);
+    };
     let isa_delay = registry
         .get_resolved(control.slots.isa)?
         .stable_fetch_delay()
@@ -967,11 +1376,10 @@ where
                 .elapsed(maximum_code_bus_cycles)
                 .and_then(|cgi| ticks.checked_add(cgi.get()))
         })
-        .and_then(|ticks| match memory_clock {
-            Some(memory) => memory
-                .elapsed(maximum_code_bus_cycles)
-                .and_then(|memory| ticks.checked_add(memory.get())),
-            None => Some(ticks),
+        .and_then(|ticks| {
+            memory_clock
+                .elapsed(maximum_shared_bus_cycles)
+                .and_then(|memory| ticks.checked_add(memory.get()))
         })
         .and_then(|ticks| {
             isa_delay
@@ -981,6 +1389,7 @@ where
         .and_then(|ticks| ticks.checked_add(1))
         .unwrap_or(external_available_ticks);
     let available_ticks = external_available_ticks.min(fast_horizon_ticks);
+    let memory_available_ticks = available_ticks.min(memory_refresh_available_ticks);
     let fast_context = Ip32FastMemoryContext::new(
         context.now().get(),
         available_ticks,
@@ -989,13 +1398,20 @@ where
         sysad_clock,
         cmi_clock,
         cgi_clock,
+        memory_clock,
         crime_timer,
         mace_ust,
+        mace_ps2_status,
         fast_horizon_ticks <= external_available_ticks,
     );
     Ok(Some(Ip32FastMemoryRuntime {
         context: fast_context,
         gbe_frame_active,
+        sdram: None,
+        memory_available_ticks,
+        memory_reads: 0,
+        memory_writes: 0,
+        memory_write_ranges: Ip32FastMemoryWriteRanges::new(),
     }))
 }
 
@@ -1063,6 +1479,7 @@ where
     }
     let cmi_completed = runtime.context.cmi_completed();
     let cgi_completed = runtime.context.cgi_completed();
+    let memory_completed = runtime.context.memory_completed();
     let (prom_fetches, ram_fetches) = match code_source {
         Some(Ip32StableCodeSource::SystemFlash) => (code_fetches_usize, 0),
         Some(Ip32StableCodeSource::Sdram) => (0, code_fetches_usize),
@@ -1085,6 +1502,11 @@ where
             usize::try_from(cgi_completed)
                 .ok()
                 .and_then(|cgi| transactions.checked_add(cgi))
+        })
+        .and_then(|transactions| {
+            usize::try_from(memory_completed)
+                .ok()
+                .and_then(|memory| transactions.checked_add(memory))
         })
         .ok_or_else(|| {
             Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
@@ -1119,7 +1541,18 @@ where
             "a fast-memory CGI batch lost idle link ownership".to_owned(),
         )));
     }
-    if ram_fetches != 0
+    let ram_transactions = ram_fetches
+        .checked_add(usize::try_from(memory_completed).map_err(|_| {
+            Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                "fast-memory SDRAM count did not fit the host ABI".to_owned(),
+            ))
+        })?)
+        .ok_or_else(|| {
+            Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                "combined SDRAM transaction count overflowed".to_owned(),
+            ))
+        })?;
+    if ram_transactions != 0
         && !registry
             .get_resolved(control.slots.memory)?
             .stable_fetch_ready()
@@ -1176,10 +1609,10 @@ where
                 ))
             })?);
     }
-    if ram_fetches != 0 {
+    if ram_transactions != 0 {
         registry
             .get_resolved_mut(control.slots.memory)?
-            .commit_stable_fetches(ram_fetches);
+            .commit_stable_fetches(ram_transactions);
     }
     if code_fetches != 0 {
         let last_code_delivery = runtime
@@ -1195,6 +1628,21 @@ where
         {
             return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
                 "a stable-code batch lost CRIME ownership during commit".to_owned(),
+            )));
+        }
+    }
+    if memory_completed != 0 {
+        let last_memory_delivery = runtime.last_memory_delivery_time().ok_or_else(|| {
+            Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                "a fast-memory SDRAM batch lost its final delivery time".to_owned(),
+            ))
+        })?;
+        if !registry
+            .get_resolved_mut(control.slots.crime)?
+            .account_synchronous_cpu_memory_transactions(memory_completed, last_memory_delivery)?
+        {
+            return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                "a fast-memory SDRAM batch lost CRIME ownership during commit".to_owned(),
             )));
         }
     }
@@ -1265,7 +1713,7 @@ where
         })?;
         if !registry
             .get_resolved_mut(control.slots.mace)?
-            .commit_synchronous_ust_reads(cmi_completed, last_cmi_delivery)
+            .commit_synchronous_cmi_reads(cmi_completed, last_cmi_delivery)
         {
             return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
                 "a fast-memory CMI batch lost MACE ownership during commit".to_owned(),
@@ -1287,9 +1735,53 @@ where
     control.cgi_transactions = control.cgi_transactions.saturating_add(cgi_completed);
     control.memory_transactions = control
         .memory_transactions
-        .saturating_add(ram_fetches as u64);
+        .saturating_add(ram_transactions as u64);
+    control.fast_transaction_reads = control
+        .fast_transaction_reads
+        .saturating_add(runtime.memory_reads);
+    control.fast_transaction_writes = control
+        .fast_transaction_writes
+        .saturating_add(runtime.memory_writes);
+    if runtime.memory_write_ranges.overflowed() {
+        invalidate_ram_code_sources(control, None);
+    } else {
+        for &(start, end) in runtime.memory_write_ranges.ranges() {
+            invalidate_ram_code_sources(
+                control,
+                usize::try_from(end.saturating_sub(start))
+                    .ok()
+                    .map(|length| (start, length)),
+            );
+        }
+    }
     if let Some(source) = code_source {
         control.jit_code_fetches.record(source, code_fetches);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_memory_write_ranges_merge_only_overlapping_or_adjacent_writes() {
+        let mut ranges = Ip32FastMemoryWriteRanges::new();
+        ranges.record(0x1000, 8);
+        ranges.record(0x1008, 4);
+        ranges.record(0x9000, 8);
+        let mut recorded = ranges.ranges().to_vec();
+        recorded.sort_unstable();
+        assert_eq!(recorded, vec![(0x1000, 0x100c), (0x9000, 0x9008)]);
+        assert!(!ranges.overflowed());
+    }
+
+    #[test]
+    fn fast_memory_write_ranges_fall_back_when_capacity_is_exhausted() {
+        let mut ranges = Ip32FastMemoryWriteRanges::new();
+        for index in 0..=FAST_MEMORY_WRITE_RANGE_CAPACITY {
+            ranges.record(index as u64 * 0x1000, 8);
+        }
+        assert!(ranges.overflowed());
+    }
 }

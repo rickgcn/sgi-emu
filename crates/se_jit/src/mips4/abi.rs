@@ -32,6 +32,7 @@ pub(super) struct Mips4NativeCallContext {
     runtime_call: usize,
     fast_memory_context: *mut (),
     fast_memory_read: usize,
+    fast_memory_write: usize,
     native_fast_memory_context: *mut Mips4NativeFastMemoryContext,
     native_affine_poll: usize,
     fast_memory_result: Mips4FastMemoryReadAbiResult,
@@ -48,6 +49,7 @@ impl Mips4NativeCallContext {
             runtime_call: 0,
             fast_memory_context: core::ptr::null_mut(),
             fast_memory_read: 0,
+            fast_memory_write: 0,
             native_fast_memory_context: core::ptr::null_mut(),
             native_affine_poll: mips4_native_affine_poll_trampoline as *const () as usize,
             fast_memory_result: Mips4FastMemoryReadAbiResult::default(),
@@ -133,6 +135,8 @@ where
             self.context.fast_memory_context = core::ptr::from_mut(&mut self.binding).cast();
             self.context.fast_memory_read =
                 mips4_fast_memory_read_trampoline::<R> as *const () as usize;
+            self.context.fast_memory_write =
+                mips4_fast_memory_write_trampoline::<R> as *const () as usize;
             self.context.native_fast_memory_context =
                 reborrow_fast_memory(&mut self.binding.fast_memory)
                     .and_then(Mips4FastMemoryRuntime::native_context)
@@ -242,6 +246,64 @@ where
     .unwrap_or(3)
 }
 
+extern "C" fn mips4_fast_memory_write_trampoline<R>(
+    context: *mut (),
+    physical_address: u64,
+    retired_boundaries: u64,
+    size: u32,
+    data: u64,
+    byte_enable: u32,
+    result: *mut Mips4FastMemoryReadAbiResult,
+) -> u32
+where
+    R: Mips4BlockRuntime,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null() || result.is_null() || byte_enable > u32::from(u8::MAX) {
+            return 3;
+        }
+        // SAFETY: Native invocation owns the live binding during the call.
+        let binding = unsafe { &mut *context.cast::<Mips4NativeRuntimeBinding<'_, '_, R>>() };
+        let Some(runtime) = reborrow_fast_memory(&mut binding.fast_memory) else {
+            return 0;
+        };
+        let size = match size {
+            1 => Mips4ExecutionTransferSize::Byte,
+            2 => Mips4ExecutionTransferSize::Halfword,
+            4 => Mips4ExecutionTransferSize::Word,
+            8 => Mips4ExecutionTransferSize::Doubleword,
+            _ => return 3,
+        };
+        let request = Mips4FastMemoryWriteRequest::new(
+            physical_address,
+            size,
+            data,
+            byte_enable as u8,
+            Mips4MemoryAccessType::Uncached,
+            retired_boundaries,
+        );
+        match runtime.write(request) {
+            Mips4FastMemoryWriteResult::Unavailable => 0,
+            Mips4FastMemoryWriteResult::Complete { retirement_limit } => {
+                if retirement_limit <= retired_boundaries {
+                    return 2;
+                }
+                // SAFETY: The native invocation supplied a live result slot.
+                unsafe {
+                    *result = Mips4FastMemoryReadAbiResult {
+                        value: 0,
+                        retirement_limit,
+                    };
+                }
+                1
+            }
+            Mips4FastMemoryWriteResult::TimelineExhausted => 2,
+            Mips4FastMemoryWriteResult::InternalError => 3,
+        }
+    }))
+    .unwrap_or(3)
+}
+
 pub(super) const fn block_exit_code(exit: Mips4BlockExit) -> u32 {
     match exit {
         Mips4BlockExit::BudgetExhausted => 1,
@@ -318,6 +380,8 @@ pub(super) const MIPS4_NATIVE_CALL_FAST_MEMORY_CONTEXT_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeCallContext, fast_memory_context) as i32;
 pub(super) const MIPS4_NATIVE_CALL_FAST_MEMORY_READ_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeCallContext, fast_memory_read) as i32;
+pub(super) const MIPS4_NATIVE_CALL_FAST_MEMORY_WRITE_OFFSET: i32 =
+    core::mem::offset_of!(Mips4NativeCallContext, fast_memory_write) as i32;
 pub(super) const MIPS4_NATIVE_CALL_NATIVE_FAST_MEMORY_CONTEXT_OFFSET: i32 =
     core::mem::offset_of!(Mips4NativeCallContext, native_fast_memory_context) as i32;
 pub(super) const MIPS4_NATIVE_CALL_NATIVE_AFFINE_POLL_OFFSET: i32 =

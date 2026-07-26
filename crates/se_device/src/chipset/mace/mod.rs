@@ -120,6 +120,24 @@ impl fmt::Display for MaceError {
 
 impl std::error::Error for MaceError {}
 
+/// Immutable side-effect-free MACE register value captured for a bounded read batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaceSynchronousReadProjection {
+    physical_address: u64,
+    value: u64,
+}
+
+impl MaceSynchronousReadProjection {
+    /// Completes the projected aligned doubleword read in physical byte-lane order.
+    pub const fn read(self, physical_address: u64, size: u32) -> Option<u64> {
+        if physical_address == self.physical_address && size == 8 {
+            Some(self.value.swap_bytes())
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingIsa {
     cmi_id: CrimeTransactionId,
@@ -471,8 +489,18 @@ impl Mace {
             .flatten()
     }
 
-    /// Commits time observed by a proven batch of side-effect-free UST reads.
-    pub fn commit_synchronous_ust_reads(
+    /// Captures the two side-effect-free PS/2 status registers while CMI is idle.
+    pub fn synchronous_ps2_status_projections(&self) -> Option<[MaceSynchronousReadProjection; 2]> {
+        self.stable_prom_fetch_ready().then(|| {
+            std::array::from_fn(|port| MaceSynchronousReadProjection {
+                physical_address: registers::PS2_BASE + port as u64 * 0x20 + 0x18,
+                value: u64::from(self.ps2[port].status()),
+            })
+        })
+    }
+
+    /// Commits time observed by a proven batch of side-effect-free CMI reads.
+    pub fn commit_synchronous_cmi_reads(
         &mut self,
         reads: u64,
         last_delivery_time: SimTime,

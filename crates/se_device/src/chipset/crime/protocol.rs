@@ -77,6 +77,29 @@ pub enum CrimeSysAdRoute {
     Unsupported,
 }
 
+/// Decoded SDRAM target for one side-effect-free synchronous CPU access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CrimeSynchronousMemoryTarget {
+    address: u64,
+    no_ecc: bool,
+}
+
+impl CrimeSynchronousMemoryTarget {
+    pub(super) const fn new(address: u64, no_ecc: bool) -> Self {
+        Self { address, no_ecc }
+    }
+
+    /// Returns the MIU-local byte address.
+    pub const fn address(self) -> u64 {
+        self.address
+    }
+
+    /// Returns whether ECC checking is bypassed.
+    pub const fn no_ecc(self) -> bool {
+        self.no_ecc
+    }
+}
+
 /// Origin of a request competing for CRIME memory service.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,

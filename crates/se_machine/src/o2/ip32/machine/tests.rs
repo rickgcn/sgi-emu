@@ -573,6 +573,47 @@ fn jit_fast_mace_ust_word_loop_matches_scalar() {
 
 #[cfg(feature = "jit")]
 #[test]
+fn jit_fast_mace_ps2_status_loop_matches_scalar() {
+    let program = [
+        (0x00, i_type(0x0f, 0, 8, 0xbf32)),
+        (0x04, i_type(0x09, 0, 9, 1024)),
+        (0x08, i_type(0x37, 8, 10, 0x0018)),
+        (0x0c, i_type(0x09, 9, 9, u16::MAX)),
+        (0x10, i_type(0x05, 9, 0, 0xfffd)),
+        (0x14, 0),
+        (0x18, WAIT),
+    ];
+    let scalar_config = config_with_program(&program);
+    let mut jit_config = scalar_config.clone();
+    jit_config.jit_enabled = true;
+    let mut scalar = Ip32Machine::from_config(scalar_config).unwrap();
+    let mut jit = Ip32Machine::from_config(jit_config).unwrap();
+    scalar.schedule_power_on().unwrap();
+    jit.schedule_power_on().unwrap();
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Baseline);
+    finish_jit_compilation_tier(&mut jit, JitCompilationTier::Region);
+
+    let deadline = SimTime::new(20_000_000);
+    scalar.run_until_time(deadline).unwrap();
+    jit.run_until_time(deadline).unwrap();
+    assert_machine_architecture_equal(&scalar, &jit);
+    assert_eq!(
+        scalar.performance_snapshot().cpu.retired_instructions,
+        jit.performance_snapshot().cpu.retired_instructions
+    );
+    assert_eq!(
+        scalar.performance_snapshot().sysad_transactions,
+        jit.performance_snapshot().sysad_transactions
+    );
+    assert_eq!(
+        scalar.performance_snapshot().cmi_transactions,
+        jit.performance_snapshot().cmi_transactions
+    );
+    assert!(jit.performance_snapshot().jit.fast_transaction_hits > 0);
+}
+
+#[cfg(feature = "jit")]
+#[test]
 fn jit_fast_crime_timer_loop_matches_scalar() {
     let program = [
         (0x00, i_type(0x0f, 0, 8, 0xb400)),
@@ -2783,7 +2824,6 @@ fn local_ip32_prom_reinitializes_gbe_with_identity_gamma() {
             cpu.state().pc(),
         );
     }
-
     let menu_settle_deadline = SimTime::new(
         machine
             .runtime()
