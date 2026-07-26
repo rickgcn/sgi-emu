@@ -56,6 +56,8 @@ impl Hasher for Mips4BlockKeyHasher {
 }
 
 type Mips4BlockIndexMap = HashMap<Mips4BlockKey, usize, BuildHasherDefault<Mips4BlockKeyHasher>>;
+type Mips4RegionDependencyMap =
+    HashMap<Mips4BlockKey, Vec<usize>, BuildHasherDefault<Mips4BlockKeyHasher>>;
 
 /// Number of block entries before a native backend compiles a block.
 pub const MIPS4_BLOCK_HOT_THRESHOLD: u64 = 64;
@@ -74,6 +76,7 @@ const MIPS4_REGION_MIN_SUCCESSOR_OBSERVATIONS: u64 = 256;
 const MIPS4_REGION_DOMINANT_DIRECT_PERCENT: u64 = 75;
 const MIPS4_REGION_DOMINANT_INDIRECT_PERCENT: u64 = 90;
 pub(super) const MIPS4_REGION_MIN_ACYCLIC_OPERATIONS: usize = 16;
+const MIPS4_BLOCK_RETRY_OPERATIONS: u64 = 4_096;
 const MIPS4_REGION_RETRY_OPERATIONS: u64 = 65_536;
 const MIPS4_BLOCK_DISPATCH_CACHE_CAPACITY: usize = MIPS4_BLOCK_CACHE_CAPACITY;
 
@@ -90,6 +93,14 @@ pub trait Mips4CodegenBackend {
 
     /// Compiles one verified domain block.
     fn compile(&mut self, block: &Mips4Block) -> Result<Self::CompiledBlock, Self::Error>;
+
+    /// Attempts to admit one block compilation without waiting for backend capacity.
+    fn try_compile(
+        &mut self,
+        block: &Mips4Block,
+    ) -> Result<Option<Self::CompiledBlock>, Self::Error> {
+        self.compile(block).map(Some)
+    }
 
     /// Polls one baseline compilation without blocking.
     fn block_compilation_status(
@@ -115,6 +126,14 @@ pub trait Mips4CodegenBackend {
     /// Compiles one verified bounded Region.
     fn compile_region(&mut self, region: &Mips4Region)
     -> Result<Self::CompiledRegion, Self::Error>;
+
+    /// Attempts to admit one Region compilation without waiting for backend capacity.
+    fn try_compile_region(
+        &mut self,
+        region: &Mips4Region,
+    ) -> Result<Option<Self::CompiledRegion>, Self::Error> {
+        self.compile_region(region).map(Some)
+    }
 
     /// Polls one Region compilation without blocking.
     fn region_compilation_status(
@@ -505,6 +524,7 @@ struct Mips4BlockRecord<C, R> {
     guard_mutating: bool,
     guard_validation_epoch: Option<u64>,
     operation_hotness: u64,
+    block_next_compile_hotness: u64,
     compiled: Option<C>,
     region_hotness: u64,
     region_next_compile_hotness: u64,
@@ -566,17 +586,24 @@ where
     record.operation_hotness = record
         .operation_hotness
         .saturating_add(frame.operations_executed());
-    let promoted =
-        record.compiled.is_none() && record.operation_hotness >= MIPS4_BLOCK_HOT_THRESHOLD;
+    let compile_due =
+        record.compiled.is_none() && record.operation_hotness >= record.block_next_compile_hotness;
+    let mut promoted = false;
     let mut compile_nanos = 0;
-    if promoted {
+    if compile_due {
         let started = std::time::Instant::now();
-        record.compiled = Some(
-            backend
-                .compile(&record.block)
-                .map_err(Mips4BlockEngineError::Backend)?,
-        );
+        let compiled = backend
+            .try_compile(&record.block)
+            .map_err(Mips4BlockEngineError::Backend)?;
         compile_nanos = duration_nanos(started.elapsed());
+        if let Some(compiled) = compiled {
+            record.compiled = Some(compiled);
+            promoted = true;
+        } else {
+            record.block_next_compile_hotness = record
+                .operation_hotness
+                .saturating_add(MIPS4_BLOCK_RETRY_OPERATIONS);
+        }
     }
     Ok((exit, promoted, compile_nanos))
 }
@@ -602,6 +629,7 @@ where
     free_records: Vec<usize>,
     dispatch_cache: Vec<Option<Mips4BlockDispatchEntry>>,
     last_dispatch: Cell<Option<Mips4BlockDispatchEntry>>,
+    region_dependencies: Mips4RegionDependencyMap,
     region_count: usize,
     statistics: Mips4BlockEngineStatistics,
 }
@@ -619,6 +647,7 @@ where
             free_records: Vec::new(),
             dispatch_cache: vec![None; MIPS4_BLOCK_DISPATCH_CACHE_CAPACITY],
             last_dispatch: Cell::new(None),
+            region_dependencies: HashMap::default(),
             region_count: 0,
             statistics: Mips4BlockEngineStatistics::default(),
         }
@@ -670,6 +699,7 @@ where
             guard_mutating,
             guard_validation_epoch: None,
             operation_hotness: 0,
+            block_next_compile_hotness: MIPS4_BLOCK_HOT_THRESHOLD,
             compiled: None,
             region_hotness: 0,
             region_next_compile_hotness: MIPS4_REGION_HOT_THRESHOLD,
@@ -679,12 +709,12 @@ where
         if let Some(index) = self.indices.get(&key).copied() {
             self.remove_dispatch_entry(key);
             self.invalidate_regions_depending_on(key);
-            if self.records[index]
-                .as_ref()
-                .is_some_and(|record| record.compiled_region.is_some())
-            {
-                self.region_count = self.region_count.saturating_sub(1);
-            }
+            debug_assert!(
+                self.records[index]
+                    .as_ref()
+                    .is_none_or(|record| record.compiled_region.is_none()),
+                "every compiled Region must depend on its entry block"
+            );
             self.records[index] = Some(record);
             self.install_dispatch_entry(key, index);
         } else {
@@ -727,14 +757,15 @@ where
     /// Removes one block after a failed visibility guard.
     pub fn invalidate(&mut self, key: Mips4BlockKey) -> bool {
         self.remove_dispatch_entry(key);
+        self.invalidate_regions_depending_on(key);
         let removed = if let Some(index) = self.indices.remove(&key) {
             let record = self.records[index].take();
-            if record
-                .as_ref()
-                .is_some_and(|record| record.compiled_region.is_some())
-            {
-                self.region_count = self.region_count.saturating_sub(1);
-            }
+            debug_assert!(
+                record
+                    .as_ref()
+                    .is_none_or(|record| record.compiled_region.is_none()),
+                "every compiled Region must depend on its entry block"
+            );
             let removed = record.is_some();
             if removed {
                 self.free_records.push(index);
@@ -743,7 +774,6 @@ where
         } else {
             false
         };
-        self.invalidate_regions_depending_on(key);
         if removed {
             self.statistics.invalidated_blocks =
                 self.statistics.invalidated_blocks.saturating_add(1);
@@ -752,18 +782,50 @@ where
     }
 
     fn invalidate_regions_depending_on(&mut self, key: Mips4BlockKey) {
-        for record in self.records.iter_mut() {
-            let Some(record) = record.as_mut() else {
-                continue;
+        let Some(dependent_regions) = self.region_dependencies.get(&key).cloned() else {
+            return;
+        };
+        for entry_index in dependent_regions {
+            self.invalidate_region(entry_index);
+        }
+        debug_assert!(
+            !self.region_dependencies.contains_key(&key),
+            "invalidating a block must remove every reverse Region dependency"
+        );
+    }
+
+    fn invalidate_region(&mut self, entry_index: usize) {
+        let member_keys = {
+            let Some(record) = self.records.get_mut(entry_index).and_then(Option::as_mut) else {
+                return;
             };
-            let depends_on_key = record
-                .compiled_region
-                .as_ref()
-                .is_some_and(|region| region.member_keys.contains(&key));
-            if depends_on_key {
-                record.compiled_region = None;
-                record.region_next_compile_hotness = record.region_hotness;
-                self.region_count = self.region_count.saturating_sub(1);
+            let Some(region) = record.compiled_region.take() else {
+                return;
+            };
+            record.region_next_compile_hotness = record
+                .region_hotness
+                .saturating_add(MIPS4_REGION_RETRY_OPERATIONS);
+            region.member_keys
+        };
+        for member_key in member_keys {
+            let remove_key = if let Some(entries) = self.region_dependencies.get_mut(&member_key) {
+                entries.retain(|index| *index != entry_index);
+                entries.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                self.region_dependencies.remove(&member_key);
+            }
+        }
+        self.region_count = self.region_count.saturating_sub(1);
+    }
+
+    fn register_region_dependencies(&mut self, entry_index: usize, member_keys: &[Mips4BlockKey]) {
+        for key in member_keys {
+            let entries = self.region_dependencies.entry(*key).or_default();
+            if !entries.contains(&entry_index) {
+                entries.push(entry_index);
             }
         }
     }
@@ -803,18 +865,27 @@ where
         let compile_started = std::time::Instant::now();
         let compiled = self
             .backend
-            .compile_region(&region)
+            .try_compile_region(&region)
             .map_err(Mips4BlockEngineError::Backend)?;
         self.statistics.region_compile_nanos = self
             .statistics
             .region_compile_nanos
             .saturating_add(duration_nanos(compile_started.elapsed()));
+        let Some(compiled) = compiled else {
+            if let Some(record) = self.records.get_mut(entry_index).and_then(Option::as_mut) {
+                record.region_next_compile_hotness = record
+                    .region_hotness
+                    .saturating_add(MIPS4_REGION_RETRY_OPERATIONS);
+            }
+            return Ok(());
+        };
         let Some(record) = self.records.get_mut(entry_index).and_then(Option::as_mut) else {
             return Err(Mips4BlockEngineError::MissingBlock(Box::new(entry_key)));
         };
         if record.block.key() != entry_key || record.compiled_region.is_some() {
             return Ok(());
         }
+        let dependency_keys = member_keys.clone();
         record.compiled_region = Some(Mips4CompiledRegionRecord {
             compiled,
             runtime_operations,
@@ -825,6 +896,7 @@ where
         record.region_next_compile_hotness = u64::MAX;
         self.region_count += 1;
         self.statistics.region_compilations = self.statistics.region_compilations.saturating_add(1);
+        self.register_region_dependencies(entry_index, &dependency_keys);
         Ok(())
     }
 
@@ -1184,6 +1256,7 @@ where
         self.free_records.clear();
         self.dispatch_cache.fill(None);
         self.last_dispatch.set(None);
+        self.region_dependencies.clear();
         self.region_count = 0;
         self.backend
             .clear()
@@ -2223,6 +2296,74 @@ mod tests {
             record.region_next_compile_hotness,
             MIPS4_REGION_HOT_THRESHOLD + MIPS4_REGION_RETRY_OPERATIONS
         );
+    }
+
+    #[test]
+    fn dependency_invalidation_delays_region_recompilation() {
+        let source = Mips4BlockSource::Stable(code_guard());
+        let first = block(0x1000, source);
+        let second = block(0x1004, source);
+        let third = block(0x1008, source);
+        let first_key = first.key();
+        let second_key = second.key();
+        let third_key = third.key();
+        let mut engine = Mips4BlockEngine::new(TestBackend);
+        engine.insert(first).unwrap();
+        engine.insert(second).unwrap();
+        engine.insert(third).unwrap();
+        let first_index = engine.record_index(first_key).unwrap();
+        let second_index = engine.record_index(second_key).unwrap();
+        let third_index = engine.record_index(third_key).unwrap();
+        let record = engine.records[first_index].as_mut().unwrap();
+        record.region_hotness = MIPS4_REGION_HOT_THRESHOLD;
+        record.region_next_compile_hotness = MIPS4_REGION_HOT_THRESHOLD;
+        record.successors[0] = Mips4SuccessorProfile {
+            key: Some(second_key),
+            observations: MIPS4_REGION_MIN_SUCCESSOR_OBSERVATIONS,
+        };
+        engine.records[second_index].as_mut().unwrap().successors[0] = Mips4SuccessorProfile {
+            key: Some(first_key),
+            observations: MIPS4_REGION_MIN_SUCCESSOR_OBSERVATIONS,
+        };
+        let record = engine.records[third_index].as_mut().unwrap();
+        record.region_hotness = MIPS4_REGION_HOT_THRESHOLD;
+        record.region_next_compile_hotness = MIPS4_REGION_HOT_THRESHOLD;
+        record.successors[0] = Mips4SuccessorProfile {
+            key: Some(second_key),
+            observations: MIPS4_REGION_MIN_SUCCESSOR_OBSERVATIONS,
+        };
+        engine.maybe_compile_region(first_index).unwrap();
+        engine.maybe_compile_region(third_index).unwrap();
+        assert!(
+            engine.records[first_index]
+                .as_ref()
+                .unwrap()
+                .compiled_region
+                .is_some()
+        );
+        assert!(
+            engine.records[third_index]
+                .as_ref()
+                .unwrap()
+                .compiled_region
+                .is_some()
+        );
+
+        assert!(engine.invalidate(second_key));
+
+        let first_record = engine.records[first_index].as_ref().unwrap();
+        assert!(first_record.compiled_region.is_none());
+        assert_eq!(
+            first_record.region_next_compile_hotness,
+            MIPS4_REGION_HOT_THRESHOLD + MIPS4_REGION_RETRY_OPERATIONS
+        );
+        let third_record = engine.records[third_index].as_ref().unwrap();
+        assert!(third_record.compiled_region.is_none());
+        assert_eq!(
+            third_record.region_next_compile_hotness,
+            MIPS4_REGION_HOT_THRESHOLD + MIPS4_REGION_RETRY_OPERATIONS
+        );
+        assert!(engine.region_dependencies.is_empty());
     }
 
     #[test]

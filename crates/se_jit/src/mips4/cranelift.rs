@@ -4,8 +4,8 @@ use core::{cell::Cell, fmt, mem, ptr::NonNull};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, JoinHandle},
     time::Instant,
@@ -77,15 +77,20 @@ struct NativeCompilationResult {
 #[derive(Debug)]
 struct NativeCompilation {
     receiver: Receiver<Result<NativeCompilationResult, CraneliftMips4Error>>,
+    cancelled: Arc<AtomicBool>,
     entry: Cell<Option<NonNull<u8>>>,
     compilation_nanos: Cell<u64>,
     reported: Cell<bool>,
 }
 
 impl NativeCompilation {
-    fn new(receiver: Receiver<Result<NativeCompilationResult, CraneliftMips4Error>>) -> Self {
+    fn new(
+        receiver: Receiver<Result<NativeCompilationResult, CraneliftMips4Error>>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             receiver,
+            cancelled,
             entry: Cell::new(None),
             compilation_nanos: Cell::new(0),
             reported: Cell::new(false),
@@ -137,11 +142,18 @@ impl NativeCompilation {
     }
 }
 
+impl Drop for NativeCompilation {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
 enum BaselineCompilerCommand {
     Compile {
         generation: u64,
         block: Box<Mips4Block>,
         result: Sender<Result<NativeCompilationResult, CraneliftMips4Error>>,
+        cancelled: Arc<AtomicBool>,
     },
     Clear,
     Shutdown,
@@ -152,6 +164,7 @@ enum RegionCompilerCommand {
         generation: u64,
         region: Mips4Region,
         result: Sender<Result<NativeCompilationResult, CraneliftMips4Error>>,
+        cancelled: Arc<AtomicBool>,
     },
     Clear,
     Shutdown,
@@ -159,6 +172,8 @@ enum RegionCompilerCommand {
 
 const MIPS4_BASELINE_COMPILER_ARENAS: usize = 1;
 const MIPS4_REGION_COMPILER_ARENAS: usize = 1;
+const MIPS4_BASELINE_COMPILER_QUEUE_CAPACITY: usize = 256;
+const MIPS4_REGION_COMPILER_QUEUE_CAPACITY: usize = 8;
 
 struct CompilerModule {
     module: Option<JITModule>,
@@ -235,9 +250,9 @@ impl std::error::Error for CraneliftMips4Error {}
 
 /// Native MIPS IV block backend using the current host ISA.
 pub struct CraneliftMips4Backend {
-    baseline_senders: Vec<Sender<BaselineCompilerCommand>>,
+    baseline_senders: Vec<SyncSender<BaselineCompilerCommand>>,
     baseline_generations: Vec<Arc<AtomicU64>>,
-    region_senders: Vec<Sender<RegionCompilerCommand>>,
+    region_senders: Vec<SyncSender<RegionCompilerCommand>>,
     region_generations: Vec<Arc<AtomicU64>>,
     workers: Vec<JoinHandle<()>>,
     next_baseline_arena: usize,
@@ -256,7 +271,7 @@ impl CraneliftMips4Backend {
         for arena in 0..MIPS4_BASELINE_COMPILER_ARENAS {
             let module = create_module("none", "single_pass")?;
             let generation = Arc::new(AtomicU64::new(0));
-            let (sender, receiver) = mpsc::channel();
+            let (sender, receiver) = mpsc::sync_channel(MIPS4_BASELINE_COMPILER_QUEUE_CAPACITY);
             let worker_generation = Arc::clone(&generation);
             let worker = thread::Builder::new()
                 .name(format!("mips4-baseline-compiler-{arena}"))
@@ -269,7 +284,7 @@ impl CraneliftMips4Backend {
         for arena in 0..MIPS4_REGION_COMPILER_ARENAS {
             let module = create_module("none", "single_pass")?;
             let generation = Arc::new(AtomicU64::new(0));
-            let (sender, receiver) = mpsc::channel();
+            let (sender, receiver) = mpsc::sync_channel(MIPS4_REGION_COMPILER_QUEUE_CAPACITY);
             let worker_generation = Arc::clone(&generation);
             let worker = thread::Builder::new()
                 .name(format!("mips4-region-compiler-{arena}"))
@@ -299,6 +314,7 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
     fn compile(&mut self, block: &Mips4Block) -> Result<Self::CompiledBlock, Self::Error> {
         block.verify().map_err(CraneliftMips4Error::new)?;
         let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         let arena = self.next_baseline_arena;
         self.next_baseline_arena = (self.next_baseline_arena + 1) % self.baseline_senders.len();
         self.baseline_senders[arena]
@@ -306,6 +322,7 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
                 generation: self.baseline_generations[arena].load(Ordering::Acquire),
                 block: Box::new(block.clone()),
                 result: sender,
+                cancelled: Arc::clone(&cancelled),
             })
             .map_err(|error| {
                 CraneliftMips4Error::message(format!(
@@ -313,8 +330,37 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
                 ))
             })?;
         Ok(CraneliftMips4Block {
-            compilation: NativeCompilation::new(receiver),
+            compilation: NativeCompilation::new(receiver, cancelled),
         })
+    }
+
+    fn try_compile(
+        &mut self,
+        block: &Mips4Block,
+    ) -> Result<Option<Self::CompiledBlock>, Self::Error> {
+        block.verify().map_err(CraneliftMips4Error::new)?;
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let arena = self.next_baseline_arena;
+        let command = BaselineCompilerCommand::Compile {
+            generation: self.baseline_generations[arena].load(Ordering::Acquire),
+            block: Box::new(block.clone()),
+            result: sender,
+            cancelled: Arc::clone(&cancelled),
+        };
+        match self.baseline_senders[arena].try_send(command) {
+            Ok(()) => {
+                self.next_baseline_arena =
+                    (self.next_baseline_arena + 1) % self.baseline_senders.len();
+                Ok(Some(CraneliftMips4Block {
+                    compilation: NativeCompilation::new(receiver, cancelled),
+                }))
+            }
+            Err(TrySendError::Full(_)) => Ok(None),
+            Err(TrySendError::Disconnected(_)) => Err(CraneliftMips4Error::message(
+                "baseline compiler worker disconnected",
+            )),
+        }
     }
 
     fn block_compilation_status(
@@ -357,6 +403,7 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
     ) -> Result<Self::CompiledRegion, Self::Error> {
         region.verify().map_err(CraneliftMips4Error::new)?;
         let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         let arena = self.next_region_arena;
         self.next_region_arena = (self.next_region_arena + 1) % self.region_senders.len();
         self.region_senders[arena]
@@ -364,6 +411,7 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
                 generation: self.region_generations[arena].load(Ordering::Acquire),
                 region: region.clone(),
                 result: sender,
+                cancelled: Arc::clone(&cancelled),
             })
             .map_err(|error| {
                 CraneliftMips4Error::message(format!(
@@ -371,8 +419,36 @@ impl Mips4CodegenBackend for CraneliftMips4Backend {
                 ))
             })?;
         Ok(CraneliftMips4Region {
-            compilation: NativeCompilation::new(receiver),
+            compilation: NativeCompilation::new(receiver, cancelled),
         })
+    }
+
+    fn try_compile_region(
+        &mut self,
+        region: &Mips4Region,
+    ) -> Result<Option<Self::CompiledRegion>, Self::Error> {
+        region.verify().map_err(CraneliftMips4Error::new)?;
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let arena = self.next_region_arena;
+        let command = RegionCompilerCommand::Compile {
+            generation: self.region_generations[arena].load(Ordering::Acquire),
+            region: region.clone(),
+            result: sender,
+            cancelled: Arc::clone(&cancelled),
+        };
+        match self.region_senders[arena].try_send(command) {
+            Ok(()) => {
+                self.next_region_arena = (self.next_region_arena + 1) % self.region_senders.len();
+                Ok(Some(CraneliftMips4Region {
+                    compilation: NativeCompilation::new(receiver, cancelled),
+                }))
+            }
+            Err(TrySendError::Full(_)) => Ok(None),
+            Err(TrySendError::Disconnected(_)) => Err(CraneliftMips4Error::message(
+                "Region compiler worker disconnected",
+            )),
+        }
     }
 
     fn region_compilation_status(
@@ -445,11 +521,11 @@ impl Drop for CraneliftMips4Backend {
     fn drop(&mut self) {
         for (sender, generation) in self.baseline_senders.iter().zip(&self.baseline_generations) {
             generation.fetch_add(1, Ordering::AcqRel);
-            let _ = sender.send(BaselineCompilerCommand::Shutdown);
+            let _ = sender.try_send(BaselineCompilerCommand::Shutdown);
         }
         for (sender, generation) in self.region_senders.iter().zip(&self.region_generations) {
             generation.fetch_add(1, Ordering::AcqRel);
-            let _ = sender.send(RegionCompilerCommand::Shutdown);
+            let _ = sender.try_send(RegionCompilerCommand::Shutdown);
         }
         for worker in self.workers.drain(..) {
             // Host code generation cannot be interrupted safely. Do not make
@@ -473,7 +549,11 @@ fn run_baseline_compiler(
                 generation,
                 block,
                 result,
+                cancelled,
             } => {
+                if cancelled.load(Ordering::Acquire) {
+                    continue;
+                }
                 let compiled = if generation == active_generation.load(Ordering::Acquire) {
                     compiler.compile_with(|module, next_function| {
                         compile_block(module, next_function, &block)
@@ -505,7 +585,11 @@ fn run_region_compiler(
                 generation,
                 region,
                 result,
+                cancelled,
             } => {
+                if cancelled.load(Ordering::Acquire) {
+                    continue;
+                }
                 let compiled = if generation == active_generation.load(Ordering::Acquire) {
                     compiler.compile_with(|module, next_function| {
                         compile_region(module, next_function, &region)
