@@ -115,6 +115,8 @@ pub struct FractionalClockProjection {
     timebase_hz: u64,
     frequency_hz: u64,
     remainder: u64,
+    whole_ticks_per_cycle: u64,
+    fractional_ticks_per_cycle: u64,
 }
 
 impl FractionalClockProjection {
@@ -127,6 +129,8 @@ impl FractionalClockProjection {
             timebase_hz,
             frequency_hz,
             remainder,
+            whole_ticks_per_cycle: timebase_hz / frequency_hz,
+            fractional_ticks_per_cycle: timebase_hz % frequency_hz,
         }
     }
 
@@ -147,11 +151,12 @@ impl FractionalClockProjection {
 
     /// Projects elapsed time for a number of cycles without changing state.
     pub fn elapsed(self, cycles: u64) -> Option<SimDuration> {
-        if let Some(ticks) = (self.timebase_hz % self.frequency_hz)
+        if let Some(ticks) = self
+            .fractional_ticks_per_cycle
             .checked_mul(cycles)
             .and_then(|fraction| self.remainder.checked_add(fraction))
             .and_then(|fraction| {
-                (self.timebase_hz / self.frequency_hz)
+                self.whole_ticks_per_cycle
                     .checked_mul(cycles)?
                     .checked_add(fraction / self.frequency_hz)
             })
@@ -159,10 +164,9 @@ impl FractionalClockProjection {
             return Some(SimDuration::new(ticks));
         }
         let numerator = u128::from(self.remainder).checked_add(
-            u128::from(self.timebase_hz % self.frequency_hz).checked_mul(u128::from(cycles))?,
+            u128::from(self.fractional_ticks_per_cycle).checked_mul(u128::from(cycles))?,
         )?;
-        let base =
-            u128::from(self.timebase_hz / self.frequency_hz).checked_mul(u128::from(cycles))?;
+        let base = u128::from(self.whole_ticks_per_cycle).checked_mul(u128::from(cycles))?;
         let ticks = base.checked_add(numerator / u128::from(self.frequency_hz))?;
         u64::try_from(ticks).ok().map(SimDuration::new)
     }
@@ -186,14 +190,15 @@ impl FractionalClockProjection {
     /// Advances the projected remainder and returns the exact elapsed time.
     pub fn advance(&mut self, cycles: u64) -> Option<SimDuration> {
         let elapsed = self.elapsed(cycles)?;
-        if let Some(remainder) = (self.timebase_hz % self.frequency_hz)
+        if let Some(remainder) = self
+            .fractional_ticks_per_cycle
             .checked_mul(cycles)
             .and_then(|fraction| self.remainder.checked_add(fraction))
         {
             self.remainder = remainder % self.frequency_hz;
         } else {
             let remainder = (u128::from(self.remainder)
-                + u128::from(self.timebase_hz % self.frequency_hz) * u128::from(cycles))
+                + u128::from(self.fractional_ticks_per_cycle) * u128::from(cycles))
                 % u128::from(self.frequency_hz);
             self.remainder = remainder as u64;
         }
