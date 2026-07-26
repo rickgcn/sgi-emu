@@ -808,6 +808,10 @@ where
                         no_progress_retries = 0;
                     }
                     if !persistent_frame {
+                        // A new frame resets retirement accounting, so it needs a new slice timeline.
+                        if slice.boundaries != 0 {
+                            return Ok(accumulated);
+                        }
                         frame =
                             self.take_block_frame(budget.saturating_sub(accumulated.boundaries));
                         block_key = self.executor.target().block_key_for_frame(&frame);

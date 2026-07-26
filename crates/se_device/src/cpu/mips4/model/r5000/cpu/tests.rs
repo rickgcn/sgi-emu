@@ -6,7 +6,9 @@ use se_float::backend::native::NativeFloatBackend;
 use crate::cpu::execution::protocol::{ExecutionAction, ExecutionTransaction};
 use crate::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 use crate::cpu::mips4::execution::block::{
-    Mips4Block, Mips4BlockRuntime, Mips4FastMemoryRuntime, interpret_block_with_runtime,
+    Mips4Block, Mips4BlockGuard, Mips4BlockInstruction, Mips4BlockInstructionMetadata,
+    Mips4BlockOperation, Mips4BlockRetire, Mips4BlockRuntime, Mips4FastMemoryRuntime,
+    interpret_block_with_runtime,
 };
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
 use crate::cpu::mips4::execution::port::{
@@ -278,6 +280,108 @@ fn protocol_boundary_refreshes_the_reusable_block_frame() {
     assert_eq!(frame.pc(), cpu.state().pc());
     assert_eq!(frame.next_pc(), cpu.state().next_pc());
     assert_eq!(frame.read_gpr(8), 0x1234_5678);
+}
+
+#[test]
+fn reusable_slice_ends_after_nonpersistent_fallback_progress() {
+    #[derive(Default)]
+    struct MissingFallbackPort {
+        direct_executions: u64,
+        reusable_attempts: u64,
+    }
+
+    impl MissingFallbackPort {
+        fn block(key: Mips4BlockKey) -> Mips4Block {
+            let mut block = Mips4Block::new(key, Mips4BlockGuard::new());
+            block
+                .push(Mips4BlockInstruction {
+                    metadata: Mips4BlockInstructionMetadata {
+                        pc: key.pc,
+                        instruction: 0,
+                        delay_slot_branch_pc: key.delay_slot_branch_pc,
+                    },
+                    operation: Mips4BlockOperation::NoOperation,
+                    retire: Mips4BlockRetire { pc: key.pc },
+                })
+                .unwrap();
+            block.terminate_dispatch().unwrap();
+            block
+        }
+    }
+
+    impl Mips4ExecutionPort for MissingFallbackPort {
+        type Error = core::convert::Infallible;
+        type FastMemoryRuntime = dyn Mips4FastMemoryRuntime;
+
+        fn probe<R>(
+            &mut self,
+            _key: Mips4BlockKey,
+            _source: Mips4BlockSource,
+            _runtime: &R,
+        ) -> Mips4BlockProbe
+        where
+            R: Mips4BlockRuntime + ?Sized,
+        {
+            Mips4BlockProbe::Ready {
+                counter_barrier: false,
+            }
+        }
+
+        fn install(
+            &mut self,
+            _block: Mips4Block,
+            _source: Mips4BlockSource,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn execute<R>(
+            &mut self,
+            key: Mips4BlockKey,
+            frame: &mut Mips4BlockFrame,
+            runtime: &mut R,
+            fast_memory: Option<&mut Self::FastMemoryRuntime>,
+        ) -> Result<Mips4BlockExecutionResult, Self::Error>
+        where
+            R: Mips4BlockRuntime,
+        {
+            self.direct_executions += 1;
+            let exit = interpret_block_with_runtime(&Self::block(key), frame, runtime, fast_memory);
+            Ok(Mips4BlockExecutionResult {
+                exit,
+                counter_barrier: false,
+                operations_executed: frame.operations_executed(),
+            })
+        }
+
+        fn execute_reusable<R>(
+            &mut self,
+            key: Mips4BlockKey,
+            frame: &mut Mips4BlockFrame,
+            runtime: &mut R,
+            fast_memory: Option<&mut Self::FastMemoryRuntime>,
+            _counters_dirty: bool,
+        ) -> Result<Mips4ReusableBlockExecution, Self::Error>
+        where
+            R: Mips4BlockRuntime,
+        {
+            self.reusable_attempts += 1;
+            if self.reusable_attempts == 1 {
+                return Ok(Mips4ReusableBlockExecution::Missing);
+            }
+            self.execute(key, frame, runtime, fast_memory)
+                .map(Mips4ReusableBlockExecution::Executed)
+        }
+    }
+
+    let mut cpu = cpu();
+    let mut port = MissingFallbackPort::default();
+
+    let slice = cpu.run_reusable_slice(&mut port, 8).unwrap().unwrap();
+
+    assert_eq!(slice.boundaries, 1);
+    assert_eq!(port.direct_executions, 1);
+    assert_eq!(port.reusable_attempts, 1);
 }
 
 #[test]
