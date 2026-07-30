@@ -105,6 +105,40 @@ pub enum GbeFrameField {
     Second,
 }
 
+/// Selects how raster content for published display frames is produced.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum GbeRasterMode {
+    /// Fetches and converts pixels through the modeled DMA pipeline every frame.
+    CycleAccurate,
+
+    /// Runs scanout timing only; frame content is composed on demand from
+    /// memory contents when a consumer actually observes it.
+    #[default]
+    OnDemand,
+}
+
+/// Timing-side announcement of one completed display frame.
+///
+/// Announced frames carry no pixel content; content is composed on demand from
+/// the register and memory state associated with the announcement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct GbeFrameMeta {
+    /// Monotonic frame sequence.
+    pub sequence: u64,
+
+    /// Simulation time at completion.
+    pub completed_at: SimTime,
+
+    /// Visible width in pixels.
+    pub width: u32,
+
+    /// Visible height in pixels.
+    pub height: u32,
+
+    /// Captured field phase.
+    pub field: GbeFrameField,
+}
+
 /// Completed host-neutral RGBA8888 display frame.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct GbeFrame {
@@ -176,6 +210,9 @@ pub enum GbeAction {
 
     /// Publishes one completed display frame.
     PublishFrame(GbeFrame),
+
+    /// Announces one completed display frame whose content is composed on demand.
+    AnnounceFrame(GbeFrameMeta),
 
     /// Emits structured diagnostic information.
     Trace(Box<OwnedTraceEvent>),

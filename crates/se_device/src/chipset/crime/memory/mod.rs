@@ -289,6 +289,41 @@ impl CrimeSdram {
         Some((output, fingerprint))
     }
 
+    /// Reads raw data into `output` without ECC checking or side effects.
+    ///
+    /// Bytes in unpopulated or undecodable address ranges read as zero. This is
+    /// the bulk counterpart of [`Self::stable_code_window`] for display-path
+    /// consumers whose hardware reads do not participate in ECC diagnostics.
+    pub fn read_raw_window(&self, address: u64, output: &mut [u8]) {
+        output.fill(0);
+        let mut position = 0;
+        while position < output.len() {
+            let Some(current) = address.checked_add(position as u64) else {
+                return;
+            };
+            let Some(BankSelection::Populated { index, offset }) = self.decode(current) else {
+                position += 1;
+                continue;
+            };
+            let bank = self.banks[index].as_ref().expect("decoded bank exists");
+            let bank_remaining = bank.config.size.bytes() - offset;
+            let count = (output.len() - position).min(bank_remaining as usize);
+            let mut consumed = 0;
+            while consumed < count {
+                let bank_offset = offset as usize + consumed;
+                let page = bank_offset / PAGE_SIZE;
+                let in_page = bank_offset % PAGE_SIZE;
+                let chunk = (PAGE_SIZE - in_page).min(count - consumed);
+                if let Some(contents) = bank.pages[page].as_ref() {
+                    output[position + consumed..position + consumed + chunk]
+                        .copy_from_slice(&contents.data[in_page..in_page + chunk]);
+                }
+                consumed += chunk;
+            }
+            position += count;
+        }
+    }
+
     /// Returns whether an immediate CPU transaction is free of exceptional
     /// ECC, address, and read-modify-write diagnostics.
     pub fn synchronous_transaction_ready(&self, transaction: &CrimeMemoryTransaction) -> bool {

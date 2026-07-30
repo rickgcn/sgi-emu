@@ -58,7 +58,8 @@ use se_device::chipset::gbe::Gbe;
 #[cfg(feature = "jit")]
 use se_device::chipset::gbe::GbeSynchronousReadProjection;
 use se_device::chipset::gbe::protocol::{
-    GbeAction, GbeExternalInput, GbeFrame, GbeOutputPins, GbePoll, GbeWiring,
+    GbeAction, GbeExternalInput, GbeFrame, GbeFrameMeta, GbeOutputPins, GbePoll, GbeRasterMode,
+    GbeWiring,
 };
 use se_device::chipset::mace::config::{MaceConfig, MacePortConfig};
 use se_device::chipset::mace::protocol::{MaceAction, MaceExternalLinks, MacePoll, MaceWiring};
@@ -186,6 +187,10 @@ pub struct Ip32MachineConfig {
     /// On IP32, the PROM environment resides in this System Flash and remains
     /// physically separate from the DS1687 RTC/NVRAM domain.
     pub prom_image: Vec<u8>,
+
+    /// Selects how GBE display-frame content is produced.
+    #[serde(default)]
+    pub gbe_raster_mode: GbeRasterMode,
 }
 
 impl Default for Ip32MachineConfig {
@@ -207,6 +212,7 @@ impl Default for Ip32MachineConfig {
             rtc: Ds1687Config::default(),
             nic_identity: Ds2502Config::default(),
             prom_image: vec![0; IP32_PROM_IMAGE_SIZE_BYTES],
+            gbe_raster_mode: GbeRasterMode::default(),
         }
     }
 }
@@ -585,6 +591,8 @@ struct MachineControl {
     host_dropped_output_bytes: [u64; 12],
     latest_display_frame: Option<GbeFrame>,
     dropped_display_frames: u64,
+    display_frame_awaiting_take: bool,
+    skipped_display_frames: u64,
     sysad_transactions: u64,
     memory_transactions: u64,
     cmi_transactions: u64,
@@ -1004,6 +1012,7 @@ impl<S> Ip32Machine<S> {
         #[cfg(not(feature = "jit"))]
         let event_chain_policy = Ip32EventChainPolicy::all();
         let persistent_config = Ip32PersistentConfig::from_machine_config(&config);
+        let gbe_raster_mode = config.gbe_raster_mode;
         let processor_frequency_hz = config.processor.processor_frequency_hz;
         let cpu = R5000Cpu::new(
             component_ids::CPU0,
@@ -1285,20 +1294,19 @@ impl<S> Ip32Machine<S> {
         insert_component(registry, Box::new(mace))?;
         insert_component(registry, Box::new(keyboard))?;
         insert_component(registry, Box::new(mouse))?;
-        insert_component(
-            registry,
-            Box::new(Gbe::new(
-                component_ids::GBE,
-                "Graphics Back End",
-                IP32_TIMEBASE_HZ,
-                GbeWiring {
-                    crime: component_ids::CRIME,
-                    crt_ddc: component_ids::GBE_CRT_DDC_BUS,
-                    flat_panel_ddc: component_ids::GBE_FLAT_PANEL_DDC_BUS,
-                    auxiliary_inputs: [true; 10],
-                },
-            )),
-        )?;
+        let mut gbe = Gbe::new(
+            component_ids::GBE,
+            "Graphics Back End",
+            IP32_TIMEBASE_HZ,
+            GbeWiring {
+                crime: component_ids::CRIME,
+                crt_ddc: component_ids::GBE_CRT_DDC_BUS,
+                flat_panel_ddc: component_ids::GBE_FLAT_PANEL_DDC_BUS,
+                auxiliary_inputs: [true; 10],
+            },
+        );
+        gbe.set_raster_mode(gbe_raster_mode);
+        insert_component(registry, Box::new(gbe))?;
         insert_component(
             registry,
             Box::new(Ip32StubEndpoint::new(component_ids::VICE, "VICE endpoint")),
@@ -1351,6 +1359,8 @@ impl<S> Ip32Machine<S> {
                 host_dropped_output_bytes: [0; 12],
                 latest_display_frame: None,
                 dropped_display_frames: 0,
+                display_frame_awaiting_take: false,
+                skipped_display_frames: 0,
                 sysad_transactions: 0,
                 memory_transactions: 0,
                 cmi_transactions: 0,
@@ -1559,12 +1569,21 @@ impl<S> Ip32Machine<S> {
 
     /// Removes and returns the newest completed display frame.
     pub fn take_display_frame(&mut self) -> Option<GbeFrame> {
-        self.control.latest_display_frame.take()
+        let frame = self.control.latest_display_frame.take();
+        if frame.is_some() {
+            self.control.display_frame_awaiting_take = false;
+        }
+        frame
     }
 
     /// Returns the number of completed frames overwritten before consumption.
     pub const fn dropped_display_frame_count(&self) -> u64 {
         self.control.dropped_display_frames
+    }
+
+    /// Returns the number of announced frames whose content was never requested.
+    pub const fn skipped_display_frame_count(&self) -> u64 {
+        self.control.skipped_display_frames
     }
 
     /// Returns a cumulative performance snapshot.
@@ -1704,6 +1723,8 @@ impl<S> Ip32Machine<S> {
                 host_dropped_output_bytes: self.control.host_dropped_output_bytes,
                 latest_display_frame: self.control.latest_display_frame.clone(),
                 dropped_display_frames: self.control.dropped_display_frames,
+                display_frame_awaiting_take: self.control.display_frame_awaiting_take,
+                skipped_display_frames: self.control.skipped_display_frames,
                 sysad_transactions: self.control.sysad_transactions,
                 memory_transactions: self.control.memory_transactions,
                 cmi_transactions: self.control.cmi_transactions,
@@ -2073,6 +2094,8 @@ impl<S> Ip32Machine<S> {
             host_dropped_output_bytes: state.control.host_dropped_output_bytes,
             latest_display_frame: state.control.latest_display_frame,
             dropped_display_frames: state.control.dropped_display_frames,
+            display_frame_awaiting_take: state.control.display_frame_awaiting_take,
+            skipped_display_frames: state.control.skipped_display_frames,
             sysad_transactions: state.control.sysad_transactions,
             memory_transactions: state.control.memory_transactions,
             cmi_transactions: state.control.cmi_transactions,
@@ -2583,6 +2606,8 @@ where
     control.host_dropped_output_bytes.fill(0);
     control.latest_display_frame = None;
     control.dropped_display_frames = 0;
+    control.display_frame_awaiting_take = false;
+    control.skipped_display_frames = 0;
     registry
         .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
         .reset();
@@ -2677,6 +2702,8 @@ where
     reset_jit_engine(control)?;
     control.latest_display_frame = None;
     control.dropped_display_frames = 0;
+    control.display_frame_awaiting_take = false;
+    control.skipped_display_frames = 0;
     registry
         .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
         .reset();
@@ -5013,12 +5040,49 @@ where
                         control.dropped_display_frames.saturating_add(1);
                 }
             }
+            GbePoll::Action(GbeAction::AnnounceFrame(meta)) => {
+                handle_frame_announce(registry, control, meta)?;
+            }
             GbePoll::Action(GbeAction::Trace(event)) => {
                 trace_device_event(context, TraceSource::Component(component_ids::GBE), *event)
             }
             GbePoll::Idle => return Ok(()),
         }
     }
+}
+
+fn handle_frame_announce(
+    registry: &mut ComponentRegistry,
+    control: &mut MachineControl,
+    meta: GbeFrameMeta,
+) -> Result<(), Ip32MachineDispatchError> {
+    let capture_armed = registry
+        .get_resolved_mut(control.slots.gbe)?
+        .capture_armed();
+    if !capture_armed && control.display_frame_awaiting_take {
+        control.skipped_display_frames = control.skipped_display_frames.saturating_add(1);
+        return Ok(());
+    }
+    let snapshot = registry.get_resolved(control.slots.gbe)?.display_snapshot();
+    let frame = {
+        let sdram = registry.get_resolved(control.slots.sdram)?;
+        let mut read = |address: u64, output: &mut [u8]| {
+            sdram.read_raw_window(address, output);
+            true
+        };
+        Gbe::compose_display_frame(&snapshot, &meta, &mut read)
+    };
+    let Some(frame) = frame else {
+        return Ok(());
+    };
+    if capture_armed {
+        registry
+            .get_resolved_mut(control.slots.gbe)?
+            .capture_composed_frame(&meta, &frame.rgba);
+    }
+    control.latest_display_frame = Some(frame);
+    control.display_frame_awaiting_take = true;
+    Ok(())
 }
 
 fn drain_gbe_ddc_bus(

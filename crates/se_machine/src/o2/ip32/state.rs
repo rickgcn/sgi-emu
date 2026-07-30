@@ -15,7 +15,7 @@ use se_device::chipset::crime::iou::{CrimeCgiBusState, CrimeCmiBusState};
 use se_device::chipset::crime::memory::CrimeSdramState;
 use se_device::chipset::crime::memory::bus::CrimeMemoryBusState;
 use se_device::chipset::gbe::GbeState;
-use se_device::chipset::gbe::protocol::GbeFrame;
+use se_device::chipset::gbe::protocol::{GbeFrame, GbeRasterMode};
 use se_device::chipset::mace::MaceState;
 use se_device::chipset::mace::config::{MaceConfig, MacePortConfig};
 use se_device::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
@@ -112,6 +112,7 @@ impl Ip32PersistentConfig {
             },
             nic_identity: self.nic_identity.clone(),
             prom_image,
+            gbe_raster_mode: GbeRasterMode::default(),
         }
     }
 }
@@ -158,6 +159,10 @@ pub(super) struct MachineControlState {
     pub(super) host_dropped_output_bytes: [u64; 12],
     pub(super) latest_display_frame: Option<GbeFrame>,
     pub(super) dropped_display_frames: u64,
+    #[serde(default)]
+    pub(super) display_frame_awaiting_take: bool,
+    #[serde(default)]
+    pub(super) skipped_display_frames: u64,
     pub(super) sysad_transactions: u64,
     pub(super) memory_transactions: u64,
     pub(super) cmi_transactions: u64,

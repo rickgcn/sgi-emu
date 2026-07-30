@@ -27,8 +27,8 @@ use self::display::{
     did_block_for_line, did_for_pixel, filter_fullscreen_rgba, visible_dimensions,
 };
 use self::protocol::{
-    GbeAction, GbeEvent, GbeExternalClock, GbeExternalInput, GbeFrame, GbeFrameField,
-    GbeOutputPins, GbePoll, GbeWiring,
+    GbeAction, GbeEvent, GbeExternalClock, GbeExternalInput, GbeFrame, GbeFrameField, GbeFrameMeta,
+    GbeOutputPins, GbePoll, GbeRasterMode, GbeWiring,
 };
 use self::registers::{
     AUXILIARY_PIN_COUNT, COLOR_MAP_FIFO, DOT_CLOCK_RUN, GbeRegisters, GbeRegistersState,
@@ -161,6 +161,15 @@ struct WorkingFrame {
     rgba: Vec<u8>,
 }
 
+/// Immutable register image captured for on-demand frame composition.
+///
+/// The snapshot is opaque to consumers; it is interpreted only by
+/// [`Gbe::compose_display_frame`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GbeDisplaySnapshot {
+    registers: GbeRegisters,
+}
+
 /// SGI Graphics Back End connected bidirectionally to the CRIME CGI link.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Gbe {
@@ -168,6 +177,7 @@ pub struct Gbe {
     name: String,
     wiring: GbeWiring,
     registers: GbeRegisters,
+    raster_mode: GbeRasterMode,
     timebase_hz: u64,
     observed_time: SimTime,
     scan_origin_time: SimTime,
@@ -624,7 +634,7 @@ impl GbeState {
                 || frame.height == 0
                 || frame.width > 4_096
                 || frame.height > 4_096
-                || frame.rgba.len() != bytes
+                || !(frame.rgba.is_empty() || frame.rgba.len() == bytes)
                 || self.next_frame_sequence.wrapping_sub(frame.sequence) != 1
             {
                 return Err(Self::invalid(
@@ -716,6 +726,13 @@ impl GbeState {
                     || drive.time > self.observed_time
             }
             GbeAction::PublishFrame(frame) => !Self::validate_frame(frame, self.observed_time),
+            GbeAction::AnnounceFrame(meta) => {
+                meta.width == 0
+                    || meta.width > 4_096
+                    || meta.height == 0
+                    || meta.height > 4_096
+                    || meta.completed_at > self.observed_time
+            }
             GbeAction::StartCgi(transaction) => {
                 if transaction.controller != component || transaction.target != self.wiring.crime {
                     return true;
@@ -762,6 +779,7 @@ impl Gbe {
             name: name.into(),
             wiring,
             registers: GbeRegisters::new(),
+            raster_mode: GbeRasterMode::CycleAccurate,
             timebase_hz,
             observed_time: SimTime::ZERO,
             scan_origin_time: SimTime::ZERO,
@@ -804,6 +822,65 @@ impl Gbe {
             interrupt_posted: [false; 4],
             capture_writes_remaining: 0,
         }
+    }
+
+    /// Selects how raster content for published display frames is produced.
+    ///
+    /// The mode is configuration, not dynamic state: it is applied at machine
+    /// construction and is not part of the serializable component state.
+    pub fn set_raster_mode(&mut self, mode: GbeRasterMode) {
+        self.raster_mode = mode;
+    }
+
+    /// Returns the active raster content production mode.
+    pub const fn raster_mode(&self) -> GbeRasterMode {
+        self.raster_mode
+    }
+
+    /// Captures the register image used by on-demand frame composition.
+    pub fn display_snapshot(&self) -> GbeDisplaySnapshot {
+        GbeDisplaySnapshot {
+            registers: self.registers.clone(),
+        }
+    }
+
+    /// Returns whether an armed video capture will consume the next announced
+    /// frame's content.
+    pub fn capture_armed(&self) -> bool {
+        self.registers.video_capture[2] & 1 != 0 && self.capture_writes_remaining == 0
+    }
+
+    /// Feeds externally composed frame content into the video-capture pipeline.
+    pub fn capture_composed_frame(&mut self, meta: &GbeFrameMeta, rgba: &[u8]) {
+        self.start_video_capture(meta.width, meta.height, rgba);
+    }
+
+    /// Composes one announced frame's RGBA content from a register snapshot and
+    /// memory contents read through `read` (physical address, fill buffer).
+    ///
+    /// Composition is side-effect-free: it neither schedules DMA nor mutates
+    /// component state. Mid-frame register or memory changes appear as one
+    /// snapshot rather than as per-scanline tearing.
+    pub fn compose_display_frame(
+        snapshot: &GbeDisplaySnapshot,
+        meta: &GbeFrameMeta,
+        read: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+    ) -> Option<GbeFrame> {
+        let width = usize::try_from(meta.width).ok()?;
+        let height = usize::try_from(meta.height).ok()?;
+        if width == 0 || height == 0 || width > 4_096 || height > 4_096 {
+            return None;
+        }
+        let rgba = display::compose_frame(&snapshot.registers, width, height, read);
+        Some(GbeFrame {
+            sequence: meta.sequence,
+            completed_at: meta.completed_at,
+            width: meta.width,
+            height: meta.height,
+            stride: meta.width.saturating_mul(4),
+            field: meta.field,
+            rgba,
+        })
     }
 
     /// Captures the GBE's dynamic hardware state.
@@ -1368,8 +1445,16 @@ impl Gbe {
                 sequence,
                 width,
                 height,
-                rgba: vec![0; width.saturating_mul(height).saturating_mul(4)],
+                rgba: match self.raster_mode {
+                    GbeRasterMode::CycleAccurate => {
+                        vec![0; width.saturating_mul(height).saturating_mul(4)]
+                    }
+                    GbeRasterMode::OnDemand => Vec::new(),
+                },
             });
+        }
+        if self.raster_mode == GbeRasterMode::OnDemand {
+            return;
         }
         let sequence = self
             .working_frame
@@ -1398,6 +1483,9 @@ impl Gbe {
     }
 
     fn finish_scanline(&mut self, y: u16) {
+        if self.raster_mode == GbeRasterMode::OnDemand {
+            return;
+        }
         let Some(frame) = self.working_frame.as_ref() else {
             return;
         };
@@ -1484,6 +1572,17 @@ impl Gbe {
         let Some(frame) = self.working_frame.take() else {
             return;
         };
+        if self.raster_mode == GbeRasterMode::OnDemand {
+            self.actions
+                .push_back(GbeAction::AnnounceFrame(GbeFrameMeta {
+                    sequence: frame.sequence,
+                    completed_at: self.observed_time,
+                    width: frame.width as u32,
+                    height: frame.height as u32,
+                    field: GbeFrameField::Progressive,
+                }));
+            return;
+        }
         let published = GbeFrame {
             sequence: frame.sequence,
             completed_at: self.observed_time,
@@ -1493,7 +1592,8 @@ impl Gbe {
             field: GbeFrameField::Progressive,
             rgba: frame.rgba,
         };
-        self.start_video_capture(&published);
+        let (width, height) = (published.width, published.height);
+        self.start_video_capture(width, height, &published.rgba);
         self.actions.push_back(GbeAction::PublishFrame(published));
     }
 
@@ -1596,6 +1696,9 @@ impl Gbe {
         self.did_frame_table.clear();
         self.did_frame_chunks_remaining = 0;
         self.did_line_blocks.clear();
+        if self.raster_mode == GbeRasterMode::OnDemand {
+            return;
+        }
         let (_, height) = visible_dimensions(&self.registers);
         let tile_rows = height.div_ceil(128);
         let normal_tiles = tile_columns(self.registers.frame[0]);
@@ -1862,7 +1965,7 @@ impl Gbe {
         }
     }
 
-    fn start_video_capture(&mut self, frame: &GbeFrame) {
+    fn start_video_capture(&mut self, width: u32, height: u32, rgba: &[u8]) {
         if self.registers.video_capture[2] & 1 == 0 || self.capture_writes_remaining != 0 {
             return;
         }
@@ -1876,16 +1979,16 @@ impl Gbe {
         let origin_y = (capture_origin >> 12) & 0x0fff;
         let x0 = usize::try_from((horizontal & 0x0fff).wrapping_sub(origin_x) & 0x0fff)
             .unwrap_or(0)
-            .min(frame.width as usize);
+            .min(width as usize);
         let x1 = usize::try_from(((horizontal >> 12) & 0x0fff).wrapping_sub(origin_x) & 0x0fff)
             .unwrap_or(0)
-            .min(frame.width.saturating_sub(1) as usize);
+            .min(width.saturating_sub(1) as usize);
         let y0 = usize::try_from((vertical & 0x0fff).wrapping_sub(origin_y) & 0x0fff)
             .unwrap_or(0)
-            .min(frame.height as usize);
+            .min(height as usize);
         let y1 = usize::try_from(((vertical >> 12) & 0x0fff).wrapping_sub(origin_y) & 0x0fff)
             .unwrap_or(0)
-            .min(frame.height.saturating_sub(1) as usize);
+            .min(height.saturating_sub(1) as usize);
         if x1 < x0 || y1 < y0 {
             return;
         }
@@ -1893,10 +1996,10 @@ impl Gbe {
         let crop_height = y1 - y0 + 1;
         let mut crop = vec![0; crop_width * crop_height * 4];
         for y in 0..crop_height {
-            let source = ((y0 + y) * frame.width as usize + x0) * 4;
+            let source = ((y0 + y) * width as usize + x0) * 4;
             let target = y * crop_width * 4;
             crop[target..target + crop_width * 4]
-                .copy_from_slice(&frame.rgba[source..source + crop_width * 4]);
+                .copy_from_slice(&rgba[source..source + crop_width * 4]);
         }
         let fullscreen = self.registers.video_capture[2] & (1 << 3) != 0;
         let pal = self.frame_rate_hz().is_some_and(|rate| rate < 55);
@@ -3127,7 +3230,8 @@ mod tests {
             field: GbeFrameField::Progressive,
             rgba: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         };
-        gbe.start_video_capture(&frame);
+        let (width, height) = (frame.width, frame.height);
+        gbe.start_video_capture(width, height, &frame.rgba);
         let transaction = loop {
             let GbePoll::Action(action) = gbe.poll() else {
                 panic!("capture must issue one CGI write");
@@ -3181,7 +3285,8 @@ mod tests {
             rgba: vec![0x7f; 512 * 321 * 4],
         };
 
-        gbe.start_video_capture(&frame);
+        let (width, height) = (frame.width, frame.height);
+        gbe.start_video_capture(width, height, &frame.rgba);
 
         assert_ne!(gbe.registers.video_capture[3] & (1 << 2), 0);
         assert_eq!(gbe.registers.video_capture[3] & (1 << 3), 0);
@@ -3207,7 +3312,8 @@ mod tests {
             rgba: vec![0x40; 300 * 56 * 4],
         };
 
-        gbe.start_video_capture(&frame);
+        let (width, height) = (frame.width, frame.height);
+        gbe.start_video_capture(width, height, &frame.rgba);
 
         let first = loop {
             let GbePoll::Action(action) = gbe.poll() else {
@@ -3250,7 +3356,8 @@ mod tests {
             field: GbeFrameField::Progressive,
             rgba: vec![0; 16],
         };
-        gbe.start_video_capture(&frame);
+        let (width, height) = (frame.width, frame.height);
+        gbe.start_video_capture(width, height, &frame.rgba);
         let id = loop {
             let GbePoll::Action(action) = gbe.poll() else {
                 panic!("capture must issue one write");
@@ -3274,5 +3381,156 @@ mod tests {
                 .iter()
                 .all(|job| !matches!(job.destination, DmaDestination::Capture))
         );
+    }
+
+    fn complete_dma_reads(gbe: &mut Gbe, memory: &[u8]) {
+        loop {
+            match gbe.poll() {
+                GbePoll::Action(GbeAction::StartCgi(transaction)) => {
+                    let CrimeLinkOperation::Dma(request) = transaction.operation else {
+                        panic!("scanout must issue DMA");
+                    };
+                    let CrimeTransferView::Read { length } = request.transfer.view() else {
+                        panic!("scanout must read memory");
+                    };
+                    let start = request.address as usize;
+                    let data = memory[start..start + usize::from(length)].to_vec();
+                    gbe.complete(CrimeCgiCompletion {
+                        id: transaction.id,
+                        result: Ok(CrimeCompletionPayload::ReadData(data.into())),
+                        memory_fault: None,
+                    });
+                }
+                GbePoll::Action(_) => {}
+                GbePoll::Idle => return,
+            }
+        }
+    }
+
+    fn cycle_accurate_frame(gbe: &mut Gbe, memory: &[u8]) -> GbeFrame {
+        gbe.prefetch_frame_metadata();
+        complete_dma_reads(gbe, memory);
+        for y in [8, 9, 0, 1] {
+            gbe.begin_scanline(y);
+            complete_dma_reads(gbe, memory);
+            gbe.finish_scanline(y);
+        }
+        gbe.finish_frame();
+        loop {
+            match gbe.poll() {
+                GbePoll::Action(GbeAction::PublishFrame(frame)) => return frame,
+                GbePoll::Action(_) => {}
+                GbePoll::Idle => panic!("a completed frame must be published"),
+            }
+        }
+    }
+
+    fn composed_frame(gbe: &Gbe, memory: &[u8], width: u32, height: u32) -> GbeFrame {
+        let meta = GbeFrameMeta {
+            sequence: 0,
+            completed_at: SimTime::ZERO,
+            width,
+            height,
+            field: GbeFrameField::Progressive,
+        };
+        let snapshot = gbe.display_snapshot();
+        let mut read = |address: u64, output: &mut [u8]| {
+            output.copy_from_slice(&memory[address as usize..address as usize + output.len()]);
+            true
+        };
+        Gbe::compose_display_frame(&snapshot, &meta, &mut read)
+            .expect("valid dimensions must compose")
+    }
+
+    #[test]
+    fn on_demand_composition_matches_cycle_accurate_scanout_for_indexed_frame() {
+        let mut memory = vec![0; 0x20_0000];
+        memory[0x4_0000] = 0;
+        memory[0x4_0001] = 0x10;
+        memory[0x4_0100] = 0;
+        memory[0x4_0101] = 0x11;
+        for y in 0..4_usize {
+            for x in 0..512_usize {
+                memory[0x10_0000 + y * 512 + x] = (y * 97 + x * 3) as u8;
+            }
+        }
+        memory[0x11_0000 + 512 + 10] = 1;
+        memory[0x11_0000 + 2 * 512 + 70] = 2;
+        for row in memory[0x10_0000..0x10_0800].chunks_exact_mut(512) {
+            display::unswizzle_cgi_pixel_words(row.try_into().unwrap());
+        }
+        for row in memory[0x11_0000..0x11_0800].chunks_exact_mut(512) {
+            display::unswizzle_cgi_pixel_words(row.try_into().unwrap());
+        }
+        memory[0x6_0000..0x6_0004].copy_from_slice(&0x0140_0040_u32.to_be_bytes());
+        memory[0x6_0200..0x6_0202].copy_from_slice(&0x0260_u16.to_be_bytes());
+        memory[0x6_0202..0x6_0204].copy_from_slice(&0x0761_u16.to_be_bytes());
+        memory[0x6_0204..0x6_0206].copy_from_slice(&0xffe0_u16.to_be_bytes());
+
+        let mut gbe = gbe();
+        gbe.registers.frame[0] = 3;
+        gbe.registers.frame[1] = 4 << 16;
+        gbe.registers.frame[2] = 0x4_0001;
+        gbe.registers.overlay[0] = 3;
+        gbe.registers.overlay[1] = 0x4_0101;
+        gbe.registers.did[0] = (1 << 16) | 0x6;
+        gbe.registers.wid[0] = 1 << 10;
+        gbe.registers.wid[1] = 1 << 5;
+        gbe.registers.vt[VT_XY_MAX] = (9 << 12) | 799;
+        gbe.registers.vt[VT_VBLANK] = 4 << 12;
+        gbe.registers.vt[VT_VPIXEN] = (8 << 12) | 2;
+        gbe.registers.vt[registers::DID_START_XY] = 0;
+        gbe.registers.vt[registers::CURSOR_START_XY] = 0;
+        gbe.registers.cursor[0] = (6 << 16) | 0x0fe5;
+        gbe.registers.cursor[1] = 3;
+        gbe.registers.cursor[2] = 0x00ff_0000;
+        for index in 0..96_u32 {
+            gbe.registers.color_map[index as usize] =
+                ((index * 7 + 1) << 24) | ((index * 5 + 3) << 16) | ((index * 3 + 7) << 8);
+            gbe.registers.color_map[256 + index as usize] =
+                ((index * 11 + 2) << 24) | ((index * 13 + 5) << 16) | ((index * 17 + 1) << 8);
+        }
+        gbe.registers.color_map[4_353] = 0x1122_3300;
+        gbe.registers.color_map[4_354] = 0x4455_6600;
+        for (index, entry) in gbe.registers.gamma_map.iter_mut().enumerate() {
+            let index = index as u32;
+            *entry = ((255 - index) << 24) | (index << 16) | ((index / 2) << 8);
+        }
+
+        let published = cycle_accurate_frame(&mut gbe, &memory);
+        let composed = composed_frame(&gbe, &memory, 96, 4);
+        assert_eq!(published.rgba, composed.rgba);
+    }
+
+    #[test]
+    fn on_demand_composition_matches_cycle_accurate_scanout_for_direct_frame() {
+        let mut memory = vec![0; 0x20_0000];
+        memory[0x4_0000] = 0;
+        memory[0x4_0001] = 0x10;
+        for y in 0..4_usize {
+            for x in 0..96_usize {
+                let pixel = ((y * 96 + x) as u32) * 25_673 + 0x0102_0304;
+                memory[0x10_0000 + y * 512 + x * 4..0x10_0000 + y * 512 + x * 4 + 4]
+                    .copy_from_slice(&pixel.to_be_bytes());
+            }
+        }
+        for row in memory[0x10_0000..0x10_0800].chunks_exact_mut(512) {
+            display::unswizzle_cgi_pixel_words(row.try_into().unwrap());
+        }
+
+        let mut gbe = gbe();
+        gbe.registers.frame[0] = (2 << 13) | 12;
+        gbe.registers.frame[1] = 4 << 16;
+        gbe.registers.frame[2] = 0x4_0001;
+        gbe.registers.wid[0] = (5 << 2) | (1 << 10);
+        gbe.registers.vt[VT_XY_MAX] = (9 << 12) | 799;
+        gbe.registers.vt[VT_VBLANK] = 4 << 12;
+        gbe.registers.vt[VT_VPIXEN] = (8 << 12) | 2;
+        gbe.registers.vt[registers::DID_START_XY] = 0;
+        gbe.registers.vt[registers::CURSOR_START_XY] = 0;
+
+        let published = cycle_accurate_frame(&mut gbe, &memory);
+        let composed = composed_frame(&gbe, &memory, 96, 4);
+        assert_eq!(published.rgba, composed.rgba);
     }
 }
