@@ -2115,6 +2115,254 @@ fn prom_tiled_screen_copy_unpacks_the_source_as_x_then_y() {
     assert_eq!(source_read.virtual_address, 7 << 16 | 5);
 }
 
+/// Returns the physical byte offset of one CI8 pixel inside its tile: bytes
+/// stay in order within each 4-byte subword while the eight subwords of every
+/// 32-byte memory word are reversed.
+fn ci8_physical_offset(x: u16, y: u16) -> u64 {
+    let logical = u64::from(y) * 512 + u64::from(x);
+    let word = logical & !31;
+    let lane = logical & 31;
+    word + (7 - (lane / 4)) * 4 + (lane % 4)
+}
+
+fn read_sdram(sdram: &mut CrimeSdram, address: u64, length: u16) -> Vec<u8> {
+    let completion = sdram.accept(CrimeMemoryTransaction {
+        id: CrimeTransactionId::new(4),
+        time: SimTime::ZERO,
+        controller: ComponentId::new(1),
+        client: CrimeMemoryClient::Render,
+        address,
+        bank_select: CrimeMemoryBankSelect::Decode,
+        no_ecc: false,
+        transfer: CrimeTransfer::read(length),
+    });
+    let CrimeCompletionPayload::ReadData(data) = completion.result.unwrap().payload else {
+        panic!("SDRAM read returned the wrong payload")
+    };
+    data.to_vec()
+}
+
+struct ScreenCopySetup {
+    draw_mode: u32,
+    stipple_mode: u32,
+    stipple_pattern: u32,
+}
+
+fn configure_ci8_screen_copy(render: &mut CrimeRender, setup: &ScreenCopySetup) {
+    for (offset, value) in [
+        (0x000, 0),
+        (0x008, 0),
+        (0x018, setup.draw_mode),
+        (0x060, 0x0302_0000),
+        (0x070, 8 << 16 | 44),
+        (0x074, 39 << 16 | 45),
+        (0x0a0, 40 << 16 | 30),
+        (0x0a8, 1),
+        (0x0ac, 1),
+        (0x0c0, setup.stipple_mode),
+        (0x0c4, setup.stipple_pattern),
+        (0x1b0, LOGIC_COPY),
+        (0x1b8, u32::MAX),
+    ] {
+        queue_and_retire(render, PIXEL_PIPE_BASE + offset, 4, value.into());
+    }
+}
+
+fn drive_pixel_command(render: &mut CrimeRender, sdram: &mut CrimeSdram) -> Vec<(bool, u64, u16)> {
+    let mut shapes = Vec::new();
+    while render.active_pixel_command.is_some() || render.interface_level() != 0 {
+        let progress = retire(render);
+        if let Some(request) = progress.memory_request {
+            let (is_read, length) = match request.transfer.view() {
+                CrimeTransferView::Read { length } => (true, length),
+                CrimeTransferView::Write { data, .. } => (false, data.len() as u16),
+            };
+            shapes.push((is_read, request.alias_address, length));
+            complete_through_sdram(render, sdram, request);
+        }
+    }
+    shapes
+}
+
+fn plant_source_row(sdram: &mut CrimeSdram, tile_base: u64, y: u16, x_range: std::ops::Range<u16>) {
+    for x in x_range {
+        let value = (x.wrapping_mul(7) ^ y) as u8;
+        write_sdram(sdram, tile_base + ci8_physical_offset(x, y), &[value]);
+    }
+}
+
+fn assert_copied_row(
+    sdram: &mut CrimeSdram,
+    tile_base: u64,
+    y: u16,
+    x_range: std::ops::Range<u16>,
+    expected: impl Fn(u16, u16) -> u8,
+) {
+    for x in x_range {
+        let copied = read_sdram(sdram, tile_base + ci8_physical_offset(x, y), 1);
+        assert_eq!(
+            copied[0],
+            expected(x, y),
+            "copied pixel mismatch at ({x}, {y})"
+        );
+    }
+}
+
+#[test]
+fn prom_ci8_screen_copy_uses_word_granular_dma_batches() {
+    let mut render = CrimeRender::new();
+    let mut sdram = CrimeSdram::new(ComponentId::new(2), "SDRAM", CrimeMemoryConfig::default());
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 1) << 48,
+    );
+    let tile_base = FRAMEBUFFER_TILE_BYTES;
+    plant_source_row(&mut sdram, tile_base, 30, 40..72);
+    plant_source_row(&mut sdram, tile_base, 31, 40..72);
+    configure_ci8_screen_copy(
+        &mut render,
+        &ScreenCopySetup {
+            draw_mode: 0x0020_02f8,
+            stipple_mode: 0,
+            stipple_pattern: 0,
+        },
+    );
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let shapes = drive_pixel_command(&mut render, &mut sdram);
+
+    let lengths = shapes
+        .iter()
+        .map(|(is_read, _, length)| (*is_read, *length))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lengths,
+        [
+            (true, 24),
+            (false, 24),
+            (true, 8),
+            (false, 8),
+            (true, 24),
+            (false, 24),
+            (true, 8),
+            (false, 8),
+        ],
+        "32-pixel rows must collapse into word-granular read/write batch pairs"
+    );
+    assert_eq!(shapes[0].1, tile_base + 30 * 512 + 32);
+    assert_eq!(shapes[2].1, tile_base + 30 * 512 + 64 + 24);
+    let expected = |x: u16, y: u16| ((x - 8 + 40).wrapping_mul(7) ^ (y - 44 + 30)) as u8;
+    assert_copied_row(&mut sdram, tile_base, 44, 8..40, expected);
+    assert_copied_row(&mut sdram, tile_base, 45, 8..40, expected);
+}
+
+#[test]
+fn stippled_pixel_dma_batch_preserves_masked_lanes() {
+    let mut render = CrimeRender::new();
+    let mut sdram = CrimeSdram::new(ComponentId::new(2), "SDRAM", CrimeMemoryConfig::default());
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 1) << 48,
+    );
+    let tile_base = FRAMEBUFFER_TILE_BYTES;
+    plant_source_row(&mut sdram, tile_base, 30, 40..72);
+    plant_source_row(&mut sdram, tile_base, 31, 40..72);
+    for y in 44..46 {
+        for x in 8..40 {
+            write_sdram(&mut sdram, tile_base + ci8_physical_offset(x, y), &[0x5a]);
+        }
+    }
+    configure_ci8_screen_copy(
+        &mut render,
+        &ScreenCopySetup {
+            draw_mode: 1 << 19 | 0x0020_02f8,
+            stipple_mode: 0x001f_0000,
+            stipple_pattern: 0xaaaa_aaaa,
+        },
+    );
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let shapes = drive_pixel_command(&mut render, &mut sdram);
+
+    let lengths = shapes
+        .iter()
+        .map(|(is_read, _, length)| (*is_read, *length))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lengths,
+        [
+            (true, 24),
+            (false, 24),
+            (true, 8),
+            (false, 8),
+            (true, 24),
+            (false, 24),
+            (true, 8),
+            (false, 8),
+        ],
+        "stipple masks must not fragment word-granular batches"
+    );
+    let expected = |x: u16, y: u16| {
+        if x.is_multiple_of(2) {
+            ((x - 8 + 40).wrapping_mul(7) ^ (y - 44 + 30)) as u8
+        } else {
+            0x5a
+        }
+    };
+    assert_copied_row(&mut sdram, tile_base, 44, 8..40, expected);
+    assert_copied_row(&mut sdram, tile_base, 45, 8..40, expected);
+}
+
+#[test]
+fn misaligned_pixel_dma_batches_use_independent_word_spans() {
+    let mut render = CrimeRender::new();
+    let mut sdram = CrimeSdram::new(ComponentId::new(2), "SDRAM", CrimeMemoryConfig::default());
+    queue_and_retire(
+        &mut render,
+        FRAMEBUFFER_A_BASE,
+        8,
+        u64::from(FRAMEBUFFER_TLB_VALID | 1) << 48,
+    );
+    let tile_base = FRAMEBUFFER_TILE_BYTES;
+    plant_source_row(&mut sdram, tile_base, 30, 40..64);
+    for (offset, value) in [
+        (0x000, 0),
+        (0x008, 0),
+        (0x018, 0x0020_02f8_u32),
+        (0x060, 0x0302_0000),
+        (0x070, 12 << 16 | 44),
+        (0x074, 35 << 16 | 44),
+        (0x0a0, 40 << 16 | 30),
+        (0x0a8, 1),
+        (0x0ac, 1),
+        (0x1b0, LOGIC_COPY),
+        (0x1b8, u32::MAX),
+    ] {
+        queue_and_retire(&mut render, PIXEL_PIPE_BASE + offset, 4, value.into());
+    }
+    render.write(PIXEL_PIPE_NULL + START_OFFSET, 4, 0).unwrap();
+
+    let shapes = drive_pixel_command(&mut render, &mut sdram);
+
+    let lengths = shapes
+        .iter()
+        .map(|(is_read, _, length)| (*is_read, *length))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lengths,
+        [(true, 20), (false, 20), (true, 4), (false, 4)],
+        "a lane-misaligned row must batch against both word boundaries"
+    );
+    assert_eq!(shapes[0].1, tile_base + 30 * 512 + 32 + 4);
+    assert_eq!(shapes[1].1, tile_base + 44 * 512);
+    let expected = |x: u16, y: u16| ((x - 12 + 40).wrapping_mul(7) ^ (y - 44 + 30)) as u8;
+    assert_copied_row(&mut sdram, tile_base, 44, 12..36, expected);
+}
+
 #[test]
 fn pixel_dma_converts_linear_ycrcb_into_tiled_rgba() {
     let mut render = CrimeRender::new();

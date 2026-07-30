@@ -2491,33 +2491,46 @@ fn prepare_pixel_dma_batch(
     job: &mut PixelPipelineJob,
     notices: &mut Vec<RenderNotice>,
 ) -> Option<RenderMemoryRequest> {
-    let position = job.rasterizer.position();
     let source_bytes = job.command.source.format.bytes_per_pixel()?;
     let destination_bytes = job.command.destination.format.bytes_per_pixel()?;
-    let dma = job.pixel_dma.as_mut().expect("PixelDMA state exists");
 
-    if matches!(dma.stage, PixelDmaStage::Read) && job.pending_batch.is_none() {
-        if !job.command.clip_passes(position.x, position.y) {
-            job.advance_candidates(1);
-            return None;
-        }
-        let stipple_foreground = job.stipple.is_none_or(|stipple| stipple.permits(0));
-        let enabled = stipple_foreground || job.command.features.opaque_stipple();
+    if job.pending_batch.is_none()
+        && matches!(
+            job.pixel_dma.as_ref().map(|dma| dma.stage),
+            Some(PixelDmaStage::Read)
+        )
+    {
+        let position = job.rasterizer.position();
+        let candidate_count = if job.fragment.is_some() {
+            1
+        } else {
+            pixel_dma_batch_count(job, position.x, position.y, source_bytes, destination_bytes)?
+        };
+        let (enabled_mask, enabled_count) =
+            pixel_dma_enabled_mask(job, position.x, position.y, candidate_count);
         notices.push(RenderNotice::RasterBatch {
             x: position.x,
             y: position.y,
-            candidates: 1,
-            enabled: u16::from(enabled),
+            candidates: candidate_count,
+            enabled: enabled_count,
         });
-        if !enabled {
-            job.advance_candidates(1);
+        if let Some(stipple) = job.stipple {
+            notices.push(RenderNotice::StippleMask {
+                pattern: job.command.stipple_pattern,
+                index: stipple.index(),
+                candidates: candidate_count,
+                enabled_mask,
+            });
+        }
+        if enabled_count == 0 {
+            job.advance_candidates(candidate_count);
             return None;
         }
         job.pending_batch = Some(PixelCandidateBatch {
             x: position.x,
             y: position.y,
-            candidate_count: 1,
-            enabled_count: 1,
+            candidate_count,
+            enabled_count,
             stipple_index: job.stipple.map(PixelStippleCursor::index),
         });
     }
@@ -2527,14 +2540,24 @@ fn prepare_pixel_dma_batch(
         .expect("PixelDMA memory operation has a frozen candidate");
     let dx = i64::from(batch.x) - i64::from(job.command.x0);
     let dy = i64::from(batch.y) - i64::from(job.command.y0);
-    let (translation, transfer) = match dma.stage {
+    let dma = job.pixel_dma.as_ref().expect("PixelDMA state exists");
+    let (translation, span, transfer) = match dma.stage {
         PixelDmaStage::Read => {
             let source_address =
                 pixel_dma_source_address(&job.command, &dma.source_buffer, source_bytes, dx, dy);
             let translation =
                 dma.source_buffer
                     .translate_address(source_address, source_bytes, true)?;
-            (translation, CrimeTransfer::read(u16::from(source_bytes)))
+            let linear = dma.source_buffer.linear();
+            let logical_lane = logical_word_lane(linear, translation.alias_address);
+            let span = physical_batch_span(
+                linear,
+                logical_lane,
+                batch.candidate_count,
+                usize::from(source_bytes),
+            );
+            let length = u16::try_from(span.1 - span.0).expect("a word span fits u16");
+            (translation, span, CrimeTransfer::read(length))
         }
         PixelDmaStage::Write => {
             let destination_address = pixel_dma_destination_address(
@@ -2549,28 +2572,212 @@ fn prepare_pixel_dma_batch(
                 destination_bytes,
                 true,
             )?;
-            let color = pixel::format::decode(job.command.source.format, &dma.source_pixel);
-            let data = pixel::format::encode(job.command.destination.format, color);
-            let length = data.len();
+            let destination_linear = dma.destination_buffer.linear();
+            let destination_lane = logical_word_lane(destination_linear, translation.alias_address);
+            let span = physical_batch_span(
+                destination_linear,
+                destination_lane,
+                batch.candidate_count,
+                usize::from(destination_bytes),
+            );
+            let source_address =
+                pixel_dma_source_address(&job.command, &dma.source_buffer, source_bytes, dx, dy);
+            let source_translation =
+                dma.source_buffer
+                    .translate_address(source_address, source_bytes, true)?;
+            let source_linear = dma.source_buffer.linear();
+            let source_lane = logical_word_lane(source_linear, source_translation.alias_address);
+            let source_span = physical_batch_span(
+                source_linear,
+                source_lane,
+                batch.candidate_count,
+                usize::from(source_bytes),
+            );
+            let (enabled_mask, _) =
+                pixel_dma_enabled_mask(job, batch.x, batch.y, batch.candidate_count);
+            let mut data = vec![0_u8; span.1 - span.0];
+            let mut byte_enable = vec![false; span.1 - span.0];
+            for candidate in 0..batch.candidate_count {
+                if enabled_mask & (1_u32 << (31 - candidate)) == 0 {
+                    continue;
+                }
+                let source_offset = physical_candidate_lane(
+                    source_linear,
+                    source_lane,
+                    candidate,
+                    usize::from(source_bytes),
+                ) - source_span.0;
+                let color = pixel::format::decode(
+                    job.command.source.format,
+                    &dma.source_pixel[source_offset..source_offset + usize::from(source_bytes)],
+                );
+                let encoded = pixel::format::encode(job.command.destination.format, color);
+                let destination_offset = physical_candidate_lane(
+                    destination_linear,
+                    destination_lane,
+                    candidate,
+                    usize::from(destination_bytes),
+                ) - span.0;
+                data[destination_offset..destination_offset + encoded.len()]
+                    .copy_from_slice(&encoded);
+                byte_enable[destination_offset..destination_offset + encoded.len()].fill(true);
+            }
             (
                 translation,
-                CrimeTransfer::write(data.into(), CrimeByteEnable::enabled(length)),
+                span,
+                CrimeTransfer::write(data.into(), byte_enable.into()),
             )
         }
         PixelDmaStage::Fragment => unreachable!("fragment stage uses the fragment memory path"),
     };
-    let physical_address = super::normalize_render_memory_alias(translation.alias_address);
+    let span_alias = (translation.alias_address & !(RENDER_MEMORY_WORD_BYTES as u64 - 1))
+        .wrapping_add(span.0 as u64);
+    let physical_address = super::normalize_render_memory_alias(span_alias);
     Some(RenderMemoryRequest {
         virtual_address: translation.virtual_address,
         raw_entry: translation.raw_entry,
         valid: translation.valid,
-        alias_address: translation.alias_address,
+        alias_address: span_alias,
         physical_address,
         bank_select: render_bank_select(translation),
         no_ecc: false,
         destination: RenderMemoryDestination::Pixel,
         transfer,
     })
+}
+
+/// Recovers the logical framebuffer-word lane of a batch's first pixel from
+/// its translated alias address.
+fn logical_word_lane(linear: bool, alias_address: u64) -> usize {
+    let lane = alias_address as usize & (RENDER_MEMORY_WORD_BYTES - 1);
+    if linear {
+        return lane;
+    }
+    // The subword-reversal permutation is an involution, so the same map also
+    // returns a physical lane to its logical origin.
+    framebuffer::physical_lane(lane).expect("a word lane always maps back")
+}
+
+/// Returns the first physical word lane occupied by one batch candidate.
+fn physical_candidate_lane(
+    linear: bool,
+    logical_lane: usize,
+    candidate: u16,
+    bytes: usize,
+) -> usize {
+    let logical = logical_lane + usize::from(candidate) * bytes;
+    if linear {
+        return logical;
+    }
+    framebuffer::physical_pixel_lane(logical, bytes)
+        .expect("a validated pixel batch remains inside one framebuffer word")
+}
+
+/// Computes the physical word-lane span covering every candidate of a batch.
+fn physical_batch_span(
+    linear: bool,
+    logical_lane: usize,
+    candidate_count: u16,
+    bytes: usize,
+) -> (usize, usize) {
+    let mut start = RENDER_MEMORY_WORD_BYTES;
+    let mut end = 0;
+    for candidate in 0..candidate_count {
+        let lane = physical_candidate_lane(linear, logical_lane, candidate, bytes);
+        start = start.min(lane);
+        end = end.max(lane + bytes);
+    }
+    (start, end)
+}
+
+/// Recomputes the per-candidate write enables of a batch, with bit 31 being
+/// the first candidate, plus the number of enabled candidates. The stipple
+/// cursor still points at the first batch candidate because a batch only
+/// advances once its writes complete.
+fn pixel_dma_enabled_mask(
+    job: &PixelPipelineJob,
+    x: u16,
+    y: u16,
+    candidate_count: u16,
+) -> (u32, u16) {
+    let mut mask = 0_u32;
+    let mut count = 0_u16;
+    for candidate in 0..candidate_count {
+        let Some(window_x) = x.checked_add(candidate) else {
+            continue;
+        };
+        if !job.command.clip_passes(window_x, y) {
+            continue;
+        }
+        let stipple_foreground = job.stipple.is_none_or(|stipple| stipple.permits(candidate));
+        if stipple_foreground || job.command.features.opaque_stipple() {
+            mask |= 1_u32 << (31 - candidate);
+            count += 1;
+        }
+    }
+    (mask, count)
+}
+
+/// Counts how many consecutive candidates starting at the current raster
+/// position share one framebuffer word on both the pixel-transfer source and
+/// destination, so the batch never crosses a word (and therefore tile or
+/// page) boundary.
+fn pixel_dma_batch_count(
+    job: &PixelPipelineJob,
+    x: u16,
+    y: u16,
+    source_bytes: u8,
+    destination_bytes: u8,
+) -> Option<u16> {
+    let dma = job.pixel_dma.as_ref().expect("PixelDMA state exists");
+    let remaining = if job.rasterizer.contiguous() {
+        job.rasterizer.remaining_in_row()
+    } else {
+        1
+    };
+    let dx = i64::from(x) - i64::from(job.command.x0);
+    let dy = i64::from(y) - i64::from(job.command.y0);
+    let destination_address = pixel_dma_destination_address(
+        &job.command,
+        &dma.destination_buffer,
+        destination_bytes,
+        dx,
+        dy,
+    );
+    let destination =
+        dma.destination_buffer
+            .translate_address(destination_address, destination_bytes, true)?;
+    let destination_lane =
+        logical_word_lane(dma.destination_buffer.linear(), destination.alias_address);
+    let destination_cap =
+        ((RENDER_MEMORY_WORD_BYTES - destination_lane) / usize::from(destination_bytes)) as u16;
+    let source_cap = if pixel_dma_source_batchable(&job.command, &dma.source_buffer, source_bytes) {
+        let source_address =
+            pixel_dma_source_address(&job.command, &dma.source_buffer, source_bytes, dx, dy);
+        let source = dma
+            .source_buffer
+            .translate_address(source_address, source_bytes, true)?;
+        let source_lane = logical_word_lane(dma.source_buffer.linear(), source.alias_address);
+        ((RENDER_MEMORY_WORD_BYTES - source_lane) / usize::from(source_bytes)) as u16
+    } else {
+        1
+    };
+    Some(remaining.min(destination_cap).min(source_cap))
+}
+
+/// Returns whether consecutive candidates advance the pixel-transfer source
+/// by exactly one pixel, which keeps a candidate batch inside one source
+/// framebuffer word.
+fn pixel_dma_source_batchable(
+    command: &DecodedPixelCommand,
+    buffer: &MteBufferSnapshot,
+    source_bytes: u8,
+) -> bool {
+    match command.snapshot.pixel_transfer_source_x_step() {
+        0 => true,
+        step if buffer.linear() => step == i32::from(source_bytes),
+        step => step == 1,
+    }
 }
 
 fn pixel_dma_source_address(
