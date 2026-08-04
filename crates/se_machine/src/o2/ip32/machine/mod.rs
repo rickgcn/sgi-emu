@@ -4,6 +4,8 @@
 //! the generic facilities in `se_runtime`.
 
 use core::fmt;
+#[cfg(feature = "jit")]
+use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use se_core::component::{Component, ComponentId, ComponentStateError};
@@ -53,7 +55,8 @@ use se_device::cpu::execution::protocol::{
 use se_device::cpu::mips4::execution::block::MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES;
 #[cfg(feature = "jit")]
 use se_device::cpu::mips4::execution::block::{
-    MIPS4_BLOCK_MAX_INSTRUCTIONS, Mips4CodeGuard, Mips4CodeSourceId, Mips4CodeWindow,
+    MIPS4_BLOCK_MAX_INSTRUCTIONS, Mips4CodeGuard, Mips4CodeSourceId, Mips4CodeSourceRequest,
+    Mips4CodeWindow,
 };
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use se_device::cpu::mips4::execution::target::Mips4ExecutionBoundary;
@@ -469,6 +472,26 @@ impl CpuClock {
     }
 }
 
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SdramCodeWindowCacheKey {
+    request: Mips4CodeSourceRequest,
+    no_ecc: bool,
+}
+
+#[cfg(feature = "jit")]
+struct CachedSdramCodeWindow {
+    source_revision: u64,
+    version: u128,
+    window: Mips4CodeWindow,
+}
+
+#[cfg(feature = "jit")]
+struct LastSdramCodeWindow {
+    key: SdramCodeWindowCacheKey,
+    cached: CachedSdramCodeWindow,
+}
+
 struct RuntimeControl {
     slots: HotComponentSlots,
     persistent_config: Ip32PersistentConfig,
@@ -492,6 +515,10 @@ struct RuntimeControl {
     cpu_continuation_quantum: usize,
     #[cfg(feature = "jit")]
     jit_engine: Option<Mips4BlockEngine<CraneliftMips4Backend>>,
+    #[cfg(feature = "jit")]
+    sdram_code_windows: HashMap<SdramCodeWindowCacheKey, CachedSdramCodeWindow>,
+    #[cfg(feature = "jit")]
+    last_sdram_code_window: Option<LastSdramCodeWindow>,
     #[cfg(test)]
     first_serial_output_time: Option<SimTime>,
     #[cfg(test)]
@@ -1047,6 +1074,10 @@ impl<S> Ip32Machine<S> {
                 cpu_continuation_quantum: DEFAULT_CPU_CONTINUATION_QUANTUM,
                 #[cfg(feature = "jit")]
                 jit_engine,
+                #[cfg(feature = "jit")]
+                sdram_code_windows: HashMap::new(),
+                #[cfg(feature = "jit")]
+                last_sdram_code_window: None,
                 #[cfg(test)]
                 first_serial_output_time: None,
                 #[cfg(test)]
@@ -1713,6 +1744,10 @@ impl<S> Ip32Machine<S> {
             cpu_continuation_quantum: state.control.cpu_continuation_quantum,
             #[cfg(feature = "jit")]
             jit_engine,
+            #[cfg(feature = "jit")]
+            sdram_code_windows: HashMap::new(),
+            #[cfg(feature = "jit")]
+            last_sdram_code_window: None,
             #[cfg(test)]
             first_serial_output_time: None,
             #[cfg(test)]
@@ -2356,6 +2391,8 @@ fn advance_cpu_generation(control: &mut RuntimeControl) -> Result<(), Ip32Runtim
 
 #[cfg(feature = "jit")]
 fn reset_jit_engine(control: &mut RuntimeControl) -> Result<(), Ip32RuntimeError> {
+    control.sdram_code_windows.clear();
+    control.last_sdram_code_window = None;
     if let Some(engine) = &mut control.jit_engine
         && !engine.is_empty()
     {
@@ -2399,7 +2436,7 @@ where
 #[cfg(feature = "jit")]
 fn functional_code_window(
     registry: &ComponentRegistry,
-    control: &RuntimeControl,
+    control: &mut RuntimeControl,
 ) -> Result<Option<Mips4CodeWindow>, Ip32RuntimeError> {
     let Some(request) = registry
         .get_resolved(control.slots.cpu)?
@@ -2451,13 +2488,60 @@ fn functional_code_window(
             no_ecc,
             ..
         } => {
-            let Some((bytes, fingerprint)) = registry
-                .get_resolved(control.slots.sdram)?
-                .stable_code_window(offset, maximum_bytes, no_ecc)
+            let sdram = registry.get_resolved(control.slots.sdram)?;
+            let source_revision = sdram.code_revision();
+            let cache_key = SdramCodeWindowCacheKey { request, no_ecc };
+            if let Some(last) = &control.last_sdram_code_window
+                && last.key == cache_key
+                && last.cached.source_revision == source_revision
+            {
+                return Ok(Some(last.cached.window.clone()));
+            }
+            if let Some(cached) = control.sdram_code_windows.get(&cache_key)
+                && cached.source_revision == source_revision
+            {
+                let window = cached.window.clone();
+                control.last_sdram_code_window = Some(LastSdramCodeWindow {
+                    key: cache_key,
+                    cached: CachedSdramCodeWindow {
+                        source_revision,
+                        version: cached.version,
+                        window: window.clone(),
+                    },
+                });
+                return Ok(Some(window));
+            }
+            let Some(version) = sdram.stable_code_window_version(offset, maximum_bytes) else {
+                return Ok(None);
+            };
+            if let Some(last) = &mut control.last_sdram_code_window
+                && last.key == cache_key
+                && last.cached.version == version
+            {
+                last.cached.source_revision = source_revision;
+                return Ok(Some(last.cached.window.clone()));
+            }
+            if let Some(cached) = control.sdram_code_windows.get_mut(&cache_key)
+                && cached.version == version
+            {
+                cached.source_revision = source_revision;
+                let window = cached.window.clone();
+                control.last_sdram_code_window = Some(LastSdramCodeWindow {
+                    key: cache_key,
+                    cached: CachedSdramCodeWindow {
+                        source_revision,
+                        version,
+                        window: window.clone(),
+                    },
+                });
+                return Ok(Some(window));
+            }
+            let Some((bytes, fingerprint)) =
+                sdram.stable_code_window(offset, maximum_bytes, no_ecc)
             else {
                 return Ok(None);
             };
-            Ok(Mips4CodeWindow::new(
+            let window = Mips4CodeWindow::new(
                 request,
                 Mips4CodeGuard {
                     source_id: Mips4CodeSourceId::new(2),
@@ -2466,7 +2550,26 @@ fn functional_code_window(
                     fingerprint,
                 },
                 &bytes,
-            ))
+            );
+            if let Some(window) = &window {
+                control.last_sdram_code_window = Some(LastSdramCodeWindow {
+                    key: cache_key,
+                    cached: CachedSdramCodeWindow {
+                        source_revision,
+                        version,
+                        window: window.clone(),
+                    },
+                });
+                control.sdram_code_windows.insert(
+                    cache_key,
+                    CachedSdramCodeWindow {
+                        source_revision,
+                        version,
+                        window: window.clone(),
+                    },
+                );
+            }
+            Ok(window)
         }
         _ => Ok(None),
     }

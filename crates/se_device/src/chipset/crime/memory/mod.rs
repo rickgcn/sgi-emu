@@ -48,6 +48,8 @@ struct SparsePage {
     data: [u8; PAGE_SIZE],
     #[serde(with = "crate::common::serde_array")]
     ecc: [u8; PAGE_SIZE / 8],
+    #[serde(skip)]
+    code_revision: u64,
 }
 
 impl SparseBank {
@@ -81,18 +83,24 @@ impl SparseBank {
         (u64::from_le_bytes(bytes), contents.ecc[lane])
     }
 
-    fn write_lane(&mut self, offset: u64, data: u64, check: u8) {
+    fn write_lane(&mut self, offset: u64, data: u64, check: u8) -> bool {
         let aligned = offset & !7;
         let aligned = aligned as usize;
         let page = aligned / PAGE_SIZE;
         let in_page = aligned % PAGE_SIZE;
         let lane = in_page / 8;
         if data == 0 && check == 0 && self.pages[page].is_none() {
-            return;
+            return false;
         }
         let contents = self.page_mut(page);
-        contents.data[in_page..in_page + 8].copy_from_slice(&data.to_le_bytes());
+        let bytes = data.to_le_bytes();
+        if contents.data[in_page..in_page + 8] == bytes && contents.ecc[lane] == check {
+            return false;
+        }
+        contents.data[in_page..in_page + 8].copy_from_slice(&bytes);
         contents.ecc[lane] = check;
+        contents.code_revision = contents.code_revision.wrapping_add(1);
+        true
     }
 
     fn page_mut(&mut self, page: usize) -> &mut SparsePage {
@@ -101,6 +109,7 @@ impl SparseBank {
                 Box::new(SparsePage {
                     data: [0; PAGE_SIZE],
                     ecc: [0; PAGE_SIZE / 8],
+                    code_revision: 0,
                 })
             })
             .as_mut()
@@ -125,6 +134,8 @@ pub struct CrimeSdram {
     ecc_enabled: bool,
     use_replacement: bool,
     replacement: u8,
+    code_revision: u64,
+    code_mapping_revision: u64,
 }
 
 /// Serializable sparse contents and programmable state of CRIME SDRAM.
@@ -150,6 +161,8 @@ impl CrimeSdram {
             ecc_enabled: false,
             use_replacement: false,
             replacement: 0,
+            code_revision: 0,
+            code_mapping_revision: 0,
         }
     }
 
@@ -212,6 +225,8 @@ impl CrimeSdram {
         self.ecc_enabled = state.ecc_enabled;
         self.use_replacement = state.use_replacement;
         self.replacement = state.replacement;
+        self.code_revision = self.code_revision.wrapping_add(1);
+        self.code_mapping_revision = self.code_mapping_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -227,6 +242,54 @@ impl CrimeSdram {
     /// Returns one programmable bank-control value.
     pub fn bank_control(&self, bank: usize) -> Option<u16> {
         self.bank_control.get(bank).copied()
+    }
+
+    /// Returns the transient source-wide code visibility revision.
+    ///
+    /// The revision changes after every effective storage, mapping, or ECC
+    /// mutation. It is derived execution metadata and is not serialized.
+    pub const fn code_revision(&self) -> u64 {
+        self.code_revision
+    }
+
+    /// Returns a transient version of one cacheable stable code window.
+    ///
+    /// A version is available only when the complete window resolves to one
+    /// contiguous sparse page or to unpopulated memory. It changes when that
+    /// page's stored data or ECC changes, or when programmable decoding and ECC
+    /// controls change. The version is derived execution metadata and is not
+    /// part of serialized machine state.
+    pub fn stable_code_window_version(&self, address: u64, length: usize) -> Option<u128> {
+        if length == 0 || length > 128 {
+            return None;
+        }
+        let last_address = address.checked_add(length as u64 - 1)?;
+        let storage_revision = match (self.decode(address)?, self.decode(last_address)?) {
+            (
+                BankSelection::Populated {
+                    index: first_bank,
+                    offset: first_offset,
+                },
+                BankSelection::Populated {
+                    index: last_bank,
+                    offset: last_offset,
+                },
+            ) if first_bank == last_bank
+                && last_offset == first_offset.checked_add(length as u64 - 1)?
+                && first_offset / PAGE_SIZE as u64 == last_offset / PAGE_SIZE as u64 =>
+            {
+                let page = first_offset as usize / PAGE_SIZE;
+                self.banks[first_bank]
+                    .as_ref()
+                    .expect("decoded bank exists")
+                    .pages[page]
+                    .as_ref()
+                    .map_or(0, |contents| contents.code_revision)
+            }
+            (BankSelection::Unpopulated, BankSelection::Unpopulated) => 0,
+            _ => return None,
+        };
+        Some((u128::from(self.code_mapping_revision) << 64) | u128::from(storage_revision))
     }
 
     /// Reads a side-effect-free code window and fingerprints its data, ECC,
@@ -340,8 +403,13 @@ impl CrimeSdram {
             .expect("decoded bank exists")
             .read_lane(offset);
         let corrupted = data ^ (1_u64 << bit);
-        let bank = self.banks[bank].as_mut().expect("decoded bank exists");
-        bank.write_lane(offset, corrupted, check);
+        let changed = self.banks[bank]
+            .as_mut()
+            .expect("decoded bank exists")
+            .write_lane(offset, corrupted, check);
+        if changed {
+            self.code_revision = self.code_revision.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -609,10 +677,13 @@ impl CrimeSdram {
             } else {
                 ecc::generate(data)
             };
-            let bank = self.banks[bank_index]
+            let changed = self.banks[bank_index]
                 .as_mut()
-                .expect("decoded bank exists");
-            bank.write_lane(lane_offset, data, check);
+                .expect("decoded bank exists")
+                .write_lane(lane_offset, data, check);
+            if changed {
+                self.code_revision = self.code_revision.wrapping_add(1);
+            }
             position += count;
         }
         Ok(CrimeMemoryOutcome::new(
@@ -672,6 +743,8 @@ impl Component for CrimeSdram {
         self.ecc_enabled = false;
         self.use_replacement = false;
         self.replacement = 0;
+        self.code_revision = self.code_revision.wrapping_add(1);
+        self.code_mapping_revision = self.code_mapping_revision.wrapping_add(1);
     }
 }
 
@@ -690,7 +763,12 @@ impl BusDeviceRole<CrimeSdramSignal> for CrimeSdram {
         match signal {
             CrimeSdramSignal::SetBankControl { bank, value } => {
                 if let Some(control) = self.bank_control.get_mut(usize::from(bank)) {
-                    *control = value & registers::MEMORY_BANK_CONTROL_MASK;
+                    let value = value & registers::MEMORY_BANK_CONTROL_MASK;
+                    if *control != value {
+                        *control = value;
+                        self.code_revision = self.code_revision.wrapping_add(1);
+                        self.code_mapping_revision = self.code_mapping_revision.wrapping_add(1);
+                    }
                 }
             }
             CrimeSdramSignal::SetEccControl {
@@ -698,9 +776,15 @@ impl BusDeviceRole<CrimeSdramSignal> for CrimeSdram {
                 use_replacement,
                 replacement,
             } => {
-                self.ecc_enabled = enabled;
-                self.use_replacement = use_replacement;
-                self.replacement = replacement;
+                if (self.ecc_enabled, self.use_replacement, self.replacement)
+                    != (enabled, use_replacement, replacement)
+                {
+                    self.ecc_enabled = enabled;
+                    self.use_replacement = use_replacement;
+                    self.replacement = replacement;
+                    self.code_revision = self.code_revision.wrapping_add(1);
+                    self.code_mapping_revision = self.code_mapping_revision.wrapping_add(1);
+                }
             }
             CrimeSdramSignal::PowerOn => self.reset(),
             CrimeSdramSignal::HardReset => {}

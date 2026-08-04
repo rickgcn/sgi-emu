@@ -5,6 +5,8 @@ use crate::o2::ip32::component_ids;
 use se_core::role::BusDeviceRole;
 use se_core::scheduler::SimTime;
 use se_device::bus::isa::{IsaDeviceResponse, IsaTransaction, IsaTransactionId, IsaTransfer};
+#[cfg(feature = "jit")]
+use se_device::cpu::mips4::gpr::Mips4GprIndex;
 use se_device::cpu::mips4::model::r5000::cpu::R5000Cpu;
 use se_device::memory::flash::SystemFlash;
 
@@ -43,6 +45,39 @@ fn hot_loop_config(jit_enabled: bool) -> Ip32RuntimeConfig {
         ..Ip32RuntimeConfig::default()
     };
     for (offset, instruction) in program {
+        config.machine.prom_image[offset..offset + 4].copy_from_slice(&instruction.to_be_bytes());
+    }
+    config
+}
+
+#[cfg(feature = "jit")]
+fn sdram_rewrite_config() -> Ip32RuntimeConfig {
+    let halt_address = 0xffff_ffff_bfc0_0038_u64;
+    let jump_halt = (2_u32 << 26) | (((halt_address as u32) >> 2) & 0x03ff_ffff);
+    let program = [
+        i_type(0x0f, 0, 1, 0xa000),
+        i_type(0x0f, 0, 2, 0x2484),
+        i_type(0x0d, 2, 2, 1),
+        i_type(0x2b, 1, 2, 0),
+        i_type(0x0f, 0, 2, 0x03e0),
+        i_type(0x0d, 2, 2, 8),
+        i_type(0x2b, 1, 2, 4),
+        r_type(1, 0, 31, 0, 0x09),
+        0,
+        i_type(0x0f, 0, 2, 0x2484),
+        i_type(0x0d, 2, 2, 2),
+        i_type(0x2b, 1, 2, 0),
+        r_type(1, 0, 31, 0, 0x09),
+        0,
+        jump_halt,
+        0,
+    ];
+    let mut config = Ip32RuntimeConfig {
+        jit_enabled: true,
+        ..Ip32RuntimeConfig::default()
+    };
+    for (index, instruction) in program.into_iter().enumerate() {
+        let offset = index * 4;
         config.machine.prom_image[offset..offset + 4].copy_from_slice(&instruction.to_be_bytes());
     }
     config
@@ -235,6 +270,29 @@ fn jit_and_scalar_share_the_same_architectural_path() {
     let jit_performance = jit.performance_snapshot();
     assert_eq!(scalar_performance.cpu, jit_performance.cpu);
     assert!(jit_performance.jit.native_operations + jit_performance.jit.region_operations > 0);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn jit_code_window_cache_observes_sdram_rewrites() {
+    let replacement = i_type(0x09, 4, 4, 2).to_be_bytes();
+    let mut runtime = Ip32Machine::from_config(sdram_rewrite_config()).unwrap();
+
+    run_to_retired(&mut runtime, 5_000);
+
+    let cpu = runtime
+        .runtime()
+        .registry()
+        .get_typed::<R5000Cpu>(component_ids::CPU0)
+        .unwrap();
+    assert_eq!(
+        cpu.state().gpr().read(Mips4GprIndex::from_u8(4).unwrap()),
+        3
+    );
+    assert!(runtime.control.sdram_code_windows.values().any(|cached| {
+        cached.window.request().physical_address == 0
+            && cached.window.bytes().starts_with(&replacement)
+    }));
 }
 
 #[test]

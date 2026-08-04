@@ -60,7 +60,7 @@ pub struct Mips4BlockKey {
 
 /// Side-effect-free external code-source request produced after instruction
 /// address translation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Mips4CodeSourceRequest {
     /// Guest virtual address of the first instruction.
     pub virtual_address: u64,

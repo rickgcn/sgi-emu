@@ -449,3 +449,118 @@ fn state_restore_preserves_name_and_rejects_topology_and_page_shape_atomically()
     ));
     assert_eq!(target, before);
 }
+
+#[test]
+fn stable_code_window_version_tracks_sparse_page_mutations() {
+    let mut memory = small_memory();
+    memory.accept(transaction(
+        1,
+        0,
+        CrimeTransfer::write(vec![0x11; 8].into(), vec![true; 8].into()),
+    ));
+
+    let initial_version = memory.stable_code_window_version(0, 32).unwrap();
+    let initial_fingerprint = memory.stable_code_window(0, 32, false).unwrap().1;
+    let initial_source_revision = memory.code_revision();
+
+    memory.accept(transaction(
+        2,
+        0,
+        CrimeTransfer::write(vec![0x11; 8].into(), vec![true; 8].into()),
+    ));
+    assert_eq!(
+        memory.stable_code_window_version(0, 32).unwrap(),
+        initial_version
+    );
+    assert_eq!(memory.code_revision(), initial_source_revision);
+
+    memory.accept(transaction(
+        3,
+        64,
+        CrimeTransfer::write(vec![0x22; 8].into(), vec![true; 8].into()),
+    ));
+    let unrelated_version = memory.stable_code_window_version(0, 32).unwrap();
+    assert_ne!(unrelated_version, initial_version);
+    assert_ne!(memory.code_revision(), initial_source_revision);
+    assert_eq!(
+        memory.stable_code_window(0, 32, false).unwrap().1,
+        initial_fingerprint
+    );
+
+    memory.accept(transaction(
+        4,
+        4,
+        CrimeTransfer::write(vec![0x33].into(), vec![true].into()),
+    ));
+    assert_ne!(
+        memory.stable_code_window_version(0, 32).unwrap(),
+        unrelated_version
+    );
+    assert_ne!(
+        memory.stable_code_window(0, 32, false).unwrap().1,
+        initial_fingerprint
+    );
+}
+
+#[test]
+fn stable_code_window_version_tracks_mapping_ecc_and_restoration() {
+    let mut source = small_memory();
+    source.accept(transaction(
+        1,
+        0,
+        CrimeTransfer::write(vec![0xaa; 8].into(), vec![true; 8].into()),
+    ));
+
+    let initial_version = source.stable_code_window_version(0, 32).unwrap();
+    source.accept(CrimeSdramSignal::SetBankControl {
+        bank: 7,
+        value: 0x1e,
+    });
+    let mapped_version = source.stable_code_window_version(0, 32).unwrap();
+    assert_ne!(mapped_version, initial_version);
+
+    source.accept(CrimeSdramSignal::SetEccControl {
+        enabled: true,
+        use_replacement: true,
+        replacement: 0x5a,
+    });
+    let ecc_version = source.stable_code_window_version(0, 32).unwrap();
+    assert_ne!(ecc_version, mapped_version);
+
+    let mut restored = small_memory();
+    restored.accept(transaction(
+        2,
+        0,
+        CrimeTransfer::write(vec![0x55; 8].into(), vec![true; 8].into()),
+    ));
+    let before_restore = restored.stable_code_window_version(0, 32).unwrap();
+    restored.restore_state(source.save_state()).unwrap();
+    assert_ne!(
+        restored.stable_code_window_version(0, 32).unwrap(),
+        before_restore
+    );
+    assert_eq!(
+        restored.stable_code_window(0, 8, false).unwrap().0,
+        vec![0xaa; 8]
+    );
+}
+
+#[test]
+fn stable_code_window_version_tracks_ecc_fault_injection() {
+    let mut memory = small_memory();
+    memory.accept(transaction(
+        1,
+        0,
+        CrimeTransfer::write(vec![0x5a; 8].into(), vec![true; 8].into()),
+    ));
+    let clean_version = memory.stable_code_window_version(0, 32).unwrap();
+
+    memory.inject_data_bit(0, 0).unwrap();
+
+    assert_ne!(
+        memory.stable_code_window_version(0, 32).unwrap(),
+        clean_version
+    );
+    assert!(memory.stable_code_window(0, 32, false).is_none());
+    assert_eq!(memory.stable_code_window(0, 8, true).unwrap().0[0], 0x5b);
+}
