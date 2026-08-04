@@ -2,7 +2,7 @@
 
 `sgi-emu` is an emulator for selected Silicon Graphics systems, written primarily in Rust.
 
-The project uses deterministic event-driven machine and device models, Berkeley SoftFloat for guest floating-point behavior, an optional Cranelift-based MIPS IV JIT, and a native Qt Widgets frontend.
+The project uses deterministic functional machine execution, event-driven device scheduling, Berkeley SoftFloat for guest floating-point behavior, an optional Cranelift-based MIPS IV JIT, and a native Qt Widgets frontend.
 
 > [!WARNING]
 > The emulator is under active development. Hardware coverage, public APIs, and saved-state compatibility may change.
@@ -25,11 +25,11 @@ The implementation is incomplete and should not yet be considered a drop-in repl
 | Crate | Purpose |
 | --- | --- |
 | `se_core` | Components, scheduling, roles, and structured tracing |
-| `se_runtime` | Event-driven runtime orchestration |
+| `se_runtime` | Machine-independent component ownership, event loops, scheduling, and tracing |
 | `se_float` | Native and Berkeley SoftFloat floating-point backends |
 | `se_device` | Processor, chipset, peripheral, memory, and bus models |
 | `se_jit` | Cranelift-based MIPS IV JIT backend |
-| `se_machine` | SGI machine profiles and board-level integration |
+| `se_machine` | SGI machine profiles, address maps, wiring, event semantics, state, and execution integration |
 | `se_ui` | Native Qt Widgets frontend and application integration |
 
 ## Requirements
@@ -105,14 +105,15 @@ SGI PROM images are proprietary and are not included in this repository. Users m
 
 ## Features
 
-`se_machine` provides an optional `jit` feature:
+`se_machine` provides an optional `jit` feature for machine integrations that
+support native CPU execution:
 
 ```sh
 cargo test -p se_machine --no-default-features
 cargo test -p se_machine --all-features
 ```
 
-The interpreter remains available without the feature. Enabling `jit` adds the Cranelift-based native execution backend.
+The interpreter remains available without the feature. Enabling `jit` adds the Cranelift-based native execution backend while preserving the runtime transaction path.
 
 The Qt frontend currently enables the JIT feature explicitly.
 
@@ -132,6 +133,7 @@ cargo clippy \
 
 cargo test --workspace --exclude se_ui
 
+cargo test -p se_runtime
 cargo test -p se_machine --no-default-features
 cargo test -p se_machine --all-features
 

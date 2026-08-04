@@ -873,7 +873,6 @@ version = "0.1.0"
 dependencies = [
  "se_core",
  "serde",
- "smallvec",
 ]
 
 [[package]]

@@ -5,7 +5,6 @@
 //! semantics. A machine layer supplies a dispatch closure that interprets event
 //! payloads and may schedule more events through [`RuntimeContext`].
 
-pub mod event_chain;
 pub mod state;
 
 use core::fmt;

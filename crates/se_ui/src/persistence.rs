@@ -17,9 +17,8 @@ use directories::ProjectDirs;
 use se_device::memory::flash::SystemFlashPersistentState;
 use se_device::rtc::ds1687::state::Ds1687PersistentState;
 use se_machine::o2::ip32::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
-use se_machine::o2::ip32::state::{
-    IP32_STATE_SCHEMA_VERSION, Ip32MachineState, Ip32PersistentConfig, Ip32PersistentConfigError,
-};
+use se_machine::o2::ip32::config::{Ip32PersistentConfig, Ip32PersistentConfigError};
+use se_machine::o2::ip32::state::{IP32_STATE_SCHEMA_VERSION, Ip32MachineState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -925,7 +924,7 @@ mod tests {
     use se_core::scheduler::SimTime;
     use se_device::bus::isa::{IsaTransaction, IsaTransactionId, IsaTransfer};
     use se_device::memory::flash::SystemFlash;
-    use se_machine::o2::ip32::machine::{Ip32Machine, Ip32MachineConfig};
+    use se_machine::o2::ip32::machine::{Ip32Machine, Ip32RuntimeConfig};
 
     #[test]
     fn real_time_clamps_a_backward_host_clock() {
@@ -956,7 +955,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let machine = Ip32Machine::from_config(Ip32MachineConfig::default()).unwrap();
+        let machine = Ip32Machine::from_config(Ip32RuntimeConfig::default()).unwrap();
         let state = machine.save_state().unwrap();
         let path = directory.path().join("state.sestate");
         write_state_file(&path, "0.1.0", &config, &state).unwrap();
@@ -1030,7 +1029,7 @@ mod tests {
         assert_eq!(migrated.version, EMULATION_CONFIG_VERSION);
         assert!(!migrated.jit_enabled());
 
-        let machine = Ip32Machine::from_config(Ip32MachineConfig::default()).unwrap();
+        let machine = Ip32Machine::from_config(Ip32RuntimeConfig::default()).unwrap();
         let state = machine.save_state().unwrap();
         let payload = postcard::to_stdvec(&state).unwrap();
         let compressed = zstd::stream::encode_all(payload.as_slice(), ZSTD_LEVEL).unwrap();

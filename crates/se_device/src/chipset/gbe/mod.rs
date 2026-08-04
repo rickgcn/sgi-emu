@@ -45,24 +45,6 @@ const MAX_DMA_READS: usize = 8;
 const MAX_DMA_WRITES: usize = 1;
 const COLOR_MAP_FIFO_CAPACITY: usize = 64;
 
-/// Immutable GBE register value captured for a bounded synchronous read batch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GbeSynchronousReadProjection {
-    /// Physical address of the projected register.
-    pub physical_address: u64,
-
-    /// Big-endian register value.
-    pub value: u32,
-}
-
-impl GbeSynchronousReadProjection {
-    /// Completes the projected aligned word read.
-    pub fn read(self, physical_address: u64, length: u16) -> Option<CrimeData> {
-        (physical_address == self.physical_address && length == 4)
-            .then(|| self.value.to_be_bytes().into())
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct ExternalClockState {
     numerator_hz: u64,
@@ -998,25 +980,6 @@ impl Gbe {
     pub fn observe_time(&mut self, now: SimTime) {
         assert!(now >= self.observed_time, "GBE time cannot move backwards");
         self.observed_time = now;
-    }
-
-    /// Captures the active framebuffer register for a bounded read batch.
-    pub fn synchronous_frame_active_projection(&self) -> GbeSynchronousReadProjection {
-        GbeSynchronousReadProjection {
-            physical_address: registers::FRAME_START + 8,
-            value: self.registers.frame[2],
-        }
-    }
-
-    /// Commits the time observed by proven active-frame register reads.
-    pub fn commit_synchronous_frame_active_reads(
-        &mut self,
-        reads: u64,
-        last_delivery_time: SimTime,
-    ) {
-        if reads != 0 {
-            self.observe_time(self.observed_time.max(last_delivery_time));
-        }
     }
 
     /// Applies one host-neutral external input transition.

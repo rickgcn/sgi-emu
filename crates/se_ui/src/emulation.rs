@@ -14,11 +14,9 @@ use se_device::chipset::gbe::protocol::{
     GbeExternalClock, GbeExternalInput, GbeFrame, GbeFrameField,
 };
 use se_device::input::ps2::{Ps2KeyPosition, Ps2KeyboardInput, Ps2MouseButtons, Ps2MouseInput};
-use se_machine::o2::ip32::{
-    address_map::IP32_PROM_IMAGE_SIZE_BYTES,
-    event::{Ip32InputEvent, Ip32SerialOutput, Ip32SerialPort},
-    machine::Ip32Machine,
-};
+use se_machine::o2::ip32::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
+use se_machine::o2::ip32::event::{Ip32InputEvent, Ip32SerialOutput, Ip32SerialPort};
+use se_machine::o2::ip32::machine::{Ip32Machine, Ip32RuntimeConfig};
 use se_runtime::runtime::RunStatus;
 
 use crate::{
@@ -949,15 +947,18 @@ fn auto_configure_machine(
     if let Some(warning) = flash_load.warning {
         warnings.push(warning);
     }
-    let mut machine_config = config.machine().machine_config(
+    let machine_config = config.machine().machine_config(
         prom,
         battery_load.state.unix_seconds(),
         battery_load.state.nvram().to_vec(),
     );
-    machine_config.jit_enabled = config.jit_enabled();
+    let runtime_config = Ip32RuntimeConfig {
+        machine: machine_config,
+        jit_enabled: config.jit_enabled(),
+    };
     let result = (|| {
         let mut new_machine =
-            Ip32Machine::from_config_with_trace_sink(machine_config, UiTraceSink::application())
+            Ip32Machine::from_config_with_trace_sink(runtime_config, UiTraceSink::application())
                 .map_err(|error| error.to_string())?;
         new_machine
             .restore_rtc_persistent_state(&battery_load.state)
@@ -1014,7 +1015,7 @@ fn build_configured_machine(
     shared: &SharedController,
     request: ConfigureRequest,
 ) -> Result<(Ip32Machine<UiTraceSink>, EmulationConfig, Option<String>), String> {
-    let persistent = se_machine::o2::ip32::state::Ip32PersistentConfig::default();
+    let persistent = se_machine::o2::ip32::config::Ip32PersistentConfig::default();
     let persisted_path = !request.prom_path.as_os_str().is_empty();
     let prom_hash = hash_bytes(&request.prom);
     let metadata_path = if persisted_path {
@@ -1059,13 +1060,16 @@ fn build_configured_machine(
             )
             .expect("the fallback battery image has the hardware size")
         });
-    let mut machine_config =
+    let machine_config =
         config
             .machine()
             .machine_config(request.prom, rtc.unix_seconds(), rtc.nvram().to_vec());
-    machine_config.jit_enabled = config.jit_enabled();
+    let runtime_config = Ip32RuntimeConfig {
+        machine: machine_config,
+        jit_enabled: config.jit_enabled(),
+    };
     let mut machine =
-        Ip32Machine::from_config_with_trace_sink(machine_config, UiTraceSink::application())
+        Ip32Machine::from_config_with_trace_sink(runtime_config, UiTraceSink::application())
             .map_err(|error| error.to_string())?;
     machine
         .restore_rtc_persistent_state(&rtc)
@@ -1161,14 +1165,17 @@ fn load_machine_state(
             .with_prom_path(prom_path)
             .map_err(|error| LoadMachineError::Failed(error.to_string()))?;
         let fallback_rtc = load_battery_for_config(shared, &config);
-        let mut machine_config = config.machine().machine_config(
+        let machine_config = config.machine().machine_config(
             prom,
             fallback_rtc.unix_seconds(),
             fallback_rtc.nvram().to_vec(),
         );
-        machine_config.jit_enabled = config.jit_enabled();
+        let runtime_config = Ip32RuntimeConfig {
+            machine: machine_config,
+            jit_enabled: config.jit_enabled(),
+        };
         let mut new_machine = Ip32Machine::from_state_with_trace_sink(
-            machine_config,
+            runtime_config,
             loaded.state,
             UiTraceSink::application(),
         )
@@ -1839,7 +1846,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use se_core::scheduler::SimTime;
-    use se_machine::o2::ip32::{component_ids, event::Ip32Event, machine::Ip32MachineConfig};
+    use se_machine::o2::ip32::{component_ids, config::Ip32MachineConfig, event::Ip32Event};
 
     use super::*;
 
@@ -1932,9 +1939,12 @@ mod tests {
     fn crt_display_connection_schedules_inputs_after_power_on() {
         let mut prom = vec![0; IP32_PROM_IMAGE_SIZE_BYTES];
         prom[..4].copy_from_slice(&WAIT.to_be_bytes());
-        let config = Ip32MachineConfig {
-            prom_image: prom,
-            ..Ip32MachineConfig::default()
+        let config = Ip32RuntimeConfig {
+            machine: Ip32MachineConfig {
+                prom_image: prom,
+                ..Ip32MachineConfig::default()
+            },
+            ..Ip32RuntimeConfig::default()
         };
         let mut machine =
             Ip32Machine::from_config_with_trace_sink(config, UiTraceSink::application()).unwrap();

@@ -7,8 +7,7 @@ use crate::cpu::execution::protocol::{ExecutionAction, ExecutionTransaction};
 use crate::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 use crate::cpu::mips4::execution::block::{
     Mips4Block, Mips4BlockGuard, Mips4BlockInstruction, Mips4BlockInstructionMetadata,
-    Mips4BlockOperation, Mips4BlockRetire, Mips4BlockRuntime, Mips4FastMemoryRuntime,
-    interpret_block_with_runtime,
+    Mips4BlockOperation, Mips4BlockRetire, Mips4BlockRuntime, interpret_block_with_runtime,
 };
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionAccessKind, Mips4ExecutionTransferSize};
 use crate::cpu::mips4::execution::port::{
@@ -22,12 +21,10 @@ use super::*;
 #[derive(Default)]
 struct InterpreterPort {
     blocks: Vec<Mips4Block>,
-    saw_fast_memory: bool,
 }
 
 impl Mips4ExecutionPort for InterpreterPort {
     type Error = core::convert::Infallible;
-    type FastMemoryRuntime = dyn Mips4FastMemoryRuntime;
 
     fn probe<R>(
         &mut self,
@@ -80,18 +77,16 @@ impl Mips4ExecutionPort for InterpreterPort {
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut Self::FastMemoryRuntime>,
     ) -> Result<Mips4BlockExecutionResult, Self::Error>
     where
         R: Mips4BlockRuntime,
     {
-        self.saw_fast_memory |= fast_memory.is_some();
         let block = self
             .blocks
             .iter()
             .find(|block| block.key() == key)
             .expect("the CPU probes or installs before execution");
-        let exit = interpret_block_with_runtime(block, frame, runtime, fast_memory);
+        let exit = interpret_block_with_runtime(block, frame, runtime);
         Ok(Mips4BlockExecutionResult {
             exit,
             counter_barrier: false,
@@ -104,7 +99,6 @@ impl Mips4ExecutionPort for InterpreterPort {
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut Self::FastMemoryRuntime>,
         _counters_dirty: bool,
     ) -> Result<Mips4ReusableBlockExecution, Self::Error>
     where
@@ -116,19 +110,8 @@ impl Mips4ExecutionPort for InterpreterPort {
         ) {
             return Ok(Mips4ReusableBlockExecution::Missing);
         }
-        self.execute(key, frame, runtime, fast_memory)
+        self.execute(key, frame, runtime)
             .map(Mips4ReusableBlockExecution::Executed)
-    }
-}
-
-struct UnavailableFastMemory;
-
-impl Mips4FastMemoryRuntime for UnavailableFastMemory {
-    fn read(
-        &mut self,
-        _request: crate::cpu::mips4::execution::block::Mips4FastMemoryReadRequest,
-    ) -> crate::cpu::mips4::execution::block::Mips4FastMemoryReadResult {
-        crate::cpu::mips4::execution::block::Mips4FastMemoryReadResult::Unavailable
     }
 }
 
@@ -311,7 +294,6 @@ fn reusable_slice_ends_after_nonpersistent_fallback_progress() {
 
     impl Mips4ExecutionPort for MissingFallbackPort {
         type Error = core::convert::Infallible;
-        type FastMemoryRuntime = dyn Mips4FastMemoryRuntime;
 
         fn probe<R>(
             &mut self,
@@ -340,13 +322,12 @@ fn reusable_slice_ends_after_nonpersistent_fallback_progress() {
             key: Mips4BlockKey,
             frame: &mut Mips4BlockFrame,
             runtime: &mut R,
-            fast_memory: Option<&mut Self::FastMemoryRuntime>,
         ) -> Result<Mips4BlockExecutionResult, Self::Error>
         where
             R: Mips4BlockRuntime,
         {
             self.direct_executions += 1;
-            let exit = interpret_block_with_runtime(&Self::block(key), frame, runtime, fast_memory);
+            let exit = interpret_block_with_runtime(&Self::block(key), frame, runtime);
             Ok(Mips4BlockExecutionResult {
                 exit,
                 counter_barrier: false,
@@ -359,7 +340,6 @@ fn reusable_slice_ends_after_nonpersistent_fallback_progress() {
             key: Mips4BlockKey,
             frame: &mut Mips4BlockFrame,
             runtime: &mut R,
-            fast_memory: Option<&mut Self::FastMemoryRuntime>,
             _counters_dirty: bool,
         ) -> Result<Mips4ReusableBlockExecution, Self::Error>
         where
@@ -369,7 +349,7 @@ fn reusable_slice_ends_after_nonpersistent_fallback_progress() {
             if self.reusable_attempts == 1 {
                 return Ok(Mips4ReusableBlockExecution::Missing);
             }
-            self.execute(key, frame, runtime, fast_memory)
+            self.execute(key, frame, runtime)
                 .map(Mips4ReusableBlockExecution::Executed)
         }
     }
@@ -385,12 +365,11 @@ fn reusable_slice_ends_after_nonpersistent_fallback_progress() {
 }
 
 #[test]
-fn fake_port_receives_fast_memory_and_reports_architectural_exceptions() {
+fn fake_port_reports_architectural_exceptions() {
     let mut cpu = cpu();
     let mut port = InterpreterPort::default();
-    let mut fast_memory = UnavailableFastMemory;
     let R5000ExecutionSliceAction::Transaction(fetch) = cpu
-        .run_slice_with_code_window_and_fast_memory(&mut port, 1, None, &mut fast_memory)
+        .run_slice_with_code_window(&mut port, 1, None)
         .unwrap()
         .action
     else {
@@ -403,10 +382,7 @@ fn fake_port_receives_fast_memory_and_reports_architectural_exceptions() {
             payload: Mips4ExecutionCompletion::ReadData(big_endian_word(0x0000_000c)),
         },
     );
-    let execution = cpu
-        .run_slice_with_code_window_and_fast_memory(&mut port, 1, None, &mut fast_memory)
-        .unwrap();
-    assert!(port.saw_fast_memory);
+    let execution = cpu.run_slice_with_code_window(&mut port, 1, None).unwrap();
     assert!(matches!(
         execution.exception_boundary,
         Some(Mips4ExecutionBoundary::Exception { .. })

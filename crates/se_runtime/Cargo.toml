@@ -9,4 +9,3 @@ authors.workspace = true
 [dependencies]
 se_core.workspace = true
 serde.workspace = true
-smallvec.workspace = true

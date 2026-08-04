@@ -1,13 +1,10 @@
-//! Runtime integration for the SGI O2 IP32 machine profile.
+//! Mutable integration for the SGI O2 IP32 machine profile.
+//!
+//! Machine-specific event semantics live here and delegate their main loop to
+//! the generic facilities in `se_runtime`.
 
 use core::fmt;
 use std::collections::VecDeque;
-#[cfg(feature = "jit")]
-use std::collections::{HashMap, HashSet};
-#[cfg(feature = "jit")]
-use std::hash::{BuildHasherDefault, Hasher};
-#[cfg(feature = "jit")]
-use std::sync::Arc;
 
 use se_core::component::{Component, ComponentId, ComponentStateError};
 use se_core::role::{BusControllerRole, BusDeviceRole, BusRole};
@@ -34,34 +31,18 @@ use se_device::bus::pci::{
 use se_device::bus::two_wire::{
     TwoWireBus, TwoWireBusAction, TwoWireBusBuildError, TwoWireBusRouteError,
 };
-#[cfg(feature = "jit")]
-use se_device::chipset::crime::CrimeSynchronousTimerProjection;
-use se_device::chipset::crime::config::CrimeConfig;
-use se_device::chipset::crime::iou::{
-    CrimeCgiBus, CrimeCgiBusEvent, CrimeCmiBus, CrimeCmiBusEvent,
-};
+use se_device::chipset::crime::iou::{CrimeCgiBus, CrimeCmiBus};
 use se_device::chipset::crime::memory::CrimeSdram;
-#[cfg(feature = "jit")]
-use se_device::chipset::crime::memory::bus::CrimeDirectMemoryPlan;
-use se_device::chipset::crime::memory::bus::{CrimeMemoryBus, CrimeMemoryBusEvent};
-#[cfg(feature = "jit")]
-use se_device::chipset::crime::protocol::CrimeTransferView;
 use se_device::chipset::crime::protocol::{
-    CRIME_IRQ_OUTPUT, CrimeAction, CrimeBusAction, CrimeBusDisposition, CrimeCgiTransaction,
-    CrimeCmiTransaction, CrimeCpuSignal, CrimeLinkDeviceResponse, CrimeMemoryTransaction,
-    CrimePoll,
+    CRIME_IRQ_OUTPUT, CrimeAction, CrimeCgiCompletion, CrimeCgiTransaction, CrimeCmiCompletion,
+    CrimeCmiTransaction, CrimeCpuSignal, CrimeLinkDeviceResponse, CrimePoll,
 };
-#[cfg(feature = "jit")]
-use se_device::chipset::crime::protocol::{CrimeSysAdRequest, CrimeSysAdRoute};
 use se_device::chipset::crime::{Crime, CrimeError};
 use se_device::chipset::gbe::Gbe;
-#[cfg(feature = "jit")]
-use se_device::chipset::gbe::GbeSynchronousReadProjection;
 use se_device::chipset::gbe::protocol::{
-    GbeAction, GbeExternalInput, GbeFrame, GbeFrameMeta, GbeOutputPins, GbePoll, GbeRasterMode,
-    GbeWiring,
+    GbeAction, GbeExternalInput, GbeFrame, GbeFrameMeta, GbeOutputPins, GbePoll, GbeWiring,
 };
-use se_device::chipset::mace::config::{MaceConfig, MacePortConfig};
+use se_device::chipset::mace::config::MacePortConfig;
 use se_device::chipset::mace::protocol::{MaceAction, MaceExternalLinks, MacePoll, MaceWiring};
 use se_device::chipset::mace::{
     MACE_IRQ_PARALLEL, MACE_IRQ_RTC, MACE_IRQ_SERIAL0, MACE_IRQ_SERIAL1, Mace, MaceError,
@@ -69,157 +50,73 @@ use se_device::chipset::mace::{
 use se_device::cpu::execution::protocol::{
     ExecutionAction, ExecutionCompletion, ExecutionTransaction,
 };
-use se_device::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 use se_device::cpu::mips4::execution::block::MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES;
 #[cfg(feature = "jit")]
 use se_device::cpu::mips4::execution::block::{
-    Mips4FastMemoryReadRequest, Mips4FastMemoryReadResult, Mips4FastMemoryRuntime,
-    Mips4FastMemoryWriteRequest, Mips4FastMemoryWriteResult, Mips4NativeAffineReadProjection,
-    Mips4NativeFastMemoryContext, Mips4NativeFractionalClockProjection,
+    MIPS4_BLOCK_MAX_INSTRUCTIONS, Mips4CodeGuard, Mips4CodeSourceId, Mips4CodeWindow,
 };
 use se_device::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use se_device::cpu::mips4::execution::target::Mips4ExecutionBoundary;
-use se_device::cpu::mips4::model::r5000::boot_mode::R5000BootMode;
 use se_device::cpu::mips4::model::r5000::cpu::{
     R5000_IRQ_IP2, R5000Cpu, R5000CpuError, R5000CpuSignal, R5000CpuStatistics, R5000IrqError,
 };
-use se_device::cpu::mips4::model::r5000::profile::R5000Profile;
-use se_device::cpu::mips4::model::r5000::revision::R5000Revision;
 use se_device::input::ps2::{
     Ps2DeviceBuildError, Ps2Keyboard, Ps2KeyboardAction, Ps2KeyboardError, Ps2KeyboardPoll,
     Ps2Mouse, Ps2MouseAction, Ps2MouseError, Ps2MousePoll, Ps2Wiring,
 };
-use se_device::memory::ds2502::{Ds2502, Ds2502Action, Ds2502Config, Ds2502Error};
+use se_device::memory::ds2502::{Ds2502, Ds2502Action, Ds2502Error};
 use se_device::memory::flash::{SystemFlash, SystemFlashPersistentState, SystemFlashStateError};
 use se_device::parallel::ieee1284::{IEEE1284_IRQ_OUTPUT, Ieee1284, Ieee1284Action};
 use se_device::rtc::ds1687::state::{Ds1687PersistentState, Ds1687StateError};
-use se_device::rtc::ds1687::{DS1687_IRQ_OUTPUT, Ds1687, Ds1687Action, Ds1687Config, Ds1687Error};
+use se_device::rtc::ds1687::{DS1687_IRQ_OUTPUT, Ds1687, Ds1687Action, Ds1687Error};
 use se_device::serial::uart16550::{
     UART16550_IRQ_OUTPUT, Uart16550, Uart16550Action, Uart16550Config, Uart16550Error,
 };
 use se_runtime::registry::{ComponentRegistry, ComponentSlot, RegistryError, RegistryLookupError};
-use se_runtime::runtime::event_chain::EventChainError;
 use se_runtime::runtime::{RunError, RunStatus, Runtime, RuntimeContext, RuntimeStatistics};
 
 use super::address_map::IP32_PROM_IMAGE_SIZE_BYTES;
 #[cfg(feature = "jit")]
 use super::address_map::{Ip32AddressResolution, Ip32PhysicalRegion};
-#[cfg(feature = "jit")]
-use super::bus::Ip32DirectSysAdPlan;
-use super::bus::{Ip32StubEndpoint, Ip32SysAdBus, Ip32SysAdBusAction};
+use super::bus::{Ip32StubEndpoint, Ip32SysAdBus};
 use super::component_ids;
-#[cfg(test)]
-use super::dispatch::LogicalTransition;
-use super::dispatch::{Ip32DispatchContext, Ip32EventChainPolicy};
+use super::config::{Ip32MachineConfig, Ip32PersistentConfig};
 use super::event::{
     Ip32Event, Ip32HostInput, Ip32HostIoStats, Ip32HostOutput, Ip32InputEvent, Ip32SerialOutput,
     Ip32SerialPort,
 };
 use super::state::{
-    IP32_STATE_SCHEMA_VERSION, Ip32MachineState, Ip32PersistentConfig, Ip32StateError,
-    MachineControlState,
+    IP32_STATE_SCHEMA_VERSION, Ip32MachineState, Ip32StateError, RuntimeControlState,
 };
-#[cfg(feature = "jit")]
-use se_device::cpu::mips4::execution::block::{
-    MIPS4_BLOCK_MAX_INSTRUCTIONS, Mips4CodeGuard, Mips4CodeSourceId, Mips4CodeWindow,
-    Mips4SliceClock, Mips4SliceTimeline,
-};
+use super::timing::IP32_TIMEBASE_HZ;
 #[cfg(feature = "jit")]
 use se_device::cpu::mips4::model::r5000::cpu::R5000ExecutionSliceAction;
 #[cfg(feature = "jit")]
 use se_jit::mips4::cranelift::CraneliftMips4Backend;
 #[cfg(feature = "jit")]
-use se_jit::mips4::engine::{MIPS4_BLOCK_CACHE_CAPACITY, Mips4BlockEngine};
+use se_jit::mips4::engine::Mips4BlockEngine;
 
-#[cfg(feature = "jit")]
-mod fast_memory;
-use super::timing::IP32_TIMEBASE_HZ;
-
-#[cfg(feature = "jit")]
-use fast_memory::{
-    commit_fast_memory_runtime, configure_fast_memory_code_timeline, plan_fast_memory_runtime,
-};
-
-const DEFAULT_PROCESSOR_FREQUENCY_HZ: u64 = 180_000_000;
-const PRIMARY_CACHE_SIZE_BYTES: u32 = 32 * 1024;
-const SECONDARY_CACHE_SIZE_BYTES: u32 = 512 * 1024;
-const CACHE_LINE_SIZE_BYTES: u32 = 32;
-const SECONDARY_CACHE_ENABLE_BIT: u64 = 1 << 12;
-const SDRAM_REFRESH_TICKS: u64 = 27_000;
 const SDRAM_INITIALIZATION_TICKS: u64 = 120_000;
 const ISA_CYCLE_TICKS: u64 = 1_000;
 const PCI_CYCLE_TICKS: u64 = 30;
 const UART_INPUT_CLOCK_HZ: u64 = 22_000_000;
 const DEFAULT_CPU_CONTINUATION_QUANTUM: usize = MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES;
-#[cfg(feature = "jit")]
-const FAST_MEMORY_SLICE_MAX_BOUNDARIES: usize = MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES;
 const TRACE_NAMESPACE: &str = "ip32";
 
-/// Complete construction input for one IP32 machine.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct Ip32MachineConfig {
+/// Execution construction input for one IP32 machine.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Ip32RuntimeConfig {
+    /// Machine hardware and firmware configuration.
+    pub machine: Ip32MachineConfig,
+
     /// Enables the host-native tiered execution engine.
     #[serde(default)]
     pub jit_enabled: bool,
-
-    /// R5000 processor identity, byte order, clocks, and cache geometry.
-    pub processor: R5000Profile,
-
-    /// R5000 boot-mode serial stream sampled at reset.
-    pub boot_mode: R5000BootMode,
-
-    /// CRIME chipset and physical SDRAM topology.
-    pub crime: CrimeConfig,
-
-    /// MACE I/O ASIC configuration.
-    pub mace: MaceConfig,
-
-    /// Deterministic DS1687 RTC time and battery-backed register/NVRAM image.
-    ///
-    /// The IP32 PROM environment is not stored in this device.
-    pub rtc: Ds1687Config,
-
-    /// Deterministic board-identity ROM and EPROM image.
-    pub nic_identity: Ds2502Config,
-
-    /// Immutable base image for the 512 KiB byte-programmable System Flash.
-    ///
-    /// On IP32, the PROM environment resides in this System Flash and remains
-    /// physically separate from the DS1687 RTC/NVRAM domain.
-    pub prom_image: Vec<u8>,
-
-    /// Selects how GBE display-frame content is produced.
-    #[serde(default)]
-    pub gbe_raster_mode: GbeRasterMode,
-}
-
-impl Default for Ip32MachineConfig {
-    fn default() -> Self {
-        Self {
-            jit_enabled: false,
-            processor: R5000Profile::new(
-                Mips4Endianness::Big,
-                R5000Revision::from_bits(0x21),
-                DEFAULT_PROCESSOR_FREQUENCY_HZ,
-                Mips4CacheConfig::present(PRIMARY_CACHE_SIZE_BYTES, CACHE_LINE_SIZE_BYTES),
-                Mips4CacheConfig::present(PRIMARY_CACHE_SIZE_BYTES, CACHE_LINE_SIZE_BYTES),
-                Mips4CacheConfig::present(SECONDARY_CACHE_SIZE_BYTES, CACHE_LINE_SIZE_BYTES),
-            ),
-            boot_mode: R5000BootMode::from_low_bits(SECONDARY_CACHE_ENABLE_BIT)
-                .expect("the default R5000 boot mode must be valid"),
-            crime: CrimeConfig::default(),
-            mace: MaceConfig::default(),
-            rtc: Ds1687Config::default(),
-            nic_identity: Ds2502Config::default(),
-            prom_image: vec![0; IP32_PROM_IMAGE_SIZE_BYTES],
-            gbe_raster_mode: GbeRasterMode::default(),
-        }
-    }
 }
 
 /// Error returned while constructing an IP32 machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Ip32MachineBuildError {
+pub enum Ip32RuntimeBuildError {
     /// JIT execution was requested from a build without JIT support.
     JitUnavailable,
 
@@ -275,7 +172,7 @@ pub enum Ip32MachineBuildError {
     RegistryLookup(RegistryLookupError),
 }
 
-impl fmt::Display for Ip32MachineBuildError {
+impl fmt::Display for Ip32RuntimeBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::JitUnavailable => write!(f, "JIT execution is unavailable in this build"),
@@ -310,11 +207,11 @@ impl fmt::Display for Ip32MachineBuildError {
     }
 }
 
-impl std::error::Error for Ip32MachineBuildError {}
+impl std::error::Error for Ip32RuntimeBuildError {}
 
 /// Error returned while dispatching an IP32 machine event.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Ip32MachineDispatchError {
+pub enum Ip32RuntimeError {
     /// A required component was missing or had an unexpected type.
     Registry(RegistryLookupError),
 
@@ -351,14 +248,14 @@ pub enum Ip32MachineDispatchError {
     /// A follow-up event could not be scheduled.
     Scheduler(SchedulerError),
 
-    /// Dispatch-local event-chain processing failed.
-    EventChain(EventChainError),
-
     /// The reset generation counter was exhausted.
     GenerationOverflow,
 
     /// A completion named a controller not implemented by the current topology.
     UnexpectedController(ComponentId),
+
+    /// A fixed functional bus invariant was violated.
+    Protocol(&'static str),
 }
 
 /// Error returned while scheduling deterministic host input.
@@ -394,7 +291,7 @@ impl From<SchedulerError> for Ip32HostInputError {
     }
 }
 
-impl fmt::Display for Ip32MachineDispatchError {
+impl fmt::Display for Ip32RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Registry(error) => write!(f, "IP32 component lookup failed: {error}"),
@@ -409,92 +306,86 @@ impl fmt::Display for Ip32MachineDispatchError {
             Self::TwoWireBus(error) => write!(f, "IP32 two-wire routing failed: {error}"),
             Self::CpuIrq(error) => write!(f, "IP32 CPU IRQ delivery failed: {error}"),
             Self::Scheduler(error) => write!(f, "IP32 event scheduling failed: {error}"),
-            Self::EventChain(error) => write!(f, "IP32 event chain failed: {error}"),
             Self::GenerationOverflow => write!(f, "IP32 reset generation overflow"),
             Self::UnexpectedController(id) => {
                 write!(f, "unsupported IP32 bus controller {id}")
             }
+            Self::Protocol(invariant) => write!(f, "IP32 protocol invariant failed: {invariant}"),
         }
     }
 }
 
-impl std::error::Error for Ip32MachineDispatchError {}
+impl std::error::Error for Ip32RuntimeError {}
 
-impl From<RegistryLookupError> for Ip32MachineDispatchError {
+impl From<RegistryLookupError> for Ip32RuntimeError {
     fn from(error: RegistryLookupError) -> Self {
         Self::Registry(error)
     }
 }
 
-impl From<R5000CpuError> for Ip32MachineDispatchError {
+impl From<R5000CpuError> for Ip32RuntimeError {
     fn from(error: R5000CpuError) -> Self {
         Self::Cpu(error)
     }
 }
 
-impl From<CrimeError> for Ip32MachineDispatchError {
+impl From<CrimeError> for Ip32RuntimeError {
     fn from(error: CrimeError) -> Self {
         Self::Crime(error)
     }
 }
 
-impl From<MaceError> for Ip32MachineDispatchError {
+impl From<MaceError> for Ip32RuntimeError {
     fn from(error: MaceError) -> Self {
         Self::Mace(error)
     }
 }
 
-impl From<Ps2KeyboardError> for Ip32MachineDispatchError {
+impl From<Ps2KeyboardError> for Ip32RuntimeError {
     fn from(error: Ps2KeyboardError) -> Self {
         Self::Keyboard(error)
     }
 }
 
-impl From<Ps2MouseError> for Ip32MachineDispatchError {
+impl From<Ps2MouseError> for Ip32RuntimeError {
     fn from(error: Ps2MouseError) -> Self {
         Self::Mouse(error)
     }
 }
 
-impl From<Uart16550Error> for Ip32MachineDispatchError {
+impl From<Uart16550Error> for Ip32RuntimeError {
     fn from(error: Uart16550Error) -> Self {
         Self::Uart(error)
     }
 }
 
-impl From<IrqBusRouteError> for Ip32MachineDispatchError {
+impl From<IrqBusRouteError> for Ip32RuntimeError {
     fn from(error: IrqBusRouteError) -> Self {
         Self::IrqBus(error)
     }
 }
 
-impl From<OneWireBusRouteError> for Ip32MachineDispatchError {
+impl From<OneWireBusRouteError> for Ip32RuntimeError {
     fn from(error: OneWireBusRouteError) -> Self {
         Self::OneWireBus(error)
     }
 }
 
-impl From<TwoWireBusRouteError> for Ip32MachineDispatchError {
+impl From<TwoWireBusRouteError> for Ip32RuntimeError {
     fn from(error: TwoWireBusRouteError) -> Self {
         Self::TwoWireBus(error)
     }
 }
 
-impl From<R5000IrqError> for Ip32MachineDispatchError {
+impl From<R5000IrqError> for Ip32RuntimeError {
     fn from(error: R5000IrqError) -> Self {
         Self::CpuIrq(error)
     }
 }
 
-impl From<SchedulerError> for Ip32MachineDispatchError {
+impl From<SchedulerError> for Ip32RuntimeError {
     fn from(error: SchedulerError) -> Self {
         Self::Scheduler(error)
-    }
-}
-
-impl From<EventChainError> for Ip32MachineDispatchError {
-    fn from(error: EventChainError) -> Self {
-        Self::EventChain(error)
     }
 }
 
@@ -578,7 +469,7 @@ impl CpuClock {
     }
 }
 
-struct MachineControl {
+struct RuntimeControl {
     slots: HotComponentSlots,
     persistent_config: Ip32PersistentConfig,
     cpu_generation: u64,
@@ -597,185 +488,21 @@ struct MachineControl {
     memory_transactions: u64,
     cmi_transactions: u64,
     cgi_transactions: u64,
-    #[cfg(feature = "jit")]
-    fast_transaction_attempts: u64,
-    #[cfg(feature = "jit")]
-    fast_transaction_hits: u64,
-    #[cfg(feature = "jit")]
-    fast_transaction_fallbacks: u64,
-    #[cfg(feature = "jit")]
-    fast_transaction_reads: u64,
-    #[cfg(feature = "jit")]
-    fast_transaction_writes: u64,
-    #[cfg(feature = "jit")]
-    jit_code_fetches: Ip32StableCodeFetchStatistics,
+    pending_sysad: Option<ExecutionTransaction<Mips4ExecutionTransaction>>,
     cpu_continuation_quantum: usize,
-    inline_sysad_completion: bool,
-    event_chain_policy: Ip32EventChainPolicy,
     #[cfg(feature = "jit")]
     jit_engine: Option<Mips4BlockEngine<CraneliftMips4Backend>>,
-    #[cfg(feature = "jit")]
-    jit_code_sources: Mips4CodeSourceCache,
-    #[cfg(feature = "jit")]
-    jit_ram_code_pages: Mips4RamCodePageSet,
-    #[cfg(test)]
-    capture_logical_transitions: bool,
-    #[cfg(test)]
-    logical_transitions: Vec<LogicalTransition>,
     #[cfg(test)]
     first_serial_output_time: Option<SimTime>,
     #[cfg(test)]
     first_cpu_idle_time: Option<SimTime>,
 }
 
-#[cfg(feature = "jit")]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum Ip32StableCodeSource {
-    SystemFlash,
-    Sdram,
-}
-
-#[cfg(feature = "jit")]
-impl Ip32StableCodeSource {
-    const fn id(self) -> Mips4CodeSourceId {
-        match self {
-            Self::SystemFlash => Mips4CodeSourceId::new(1),
-            Self::Sdram => Mips4CodeSourceId::new(2),
-        }
-    }
-
-    fn from_guard(guard: Mips4CodeGuard) -> Result<Self, Ip32MachineDispatchError> {
-        match guard.source_id {
-            source_id if source_id == Self::SystemFlash.id() => Ok(Self::SystemFlash),
-            source_id if source_id == Self::Sdram.id() => Ok(Self::Sdram),
-            source_id => Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
-                format!(
-                    "stable code guard used unknown IP32 source ID {}",
-                    source_id.get()
-                ),
-            ))),
-        }
-    }
-}
-
-#[cfg(feature = "jit")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct Ip32StableCodeFetchStatistics {
-    system_flash: u64,
-    sdram: u64,
-}
-
-#[cfg(feature = "jit")]
-impl Ip32StableCodeFetchStatistics {
-    fn record(&mut self, source: Ip32StableCodeSource, fetches: u64) {
-        let counter = match source {
-            Ip32StableCodeSource::SystemFlash => &mut self.system_flash,
-            Ip32StableCodeSource::Sdram => &mut self.sdram,
-        };
-        *counter = counter.saturating_add(fetches);
-    }
-}
-
-#[cfg(feature = "jit")]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct Mips4CodeSourceCacheKey {
-    source: Ip32StableCodeSource,
-    source_offset: u64,
-    revision: u64,
-    byte_count: u8,
-    no_ecc: bool,
-}
-
-#[cfg(feature = "jit")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Mips4CodeSourceCacheEntry {
-    bytes: Arc<[u8]>,
-    fingerprint: u64,
-}
-
-#[cfg(feature = "jit")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Ip32CpuTransactionPlan {
-    sysad: Ip32DirectSysAdPlan,
-    request: CrimeSysAdRequest,
-    completion_time: SimTime,
-    route: Ip32CpuTransactionRoute,
-}
-
-#[cfg(feature = "jit")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum Ip32CpuTransactionRoute {
-    InternalRegister,
-    TimerWrite,
-    Memory {
-        plan: CrimeDirectMemoryPlan,
-        transaction: CrimeMemoryTransaction,
-    },
-}
-
-#[cfg(feature = "jit")]
-#[derive(Default)]
-struct Mips4CodeSourceKeyHasher(u64);
-
-#[cfg(feature = "jit")]
-impl Mips4CodeSourceKeyHasher {
-    fn mix(&mut self, value: u64) {
-        self.0 ^= value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        self.0 = self.0.rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
-    }
-}
-
-#[cfg(feature = "jit")]
-impl Hasher for Mips4CodeSourceKeyHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            self.mix(u64::from_ne_bytes(chunk.try_into().unwrap()));
-        }
-        let remainder = chunks.remainder();
-        if !remainder.is_empty() {
-            let mut tail = [0; 8];
-            tail[..remainder.len()].copy_from_slice(remainder);
-            self.mix(u64::from_ne_bytes(tail));
-        }
-    }
-
-    fn write_u8(&mut self, value: u8) {
-        self.mix(u64::from(value));
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.mix(value);
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.mix(value as u64);
-    }
-}
-
-#[cfg(feature = "jit")]
-type Mips4CodeSourceCache = HashMap<
-    Mips4CodeSourceCacheKey,
-    Mips4CodeSourceCacheEntry,
-    BuildHasherDefault<Mips4CodeSourceKeyHasher>,
->;
-
-#[cfg(feature = "jit")]
-type Mips4RamCodePageSet = HashSet<u64, BuildHasherDefault<Mips4CodeSourceKeyHasher>>;
-
-#[cfg(feature = "jit")]
-const MIPS4_RAM_CODE_PAGE_SHIFT: u32 = 12;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HotComponentSlots {
     cpu: ComponentSlot<R5000Cpu>,
     sysad: ComponentSlot<Ip32SysAdBus>,
     crime: ComponentSlot<Crime>,
-    memory: ComponentSlot<CrimeMemoryBus>,
     sdram: ComponentSlot<CrimeSdram>,
     cmi: ComponentSlot<CrimeCmiBus>,
     cgi: ComponentSlot<CrimeCgiBus>,
@@ -800,7 +527,6 @@ impl HotComponentSlots {
             cpu: registry.resolve(component_ids::CPU0)?,
             sysad: registry.resolve(component_ids::CPU_SYSAD_BUS)?,
             crime: registry.resolve(component_ids::CRIME)?,
-            memory: registry.resolve(component_ids::CRIME_MEMORY_DOMAIN)?,
             sdram: registry.resolve(component_ids::RAM)?,
             cmi: registry.resolve(component_ids::CRIME_MACE_LINK)?,
             cgi: registry.resolve(component_ids::CRIME_GBE_LINK)?,
@@ -906,44 +632,17 @@ pub struct Ip32JitPerformanceSnapshot {
     /// Typed runtime helper calls.
     pub runtime_calls: u64,
 
-    /// Fast-memory reads completed directly by native code.
-    pub native_fast_memory_reads: u64,
-
     /// Instructions translated after real dynamic fetches.
     pub dynamic_fetches: u64,
-
-    /// Instructions fetched through stable code windows.
-    pub fast_fetches: u64,
-
-    /// Stable instructions fetched from System Flash.
-    pub system_flash_fetches: u64,
-
-    /// Stable instructions fetched from SDRAM.
-    pub sdram_fetches: u64,
 
     /// Native blocks compiled since the latest engine reset.
     pub compiled_blocks: u64,
 
     /// Whole derived-cache resets.
     pub cache_resets: u64,
-
-    /// CPU transactions considered for synchronous direct completion.
-    pub fast_transaction_attempts: u64,
-
-    /// CPU transactions completed through a synchronous direct plan.
-    pub fast_transaction_hits: u64,
-
-    /// CPU transactions retained on the exact scheduled path.
-    pub fast_transaction_fallbacks: u64,
-
-    /// Directly completed CPU read transactions.
-    pub fast_transaction_reads: u64,
-
-    /// Directly completed CPU write transactions.
-    pub fast_transaction_writes: u64,
 }
 
-/// SGI O2 IP32 machine with runtime-owned hardware components.
+/// SGI O2 IP32 machine with owned hardware components and execution state.
 ///
 /// Mutable runtime access is intentionally unavailable because the cached
 /// component slots require the constructed topology to remain fixed.
@@ -959,18 +658,18 @@ pub struct Ip32JitPerformanceSnapshot {
 /// ```
 pub struct Ip32Machine<S = NoopTraceSink> {
     runtime: Runtime<Ip32Event, S>,
-    control: MachineControl,
+    control: RuntimeControl,
 }
 
 impl Ip32Machine<NoopTraceSink> {
     /// Creates the default IP32 machine with a noop trace sink.
     pub fn new() -> Self {
-        Self::from_config(Ip32MachineConfig::default())
+        Self::from_config(Ip32RuntimeConfig::default())
             .expect("the default IP32 machine configuration must be valid")
     }
 
     /// Creates a configured IP32 machine with a noop trace sink.
-    pub fn from_config(config: Ip32MachineConfig) -> Result<Self, Ip32MachineBuildError> {
+    pub fn from_config(config: Ip32RuntimeConfig) -> Result<Self, Ip32RuntimeBuildError> {
         Self::from_config_with_trace_sink(config, NoopTraceSink)
     }
 }
@@ -984,33 +683,26 @@ impl Default for Ip32Machine<NoopTraceSink> {
 impl<S> Ip32Machine<S> {
     /// Creates the default IP32 machine with the given trace sink.
     pub fn with_trace_sink(sink: S) -> Self {
-        Self::from_config_with_trace_sink(Ip32MachineConfig::default(), sink)
+        Self::from_config_with_trace_sink(Ip32RuntimeConfig::default(), sink)
             .expect("the default IP32 machine configuration must be valid")
     }
 
     /// Creates a configured IP32 machine with the given trace sink.
     pub fn from_config_with_trace_sink(
-        config: Ip32MachineConfig,
+        config: Ip32RuntimeConfig,
         sink: S,
-    ) -> Result<Self, Ip32MachineBuildError> {
+    ) -> Result<Self, Ip32RuntimeBuildError> {
         validate_config(&config)?;
         #[cfg(feature = "jit")]
         let jit_engine = if config.jit_enabled {
             Some(Mips4BlockEngine::new(
                 CraneliftMips4Backend::new()
-                    .map_err(|error| Ip32MachineBuildError::JitInitialization(error.to_string()))?,
+                    .map_err(|error| Ip32RuntimeBuildError::JitInitialization(error.to_string()))?,
             ))
         } else {
             None
         };
-        #[cfg(feature = "jit")]
-        let event_chain_policy = if jit_engine.is_some() {
-            Ip32EventChainPolicy::disabled()
-        } else {
-            Ip32EventChainPolicy::all()
-        };
-        #[cfg(not(feature = "jit"))]
-        let event_chain_policy = Ip32EventChainPolicy::all();
+        let config = config.machine;
         let persistent_config = Ip32PersistentConfig::from_machine_config(&config);
         let gbe_raster_mode = config.gbe_raster_mode;
         let processor_frequency_hz = config.processor.processor_frequency_hz;
@@ -1020,7 +712,7 @@ impl<S> Ip32Machine<S> {
             config.processor,
             config.boot_mode,
         )
-        .map_err(Ip32MachineBuildError::Cpu)?;
+        .map_err(Ip32RuntimeBuildError::Cpu)?;
         let crime = Crime::new(
             component_ids::CRIME,
             "CRIME 1.1",
@@ -1030,7 +722,7 @@ impl<S> Ip32Machine<S> {
             component_ids::MACE,
             component_ids::GBE,
         )
-        .map_err(Ip32MachineBuildError::Crime)?;
+        .map_err(Ip32RuntimeBuildError::Crime)?;
         let irq_bus = IrqBus::new(
             component_ids::CPU_IRQ_BUS,
             "CPU IRQ bus",
@@ -1045,7 +737,7 @@ impl<S> Ip32Machine<S> {
                 },
             }],
         )
-        .map_err(Ip32MachineBuildError::IrqBus)?;
+        .map_err(Ip32RuntimeBuildError::IrqBus)?;
         let mace_irq_bus = IrqBus::new(
             component_ids::MACE_IRQ_BUS,
             "MACE IRQ bus",
@@ -1092,37 +784,37 @@ impl<S> Ip32Machine<S> {
                 },
             ],
         )
-        .map_err(Ip32MachineBuildError::IrqBus)?;
+        .map_err(Ip32RuntimeBuildError::IrqBus)?;
         let one_wire_bus = OneWireBus::new(
             component_ids::ONE_WIRE_BUS,
             "MACE board-identity 1-Wire bus",
             [component_ids::MACE, component_ids::NIC_IDENTITY],
         )
-        .map_err(Ip32MachineBuildError::OneWireBus)?;
+        .map_err(Ip32RuntimeBuildError::OneWireBus)?;
         let gbe_crt_ddc = TwoWireBus::new(
             component_ids::GBE_CRT_DDC_BUS,
             "GBE CRT DDC bus",
             [component_ids::GBE],
         )
-        .map_err(Ip32MachineBuildError::TwoWireBus)?;
+        .map_err(Ip32RuntimeBuildError::TwoWireBus)?;
         let gbe_flat_panel_ddc = TwoWireBus::new(
             component_ids::GBE_FLAT_PANEL_DDC_BUS,
             "GBE flat-panel DDC bus",
             [component_ids::GBE],
         )
-        .map_err(Ip32MachineBuildError::TwoWireBus)?;
+        .map_err(Ip32RuntimeBuildError::TwoWireBus)?;
         let keyboard_ps2_bus = TwoWireBus::new(
             component_ids::KEYBOARD_PS2_BUS,
             "MACE keyboard PS/2 bus",
             [component_ids::MACE, component_ids::KEYBOARD],
         )
-        .map_err(Ip32MachineBuildError::TwoWireBus)?;
+        .map_err(Ip32RuntimeBuildError::TwoWireBus)?;
         let mouse_ps2_bus = TwoWireBus::new(
             component_ids::MOUSE_PS2_BUS,
             "MACE mouse PS/2 bus",
             [component_ids::MACE, component_ids::MOUSE],
         )
-        .map_err(Ip32MachineBuildError::TwoWireBus)?;
+        .map_err(Ip32RuntimeBuildError::TwoWireBus)?;
         let keyboard = Ps2Keyboard::new(
             component_ids::KEYBOARD,
             "IBM enhanced PS/2 keyboard",
@@ -1132,7 +824,7 @@ impl<S> Ip32Machine<S> {
             },
             IP32_TIMEBASE_HZ,
         )
-        .map_err(Ip32MachineBuildError::Ps2)?;
+        .map_err(Ip32RuntimeBuildError::Ps2)?;
         let mouse = Ps2Mouse::new(
             component_ids::MOUSE,
             "Standard three-button PS/2 mouse",
@@ -1142,7 +834,7 @@ impl<S> Ip32Machine<S> {
             },
             IP32_TIMEBASE_HZ,
         )
-        .map_err(Ip32MachineBuildError::Ps2)?;
+        .map_err(Ip32RuntimeBuildError::Ps2)?;
         let mace = Mace::new(
             component_ids::MACE,
             "MACE 2.0",
@@ -1178,14 +870,14 @@ impl<S> Ip32Machine<S> {
             },
             IP32_TIMEBASE_HZ,
         )
-        .map_err(Ip32MachineBuildError::Mace)?;
+        .map_err(Ip32RuntimeBuildError::Mace)?;
         let rtc = Ds1687::new(
             component_ids::RTC,
             "DS1687 RTC/NVRAM",
             IP32_TIMEBASE_HZ,
             config.rtc,
         )
-        .map_err(Ip32MachineBuildError::Rtc)?;
+        .map_err(Ip32RuntimeBuildError::Rtc)?;
         let nic_identity = Ds2502::new(
             component_ids::NIC_IDENTITY,
             "DS2502 board identity",
@@ -1193,16 +885,16 @@ impl<S> Ip32Machine<S> {
             IP32_TIMEBASE_HZ,
             config.nic_identity,
         )
-        .map_err(Ip32MachineBuildError::NicIdentity)?;
+        .map_err(Ip32RuntimeBuildError::NicIdentity)?;
         let uart_config = Uart16550Config {
             input_clock_hz: UART_INPUT_CLOCK_HZ,
             timebase_hz: IP32_TIMEBASE_HZ,
             external_queue_capacity: config.mace.ports.byte_stream_bytes,
         };
         let serial0 = Uart16550::new(component_ids::SERIAL0, "Serial port 0", uart_config)
-            .map_err(Ip32MachineBuildError::Uart)?;
+            .map_err(Ip32RuntimeBuildError::Uart)?;
         let serial1 = Uart16550::new(component_ids::SERIAL1, "Serial port 1", uart_config)
-            .map_err(Ip32MachineBuildError::Uart)?;
+            .map_err(Ip32RuntimeBuildError::Uart)?;
 
         let mut runtime = Runtime::with_trace_sink(sink);
         let registry = runtime.registry_mut();
@@ -1214,8 +906,6 @@ impl<S> Ip32Machine<S> {
                 "CPU SysAD bus",
                 component_ids::CPU0,
                 component_ids::CRIME,
-                IP32_TIMEBASE_HZ,
-                66_666_500,
             )),
         )?;
         insert_component(registry, Box::new(irq_bus))?;
@@ -1228,20 +918,9 @@ impl<S> Ip32Machine<S> {
         insert_component(registry, Box::new(crime))?;
         insert_component(
             registry,
-            Box::new(CrimeMemoryBus::new(
-                component_ids::CRIME_MEMORY_DOMAIN,
-                "CRIME memory domain",
-                component_ids::RAM,
-                IP32_TIMEBASE_HZ,
-                SimDuration::new(SDRAM_REFRESH_TICKS),
-            )),
-        )?;
-        insert_component(
-            registry,
             Box::new(CrimeCmiBus::new(
                 component_ids::CRIME_MACE_LINK,
                 "CRIME CMI link",
-                IP32_TIMEBASE_HZ,
             )),
         )?;
         insert_component(
@@ -1249,7 +928,6 @@ impl<S> Ip32Machine<S> {
             Box::new(CrimeCgiBus::new(
                 component_ids::CRIME_GBE_LINK,
                 "CRIME CGI link",
-                IP32_TIMEBASE_HZ,
             )),
         )?;
         insert_component(
@@ -1343,10 +1021,10 @@ impl<S> Ip32Machine<S> {
         )?;
 
         let slots = HotComponentSlots::resolve(runtime.registry())
-            .map_err(Ip32MachineBuildError::RegistryLookup)?;
+            .map_err(Ip32RuntimeBuildError::RegistryLookup)?;
         Ok(Self {
             runtime,
-            control: MachineControl {
+            control: RuntimeControl {
                 slots,
                 persistent_config,
                 cpu_generation: 0,
@@ -1365,31 +1043,10 @@ impl<S> Ip32Machine<S> {
                 memory_transactions: 0,
                 cmi_transactions: 0,
                 cgi_transactions: 0,
-                #[cfg(feature = "jit")]
-                fast_transaction_attempts: 0,
-                #[cfg(feature = "jit")]
-                fast_transaction_hits: 0,
-                #[cfg(feature = "jit")]
-                fast_transaction_fallbacks: 0,
-                #[cfg(feature = "jit")]
-                fast_transaction_reads: 0,
-                #[cfg(feature = "jit")]
-                fast_transaction_writes: 0,
-                #[cfg(feature = "jit")]
-                jit_code_fetches: Ip32StableCodeFetchStatistics::default(),
+                pending_sysad: None,
                 cpu_continuation_quantum: DEFAULT_CPU_CONTINUATION_QUANTUM,
-                inline_sysad_completion: true,
-                event_chain_policy,
                 #[cfg(feature = "jit")]
                 jit_engine,
-                #[cfg(feature = "jit")]
-                jit_code_sources: Mips4CodeSourceCache::default(),
-                #[cfg(feature = "jit")]
-                jit_ram_code_pages: Mips4RamCodePageSet::default(),
-                #[cfg(test)]
-                capture_logical_transitions: false,
-                #[cfg(test)]
-                logical_transitions: Vec::new(),
                 #[cfg(test)]
                 first_serial_output_time: None,
                 #[cfg(test)]
@@ -1611,18 +1268,9 @@ impl<S> Ip32Machine<S> {
                     region_runtime_side_exits: statistics.region_runtime_side_exits,
                     region_guard_side_exits: statistics.region_guard_side_exits,
                     runtime_calls: statistics.runtime_calls,
-                    native_fast_memory_reads: statistics.native_fast_memory_reads,
                     dynamic_fetches: statistics.dynamic_fetches,
-                    fast_fetches: statistics.fast_fetches,
-                    system_flash_fetches: self.control.jit_code_fetches.system_flash,
-                    sdram_fetches: self.control.jit_code_fetches.sdram,
                     compiled_blocks: statistics.compiled_blocks,
                     cache_resets: statistics.cache_resets,
-                    fast_transaction_attempts: self.control.fast_transaction_attempts,
-                    fast_transaction_hits: self.control.fast_transaction_hits,
-                    fast_transaction_fallbacks: self.control.fast_transaction_fallbacks,
-                    fast_transaction_reads: self.control.fast_transaction_reads,
-                    fast_transaction_writes: self.control.fast_transaction_writes,
                 }
             })
             .unwrap_or_default();
@@ -1712,7 +1360,7 @@ impl<S> Ip32Machine<S> {
             schema_version: IP32_STATE_SCHEMA_VERSION,
             config: self.control.persistent_config.clone(),
             runtime: self.runtime.save_state(),
-            control: MachineControlState {
+            control: RuntimeControlState {
                 cpu_generation: self.control.cpu_generation,
                 cpu_clock_remainder: self.control.cpu_clock.remainder,
                 host_generation: self.control.host_generation,
@@ -1729,14 +1377,8 @@ impl<S> Ip32Machine<S> {
                 memory_transactions: self.control.memory_transactions,
                 cmi_transactions: self.control.cmi_transactions,
                 cgi_transactions: self.control.cgi_transactions,
+                pending_sysad: self.control.pending_sysad.clone(),
                 cpu_continuation_quantum: self.control.cpu_continuation_quantum,
-                inline_sysad_completion: self.control.inline_sysad_completion,
-                fusion_sysad: self.control.event_chain_policy.sysad,
-                fusion_memory: self.control.event_chain_policy.memory,
-                fusion_cmi: self.control.event_chain_policy.cmi,
-                fusion_cgi: self.control.event_chain_policy.cgi,
-                fusion_isa: self.control.event_chain_policy.isa,
-                fusion_budget: self.control.event_chain_policy.budget,
             },
             cpu: save_component(registry, component_ids::CPU0, R5000Cpu::save_state)?,
             sysad: save_component(
@@ -1776,11 +1418,6 @@ impl<S> Ip32Machine<S> {
                 )?,
             ],
             crime: save_component(registry, component_ids::CRIME, Crime::save_state)?,
-            memory_bus: save_component(
-                registry,
-                component_ids::CRIME_MEMORY_DOMAIN,
-                CrimeMemoryBus::save_state,
-            )?,
             cmi: save_component(
                 registry,
                 component_ids::CRIME_MACE_LINK,
@@ -1836,7 +1473,7 @@ impl<S> Ip32Machine<S> {
 
     /// Rebuilds a complete IP32 machine around a caller-provided trace sink.
     pub fn from_state_with_trace_sink(
-        config: Ip32MachineConfig,
+        config: Ip32RuntimeConfig,
         state: Ip32MachineState,
         sink: S,
     ) -> Result<Self, Ip32StateError> {
@@ -1845,7 +1482,7 @@ impl<S> Ip32Machine<S> {
                 version: state.schema_version,
             });
         }
-        if Ip32PersistentConfig::from_machine_config(&config) != state.config {
+        if Ip32PersistentConfig::from_machine_config(&config.machine) != state.config {
             return Err(Ip32StateError::ConfigurationMismatch);
         }
         let mut machine =
@@ -1917,12 +1554,6 @@ impl<S> Ip32Machine<S> {
             component_ids::CRIME,
             state.crime,
             Crime::restore_state,
-        )?;
-        restore_component(
-            registry,
-            component_ids::CRIME_MEMORY_DOMAIN,
-            state.memory_bus,
-            CrimeMemoryBus::restore_state,
         )?;
         restore_component(
             registry,
@@ -2047,7 +1678,7 @@ impl<S> Ip32Machine<S> {
         let jit_engine = if self.control.jit_engine.is_some() {
             Some(Mips4BlockEngine::new(
                 CraneliftMips4Backend::new().map_err(|error| {
-                    Ip32StateError::Build(Ip32MachineBuildError::JitInitialization(
+                    Ip32StateError::Build(Ip32RuntimeBuildError::JitInitialization(
                         error.to_string(),
                     ))
                 })?,
@@ -2055,29 +1686,7 @@ impl<S> Ip32Machine<S> {
         } else {
             None
         };
-        #[cfg(feature = "jit")]
-        let event_chain_policy = if jit_engine.is_some() {
-            Ip32EventChainPolicy::disabled()
-        } else {
-            Ip32EventChainPolicy {
-                sysad: state.control.fusion_sysad,
-                memory: state.control.fusion_memory,
-                cmi: state.control.fusion_cmi,
-                cgi: state.control.fusion_cgi,
-                isa: state.control.fusion_isa,
-                budget: state.control.fusion_budget,
-            }
-        };
-        #[cfg(not(feature = "jit"))]
-        let event_chain_policy = Ip32EventChainPolicy {
-            sysad: state.control.fusion_sysad,
-            memory: state.control.fusion_memory,
-            cmi: state.control.fusion_cmi,
-            cgi: state.control.fusion_cgi,
-            isa: state.control.fusion_isa,
-            budget: state.control.fusion_budget,
-        };
-        self.control = MachineControl {
+        self.control = RuntimeControl {
             slots: HotComponentSlots::resolve(self.runtime.registry())
                 .map_err(Ip32StateError::Registry)?,
             persistent_config: state.config,
@@ -2100,31 +1709,10 @@ impl<S> Ip32Machine<S> {
             memory_transactions: state.control.memory_transactions,
             cmi_transactions: state.control.cmi_transactions,
             cgi_transactions: state.control.cgi_transactions,
-            #[cfg(feature = "jit")]
-            fast_transaction_attempts: 0,
-            #[cfg(feature = "jit")]
-            fast_transaction_hits: 0,
-            #[cfg(feature = "jit")]
-            fast_transaction_fallbacks: 0,
-            #[cfg(feature = "jit")]
-            fast_transaction_reads: 0,
-            #[cfg(feature = "jit")]
-            fast_transaction_writes: 0,
-            #[cfg(feature = "jit")]
-            jit_code_fetches: Ip32StableCodeFetchStatistics::default(),
+            pending_sysad: state.control.pending_sysad,
             cpu_continuation_quantum: state.control.cpu_continuation_quantum,
-            inline_sysad_completion: state.control.inline_sysad_completion,
-            event_chain_policy,
             #[cfg(feature = "jit")]
             jit_engine,
-            #[cfg(feature = "jit")]
-            jit_code_sources: Mips4CodeSourceCache::default(),
-            #[cfg(feature = "jit")]
-            jit_ram_code_pages: Mips4RamCodePageSet::default(),
-            #[cfg(test)]
-            capture_logical_transitions: false,
-            #[cfg(test)]
-            logical_transitions: Vec::new(),
             #[cfg(test)]
             first_serial_output_time: None,
             #[cfg(test)]
@@ -2229,7 +1817,7 @@ where
     pub fn run_steps(
         &mut self,
         max_events: usize,
-    ) -> Result<RunStatus, RunError<Ip32MachineDispatchError>> {
+    ) -> Result<RunStatus, RunError<Ip32RuntimeError>> {
         let control = &mut self.control;
         self.runtime
             .run_steps(max_events, |event, registry, context| {
@@ -2238,7 +1826,7 @@ where
     }
 
     /// Schedules and completely dispatches a hard-reset event.
-    pub fn hard_reset(&mut self) -> Result<(), RunError<Ip32MachineDispatchError>> {
+    pub fn hard_reset(&mut self) -> Result<(), RunError<Ip32RuntimeError>> {
         self.runtime.clear_stop();
         let reset_id = self.schedule_reset()?;
         let mut reset_dispatched = false;
@@ -2256,7 +1844,7 @@ where
     pub fn run_until_time(
         &mut self,
         deadline: SimTime,
-    ) -> Result<RunStatus, RunError<Ip32MachineDispatchError>> {
+    ) -> Result<RunStatus, RunError<Ip32RuntimeError>> {
         let control = &mut self.control;
         self.runtime
             .run_until_time(deadline, |event, registry, context| {
@@ -2265,23 +1853,24 @@ where
     }
 }
 
-fn validate_config(config: &Ip32MachineConfig) -> Result<(), Ip32MachineBuildError> {
+fn validate_config(config: &Ip32RuntimeConfig) -> Result<(), Ip32RuntimeBuildError> {
     #[cfg(not(feature = "jit"))]
     if config.jit_enabled {
-        return Err(Ip32MachineBuildError::JitUnavailable);
+        return Err(Ip32RuntimeBuildError::JitUnavailable);
     }
     config
+        .machine
         .crime
         .validate()
-        .map_err(|error| Ip32MachineBuildError::Crime(CrimeError::Configuration(error)))?;
-    if config.prom_image.len() != IP32_PROM_IMAGE_SIZE_BYTES {
-        return Err(Ip32MachineBuildError::InvalidPromSize {
-            size_bytes: config.prom_image.len(),
+        .map_err(|error| Ip32RuntimeBuildError::Crime(CrimeError::Configuration(error)))?;
+    if config.machine.prom_image.len() != IP32_PROM_IMAGE_SIZE_BYTES {
+        return Err(Ip32RuntimeBuildError::InvalidPromSize {
+            size_bytes: config.machine.prom_image.len(),
         });
     }
-    let frequency_hz = config.processor.processor_frequency_hz;
+    let frequency_hz = config.machine.processor.processor_frequency_hz;
     if !(1..=IP32_TIMEBASE_HZ).contains(&frequency_hz) {
-        return Err(Ip32MachineBuildError::InvalidProcessorFrequency { frequency_hz });
+        return Err(Ip32RuntimeBuildError::InvalidProcessorFrequency { frequency_hz });
     }
     Ok(())
 }
@@ -2289,15 +1878,15 @@ fn validate_config(config: &Ip32MachineConfig) -> Result<(), Ip32MachineBuildErr
 fn insert_component(
     registry: &mut ComponentRegistry,
     component: Box<dyn Component>,
-) -> Result<(), Ip32MachineBuildError> {
+) -> Result<(), Ip32RuntimeBuildError> {
     registry
         .insert(component)
-        .map_err(Ip32MachineBuildError::Registry)
+        .map_err(Ip32RuntimeBuildError::Registry)
 }
 
 fn crime_with_trace_interest<'a, S>(
     registry: &'a mut ComponentRegistry,
-    context: &Ip32DispatchContext<'_, '_, S>,
+    context: &RuntimeContext<'_, Ip32Event, S>,
     slot: ComponentSlot<Crime>,
 ) -> Result<&'a mut Crime, RegistryLookupError>
 where
@@ -2311,7 +1900,7 @@ where
 
 fn mace_with_trace_interest<'a, S>(
     registry: &'a mut ComponentRegistry,
-    context: &Ip32DispatchContext<'_, '_, S>,
+    context: &RuntimeContext<'_, Ip32Event, S>,
     slot: ComponentSlot<Mace>,
 ) -> Result<&'a mut Mace, RegistryLookupError>
 where
@@ -2326,39 +1915,25 @@ where
 fn dispatch_event<S>(
     event: ScheduledEvent<Ip32Event>,
     registry: &mut ComponentRegistry,
-    runtime_context: &mut RuntimeContext<'_, Ip32Event, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
-    let mut context = Ip32DispatchContext::new(runtime_context, control.event_chain_policy);
-    dispatch_event_payload(event.target, event.payload, registry, &mut context, control)?;
-    while let Some((target, payload)) = context.take_next_inline()? {
-        dispatch_event_payload(target, payload, registry, &mut context, control)?;
-    }
-    context.finish()?;
-    Ok(())
+    dispatch_event_payload(event.target, event.payload, registry, context, control)
 }
 
 fn dispatch_event_payload<S>(
     _target: ComponentId,
     payload: Ip32Event,
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
-    #[cfg(test)]
-    if control.capture_logical_transitions
-        && let Some(transition) =
-            super::dispatch::logical_transition(context.now(), _target, &payload)
-    {
-        control.logical_transitions.push(transition);
-    }
-    context.enter_event(&payload);
     match payload {
         Ip32Event::PowerOn => power_on(registry, context, control)?,
         Ip32Event::HardReset => hard_reset(registry, context, control)?,
@@ -2370,30 +1945,6 @@ where
             crime_with_trace_interest(registry, context, control.slots.crime)?
                 .handle_event(context.now(), event);
             drain_crime(registry, context, control)?;
-        }
-        Ip32Event::SysAdBus(event) => {
-            registry
-                .get_resolved_mut(control.slots.sysad)?
-                .handle_event(context.now(), event);
-            drain_sysad_bus(registry, context, control)?;
-        }
-        Ip32Event::CrimeMemoryBus(event) => {
-            registry
-                .get_resolved_mut(control.slots.memory)?
-                .handle_event(event);
-            drain_memory_bus(registry, context, control)?;
-        }
-        Ip32Event::CrimeCmiBus(event) => {
-            registry
-                .get_resolved_mut(control.slots.cmi)?
-                .handle_event(event);
-            drain_cmi_bus(registry, context, control)?;
-        }
-        Ip32Event::CrimeCgiBus(event) => {
-            registry
-                .get_resolved_mut(control.slots.cgi)?
-                .handle_event(event);
-            drain_cgi_bus(registry, context, control)?;
         }
         Ip32Event::Gbe(event) => {
             let gbe = registry.get_resolved_mut(control.slots.gbe)?;
@@ -2436,17 +1987,6 @@ where
                 .get_resolved_mut(control.slots.isa)?
                 .handle_event(event);
             drain_isa_bus(registry, context, control)?;
-        }
-        Ip32Event::PciBusService => {
-            registry
-                .get_typed_mut::<PciBus>(component_ids::PCI_BUS)?
-                .service();
-            drain_pci_bus(registry, context, control)?;
-        }
-        Ip32Event::I2cBusService { index } => {
-            let bus_id = i2c_bus_id(index)?;
-            registry.get_typed_mut::<I2cBus>(bus_id)?.service();
-            drain_i2c_bus(registry, context, control, index)?;
         }
         Ip32Event::Uart { port, event } => {
             let uart_id = serial_port_component(port);
@@ -2592,9 +2132,9 @@ fn media_port_capacity(
 
 fn power_on<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -2617,9 +2157,10 @@ where
     registry
         .get_typed_mut::<IrqBus>(component_ids::MACE_IRQ_BUS)?
         .reset();
+    control.pending_sysad = None;
     registry
         .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
-        .hard_reset();
+        .reset();
     registry
         .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
         .hard_reset();
@@ -2671,9 +2212,6 @@ where
     registry
         .get_typed_mut::<Ip32StubEndpoint>(component_ids::VICE)?
         .reset();
-    registry
-        .get_typed_mut::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)?
-        .power_on(context.now());
     crime_with_trace_interest(registry, context, control.slots.crime)?.power_on(context.now());
     drain_crime(registry, context, control)?;
     drain_mace(registry, context, control)?;
@@ -2691,9 +2229,9 @@ where
 
 fn hard_reset<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -2713,9 +2251,7 @@ where
     registry
         .get_typed_mut::<IrqBus>(component_ids::MACE_IRQ_BUS)?
         .reset();
-    registry
-        .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
-        .hard_reset();
+    control.pending_sysad = None;
     registry
         .get_typed_mut::<CrimeCmiBus>(component_ids::CRIME_MACE_LINK)?
         .hard_reset();
@@ -2767,9 +2303,6 @@ where
     registry
         .get_typed_mut::<Ip32StubEndpoint>(component_ids::VICE)?
         .reset();
-    registry
-        .get_typed_mut::<CrimeMemoryBus>(component_ids::CRIME_MEMORY_DOMAIN)?
-        .hard_reset(context.now());
     crime_with_trace_interest(registry, context, control.slots.crime)?.hard_reset(context.now());
     drain_crime(registry, context, control)?;
     drain_mace(registry, context, control)?;
@@ -2787,9 +2320,9 @@ where
 
 fn warm_reset<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -2797,9 +2330,10 @@ where
     registry
         .get_typed_mut::<R5000Cpu>(component_ids::CPU0)?
         .accept(R5000CpuSignal::SoftReset);
+    control.pending_sysad = None;
     registry
         .get_typed_mut::<Ip32SysAdBus>(component_ids::CPU_SYSAD_BUS)?
-        .hard_reset();
+        .reset();
     crime_with_trace_interest(registry, context, control.slots.crime)?.warm_reset();
     context.schedule_at(
         context.now(),
@@ -2811,103 +2345,46 @@ where
     Ok(())
 }
 
-fn advance_cpu_generation(control: &mut MachineControl) -> Result<(), Ip32MachineDispatchError> {
+fn advance_cpu_generation(control: &mut RuntimeControl) -> Result<(), Ip32RuntimeError> {
     control.cpu_generation = control
         .cpu_generation
         .checked_add(1)
-        .ok_or(Ip32MachineDispatchError::GenerationOverflow)?;
+        .ok_or(Ip32RuntimeError::GenerationOverflow)?;
     control.cpu_clock.reset();
     Ok(())
 }
 
 #[cfg(feature = "jit")]
-fn reset_jit_engine(control: &mut MachineControl) -> Result<(), Ip32MachineDispatchError> {
-    clear_jit_code_sources(control);
+fn reset_jit_engine(control: &mut RuntimeControl) -> Result<(), Ip32RuntimeError> {
     if let Some(engine) = &mut control.jit_engine
         && !engine.is_empty()
     {
-        engine.reset().map_err(|error| {
-            Ip32MachineDispatchError::Cpu(R5000CpuError::Block(error.to_string()))
-        })?;
+        engine
+            .reset()
+            .map_err(|error| Ip32RuntimeError::Cpu(R5000CpuError::Block(error.to_string())))?;
     }
     Ok(())
-}
-
-#[cfg(feature = "jit")]
-fn clear_jit_code_sources(control: &mut MachineControl) {
-    control.jit_code_sources.clear();
-    control.jit_ram_code_pages.clear();
-}
-
-#[cfg(feature = "jit")]
-fn remember_ram_code_source(control: &mut MachineControl, address: u64, length: usize) {
-    let Some(last_address) = address.checked_add(length.saturating_sub(1) as u64) else {
-        return;
-    };
-    let first_page = address >> MIPS4_RAM_CODE_PAGE_SHIFT;
-    let last_page = last_address >> MIPS4_RAM_CODE_PAGE_SHIFT;
-    for page in first_page..=last_page {
-        control.jit_ram_code_pages.insert(page);
-    }
-}
-
-#[cfg(feature = "jit")]
-fn invalidate_ram_code_sources(control: &mut MachineControl, range: Option<(u64, usize)>) {
-    let Some((address, length)) = range else {
-        control
-            .jit_code_sources
-            .retain(|key, _| key.source != Ip32StableCodeSource::Sdram);
-        control.jit_ram_code_pages.clear();
-        return;
-    };
-    if length == 0 {
-        return;
-    }
-    let write_end = address.saturating_add(length as u64);
-    let last_address = write_end.saturating_sub(1);
-    let first_page = address >> MIPS4_RAM_CODE_PAGE_SHIFT;
-    let last_page = last_address >> MIPS4_RAM_CODE_PAGE_SHIFT;
-    if !(first_page..=last_page).any(|page| control.jit_ram_code_pages.contains(&page)) {
-        return;
-    }
-    control.jit_code_sources.retain(|key, _| {
-        if key.source != Ip32StableCodeSource::Sdram {
-            return true;
-        }
-        let source_end = key.source_offset.saturating_add(u64::from(key.byte_count));
-        write_end <= key.source_offset || source_end <= address
-    });
-    control.jit_ram_code_pages.clear();
-    let remaining = control
-        .jit_code_sources
-        .keys()
-        .filter(|key| key.source == Ip32StableCodeSource::Sdram)
-        .map(|key| (key.source_offset, usize::from(key.byte_count)))
-        .collect::<Vec<_>>();
-    for (source_offset, byte_count) in remaining {
-        remember_ram_code_source(control, source_offset, byte_count);
-    }
 }
 
 #[cfg(not(feature = "jit"))]
-fn reset_jit_engine(_control: &mut MachineControl) -> Result<(), Ip32MachineDispatchError> {
+fn reset_jit_engine(_control: &mut RuntimeControl) -> Result<(), Ip32RuntimeError> {
     Ok(())
 }
 
-fn advance_host_generation(control: &mut MachineControl) -> Result<(), Ip32MachineDispatchError> {
+fn advance_host_generation(control: &mut RuntimeControl) -> Result<(), Ip32RuntimeError> {
     control.host_generation = control
         .host_generation
         .checked_add(1)
-        .ok_or(Ip32MachineDispatchError::GenerationOverflow)?;
+        .ok_or(Ip32RuntimeError::GenerationOverflow)?;
     control.host_reservations.fill(0);
     Ok(())
 }
 
 fn dispatch_cpu_step<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -2920,602 +2397,130 @@ where
 }
 
 #[cfg(feature = "jit")]
-fn plan_stable_timeline<S>(
-    context: &Ip32DispatchContext<'_, '_, S>,
-    control: &MachineControl,
-    maximum_fetches: usize,
-    clocks: &[Mips4SliceClock],
-    fixed_ticks_per_fetch: u64,
-    stable_deadline: Option<SimTime>,
-) -> Option<Mips4SliceTimeline>
-where
-    S: TraceSink,
-{
-    let timeline = Mips4SliceTimeline::new(maximum_fetches, clocks, fixed_ticks_per_fetch)?;
-    let pclock = Mips4SliceClock::new(control.cpu_clock.projection(), 1)?;
-    let total_ticks = |candidate: usize| {
-        let fetch_ticks = timeline.prefix_ticks(candidate)?;
-        let pclock_ticks = pclock.elapsed_fetches(candidate as u64)?;
-        fetch_ticks.checked_add(pclock_ticks)
-    };
-    let now = context.now().get();
-    let mut limit = context.deadline().get();
-    if let Some(event) = context.next_event_time() {
-        limit = limit.min(event.get().checked_sub(1)?);
-    }
-    if let Some(deadline) = stable_deadline {
-        limit = limit.min(deadline.get());
-    }
-    let available_ticks = limit.checked_sub(now)?;
-    let average_ticks = timeline.average_ticks_per_fetch() + pclock.average_ticks_per_fetch();
-    let mut admitted = (available_ticks as f64 / average_ticks) as usize;
-    if admitted >= maximum_fetches {
-        if total_ticks(maximum_fetches)? <= available_ticks {
-            return Some(timeline);
-        }
-        admitted = maximum_fetches - 1;
-    }
-    while admitted != 0 && total_ticks(admitted)? > available_ticks {
-        admitted -= 1;
-    }
-    while admitted < maximum_fetches - 1 && total_ticks(admitted + 1)? <= available_ticks {
-        admitted += 1;
-    }
-    Mips4SliceTimeline::new(admitted, clocks, fixed_ticks_per_fetch)
-}
-
-#[cfg(feature = "jit")]
-fn stable_prom_code_window<S>(
+fn functional_code_window(
     registry: &ComponentRegistry,
-    context: &Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-    maximum_instructions: usize,
-) -> Result<Option<Mips4CodeWindow>, Ip32MachineDispatchError>
-where
-    S: TraceSink,
-{
-    if maximum_instructions == 0
-        || !registry
-            .get_resolved(control.slots.sysad)?
-            .stable_fetch_ready()
-        || !registry
-            .get_resolved(control.slots.cmi)?
-            .stable_fetch_ready()
-        || !registry
-            .get_resolved(control.slots.isa)?
-            .stable_fetch_ready()
-        || !registry
-            .get_resolved(control.slots.crime)?
-            .stable_cpu_fetch_ready()
-        || !registry
-            .get_resolved(control.slots.mace)?
-            .stable_prom_fetch_ready()
-    {
-        return Ok(None);
-    }
+    control: &RuntimeControl,
+) -> Result<Option<Mips4CodeWindow>, Ip32RuntimeError> {
     let Some(request) = registry
         .get_resolved(control.slots.cpu)?
         .code_source_request()
     else {
         return Ok(None);
     };
+    let maximum_bytes =
+        usize::from(request.maximum_bytes).min(MIPS4_BLOCK_MAX_INSTRUCTIONS * 4) / 4 * 4;
+    if maximum_bytes == 0 {
+        return Ok(None);
+    }
     let ram_size = registry
         .get_resolved(control.slots.sdram)?
         .total_size_bytes();
-    let Ip32AddressResolution::Memory {
-        region: Ip32PhysicalRegion::SystemRom,
-        offset,
-        ..
-    } = super::address_map::resolve(request.physical_address, 4, ram_size)
-    else {
-        return Ok(None);
-    };
-
-    let flash = registry.get_resolved(control.slots.prom)?;
-    let available = flash.len().saturating_sub(offset as usize);
-    let source_instructions = (usize::from(request.maximum_bytes) / 4)
-        .min(available / 4)
-        .min(MIPS4_BLOCK_MAX_INSTRUCTIONS);
-    let timeline_instructions = maximum_instructions.min(MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES);
-    if source_instructions == 0 || timeline_instructions == 0 {
-        return Ok(None);
-    }
-    let sysad = registry
-        .get_resolved(control.slots.sysad)?
-        .stable_fetch_clock()
-        .and_then(|clock| Mips4SliceClock::new(clock, 2))
-        .expect("stable SysAD readiness was checked");
-    let cmi = registry
-        .get_resolved(control.slots.cmi)?
-        .stable_fetch_clock()
-        .and_then(|clock| Mips4SliceClock::new(clock, 2))
-        .expect("stable CMI readiness was checked");
-    let isa = registry
-        .get_resolved(control.slots.isa)?
-        .stable_fetch_delay()
-        .expect("stable ISA readiness was checked")
-        .get();
-    let Some(timeline) = plan_stable_timeline(
-        context,
-        control,
-        timeline_instructions,
-        &[sysad, cmi],
-        isa,
-        None,
-    ) else {
-        return Ok(None);
-    };
-
-    let byte_count = source_instructions * 4;
-    let revision = flash.persistence_revision();
-    let cache_key = Mips4CodeSourceCacheKey {
-        source: Ip32StableCodeSource::SystemFlash,
-        source_offset: offset,
-        revision,
-        byte_count: byte_count as u8,
-        no_ecc: false,
-    };
-    if control.jit_code_sources.len() == MIPS4_BLOCK_CACHE_CAPACITY
-        && !control.jit_code_sources.contains_key(&cache_key)
-    {
-        clear_jit_code_sources(control);
-    }
-    let source = control
-        .jit_code_sources
-        .entry(cache_key)
-        .or_insert_with(|| {
-            let bytes: Arc<[u8]> =
-                Arc::from(&flash.bytes()[offset as usize..offset as usize + byte_count]);
-            let fingerprint = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-            });
-            Mips4CodeSourceCacheEntry { bytes, fingerprint }
-        });
-    let guard = Mips4CodeGuard {
-        source_id: Ip32StableCodeSource::SystemFlash.id(),
-        source_offset: offset,
-        revision,
-        fingerprint: source.fingerprint,
-    };
-    Ok(Mips4CodeWindow::from_shared(
-        request,
-        guard,
-        Arc::clone(&source.bytes),
-        timeline,
-    ))
-}
-
-#[cfg(feature = "jit")]
-fn stable_ram_code_window<S>(
-    registry: &ComponentRegistry,
-    context: &Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-    maximum_instructions: usize,
-) -> Result<Option<Mips4CodeWindow>, Ip32MachineDispatchError>
-where
-    S: TraceSink,
-{
-    let memory = registry.get_resolved(control.slots.memory)?;
-    let refresh_deadline = memory.stable_fetch_refresh_deadline();
-    if maximum_instructions == 0
-        || !registry
-            .get_resolved(control.slots.sysad)?
-            .stable_fetch_ready()
-        || !memory.stable_fetch_ready()
-        || refresh_deadline.is_some_and(|deadline| context.now() >= deadline)
-        || !registry
-            .get_resolved(control.slots.crime)?
-            .stable_cpu_fetch_ready()
-    {
-        return Ok(None);
-    }
-    let Some(request) = registry
-        .get_resolved(control.slots.cpu)?
-        .code_source_request()
-    else {
-        return Ok(None);
-    };
-    let ram_size = registry
-        .get_resolved(control.slots.sdram)?
-        .total_size_bytes();
-    let Ip32AddressResolution::Memory {
-        region:
-            Ip32PhysicalRegion::LowMemory
-            | Ip32PhysicalRegion::HighMemoryUnconfirmed
-            | Ip32PhysicalRegion::LinearMemory
-            | Ip32PhysicalRegion::NoEccMemory,
-        offset,
-        no_ecc,
-        ..
-    } = super::address_map::resolve(request.physical_address, 4, ram_size)
-    else {
-        return Ok(None);
-    };
-    let source_instructions =
-        (usize::from(request.maximum_bytes) / 4).min(MIPS4_BLOCK_MAX_INSTRUCTIONS);
-    let timeline_instructions = maximum_instructions.min(MIPS4_EXECUTION_HORIZON_MAX_BOUNDARIES);
-    if source_instructions == 0 || timeline_instructions == 0 {
-        return Ok(None);
-    }
-    let sysad = registry
-        .get_resolved(control.slots.sysad)?
-        .stable_fetch_clock()
-        .and_then(|clock| Mips4SliceClock::new(clock, 2))
-        .expect("stable SysAD readiness was checked");
-    let memory = registry
-        .get_resolved(control.slots.memory)?
-        .stable_fetch_clock()
-        .and_then(|clock| Mips4SliceClock::new(clock, 2))
-        .expect("stable memory-bus readiness was checked");
-    let Some(timeline) = plan_stable_timeline(
-        context,
-        control,
-        timeline_instructions,
-        &[sysad, memory],
-        0,
-        refresh_deadline,
-    ) else {
-        return Ok(None);
-    };
-    let byte_count = source_instructions * 4;
-    let cache_key = Mips4CodeSourceCacheKey {
-        source: Ip32StableCodeSource::Sdram,
-        source_offset: offset,
-        revision: 0,
-        byte_count: byte_count as u8,
-        no_ecc,
-    };
-    if control.jit_code_sources.len() == MIPS4_BLOCK_CACHE_CAPACITY
-        && !control.jit_code_sources.contains_key(&cache_key)
-    {
-        clear_jit_code_sources(control);
-    }
-    let window = {
-        let source = match control.jit_code_sources.entry(cache_key) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let Some((bytes, fingerprint)) = registry
-                    .get_resolved(control.slots.sdram)?
-                    .stable_code_window(offset, byte_count, no_ecc)
-                else {
-                    return Ok(None);
-                };
-                entry.insert(Mips4CodeSourceCacheEntry {
-                    bytes: bytes.into(),
-                    fingerprint,
-                })
+    let resolution = super::address_map::resolve(request.physical_address, 4, ram_size);
+    match resolution {
+        Ip32AddressResolution::Memory {
+            region: Ip32PhysicalRegion::SystemRom,
+            offset,
+            ..
+        } => {
+            let flash = registry.get_resolved(control.slots.prom)?;
+            let byte_count = maximum_bytes.min(flash.len().saturating_sub(offset as usize));
+            let byte_count = byte_count / 4 * 4;
+            if byte_count == 0 {
+                return Ok(None);
             }
-        };
-        let guard = Mips4CodeGuard {
-            source_id: Ip32StableCodeSource::Sdram.id(),
-            source_offset: offset,
-            revision: 0,
-            fingerprint: source.fingerprint,
-        };
-        Mips4CodeWindow::from_shared(request, guard, Arc::clone(&source.bytes), timeline)
-    };
-    if window.is_some() {
-        remember_ram_code_source(control, offset, byte_count);
+            let bytes = &flash.bytes()[offset as usize..offset as usize + byte_count];
+            let fingerprint = fingerprint(bytes);
+            Ok(Mips4CodeWindow::new(
+                request,
+                Mips4CodeGuard {
+                    source_id: Mips4CodeSourceId::new(1),
+                    source_offset: offset,
+                    revision: flash.persistence_revision(),
+                    fingerprint,
+                },
+                bytes,
+            ))
+        }
+        Ip32AddressResolution::Memory {
+            region:
+                Ip32PhysicalRegion::LowMemory
+                | Ip32PhysicalRegion::HighMemoryUnconfirmed
+                | Ip32PhysicalRegion::LinearMemory
+                | Ip32PhysicalRegion::NoEccMemory,
+            offset,
+            no_ecc,
+            ..
+        } => {
+            let Some((bytes, fingerprint)) = registry
+                .get_resolved(control.slots.sdram)?
+                .stable_code_window(offset, maximum_bytes, no_ecc)
+            else {
+                return Ok(None);
+            };
+            Ok(Mips4CodeWindow::new(
+                request,
+                Mips4CodeGuard {
+                    source_id: Mips4CodeSourceId::new(2),
+                    source_offset: offset,
+                    revision: 0,
+                    fingerprint,
+                },
+                &bytes,
+            ))
+        }
+        _ => Ok(None),
     }
-    Ok(window)
 }
 
 #[cfg(feature = "jit")]
-fn stable_code_window<S>(
-    registry: &ComponentRegistry,
-    context: &Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-    maximum_instructions: usize,
-) -> Result<Option<Mips4CodeWindow>, Ip32MachineDispatchError>
-where
-    S: TraceSink,
-{
-    if registry
-        .get_resolved(control.slots.cpu)?
-        .code_source_request()
-        .is_none()
-    {
-        return Ok(None);
-    }
-    if let Some(window) = stable_prom_code_window(registry, context, control, maximum_instructions)?
-    {
-        return Ok(Some(window));
-    }
-    stable_ram_code_window(registry, context, control, maximum_instructions)
-}
-
-#[cfg(feature = "jit")]
-fn commit_stable_prom_fetches(
-    registry: &mut ComponentRegistry,
-    control: &mut MachineControl,
-    window: &Mips4CodeWindow,
-    fetches: usize,
-    slice_start: SimTime,
-) -> Result<(), Ip32MachineDispatchError> {
-    if fetches == 0 {
-        return Ok(());
-    }
-    let previous_fetches = fetches - 1;
-    let previous_fetch_ticks = window
-        .fetch_time_ticks(previous_fetches)
-        .expect("executed fetches must fit the stable timeline");
-    let previous_pclock_ticks = control
-        .cpu_clock
-        .projection()
-        .elapsed(previous_fetches as u64)
-        .expect("the bounded slice PClock projection cannot overflow")
-        .get();
-    let previous_ticks = previous_fetch_ticks
-        .checked_add(previous_pclock_ticks)
-        .expect("the bounded slice timeline cannot overflow");
-    let previous_time = slice_start
-        .checked_add(SimDuration::new(previous_ticks))
-        .expect("the bounded slice timeline must fit simulated time");
-    let sysad = registry
-        .get_resolved(control.slots.sysad)?
-        .stable_fetch_clock()
-        .expect("stable SysAD readiness was checked");
-    let cmi = registry
-        .get_resolved(control.slots.cmi)?
-        .stable_fetch_clock()
-        .expect("stable CMI readiness was checked");
-    let previous_bus_cycles = (previous_fetches as u64)
-        .checked_mul(2)
-        .expect("the bounded slice cycle count cannot overflow");
-    let sysad_delivery_delay = fractional_cycle_delay(sysad, previous_bus_cycles);
-    let cmi_delivery_delay = fractional_cycle_delay(cmi, previous_bus_cycles);
-    let crime_delivery_time = previous_time
-        .checked_add(sysad_delivery_delay)
-        .expect("the bounded SysAD delivery time must fit simulated time");
-    let mace_delivery_time = crime_delivery_time
-        .checked_add(cmi_delivery_delay)
-        .expect("the bounded CMI delivery time must fit simulated time");
-    registry
-        .get_resolved_mut(control.slots.sysad)?
-        .commit_stable_fetches(fetches);
-    registry
-        .get_resolved_mut(control.slots.cmi)?
-        .commit_stable_fetches(fetches);
-    if !registry
-        .get_resolved_mut(control.slots.crime)?
-        .account_stable_cpu_fetches(fetches, crime_delivery_time)?
-        || !registry
-            .get_resolved_mut(control.slots.mace)?
-            .account_stable_prom_fetches(fetches, mace_delivery_time)
-    {
-        return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
-            "stable PROM fetch lost idle bus ownership".to_owned(),
-        )));
-    }
-    control
-        .jit_code_fetches
-        .record(Ip32StableCodeSource::SystemFlash, fetches as u64);
-    Ok(())
-}
-
-#[cfg(feature = "jit")]
-fn commit_stable_ram_fetches(
-    registry: &mut ComponentRegistry,
-    control: &mut MachineControl,
-    window: &Mips4CodeWindow,
-    fetches: usize,
-    slice_start: SimTime,
-) -> Result<(), Ip32MachineDispatchError> {
-    if fetches == 0 {
-        return Ok(());
-    }
-    let previous_fetches = fetches - 1;
-    let previous_fetch_ticks = window
-        .fetch_time_ticks(previous_fetches)
-        .expect("executed fetches must fit the stable timeline");
-    let previous_pclock_ticks = control
-        .cpu_clock
-        .projection()
-        .elapsed(previous_fetches as u64)
-        .expect("the bounded slice PClock projection cannot overflow")
-        .get();
-    let previous_ticks = previous_fetch_ticks
-        .checked_add(previous_pclock_ticks)
-        .expect("the bounded slice timeline cannot overflow");
-    let previous_time = slice_start
-        .checked_add(SimDuration::new(previous_ticks))
-        .expect("the bounded slice timeline must fit simulated time");
-    let sysad = registry
-        .get_resolved(control.slots.sysad)?
-        .stable_fetch_clock()
-        .expect("stable SysAD readiness was checked");
-    let previous_bus_cycles = (previous_fetches as u64)
-        .checked_mul(2)
-        .expect("the bounded slice cycle count cannot overflow");
-    let crime_delivery_time = previous_time
-        .checked_add(fractional_cycle_delay(sysad, previous_bus_cycles))
-        .expect("the bounded SysAD delivery time must fit simulated time");
-    registry
-        .get_resolved_mut(control.slots.sysad)?
-        .commit_stable_fetches(fetches);
-    registry
-        .get_resolved_mut(control.slots.memory)?
-        .commit_stable_fetches(fetches);
-    if !registry
-        .get_resolved_mut(control.slots.crime)?
-        .account_stable_cpu_fetches(fetches, crime_delivery_time)?
-    {
-        return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
-            "stable RAM fetch lost idle bus ownership".to_owned(),
-        )));
-    }
-    control
-        .jit_code_fetches
-        .record(Ip32StableCodeSource::Sdram, fetches as u64);
-    Ok(())
-}
-
-#[cfg(feature = "jit")]
-fn fractional_cycle_delay(
-    projection: FractionalClockProjection,
-    previous_cycles: u64,
-) -> SimDuration {
-    let before = projection
-        .elapsed(previous_cycles)
-        .expect("the bounded clock projection cannot overflow")
-        .get();
-    let after = projection
-        .elapsed(previous_cycles + 1)
-        .expect("the bounded clock projection cannot overflow")
-        .get();
-    SimDuration::new(after - before)
+fn fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 #[cfg(feature = "jit")]
 #[inline(never)]
 fn drive_cpu_jit<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
     let mut boundaries = 0;
-    let fast_transaction_tracing_disabled = fast_transaction_tracing_disabled(context);
     loop {
-        let slice_start = context.now();
         let remaining = control.cpu_continuation_quantum - boundaries;
-        let planned = control
-            .cpu_clock
-            .plan_boundary_budget(
-                context.now(),
-                context.deadline(),
-                context.next_event_time(),
-                remaining,
-            )
-            .min(FAST_MEMORY_SLICE_MAX_BOUNDARIES);
-        let mut fast_memory_runtime = plan_fast_memory_runtime(
-            registry,
-            context,
-            control,
-            fast_transaction_tracing_disabled,
-        )?;
-        let (requested, cached_slice) = {
-            let cpu_slot = control.slots.cpu;
-            let sdram_slot = control.slots.sdram;
+        let planned = control.cpu_clock.plan_boundary_budget(
+            context.now(),
+            context.deadline(),
+            context.next_event_time(),
+            remaining,
+        );
+        let requested = {
+            let cpu = registry.get_resolved_mut(control.slots.cpu)?;
+            cpu.limit_slice_budget(planned as u64)
+        };
+        let reusable = {
+            let cpu = registry.get_resolved_mut(control.slots.cpu)?;
             let engine = control
                 .jit_engine
                 .as_mut()
                 .expect("JIT dispatch requires an initialized engine");
-            match fast_memory_runtime.as_mut() {
-                Some(runtime) => {
-                    let (cpu, sdram) = registry.get_resolved_pair_mut(cpu_slot, sdram_slot)?;
-                    let requested = cpu.limit_slice_budget(planned as u64);
-                    let cached_slice = runtime.with_sdram(sdram, |runtime| {
-                        cpu.run_reusable_slice_with_fast_memory(engine, requested, runtime)
-                    })?;
-                    (requested, cached_slice)
-                }
-                None => {
-                    let cpu = registry.get_resolved_mut(cpu_slot)?;
-                    let requested = cpu.limit_slice_budget(planned as u64);
-                    let cached_slice = cpu.run_reusable_slice(engine, requested)?;
-                    (requested, cached_slice)
-                }
-            }
+            cpu.run_reusable_slice(engine, requested)?
         };
-        let (code_window, slice) = if let Some(slice) = cached_slice {
-            (None, slice)
+        let slice = if let Some(slice) = reusable {
+            slice
         } else {
-            let code_window = if fast_transaction_tracing_disabled {
-                stable_code_window(registry, context, control, requested as usize)?
-            } else {
-                None
-            };
-            if let (Some(runtime), Some(window)) =
-                (fast_memory_runtime.as_mut(), code_window.as_ref())
-            {
-                configure_fast_memory_code_timeline(registry, control, runtime, window)?;
-            }
-            let requested = code_window.as_ref().map_or(requested, |window| {
-                requested.min(window.fetch_count() as u64)
-            });
-            let cpu_slot = control.slots.cpu;
-            let sdram_slot = control.slots.sdram;
+            let code_window = functional_code_window(registry, control)?;
+            let cpu = registry.get_resolved_mut(control.slots.cpu)?;
             let engine = control
                 .jit_engine
                 .as_mut()
                 .expect("JIT dispatch requires an initialized engine");
-            let slice = match fast_memory_runtime.as_mut() {
-                Some(runtime) => {
-                    let (cpu, sdram) = registry.get_resolved_pair_mut(cpu_slot, sdram_slot)?;
-                    runtime.with_sdram(sdram, |runtime| {
-                        cpu.run_slice_with_code_window_and_fast_memory(
-                            engine,
-                            requested,
-                            code_window.as_ref(),
-                            runtime,
-                        )
-                    })?
-                }
-                None => {
-                    let cpu = registry.get_resolved_mut(cpu_slot)?;
-                    match code_window.as_ref() {
-                        Some(window) => {
-                            cpu.run_slice_with_code_window(engine, requested, Some(window))?
-                        }
-                        None => cpu.run_slice(engine, requested)?,
-                    }
-                }
-            };
-            (code_window, slice)
+            cpu.run_slice_with_code_window(engine, requested, code_window.as_ref())?
         };
-
-        let combined_code_timeline = fast_memory_runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.context.code_fetch_active());
-        if let Some(runtime) = &fast_memory_runtime {
-            commit_fast_memory_runtime(
-                registry,
-                context,
-                control,
-                runtime,
-                code_window.as_ref(),
-                slice.fast_fetches,
-            )?;
-        }
-
-        if slice.simulated_time_ticks != 0 && !combined_code_timeline {
-            let delay = SimDuration::new(slice.simulated_time_ticks);
-            let next_time =
-                context
-                    .now()
-                    .checked_add(delay)
-                    .ok_or(SchedulerError::TimeOverflow {
-                        time: context.now(),
-                        duration: delay,
-                    })?;
-            if !context.try_advance_to(next_time)? {
-                return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
-                    "stable PROM timeline crossed a scheduler event".to_owned(),
-                )));
-            }
-            let window = code_window
-                .as_ref()
-                .expect("fast fetches require a code window");
-            match Ip32StableCodeSource::from_guard(window.guard())? {
-                Ip32StableCodeSource::SystemFlash => commit_stable_prom_fetches(
-                    registry,
-                    control,
-                    window,
-                    slice.fast_fetches as usize,
-                    slice_start,
-                )?,
-                Ip32StableCodeSource::Sdram => commit_stable_ram_fetches(
-                    registry,
-                    control,
-                    window,
-                    slice.fast_fetches as usize,
-                    slice_start,
-                )?,
-            }
-        }
 
         let slice_boundaries = usize::try_from(slice.boundaries)
             .expect("a bounded JIT slice boundary count must fit usize");
@@ -3531,7 +2536,7 @@ where
                         duration: delay,
                     })?;
             if !context.try_advance_to(next_time)? {
-                return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                return Err(Ip32RuntimeError::Cpu(R5000CpuError::Block(
                     "planned PClock prefix crossed a scheduler event".to_owned(),
                 )));
             }
@@ -3561,20 +2566,11 @@ where
 
         match slice.action {
             R5000ExecutionSliceAction::Transaction(transaction) => {
-                if try_complete_fast_cpu_transaction(
-                    registry,
-                    context,
-                    control,
-                    &transaction,
-                    fast_transaction_tracing_disabled,
-                )? {
-                    continue;
-                }
-                return route_cpu_transaction(registry, context, control, transaction);
+                route_cpu_transaction(registry, context, control, transaction)?;
             }
             R5000ExecutionSliceAction::Progress if slice.boundaries != 0 => {}
             R5000ExecutionSliceAction::Progress => {
-                return Err(Ip32MachineDispatchError::Cpu(R5000CpuError::Block(
+                return Err(Ip32RuntimeError::Cpu(R5000CpuError::Block(
                     "JIT slice made no architectural progress".to_owned(),
                 )));
             }
@@ -3583,277 +2579,16 @@ where
                 control.first_cpu_idle_time.get_or_insert(context.now());
                 return Ok(());
             }
-            R5000ExecutionSliceAction::Waiting { .. } => {
-                return Ok(());
-            }
+            R5000ExecutionSliceAction::Waiting { .. } => return Ok(()),
         }
     }
 }
-
-#[cfg(feature = "jit")]
-fn try_complete_fast_cpu_transaction<S>(
-    registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-    transaction: &ExecutionTransaction<Mips4ExecutionTransaction>,
-    tracing_disabled: bool,
-) -> Result<bool, Ip32MachineDispatchError>
-where
-    S: TraceSink,
-{
-    control.fast_transaction_attempts = control.fast_transaction_attempts.saturating_add(1);
-    let Some(plan) =
-        plan_fast_cpu_transaction(registry, context, control, transaction, tracing_disabled)?
-    else {
-        control.fast_transaction_fallbacks = control.fast_transaction_fallbacks.saturating_add(1);
-        return Ok(false);
-    };
-    if !context.try_advance_to(plan.completion_time)? {
-        control.fast_transaction_fallbacks = control.fast_transaction_fallbacks.saturating_add(1);
-        return Ok(false);
-    }
-    if !registry
-        .get_resolved_mut(control.slots.sysad)?
-        .commit_direct_transaction(plan.sysad)
-    {
-        return Err(fast_transaction_invariant(
-            "the SysAD transaction changed after planning",
-        ));
-    }
-    let crime_completion = match plan.route {
-        Ip32CpuTransactionRoute::InternalRegister => registry
-            .get_resolved_mut(control.slots.crime)?
-            .commit_synchronous_sysad_read(&plan.request),
-        Ip32CpuTransactionRoute::TimerWrite => registry
-            .get_resolved_mut(control.slots.crime)?
-            .commit_synchronous_timer_write(&plan.request),
-        Ip32CpuTransactionRoute::Memory {
-            plan: memory_plan,
-            transaction: memory_transaction,
-        } => commit_fast_cpu_memory_transaction(
-            registry,
-            control,
-            &plan.request,
-            memory_plan,
-            memory_transaction,
-        )?,
-    };
-    let completion = Ip32SysAdBus::translate_crime_completion(transaction, crime_completion)
-        .ok_or_else(|| fast_transaction_invariant("CRIME changed the direct SysAD correlation"))?;
-    registry
-        .get_resolved_mut(control.slots.cpu)?
-        .complete(completion);
-    control.sysad_transactions = control.sysad_transactions.saturating_add(1);
-    control.fast_transaction_hits = control.fast_transaction_hits.saturating_add(1);
-    match transaction.payload {
-        Mips4ExecutionTransaction::Read { .. } => {
-            control.fast_transaction_reads = control.fast_transaction_reads.saturating_add(1);
-        }
-        Mips4ExecutionTransaction::Write { .. } => {
-            control.fast_transaction_writes = control.fast_transaction_writes.saturating_add(1);
-        }
-    }
-    Ok(true)
-}
-
-#[cfg(feature = "jit")]
-fn commit_fast_cpu_memory_transaction(
-    registry: &mut ComponentRegistry,
-    control: &mut MachineControl,
-    request: &CrimeSysAdRequest,
-    plan: CrimeDirectMemoryPlan,
-    planned_memory_transaction: CrimeMemoryTransaction,
-) -> Result<se_device::chipset::crime::protocol::CrimeSysAdCompletion, Ip32MachineDispatchError> {
-    registry
-        .get_resolved_mut(control.slots.crime)?
-        .accept(request.clone())?;
-    let memory_transaction = match registry.get_resolved_mut(control.slots.crime)?.poll()? {
-        CrimePoll::Action(CrimeAction::StartMemory(transaction))
-            if transaction == planned_memory_transaction =>
-        {
-            transaction
-        }
-        _ => {
-            return Err(fast_transaction_invariant(
-                "CRIME memory request changed after planning",
-            ));
-        }
-    };
-    let delivered = registry
-        .get_resolved_mut(control.slots.memory)?
-        .begin_direct_cpu_transaction(plan, memory_transaction);
-    if matches!(delivered.transfer.view(), CrimeTransferView::Write { .. }) {
-        invalidate_ram_code_sources(
-            control,
-            Some((delivered.address, delivered.transfer.length())),
-        );
-    }
-    let sdram_completion = registry
-        .get_resolved_mut(control.slots.sdram)?
-        .accept(delivered);
-    let (controller, memory_completion) = registry
-        .get_resolved_mut(control.slots.memory)?
-        .finish_direct_cpu_transaction(plan, sdram_completion);
-    if controller != component_ids::CRIME {
-        return Err(Ip32MachineDispatchError::UnexpectedController(controller));
-    }
-    registry
-        .get_resolved_mut(control.slots.crime)?
-        .complete(memory_completion);
-    let completion = match registry.get_resolved_mut(control.slots.crime)?.poll()? {
-        CrimePoll::Action(CrimeAction::CompleteSysAd(completion))
-            if completion.id == request.id =>
-        {
-            completion
-        }
-        _ => {
-            return Err(fast_transaction_invariant(
-                "CRIME memory completion changed after planning",
-            ));
-        }
-    };
-    control.memory_transactions = control.memory_transactions.saturating_add(1);
-    Ok(completion)
-}
-
-#[cfg(feature = "jit")]
-fn fast_transaction_invariant(message: &str) -> Ip32MachineDispatchError {
-    Ip32MachineDispatchError::Cpu(R5000CpuError::Block(message.to_owned()))
-}
-
-#[cfg(feature = "jit")]
-fn plan_fast_cpu_transaction<S>(
-    registry: &ComponentRegistry,
-    context: &Ip32DispatchContext<'_, '_, S>,
-    control: &MachineControl,
-    transaction: &ExecutionTransaction<Mips4ExecutionTransaction>,
-    tracing_disabled: bool,
-) -> Result<Option<Ip32CpuTransactionPlan>, Ip32MachineDispatchError>
-where
-    S: TraceSink,
-{
-    if context.stop_requested() || !tracing_disabled {
-        return Ok(None);
-    }
-    let Some(sysad) = registry
-        .get_resolved(control.slots.sysad)?
-        .plan_direct_transaction()
-    else {
-        return Ok(None);
-    };
-    let delivery_time =
-        context
-            .now()
-            .checked_add(sysad.request_delay())
-            .ok_or(SchedulerError::TimeOverflow {
-                time: context.now(),
-                duration: sysad.request_delay(),
-            })?;
-    let request = Ip32SysAdBus::translate_cpu_transaction(transaction, delivery_time);
-    let route = match Crime::classify_sysad_route(request.address, &request.transfer) {
-        CrimeSysAdRoute::SynchronousInternalRegister
-            if registry
-                .get_resolved(control.slots.crime)?
-                .synchronous_sysad_read_ready(request.address, &request.transfer) =>
-        {
-            Ip32CpuTransactionRoute::InternalRegister
-        }
-        CrimeSysAdRoute::SynchronousInternalRegister
-            if registry
-                .get_resolved(control.slots.crime)?
-                .synchronous_timer_write_ready(request.address, &request.transfer) =>
-        {
-            Ip32CpuTransactionRoute::TimerWrite
-        }
-        CrimeSysAdRoute::Memory => {
-            let Some(memory_transaction) = registry
-                .get_resolved(control.slots.crime)?
-                .preview_synchronous_memory_request(&request)
-            else {
-                return Ok(None);
-            };
-            let Some(plan) = registry
-                .get_resolved(control.slots.memory)?
-                .plan_direct_cpu_transaction(delivery_time)
-            else {
-                return Ok(None);
-            };
-            if !registry
-                .get_resolved(control.slots.sdram)?
-                .synchronous_transaction_ready(&memory_transaction)
-            {
-                return Ok(None);
-            }
-            Ip32CpuTransactionRoute::Memory {
-                plan,
-                transaction: memory_transaction,
-            }
-        }
-        _ => return Ok(None),
-    };
-    let device_completion_time = match &route {
-        Ip32CpuTransactionRoute::InternalRegister | Ip32CpuTransactionRoute::TimerWrite => {
-            delivery_time
-        }
-        Ip32CpuTransactionRoute::Memory { plan, .. } => delivery_time
-            .checked_add(plan.service_delay())
-            .ok_or(SchedulerError::TimeOverflow {
-                time: delivery_time,
-                duration: plan.service_delay(),
-            })?
-            .checked_add(plan.completion_delay())
-            .ok_or(SchedulerError::TimeOverflow {
-                time: delivery_time,
-                duration: plan.completion_delay(),
-            })?,
-    };
-    let completion_time = device_completion_time
-        .checked_add(sysad.completion_delay())
-        .ok_or(SchedulerError::TimeOverflow {
-            time: device_completion_time,
-            duration: sysad.completion_delay(),
-        })?;
-    if completion_time >= context.deadline()
-        || context
-            .next_event_time()
-            .is_some_and(|event| completion_time >= event)
-    {
-        return Ok(None);
-    }
-    Ok(Some(Ip32CpuTransactionPlan {
-        sysad,
-        request,
-        completion_time,
-        route,
-    }))
-}
-
-#[cfg(feature = "jit")]
-fn fast_transaction_tracing_disabled<S>(context: &Ip32DispatchContext<'_, '_, S>) -> bool
-where
-    S: TraceSink,
-{
-    [
-        TraceSource::Runtime,
-        TraceSource::Scheduler,
-        TraceSource::Component(component_ids::CPU_SYSAD_BUS),
-        TraceSource::Component(component_ids::CRIME),
-        TraceSource::Component(component_ids::CRIME_MEMORY_DOMAIN),
-        TraceSource::Component(component_ids::RAM),
-        TraceSource::Component(component_ids::CRIME_MACE_LINK),
-        TraceSource::Component(component_ids::MACE),
-        TraceSource::Component(component_ids::ISA_BUS),
-    ]
-    .into_iter()
-    .all(|source| context.trace_interest(source) == TraceInterest::None)
-}
-
 fn drive_cpu<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
     mut action: ExecutionAction<Mips4ExecutionTransaction, Mips4ExecutionBoundary>,
-) -> Result<(), Ip32MachineDispatchError>
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -3861,7 +2596,8 @@ where
     loop {
         match action {
             ExecutionAction::Transaction(transaction) => {
-                return route_cpu_transaction(registry, context, control, transaction);
+                route_cpu_transaction(registry, context, control, transaction)?;
+                action = registry.get_resolved_mut(control.slots.cpu)?.poll()?;
             }
             ExecutionAction::Boundary(_) => {
                 boundaries += 1;
@@ -3896,36 +2632,39 @@ where
 
 fn route_cpu_transaction<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
     transaction: ExecutionTransaction<Mips4ExecutionTransaction>,
-) -> Result<(), Ip32MachineDispatchError>
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
     control.sysad_transactions = control.sysad_transactions.saturating_add(1);
-    let disposition = registry
-        .get_resolved_mut(control.slots.sysad)?
-        .route(transaction);
-    if let CrimeBusDisposition::QueuedAndNeedsService {
-        delay,
-        epoch: generation,
-    } = disposition
-    {
-        context.schedule_after(
-            delay,
-            component_ids::CPU_SYSAD_BUS,
-            Ip32Event::SysAdBus(super::bus::Ip32SysAdBusEvent::Service { generation }),
-        )?;
+    if control.pending_sysad.is_some() {
+        return Err(Ip32RuntimeError::Protocol(
+            "the CPU issued overlapping SysAD transactions",
+        ));
     }
+    let request = {
+        let sysad = registry.get_resolved(control.slots.sysad)?;
+        if sysad.controller() != component_ids::CPU0 || sysad.target() != component_ids::CRIME {
+            return Err(Ip32RuntimeError::Protocol(
+                "the fixed SysAD endpoints changed after construction",
+            ));
+        }
+        sysad.translate_request(&transaction, context.now())
+    };
+    control.pending_sysad = Some(transaction);
+    crime_with_trace_interest(registry, context, control.slots.crime)?.accept(request)?;
+    drain_crime(registry, context, control)?;
     Ok(())
 }
 
 fn schedule_cpu_step<S>(
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &MachineControl,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &RuntimeControl,
     delay: SimDuration,
-) -> Result<(), EventChainError>
+) -> Result<(), SchedulerError>
 where
     S: TraceSink,
 {
@@ -3941,9 +2680,9 @@ where
 
 fn drain_crime<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -3958,52 +2697,76 @@ where
             }
             CrimeAction::StartMemory(transaction) => {
                 control.memory_transactions = control.memory_transactions.saturating_add(1);
-                route_memory(registry, context, control.slots.memory, transaction)?;
+                let completion = registry
+                    .get_resolved_mut(control.slots.sdram)?
+                    .accept(transaction);
+                crime_with_trace_interest(registry, context, control.slots.crime)?
+                    .complete(completion);
             }
             CrimeAction::StartCmi(transaction) => {
                 control.cmi_transactions = control.cmi_transactions.saturating_add(1);
-                route_cmi(registry, context, control.slots.cmi, transaction)?;
+                route_cmi(registry, context, control, transaction)?;
             }
             CrimeAction::StartCgi(transaction) => {
                 control.cgi_transactions = control.cgi_transactions.saturating_add(1);
-                route_cgi(registry, context, control.slots.cgi, transaction)?;
+                route_cgi(registry, context, control, transaction)?;
             }
             CrimeAction::CompleteCmiDevice(completion) => {
-                registry
-                    .get_resolved_mut(control.slots.cmi)?
-                    .accept_device_completion(completion);
-                drain_cmi_bus(registry, context, control)?;
+                complete_cmi_transaction(
+                    registry,
+                    context,
+                    control,
+                    component_ids::CRIME,
+                    completion,
+                )?;
             }
             CrimeAction::CompleteCgiDevice(completion) => {
-                registry
-                    .get_resolved_mut(control.slots.cgi)?
-                    .accept_device_completion(component_ids::CRIME, completion);
-                drain_cgi_bus(registry, context, control)?;
+                complete_cgi_transaction(
+                    registry,
+                    context,
+                    control,
+                    component_ids::CRIME,
+                    completion,
+                )?;
             }
             CrimeAction::CompleteSysAd(completion) => {
+                let transaction =
+                    control
+                        .pending_sysad
+                        .take()
+                        .ok_or(Ip32RuntimeError::Protocol(
+                            "CRIME completed an unknown SysAD transaction",
+                        ))?;
+                let completion = registry
+                    .get_resolved(control.slots.sysad)?
+                    .translate_completion(&transaction, completion)
+                    .ok_or(Ip32RuntimeError::Protocol(
+                        "CRIME returned an uncorrelated SysAD completion",
+                    ))?;
+                trace_sysad_access(
+                    registry,
+                    context,
+                    control.slots.cpu,
+                    &transaction,
+                    &completion,
+                )?;
                 registry
-                    .get_resolved_mut(control.slots.sysad)?
-                    .accept_device_completion(completion);
-                drain_sysad_bus(registry, context, control)?;
+                    .get_resolved_mut(control.slots.cpu)?
+                    .complete(completion);
             }
             CrimeAction::SetIrq(transaction) => {
-                context.request_barrier();
                 registry
                     .get_typed_mut::<IrqBus>(component_ids::CPU_IRQ_BUS)?
                     .route(transaction)?;
                 drain_irq_bus(registry)?;
             }
             CrimeAction::SignalCpu(CrimeCpuSignal::WarmReset) => {
-                context.request_barrier();
                 warm_reset(registry, context, control)?;
             }
             CrimeAction::SignalCpu(CrimeCpuSignal::HardReset) => {
-                context.request_barrier();
                 context.schedule_at(context.now(), component_ids::MACHINE, Ip32Event::HardReset)?;
             }
             CrimeAction::SignalMemory(signal) => {
-                #[cfg(feature = "jit")]
-                invalidate_ram_code_sources(control, None);
                 registry
                     .get_typed_mut::<CrimeSdram>(component_ids::RAM)?
                     .accept(signal);
@@ -4017,7 +2780,7 @@ where
     }
 }
 
-fn drain_irq_bus(registry: &mut ComponentRegistry) -> Result<(), Ip32MachineDispatchError> {
+fn drain_irq_bus(registry: &mut ComponentRegistry) -> Result<(), Ip32RuntimeError> {
     loop {
         match registry
             .get_typed_mut::<IrqBus>(component_ids::CPU_IRQ_BUS)?
@@ -4025,7 +2788,7 @@ fn drain_irq_bus(registry: &mut ComponentRegistry) -> Result<(), Ip32MachineDisp
         {
             IrqBusAction::Deliver { target, delivery } => {
                 if target != component_ids::CPU0 {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                    return Err(Ip32RuntimeError::UnexpectedController(target));
                 }
                 registry
                     .get_typed_mut::<R5000Cpu>(target)?
@@ -4038,9 +2801,9 @@ fn drain_irq_bus(registry: &mut ComponentRegistry) -> Result<(), Ip32MachineDisp
 
 fn drain_mace_irq_bus<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4051,9 +2814,8 @@ where
         {
             IrqBusAction::Deliver { target, delivery } => {
                 if target != component_ids::MACE {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                    return Err(Ip32RuntimeError::UnexpectedController(target));
                 }
-                context.request_barrier();
                 mace_with_trace_interest(registry, context, control.slots.mace)?
                     .accept(delivery)?;
                 drain_mace(registry, context, control)?;
@@ -4065,9 +2827,9 @@ where
 
 fn drain_mace<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4082,55 +2844,49 @@ where
             }
             MaceAction::StartCmi(transaction) => {
                 control.cmi_transactions = control.cmi_transactions.saturating_add(1);
-                route_cmi(registry, context, control.slots.cmi, transaction)?;
+                route_cmi(registry, context, control, transaction)?;
             }
             MaceAction::StartIsa(transaction) => {
                 route_isa(registry, context, control, transaction)?
             }
             MaceAction::StartPci(transaction) => {
-                context.request_barrier();
                 let disposition = registry
                     .get_typed_mut::<PciBus>(component_ids::PCI_BUS)?
                     .route(transaction);
-                if let se_device::bus::pci::PciBusDisposition::QueuedAndNeedsService { delay } =
+                if let se_device::bus::pci::PciBusDisposition::QueuedAndNeedsService { .. } =
                     disposition
                 {
-                    context.schedule_after(
-                        delay,
-                        component_ids::PCI_BUS,
-                        Ip32Event::PciBusService,
-                    )?;
+                    registry
+                        .get_typed_mut::<PciBus>(component_ids::PCI_BUS)?
+                        .service();
+                    drain_pci_bus(registry, context, control)?;
                 }
             }
             MaceAction::StartI2c(transaction) => {
-                context.request_barrier();
                 let index = if transaction.target == component_ids::VIDEO_INPUT0 {
                     0
                 } else {
                     1
                 };
                 let bus_id = i2c_bus_id(index)?;
-                let duration = I2cBus::duration(&transaction, IP32_TIMEBASE_HZ);
                 if registry.get_typed_mut::<I2cBus>(bus_id)?.route(transaction) {
-                    context.schedule_after(duration, bus_id, Ip32Event::I2cBusService { index })?;
+                    registry.get_typed_mut::<I2cBus>(bus_id)?.service();
+                    drain_i2c_bus(registry, context, control, index)?;
                 }
             }
             MaceAction::StartExternal(transaction) => {
-                context.request_barrier();
                 registry
                     .get_typed_mut::<MediaBus>(component_ids::MACE_MEDIA_BUS)?
                     .route(transaction);
                 drain_media_bus(registry, context, control)?;
             }
             MaceAction::SetOneWire(drive) => {
-                context.request_barrier();
                 registry
                     .get_resolved_mut(control.slots.one_wire)?
                     .route(drive)?;
                 drain_one_wire_bus(registry, context, control)?;
             }
             MaceAction::SetTwoWire { bus, drive } => {
-                context.request_barrier();
                 let index = ps2_bus_index(bus)?;
                 registry
                     .get_resolved_mut(control.slots.ps2_buses[index])?
@@ -4138,10 +2894,13 @@ where
                 drain_ps2_bus(registry, context, control, index)?;
             }
             MaceAction::CompleteCmiDevice(completion) => {
-                registry
-                    .get_resolved_mut(control.slots.cmi)?
-                    .accept_device_completion(completion);
-                drain_cmi_bus(registry, context, control)?;
+                complete_cmi_transaction(
+                    registry,
+                    context,
+                    control,
+                    component_ids::MACE,
+                    completion,
+                )?;
             }
             MaceAction::Trace(event) => {
                 trace_device_event(context, TraceSource::Component(component_ids::MACE), *event)
@@ -4150,22 +2909,22 @@ where
     }
 }
 
-fn ps2_bus_index(bus: ComponentId) -> Result<usize, Ip32MachineDispatchError> {
+fn ps2_bus_index(bus: ComponentId) -> Result<usize, Ip32RuntimeError> {
     if bus == component_ids::KEYBOARD_PS2_BUS {
         Ok(0)
     } else if bus == component_ids::MOUSE_PS2_BUS {
         Ok(1)
     } else {
-        Err(Ip32MachineDispatchError::UnexpectedController(bus))
+        Err(Ip32RuntimeError::UnexpectedController(bus))
     }
 }
 
 fn drain_ps2_bus<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
     index: usize,
-) -> Result<(), Ip32MachineDispatchError>
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4196,7 +2955,7 @@ where
                 drain_mouse(registry, context, control)?;
             }
             TwoWireBusAction::Deliver { target, .. } => {
-                return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                return Err(Ip32RuntimeError::UnexpectedController(target));
             }
             TwoWireBusAction::Idle => return Ok(()),
         }
@@ -4205,9 +2964,9 @@ where
 
 fn drain_keyboard<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4233,9 +2992,9 @@ where
 
 fn drain_mouse<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4257,9 +3016,9 @@ where
 
 fn drain_ds2502_actions<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4287,9 +3046,9 @@ where
 
 fn drain_one_wire_bus<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4307,7 +3066,7 @@ where
                 drain_ds2502_actions(registry, context, control)?;
             }
             OneWireBusAction::Deliver { target, .. } => {
-                return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                return Err(Ip32RuntimeError::UnexpectedController(target));
             }
             OneWireBusAction::Idle => return Ok(()),
         }
@@ -4316,18 +3075,21 @@ where
 
 fn route_isa<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &MachineControl,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
     transaction: IsaTransaction,
-) -> Result<(), Ip32MachineDispatchError>
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
     let disposition = registry
         .get_resolved_mut(control.slots.isa)?
         .route(transaction);
-    if let IsaBusDisposition::QueuedAndNeedsService { delay, event } = disposition {
-        context.schedule_after(delay, component_ids::ISA_BUS, Ip32Event::IsaBus(event))?;
+    if let IsaBusDisposition::QueuedAndNeedsService { event, .. } = disposition {
+        registry
+            .get_resolved_mut(control.slots.isa)?
+            .handle_event(event);
+        drain_isa_bus(registry, context, control)?;
     }
     Ok(())
 }
@@ -4354,9 +3116,9 @@ fn isa_post_delivery(target: ComponentId) -> IsaPostDelivery {
 
 fn drain_isa_bus<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4395,7 +3157,7 @@ where
                             .get_resolved_mut(control.slots.isa)?
                             .accept_device_completion(completion);
                     }
-                    IsaDeviceResponse::Deferred => context.request_barrier(),
+                    IsaDeviceResponse::Deferred => {}
                 }
                 match isa_post_delivery(target) {
                     IsaPostDelivery::None => {}
@@ -4411,14 +3173,16 @@ where
                 completion,
             } => {
                 if controller != component_ids::MACE {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
+                    return Err(Ip32RuntimeError::UnexpectedController(controller));
                 }
                 mace_with_trace_interest(registry, context, control.slots.mace)?
                     .complete(completion);
                 drain_mace(registry, context, control)?;
             }
-            IsaBusAction::Schedule { delay, event } => {
-                context.schedule_after(delay, component_ids::ISA_BUS, Ip32Event::IsaBus(event))?;
+            IsaBusAction::Schedule { event, .. } => {
+                registry
+                    .get_resolved_mut(control.slots.isa)?
+                    .handle_event(event);
             }
             IsaBusAction::Idle => return Ok(()),
         }
@@ -4427,9 +3191,9 @@ where
 
 fn drain_rtc<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4448,10 +3212,10 @@ where
 
 fn drain_uart<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
     uart_id: ComponentId,
-) -> Result<(), Ip32MachineDispatchError>
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4494,9 +3258,9 @@ where
 
 fn drain_parallel<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4515,9 +3279,9 @@ where
 
 fn drain_pci_bus<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4547,7 +3311,7 @@ where
                 completion,
             } => {
                 if controller != component_ids::MACE {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
+                    return Err(Ip32RuntimeError::UnexpectedController(controller));
                 }
                 mace_with_trace_interest(registry, context, control.slots.mace)?
                     .complete(completion);
@@ -4560,10 +3324,10 @@ where
 
 fn drain_i2c_bus<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
     index: u8,
-) -> Result<(), Ip32MachineDispatchError>
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4580,7 +3344,7 @@ where
                 completion,
             } => {
                 if controller != component_ids::MACE {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
+                    return Err(Ip32RuntimeError::UnexpectedController(controller));
                 }
                 mace_with_trace_interest(registry, context, control.slots.mace)?
                     .complete(completion);
@@ -4593,9 +3357,9 @@ where
 
 fn drain_media_bus<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -4614,7 +3378,7 @@ where
                     drain_mace(registry, context, control)?;
                 } else if matches!(target, component_ids::SERIAL0 | component_ids::SERIAL1) {
                     let MediaPayload::Bytes(bytes) = transaction.payload else {
-                        return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                        return Err(Ip32RuntimeError::UnexpectedController(target));
                     };
                     registry
                         .get_resolved_mut(control.slots.serial[serial_component_index(target)])?
@@ -4629,7 +3393,7 @@ where
     }
 }
 
-fn enqueue_host_output(control: &mut MachineControl, transaction: MediaTransaction, _now: SimTime) {
+fn enqueue_host_output(control: &mut RuntimeControl, transaction: MediaTransaction, _now: SimTime) {
     let port = transaction.port;
     #[cfg(test)]
     if matches!(port, MediaPort::Serial0 | MediaPort::Serial1)
@@ -4673,335 +3437,155 @@ fn enqueue_host_output(control: &mut MachineControl, transaction: MediaTransacti
     });
 }
 
-fn i2c_bus_id(index: u8) -> Result<ComponentId, Ip32MachineDispatchError> {
+fn i2c_bus_id(index: u8) -> Result<ComponentId, Ip32RuntimeError> {
     match index {
         0 => Ok(component_ids::I2C_BUS0),
         1 => Ok(component_ids::I2C_BUS1),
-        _ => Err(Ip32MachineDispatchError::UnexpectedController(
-            ComponentId::new(u64::from(index)),
-        )),
+        _ => Err(Ip32RuntimeError::UnexpectedController(ComponentId::new(
+            u64::from(index),
+        ))),
     }
-}
-
-fn route_memory<S>(
-    registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    slot: ComponentSlot<CrimeMemoryBus>,
-    transaction: CrimeMemoryTransaction,
-) -> Result<(), Ip32MachineDispatchError>
-where
-    S: TraceSink,
-{
-    let disposition = registry.get_resolved_mut(slot)?.route(transaction);
-    if let CrimeBusDisposition::QueuedAndNeedsService { delay, epoch } = disposition {
-        context.schedule_after(
-            delay,
-            component_ids::CRIME_MEMORY_DOMAIN,
-            Ip32Event::CrimeMemoryBus(CrimeMemoryBusEvent::Service { epoch }),
-        )?;
-    }
-    Ok(())
 }
 
 fn route_cmi<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    slot: ComponentSlot<CrimeCmiBus>,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
     transaction: CrimeCmiTransaction,
-) -> Result<(), Ip32MachineDispatchError>
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
-    let disposition = registry.get_resolved_mut(slot)?.route(transaction);
-    if let CrimeBusDisposition::QueuedAndNeedsService { delay, epoch } = disposition {
-        context.schedule_after(
-            delay,
-            component_ids::CRIME_MACE_LINK,
-            Ip32Event::CrimeCmiBus(CrimeCmiBusEvent::Service { epoch }),
-        )?;
+    if !registry
+        .get_resolved_mut(control.slots.cmi)?
+        .begin(&transaction)
+    {
+        return Err(Ip32RuntimeError::Protocol(
+            "a CMI target received a duplicate transaction identifier",
+        ));
+    }
+    let target = transaction.target;
+    let response = if target == component_ids::MACE {
+        let mace = mace_with_trace_interest(registry, context, control.slots.mace)?;
+        mace.observe_time(context.now());
+        let response = mace.accept(transaction);
+        drain_mace(registry, context, control)?;
+        response
+    } else if target == component_ids::CRIME {
+        let crime = crime_with_trace_interest(registry, context, control.slots.crime)?;
+        crime.observe_time(context.now());
+        let response = crime.accept(transaction);
+        drain_crime(registry, context, control)?;
+        response
+    } else {
+        return Err(Ip32RuntimeError::UnexpectedController(target));
+    };
+    if let CrimeLinkDeviceResponse::Complete(completion) = response {
+        complete_cmi_transaction(registry, context, control, target, completion)?;
     }
     Ok(())
+}
+
+fn complete_cmi_transaction<S>(
+    registry: &mut ComponentRegistry,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+    target: ComponentId,
+    completion: CrimeCmiCompletion,
+) -> Result<(), Ip32RuntimeError>
+where
+    S: TraceSink,
+{
+    let (controller, completion) = registry
+        .get_resolved_mut(control.slots.cmi)?
+        .complete(target, completion)
+        .ok_or(Ip32RuntimeError::Protocol(
+            "a CMI device completed an unknown transaction",
+        ))?;
+    if controller == component_ids::CRIME {
+        crime_with_trace_interest(registry, context, control.slots.crime)?.complete(completion);
+        drain_crime(registry, context, control)
+    } else if controller == component_ids::MACE {
+        mace_with_trace_interest(registry, context, control.slots.mace)?.complete(completion);
+        drain_mace(registry, context, control)
+    } else {
+        Err(Ip32RuntimeError::UnexpectedController(controller))
+    }
 }
 
 fn route_cgi<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    slot: ComponentSlot<CrimeCgiBus>,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
     transaction: CrimeCgiTransaction,
-) -> Result<(), Ip32MachineDispatchError>
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
-    let disposition = registry.get_resolved_mut(slot)?.route(transaction);
-    if let CrimeBusDisposition::QueuedAndNeedsService { delay, epoch } = disposition {
-        context.schedule_after(
-            delay,
-            component_ids::CRIME_GBE_LINK,
-            Ip32Event::CrimeCgiBus(CrimeCgiBusEvent::Service { epoch }),
-        )?;
+    if !registry
+        .get_resolved_mut(control.slots.cgi)?
+        .begin(&transaction)
+    {
+        return Err(Ip32RuntimeError::Protocol(
+            "a CGI target received a duplicate transaction identifier",
+        ));
+    }
+    let target = transaction.target;
+    let response = if target == component_ids::GBE {
+        let gbe = registry.get_resolved_mut(control.slots.gbe)?;
+        gbe.observe_time(context.now());
+        let response = gbe.accept(transaction);
+        drain_gbe(registry, context, control)?;
+        response
+    } else if target == component_ids::CRIME {
+        let crime = crime_with_trace_interest(registry, context, control.slots.crime)?;
+        crime.observe_time(context.now());
+        let response = crime.accept(transaction);
+        drain_crime(registry, context, control)?;
+        response
+    } else {
+        return Err(Ip32RuntimeError::UnexpectedController(target));
+    };
+    if let CrimeLinkDeviceResponse::Complete(completion) = response {
+        complete_cgi_transaction(registry, context, control, target, completion)?;
     }
     Ok(())
 }
 
-fn drain_sysad_bus<S>(
+fn complete_cgi_transaction<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+    target: ComponentId,
+    completion: CrimeCgiCompletion,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
-    loop {
-        let action = registry.get_resolved_mut(control.slots.sysad)?.poll();
-        match action {
-            Ip32SysAdBusAction::Deliver { target, request } => {
-                if target != component_ids::CRIME {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
-                }
-                crime_with_trace_interest(registry, context, control.slots.crime)?
-                    .accept(request)?;
-                drain_crime(registry, context, control)?;
-            }
-            Ip32SysAdBusAction::Complete {
-                controller,
-                transaction,
-                completion,
-            } => {
-                if controller != component_ids::CPU0 {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
-                }
-                trace_sysad_access(
-                    registry,
-                    context,
-                    control.slots.cpu,
-                    &transaction,
-                    &completion,
-                )?;
-                registry
-                    .get_resolved_mut(control.slots.cpu)?
-                    .complete(completion);
-                let same_time_event = context
-                    .next_event_time()
-                    .is_some_and(|time| time <= context.now());
-                if !control.inline_sysad_completion || same_time_event {
-                    schedule_cpu_step(context, control, SimDuration::ZERO)?;
-                } else {
-                    dispatch_cpu_step(registry, context, control)?;
-                }
-            }
-            Ip32SysAdBusAction::Schedule { delay, event } => {
-                context.schedule_after(
-                    delay,
-                    component_ids::CPU_SYSAD_BUS,
-                    Ip32Event::SysAdBus(event),
-                )?;
-            }
-            Ip32SysAdBusAction::Idle => return Ok(()),
-        }
-    }
-}
-
-fn drain_memory_bus<S>(
-    registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
-where
-    S: TraceSink,
-{
-    loop {
-        let action = registry.get_resolved_mut(control.slots.memory)?.poll();
-        match action {
-            CrimeBusAction::Deliver {
-                target,
-                transaction,
-            } => {
-                if target != component_ids::RAM {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
-                }
-                #[cfg(feature = "jit")]
-                if matches!(transaction.transfer.view(), CrimeTransferView::Write { .. }) {
-                    invalidate_ram_code_sources(
-                        control,
-                        Some((transaction.address, transaction.transfer.length())),
-                    );
-                }
-                let completion = registry
-                    .get_resolved_mut(control.slots.sdram)?
-                    .accept(transaction);
-                registry
-                    .get_resolved_mut(control.slots.memory)?
-                    .accept_device_completion(completion);
-            }
-            CrimeBusAction::Complete {
-                controller,
-                completion,
-            } => {
-                if controller != component_ids::CRIME {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
-                }
-                crime_with_trace_interest(registry, context, control.slots.crime)?
-                    .complete(completion);
-                drain_crime(registry, context, control)?;
-            }
-            CrimeBusAction::ScheduleService { delay } => {
-                let event = registry
-                    .get_resolved(control.slots.memory)?
-                    .next_scheduled_event();
-                context.schedule_after(
-                    delay,
-                    component_ids::CRIME_MEMORY_DOMAIN,
-                    Ip32Event::CrimeMemoryBus(event),
-                )?;
-            }
-            CrimeBusAction::Idle => return Ok(()),
-        }
-    }
-}
-
-fn drain_cmi_bus<S>(
-    registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
-where
-    S: TraceSink,
-{
-    loop {
-        let action = registry.get_resolved_mut(control.slots.cmi)?.poll();
-        match action {
-            CrimeBusAction::Deliver {
-                target,
-                transaction,
-            } => {
-                let response = if target == component_ids::MACE {
-                    let mace = mace_with_trace_interest(registry, context, control.slots.mace)?;
-                    mace.observe_time(context.now());
-                    mace.accept(transaction)
-                } else if target == component_ids::CRIME {
-                    let crime = crime_with_trace_interest(registry, context, control.slots.crime)?;
-                    crime.observe_time(context.now());
-                    crime.accept(transaction)
-                } else {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
-                };
-                match response {
-                    CrimeLinkDeviceResponse::Complete(completion) => {
-                        registry
-                            .get_resolved_mut(control.slots.cmi)?
-                            .accept_device_completion(completion);
-                    }
-                    CrimeLinkDeviceResponse::Deferred => context.request_barrier(),
-                }
-                drain_mace(registry, context, control)?;
-                drain_crime(registry, context, control)?;
-            }
-            CrimeBusAction::Complete {
-                controller,
-                completion,
-            } => {
-                if controller == component_ids::CRIME {
-                    crime_with_trace_interest(registry, context, control.slots.crime)?
-                        .complete(completion);
-                    drain_crime(registry, context, control)?;
-                } else if controller == component_ids::MACE {
-                    mace_with_trace_interest(registry, context, control.slots.mace)?
-                        .complete(completion);
-                    drain_mace(registry, context, control)?;
-                } else {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
-                }
-            }
-            CrimeBusAction::ScheduleService { delay } => {
-                let event = registry
-                    .get_resolved(control.slots.cmi)?
-                    .next_scheduled_event();
-                context.schedule_after(
-                    delay,
-                    component_ids::CRIME_MACE_LINK,
-                    Ip32Event::CrimeCmiBus(event),
-                )?;
-            }
-            CrimeBusAction::Idle => return Ok(()),
-        }
-    }
-}
-
-fn drain_cgi_bus<S>(
-    registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
-where
-    S: TraceSink,
-{
-    loop {
-        let action = registry.get_resolved_mut(control.slots.cgi)?.poll();
-        match action {
-            CrimeBusAction::Deliver {
-                target,
-                transaction,
-            } => {
-                let response = if target == component_ids::GBE {
-                    let gbe = registry.get_resolved_mut(control.slots.gbe)?;
-                    gbe.observe_time(context.now());
-                    gbe.accept(transaction)
-                } else if target == component_ids::CRIME {
-                    let crime = crime_with_trace_interest(registry, context, control.slots.crime)?;
-                    crime.observe_time(context.now());
-                    crime.accept(transaction)
-                } else {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
-                };
-                match response {
-                    CrimeLinkDeviceResponse::Complete(completion) => {
-                        registry
-                            .get_resolved_mut(control.slots.cgi)?
-                            .accept_device_completion(target, completion);
-                    }
-                    CrimeLinkDeviceResponse::Deferred => context.request_barrier(),
-                }
-                drain_crime(registry, context, control)?;
-                drain_gbe(registry, context, control)?;
-            }
-            CrimeBusAction::Complete {
-                controller,
-                completion,
-            } => {
-                if controller == component_ids::CRIME {
-                    crime_with_trace_interest(registry, context, control.slots.crime)?
-                        .complete(completion);
-                    drain_crime(registry, context, control)?;
-                } else if controller == component_ids::GBE {
-                    registry
-                        .get_resolved_mut(control.slots.gbe)?
-                        .complete(completion);
-                    drain_gbe(registry, context, control)?;
-                } else {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(controller));
-                }
-            }
-            CrimeBusAction::ScheduleService { delay } => {
-                let event = registry
-                    .get_resolved_mut(control.slots.cgi)?
-                    .next_scheduled_event()
-                    .expect("every CGI scheduling action must carry one event");
-                context.schedule_after(
-                    delay,
-                    component_ids::CRIME_GBE_LINK,
-                    Ip32Event::CrimeCgiBus(event),
-                )?;
-            }
-            CrimeBusAction::Idle => return Ok(()),
-        }
+    let (controller, completion) = registry
+        .get_resolved_mut(control.slots.cgi)?
+        .complete(target, completion)
+        .ok_or(Ip32RuntimeError::Protocol(
+            "a CGI device completed an unknown transaction",
+        ))?;
+    if controller == component_ids::CRIME {
+        crime_with_trace_interest(registry, context, control.slots.crime)?.complete(completion);
+        drain_crime(registry, context, control)
+    } else if controller == component_ids::GBE {
+        registry
+            .get_resolved_mut(control.slots.gbe)?
+            .complete(completion);
+        drain_gbe(registry, context, control)
+    } else {
+        Err(Ip32RuntimeError::UnexpectedController(controller))
     }
 }
 
 fn drain_gbe<S>(
     registry: &mut ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
-    control: &mut MachineControl,
-) -> Result<(), Ip32MachineDispatchError>
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
+    control: &mut RuntimeControl,
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -5012,16 +3596,15 @@ where
             }
             GbePoll::Action(GbeAction::StartCgi(transaction)) => {
                 control.cgi_transactions = control.cgi_transactions.saturating_add(1);
-                route_cgi(registry, context, control.slots.cgi, transaction)?;
+                route_cgi(registry, context, control, transaction)?;
             }
             GbePoll::Action(GbeAction::SetDdc { bus, drive }) => {
-                context.request_barrier();
                 let index = if bus == component_ids::GBE_CRT_DDC_BUS {
                     0
                 } else if bus == component_ids::GBE_FLAT_PANEL_DDC_BUS {
                     1
                 } else {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(bus));
+                    return Err(Ip32RuntimeError::UnexpectedController(bus));
                 };
                 registry
                     .get_resolved_mut(control.slots.gbe_ddc[index])?
@@ -5029,10 +3612,13 @@ where
                 drain_gbe_ddc_bus(registry, control, index)?;
             }
             GbePoll::Action(GbeAction::CompleteCgiDevice(completion)) => {
-                registry
-                    .get_resolved_mut(control.slots.cgi)?
-                    .accept_device_completion(component_ids::GBE, completion);
-                drain_cgi_bus(registry, context, control)?;
+                complete_cgi_transaction(
+                    registry,
+                    context,
+                    control,
+                    component_ids::GBE,
+                    completion,
+                )?;
             }
             GbePoll::Action(GbeAction::PublishFrame(frame)) => {
                 if control.latest_display_frame.replace(frame).is_some() {
@@ -5053,9 +3639,9 @@ where
 
 fn handle_frame_announce(
     registry: &mut ComponentRegistry,
-    control: &mut MachineControl,
+    control: &mut RuntimeControl,
     meta: GbeFrameMeta,
-) -> Result<(), Ip32MachineDispatchError> {
+) -> Result<(), Ip32RuntimeError> {
     let capture_armed = registry
         .get_resolved_mut(control.slots.gbe)?
         .capture_armed();
@@ -5087,9 +3673,9 @@ fn handle_frame_announce(
 
 fn drain_gbe_ddc_bus(
     registry: &mut ComponentRegistry,
-    control: &MachineControl,
+    control: &RuntimeControl,
     index: usize,
-) -> Result<(), Ip32MachineDispatchError> {
+) -> Result<(), Ip32RuntimeError> {
     loop {
         match registry
             .get_resolved_mut(control.slots.gbe_ddc[index])?
@@ -5097,7 +3683,7 @@ fn drain_gbe_ddc_bus(
         {
             TwoWireBusAction::Deliver { target, delivery } => {
                 if target != component_ids::GBE {
-                    return Err(Ip32MachineDispatchError::UnexpectedController(target));
+                    return Err(Ip32RuntimeError::UnexpectedController(target));
                 }
                 registry
                     .get_resolved_mut(control.slots.gbe)?
@@ -5110,11 +3696,11 @@ fn drain_gbe_ddc_bus(
 
 fn trace_sysad_access<S>(
     registry: &ComponentRegistry,
-    context: &mut Ip32DispatchContext<'_, '_, S>,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
     cpu_slot: ComponentSlot<R5000Cpu>,
     transaction: &ExecutionTransaction<Mips4ExecutionTransaction>,
     completion: &ExecutionCompletion<Mips4ExecutionCompletion>,
-) -> Result<(), Ip32MachineDispatchError>
+) -> Result<(), Ip32RuntimeError>
 where
     S: TraceSink,
 {
@@ -5157,7 +3743,7 @@ where
 }
 
 fn trace_device_event<S>(
-    context: &mut Ip32DispatchContext<'_, '_, S>,
+    context: &mut RuntimeContext<'_, Ip32Event, S>,
     source: TraceSource,
     event: OwnedTraceEvent,
 ) where

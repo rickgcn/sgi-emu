@@ -1,11 +1,9 @@
-//! Machine profiles and board-level integration.
+//! Machine profiles and mutable integrations for supported systems.
 //!
-//! This crate contains machine-specific profiles built on top of `se_core` and
-//! `se_runtime`. A machine profile fixes board topology, component identity, and
-//! the physical meaning of internal simulated time for that machine family.
-//!
-//! Chip behavior, address decoding, bus transactions, firmware images, and
-//! host-time pacing are represented by dedicated machine integration modules.
+//! A machine profile defines hardware configuration, board topology, component
+//! identity, address maps, protocol wiring, event semantics, and machine state.
+//! Each integration delegates its event loop to the machine-independent
+//! facilities in `se_runtime`.
 
 pub mod common;
 pub mod indigo;

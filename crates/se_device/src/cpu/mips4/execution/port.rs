@@ -4,7 +4,6 @@ use core::fmt;
 
 use super::block::{
     Mips4Block, Mips4BlockExit, Mips4BlockFrame, Mips4BlockKey, Mips4BlockRuntime, Mips4CodeGuard,
-    Mips4FastMemoryRuntime,
 };
 
 /// Instruction source associated with one translated block.
@@ -90,9 +89,6 @@ pub trait Mips4ExecutionPort {
     /// Port-owned installation or execution failure.
     type Error: fmt::Display;
 
-    /// Optional fast-memory runtime accepted by this port.
-    type FastMemoryRuntime: Mips4FastMemoryRuntime + ?Sized;
-
     /// Probes for a valid translated block matching the requested source.
     fn probe<R>(
         &mut self,
@@ -112,7 +108,6 @@ pub trait Mips4ExecutionPort {
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut Self::FastMemoryRuntime>,
     ) -> Result<Mips4BlockExecutionResult, Self::Error>
     where
         R: Mips4BlockRuntime;
@@ -123,7 +118,6 @@ pub trait Mips4ExecutionPort {
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut Self::FastMemoryRuntime>,
         counters_dirty: bool,
     ) -> Result<Mips4ReusableBlockExecution, Self::Error>
     where
@@ -137,13 +131,12 @@ pub trait Mips4ExecutionPort {
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut Self::FastMemoryRuntime>,
         counters_dirty: bool,
     ) -> Result<Mips4ReusableBatchExecution, Self::Error>
     where
         R: Mips4BlockRuntime,
     {
-        self.execute_reusable(key, frame, runtime, fast_memory, counters_dirty)
+        self.execute_reusable(key, frame, runtime, counters_dirty)
             .map(|execution| match execution {
                 Mips4ReusableBlockExecution::Missing => Mips4ReusableBatchExecution::Missing,
                 Mips4ReusableBlockExecution::CounterSynchronization => {

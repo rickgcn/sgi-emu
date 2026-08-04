@@ -19,7 +19,6 @@ use crate::cpu::execution::target::ExecutionTargetAction;
 use crate::cpu::mips4::cp0::Mips4Cp0CacheErr;
 use crate::cpu::mips4::execution::block::{
     Mips4BlockExit, Mips4BlockFrame, Mips4BlockKey, Mips4CodeSourceRequest, Mips4CodeWindow,
-    Mips4FastMemoryRuntime,
 };
 use crate::cpu::mips4::execution::bus::{Mips4ExecutionCompletion, Mips4ExecutionTransaction};
 use crate::cpu::mips4::execution::port::{
@@ -99,9 +98,6 @@ pub struct R5000ExecutionSlice {
     /// Stable external instruction fetches completed by this slice.
     pub fast_fetches: u64,
 
-    /// Simulated time consumed by stable external instruction fetches.
-    pub simulated_time_ticks: u64,
-
     /// Dispatcher action required after the slice.
     pub action: R5000ExecutionSliceAction,
 }
@@ -174,10 +170,6 @@ impl Clone for R5000ReusableBlockFrame {
     fn clone(&self) -> Self {
         Self::default()
     }
-}
-
-fn reborrow_optional<'a, T: ?Sized>(value: &'a mut Option<&mut T>) -> Option<&'a mut T> {
-    value.as_mut().map(|value| &mut **value)
 }
 
 /// Functional R5000 CPU with an injectable floating-point backend.
@@ -416,12 +408,10 @@ where
     {
         let mut cached_retired = 0;
         let mut cached_exceptions = 0;
-        let mut fast_memory = None;
         let result = self.run_slice_inner(
             port,
             budget,
             None,
-            &mut fast_memory,
             &mut cached_retired,
             &mut cached_exceptions,
         );
@@ -443,15 +433,13 @@ where
         P: Mips4ExecutionPort,
         P::Error: fmt::Display,
     {
-        let mut fast_memory = None;
-        self.run_reusable_slice_inner(port, budget, &mut fast_memory)
+        self.run_reusable_slice_inner(port, budget)
     }
 
     fn run_reusable_slice_inner<P>(
         &mut self,
         port: &mut P,
         budget: u64,
-        fast_memory: &mut Option<&mut P::FastMemoryRuntime>,
     ) -> Result<Option<R5000ExecutionSlice>, R5000CpuError>
     where
         P: Mips4ExecutionPort,
@@ -469,7 +457,6 @@ where
                 port,
                 budget,
                 None,
-                fast_memory,
                 &mut cached_retired,
                 &mut cached_exceptions,
             );
@@ -503,7 +490,6 @@ where
             port,
             budget,
             Some(key),
-            fast_memory,
             &mut cached_retired,
             &mut cached_exceptions,
         );
@@ -515,94 +501,11 @@ where
         result.map(Some)
     }
 
-    /// Runs queued work or reusable blocks with a machine-proven fast-memory runtime.
-    pub fn run_reusable_slice_with_fast_memory<P>(
-        &mut self,
-        port: &mut P,
-        budget: u64,
-        runtime: &mut P::FastMemoryRuntime,
-    ) -> Result<Option<R5000ExecutionSlice>, R5000CpuError>
-    where
-        P: Mips4ExecutionPort,
-        P::Error: fmt::Display,
-    {
-        let before = runtime.completed_transactions();
-        let mut fast_memory = Some(&mut *runtime);
-        let mut result = self.run_reusable_slice_inner(port, budget, &mut fast_memory);
-        let completed = fast_memory
-            .as_deref()
-            .expect("fast-memory runtime remains installed for the slice")
-            .completed_transactions()
-            .checked_sub(before)
-            .ok_or_else(|| self.block_error("fast-memory transaction counter moved backwards"))?;
-        if completed != 0 {
-            if let Ok(Some(R5000ExecutionSlice {
-                action: R5000ExecutionSliceAction::Transaction(transaction),
-                ..
-            })) = &mut result
-            {
-                transaction.id = self
-                    .executor
-                    .account_transactions_before_waiting(completed)
-                    .map_err(R5000CpuError::Execution)?;
-            } else {
-                self.executor
-                    .account_ready_transactions(completed)
-                    .map_err(R5000CpuError::Execution)?;
-            }
-            self.statistics.transactions = self.statistics.transactions.saturating_add(completed);
-        }
-        result
-    }
-
-    /// Runs a general typed slice with a machine-proven fast-memory runtime.
-    pub fn run_slice_with_code_window_and_fast_memory<P>(
-        &mut self,
-        port: &mut P,
-        budget: u64,
-        code_window: Option<&Mips4CodeWindow>,
-        runtime: &mut P::FastMemoryRuntime,
-    ) -> Result<R5000ExecutionSlice, R5000CpuError>
-    where
-        P: Mips4ExecutionPort,
-        P::Error: fmt::Display,
-    {
-        let before = runtime.completed_transactions();
-        let mut fast_memory = Some(&mut *runtime);
-        let mut result =
-            self.run_slice_with_code_window_inner(port, budget, code_window, &mut fast_memory);
-        let completed = fast_memory
-            .as_deref()
-            .expect("fast-memory runtime remains installed for the slice")
-            .completed_transactions()
-            .checked_sub(before)
-            .ok_or_else(|| self.block_error("fast-memory transaction counter moved backwards"))?;
-        if completed != 0 {
-            if let Ok(R5000ExecutionSlice {
-                action: R5000ExecutionSliceAction::Transaction(transaction),
-                ..
-            }) = &mut result
-            {
-                transaction.id = self
-                    .executor
-                    .account_transactions_before_waiting(completed)
-                    .map_err(R5000CpuError::Execution)?;
-            } else {
-                self.executor
-                    .account_ready_transactions(completed)
-                    .map_err(R5000CpuError::Execution)?;
-            }
-            self.statistics.transactions = self.statistics.transactions.saturating_add(completed);
-        }
-        result
-    }
-
     fn run_slice_inner<P>(
         &mut self,
         port: &mut P,
         budget: u64,
         initial_cached_block: Option<Mips4BlockKey>,
-        fast_memory: &mut Option<&mut P::FastMemoryRuntime>,
         cached_retired: &mut u64,
         cached_exceptions: &mut u64,
     ) -> Result<R5000ExecutionSlice, R5000CpuError>
@@ -618,7 +521,6 @@ where
             boundaries: 0,
             exception_boundary: None,
             fast_fetches: 0,
-            simulated_time_ticks: 0,
             action: R5000ExecutionSliceAction::Progress,
         };
         if initial_cached_block.is_none()
@@ -671,7 +573,6 @@ where
                         block_key,
                         &mut frame,
                         target,
-                        reborrow_optional(fast_memory),
                         deferred_boundaries != 0,
                     )
                 };
@@ -685,7 +586,6 @@ where
                         batch.execution.exit,
                         Mips4BlockExit::BudgetExhausted
                             | Mips4BlockExit::Dispatch
-                            | Mips4BlockExit::TimelineExhausted
                             | Mips4BlockExit::GuardInvalid
                     ) =>
                 {
@@ -713,11 +613,6 @@ where
                     if batch.stop == Mips4ReusableBatchStop::CounterSynchronization {
                         self.advance_deferred_boundaries(&mut deferred_boundaries);
                         continue;
-                    }
-                    if batch.execution.exit == Mips4BlockExit::TimelineExhausted {
-                        self.advance_deferred_boundaries(&mut deferred_boundaries);
-                        self.commit_reusable_block_frame(frame);
-                        return Ok(accumulated);
                     }
                     if batch.execution.counter_barrier {
                         self.advance_deferred_boundaries(&mut deferred_boundaries);
@@ -767,7 +662,7 @@ where
                         return Ok(accumulated);
                     }
                     (
-                        self.run_slice_with_code_window_inner(port, remaining, None, fast_memory)?,
+                        self.run_slice_with_code_window_inner(port, remaining, None)?,
                         false,
                         false,
                     )
@@ -893,7 +788,6 @@ where
             }
             Mips4BlockExit::BudgetExhausted
             | Mips4BlockExit::Dispatch
-            | Mips4BlockExit::TimelineExhausted
             | Mips4BlockExit::GuardInvalid => unreachable!("progress exits return above"),
         }
 
@@ -907,7 +801,6 @@ where
             boundaries,
             exception_boundary,
             fast_fetches: 0,
-            simulated_time_ticks: 0,
             action: slice_action,
         })
     }
@@ -923,8 +816,7 @@ where
         P: Mips4ExecutionPort,
         P::Error: fmt::Display,
     {
-        let mut fast_memory = None;
-        self.run_slice_with_code_window_inner(port, budget, code_window, &mut fast_memory)
+        self.run_slice_with_code_window_inner(port, budget, code_window)
     }
 
     fn run_slice_with_code_window_inner<P>(
@@ -932,7 +824,6 @@ where
         port: &mut P,
         budget: u64,
         code_window: Option<&Mips4CodeWindow>,
-        fast_memory: &mut Option<&mut P::FastMemoryRuntime>,
     ) -> Result<R5000ExecutionSlice, R5000CpuError>
     where
         P: Mips4ExecutionPort,
@@ -947,7 +838,6 @@ where
                 boundaries: 0,
                 exception_boundary: None,
                 fast_fetches: 0,
-                simulated_time_ticks: 0,
                 action: R5000ExecutionSliceAction::Progress,
             });
         }
@@ -968,7 +858,7 @@ where
                 .block_key_for_code_window(window)
                 .is_some()
         }) {
-            return self.run_stable_code_window_slice(port, budget, window, fast_memory);
+            return self.run_stable_code_window_slice(port, budget, window);
         }
 
         let key = self.executor.target().block_key();
@@ -1031,7 +921,7 @@ where
         let mut frame = self.take_block_frame(budget);
         let execution = {
             let target = self.executor.target_mut();
-            port.execute(key, &mut frame, target, reborrow_optional(fast_memory))
+            port.execute(key, &mut frame, target)
                 .map_err(|error| self.block_error(error))?
         };
         self.executor.target_mut().commit_block_frame(&mut frame);
@@ -1080,7 +970,6 @@ where
             Mips4BlockExit::RuntimeIdle => {
                 slice_action = R5000ExecutionSliceAction::Idle;
             }
-            Mips4BlockExit::TimelineExhausted => {}
             Mips4BlockExit::GuardInvalid => {}
             Mips4BlockExit::InternalError => {
                 return Err(self.block_error(format_args!(
@@ -1099,14 +988,12 @@ where
         }
         self.executor.target_mut().advance_random(boundaries);
         self.advance_pclocks(boundaries);
-        let simulated_time_ticks = 0;
         self.reusable_block_frame.0 = Some(frame);
         Ok(R5000ExecutionSlice {
             retired_instructions: retired,
             boundaries,
             exception_boundary,
             fast_fetches,
-            simulated_time_ticks,
             action: slice_action,
         })
     }
@@ -1116,14 +1003,13 @@ where
         port: &mut P,
         budget: u64,
         window: &Mips4CodeWindow,
-        fast_memory: &mut Option<&mut P::FastMemoryRuntime>,
     ) -> Result<R5000ExecutionSlice, R5000CpuError>
     where
         P: Mips4ExecutionPort,
         P::Error: fmt::Display,
     {
-        let fetch_limit = window.fetch_count() as u64;
-        let mut frame = self.take_block_frame(budget.min(fetch_limit));
+        let fetch_limit = budget;
+        let mut frame = self.take_block_frame(budget);
         let mut fast_fetches = 0_u64;
         let mut final_block = None;
 
@@ -1176,7 +1062,7 @@ where
             self.executor.target_mut().discard_dynamic_instruction();
             let execution = {
                 let target = self.executor.target_mut();
-                port.execute(key, &mut frame, target, reborrow_optional(fast_memory))
+                port.execute(key, &mut frame, target)
                     .map_err(|error| self.block_error(error))?
             };
             fast_fetches = fast_fetches
@@ -1246,7 +1132,6 @@ where
             Mips4BlockExit::RuntimeIdle => {
                 slice_action = R5000ExecutionSliceAction::Idle;
             }
-            Mips4BlockExit::TimelineExhausted => {}
             Mips4BlockExit::GuardInvalid => {}
             Mips4BlockExit::InternalError => {
                 return Err(self.block_error(format_args!(
@@ -1265,16 +1150,12 @@ where
         }
         self.executor.target_mut().advance_random(boundaries);
         self.advance_pclocks(boundaries);
-        let simulated_time_ticks = window
-            .fetch_time_ticks(fast_fetches as usize)
-            .ok_or_else(|| self.block_error("stable fetches exceeded their planned timeline"))?;
         self.reusable_block_frame.0 = Some(frame);
         Ok(R5000ExecutionSlice {
             retired_instructions: retired,
             boundaries,
             exception_boundary,
             fast_fetches,
-            simulated_time_ticks,
             action: slice_action,
         })
     }
@@ -1287,7 +1168,6 @@ where
                 boundaries: 0,
                 exception_boundary: None,
                 fast_fetches: 0,
-                simulated_time_ticks: 0,
                 action: R5000ExecutionSliceAction::Transaction(transaction),
             },
             ExecutionAction::Boundary(Mips4ExecutionBoundary::Retired { .. }) => {
@@ -1296,7 +1176,6 @@ where
                     boundaries: 1,
                     exception_boundary: None,
                     fast_fetches: 0,
-                    simulated_time_ticks: 0,
                     action: R5000ExecutionSliceAction::Progress,
                 }
             }
@@ -1305,7 +1184,6 @@ where
                 boundaries: 1,
                 exception_boundary: Some(boundary),
                 fast_fetches: 0,
-                simulated_time_ticks: 0,
                 action: R5000ExecutionSliceAction::Progress,
             },
             ExecutionAction::Idle => R5000ExecutionSlice {
@@ -1313,7 +1191,6 @@ where
                 boundaries: 0,
                 exception_boundary: None,
                 fast_fetches: 0,
-                simulated_time_ticks: 0,
                 action: R5000ExecutionSliceAction::Idle,
             },
             ExecutionAction::Waiting { transaction_id } => R5000ExecutionSlice {
@@ -1321,7 +1198,6 @@ where
                 boundaries: 0,
                 exception_boundary: None,
                 fast_fetches: 0,
-                simulated_time_ticks: 0,
                 action: R5000ExecutionSliceAction::Waiting { transaction_id },
             },
         })
@@ -1339,7 +1215,6 @@ where
                     boundaries: 0,
                     exception_boundary: None,
                     fast_fetches: 0,
-                    simulated_time_ticks: 0,
                     action: R5000ExecutionSliceAction::Transaction(transaction),
                 }
             }
@@ -1358,7 +1233,6 @@ where
                     boundaries: 1,
                     exception_boundary: None,
                     fast_fetches: 0,
-                    simulated_time_ticks: 0,
                     action: R5000ExecutionSliceAction::Progress,
                 }
             }
@@ -1376,7 +1250,6 @@ where
                     boundaries: 1,
                     exception_boundary: Some(boundary),
                     fast_fetches: 0,
-                    simulated_time_ticks: 0,
                     action: R5000ExecutionSliceAction::Progress,
                 }
             }
@@ -1385,7 +1258,6 @@ where
                 boundaries: 0,
                 exception_boundary: None,
                 fast_fetches: 0,
-                simulated_time_ticks: 0,
                 action: R5000ExecutionSliceAction::Idle,
             },
             ExecutionAction::Waiting { transaction_id } => R5000ExecutionSlice {
@@ -1393,7 +1265,6 @@ where
                 boundaries: 0,
                 exception_boundary: None,
                 fast_fetches: 0,
-                simulated_time_ticks: 0,
                 action: R5000ExecutionSliceAction::Waiting { transaction_id },
             },
         };

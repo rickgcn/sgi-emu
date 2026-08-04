@@ -120,24 +120,6 @@ impl fmt::Display for MaceError {
 
 impl std::error::Error for MaceError {}
 
-/// Immutable side-effect-free MACE register value captured for a bounded read batch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaceSynchronousReadProjection {
-    physical_address: u64,
-    value: u64,
-}
-
-impl MaceSynchronousReadProjection {
-    /// Completes the projected aligned doubleword read in physical byte-lane order.
-    pub const fn read(self, physical_address: u64, size: u32) -> Option<u64> {
-        if physical_address == self.physical_address && size == 8 {
-            Some(self.value.swap_bytes())
-        } else {
-            None
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct PendingIsa {
     cmi_id: CrimeTransactionId,
@@ -471,80 +453,6 @@ impl Mace {
     /// Observes the current simulation time before accepting work.
     pub fn observe_time(&mut self, now: SimTime) {
         self.now = now;
-    }
-
-    /// Returns whether an idle stable PROM fetch can bypass MACE.
-    pub fn stable_prom_fetch_ready(&self) -> bool {
-        self.pending_isa.is_empty()
-            && self.pending_pci.is_empty()
-            && self.pending_cmi.is_empty()
-            && self.actions.is_empty()
-            && self.terminal_error.is_none()
-    }
-
-    /// Captures the side-effect-free UST model while the incoming CMI path is idle.
-    pub fn synchronous_ust_projection(&self) -> Option<peripheral::MaceUstProjection> {
-        self.stable_prom_fetch_ready()
-            .then(|| self.timers.ust_projection())
-            .flatten()
-    }
-
-    /// Captures the two side-effect-free PS/2 status registers while CMI is idle.
-    pub fn synchronous_ps2_status_projections(&self) -> Option<[MaceSynchronousReadProjection; 2]> {
-        self.stable_prom_fetch_ready().then(|| {
-            std::array::from_fn(|port| MaceSynchronousReadProjection {
-                physical_address: registers::PS2_BASE + port as u64 * 0x20 + 0x18,
-                value: u64::from(self.ps2[port].status()),
-            })
-        })
-    }
-
-    /// Commits time observed by a proven batch of side-effect-free CMI reads.
-    pub fn commit_synchronous_cmi_reads(
-        &mut self,
-        reads: u64,
-        last_delivery_time: SimTime,
-    ) -> bool {
-        if reads == 0 {
-            return true;
-        }
-        if !self.stable_prom_fetch_ready() {
-            return false;
-        }
-        self.now = self.now.max(last_delivery_time);
-        true
-    }
-
-    /// Accounts for bypassed stable PROM requests at the last CMI delivery time.
-    pub fn account_stable_prom_fetches(
-        &mut self,
-        fetches: usize,
-        last_delivery_time: SimTime,
-    ) -> bool {
-        if fetches == 0 {
-            return true;
-        }
-        if !self.stable_prom_fetch_ready() {
-            return false;
-        }
-        let Ok(fetches) = u128::try_from(fetches) else {
-            return false;
-        };
-        let Some(next_transaction_id) = self.next_transaction_id.checked_add(fetches) else {
-            return false;
-        };
-        self.next_transaction_id = next_transaction_id;
-        self.now = self.now.max(last_delivery_time);
-        true
-    }
-
-    /// Returns whether stable PROM fetches can allocate all downstream IDs.
-    pub fn stable_prom_fetches_ready(&self, fetches: usize) -> bool {
-        self.stable_prom_fetch_ready()
-            && u128::try_from(fetches)
-                .ok()
-                .and_then(|fetches| self.next_transaction_id.checked_add(fetches))
-                .is_some()
     }
 
     /// Updates the coarse trace interest supplied by the machine runtime.

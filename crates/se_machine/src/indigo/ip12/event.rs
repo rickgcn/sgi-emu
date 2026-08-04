@@ -1,7 +1,7 @@
-//! Machine-level events for the IP12 profile.
+//! Machine events for the IP12 profile.
 //!
-//! These events represent board-level control transitions handled by machine
-//! orchestration.
+//! These events represent board-level control transitions handled by the IP12
+//! machine integration.
 
 /// IP12 machine-level event payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

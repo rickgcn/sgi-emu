@@ -2,12 +2,12 @@
 //!
 //! The IP32 profile defines stable board-level identities, timing, CPU
 //! physical address classification, interrupt mapping, and machine-level event
-//! orchestration for the SGI O2 workstation.
+//! semantics for the SGI O2 workstation.
 
 pub mod address_map;
 pub mod bus;
 pub mod component_ids;
-mod dispatch;
+pub mod config;
 pub mod event;
 pub mod machine;
 pub mod state;

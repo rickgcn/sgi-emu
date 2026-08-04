@@ -112,13 +112,12 @@ pub trait Mips4CodegenBackend {
     }
 
     /// Executes one compiled block against the stable frame ABI.
-    fn execute<'fast, R>(
+    fn execute<R>(
         &mut self,
         compiled: &Self::CompiledBlock,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
         operations: &[Mips4RuntimeOperation],
-        fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
     ) -> Result<Mips4BlockExit, Self::Error>
     where
         R: Mips4BlockRuntime;
@@ -145,13 +144,12 @@ pub trait Mips4CodegenBackend {
     }
 
     /// Executes one compiled Region against the stable frame ABI.
-    fn execute_region<'fast, R>(
+    fn execute_region<R>(
         &mut self,
         compiled: &Self::CompiledRegion,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
         operations: &[Mips4RuntimeOperation],
-        fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
     ) -> Result<(Mips4BlockExit, Option<Mips4RegionSideExit>), Self::Error>
     where
         R: Mips4BlockRuntime;
@@ -210,9 +208,6 @@ pub struct Mips4BlockExecution {
     /// Typed runtime helpers entered by this block invocation.
     pub runtime_calls: u64,
 
-    /// Fast-memory reads completed directly by native code.
-    pub native_fast_memory_reads: u64,
-
     /// Native Region side-exit reason, when the Region tier executed.
     pub region_side_exit: Option<Mips4RegionSideExit>,
 }
@@ -253,9 +248,6 @@ pub struct Mips4BlockEngineStatistics {
 
     /// Typed runtime helper calls made by either tier.
     pub runtime_calls: u64,
-
-    /// Fast-memory reads completed directly by native code.
-    pub native_fast_memory_reads: u64,
 
     /// Dynamically fetched instructions translated as single-instruction blocks.
     pub dynamic_fetches: u64,
@@ -571,18 +563,17 @@ where
 
 #[cold]
 #[inline(never)]
-fn execute_interpreted_tier<'fast, B, R>(
+fn execute_interpreted_tier<B, R>(
     backend: &mut B,
     record: &mut Mips4BlockRecord<B::CompiledBlock, B::CompiledRegion>,
     frame: &mut Mips4BlockFrame,
     runtime: &mut R,
-    fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
 ) -> Result<(Mips4BlockExit, bool, u64), Mips4BlockEngineError<B::Error>>
 where
     B: Mips4CodegenBackend,
     R: Mips4BlockRuntime,
 {
-    let exit = interpret_block_with_runtime(&record.block, frame, runtime, fast_memory);
+    let exit = interpret_block_with_runtime(&record.block, frame, runtime);
     record.operation_hotness = record
         .operation_hotness
         .saturating_add(frame.operations_executed());
@@ -909,29 +900,24 @@ where
         struct RejectRuntime;
 
         impl Mips4BlockRuntime for RejectRuntime {
-            fn execute<F>(
+            fn execute(
                 &mut self,
                 _frame: &mut Mips4BlockFrame,
                 _operation: Mips4RuntimeOperation,
-                _fast_memory: Option<&mut F>,
-            ) -> Mips4RuntimeResult
-            where
-                F: Mips4FastMemoryRuntime + ?Sized,
-            {
+            ) -> Mips4RuntimeResult {
                 Mips4RuntimeResult::InternalError
             }
         }
 
-        self.execute_with_runtime(key, frame, &mut RejectRuntime, None)
+        self.execute_with_runtime(key, frame, &mut RejectRuntime)
     }
 
     /// Executes one cached block with access to typed shared runtime semantics.
-    pub fn execute_with_runtime<'fast, R>(
+    pub fn execute_with_runtime<R>(
         &mut self,
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
     ) -> Result<Mips4BlockExecution, Mips4BlockEngineError<B::Error>>
     where
         R: Mips4BlockRuntime,
@@ -971,13 +957,7 @@ where
                     .as_ref()
                     .expect("a ready Region status requires a compiled record");
                 let (exit, region_side_exit) = backend
-                    .execute_region(
-                        &region.compiled,
-                        frame,
-                        runtime,
-                        &region.runtime_operations,
-                        fast_memory,
-                    )
+                    .execute_region(&region.compiled, frame, runtime, &region.runtime_operations)
                     .map_err(Mips4BlockEngineError::Backend)?;
                 (
                     exit,
@@ -992,13 +972,7 @@ where
                     .as_ref()
                     .expect("a ready block status requires a compiled record");
                 let exit = backend
-                    .execute(
-                        compiled,
-                        frame,
-                        runtime,
-                        &record.runtime_operations,
-                        fast_memory,
-                    )
+                    .execute(compiled, frame, runtime, &record.runtime_operations)
                     .map_err(Mips4BlockEngineError::Backend)?;
                 (
                     exit,
@@ -1009,7 +983,7 @@ where
                 )
             } else {
                 let (exit, promoted, compile_nanos) =
-                    execute_interpreted_tier(backend, record, frame, runtime, fast_memory)?;
+                    execute_interpreted_tier(backend, record, frame, runtime)?;
                 self.statistics.block_compile_nanos = self
                     .statistics
                     .block_compile_nanos
@@ -1061,11 +1035,6 @@ where
             .statistics
             .runtime_calls
             .saturating_add(frame.runtime_calls());
-        self.statistics.native_fast_memory_reads = self
-            .statistics
-            .native_fast_memory_reads
-            .saturating_add(frame.native_fast_memory_reads());
-
         if tier != Mips4BlockTier::Region {
             let record = self.records[index]
                 .as_mut()
@@ -1091,18 +1060,16 @@ where
             counter_barrier,
             operations_executed: frame.operations_executed(),
             runtime_calls: frame.runtime_calls(),
-            native_fast_memory_reads: frame.native_fast_memory_reads(),
             region_side_exit,
         })
     }
 
     /// Executes one reusable I-cache block with a single record lookup.
-    pub fn execute_cached_with_runtime<'fast, R>(
+    pub fn execute_cached_with_runtime<R>(
         &mut self,
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
         counters_dirty: bool,
     ) -> Result<Mips4CachedBlockExecution, Mips4BlockEngineError<B::Error>>
     where
@@ -1170,7 +1137,6 @@ where
                                 frame,
                                 runtime,
                                 &region.runtime_operations,
-                                fast_memory,
                             )
                             .map_err(Mips4BlockEngineError::Backend)?;
                         (exit, Mips4BlockTier::Region, region_side_exit)
@@ -1180,18 +1146,12 @@ where
                             .as_ref()
                             .expect("a ready block status requires a compiled record");
                         let exit = backend
-                            .execute(
-                                compiled,
-                                frame,
-                                runtime,
-                                &record.runtime_operations,
-                                fast_memory,
-                            )
+                            .execute(compiled, frame, runtime, &record.runtime_operations)
                             .map_err(Mips4BlockEngineError::Backend)?;
                         (exit, Mips4BlockTier::Native, None)
                     } else {
                         let (exit, promoted, compile_nanos) =
-                            execute_interpreted_tier(backend, record, frame, runtime, fast_memory)?;
+                            execute_interpreted_tier(backend, record, frame, runtime)?;
                         self.statistics.block_compile_nanos = self
                             .statistics
                             .block_compile_nanos
@@ -1227,7 +1187,6 @@ where
                         counter_barrier: record.counter_barrier,
                         operations_executed: frame.operations_executed(),
                         runtime_calls: frame.runtime_calls(),
-                        native_fast_memory_reads: frame.native_fast_memory_reads(),
                         region_side_exit,
                     }),
                     record.guard_mutating && !cached_guard_valid(record, runtime),
@@ -1304,7 +1263,6 @@ where
             }
         }
         statistics.runtime_calls = execution.runtime_calls;
-        statistics.native_fast_memory_reads = execution.native_fast_memory_reads;
         self.record_cached_statistics(statistics);
     }
 
@@ -1357,10 +1315,6 @@ where
             .statistics
             .runtime_calls
             .saturating_add(statistics.runtime_calls);
-        self.statistics.native_fast_memory_reads = self
-            .statistics
-            .native_fast_memory_reads
-            .saturating_add(statistics.native_fast_memory_reads);
         self.statistics.block_compile_nanos = self
             .statistics
             .block_compile_nanos
@@ -1536,7 +1490,6 @@ where
     B::Error: fmt::Display,
 {
     type Error = Mips4BlockEngineError<B::Error>;
-    type FastMemoryRuntime = dyn Mips4FastMemoryRuntime;
 
     fn probe<R>(
         &mut self,
@@ -1611,7 +1564,6 @@ where
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut Self::FastMemoryRuntime>,
     ) -> Result<Mips4BlockExecutionResult, Self::Error>
     where
         R: Mips4BlockRuntime,
@@ -1620,7 +1572,7 @@ where
             .block(key)
             .and_then(|block| block.guard().code_source())
             .is_some();
-        let execution = self.execute_with_runtime(key, frame, runtime, fast_memory)?;
+        let execution = self.execute_with_runtime(key, frame, runtime)?;
         if stable_source {
             self.record_fast_fetches(execution.operations_executed);
         }
@@ -1643,13 +1595,12 @@ where
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut Self::FastMemoryRuntime>,
         counters_dirty: bool,
     ) -> Result<Mips4ReusableBlockExecution, Self::Error>
     where
         R: Mips4BlockRuntime,
     {
-        match self.execute_cached_with_runtime(key, frame, runtime, fast_memory, counters_dirty)? {
+        match self.execute_cached_with_runtime(key, frame, runtime, counters_dirty)? {
             Mips4CachedBlockExecution::Missing => Ok(Mips4ReusableBlockExecution::Missing),
             Mips4CachedBlockExecution::CounterSynchronization => {
                 Ok(Mips4ReusableBlockExecution::CounterSynchronization)
@@ -1672,14 +1623,12 @@ where
         key: Mips4BlockKey,
         frame: &mut Mips4BlockFrame,
         runtime: &mut R,
-        fast_memory: Option<&mut Self::FastMemoryRuntime>,
         counters_dirty: bool,
     ) -> Result<Mips4ReusableBatchExecution, Self::Error>
     where
         R: Mips4BlockRuntime,
     {
         let mut key = key;
-        let mut fast_memory = fast_memory;
         let mut counters_dirty = counters_dirty;
         let mut entries = 0_u64;
         let mut operations_executed = 0_u64;
@@ -1687,13 +1636,8 @@ where
 
         loop {
             let previous_retired = frame.retired();
-            let execution = self.execute_cached_with_runtime(
-                key,
-                frame,
-                runtime,
-                fast_memory.as_deref_mut(),
-                counters_dirty,
-            )?;
+            let execution =
+                self.execute_cached_with_runtime(key, frame, runtime, counters_dirty)?;
             let execution = match execution {
                 Mips4CachedBlockExecution::Missing => {
                     let Some(execution) = last_execution else {
@@ -1765,23 +1709,17 @@ mod tests {
             Ok(block.clone())
         }
 
-        fn execute<'fast, R>(
+        fn execute<R>(
             &mut self,
             compiled: &Self::CompiledBlock,
             frame: &mut Mips4BlockFrame,
             runtime: &mut R,
             _operations: &[Mips4RuntimeOperation],
-            fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
         ) -> Result<Mips4BlockExit, Self::Error>
         where
             R: Mips4BlockRuntime,
         {
-            Ok(interpret_block_with_runtime(
-                compiled,
-                frame,
-                runtime,
-                fast_memory,
-            ))
+            Ok(interpret_block_with_runtime(compiled, frame, runtime))
         }
 
         fn compile_region(
@@ -1791,13 +1729,12 @@ mod tests {
             Ok(region.clone())
         }
 
-        fn execute_region<'fast, R>(
+        fn execute_region<R>(
             &mut self,
             _compiled: &Self::CompiledRegion,
             _frame: &mut Mips4BlockFrame,
             _runtime: &mut R,
             _operations: &[Mips4RuntimeOperation],
-            _fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
         ) -> Result<(Mips4BlockExit, Option<Mips4RegionSideExit>), Self::Error>
         where
             R: Mips4BlockRuntime,
@@ -1837,13 +1774,12 @@ mod tests {
             })
         }
 
-        fn execute<'fast, R>(
+        fn execute<R>(
             &mut self,
             _compiled: &Self::CompiledBlock,
             _frame: &mut Mips4BlockFrame,
             _runtime: &mut R,
             _operations: &[Mips4RuntimeOperation],
-            _fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
         ) -> Result<Mips4BlockExit, Self::Error>
         where
             R: Mips4BlockRuntime,
@@ -1858,13 +1794,12 @@ mod tests {
             Ok(region.clone())
         }
 
-        fn execute_region<'fast, R>(
+        fn execute_region<R>(
             &mut self,
             _compiled: &Self::CompiledRegion,
             _frame: &mut Mips4BlockFrame,
             _runtime: &mut R,
             _operations: &[Mips4RuntimeOperation],
-            _fast_memory: Option<&mut (dyn Mips4FastMemoryRuntime + 'fast)>,
         ) -> Result<(Mips4BlockExit, Option<Mips4RegionSideExit>), Self::Error>
         where
             R: Mips4BlockRuntime,
@@ -1883,15 +1818,11 @@ mod tests {
     }
 
     impl Mips4BlockRuntime for TestRuntime {
-        fn execute<F>(
+        fn execute(
             &mut self,
             _frame: &mut Mips4BlockFrame,
             _operation: Mips4RuntimeOperation,
-            _fast_memory: Option<&mut F>,
-        ) -> Mips4RuntimeResult
-        where
-            F: Mips4FastMemoryRuntime + ?Sized,
-        {
+        ) -> Mips4RuntimeResult {
             Mips4RuntimeResult::InternalError
         }
 
@@ -2020,7 +1951,7 @@ mod tests {
         };
         for _ in 0..=MIPS4_BLOCK_HOT_THRESHOLD {
             let mut frame = frame(key);
-            Mips4ExecutionPort::execute(&mut engine, key, &mut frame, &mut runtime, None).unwrap();
+            Mips4ExecutionPort::execute(&mut engine, key, &mut frame, &mut runtime).unwrap();
         }
         let statistics = engine.statistics();
         assert_eq!(statistics.compiled_blocks, 1);
@@ -2046,12 +1977,12 @@ mod tests {
         };
 
         let execution = engine
-            .execute_with_runtime(key, &mut frame(key), &mut runtime, None)
+            .execute_with_runtime(key, &mut frame(key), &mut runtime)
             .unwrap();
         assert_eq!(execution.tier, Mips4BlockTier::Interpreter);
         assert!(matches!(
             engine
-                .execute_cached_with_runtime(key, &mut frame(key), &mut runtime, None, false,)
+                .execute_cached_with_runtime(key, &mut frame(key), &mut runtime, false)
                 .unwrap(),
             Mips4CachedBlockExecution::Executed(Mips4BlockExecution {
                 tier: Mips4BlockTier::Interpreter,
@@ -2073,7 +2004,7 @@ mod tests {
             epoch: 0,
         };
 
-        Mips4ExecutionPort::execute(&mut engine, key, &mut frame(key), &mut runtime, None).unwrap();
+        Mips4ExecutionPort::execute(&mut engine, key, &mut frame(key), &mut runtime).unwrap();
 
         assert_eq!(engine.statistics().fast_fetches, 1);
         assert_eq!(engine.statistics().dynamic_fetches, 0);
@@ -2125,21 +2056,14 @@ mod tests {
             guard_valid: true,
             epoch: 0,
         };
-        Mips4ExecutionPort::execute(
-            &mut ordinary,
-            key,
-            &mut frame(key),
-            &mut ordinary_runtime,
-            None,
-        )
-        .unwrap();
+        Mips4ExecutionPort::execute(&mut ordinary, key, &mut frame(key), &mut ordinary_runtime)
+            .unwrap();
         assert!(matches!(
             Mips4ExecutionPort::execute_reusable(
                 &mut reusable,
                 key,
                 &mut frame(key),
                 &mut reusable_runtime,
-                None,
                 false,
             )
             .unwrap(),
@@ -2177,7 +2101,6 @@ mod tests {
             key,
             &mut batch_frame,
             &mut batch_runtime,
-            None,
             false,
         )
         .unwrap();
@@ -2197,7 +2120,6 @@ mod tests {
                     scalar_key,
                     &mut scalar_frame,
                     &mut scalar_runtime,
-                    None,
                     false,
                 )
                 .unwrap(),
@@ -2242,7 +2164,6 @@ mod tests {
             first_key,
             &mut frame,
             &mut runtime,
-            None,
             false,
         )
         .unwrap();
@@ -2259,7 +2180,6 @@ mod tests {
                 second_key,
                 &mut frame,
                 &mut runtime,
-                None,
                 true,
             )
             .unwrap(),

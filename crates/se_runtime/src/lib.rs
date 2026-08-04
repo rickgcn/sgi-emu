@@ -1,8 +1,8 @@
-//! Runtime orchestration for the emulator.
+//! Machine-independent runtime orchestration for the emulator.
 //!
-//! This crate connects core primitives into an event-driven execution layer. It
-//! owns components, advances the simulated-time scheduler, and records
-//! structured trace facts.
+//! This crate owns the generic component registry, simulated-time event loop,
+//! runtime bookkeeping, and structured tracing context. Machine crates supply
+//! event payloads and dispatch semantics through closures.
 //!
 //! The runtime uses [`se_core::scheduler::SimTime`] as its only time input.
 //! Host wall-clock time, sleeping, and real-time pacing belong to outer

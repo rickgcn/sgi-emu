@@ -5,8 +5,7 @@ use se_device::cpu::mips4::config::{Mips4CacheConfig, Mips4Endianness};
 use se_device::cpu::mips4::execution::block::{
     Mips4Block, Mips4BlockFrame, Mips4BlockGuard, Mips4BlockInstructionMetadata, Mips4BlockKey,
     Mips4BlockLiftedInstruction, Mips4BlockRuntime, Mips4CodeGuard, Mips4CodeSourceId,
-    Mips4FastMemoryRuntime, Mips4RuntimeOperation, Mips4RuntimeResult, interpret_block,
-    lift_cpu_instruction,
+    Mips4RuntimeOperation, Mips4RuntimeResult, interpret_block, lift_cpu_instruction,
 };
 use se_device::cpu::mips4::instruction::Mips4Instruction;
 use se_device::cpu::mips4::instruction::decode::{
@@ -28,15 +27,11 @@ const REGION_BUDGET: u64 = 100;
 struct RejectRuntime;
 
 impl Mips4BlockRuntime for RejectRuntime {
-    fn execute<F>(
+    fn execute(
         &mut self,
         _frame: &mut Mips4BlockFrame,
         _operation: Mips4RuntimeOperation,
-        _fast_memory: Option<&mut F>,
-    ) -> Mips4RuntimeResult
-    where
-        F: Mips4FastMemoryRuntime + ?Sized,
-    {
+    ) -> Mips4RuntimeResult {
         Mips4RuntimeResult::InternalError
     }
 }
@@ -48,11 +43,7 @@ fn execute_native_block(
     frame: &mut Mips4BlockFrame,
     runtime: &mut RejectRuntime,
 ) {
-    black_box(
-        backend
-            .execute(compiled, frame, runtime, &[], None)
-            .unwrap(),
-    );
+    black_box(backend.execute(compiled, frame, runtime, &[]).unwrap());
 }
 
 #[inline(always)]
@@ -64,7 +55,7 @@ fn execute_native_region(
 ) {
     black_box(
         backend
-            .execute_region(compiled, frame, runtime, &[], None)
+            .execute_region(compiled, frame, runtime, &[])
             .unwrap(),
     );
 }

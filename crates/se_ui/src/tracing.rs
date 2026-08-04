@@ -326,7 +326,8 @@ mod tests {
         scheduler::SimTime,
         tracing::{TraceField, TraceInterest, TraceLevel, TraceRecord, TraceSink, TraceSource},
     };
-    use se_machine::o2::ip32::machine::{Ip32Machine, Ip32MachineConfig};
+    use se_machine::o2::ip32::config::Ip32MachineConfig;
+    use se_machine::o2::ip32::machine::{Ip32Machine, Ip32RuntimeConfig};
 
     use super::{Ordering, TraceQueue, UiTraceSink, ffi};
 
@@ -534,9 +535,12 @@ mod tests {
                 .scheduler_capture_enabled
                 .store(scheduler_capture, Ordering::Relaxed);
             let queue = sink.queue.clone();
-            let config = Ip32MachineConfig {
-                prom_image: prom.clone(),
-                ..Ip32MachineConfig::default()
+            let config = Ip32RuntimeConfig {
+                machine: Ip32MachineConfig {
+                    prom_image: prom.clone(),
+                    ..Ip32MachineConfig::default()
+                },
+                ..Ip32RuntimeConfig::default()
             };
             let mut machine = Ip32Machine::from_config_with_trace_sink(config, sink)
                 .expect("the local IP32 machine must build");

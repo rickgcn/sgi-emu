@@ -169,10 +169,6 @@ impl CrimePiu {
         self.interrupt_output_asserted
     }
 
-    pub(super) const fn timer_projection(&self) -> (u32, SimTime) {
-        (self.timer_base, self.timer_base_time)
-    }
-
     pub(super) fn validate_state(&self, current_time: SimTime) -> Result<(), &'static str> {
         let watchdog_mask = registers::WATCHDOG_POWER_ON_RESET
             | registers::WATCHDOG_WARM_RESET

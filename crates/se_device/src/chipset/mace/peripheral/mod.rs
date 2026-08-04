@@ -2,22 +2,6 @@
 
 use se_core::scheduler::{SimDuration, SimTime};
 
-/// Affine MACE UST model captured for a synchronous read batch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaceUstProjection {
-    /// UST value at `base_time`.
-    pub base: u32,
-
-    /// Simulation-time origin of `base`.
-    pub base_time: SimTime,
-
-    /// Numerator frequency used by the affine counter.
-    pub frequency_hz: u64,
-
-    /// Denominator timebase used by the affine counter.
-    pub timebase_hz: u64,
-}
-
 /// MACE 32-bit UST and three compare registers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaceTimers {
@@ -64,16 +48,6 @@ impl MaceTimers {
         let increments =
             elapsed.saturating_mul(1_000_000_000) / (u128::from(self.timebase_hz) * 960);
         self.base_ust.wrapping_add(increments as u32)
-    }
-
-    /// Captures the exact affine UST model without observing a new time.
-    pub fn ust_projection(&self) -> Option<MaceUstProjection> {
-        Some(MaceUstProjection {
-            base: self.base_ust,
-            base_time: self.base_time,
-            frequency_hz: 1_000_000_000,
-            timebase_hz: self.timebase_hz.checked_mul(960)?,
-        })
     }
 
     pub fn write_ust(&mut self, now: SimTime, value: u32) {
