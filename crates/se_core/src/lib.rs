@@ -10,5 +10,7 @@ pub mod device;
 pub mod event;
 pub mod inspect;
 pub mod interrupt;
+pub mod machine;
 pub mod save;
+pub mod snapshot;
 pub mod time;

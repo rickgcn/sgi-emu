@@ -190,6 +190,18 @@ impl<'a> StateWriter<'a> {
         }
     }
 
+    pub(crate) fn with_limit(sink: &'a mut dyn io::Write, maximum: u64) -> Self {
+        Self {
+            sink: CountingWriter {
+                inner: sink,
+                written: 0,
+                maximum: Some(maximum),
+                failure: None,
+            },
+            root_written: false,
+        }
+    }
+
     /// Serializes the single root value directly into the payload sink.
     pub fn serialize<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), StateError> {
         if self.root_written {
@@ -444,6 +456,31 @@ mod tests {
             empty_writer.finish(),
             Err(StateError::MissingRootValue)
         ));
+    }
+
+    #[test]
+    fn writer_enforces_payload_limit_before_forwarding_bytes() {
+        let bytes = [0x5a; 4_096];
+        let mut limited_payload = Vec::new();
+        {
+            let mut limited = StateWriter::with_limit(&mut limited_payload, 2);
+            let error = limited.serialize(&ByteSlice::new(&bytes)).unwrap_err();
+            assert!(matches!(
+                error,
+                StateError::PayloadTooLarge {
+                    actual,
+                    maximum: 2
+                } if actual > 2
+            ));
+        }
+        assert_eq!(limited_payload.len(), 2);
+
+        let expected = postcard::to_stdvec(&ByteSlice::new(&[1, 2, 3, 4])).unwrap();
+        let mut exact_payload = Vec::new();
+        let mut exact = StateWriter::with_limit(&mut exact_payload, expected.len() as u64);
+        exact.serialize(&ByteSlice::new(&[1, 2, 3, 4])).unwrap();
+        assert_eq!(exact.finish().unwrap(), expected.len() as u64);
+        assert_eq!(exact_payload, expected);
     }
 
     #[test]
