@@ -4,6 +4,9 @@
 #![deny(missing_docs)]
 
 pub mod address;
+pub mod bus;
+pub mod device;
+pub mod event;
 pub mod inspect;
 pub mod interrupt;
 pub mod save;
