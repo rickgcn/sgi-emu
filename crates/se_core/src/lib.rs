@@ -5,6 +5,7 @@
 
 pub mod address;
 pub mod bus;
+pub mod decode;
 pub mod device;
 pub mod event;
 pub mod inspect;
