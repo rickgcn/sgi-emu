@@ -1,4 +1,7 @@
-//! Virtual-time definitions shared by every machine component.
+//! Defines the machine-wide virtual timeline and its unit conversions.
+//!
+//! [`VTime`] is measured exclusively in nanoseconds. Host wall-clock time is not
+//! part of this representation and must not be written into guest-visible state.
 
 /// Virtual time in nanoseconds.
 pub type VTime = u64;
@@ -12,7 +15,10 @@ pub const NS_PER_MS: VTime = 1_000_000;
 /// Nanoseconds in one second.
 pub const NS_PER_SEC: VTime = 1_000_000_000;
 
-/// Sentinel used when a CPU burst has no event deadline.
+/// Represents the absence of a finite CPU-burst deadline.
+///
+/// The value remains a representable [`VTime`]; APIs that accept event times may
+/// therefore also use it as the latest possible timestamp.
 pub const NO_DEADLINE: VTime = VTime::MAX;
 
 #[cfg(test)]

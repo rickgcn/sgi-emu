@@ -1,4 +1,12 @@
-//! Master-side bus and device-side MMIO contracts.
+//! Defines master-side physical bus and device-side MMIO contracts.
+//!
+//! [`Bus`] accepts [`PhysAddr`] values from CPUs and DMA-capable devices.
+//! Routing translates each transaction into an [`MmioAccess`] containing a
+//! [`DeviceAddr`] and the original [`BusInitiator`]. Fixed-width methods are
+//! single transactions; block methods may complete a prefix before failing.
+//!
+//! [`DirectSpan`] exposes borrowed direct memory without granting pointer
+//! stability beyond the bus or device borrow that produced it.
 
 use std::error::Error;
 use std::fmt;
@@ -8,7 +16,9 @@ use std::ptr::NonNull;
 use crate::address::{DeviceAddr, PhysAddr};
 use crate::device::DeviceId;
 
-/// Stable identity of a CPU within one machine profile.
+/// Identifies a CPU within one machine profile.
+///
+/// The profile assigns raw values; this identity is independent of host threads.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CpuId(u32);
@@ -27,7 +37,7 @@ impl CpuId {
     }
 }
 
-/// Identity of the master issuing a bus transaction.
+/// Identifies the master that issued a bus transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BusInitiator {
     /// A transaction issued by a guest CPU.
@@ -36,7 +46,7 @@ pub enum BusInitiator {
     Device(DeviceId),
 }
 
-/// A device-side access with initiator and private local address.
+/// Describes one device-side access after physical address translation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MmioAccess {
     /// Master that issued the transaction.
@@ -45,7 +55,7 @@ pub struct MmioAccess {
     pub addr: DeviceAddr,
 }
 
-/// Bus transaction failure visible to a master.
+/// Reports why a bus transaction did not complete successfully.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BusFault {
     /// No single mapping completely covers the transaction.
@@ -65,7 +75,7 @@ impl fmt::Display for BusFault {
 
 impl Error for BusFault {}
 
-/// Intended use of a requested direct memory span.
+/// Declares how a caller intends to use a direct memory span.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectAccess {
     /// The caller will only read the span.
@@ -74,10 +84,11 @@ pub enum DirectAccess {
     Write,
 }
 
-/// An immediately usable direct-memory pointer and its contiguous byte length.
+/// Provides an immediately usable pointer to a contiguous byte region.
 ///
 /// The lifetime prevents the originating bus or device from being accessed while
-/// the span exists. It does not grant stability beyond that borrow.
+/// the span exists. The pointer is not stable beyond that borrow, and
+/// [`DirectAccess`] does not enforce access permissions at the type level.
 #[derive(Debug)]
 pub struct DirectSpan<'a> {
     pointer: NonNull<u8>,
@@ -87,6 +98,8 @@ pub struct DirectSpan<'a> {
 
 impl<'a> DirectSpan<'a> {
     /// Creates a direct span covering an entire mutable byte slice.
+    ///
+    /// Returns `None` when `bytes` is empty.
     #[must_use]
     pub fn from_slice(bytes: &'a mut [u8]) -> Option<Self> {
         if bytes.is_empty() {
@@ -99,12 +112,14 @@ impl<'a> DirectSpan<'a> {
         })
     }
 
-    /// Creates a direct span from a raw pointer and non-zero length.
+    /// Creates a direct span from raw parts, returning `None` when `len` is zero.
     ///
     /// # Safety
     ///
-    /// The pointer must remain valid and exclusively accessible for `len` bytes
-    /// throughout `'a`. The memory must support the requested access kind.
+    /// For nonzero `len`, `pointer` must refer to `len` consecutive initialized
+    /// bytes in one live allocation. That region must remain valid for reads and
+    /// writes and must not be accessed through any other pointer throughout
+    /// `'a`.
     pub unsafe fn from_raw_parts(pointer: NonNull<u8>, len: usize) -> Option<Self> {
         if len == 0 {
             return None;
@@ -128,13 +143,15 @@ impl<'a> DirectSpan<'a> {
         self.len
     }
 
-    /// Returns whether this span contains no bytes.
+    /// Returns `false`; constructors never produce an empty span.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         false
     }
 
-    /// Shrinks the span without changing its first byte.
+    /// Limits the span to at most `maximum` bytes without changing its pointer.
+    ///
+    /// Returns `None` when `maximum` is zero.
     #[must_use]
     pub fn truncate(mut self, maximum: usize) -> Option<Self> {
         self.len = self.len.min(maximum);
@@ -144,8 +161,12 @@ impl<'a> DirectSpan<'a> {
 
 /// Physical bus operations used by CPUs and device DMA engines.
 ///
-/// Multi-byte values use guest big-endian byte order for legal transactions.
-/// Each fixed-width operation is one atomic device transaction.
+/// Multi-byte values use guest big-endian byte order. Each fixed-width method is
+/// one device transaction and must not be decomposed into narrower accesses.
+/// [`BusFault::Unmapped`] means no device transaction was issued because one
+/// physical route did not cover the complete access. [`BusFault::Fault`] means a
+/// mapped device rejected the transaction; the bus does not promise to roll back
+/// device side effects associated with that rejection.
 pub trait Bus {
     /// Reads one byte.
     fn read8(&mut self, addr: PhysAddr) -> Result<u8, BusFault>;
@@ -171,7 +192,16 @@ pub trait Bus {
     /// Writes one big-endian 64-bit value.
     fn write64(&mut self, addr: PhysAddr, value: u64) -> Result<(), BusFault>;
 
-    /// Reads a continuous byte sequence, possibly with partial completion on error.
+    /// Reads a contiguous byte sequence in ascending physical-address order.
+    ///
+    /// An empty output succeeds without resolving `addr`. On failure, an
+    /// unspecified prefix of `output` may already contain transferred bytes;
+    /// bytes after that prefix retain their previous values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BusFault::Unmapped`] when an address or route is unavailable and
+    /// [`BusFault::Fault`] when a mapped device rejects a routed chunk.
     fn read_block(&mut self, addr: PhysAddr, output: &mut [u8]) -> Result<(), BusFault> {
         for (offset, byte) in output.iter_mut().enumerate() {
             let offset = u64::try_from(offset).map_err(|_| BusFault::Unmapped)?;
@@ -181,7 +211,15 @@ pub trait Bus {
         Ok(())
     }
 
-    /// Writes a continuous byte sequence, possibly with partial completion on error.
+    /// Writes a contiguous byte sequence in ascending physical-address order.
+    ///
+    /// An empty input succeeds without resolving `addr`. On failure, an
+    /// unspecified prefix may already have been committed to one or more devices.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BusFault::Unmapped`] when an address or route is unavailable and
+    /// [`BusFault::Fault`] when a mapped device rejects a routed chunk.
     fn write_block(&mut self, addr: PhysAddr, input: &[u8]) -> Result<(), BusFault> {
         for (offset, &byte) in input.iter().enumerate() {
             let offset = u64::try_from(offset).map_err(|_| BusFault::Unmapped)?;
@@ -191,7 +229,16 @@ pub trait Bus {
         Ok(())
     }
 
-    /// Requests an immediately usable direct memory span.
+    /// Requests a direct span beginning at a physical address.
+    ///
+    /// A successful `None` result means that the route provides no direct access.
+    /// Any returned span must contain at most `requested` bytes and must not cross
+    /// a physical route boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BusFault::Unmapped`] when the first byte is not routed and
+    /// [`BusFault::Fault`] when the mapped device rejects the request.
     fn direct_span(
         &mut self,
         addr: PhysAddr,
@@ -203,6 +250,9 @@ pub trait Bus {
 /// Device-side MMIO operations over a private local address space.
 ///
 /// Implementations independently select legal access widths and side effects.
+/// Each fixed-width method receives one indivisible transaction in guest
+/// big-endian value form. Returning [`BusFault::Fault`] does not promise rollback
+/// of device side effects.
 pub trait MmioDevice {
     /// Reads one byte.
     fn read8(&mut self, access: MmioAccess) -> Result<u8, BusFault>;
@@ -228,7 +278,10 @@ pub trait MmioDevice {
     /// Writes one big-endian 64-bit value.
     fn write64(&mut self, access: MmioAccess, value: u64) -> Result<(), BusFault>;
 
-    /// Reads a continuous byte sequence within one physical route.
+    /// Reads a contiguous local byte sequence within one physical route.
+    ///
+    /// The default implementation performs ascending `read8` transactions. On
+    /// failure, an unspecified prefix of `output` may already be modified.
     fn read_block(&mut self, access: MmioAccess, output: &mut [u8]) -> Result<(), BusFault> {
         for (offset, byte) in output.iter_mut().enumerate() {
             let offset = u64::try_from(offset).map_err(|_| BusFault::Fault)?;
@@ -238,7 +291,10 @@ pub trait MmioDevice {
         Ok(())
     }
 
-    /// Writes a continuous byte sequence within one physical route.
+    /// Writes a contiguous local byte sequence within one physical route.
+    ///
+    /// The default implementation performs ascending `write8` transactions. On
+    /// failure, an unspecified prefix may already be committed.
     fn write_block(&mut self, access: MmioAccess, input: &[u8]) -> Result<(), BusFault> {
         for (offset, &byte) in input.iter().enumerate() {
             let offset = u64::try_from(offset).map_err(|_| BusFault::Fault)?;
@@ -248,7 +304,10 @@ pub trait MmioDevice {
         Ok(())
     }
 
-    /// Requests an immediately usable direct memory span from the device.
+    /// Requests a direct span beginning at a device-local address.
+    ///
+    /// A successful `None` result means that the device provides no direct
+    /// access. Any returned span must contain at most `requested` bytes.
     fn direct_span(
         &mut self,
         access: MmioAccess,

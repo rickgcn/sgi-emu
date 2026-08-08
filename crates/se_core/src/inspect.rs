@@ -1,9 +1,14 @@
-//! Shared deterministic monitor and debugging introspection interface.
+//! Defines object-safe command discovery and diagnostic execution.
+//!
+//! [`Introspect::commands`] publishes an ordered command manifest, while
+//! [`Introspect::execute`] writes command output through [`std::fmt::Write`]. A
+//! command's [`InspectCommand::mutates_state`] flag declares guest-visible
+//! mutation for callers; the interface does not enforce that declaration.
 
 use std::error::Error;
 use std::fmt;
 
-/// Description of one introspection command.
+/// Describes one introspection command exposed by a target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InspectCommand {
     name: String,
@@ -12,7 +17,7 @@ pub struct InspectCommand {
 }
 
 impl InspectCommand {
-    /// Creates a command description.
+    /// Creates a command description with its mutation declaration.
     #[must_use]
     pub fn new(name: impl Into<String>, summary: impl Into<String>, mutates_state: bool) -> Self {
         Self {
@@ -41,7 +46,7 @@ impl InspectCommand {
     }
 }
 
-/// Errors produced while executing an introspection command.
+/// Reports an introspection command failure.
 #[derive(Debug)]
 pub enum InspectError {
     /// The requested command is not present in the command manifest.
@@ -80,12 +85,21 @@ impl From<fmt::Error> for InspectError {
     }
 }
 
-/// Object-safe introspection implemented by devices and complete machines.
+/// Exposes an object-safe introspection command surface.
 pub trait Introspect {
-    /// Returns the stable command manifest.
+    /// Returns the target's ordered command manifest.
     fn commands(&self) -> &[InspectCommand];
 
     /// Executes one command with tokenized arguments and a text output sink.
+    ///
+    /// Implementations may mutate deterministic state only when the matching
+    /// [`InspectCommand`] declares that behavior. An error does not roll back text
+    /// or declared state changes already produced by the command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InspectError`] when the command or arguments are invalid,
+    /// execution fails, or the output sink rejects text.
     fn execute(
         &mut self,
         command: &str,
