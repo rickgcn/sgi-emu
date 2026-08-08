@@ -1,4 +1,16 @@
-//! Object-safe component state serialization over a single Postcard root value.
+//! Defines object-safe component state serialization.
+//!
+//! Each component encodes one private Serde DTO as exactly one Postcard root value
+//! through [`StateWriter`]. [`StateReader`] decodes one owned root value and rejects
+//! trailing bytes, keeping component payload boundaries explicit. Postcard is
+//! positional, so DTO field types and order and enum variant order are part of the
+//! component schema.
+//!
+//! [`Saveable`] separates a component's runtime representation from its snapshot
+//! schema. Loading implementations validate a decoded candidate before replacing
+//! live state. Persistent DTOs use explicit-width values and canonical collection
+//! order and omit host resources and wall-clock state; runtime container framing
+//! and cross-component dispatch belong to [`crate::snapshot`].
 
 use std::error::Error;
 use std::fmt;
@@ -7,10 +19,10 @@ use std::io;
 use serde::de::{DeserializeOwned, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Snapshot schema version used by every component.
+/// Identifies the component schema emitted and accepted by this crate.
 pub const SNAPSHOT_VERSION: u32 = 1;
 
-/// Errors produced while encoding, decoding, or validating component state.
+/// Reports a component-state encoding, decoding, or validation failure.
 #[derive(Debug)]
 pub enum StateError {
     /// A component attempted to encode more than one root value.
@@ -89,6 +101,8 @@ struct CountingWriter<'a> {
     inner: &'a mut dyn io::Write,
     written: u64,
     maximum: Option<u64>,
+    // Postcard folds writer failures into its serialization error, so retain the
+    // original cause for the component and container error contracts.
     failure: Option<CountingFailure>,
 }
 
@@ -167,10 +181,11 @@ impl io::Write for CountingWriter<'_> {
     }
 }
 
-/// A component payload writer.
+/// Encodes exactly one Postcard root value into a component payload sink.
 ///
 /// Exactly one call to [`Self::serialize`] must succeed before the writer is
-/// finished.
+/// finished. The writer counts encoded bytes and, when constructed by the snapshot
+/// container, enforces that component's payload limit during each write.
 pub struct StateWriter<'a> {
     sink: CountingWriter<'a>,
     root_written: bool,
@@ -203,6 +218,18 @@ impl<'a> StateWriter<'a> {
     }
 
     /// Serializes the single root value directly into the payload sink.
+    ///
+    /// A failed stream write may leave an incomplete prefix in the sink. The root
+    /// remains unwritten from this writer's contract; callers discard the payload
+    /// after any error because retrying does not remove bytes already forwarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::MultipleRootValues`] after a root has already been
+    /// encoded, [`StateError::PayloadTooLarge`] when a configured limit is crossed,
+    /// [`StateError::LengthOverflow`] when the byte count cannot be represented,
+    /// [`StateError::Io`] for a sink failure, or [`StateError::Encode`] for another
+    /// Postcard encoding failure.
     pub fn serialize<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), StateError> {
         if self.root_written {
             return Err(StateError::MultipleRootValues);
@@ -222,6 +249,11 @@ impl<'a> StateWriter<'a> {
     }
 
     /// Verifies the root-value contract and returns the encoded byte count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::MissingRootValue`] unless one call to
+    /// [`Self::serialize`] completed successfully.
     pub fn finish(self) -> Result<u64, StateError> {
         if !self.root_written {
             return Err(StateError::MissingRootValue);
@@ -230,7 +262,7 @@ impl<'a> StateWriter<'a> {
     }
 }
 
-/// A component payload reader constrained to one declared payload slice.
+/// Decodes exactly one Postcard root value from a complete component payload.
 ///
 /// Exactly one call to [`Self::deserialize`] must succeed before the reader is
 /// finished. Any bytes following that root value are rejected.
@@ -250,6 +282,14 @@ impl<'a> StateReader<'a> {
     }
 
     /// Decodes the single owned root value and rejects trailing bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::MultipleRootValues`] after a root has already been
+    /// decoded, [`StateError::Decode`] for invalid Postcard data,
+    /// [`StateError::TrailingBytes`] when the payload contains data after the root,
+    /// or [`StateError::LengthOverflow`] if that trailing length cannot be
+    /// represented.
     pub fn deserialize<T: DeserializeOwned>(&mut self) -> Result<T, StateError> {
         if self.root_read {
             return Err(StateError::MultipleRootValues);
@@ -266,6 +306,11 @@ impl<'a> StateReader<'a> {
     }
 
     /// Verifies that a root value was decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::MissingRootValue`] unless one call to
+    /// [`Self::deserialize`] completed successfully.
     pub fn finish(self) -> Result<(), StateError> {
         if !self.root_read {
             return Err(StateError::MissingRootValue);
@@ -274,15 +319,34 @@ impl<'a> StateReader<'a> {
     }
 }
 
-/// Object-safe snapshot behavior implemented by stateful components.
+/// Defines object-safe snapshot behavior for one stateful component.
+///
+/// Implementations serialize private DTOs rather than relying on runtime type
+/// layout. A load operation decodes and validates a complete candidate before
+/// atomically committing it to the component.
 pub trait Saveable {
-    /// Returns the component's snapshot schema version.
+    /// Returns the schema version emitted by [`Self::save`].
     fn snapshot_version(&self) -> u32;
 
-    /// Encodes the component's private state DTO.
+    /// Encodes the component's private state DTO as one root value.
+    ///
+    /// Saving is a pure observation of deterministic component state. Within one
+    /// build and profile, equal component states produce identical payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateError`] if the state cannot be encoded or written.
     fn save(&self, writer: &mut StateWriter<'_>) -> Result<(), StateError>;
 
     /// Decodes, validates, and atomically commits the component's private state DTO.
+    ///
+    /// `version` is the component schema version stored in the manifest.
+    /// Implementations leave their prior state unchanged on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::UnsupportedVersion`] for an unsupported schema, or
+    /// another [`StateError`] when decoding or invariant validation fails.
     fn load(&mut self, version: u32, reader: &mut StateReader<'_>) -> Result<(), StateError>;
 }
 

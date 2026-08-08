@@ -1,4 +1,15 @@
-//! Object-safe machine driving and construction interfaces.
+//! Defines object-safe machine driving and construction interfaces.
+//!
+//! [`Machine`] exposes the deterministic boundary used by a runtime: inspect the
+//! next event deadline, advance the complete CPU complex, remove due events, and
+//! dispatch them. It also combines component snapshots, introspection, and a
+//! canonical guest-visible state digest without exposing a concrete CPU, device,
+//! or machine type.
+//!
+//! [`MachineFactory`] belongs to the application composition root and constructs a
+//! fresh canonical topology for snapshot loading. This module defines neither the
+//! runtime loop policy nor how a machine interleaves CPUs within its single virtual
+//! timeline.
 
 use std::error::Error;
 use std::fmt;
@@ -10,7 +21,7 @@ use crate::save::StateError;
 use crate::snapshot::{ProfileFingerprint, SnapshotTarget};
 use crate::time::VTime;
 
-/// Reason a machine's CPU complex returned control to the runtime.
+/// Identifies why a machine's CPU complex returned control to the runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CpuExit {
     /// The CPU complex reached the requested virtual-time deadline.
@@ -23,7 +34,12 @@ pub enum CpuExit {
     Halted,
 }
 
-/// Canonical digest of all guest-visible machine state.
+/// Contains a canonical digest of all guest-visible machine state.
+///
+/// The concrete machine defines the canonical encoding being digested. Equal
+/// deterministic states within one build and profile produce equal bytes under
+/// that machine contract; this value is distinct from the snapshot container's
+/// integrity digest.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct StateDigest([u8; 32]);
@@ -42,7 +58,7 @@ impl StateDigest {
     }
 }
 
-/// Errors returned by a machine's runtime driving surface.
+/// Reports a failure on a machine's runtime driving surface.
 #[derive(Debug)]
 pub enum MachineError {
     /// Event queue advancement or removal failed.
@@ -95,38 +111,76 @@ impl From<StateError> for MachineError {
     }
 }
 
-/// Complete object-safe driving surface used by the runtime.
+/// Defines the complete object-safe driving surface used by the runtime.
 ///
-/// A future logical SMP implementation may interleave multiple guest CPUs
-/// internally while retaining this single deterministic machine timeline.
+/// The CPU complex represents the whole machine rather than a distinguished CPU.
+/// An implementation may deterministically interleave multiple guest CPUs while
+/// retaining one machine virtual timeline and one guest-visible event order.
 pub trait Machine: SnapshotTarget + Introspect {
     /// Returns the current machine virtual time.
     fn now(&self) -> VTime;
 
-    /// Returns the next scheduled event time after pruning cancelled entries.
+    /// Returns the earliest live event time after pruning cancelled entries.
+    ///
+    /// Returns `None` when no event is scheduled. The returned deadline may equal
+    /// the current machine time when an event is already due.
     fn front_event_time(&mut self) -> Option<VTime>;
 
     /// Advances the complete CPU complex until a deadline or another exit reason.
+    ///
+    /// `deadline` is an absolute virtual time. [`crate::time::NO_DEADLINE`] requests
+    /// an unbounded burst; a newly scheduled finite event can still truncate that
+    /// burst through the active CPU's event-truncate target.
+    ///
+    /// [`CpuExit::Deadline`] means the complex reached `deadline`. Other exit
+    /// reasons may return earlier, and no successful call moves machine time beyond
+    /// a finite deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineError`] when CPU advancement or a machine invariant fails.
     fn run_cpu_until(&mut self, deadline: VTime) -> Result<CpuExit, MachineError>;
 
-    /// Pops the earliest event when it is due at the current machine time.
+    /// Removes the earliest event due at the current machine time.
+    ///
+    /// Returns `None` when no live event is due.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineError`] when queue maintenance or event removal fails.
     fn pop_event(&mut self) -> Result<Option<ScheduledEvent>, MachineError>;
 
     /// Dispatches a previously popped event to its target device.
+    ///
+    /// An error does not roll back device, bus, or scheduling effects already
+    /// produced by the callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineError`] when the target is unavailable or its callback
+    /// fails.
     fn dispatch_event(&mut self, event: ScheduledEvent) -> Result<(), MachineError>;
 
     /// Computes a canonical digest of guest-visible state.
+    ///
+    /// Host resources and nondeterministic presentation state do not contribute to
+    /// the digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineError`] when canonical state cannot be encoded or
+    /// validated.
     fn state_digest(&self) -> Result<StateDigest, MachineError>;
 }
 
-/// Errors produced while assembling a fresh machine instance.
+/// Describes a failure to assemble a fresh machine instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MachineCreateError {
     reason: String,
 }
 
 impl MachineCreateError {
-    /// Creates an assembly error with a stable human-readable reason.
+    /// Creates an assembly error with a human-readable reason.
     #[must_use]
     pub fn new(reason: impl Into<String>) -> Self {
         Self {
@@ -149,11 +203,19 @@ impl fmt::Display for MachineCreateError {
 
 impl Error for MachineCreateError {}
 
-/// Object-safe factory supplied by the application composition root.
+/// Constructs fresh machines for the application composition root.
+///
+/// Repeated successful construction for one factory yields the same canonical
+/// topology, component manifest, and initial profile configuration.
 pub trait MachineFactory {
     /// Returns the exact machine-profile fingerprint accepted by this factory.
     fn profile_fingerprint(&self) -> ProfileFingerprint;
 
     /// Constructs a fresh machine with its canonical initial topology.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineCreateError`] when topology assembly or initial invariant
+    /// validation fails.
     fn create(&self) -> Result<Box<dyn Machine>, MachineCreateError>;
 }
