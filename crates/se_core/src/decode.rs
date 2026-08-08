@@ -1,4 +1,16 @@
-//! Assembly-time compiled physical address decoder.
+//! Compiles declarative physical mappings into an exact runtime decoder.
+//!
+//! [`DeviceRegistryBuilder`] assigns identities independently of mappings, and
+//! [`AddressMap`] declares one or more physical windows for those identities.
+//! Multiple windows may target the same device-local bytes to form aliases, while
+//! physical overlap is rejected when [`Decoder::build`] validates the complete
+//! map.
+//!
+//! Compilation divides physical space into 4 GiB banks and 64 KiB slots. Complete
+//! banks and slots use direct routes; boundary slots use exact range tables, and
+//! populated high banks use a bounded-depth radix directory. Non-edge lookups use
+//! only bounded direct or radix indexing; edge entries binary-search exact ranges.
+//! This preserves byte-accurate mappings across every supported profile width.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -18,7 +30,7 @@ const SPARSE_PAGE_SLOTS: usize = 256;
 const SPARSE_PAGE_COUNT: usize = SLOTS_PER_BANK / SPARSE_PAGE_SLOTS;
 const DENSE_SLOT_THRESHOLD: usize = 4_096;
 
-/// Errors produced while assigning stable runtime device identities.
+/// Reports a rejected device registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceRegistryError {
     /// No additional identity can be represented while retaining a `u32` count.
@@ -35,7 +47,11 @@ impl fmt::Display for DeviceRegistryError {
 
 impl Error for DeviceRegistryError {}
 
-/// Builder that assigns `DeviceId` values independently of address mappings.
+/// Assigns runtime [`DeviceId`] values in registration order.
+///
+/// Registration order defines identity independently of the number, position, or
+/// order of a device's physical mappings. The completed [`Decoder`] retains one
+/// slot for every registered identity.
 #[derive(Default)]
 pub struct DeviceRegistryBuilder {
     devices: Vec<Box<dyn Device>>,
@@ -49,6 +65,11 @@ impl DeviceRegistryBuilder {
     }
 
     /// Registers a device and returns its registration-order identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceRegistryError::TooManyDevices`] without changing the
+    /// registry when the `u32` identity space is exhausted.
     pub fn register(&mut self, device: Box<dyn Device>) -> Result<DeviceId, DeviceRegistryError> {
         if self.devices.len() >= u32::MAX as usize {
             return Err(DeviceRegistryError::TooManyDevices);
@@ -79,7 +100,7 @@ struct Mapping {
     device_base: DeviceAddr,
 }
 
-/// Errors produced while declaring or validating a physical address map.
+/// Reports an invalid physical address-map declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressMapError {
     /// Implemented physical address bits must be in `1..=63`.
@@ -141,7 +162,13 @@ impl fmt::Display for AddressMapError {
 
 impl Error for AddressMapError {}
 
-/// Declarative physical mappings for one explicitly configured address space.
+/// Collects physical windows for one explicitly configured address space.
+///
+/// A mapping translates a physical address `p` to
+/// `device_base + (p - physical.start())`. The same device may appear in multiple
+/// windows, including aliases that translate to overlapping device-local ranges.
+/// Physical windows themselves must not overlap; that complete-map invariant is
+/// checked by [`Decoder::build`].
 pub struct AddressMap {
     config: AddressSpaceConfig,
     mappings: Vec<Mapping>,
@@ -149,6 +176,11 @@ pub struct AddressMap {
 
 impl AddressMap {
     /// Creates an empty map for an explicit physical address geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddressMapError::InvalidPhysicalAddressBits`] unless the profile
+    /// declares between 1 and 63 implemented physical address bits, inclusive.
     pub fn new(config: AddressSpaceConfig) -> Result<Self, AddressMapError> {
         if !(1..=63).contains(&config.physical_address_bits) {
             return Err(AddressMapError::InvalidPhysicalAddressBits(
@@ -162,6 +194,17 @@ impl AddressMap {
     }
 
     /// Declares an exact physical range and its device-local base.
+    ///
+    /// The declaration is appended without coalescing adjacent windows. Physical
+    /// overlap with other declarations is checked later by [`Decoder::build`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddressMapError::PhysicalRangeOutOfSpace`] when any byte lies
+    /// outside the configured physical space, or
+    /// [`AddressMapError::DeviceRangeOverflow`] when the inclusive last
+    /// device-local byte cannot be represented. Rejection leaves the map
+    /// unchanged.
     pub fn map_region(
         &mut self,
         device: DeviceId,
@@ -207,7 +250,7 @@ impl AddressMap {
     }
 }
 
-/// Errors produced while validating and compiling a complete decoder.
+/// Reports a failure to validate or compile a decoder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecoderBuildError {
     /// The address map itself is invalid.
@@ -495,22 +538,22 @@ impl BankDirectory {
     }
 }
 
-/// Counts of compiled decoder structures, useful for validation and profiling.
+/// Counts the representations selected for a compiled decoder.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DecoderLayoutStats {
     /// Explicitly represented unmapped banks, including bank zero when empty.
     pub unmapped_banks: usize,
-    /// Completely linear 4 GiB banks.
+    /// Complete 4 GiB banks represented by one route.
     pub uniform_banks: usize,
     /// Banks represented by 65,536 direct slot entries.
     pub dense_banks: usize,
-    /// Banks represented by fixed two-level sparse slot radix tables.
+    /// Banks represented by paged sparse slot tables.
     pub sparse_banks: usize,
     /// Slots that directly identify one route.
     pub direct_slots: usize,
     /// Slots that require an exact edge lookup.
     pub edge_slots: usize,
-    /// Exact edge tables referenced by edge slots.
+    /// Exact range tables referenced by edge slots.
     pub edge_tables: usize,
 }
 
@@ -521,7 +564,7 @@ struct ResolvedRoute {
     remaining: u64,
 }
 
-/// Runtime access errors for explicitly taking a device out of the decoder.
+/// Reports an invalid device-slot ownership operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceSlotError {
     /// The registry contains no such identity.
@@ -552,7 +595,7 @@ impl fmt::Display for DeviceSlotError {
 
 impl Error for DeviceSlotError {}
 
-/// Errors produced while dispatching a scheduled event through the decoder.
+/// Reports a failure to dispatch a scheduled device event.
 #[derive(Debug)]
 pub enum DeviceDispatchError {
     /// The destination cannot be taken from the device registry.
@@ -579,7 +622,16 @@ impl Error for DeviceDispatchError {
     }
 }
 
-/// Compiled exact physical decoder and its registered devices.
+/// Owns registered devices and dispatches an exact compiled physical map.
+///
+/// Every fixed-width transaction must fit entirely within one declared mapping.
+/// Block transfers may cross adjacent mappings and are split in increasing address
+/// order, so a later fault can occur after earlier chunks have completed. A direct
+/// span is limited to the current mapping before the device receives the request.
+///
+/// Taking a device temporarily leaves its identity and routes intact. Transactions
+/// through any of its windows then return [`BusFault::Fault`] until the device is
+/// returned to the same slot.
 pub struct Decoder {
     config: AddressSpaceConfig,
     devices: Vec<Option<Box<dyn Device>>>,
@@ -589,7 +641,17 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Validates the complete graph and compiles its adaptive routing index.
+    /// Validates the complete registry and map, then compiles the routing index.
+    ///
+    /// Mappings are sorted by physical start before overlap validation. Their
+    /// original declaration order therefore does not affect runtime decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecoderBuildError::UnknownDevice`] for a mapping whose identity is
+    /// not registered, [`DecoderBuildError::AddressMap`] for overlapping physical
+    /// ranges, or the corresponding capacity error when a compiled `u32` index
+    /// space is exhausted.
     pub fn build(
         devices: DeviceRegistryBuilder,
         address_map: AddressMap,
@@ -655,7 +717,10 @@ impl Decoder {
         })
     }
 
-    /// Returns a physical bus port permanently bound to one initiator identity.
+    /// Borrows a physical bus port bound to one initiator identity.
+    ///
+    /// Every transaction issued through the returned port carries `initiator` to
+    /// the selected device.
     pub fn port(&mut self, initiator: BusInitiator) -> BusPort<'_> {
         BusPort {
             decoder: self,
@@ -676,6 +741,8 @@ impl Decoder {
     }
 
     /// Returns immutable access to a device that is currently present.
+    ///
+    /// Returns `None` when `id` is unknown or its device has been taken.
     #[must_use]
     pub fn device(&self, id: DeviceId) -> Option<&(dyn Device + '_)> {
         match self.devices.get(id.get() as usize) {
@@ -685,6 +752,8 @@ impl Decoder {
     }
 
     /// Returns mutable access to a device that is currently present.
+    ///
+    /// Returns `None` when `id` is unknown or its device has been taken.
     pub fn device_mut(&mut self, id: DeviceId) -> Option<&mut (dyn Device + '_)> {
         match self.devices.get_mut(id.get() as usize) {
             Some(Some(device)) => Some(device.as_mut()),
@@ -692,7 +761,16 @@ impl Decoder {
         }
     }
 
-    /// Temporarily removes a device so its callback can borrow the decoder bus.
+    /// Temporarily removes a device while retaining its identity and routes.
+    ///
+    /// Until [`Self::put_device`] returns it, transactions through all of its
+    /// windows fail with [`BusFault::Fault`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceSlotError::UnknownDevice`] when `id` is outside the
+    /// registry, or [`DeviceSlotError::DeviceTaken`] when its slot is already
+    /// empty.
     pub fn take_device(&mut self, id: DeviceId) -> Result<Box<dyn Device>, DeviceSlotError> {
         let slot = self
             .devices
@@ -702,6 +780,13 @@ impl Decoder {
     }
 
     /// Returns a temporarily removed device to its exact registry slot.
+    ///
+    /// On failure, the error tuple returns ownership of `device` to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceSlotError::UnknownDevice`] when `id` is outside the
+    /// registry, or [`DeviceSlotError::DevicePresent`] when the slot is occupied.
     pub fn put_device(
         &mut self,
         id: DeviceId,
@@ -718,6 +803,17 @@ impl Decoder {
     }
 
     /// Dispatches one event while keeping every window of its target faulted.
+    ///
+    /// The callback receives the scheduler's current time, a scheduling handle
+    /// bound to the destination identity, and a bus port whose initiator is that
+    /// device. The target is returned to its slot even when the callback reports an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceDispatchError::Slot`] if the target identity cannot be
+    /// taken, or [`DeviceDispatchError::Device`] if [`Device::on_event`] rejects
+    /// the callback.
     pub fn dispatch_event(
         &mut self,
         event: ScheduledEvent,
@@ -739,7 +835,7 @@ impl Decoder {
         result.map_err(DeviceDispatchError::Device)
     }
 
-    /// Returns statistics describing the selected compiled representations.
+    /// Returns counts describing the selected compiled representations.
     #[must_use]
     pub fn layout_stats(&self) -> DecoderLayoutStats {
         let mut stats = self.banks.stats();
@@ -1071,7 +1167,10 @@ fn compile_edge(
     Ok(SlotEntry::Edge(table_id))
 }
 
-/// A mutable physical bus view bound to one CPU or DMA initiator.
+/// Provides mutable physical-bus access for one CPU or DMA initiator.
+///
+/// The binding lasts for the port's borrow of its [`Decoder`], and every
+/// transaction forwards the same [`BusInitiator`] to the addressed device.
 pub struct BusPort<'a> {
     decoder: &'a mut Decoder,
     initiator: BusInitiator,

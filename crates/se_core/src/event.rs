@@ -1,4 +1,13 @@
-//! Deterministic virtual-time event scheduling.
+//! Provides deterministic virtual-time event scheduling.
+//!
+//! [`EventQueue`] orders events by virtual time and insertion sequence, so events
+//! with the same deadline are delivered in strict FIFO order. [`ScheduleToken`]
+//! combines a slab index with a generation to prevent stale cancellation after a
+//! slot is reused.
+//!
+//! [`SchedulerShared`] adds device-bound handles and scoped CPU-burst
+//! truncation. Scheduling an event before the active burst deadline requests an
+//! event-truncate exit through that burst's [`InterruptWord`].
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
@@ -14,20 +23,24 @@ use crate::interrupt::InterruptWord;
 use crate::save::{SNAPSHOT_VERSION, Saveable, StateError, StateReader, StateWriter};
 use crate::time::{NO_DEADLINE, VTime};
 
-/// A serializable event delivered to a device at a virtual time.
+/// Describes one deterministic event awaiting delivery to a device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScheduledEvent {
     /// Delivery time in virtual nanoseconds.
     pub vtime: VTime,
     /// Runtime identity of the destination device.
     pub device: DeviceId,
-    /// Device-defined event selector.
+    /// Device-defined event selector interpreted by the destination.
     pub tag: u32,
-    /// Device-defined deterministic scalar payload.
+    /// Device-defined scalar payload whose interpretation is selected by [`Self::tag`].
     pub payload: u64,
 }
 
-/// Stable identity of one scheduled event slot and generation.
+/// Identifies one live generation of an event-queue slot.
+///
+/// A token remains useful only while that generation is live. Cancellation or
+/// delivery advances the slot generation, causing stale tokens to stop matching
+/// even if the slot is later reused.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ScheduleToken {
     slot: u32,
@@ -35,7 +48,11 @@ pub struct ScheduleToken {
 }
 
 impl ScheduleToken {
-    /// Reconstructs a token from its snapshot-safe raw representation.
+    /// Decodes a token from its snapshot-safe raw representation.
+    ///
+    /// The low 32 bits contain the slot and the high 32 bits contain the
+    /// generation. Decoding does not establish that the token names a live event;
+    /// use [`EventQueue::is_scheduled`] for that check.
     #[must_use]
     pub const fn from_raw(raw: u64) -> Self {
         Self {
@@ -44,7 +61,10 @@ impl ScheduleToken {
         }
     }
 
-    /// Returns the snapshot-safe raw representation.
+    /// Encodes the token as a snapshot-safe raw representation.
+    ///
+    /// The low 32 bits contain the slot and the high 32 bits contain the
+    /// generation.
     #[must_use]
     pub const fn to_raw(self) -> u64 {
         ((self.generation as u64) << 32) | self.slot as u64
@@ -85,6 +105,8 @@ struct HeapEntry {
 
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is max-first, so reverse every key to expose the minimum
+        // deterministic (virtual time, sequence, slot, generation) entry.
         other
             .vtime
             .cmp(&self.vtime)
@@ -100,7 +122,7 @@ impl PartialOrd for HeapEntry {
     }
 }
 
-/// Errors produced by deterministic event scheduling.
+/// Reports a rejected event-queue operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventQueueError {
     /// Virtual time cannot move backwards.
@@ -150,7 +172,15 @@ impl fmt::Display for EventQueueError {
 
 impl Error for EventQueueError {}
 
-/// Deterministic event storage using stable slab tokens and a FIFO time heap.
+/// Stores events in deterministic deadline and insertion order.
+///
+/// Events are delivered in ascending `(vtime, sequence)` order. Cancellation is
+/// lazy in the heap but immediate in the slab, and the token generation prevents
+/// a cancelled token from affecting a later occupant of the same slot.
+///
+/// Snapshot state preserves insertion sequences, slot generations, and free-slot
+/// order. Restoration rebuilds the derived heap without changing delivery order
+/// or the validity of live tokens.
 #[derive(Debug)]
 pub struct EventQueue {
     now: VTime,
@@ -180,6 +210,11 @@ impl EventQueue {
     }
 
     /// Advances the queue's current virtual time monotonically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventQueueError::TimeReversal`] without modifying the queue when
+    /// `now` precedes the current virtual time.
     pub fn advance_to(&mut self, now: VTime) -> Result<(), EventQueueError> {
         if now < self.now {
             return Err(EventQueueError::TimeReversal {
@@ -191,9 +226,17 @@ impl EventQueue {
         Ok(())
     }
 
-    /// Schedules an event and returns its stable cancellation token.
+    /// Schedules an event and returns its cancellation token.
     ///
-    /// An event earlier than [`Self::now`] is rejected without modifying the queue.
+    /// Events assigned the same virtual time are delivered in call order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventQueueError::PastEvent`] when the deadline precedes
+    /// [`Self::now`], [`EventQueueError::SequenceExhausted`] when another FIFO
+    /// sequence cannot be represented, or [`EventQueueError::SlotExhausted`] when
+    /// another slab index cannot be represented. Rejection leaves the queue
+    /// unchanged.
     pub fn schedule(&mut self, event: ScheduledEvent) -> Result<ScheduleToken, EventQueueError> {
         if event.vtime < self.now {
             return Err(EventQueueError::PastEvent {
@@ -237,7 +280,16 @@ impl EventQueue {
         Ok(token)
     }
 
-    /// Cancels an event when the token still names its live generation.
+    /// Cancels the event named by a live token.
+    ///
+    /// Returns `false` without modifying the queue when the token is out of range,
+    /// stale, or already inactive. A successful cancellation invalidates the
+    /// token before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventQueueError::GenerationExhausted`] if the named live slot's
+    /// generation cannot be advanced.
     pub fn cancel(&mut self, token: ScheduleToken) -> Result<bool, EventQueueError> {
         let Some(slot) = self.slots.get_mut(token.slot as usize) else {
             return Ok(false);
@@ -263,7 +315,16 @@ impl EventQueue {
         self.heap.peek().map(|entry| entry.vtime)
     }
 
-    /// Pops the earliest event when it is due at the queue's current time.
+    /// Removes and returns the earliest event due at the current virtual time.
+    ///
+    /// Returns `None` when the queue has no live event whose deadline is at or
+    /// before [`Self::now`]. A returned event's token is invalidated before this
+    /// method returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventQueueError::GenerationExhausted`] if the due event's slot
+    /// generation cannot be advanced.
     pub fn pop_due(&mut self) -> Result<Option<ScheduledEvent>, EventQueueError> {
         self.prune_top();
         let Some(entry) = self.heap.peek().copied() else {
@@ -306,7 +367,12 @@ impl EventQueue {
         self.len() == 0
     }
 
-    /// Validates that every live event targets a registered device.
+    /// Validates that every live event targets a registered device index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::InvalidState`] when an event's raw device index is
+    /// greater than or equal to `device_count`.
     pub fn validate_device_ids(&self, device_count: u32) -> Result<(), StateError> {
         if let Some(device) = self
             .slots
@@ -505,7 +571,12 @@ struct SchedulerInner {
     truncate_target: RefCell<Option<InterruptWord>>,
 }
 
-/// Shared single-thread scheduler state used by machine components.
+/// Shares one single-threaded event queue among machine components.
+///
+/// Clones refer to the same queue and active burst state. `Rc` ownership makes the
+/// scheduler neither `Send` nor `Sync`; every clone remains on one host thread.
+/// Snapshot operations persist the queue, while an active burst deadline and its
+/// truncation target are transient runtime state.
 #[derive(Clone)]
 pub struct SchedulerShared {
     inner: Rc<SchedulerInner>,
@@ -518,7 +589,7 @@ impl SchedulerShared {
         Self::from_queue(EventQueue::new())
     }
 
-    /// Creates a scheduler around an existing queue.
+    /// Takes ownership of an existing event queue and creates shared scheduler state.
     #[must_use]
     pub fn from_queue(queue: EventQueue) -> Self {
         Self {
@@ -546,6 +617,10 @@ impl SchedulerShared {
     }
 
     /// Advances virtual time monotonically.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by [`EventQueue::advance_to`].
     pub fn advance_to(&self, now: VTime) -> Result<(), EventQueueError> {
         self.inner.queue.borrow_mut().advance_to(now)
     }
@@ -555,12 +630,27 @@ impl SchedulerShared {
         self.inner.queue.borrow_mut().front_time()
     }
 
-    /// Pops the earliest due event.
+    /// Removes and returns the earliest due event.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by [`EventQueue::pop_due`].
     pub fn pop_due(&self) -> Result<Option<ScheduledEvent>, EventQueueError> {
         self.inner.queue.borrow_mut().pop_due()
     }
 
-    /// Begins a CPU burst with an explicit per-CPU truncation target.
+    /// Begins a CPU burst with its deadline and truncation target.
+    ///
+    /// Entry clears any stale event-truncate request on `truncate_target`.
+    /// Keeping the returned [`BurstScope`] alive marks the burst as active;
+    /// dropping it clears the request and removes the active deadline.
+    /// [`NO_DEADLINE`] represents a burst with no finite deadline, which is still
+    /// truncated by every newly scheduled finite event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BurstScopeError::AlreadyActive`] if another burst scope is active
+    /// on this shared scheduler.
     pub fn begin_burst(
         &self,
         deadline: VTime,
@@ -577,7 +667,11 @@ impl SchedulerShared {
         })
     }
 
-    /// Validates all event destination identities.
+    /// Validates all event destination identities against a device count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by [`EventQueue::validate_device_ids`].
     pub fn validate_device_ids(&self, device_count: u32) -> Result<(), StateError> {
         self.inner.queue.borrow().validate_device_ids(device_count)
     }
@@ -603,7 +697,7 @@ impl Saveable for SchedulerShared {
     }
 }
 
-/// Errors produced while opening a CPU burst scope.
+/// Reports a rejected CPU-burst scope operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BurstScopeError {
     /// Only one CPU burst may be active on a scheduler at a time.
@@ -620,7 +714,10 @@ impl fmt::Display for BurstScopeError {
 
 impl Error for BurstScopeError {}
 
-/// RAII scope for one CPU burst's deadline and truncation target.
+/// Keeps one CPU burst's deadline and truncation target active.
+///
+/// Dropping the scope clears the target's event-truncate request and restores the
+/// scheduler to its no-active-burst state.
 pub struct BurstScope {
     inner: Rc<SchedulerInner>,
 }
@@ -634,7 +731,7 @@ impl Drop for BurstScope {
     }
 }
 
-/// Scheduling access bound to one destination device identity.
+/// Schedules events for one bound destination device identity.
 #[derive(Clone)]
 pub struct SchedulerHandle {
     shared: SchedulerShared,
@@ -656,7 +753,15 @@ impl SchedulerHandle {
 
     /// Schedules an event at an absolute virtual time.
     ///
-    /// A time earlier than the scheduler's current time is rejected.
+    /// If a burst is active and `vtime` precedes its deadline, successful insertion
+    /// requests event truncation on that burst's target. An event exactly at the
+    /// deadline does not request truncation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by [`EventQueue::schedule`]. In particular, a
+    /// time earlier than the scheduler's current time is rejected without
+    /// requesting truncation.
     pub fn schedule_at(
         &self,
         vtime: VTime,
@@ -684,6 +789,11 @@ impl SchedulerHandle {
     }
 
     /// Schedules an event relative to the current virtual time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventQueueError::DeadlineOverflow`] when the current time plus
+    /// `delay` is not representable, or an error reported by [`Self::schedule_at`].
     pub fn schedule_after(
         &self,
         delay: VTime,
@@ -697,7 +807,13 @@ impl SchedulerHandle {
         self.schedule_at(deadline, tag, payload)
     }
 
-    /// Cancels an event previously scheduled through any handle.
+    /// Cancels an event previously scheduled through any scheduler handle.
+    ///
+    /// Returns `false` when `token` no longer names a live event.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by [`EventQueue::cancel`].
     pub fn cancel(&self, token: ScheduleToken) -> Result<bool, EventQueueError> {
         self.shared.inner.queue.borrow_mut().cancel(token)
     }
