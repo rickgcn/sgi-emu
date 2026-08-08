@@ -1,4 +1,9 @@
-//! Device identity and device-facing core interfaces.
+//! Defines registered device identity and device-facing services.
+//!
+//! [`Device`] combines MMIO, snapshot, introspection, reset, and scheduled-event
+//! behavior. During an event callback, [`DeviceCtx`] supplies a physical bus
+//! whose initiator is that device and a [`SchedulerHandle`] whose destination is
+//! the same device identity.
 
 use std::any::Any;
 use std::error::Error;
@@ -10,26 +15,29 @@ use crate::inspect::Introspect;
 use crate::save::Saveable;
 use crate::time::VTime;
 
-/// Stable runtime identity assigned in device registration order.
+/// Identifies a registered device by its registration-order value.
+///
+/// The value remains stable for the lifetime and snapshots of one machine
+/// profile. It is not a snapshot component key.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeviceId(u32);
 
 impl DeviceId {
-    /// Creates an identity from its stable raw value.
+    /// Creates a device identity from its profile-defined raw value.
     #[must_use]
     pub const fn from_raw(value: u32) -> Self {
         Self(value)
     }
 
-    /// Returns the stable raw value.
+    /// Returns the profile-defined raw value.
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0
     }
 }
 
-/// Runtime downcasting support inherited by every concrete device.
+/// Provides object-safe access to a concrete device's [`Any`] identity.
 pub trait AsAny {
     /// Returns this value as an immutable dynamic `Any` reference.
     fn as_any(&self) -> &dyn Any;
@@ -48,17 +56,17 @@ impl<T: Any> AsAny for T {
     }
 }
 
-/// Services available while a device handles a scheduled event.
+/// Provides machine services during a scheduled device event.
 pub struct DeviceCtx<'a> {
-    /// Current machine virtual time.
+    /// Machine virtual time at which the event is dispatched.
     pub now: VTime,
-    /// Physical bus port bound to this device as the transaction initiator.
+    /// Physical bus access bound to this device as the transaction initiator.
     pub bus: &'a mut dyn Bus,
-    /// Scheduler handle bound to this device as the event destination.
+    /// Scheduler access bound to this device as the event destination.
     pub sched: &'a SchedulerHandle,
 }
 
-/// Errors produced by a device event callback.
+/// Reports a device event callback failure.
 #[derive(Debug)]
 pub enum DeviceError {
     /// A DMA bus transaction failed.
@@ -101,12 +109,23 @@ impl From<EventQueueError> for DeviceError {
     }
 }
 
-/// Complete behavior required from a registered machine device.
+/// Defines the complete object-safe behavior of a registered device.
 pub trait Device: MmioDevice + Saveable + Introspect + AsAny {
-    /// Resets the device, preserving state only when defined for a soft reset.
+    /// Resets the device according to its hard- or soft-reset contract.
+    ///
+    /// `soft == true` requests a soft reset and `false` requests a hard reset. The
+    /// concrete device defines which state, if any, each operation preserves.
     fn reset(&mut self, soft: bool);
 
-    /// Delivers a deterministic scheduled event.
+    /// Delivers a scheduled event at the context's virtual time.
+    ///
+    /// An error does not roll back state or bus effects already produced by the
+    /// callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceError`] when DMA, event scheduling, or a device invariant
+    /// prevents the callback from completing.
     fn on_event(
         &mut self,
         tag: u32,

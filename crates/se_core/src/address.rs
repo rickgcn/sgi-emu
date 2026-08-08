@@ -1,9 +1,17 @@
-//! Machine-independent physical and device-local address types.
+//! Separates machine physical addresses from device-local addresses.
+//!
+//! [`PhysRange`] represents non-empty half-open physical ranges with checked
+//! endpoints. [`AddressSpaceConfig`] constrains those ranges to a profile-defined
+//! width of 1 through 63 bits; complete 64-bit physical spaces are not
+//! representable by the module's `u64` exclusive endpoints.
 
 use std::error::Error;
 use std::fmt;
 
 /// A physical address issued by a CPU or DMA-capable device.
+///
+/// Construction accepts every `u64`; an [`AddressSpaceConfig`] determines whether
+/// the address is implemented by a machine profile.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PhysAddr(u64);
@@ -21,7 +29,7 @@ impl PhysAddr {
         self.0
     }
 
-    /// Adds an offset without wrapping.
+    /// Adds a byte offset, returning `None` if the raw address would overflow.
     #[must_use]
     pub const fn checked_add(self, offset: u64) -> Option<Self> {
         match self.0.checked_add(offset) {
@@ -43,7 +51,9 @@ impl From<PhysAddr> for u64 {
     }
 }
 
-/// An address in a device's private local address space.
+/// Identifies a byte in a device's private local address space.
+///
+/// The value is independent of the machine's physical address width.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeviceAddr(u64);
@@ -61,7 +71,7 @@ impl DeviceAddr {
         self.0
     }
 
-    /// Adds an offset without wrapping.
+    /// Adds a byte offset, returning `None` if the raw address would overflow.
     #[must_use]
     pub const fn checked_add(self, offset: u64) -> Option<Self> {
         match self.0.checked_add(offset) {
@@ -83,7 +93,7 @@ impl From<DeviceAddr> for u64 {
     }
 }
 
-/// Errors produced while constructing a physical range.
+/// Reports an invalid physical range construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PhysRangeError {
     /// A mapping cannot contain zero bytes.
@@ -111,7 +121,13 @@ pub struct PhysRange {
 }
 
 impl PhysRange {
-    /// Creates a range from a start address and byte length.
+    /// Creates a non-empty half-open range from a start address and byte length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhysRangeError::ZeroLength`] when `len` is zero and
+    /// [`PhysRangeError::EndOverflow`] when `start + len` cannot be represented
+    /// as a `u64` exclusive endpoint.
     pub fn from_start_len(start: PhysAddr, len: u64) -> Result<Self, PhysRangeError> {
         if len == 0 {
             return Err(PhysRangeError::ZeroLength);
@@ -144,7 +160,7 @@ impl PhysRange {
         self.end_exclusive - self.start.get()
     }
 
-    /// Returns whether the range is empty.
+    /// Returns `false`; construction guarantees that every range is non-empty.
     #[must_use]
     pub const fn is_empty(self) -> bool {
         false
@@ -156,7 +172,9 @@ impl PhysRange {
         addr.get() >= self.start.get() && addr.get() < self.end_exclusive
     }
 
-    /// Returns whether the complete non-empty byte span belongs to the range.
+    /// Returns whether a complete non-empty byte span belongs to the range.
+    ///
+    /// A zero length or an overflowing `addr + len` returns `false`.
     #[must_use]
     pub fn contains_span(self, addr: PhysAddr, len: u64) -> bool {
         if len == 0 || addr.get() < self.start.get() {
@@ -168,7 +186,10 @@ impl PhysRange {
     }
 }
 
-/// Physical address geometry selected by a machine profile.
+/// Describes the implemented physical address width of a machine profile.
+///
+/// Supported widths are 1 through 63 bits. Query methods treat every other
+/// width as unsupported rather than as a complete `u64` address space.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AddressSpaceConfig {
     /// Number of implemented physical address bits.
@@ -176,7 +197,9 @@ pub struct AddressSpaceConfig {
 }
 
 impl AddressSpaceConfig {
-    /// Returns whether a raw address is implemented by this configuration.
+    /// Returns whether an address is implemented by this configuration.
+    ///
+    /// Returns `false` when [`Self::physical_address_bits`] is outside `1..=63`.
     #[must_use]
     pub const fn contains(self, addr: PhysAddr) -> bool {
         match self.physical_address_bits {
@@ -186,6 +209,8 @@ impl AddressSpaceConfig {
     }
 
     /// Returns whether a physical range fits completely in this configuration.
+    ///
+    /// Returns `false` when [`Self::physical_address_bits`] is outside `1..=63`.
     #[must_use]
     pub const fn contains_range(self, range: PhysRange) -> bool {
         match self.physical_address_bits {
@@ -194,7 +219,9 @@ impl AddressSpaceConfig {
         }
     }
 
-    /// Returns the exclusive address-space limit for a supported geometry.
+    /// Returns the exclusive address-space limit.
+    ///
+    /// Returns `None` when [`Self::physical_address_bits`] is outside `1..=63`.
     #[must_use]
     pub const fn upper_bound_exclusive(self) -> Option<u64> {
         match self.physical_address_bits {

@@ -1,4 +1,10 @@
-//! Per-CPU interrupt delivery primitives.
+//! Provides per-CPU interrupt delivery and burst-truncation bits.
+//!
+//! Each [`InterruptWord`] contains guest interrupt lines in bits 0 through 62
+//! and [`EVENT_TRUNCATE`] in bit 63. Clones share one atomic word. Relaxed atomic
+//! operations make bit updates race-free but do not synchronize any other
+//! machine state; deterministic scheduling and ownership establish that state's
+//! ordering separately.
 
 use std::error::Error;
 use std::fmt;
@@ -11,7 +17,9 @@ pub const EVENT_TRUNCATE: u64 = 1_u64 << 63;
 /// Mask containing every guest-visible interrupt-line bit.
 pub const GUEST_INTERRUPT_MASK: u64 = EVENT_TRUNCATE - 1;
 
-/// A cheaply polled interrupt word owned by one guest CPU.
+/// Holds the interrupt and burst-truncation bits observed by one guest CPU.
+///
+/// Cloning this value creates another handle to the same atomic bitset.
 #[derive(Clone, Debug)]
 pub struct InterruptWord {
     bits: Arc<AtomicU64>,
@@ -26,20 +34,22 @@ impl InterruptWord {
         }
     }
 
-    /// Performs the CPU hot-path relaxed load.
+    /// Loads all interrupt bits with relaxed ordering.
+    ///
+    /// This operation observes only the bitset and does not acquire other state.
     #[inline]
     #[must_use]
     pub fn load_relaxed(&self) -> u64 {
         self.bits.load(Ordering::Relaxed)
     }
 
-    /// Atomically sets every bit in a mask.
+    /// Atomically sets every bit in `mask` with relaxed ordering.
     #[inline]
     pub fn set_mask(&self, mask: u64) {
         self.bits.fetch_or(mask, Ordering::Relaxed);
     }
 
-    /// Atomically clears every bit in a mask.
+    /// Atomically clears every bit in `mask` with relaxed ordering.
     #[inline]
     pub fn clear_mask(&self, mask: u64) {
         self.bits.fetch_and(!mask, Ordering::Relaxed);
@@ -64,13 +74,13 @@ impl Default for InterruptWord {
     }
 }
 
-/// A level-sensitive interrupt input held by a device.
+/// Accepts the asserted level of an interrupt input.
 pub trait InterruptSink {
     /// Drives the connected line high or low.
     fn set(&self, level: bool);
 }
 
-/// Errors produced while connecting a direct interrupt line.
+/// Reports an invalid direct interrupt-line connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InterruptLineError {
     /// Guest interrupt lines are limited to bits 0 through 62.
@@ -96,6 +106,11 @@ pub struct WordLineSink {
 
 impl WordLineSink {
     /// Connects a guest interrupt line to a CPU interrupt word.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InterruptLineError::InvalidLine`] when `line` is greater than
+    /// 62; bit 63 is reserved for [`EVENT_TRUNCATE`].
     pub fn new(word: InterruptWord, line: u8) -> Result<Self, InterruptLineError> {
         if line > 62 {
             return Err(InterruptLineError::InvalidLine(line));
