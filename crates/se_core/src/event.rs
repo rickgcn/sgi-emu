@@ -8,6 +8,8 @@
 //! [`SchedulerShared`] adds device-bound handles and scoped CPU-burst
 //! truncation. Scheduling an event before the active burst deadline requests an
 //! event-truncate exit through that burst's [`InterruptWord`].
+//! Queue advancement cannot pass a live event, and snapshot restoration rejects
+//! states whose live events precede the saved virtual time.
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
@@ -22,6 +24,8 @@ use crate::device::DeviceId;
 use crate::interrupt::InterruptWord;
 use crate::save::{SNAPSHOT_VERSION, Saveable, StateError, StateReader, StateWriter};
 use crate::time::{NO_DEADLINE, VTime};
+
+const MAX_EVENT_SLOTS: usize = u32::MAX as usize;
 
 /// Describes one deterministic event awaiting delivery to a device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,9 +143,16 @@ pub enum EventQueueError {
         /// Rejected event time.
         requested: VTime,
     },
+    /// Virtual time cannot advance past an event awaiting delivery.
+    PendingEvent {
+        /// Earliest event deadline that must be delivered first.
+        deadline: VTime,
+        /// Rejected later time.
+        requested: VTime,
+    },
     /// The stable FIFO sequence counter is exhausted.
     SequenceExhausted,
-    /// The slab cannot represent another slot with a `u32` index.
+    /// The slab has reached its maximum supported count of `u32::MAX` slots.
     SlotExhausted,
     /// A slot generation cannot be advanced without wrapping.
     GenerationExhausted(u32),
@@ -160,8 +171,15 @@ impl fmt::Display for EventQueueError {
                 formatter,
                 "event time {requested} precedes current virtual time {current}"
             ),
+            Self::PendingEvent {
+                deadline,
+                requested,
+            } => write!(
+                formatter,
+                "virtual time cannot advance to {requested} before delivering event at {deadline}"
+            ),
             Self::SequenceExhausted => formatter.write_str("event FIFO sequence is exhausted"),
-            Self::SlotExhausted => formatter.write_str("event slab slot index is exhausted"),
+            Self::SlotExhausted => formatter.write_str("event slab capacity is exhausted"),
             Self::GenerationExhausted(slot) => {
                 write!(formatter, "event slot {slot} generation is exhausted")
             }
@@ -180,7 +198,9 @@ impl Error for EventQueueError {}
 ///
 /// Snapshot state preserves insertion sequences, slot generations, and free-slot
 /// order. Restoration rebuilds the derived heap without changing delivery order
-/// or the validity of live tokens.
+/// or the validity of live tokens. Every live event remains at or after the
+/// current time in both running and restored queues. The next insertion sequence
+/// always equals the aggregate schedule count encoded by all slot lifecycles.
 #[derive(Debug)]
 pub struct EventQueue {
     now: VTime,
@@ -209,16 +229,26 @@ impl EventQueue {
         self.now
     }
 
-    /// Advances the queue's current virtual time monotonically.
+    /// Advances the queue's current virtual time without crossing a live event.
     ///
     /// # Errors
     ///
     /// Returns [`EventQueueError::TimeReversal`] without modifying the queue when
-    /// `now` precedes the current virtual time.
+    /// `now` precedes the current virtual time. Returns
+    /// [`EventQueueError::PendingEvent`] without changing observable queue state
+    /// when the earliest live event precedes `now` and must be delivered first.
     pub fn advance_to(&mut self, now: VTime) -> Result<(), EventQueueError> {
         if now < self.now {
             return Err(EventQueueError::TimeReversal {
                 current: self.now,
+                requested: now,
+            });
+        }
+        if let Some(deadline) = self.front_time()
+            && deadline < now
+        {
+            return Err(EventQueueError::PendingEvent {
+                deadline,
                 requested: now,
             });
         }
@@ -235,7 +265,7 @@ impl EventQueue {
     /// Returns [`EventQueueError::PastEvent`] when the deadline precedes
     /// [`Self::now`], [`EventQueueError::SequenceExhausted`] when another FIFO
     /// sequence cannot be represented, or [`EventQueueError::SlotExhausted`] when
-    /// another slab index cannot be represented. Rejection leaves the queue
+    /// the slab already contains `u32::MAX` slots. Rejection leaves the queue
     /// unchanged.
     pub fn schedule(&mut self, event: ScheduledEvent) -> Result<ScheduleToken, EventQueueError> {
         if event.vtime < self.now {
@@ -255,8 +285,7 @@ impl EventQueue {
             debug_assert_ne!(self.slots[slot_index as usize].generation, u32::MAX);
             slot_index
         } else {
-            let slot =
-                u32::try_from(self.slots.len()).map_err(|_| EventQueueError::SlotExhausted)?;
+            let slot = new_slot_index(self.slots.len())?;
             self.slots.push(Slot {
                 generation: 0,
                 live: None,
@@ -309,17 +338,19 @@ impl EventQueue {
         Ok(true)
     }
 
-    /// Returns the earliest live event time, pruning cancelled heap entries.
+    /// Returns the earliest live event time at or after the current time.
+    ///
+    /// Cancelled heap entries are pruned before the deadline is returned.
     pub fn front_time(&mut self) -> Option<VTime> {
         self.prune_top();
         self.heap.peek().map(|entry| entry.vtime)
     }
 
-    /// Removes and returns the earliest event due at the current virtual time.
+    /// Removes and returns the earliest event at the current virtual time.
     ///
-    /// Returns `None` when the queue has no live event whose deadline is at or
-    /// before [`Self::now`]. A returned event's token is invalidated before this
-    /// method returns.
+    /// Returns `None` when the queue has no live event whose deadline equals
+    /// [`Self::now`]. A returned event's token is invalidated before this method
+    /// returns.
     ///
     /// # Errors
     ///
@@ -400,9 +431,9 @@ impl EventQueue {
     }
 
     fn from_state(state: EventQueueState) -> Result<Self, StateError> {
-        if state.slots.len() > u32::MAX as usize {
+        if state.slots.len() > MAX_EVENT_SLOTS {
             return Err(StateError::InvalidState(
-                "event slab exceeds u32 slot space".to_owned(),
+                "event slab exceeds maximum slot count".to_owned(),
             ));
         }
 
@@ -421,6 +452,7 @@ impl EventQueue {
         }
 
         let mut sequence_set = BTreeSet::new();
+        let mut lifecycle_schedule_count = 0_u64;
         let mut slots = Vec::with_capacity(state.slots.len());
         let mut heap = BinaryHeap::new();
         for (expected_index, saved) in state.slots.into_iter().enumerate() {
@@ -436,6 +468,25 @@ impl EventQueue {
                     saved.index
                 )));
             }
+            if let Some(entry) = &saved.live
+                && entry.vtime < state.now
+            {
+                return Err(StateError::InvalidState(format!(
+                    "live event slot {} at time {} precedes queue time {}",
+                    saved.index, entry.vtime, state.now
+                )));
+            }
+            // Every successful schedule contributes either one live occupancy or
+            // one completed generation to exactly one slot.
+            let slot_schedule_count =
+                u64::from(saved.generation) + u64::from(u8::from(saved.live.is_some()));
+            lifecycle_schedule_count = lifecycle_schedule_count
+                .checked_add(slot_schedule_count)
+                .ok_or_else(|| {
+                    StateError::InvalidState(
+                        "event lifecycle schedule count overflows u64".to_owned(),
+                    )
+                })?;
             let live = saved.live.map(|entry| {
                 let event = ScheduledEvent {
                     vtime: entry.vtime,
@@ -481,6 +532,13 @@ impl EventQueue {
             });
         }
 
+        if lifecycle_schedule_count != state.next_seq {
+            return Err(StateError::InvalidState(format!(
+                "event next sequence {} does not match lifecycle schedule count {}",
+                state.next_seq, lifecycle_schedule_count
+            )));
+        }
+
         Ok(Self {
             now: state.now,
             next_seq: state.next_seq,
@@ -489,6 +547,13 @@ impl EventQueue {
             heap,
         })
     }
+}
+
+fn new_slot_index(slot_count: usize) -> Result<u32, EventQueueError> {
+    if slot_count >= MAX_EVENT_SLOTS {
+        return Err(EventQueueError::SlotExhausted);
+    }
+    u32::try_from(slot_count).map_err(|_| EventQueueError::SlotExhausted)
 }
 
 impl Default for EventQueue {
@@ -616,7 +681,7 @@ impl SchedulerShared {
         self.inner.queue.borrow().now()
     }
 
-    /// Advances virtual time monotonically.
+    /// Advances virtual time without crossing a live event.
     ///
     /// # Errors
     ///
@@ -836,7 +901,7 @@ mod tests {
 
     use super::{
         DeviceId, EventQueue, EventQueueError, EventQueueState, LiveEventState, ScheduledEvent,
-        SchedulerShared, SlotState,
+        SchedulerShared, SlotState, new_slot_index,
     };
     use crate::interrupt::{EVENT_TRUNCATE, InterruptWord};
     use crate::time::NO_DEADLINE;
@@ -881,6 +946,15 @@ mod tests {
         assert_eq!(reused.slot(), cancelled.slot());
         assert_ne!(reused.generation(), cancelled.generation());
         assert_eq!(queue.front_time(), Some(1));
+    }
+
+    #[test]
+    fn new_slot_index_preserves_snapshot_compatible_capacity() {
+        assert_eq!(new_slot_index((u32::MAX - 1) as usize), Ok(u32::MAX - 1));
+        assert_eq!(
+            new_slot_index(u32::MAX as usize),
+            Err(EventQueueError::SlotExhausted)
+        );
     }
 
     #[test]
@@ -946,19 +1020,95 @@ mod tests {
     }
 
     #[test]
+    fn queue_restore_rejects_past_live_event_atomically() {
+        let mut queue = EventQueue::new();
+        let original_token = queue.schedule(event(20, 0, 1)).unwrap();
+        let original_payload = save_queue(&queue);
+        let invalid_state = EventQueueState {
+            now: 10,
+            next_seq: 1,
+            slots: vec![SlotState {
+                index: 0,
+                generation: 0,
+                live: Some(LiveEventState {
+                    vtime: 9,
+                    device: 0,
+                    tag: 2,
+                    payload: 20,
+                    seq: 0,
+                }),
+            }],
+            free: Vec::new(),
+        };
+        let mut invalid_payload = Vec::new();
+        let mut writer = StateWriter::new(&mut invalid_payload);
+        writer.serialize(&invalid_state).unwrap();
+        writer.finish().unwrap();
+
+        let mut reader = StateReader::new(&invalid_payload);
+        assert!(matches!(
+            queue.load(SNAPSHOT_VERSION, &mut reader),
+            Err(StateError::InvalidState(reason))
+                if reason == "live event slot 0 at time 9 precedes queue time 10"
+        ));
+        reader.finish().unwrap();
+        assert_eq!(save_queue(&queue), original_payload);
+        assert!(queue.is_scheduled(original_token));
+    }
+
+    #[test]
+    fn queue_restore_rejects_sequence_lifecycle_mismatch_atomically() {
+        let mut queue = EventQueue::new();
+        let original_token = queue.schedule(event(20, 0, 1)).unwrap();
+        let original_payload = save_queue(&queue);
+        let invalid_state = EventQueueState {
+            now: 0,
+            next_seq: 500_000_000,
+            slots: vec![SlotState {
+                index: 0,
+                generation: 0,
+                live: Some(LiveEventState {
+                    vtime: 10,
+                    device: 0,
+                    tag: 2,
+                    payload: 20,
+                    seq: 0,
+                }),
+            }],
+            free: Vec::new(),
+        };
+        let mut invalid_payload = Vec::new();
+        let mut writer = StateWriter::new(&mut invalid_payload);
+        writer.serialize(&invalid_state).unwrap();
+        writer.finish().unwrap();
+
+        let mut reader = StateReader::new(&invalid_payload);
+        assert!(matches!(
+            queue.load(SNAPSHOT_VERSION, &mut reader),
+            Err(StateError::InvalidState(reason))
+                if reason
+                    == "event next sequence 500000000 does not match lifecycle schedule count 1"
+        ));
+        reader.finish().unwrap();
+        assert_eq!(save_queue(&queue), original_payload);
+        assert!(queue.is_scheduled(original_token));
+    }
+
+    #[test]
     fn exhausted_generations_retire_slots_and_round_trip() {
+        let generation = u32::MAX - 1;
         let mut queue = EventQueue::from_state(EventQueueState {
             now: 0,
-            next_seq: 0,
+            next_seq: u64::from(generation) * 2,
             slots: vec![
                 SlotState {
                     index: 0,
-                    generation: u32::MAX - 1,
+                    generation,
                     live: None,
                 },
                 SlotState {
                     index: 1,
-                    generation: u32::MAX - 1,
+                    generation,
                     live: None,
                 },
             ],
@@ -1056,6 +1206,31 @@ mod tests {
         assert_eq!(token.slot(), 0);
         assert_eq!(token.generation(), 0);
         assert_eq!(queue.front_time(), Some(10));
+    }
+
+    #[test]
+    fn queue_rejects_advancement_past_pending_event_without_mutation() {
+        let mut queue = EventQueue::new();
+        let token = queue.schedule(event(9, 0, 1)).unwrap();
+        let before = save_queue(&queue);
+
+        assert_eq!(
+            queue.advance_to(10),
+            Err(EventQueueError::PendingEvent {
+                deadline: 9,
+                requested: 10,
+            })
+        );
+        assert_eq!(save_queue(&queue), before);
+        assert!(queue.is_scheduled(token));
+
+        queue.advance_to(9).unwrap();
+        assert_eq!(queue.pop_due().unwrap(), Some(event(9, 0, 1)));
+
+        let cancelled = queue.schedule(event(10, 0, 2)).unwrap();
+        assert!(queue.cancel(cancelled).unwrap());
+        queue.advance_to(11).unwrap();
+        assert_eq!(queue.now(), 11);
     }
 
     #[test]
