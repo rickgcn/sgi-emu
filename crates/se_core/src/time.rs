@@ -2,6 +2,8 @@
 //!
 //! [`VTime`] is measured exclusively in nanoseconds. Host wall-clock time is not
 //! part of this representation and must not be written into guest-visible state.
+//! A machine can process an event between CPU instruction boundaries; advancing
+//! machine time to that event does not rebase a CPU's separately stored phase.
 
 /// Virtual time in nanoseconds.
 pub type VTime = u64;

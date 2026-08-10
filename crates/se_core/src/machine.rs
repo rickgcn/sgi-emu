@@ -132,6 +132,16 @@ pub trait Machine: SnapshotTarget + Introspect {
     /// an unbounded burst; a newly scheduled finite event can still truncate that
     /// burst through the active CPU's event-truncate target.
     ///
+    /// Machine time may stop at an event between CPU instruction boundaries.
+    /// Implementations preserve each CPU's absolute clock phase across such a
+    /// stop; resuming does not derive the next boundary from the current machine
+    /// time. Per-CPU phase and any fractional-rate remainder are guest-visible
+    /// state and therefore contribute to snapshots and state digests.
+    ///
+    /// CPU work timestamped exactly at a finite deadline completes before the
+    /// method returns [`CpuExit::Deadline`]. A runtime can then dispatch events at
+    /// that timestamp, preserving CPU-before-event ordering for equal times.
+    ///
     /// [`CpuExit::Deadline`] means the complex reached `deadline`. Other exit
     /// reasons may return earlier, and no successful call moves machine time beyond
     /// a finite deadline.
