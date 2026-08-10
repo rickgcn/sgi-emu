@@ -266,11 +266,12 @@ fn strict_warnings(build: &mut cc::Build, profile: CompilerProfile) {
 fn upstream_warnings(build: &mut cc::Build, profile: CompilerProfile) {
     strict_warnings(build, profile);
     match profile {
-        CompilerProfile::Gcc => {
+        CompilerProfile::Gcc | CompilerProfile::AppleClang => {
             build.flag("-Wno-unused-parameter");
-            build.flag("-Wno-unused-variable");
+            if matches!(profile, CompilerProfile::Gcc) {
+                build.flag("-Wno-unused-variable");
+            }
         }
-        CompilerProfile::AppleClang => {}
         CompilerProfile::Msvc => {
             build.flag("/wd4100");
             build.flag("/wd4101");
