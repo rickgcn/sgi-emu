@@ -36,10 +36,17 @@ pub struct SoftFloatBackend;
 
 /// Identifies the host-native backend whose value operations use Rust floats.
 ///
-/// Native operations use roundTiesToEven and do not report IEEE exception
-/// flags or [`env::RoundingFacts`]. Their NaN bit patterns follow the fixed
-/// Rust toolchain rather than the canonical SoftFloat result convention. The
-/// surrounding process must preserve Rust's default floating-point control
-/// environment across external calls.
+/// Semantics come from ordinary `f32` and `f64` primitives in the fixed Rust
+/// 1.95.0 toolchain. Floating-point results use roundTiesToEven and return the
+/// primitive's raw `to_bits` result. NaN results promise only the NaN category,
+/// not a stable sign, payload, or encoding. Floating-point-to-signed-integer
+/// conversions return `None` when no integer value exists. Native operations
+/// do not report IEEE exception flags or [`env::RoundingFacts`].
+///
+/// External C, C++, Qt, and plugin code must restore the default floating-point
+/// control state required by Rust before returning to Rust. This backend does
+/// not detect or repair a violation of that integration contract. Its
+/// availability does not make it a substitute for [`SoftFloatBackend`] when
+/// deterministic values, selectable rounding, flags, or facts are required.
 #[derive(Debug, Default)]
 pub struct NativeBackend;
