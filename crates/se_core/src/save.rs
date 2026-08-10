@@ -27,6 +27,8 @@ pub const SNAPSHOT_VERSION: u32 = 1;
 pub enum StateError {
     /// A component attempted to encode more than one root value.
     MultipleRootValues,
+    /// A prior serialization failure permanently invalidated the writer.
+    WriterPoisoned,
     /// A component did not encode or decode a root value.
     MissingRootValue,
     /// Bytes remained after the root value was decoded.
@@ -60,6 +62,7 @@ impl fmt::Display for StateError {
             Self::MultipleRootValues => {
                 formatter.write_str("component payload contains multiple root values")
             }
+            Self::WriterPoisoned => formatter.write_str("component state writer is poisoned"),
             Self::MissingRootValue => formatter.write_str("component payload has no root value"),
             Self::TrailingBytes(count) => {
                 write!(formatter, "component payload has {count} trailing bytes")
@@ -185,10 +188,12 @@ impl io::Write for CountingWriter<'_> {
 ///
 /// Exactly one call to [`Self::serialize`] must succeed before the writer is
 /// finished. The writer counts encoded bytes and, when constructed by the snapshot
-/// container, enforces that component's payload limit during each write.
+/// container, enforces that component's payload limit during each write. Any
+/// serialization failure permanently poisons the writer.
 pub struct StateWriter<'a> {
     sink: CountingWriter<'a>,
     root_written: bool,
+    poisoned: bool,
 }
 
 impl<'a> StateWriter<'a> {
@@ -202,6 +207,7 @@ impl<'a> StateWriter<'a> {
                 failure: None,
             },
             root_written: false,
+            poisoned: false,
         }
     }
 
@@ -214,27 +220,36 @@ impl<'a> StateWriter<'a> {
                 failure: None,
             },
             root_written: false,
+            poisoned: false,
         }
     }
 
     /// Serializes the single root value directly into the payload sink.
     ///
-    /// A failed stream write may leave an incomplete prefix in the sink. The root
-    /// remains unwritten from this writer's contract; callers discard the payload
-    /// after any error because retrying does not remove bytes already forwarded.
+    /// A failure may leave an incomplete prefix in the sink and permanently
+    /// poisons this writer. Subsequent calls to this method or [`Self::finish`]
+    /// return [`StateError::WriterPoisoned`] without forwarding more bytes. The
+    /// caller discards the entire payload after the first error.
     ///
     /// # Errors
     ///
-    /// Returns [`StateError::MultipleRootValues`] after a root has already been
-    /// encoded, [`StateError::PayloadTooLarge`] when a configured limit is crossed,
+    /// Returns [`StateError::WriterPoisoned`] after any prior serialization error,
+    /// [`StateError::MultipleRootValues`] after a root has already been encoded,
+    /// [`StateError::PayloadTooLarge`] when a configured limit is crossed,
     /// [`StateError::LengthOverflow`] when the byte count cannot be represented,
     /// [`StateError::Io`] for a sink failure, or [`StateError::Encode`] for another
-    /// Postcard encoding failure.
+    /// Postcard encoding failure. Every error other than an already poisoned
+    /// writer poisons it before returning.
     pub fn serialize<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), StateError> {
+        if self.poisoned {
+            return Err(StateError::WriterPoisoned);
+        }
         if self.root_written {
+            self.poisoned = true;
             return Err(StateError::MultipleRootValues);
         }
         if let Err(error) = postcard::to_io(value, &mut self.sink) {
+            self.poisoned = true;
             return Err(match self.sink.failure.take() {
                 Some(CountingFailure::LengthOverflow) => StateError::LengthOverflow,
                 Some(CountingFailure::PayloadTooLarge { actual, maximum }) => {
@@ -252,9 +267,13 @@ impl<'a> StateWriter<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`StateError::MissingRootValue`] unless one call to
-    /// [`Self::serialize`] completed successfully.
+    /// Returns [`StateError::WriterPoisoned`] after any serialization error, or
+    /// [`StateError::MissingRootValue`] unless one call to [`Self::serialize`]
+    /// completed successfully.
     pub fn finish(self) -> Result<u64, StateError> {
+        if self.poisoned {
+            return Err(StateError::WriterPoisoned);
+        }
         if !self.root_written {
             return Err(StateError::MissingRootValue);
         }
@@ -432,7 +451,9 @@ impl<'de> Deserialize<'de> for ByteVec {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::io;
+    use std::rc::Rc;
 
     use serde::{Deserialize, Serialize};
 
@@ -459,6 +480,12 @@ mod tests {
         point: FailurePoint,
     }
 
+    struct FailOnceAfterPrefix {
+        output: Rc<RefCell<Vec<u8>>>,
+        prefix_remaining: usize,
+        failed: bool,
+    }
+
     impl io::Write for FailingWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             match self.point {
@@ -478,6 +505,34 @@ mod tests {
                     "injected component flush failure",
                 )),
             }
+        }
+    }
+
+    impl io::Write for FailOnceAfterPrefix {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            if self.failed {
+                self.output.borrow_mut().extend_from_slice(bytes);
+                return Ok(bytes.len());
+            }
+            if self.prefix_remaining == 0 {
+                self.failed = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected failure after component prefix",
+                ));
+            }
+
+            let count = bytes.len().min(self.prefix_remaining);
+            self.output.borrow_mut().extend_from_slice(&bytes[..count]);
+            self.prefix_remaining -= count;
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -514,6 +569,7 @@ mod tests {
             writer.serialize(&2_u32),
             Err(StateError::MultipleRootValues)
         ));
+        assert!(matches!(writer.finish(), Err(StateError::WriterPoisoned)));
 
         let empty_writer = StateWriter::new(&mut payload);
         assert!(matches!(
@@ -572,6 +628,34 @@ mod tests {
             }
             result => panic!("unexpected flush result: {result:?}"),
         }
+    }
+
+    #[test]
+    fn writer_is_poisoned_after_partial_serialization_failure() {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = FailOnceAfterPrefix {
+            output: Rc::clone(&output),
+            prefix_remaining: 1,
+            failed: false,
+        };
+        let mut writer = StateWriter::new(&mut sink);
+
+        match writer.serialize(&ByteSlice::new(&[0x5a; 64])) {
+            Err(StateError::Io(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(error.to_string(), "injected failure after component prefix");
+            }
+            result => panic!("unexpected prefix write result: {result:?}"),
+        }
+        let prefix_len = output.borrow().len();
+        assert!(prefix_len > 0);
+
+        assert!(matches!(
+            writer.serialize(&7_u32),
+            Err(StateError::WriterPoisoned)
+        ));
+        assert_eq!(output.borrow().len(), prefix_len);
+        assert!(matches!(writer.finish(), Err(StateError::WriterPoisoned)));
     }
 
     #[test]
