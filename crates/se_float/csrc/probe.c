@@ -9,8 +9,16 @@ _Static_assert(UINT_FAST8_MAX == UINT8_MAX,
                "se_float requires an eight-bit uint_fast8_t");
 _Static_assert(sizeof(void *) == 8, "se_float requires 64-bit pointers");
 
+#if defined(SE_FLOAT_COMPILER_APPLE_CLANG)
+#define SE_FLOAT_PROBE_USED __attribute__((used))
+#else
+#define SE_FLOAT_PROBE_USED
+#endif
+
 static THREAD_LOCAL uint8_t se_float_probe_tls;
-static THREAD_LOCAL uint8_t se_float_probe_tls = 0;
+static THREAD_LOCAL uint8_t se_float_probe_tls SE_FLOAT_PROBE_USED = 0;
+
+#undef SE_FLOAT_PROBE_USED
 
 _Static_assert(sizeof(se_float_probe_tls) == 1,
                "se_float TLS declarations must preserve byte width");
