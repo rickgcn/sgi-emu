@@ -338,6 +338,17 @@ impl EventQueue {
         Ok(true)
     }
 
+    fn cancel_for(
+        &mut self,
+        token: ScheduleToken,
+        device: DeviceId,
+    ) -> Result<bool, EventQueueError> {
+        if !self.is_scheduled_for(token, device) {
+            return Ok(false);
+        }
+        self.cancel(token)
+    }
+
     /// Returns the earliest live event time at or after the current time.
     ///
     /// Cancelled heap entries are pruned before the deadline is returned.
@@ -384,6 +395,13 @@ impl EventQueue {
         self.slots
             .get(token.slot as usize)
             .is_some_and(|slot| slot.generation == token.generation && slot.live.is_some())
+    }
+
+    fn is_scheduled_for(&self, token: ScheduleToken, device: DeviceId) -> bool {
+        self.slots.get(token.slot as usize).is_some_and(|slot| {
+            slot.generation == token.generation
+                && slot.live.is_some_and(|live| live.event.device == device)
+        })
     }
 
     /// Returns the number of live events.
@@ -883,21 +901,30 @@ impl SchedulerHandle {
         self.schedule_at(deadline, tag, payload)
     }
 
-    /// Cancels an event previously scheduled through any scheduler handle.
+    /// Cancels a live event owned by this handle's destination device.
     ///
-    /// Returns `false` when `token` no longer names a live event.
+    /// Returns `false` without modifying the queue when `token` is stale,
+    /// inactive, or names an event for another device.
     ///
     /// # Errors
     ///
     /// Returns the error reported by [`EventQueue::cancel`].
     pub fn cancel(&self, token: ScheduleToken) -> Result<bool, EventQueueError> {
-        self.shared.inner.queue.borrow_mut().cancel(token)
+        self.shared
+            .inner
+            .queue
+            .borrow_mut()
+            .cancel_for(token, self.device)
     }
 
-    /// Returns whether a token still names a live event.
+    /// Returns whether a token names a live event for this handle's destination.
     #[must_use]
     pub fn is_scheduled(&self, token: ScheduleToken) -> bool {
-        self.shared.inner.queue.borrow().is_scheduled(token)
+        self.shared
+            .inner
+            .queue
+            .borrow()
+            .is_scheduled_for(token, self.device)
     }
 }
 
@@ -1224,6 +1251,53 @@ mod tests {
 
         drop(burst);
         assert_eq!(cpu_word.load_relaxed(), 0);
+    }
+
+    #[test]
+    fn scheduler_handles_cannot_observe_or_cancel_other_device_events() {
+        let scheduler = SchedulerShared::new();
+        let device_a = DeviceId::from_raw(3);
+        let device_b = DeviceId::from_raw(4);
+        let handle_a = scheduler.handle(device_a);
+        let handle_b = scheduler.handle(device_b);
+        let token_a = handle_a.schedule_at(5, 1, 10).unwrap();
+
+        assert!(handle_a.is_scheduled(token_a));
+        assert!(!handle_b.is_scheduled(token_a));
+        assert!(!handle_b.cancel(token_a).unwrap());
+        assert!(handle_a.is_scheduled(token_a));
+
+        scheduler.advance_to(5).unwrap();
+        assert_eq!(scheduler.pop_due().unwrap(), Some(event(5, 3, 1)));
+        assert!(scheduler.pop_due().unwrap().is_none());
+    }
+
+    #[test]
+    fn scheduler_snapshot_preserves_device_scoped_token_ownership() {
+        let scheduler = SchedulerShared::new();
+        let device_a = DeviceId::from_raw(3);
+        let device_b = DeviceId::from_raw(4);
+        let token_a = scheduler.handle(device_a).schedule_at(5, 1, 10).unwrap();
+        let token_b = scheduler.handle(device_b).schedule_at(6, 2, 20).unwrap();
+        let mut payload = Vec::new();
+        let mut writer = StateWriter::new(&mut payload);
+        scheduler.save(&mut writer).unwrap();
+        writer.finish().unwrap();
+
+        let mut restored = SchedulerShared::new();
+        let mut reader = StateReader::new(&payload);
+        restored.load(SNAPSHOT_VERSION, &mut reader).unwrap();
+        reader.finish().unwrap();
+        let restored_a = restored.handle(device_a);
+        let restored_b = restored.handle(device_b);
+
+        assert!(restored_a.is_scheduled(token_a));
+        assert!(!restored_a.is_scheduled(token_b));
+        assert!(restored_b.is_scheduled(token_b));
+        assert!(!restored_b.is_scheduled(token_a));
+        assert!(!restored_b.cancel(token_a).unwrap());
+        assert!(restored_a.is_scheduled(token_a));
+        assert!(restored_b.is_scheduled(token_b));
     }
 
     #[test]
