@@ -186,6 +186,136 @@ fn exceptional_arithmetic_reports_non_trapping_flags() {
 }
 
 #[test]
+fn every_non_trapping_flag_class_and_hidden_rounding_fact_is_fixed() {
+    let backend = SoftFloatBackend;
+    let rounding = RoundingMode::NearestEven;
+
+    assert_outcome(
+        backend.add_f32(0x3f80_0000, 0x3f80_0000, rounding),
+        0x4000_0000,
+        ExceptionFlags::empty(),
+        RoundingFacts::default(),
+    );
+    assert_outcome(
+        backend.div_f32(0x3f80_0000, 0x4040_0000, rounding),
+        0x3eaa_aaab,
+        ExceptionFlags::INEXACT,
+        RoundingFacts {
+            tiny_after_rounding: false,
+            precision_inexact: true,
+        },
+    );
+
+    // This value is precision-tiny before subnormal quantization, which then
+    // carries into the minimum normal encoding.
+    assert_outcome(
+        backend.f64_to_f32(0x380f_ffff_e100_0000, rounding),
+        0x0080_0000,
+        ExceptionFlags::UNDERFLOW | ExceptionFlags::INEXACT,
+        RoundingFacts {
+            tiny_after_rounding: true,
+            precision_inexact: true,
+        },
+    );
+    // The exact maximum subnormal is tiny without losing precision.
+    assert_outcome(
+        backend.f64_to_f32(0x380f_ffff_c000_0000, rounding),
+        0x007f_ffff,
+        ExceptionFlags::empty(),
+        RoundingFacts {
+            tiny_after_rounding: true,
+            precision_inexact: false,
+        },
+    );
+
+    // Both products exceed the exponent range. Only the second product also
+    // discards nonzero significand information before overflow replacement.
+    assert_outcome(
+        backend.mul_f32(0x7f00_0000, 0x4000_0000, rounding),
+        0x7f80_0000,
+        ExceptionFlags::OVERFLOW | ExceptionFlags::INEXACT,
+        RoundingFacts {
+            tiny_after_rounding: false,
+            precision_inexact: false,
+        },
+    );
+    assert_outcome(
+        backend.mul_f32(0x7f7f_ffff, 0x3f80_0001, rounding),
+        0x7f80_0000,
+        ExceptionFlags::OVERFLOW | ExceptionFlags::INEXACT,
+        RoundingFacts {
+            tiny_after_rounding: false,
+            precision_inexact: true,
+        },
+    );
+    assert_outcome(
+        backend.div_f64(0x3ff0_0000_0000_0000, 0, rounding),
+        0x7ff0_0000_0000_0000,
+        ExceptionFlags::DIVIDE_BY_ZERO,
+        RoundingFacts::default(),
+    );
+    assert_outcome(
+        backend.sqrt_f32(0xbf80_0000, rounding),
+        0x7fc0_0000,
+        ExceptionFlags::INVALID,
+        RoundingFacts::default(),
+    );
+}
+
+#[test]
+fn conversion_boundaries_use_independent_golden_encodings() {
+    let backend = SoftFloatBackend;
+    let rounding = RoundingMode::NearestEven;
+
+    assert_outcome(
+        backend.i32_to_f32(i32::MIN, rounding),
+        0xcf00_0000,
+        ExceptionFlags::empty(),
+        RoundingFacts::default(),
+    );
+    assert_outcome(
+        backend.i64_to_f64(i64::MAX, rounding),
+        0x43e0_0000_0000_0000,
+        ExceptionFlags::INEXACT,
+        RoundingFacts {
+            tiny_after_rounding: false,
+            precision_inexact: true,
+        },
+    );
+
+    // Binary64 represents the lower i32 RN boundary exactly. The tie rounds
+    // to the even integer i32::MIN and remains a valid inexact conversion.
+    assert_outcome(
+        backend.f64_to_i32(0xc1e0_0000_0010_0000, rounding),
+        Some(i32::MIN),
+        ExceptionFlags::INEXACT,
+        RoundingFacts {
+            tiny_after_rounding: false,
+            precision_inexact: true,
+        },
+    );
+    assert_outcome(
+        backend.f64_to_i32(0x41df_ffff_ffe0_0000, rounding),
+        None,
+        ExceptionFlags::INVALID,
+        RoundingFacts::default(),
+    );
+
+    assert_outcome(
+        backend.f32_to_f64(0x007f_ffff),
+        0x380f_ffff_c000_0000,
+        ExceptionFlags::empty(),
+        RoundingFacts::default(),
+    );
+    assert_outcome(
+        backend.f64_to_f32(0x47ef_ffff_e000_0000, rounding),
+        0x7f7f_ffff,
+        ExceptionFlags::empty(),
+        RoundingFacts::default(),
+    );
+}
+
+#[test]
 fn standard_nan_polarity_and_canonical_results_are_fixed() {
     let backend = SoftFloatBackend;
     let rounding = RoundingMode::NearestEven;
@@ -210,6 +340,31 @@ fn standard_nan_polarity_and_canonical_results_are_fixed() {
     );
     assert_outcome(
         backend.mul_f64(0x7ff0_0000_0000_0001, 0x3ff0_0000_0000_0000, rounding),
+        0x7ff8_0000_0000_0000,
+        ExceptionFlags::INVALID,
+        RoundingFacts::default(),
+    );
+
+    assert_outcome(
+        backend.add_f32(0x3f80_0000, 0x7fe1_2345, rounding),
+        0x7fc0_0000,
+        ExceptionFlags::empty(),
+        RoundingFacts::default(),
+    );
+    assert_outcome(
+        backend.add_f32(0xff80_0123, 0x7fc0_0000, rounding),
+        0x7fc0_0000,
+        ExceptionFlags::INVALID,
+        RoundingFacts::default(),
+    );
+    assert_outcome(
+        backend.add_f64(0x3ff0_0000_0000_0000, 0x7ffa_1234_5678_9abc, rounding),
+        0x7ff8_0000_0000_0000,
+        ExceptionFlags::empty(),
+        RoundingFacts::default(),
+    );
+    assert_outcome(
+        backend.add_f64(0xfff0_1234_5678_9abc, 0x7ff8_0000_0000_0000, rounding),
         0x7ff8_0000_0000_0000,
         ExceptionFlags::INVALID,
         RoundingFacts::default(),
