@@ -23,6 +23,8 @@
 
 use std::error::Error;
 use std::fmt;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -37,12 +39,32 @@ pub const GUEST_INTERRUPT_MASK: u64 = HOST_WAKE - 1;
 
 /// Holds the guest-interrupt and execution-control bits observed by one CPU.
 ///
-/// Cloning this value creates another handle to the same atomic bitset.
+/// Cloning this value creates another deterministic-thread handle to the same
+/// atomic bitset. The word is neither [`Send`] nor [`Sync`], so guest interrupt
+/// lines and event truncation cannot be driven directly by host workers. Use
+/// [`Self::host_wake_handle`] to create the thread-safe host-control capability.
+///
+/// ```compile_fail
+/// use se_core::interrupt::InterruptWord;
+///
+/// fn require_send<T: Send>() {}
+///
+/// require_send::<InterruptWord>();
+/// ```
+///
+/// ```compile_fail
+/// use se_core::interrupt::InterruptWord;
+///
+/// fn require_sync<T: Sync>() {}
+///
+/// require_sync::<InterruptWord>();
+/// ```
 #[derive(Clone, Debug)]
 pub struct InterruptWord {
     // Keep every mutation as an atomic read-modify-write so unrelated bit changes
     // preserve a HOST_WAKE release sequence until the slow path consumes it.
     bits: Arc<AtomicU64>,
+    single_thread: PhantomData<Rc<()>>,
 }
 
 impl InterruptWord {
@@ -51,6 +73,7 @@ impl InterruptWord {
     pub fn new() -> Self {
         Self {
             bits: Arc::new(AtomicU64::new(0)),
+            single_thread: PhantomData,
         }
     }
 
@@ -75,7 +98,7 @@ impl InterruptWord {
         self.bits.fetch_and(!mask, Ordering::Relaxed);
     }
 
-    /// Requests that the current CPU burst stop at its next instruction boundary.
+    /// Requests that the current CPU burst stop at its next CPU safe point.
     #[inline]
     pub(crate) fn request_event_truncate(&self) {
         self.set_mask(EVENT_TRUNCATE);
@@ -121,7 +144,8 @@ impl Default for InterruptWord {
 /// thread-safe channel before [`Self::request`] is called. The release/acquire
 /// doorbell pair publishes preceding work, while the channel remains responsible
 /// for race-free storage, ownership, and multi-producer ordering. Signaling the
-/// bit does not wake a parked host execution thread.
+/// bit does not wake a parked host execution thread. Unlike [`InterruptWord`],
+/// this handle is [`Send`] and [`Sync`].
 #[derive(Clone, Debug)]
 pub struct HostWakeHandle {
     bits: Arc<AtomicU64>,
@@ -167,6 +191,22 @@ impl Error for InterruptLineError {}
 /// topology: either sink could clear the other source's asserted level. Shared
 /// sources use distinct interrupt-controller inputs, and only the controller owns
 /// the direct output sink.
+///
+/// ```compile_fail
+/// use se_core::interrupt::WordLineSink;
+///
+/// fn require_send<T: Send>() {}
+///
+/// require_send::<WordLineSink>();
+/// ```
+///
+/// ```compile_fail
+/// use se_core::interrupt::WordLineSink;
+///
+/// fn require_sync<T: Sync>() {}
+///
+/// require_sync::<WordLineSink>();
+/// ```
 #[derive(Debug)]
 pub struct WordLineSink {
     word: InterruptWord,
@@ -219,9 +259,16 @@ mod tests {
     use std::thread;
 
     use super::{
-        EVENT_TRUNCATE, GUEST_INTERRUPT_MASK, HOST_WAKE, InterruptLineError, InterruptSink,
-        InterruptWord, WordLineSink,
+        EVENT_TRUNCATE, GUEST_INTERRUPT_MASK, HOST_WAKE, HostWakeHandle, InterruptLineError,
+        InterruptSink, InterruptWord, WordLineSink,
     };
+
+    #[test]
+    fn host_wake_handle_remains_send_and_sync() {
+        fn require_send_and_sync<T: Send + Sync>() {}
+
+        require_send_and_sync::<HostWakeHandle>();
+    }
 
     #[test]
     fn direct_line_changes_only_its_guest_bit() {
