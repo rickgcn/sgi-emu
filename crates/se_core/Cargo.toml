@@ -14,3 +14,7 @@ serde.workspace = true
 [[bench]]
 name = "decoder"
 harness = false
+
+[[bench]]
+name = "event_queue"
+harness = false

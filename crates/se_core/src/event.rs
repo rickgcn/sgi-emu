@@ -26,6 +26,8 @@ use crate::save::{SNAPSHOT_VERSION, Saveable, StateError, StateReader, StateWrit
 use crate::time::{NO_DEADLINE, VTime};
 
 const MAX_EVENT_SLOTS: usize = u32::MAX as usize;
+const HEAP_COMPACTION_BASE_ENTRIES: usize = 1_024;
+const HEAP_COMPACTION_SLOT_FACTOR: usize = 4;
 
 /// Describes one deterministic event awaiting delivery to a device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +197,9 @@ impl Error for EventQueueError {}
 /// Events are delivered in ascending `(vtime, sequence)` order. Cancellation is
 /// lazy in the heap but immediate in the slab, and the token generation prevents
 /// a cancelled token from affecting a later occupant of the same slot.
+/// Deterministic compaction rebuilds an oversized heap from live slab entries, so
+/// repeatedly cancelling events hidden behind an earlier deadline cannot retain
+/// unbounded host memory or create an unbounded later pruning spike.
 ///
 /// Snapshot state preserves insertion sequences, slot generations, and free-slot
 /// order. Restoration rebuilds the derived heap without changing delivery order
@@ -335,6 +340,7 @@ impl EventQueue {
         if next_generation != u32::MAX {
             self.free.push(token.slot);
         }
+        self.compact_heap_if_oversized();
         Ok(true)
     }
 
@@ -446,6 +452,36 @@ impl EventQueue {
         }) {
             self.heap.pop();
         }
+    }
+
+    fn compact_heap_if_oversized(&mut self) {
+        if self.heap.len() <= HEAP_COMPACTION_BASE_ENTRIES {
+            return;
+        }
+        let entry_limit = self
+            .slots
+            .len()
+            .saturating_mul(HEAP_COMPACTION_SLOT_FACTOR)
+            .saturating_add(HEAP_COMPACTION_BASE_ENTRIES);
+        if self.heap.len() <= entry_limit {
+            return;
+        }
+
+        self.heap = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let live = slot.live?;
+                let index = u32::try_from(index).expect("event slot index must fit u32");
+                Some(HeapEntry {
+                    vtime: live.event.vtime,
+                    seq: live.seq,
+                    slot: index,
+                    generation: slot.generation,
+                })
+            })
+            .collect();
     }
 
     fn from_state(state: EventQueueState) -> Result<Self, StateError> {
@@ -728,13 +764,17 @@ impl SchedulerShared {
     /// Entry clears any stale event-truncate request on `truncate_target`.
     /// Keeping the returned [`BurstScope`] alive marks the burst as active;
     /// dropping it clears the request and removes the active deadline.
-    /// [`NO_DEADLINE`] represents a burst with no finite deadline, which is still
-    /// truncated by every newly scheduled finite event.
+    /// [`NO_DEADLINE`] represents a burst with no finite deadline. It is accepted
+    /// only when no existing finite event is pending and is still truncated by
+    /// every newly scheduled finite event.
     ///
     /// # Errors
     ///
-    /// Returns [`BurstScopeError::AlreadyActive`] if another burst scope is active
-    /// on this shared scheduler.
+    /// Returns [`BurstScopeError::AlreadyActive`] if another burst scope is active,
+    /// [`BurstScopeError::DeadlineBeforeNow`] if `deadline` precedes the current
+    /// scheduler time, or [`BurstScopeError::CrossesPendingEvent`] if an existing
+    /// event precedes `deadline`. An event exactly at `deadline` is valid. Rejection
+    /// does not activate a scope or clear control bits in `truncate_target`.
     pub fn begin_burst(
         &self,
         deadline: VTime,
@@ -742,6 +782,18 @@ impl SchedulerShared {
     ) -> Result<BurstScope, BurstScopeError> {
         if self.inner.truncate_target.borrow().is_some() {
             return Err(BurstScopeError::AlreadyActive);
+        }
+        {
+            let mut queue = self.inner.queue.borrow_mut();
+            let now = queue.now();
+            if deadline < now {
+                return Err(BurstScopeError::DeadlineBeforeNow { now, deadline });
+            }
+            if let Some(pending) = queue.front_time()
+                && pending < deadline
+            {
+                return Err(BurstScopeError::CrossesPendingEvent { pending, deadline });
+            }
         }
         truncate_target.clear_event_truncate();
         self.inner.burst_deadline.set(deadline);
@@ -791,12 +843,34 @@ impl Saveable for SchedulerShared {
 pub enum BurstScopeError {
     /// Only one CPU burst may be active on a scheduler at a time.
     AlreadyActive,
+    /// The requested deadline precedes the scheduler's current time.
+    DeadlineBeforeNow {
+        /// Scheduler time observed at burst entry.
+        now: VTime,
+        /// Rejected earlier deadline.
+        deadline: VTime,
+    },
+    /// The requested burst would cross an existing event deadline.
+    CrossesPendingEvent {
+        /// Earliest pending event time.
+        pending: VTime,
+        /// Rejected later burst deadline.
+        deadline: VTime,
+    },
 }
 
 impl fmt::Display for BurstScopeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AlreadyActive => formatter.write_str("a scheduler burst is already active"),
+            Self::DeadlineBeforeNow { now, deadline } => write!(
+                formatter,
+                "CPU burst deadline {deadline} precedes scheduler time {now}"
+            ),
+            Self::CrossesPendingEvent { pending, deadline } => write!(
+                formatter,
+                "CPU burst deadline {deadline} crosses pending event at {pending}"
+            ),
         }
     }
 }
@@ -933,7 +1007,8 @@ mod tests {
     use crate::save::{SNAPSHOT_VERSION, Saveable, StateError, StateReader, StateWriter};
 
     use super::{
-        DeviceId, EventQueue, EventQueueError, EventQueueState, LiveEventState, ScheduledEvent,
+        BurstScopeError, DeviceId, EventQueue, EventQueueError, EventQueueState,
+        HEAP_COMPACTION_BASE_ENTRIES, HEAP_COMPACTION_SLOT_FACTOR, LiveEventState, ScheduledEvent,
         SchedulerShared, SlotState, new_slot_index,
     };
     use crate::interrupt::{EVENT_TRUNCATE, InterruptWord};
@@ -979,6 +1054,33 @@ mod tests {
         assert_eq!(reused.slot(), cancelled.slot());
         assert_ne!(reused.generation(), cancelled.generation());
         assert_eq!(queue.front_time(), Some(1));
+    }
+
+    #[test]
+    fn lazy_cancellation_compacts_buried_entries_without_changing_fifo_order() {
+        let mut queue = EventQueue::new();
+        queue.schedule(event(16, 0, 1)).unwrap();
+        queue.schedule(event(16, 0, 2)).unwrap();
+
+        for tag in 3..100_003 {
+            let cancelled = queue.schedule(event(1_000, 0, tag)).unwrap();
+            assert!(queue.cancel(cancelled).unwrap());
+            assert_eq!(queue.front_time(), Some(16));
+        }
+
+        let entry_limit = queue
+            .slots
+            .len()
+            .saturating_mul(HEAP_COMPACTION_SLOT_FACTOR)
+            .saturating_add(HEAP_COMPACTION_BASE_ENTRIES);
+        assert_eq!(queue.len(), 2);
+        assert!(queue.heap.len() <= entry_limit);
+
+        queue.advance_to(16).unwrap();
+        assert_eq!(queue.pop_due().unwrap().unwrap().tag, 1);
+        assert_eq!(queue.pop_due().unwrap().unwrap().tag, 2);
+        assert_eq!(queue.pop_due().unwrap(), None);
+        assert!(queue.heap.is_empty());
     }
 
     #[test]
@@ -1196,28 +1298,77 @@ mod tests {
     fn scheduler_truncates_active_bursts_before_their_deadlines() {
         let scheduler = SchedulerShared::new();
         let handle = scheduler.handle(DeviceId::from_raw(7));
-        let cpu_one = InterruptWord::new();
         let cpu_two = InterruptWord::new();
 
-        handle.schedule_at(5, 1, 0).unwrap();
-        assert_eq!(cpu_one.load_relaxed(), 0);
+        handle.schedule_at(100, 1, 0).unwrap();
         {
             let _burst = scheduler.begin_burst(100, cpu_two.clone()).unwrap();
             handle.schedule_at(100, 2, 0).unwrap();
             assert_eq!(cpu_two.load_relaxed(), 0);
             handle.schedule_at(50, 3, 0).unwrap();
-            assert_eq!(cpu_one.load_relaxed(), 0);
             assert_eq!(cpu_two.load_relaxed(), EVENT_TRUNCATE);
         }
         assert_eq!(cpu_two.load_relaxed(), 0);
+
+        let unbounded_scheduler = SchedulerShared::new();
+        let unbounded_handle = unbounded_scheduler.handle(DeviceId::from_raw(7));
+        let cpu_one = InterruptWord::new();
         {
-            let _burst = scheduler.begin_burst(NO_DEADLINE, cpu_one.clone()).unwrap();
-            handle.schedule_at(NO_DEADLINE, 4, 0).unwrap();
+            let _burst = unbounded_scheduler
+                .begin_burst(NO_DEADLINE, cpu_one.clone())
+                .unwrap();
+            unbounded_handle.schedule_at(NO_DEADLINE, 4, 0).unwrap();
             assert_eq!(cpu_one.load_relaxed(), 0);
-            handle.schedule_at(1, 5, 0).unwrap();
+            unbounded_handle.schedule_at(1, 5, 0).unwrap();
             assert_eq!(cpu_one.load_relaxed(), EVENT_TRUNCATE);
         }
         assert_eq!(cpu_one.load_relaxed(), 0);
+    }
+
+    #[test]
+    fn scheduler_rejects_invalid_burst_horizons_without_activating_a_scope() {
+        let scheduler = SchedulerShared::new();
+        scheduler.advance_to(100).unwrap();
+        let cpu_word = InterruptWord::new();
+        cpu_word.request_event_truncate();
+
+        assert!(matches!(
+            scheduler.begin_burst(99, cpu_word.clone()),
+            Err(BurstScopeError::DeadlineBeforeNow {
+                now: 100,
+                deadline: 99
+            })
+        ));
+        assert_eq!(cpu_word.load_relaxed(), EVENT_TRUNCATE);
+
+        scheduler
+            .handle(DeviceId::from_raw(7))
+            .schedule_at(120, 1, 0)
+            .unwrap();
+        assert!(matches!(
+            scheduler.begin_burst(121, cpu_word.clone()),
+            Err(BurstScopeError::CrossesPendingEvent {
+                pending: 120,
+                deadline: 121
+            })
+        ));
+        assert_eq!(cpu_word.load_relaxed(), EVENT_TRUNCATE);
+        assert!(matches!(
+            scheduler.begin_burst(NO_DEADLINE, cpu_word.clone()),
+            Err(BurstScopeError::CrossesPendingEvent {
+                pending: 120,
+                deadline: NO_DEADLINE
+            })
+        ));
+        assert_eq!(cpu_word.load_relaxed(), EVENT_TRUNCATE);
+
+        let burst = scheduler.begin_burst(120, cpu_word.clone()).unwrap();
+        assert_eq!(cpu_word.load_relaxed(), 0);
+        drop(burst);
+        assert_eq!(cpu_word.load_relaxed(), 0);
+
+        let shorter_burst = scheduler.begin_burst(110, cpu_word.clone()).unwrap();
+        drop(shorter_burst);
     }
 
     #[test]
@@ -1232,7 +1383,7 @@ mod tests {
         let replacement_payload = save_queue(&replacement);
 
         let cpu_word = InterruptWord::new();
-        let burst = scheduler.begin_burst(100, cpu_word.clone()).unwrap();
+        let burst = scheduler.begin_burst(80, cpu_word.clone()).unwrap();
         let mut reader = StateReader::new(&replacement_payload);
         assert!(matches!(
             scheduler.load(SNAPSHOT_VERSION, &mut reader),
