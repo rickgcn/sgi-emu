@@ -641,7 +641,8 @@ struct SchedulerInner {
 /// Clones refer to the same queue and active burst state. `Rc` ownership makes the
 /// scheduler neither `Send` nor `Sync`; every clone remains on one host thread.
 /// Snapshot operations persist the queue, while an active burst deadline and its
-/// truncation target are transient runtime state.
+/// truncation target are transient runtime state. Restoring while a burst is active
+/// is rejected so persistent queue state cannot mix with transient burst state.
 #[derive(Clone)]
 pub struct SchedulerShared {
     inner: Rc<SchedulerInner>,
@@ -758,6 +759,11 @@ impl Saveable for SchedulerShared {
     }
 
     fn load(&mut self, version: u32, reader: &mut StateReader<'_>) -> Result<(), StateError> {
+        if self.inner.truncate_target.borrow().is_some() {
+            return Err(StateError::InvalidState(
+                "cannot restore scheduler during an active CPU burst".into(),
+            ));
+        }
         self.inner.queue.borrow_mut().load(version, reader)
     }
 }
@@ -1185,6 +1191,39 @@ mod tests {
             assert_eq!(cpu_one.load_relaxed(), EVENT_TRUNCATE);
         }
         assert_eq!(cpu_one.load_relaxed(), 0);
+    }
+
+    #[test]
+    fn scheduler_restore_rejects_active_burst_without_mutation() {
+        let mut scheduler = SchedulerShared::new();
+        let handle = scheduler.handle(DeviceId::from_raw(7));
+        let original_token = handle.schedule_at(80, 1, 10).unwrap();
+        let original_payload = save_queue(&scheduler.inner.queue.borrow());
+
+        let mut replacement = EventQueue::new();
+        replacement.schedule(event(20, 3, 2)).unwrap();
+        let replacement_payload = save_queue(&replacement);
+
+        let cpu_word = InterruptWord::new();
+        let burst = scheduler.begin_burst(100, cpu_word.clone()).unwrap();
+        let mut reader = StateReader::new(&replacement_payload);
+        assert!(matches!(
+            scheduler.load(SNAPSHOT_VERSION, &mut reader),
+            Err(StateError::InvalidState(reason))
+                if reason == "cannot restore scheduler during an active CPU burst"
+        ));
+
+        assert_eq!(
+            save_queue(&scheduler.inner.queue.borrow()),
+            original_payload
+        );
+        assert!(handle.is_scheduled(original_token));
+        assert!(scheduler.begin_burst(200, InterruptWord::new()).is_err());
+        handle.schedule_at(50, 2, 20).unwrap();
+        assert_eq!(cpu_word.load_relaxed(), EVENT_TRUNCATE);
+
+        drop(burst);
+        assert_eq!(cpu_word.load_relaxed(), 0);
     }
 
     #[test]
