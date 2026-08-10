@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  SOFTFLOAT_REVISION: a0c6494cdc11865811dec815d5c0049fba9d82a8
+
+jobs:
+  quality:
+    name: Linux quality
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+
+      - name: Verify SoftFloat source identity
+        shell: bash
+        run: |
+          actual_revision="$(git -C 3rdparty/softfloat3 rev-parse HEAD)"
+          test "$actual_revision" = "$SOFTFLOAT_REVISION"
+          test -z "$(git -C 3rdparty/softfloat3 status --porcelain --untracked-files=all)"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+  targets:
+    name: ${{ matrix.target }} (${{ matrix.compiler }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            compiler: GCC
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            compiler: MSVC
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            compiler: Apple Clang
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain and LLVM tools
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+          components: llvm-tools-preview
+
+      - name: Verify SoftFloat source identity
+        shell: bash
+        run: |
+          actual_revision="$(git -C 3rdparty/softfloat3 rev-parse HEAD)"
+          test "$actual_revision" = "$SOFTFLOAT_REVISION"
+          test -z "$(git -C 3rdparty/softfloat3 status --porcelain --untracked-files=all)"
+
+      - name: Compile all Cargo targets
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo check --workspace --all-targets --target "$TARGET" \
+            --message-format=json > cargo-messages.json
+
+      - name: Run debug tests and doctests
+        shell: bash
+        run: cargo test --workspace --target "${{ matrix.target }}"
+
+      - name: Run release tests and doctests
+        shell: bash
+        run: cargo test --workspace --release --target "${{ matrix.target }}"
+
+      - name: Audit C archive namespaces
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rust_sysroot="$(rustc --print sysroot)"
+          rust_host="$(rustc -vV | sed -n 's/^host: //p')"
+          llvm_nm="$rust_sysroot/lib/rustlib/$rust_host/bin/llvm-nm"
+          if test "${{ runner.os }}" = "Windows"; then
+            llvm_nm="$llvm_nm.exe"
+          fi
+          python .github/scripts/check_se_float_symbols.py \
+            --cargo-messages cargo-messages.json \
+            --llvm-nm "$llvm_nm" \
+            --target "$TARGET"
