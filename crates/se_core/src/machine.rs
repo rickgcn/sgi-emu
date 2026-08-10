@@ -28,6 +28,8 @@ pub enum CpuExit {
     Deadline,
     /// A guest interrupt or burst truncation request ended the burst.
     Interrupt,
+    /// Pending host-control work ended the burst.
+    HostWake,
     /// A debugger breakpoint ended the burst.
     Breakpoint,
     /// The machine entered a halted state.
@@ -152,6 +154,11 @@ pub trait Machine: SnapshotTarget + Introspect {
     /// [`CpuExit::Deadline`] means the complex reached `deadline`. Other exit
     /// reasons may return earlier, and no successful call moves machine time beyond
     /// a finite deadline.
+    ///
+    /// Before returning [`CpuExit::HostWake`], the CPU complex consumes the
+    /// corresponding [`crate::interrupt::HOST_WAKE`] doorbell without changing
+    /// guest interrupt lines. The runtime then drains its separately synchronized
+    /// host-control channel before resuming guest execution.
     ///
     /// # Errors
     ///

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use se_core::device::DeviceId;
 use se_core::event::{ScheduleToken, ScheduledEvent, SchedulerShared};
 use se_core::inspect::{InspectCommand, InspectError, Introspect};
-use se_core::interrupt::{EVENT_TRUNCATE, GUEST_INTERRUPT_MASK, InterruptWord};
+use se_core::interrupt::{EVENT_TRUNCATE, GUEST_INTERRUPT_MASK, HOST_WAKE, InterruptWord};
 use se_core::machine::{
     CpuExit, Machine, MachineCreateError, MachineError, MachineFactory, StateDigest,
 };
@@ -177,7 +177,7 @@ impl SnapshotTarget for DeterministicMachine {
                         "CPU snapshot contains an inconsistent clock phase".to_owned(),
                     ));
                 }
-                self.cpu.interrupt_word.clear_mask(u64::MAX);
+                self.cpu.interrupt_word.clear_mask(GUEST_INTERRUPT_MASK);
                 self.cpu.interrupt_word.set_mask(state.pending_interrupts);
                 self.cpu.retired = state.retired;
                 self.cpu.next_boundary = state.next_boundary;
@@ -264,6 +264,11 @@ impl Machine for DeterministicMachine {
             }
             let previous_boundary = self.cpu.next_boundary - INSTRUCTION_NS;
             let pending = self.cpu.interrupt_word.load_relaxed();
+            if pending & HOST_WAKE != 0 {
+                let consumed = self.cpu.interrupt_word.take_host_wake();
+                debug_assert!(consumed);
+                return Ok(CpuExit::HostWake);
+            }
             if self.now() == previous_boundary && pending & GUEST_INTERRUPT_MASK != 0 {
                 self.cpu.interrupt_seen_at = Some(self.now());
                 self.cpu.interrupt_word.clear_mask(GUEST_INTERRUPT_MASK);
@@ -456,6 +461,48 @@ fn off_grid_interrupt_waits_for_the_next_instruction_boundary() {
     assert_eq!(machine.cpu.interrupt_seen_at, Some(30));
     assert_eq!(machine.cpu.retired, 3);
     assert_eq!(machine.cpu.next_boundary, 40);
+}
+
+#[test]
+fn host_wake_exits_without_advancing_guest_state() {
+    let mut machine = DeterministicMachine::new();
+    let wake = machine.cpu.interrupt_word.host_wake_handle();
+    machine.cpu.interrupt_word.set_mask(INTERRUPT_LINE);
+    wake.request();
+
+    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::HostWake);
+    assert_eq!(machine.now(), 0);
+    assert_eq!(machine.cpu.retired, 0);
+    assert_eq!(machine.cpu.interrupt_word.load_relaxed() & HOST_WAKE, 0);
+    assert_eq!(
+        machine.cpu.interrupt_word.load_relaxed() & INTERRUPT_LINE,
+        INTERRUPT_LINE
+    );
+
+    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Interrupt);
+    assert_eq!(machine.cpu.interrupt_seen_at, Some(0));
+    assert_eq!(machine.cpu.retired, 0);
+    assert_eq!(machine.run_cpu_until(20).unwrap(), CpuExit::Deadline);
+    assert_eq!(machine.cpu.retired, 2);
+}
+
+#[test]
+fn host_wake_is_excluded_from_snapshot_and_state_digest() {
+    let machine = DeterministicMachine::new();
+    let baseline_snapshot = encode_snapshot(&machine, BUILD, PROFILE).unwrap();
+    let baseline_digest = machine.state_digest().unwrap();
+
+    machine.cpu.interrupt_word.host_wake_handle().request();
+
+    assert_eq!(
+        encode_snapshot(&machine, BUILD, PROFILE).unwrap(),
+        baseline_snapshot
+    );
+    assert_eq!(machine.state_digest().unwrap(), baseline_digest);
+    assert_eq!(
+        machine.cpu.interrupt_word.load_relaxed() & HOST_WAKE,
+        HOST_WAKE
+    );
 }
 
 #[test]
