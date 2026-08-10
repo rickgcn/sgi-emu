@@ -64,113 +64,81 @@ fn round_f64_to_i64(value: f64) -> Option<i64> {
 }
 
 impl NativeBackend {
-    /// Adds two IEEE binary32 values supplied as raw `u32` bit patterns.
+    /// Adds two IEEE binary32 raw `u32` bit patterns and returns raw `u32` result bits.
     ///
-    /// Ordinary Rust 1.95.0 `f32` addition uses fixed roundTiesToEven and the
-    /// returned bits come directly from `to_bits`. A NaN result promises only
-    /// the NaN category. This operation provides no flags or rounding facts
-    /// and does not inspect or manage the host floating-point environment.
+    /// The operation uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn add_f32(&self, a: u32, b: u32) -> u32 {
         (f32::from_bits(a) + f32::from_bits(b)).to_bits()
     }
 
-    /// Subtracts two IEEE binary32 values supplied as raw `u32` bit patterns.
+    /// Subtracts two IEEE binary32 raw `u32` bit patterns and returns raw `u32` result bits.
     ///
-    /// Ordinary Rust 1.95.0 `f32` subtraction uses fixed roundTiesToEven and
-    /// the returned bits come directly from `to_bits`. A NaN result promises
-    /// only the NaN category. This operation provides no flags or rounding
-    /// facts and does not inspect or manage the host floating-point environment.
+    /// The operation uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn sub_f32(&self, a: u32, b: u32) -> u32 {
         (f32::from_bits(a) - f32::from_bits(b)).to_bits()
     }
 
-    /// Multiplies two IEEE binary32 values supplied as raw `u32` bit patterns.
+    /// Multiplies two IEEE binary32 raw `u32` bit patterns and returns raw `u32` result bits.
     ///
-    /// Ordinary Rust 1.95.0 `f32` multiplication uses fixed roundTiesToEven
-    /// and the returned bits come directly from `to_bits`. A NaN result
-    /// promises only the NaN category. This operation provides no flags or
-    /// rounding facts and does not inspect or manage the host floating-point
-    /// environment.
+    /// The operation uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn mul_f32(&self, a: u32, b: u32) -> u32 {
         (f32::from_bits(a) * f32::from_bits(b)).to_bits()
     }
 
-    /// Divides two IEEE binary32 values supplied as raw `u32` bit patterns.
+    /// Divides two IEEE binary32 raw `u32` bit patterns and returns raw `u32` result bits.
     ///
-    /// Ordinary Rust 1.95.0 `f32` division uses fixed roundTiesToEven and the
-    /// returned bits come directly from `to_bits`. A NaN result promises only
-    /// the NaN category. This operation provides no flags or rounding facts
-    /// and does not inspect or manage the host floating-point environment.
+    /// The operation uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn div_f32(&self, a: u32, b: u32) -> u32 {
         (f32::from_bits(a) / f32::from_bits(b)).to_bits()
     }
 
-    /// Computes the square root of an IEEE binary32 raw `u32` bit pattern.
+    /// Computes an IEEE binary32 square root from raw `u32` bits and returns raw result bits.
     ///
-    /// Rust 1.95.0 `f32::sqrt` uses fixed roundTiesToEven and the returned bits
-    /// come directly from `to_bits`. A NaN result promises only the NaN
-    /// category. This operation provides no flags or rounding facts and does
-    /// not inspect or manage the host floating-point environment.
+    /// The operation uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn sqrt_f32(&self, value: u32) -> u32 {
         f32::from_bits(value).sqrt().to_bits()
     }
 
-    /// Adds two IEEE binary64 values supplied as raw `u64` bit patterns.
+    /// Adds two IEEE binary64 raw `u64` bit patterns and returns raw `u64` result bits.
     ///
-    /// Ordinary Rust 1.95.0 `f64` addition uses fixed roundTiesToEven and the
-    /// returned bits come directly from `to_bits`. A NaN result promises only
-    /// the NaN category. This operation provides no flags or rounding facts
-    /// and does not inspect or manage the host floating-point environment.
+    /// The operation uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn add_f64(&self, a: u64, b: u64) -> u64 {
         (f64::from_bits(a) + f64::from_bits(b)).to_bits()
     }
 
-    /// Subtracts two IEEE binary64 values supplied as raw `u64` bit patterns.
+    /// Subtracts two IEEE binary64 raw `u64` bit patterns and returns raw `u64` result bits.
     ///
-    /// Ordinary Rust 1.95.0 `f64` subtraction uses fixed roundTiesToEven and
-    /// the returned bits come directly from `to_bits`. A NaN result promises
-    /// only the NaN category. This operation provides no flags or rounding
-    /// facts and does not inspect or manage the host floating-point environment.
+    /// The operation uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn sub_f64(&self, a: u64, b: u64) -> u64 {
         (f64::from_bits(a) - f64::from_bits(b)).to_bits()
     }
 
-    /// Multiplies two IEEE binary64 values supplied as raw `u64` bit patterns.
+    /// Multiplies two IEEE binary64 raw `u64` bit patterns and returns raw `u64` result bits.
     ///
-    /// Ordinary Rust 1.95.0 `f64` multiplication uses fixed roundTiesToEven
-    /// and the returned bits come directly from `to_bits`. A NaN result
-    /// promises only the NaN category. This operation provides no flags or
-    /// rounding facts and does not inspect or manage the host floating-point
-    /// environment.
+    /// The operation uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn mul_f64(&self, a: u64, b: u64) -> u64 {
         (f64::from_bits(a) * f64::from_bits(b)).to_bits()
     }
 
-    /// Divides two IEEE binary64 values supplied as raw `u64` bit patterns.
+    /// Divides two IEEE binary64 raw `u64` bit patterns and returns raw `u64` result bits.
     ///
-    /// Ordinary Rust 1.95.0 `f64` division uses fixed roundTiesToEven and the
-    /// returned bits come directly from `to_bits`. A NaN result promises only
-    /// the NaN category. This operation provides no flags or rounding facts
-    /// and does not inspect or manage the host floating-point environment.
+    /// The operation uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn div_f64(&self, a: u64, b: u64) -> u64 {
         (f64::from_bits(a) / f64::from_bits(b)).to_bits()
     }
 
-    /// Computes the square root of an IEEE binary64 raw `u64` bit pattern.
+    /// Computes an IEEE binary64 square root from raw `u64` bits and returns raw result bits.
     ///
-    /// Rust 1.95.0 `f64::sqrt` uses fixed roundTiesToEven and the returned bits
-    /// come directly from `to_bits`. A NaN result promises only the NaN
-    /// category. This operation provides no flags or rounding facts and does
-    /// not inspect or manage the host floating-point environment.
+    /// The operation uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn sqrt_f64(&self, value: u64) -> u64 {
         f64::from_bits(value).sqrt().to_bits()
@@ -178,10 +146,8 @@ impl NativeBackend {
 
     /// Quietly compares two IEEE binary32 raw `u32` bit patterns.
     ///
-    /// Rust `f32` comparison treats both zero signs as equal and maps any NaN
-    /// operand to [`Relation::Unordered`]. This operation accepts no rounding
-    /// mode, provides no flags or rounding facts, and does not inspect or
-    /// manage the host floating-point environment.
+    /// Returns [`Relation::Unordered`] for any NaN operand and
+    /// [`Relation::Equal`] for either ordering of signed zero.
     #[must_use]
     pub fn compare_f32(&self, a: u32, b: u32) -> Relation {
         relation(f32::from_bits(a).partial_cmp(&f32::from_bits(b)))
@@ -189,120 +155,100 @@ impl NativeBackend {
 
     /// Quietly compares two IEEE binary64 raw `u64` bit patterns.
     ///
-    /// Rust `f64` comparison treats both zero signs as equal and maps any NaN
-    /// operand to [`Relation::Unordered`]. This operation accepts no rounding
-    /// mode, provides no flags or rounding facts, and does not inspect or
-    /// manage the host floating-point environment.
+    /// Returns [`Relation::Unordered`] for any NaN operand and
+    /// [`Relation::Equal`] for either ordering of signed zero.
     #[must_use]
     pub fn compare_f64(&self, a: u64, b: u64) -> Relation {
         relation(f64::from_bits(a).partial_cmp(&f64::from_bits(b)))
     }
 
-    /// Widens an IEEE binary32 raw `u32` bit pattern to binary64 raw bits.
+    /// Widens an IEEE binary32 raw `u32` bit pattern to binary64 raw `u64` bits.
     ///
-    /// Rust 1.95.0 performs the finite conversion exactly and returns the
-    /// `f64::to_bits` result unchanged. A NaN result promises only the NaN
-    /// category. This operation provides no flags or rounding facts and does
-    /// not inspect or manage the host floating-point environment.
+    /// Every finite input widens exactly, so the method accepts no rounding mode.
     #[must_use]
     pub fn f32_to_f64(&self, value: u32) -> u64 {
         (f32::from_bits(value) as f64).to_bits()
     }
 
-    /// Narrows an IEEE binary64 raw `u64` bit pattern to binary32 raw bits.
+    /// Narrows an IEEE binary64 raw `u64` bit pattern to binary32 raw `u32` bits.
     ///
-    /// Rust 1.95.0 performs the conversion with fixed roundTiesToEven and
-    /// returns the `f32::to_bits` result unchanged. A NaN result promises only
-    /// the NaN category. This operation provides no flags or rounding facts
-    /// and does not inspect or manage the host floating-point environment.
+    /// The conversion uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn f64_to_f32(&self, value: u64) -> u32 {
         (f64::from_bits(value) as f32).to_bits()
     }
 
-    /// Converts an `i32` value to an IEEE binary32 raw `u32` bit pattern.
+    /// Converts a signed `i32` to an IEEE binary32 raw `u32` bit pattern.
     ///
-    /// Rust 1.95.0 performs the conversion with fixed roundTiesToEven and
-    /// returns `f32::to_bits` unchanged. This operation provides no flags or
-    /// rounding facts and does not inspect or manage the host floating-point
-    /// environment.
+    /// The conversion uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn i32_to_f32(&self, value: i32) -> u32 {
         (value as f32).to_bits()
     }
 
-    /// Converts an `i64` value to an IEEE binary32 raw `u32` bit pattern.
+    /// Converts a signed `i64` to an IEEE binary32 raw `u32` bit pattern.
     ///
-    /// Rust 1.95.0 performs the conversion with fixed roundTiesToEven and
-    /// returns `f32::to_bits` unchanged. This operation provides no flags or
-    /// rounding facts and does not inspect or manage the host floating-point
-    /// environment.
+    /// The conversion uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn i64_to_f32(&self, value: i64) -> u32 {
         (value as f32).to_bits()
     }
 
-    /// Converts an `i32` value to an IEEE binary64 raw `u64` bit pattern.
+    /// Converts a signed `i32` exactly to an IEEE binary64 raw `u64` bit pattern.
     ///
-    /// Every `i32` is represented exactly by Rust 1.95.0 `f64`, and the method
-    /// returns `f64::to_bits` unchanged. This operation provides no flags or
-    /// rounding facts and does not inspect or manage the host floating-point
-    /// environment.
+    /// Every `i32` is representable, so the method accepts no rounding mode.
     #[must_use]
     pub fn i32_to_f64(&self, value: i32) -> u64 {
         (value as f64).to_bits()
     }
 
-    /// Converts an `i64` value to an IEEE binary64 raw `u64` bit pattern.
+    /// Converts a signed `i64` to an IEEE binary64 raw `u64` bit pattern.
     ///
-    /// Rust 1.95.0 performs the conversion with fixed roundTiesToEven and
-    /// returns `f64::to_bits` unchanged. This operation provides no flags or
-    /// rounding facts and does not inspect or manage the host floating-point
-    /// environment.
+    /// The conversion uses the backend's fixed roundTiesToEven mode.
     #[must_use]
     pub fn i64_to_f64(&self, value: i64) -> u64 {
         (value as f64).to_bits()
     }
 
-    /// Converts an IEEE binary32 raw `u32` bit pattern to an `i32` value.
+    /// Converts an IEEE binary32 raw `u32` bit pattern to a signed `i32` value.
     ///
     /// The value is rounded with `round_ties_even` and accepted only when the
     /// rounded result is in `-2^31..2^31`. NaN, infinity, and out-of-range
     /// results return `None`. This operation provides no flags or rounding
-    /// facts and does not inspect or manage the host floating-point environment.
+    /// facts.
     #[must_use]
     pub fn f32_to_i32(&self, value: u32) -> Option<i32> {
         round_f32_to_i32(f32::from_bits(value))
     }
 
-    /// Converts an IEEE binary32 raw `u32` bit pattern to an `i64` value.
+    /// Converts an IEEE binary32 raw `u32` bit pattern to a signed `i64` value.
     ///
     /// The value is rounded with `round_ties_even` and accepted only when the
     /// rounded result is in `-2^63..2^63`. NaN, infinity, and out-of-range
     /// results return `None`. This operation provides no flags or rounding
-    /// facts and does not inspect or manage the host floating-point environment.
+    /// facts.
     #[must_use]
     pub fn f32_to_i64(&self, value: u32) -> Option<i64> {
         round_f32_to_i64(f32::from_bits(value))
     }
 
-    /// Converts an IEEE binary64 raw `u64` bit pattern to an `i32` value.
+    /// Converts an IEEE binary64 raw `u64` bit pattern to a signed `i32` value.
     ///
     /// The value is rounded with `round_ties_even` and accepted only when the
     /// rounded result is in `-2^31..2^31`. NaN, infinity, and out-of-range
     /// results return `None`. This operation provides no flags or rounding
-    /// facts and does not inspect or manage the host floating-point environment.
+    /// facts.
     #[must_use]
     pub fn f64_to_i32(&self, value: u64) -> Option<i32> {
         round_f64_to_i32(f64::from_bits(value))
     }
 
-    /// Converts an IEEE binary64 raw `u64` bit pattern to an `i64` value.
+    /// Converts an IEEE binary64 raw `u64` bit pattern to a signed `i64` value.
     ///
     /// The value is rounded with `round_ties_even` and accepted only when the
     /// rounded result is in `-2^63..2^63`. NaN, infinity, and out-of-range
     /// results return `None`. This operation provides no flags or rounding
-    /// facts and does not inspect or manage the host floating-point environment.
+    /// facts.
     #[must_use]
     pub fn f64_to_i64(&self, value: u64) -> Option<i64> {
         round_f64_to_i64(f64::from_bits(value))

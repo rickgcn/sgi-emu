@@ -31,7 +31,7 @@ pub enum RoundingMode {
 pub struct ExceptionFlags(u8);
 
 impl ExceptionFlags {
-    /// Indicates that target-precision rounding discarded nonzero information.
+    /// Indicates an inexact result, including the flag that accompanies overflow.
     pub const INEXACT: Self = Self(1 << 0);
     /// Indicates a tiny and inexact result under after-rounding tininess detection.
     pub const UNDERFLOW: Self = Self(1 << 1);

@@ -481,144 +481,103 @@ fn validate_float_flags(flags: ExceptionFlags, nonzero_subnormal: bool) {
 }
 
 impl SoftFloatBackend {
-    /// Adds two IEEE binary32 values supplied as raw `u32` bit patterns.
+    /// Adds two IEEE binary32 raw `u32` bit patterns.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains the raw binary32 result and may report `INVALID`, `OVERFLOW`,
-    /// or `INEXACT`. Its rounding facts record post-precision tininess and
-    /// discarded precision. Standard quiet NaN operands do not themselves
-    /// report [`ExceptionFlags::INVALID`];
-    /// signaling NaNs do, and every NaN result is canonical `0x7FC00000`.
-    /// Guest status, trap, payload, and denormal policies are not applied.
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u32>`]
+    /// contains raw binary32 result bits and may report `INVALID`, `OVERFLOW`,
+    /// or `INEXACT`.
     #[must_use]
     pub fn add_f32(&self, a: u32, b: u32, rounding: RoundingMode) -> Outcome<u32> {
         outcome_f32(ffi::add_f32(a, b, encode_rounding(rounding)))
     }
 
-    /// Subtracts two IEEE binary32 values supplied as raw `u32` bit patterns.
+    /// Subtracts two IEEE binary32 raw `u32` bit patterns.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains the raw binary32 result and may report `INVALID`, `OVERFLOW`,
-    /// or `INEXACT`. Its rounding facts record post-precision tininess and
-    /// discarded precision. Standard quiet NaN operands do not themselves
-    /// report [`ExceptionFlags::INVALID`];
-    /// signaling NaNs do, and every NaN result is canonical `0x7FC00000`.
-    /// Guest status, trap, payload, and denormal policies are not applied.
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u32>`]
+    /// contains raw binary32 result bits and may report `INVALID`, `OVERFLOW`,
+    /// or `INEXACT`.
     #[must_use]
     pub fn sub_f32(&self, a: u32, b: u32, rounding: RoundingMode) -> Outcome<u32> {
         outcome_f32(ffi::sub_f32(a, b, encode_rounding(rounding)))
     }
 
-    /// Multiplies two IEEE binary32 values supplied as raw `u32` bit patterns.
+    /// Multiplies two IEEE binary32 raw `u32` bit patterns.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains the raw binary32 result and may report `INVALID`, `OVERFLOW`,
-    /// `UNDERFLOW`, or `INEXACT`. Its rounding facts record post-precision
-    /// tininess and discarded precision. Standard quiet NaN operands do not
-    /// themselves report [`ExceptionFlags::INVALID`];
-    /// signaling NaNs do, and every NaN result is canonical `0x7FC00000`.
-    /// Guest status, trap, payload, and denormal policies are not applied.
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u32>`]
+    /// contains raw binary32 result bits and may report `INVALID`, `OVERFLOW`,
+    /// `UNDERFLOW`, or `INEXACT`.
     #[must_use]
     pub fn mul_f32(&self, a: u32, b: u32, rounding: RoundingMode) -> Outcome<u32> {
         outcome_f32(ffi::mul_f32(a, b, encode_rounding(rounding)))
     }
 
-    /// Divides two IEEE binary32 values supplied as raw `u32` bit patterns.
+    /// Divides two IEEE binary32 raw `u32` bit patterns.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains the raw binary32 result and may report `INVALID`,
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u32>`]
+    /// contains raw binary32 result bits and may report `INVALID`,
     /// [`ExceptionFlags::DIVIDE_BY_ZERO`], `OVERFLOW`, `UNDERFLOW`, or
-    /// `INEXACT`. Its rounding facts record post-precision tininess and
-    /// discarded precision. Standard quiet NaN operands do not themselves
-    /// report invalid; signaling NaNs do, and
-    /// every NaN result is canonical `0x7FC00000`. Guest exception policy is
-    /// not applied.
+    /// `INEXACT`.
     #[must_use]
     pub fn div_f32(&self, a: u32, b: u32, rounding: RoundingMode) -> Outcome<u32> {
         outcome_f32(ffi::div_f32(a, b, encode_rounding(rounding)))
     }
 
-    /// Computes the square root of an IEEE binary32 raw `u32` bit pattern.
+    /// Computes an IEEE binary32 square root from a raw `u32` bit pattern.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains the raw binary32 result and may report `INVALID` or `INEXACT`;
-    /// its rounding facts record tininess and discarded precision. A standard
-    /// quiet NaN does not itself report invalid; a signaling NaN or a negative
-    /// nonzero finite operand reports
-    /// [`ExceptionFlags::INVALID`]. NaN results are canonical `0x7FC00000`.
-    /// Guest exception and result policies are not applied.
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u32>`]
+    /// contains raw binary32 result bits and may report `INEXACT`. A negative
+    /// nonzero finite operand reports [`ExceptionFlags::INVALID`].
     #[must_use]
     pub fn sqrt_f32(&self, value: u32, rounding: RoundingMode) -> Outcome<u32> {
         outcome_f32(ffi::sqrt_f32(value, encode_rounding(rounding)))
     }
 
-    /// Adds two IEEE binary64 values supplied as raw `u64` bit patterns.
+    /// Adds two IEEE binary64 raw `u64` bit patterns.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains the raw binary64 result and may report `INVALID`, `OVERFLOW`,
-    /// or `INEXACT`. Its rounding facts record post-precision tininess and
-    /// discarded precision. Standard quiet NaN operands do not themselves
-    /// report [`ExceptionFlags::INVALID`];
-    /// signaling NaNs do, and every NaN result is canonical
-    /// `0x7FF8000000000000`. Guest policies are not applied.
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u64>`]
+    /// contains raw binary64 result bits and may report `INVALID`, `OVERFLOW`,
+    /// or `INEXACT`.
     #[must_use]
     pub fn add_f64(&self, a: u64, b: u64, rounding: RoundingMode) -> Outcome<u64> {
         outcome_f64(ffi::add_f64(a, b, encode_rounding(rounding)))
     }
 
-    /// Subtracts two IEEE binary64 values supplied as raw `u64` bit patterns.
+    /// Subtracts two IEEE binary64 raw `u64` bit patterns.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains the raw binary64 result and may report `INVALID`, `OVERFLOW`,
-    /// or `INEXACT`. Its rounding facts record post-precision tininess and
-    /// discarded precision. Standard quiet NaN operands do not themselves
-    /// report [`ExceptionFlags::INVALID`];
-    /// signaling NaNs do, and every NaN result is canonical
-    /// `0x7FF8000000000000`. Guest policies are not applied.
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u64>`]
+    /// contains raw binary64 result bits and may report `INVALID`, `OVERFLOW`,
+    /// or `INEXACT`.
     #[must_use]
     pub fn sub_f64(&self, a: u64, b: u64, rounding: RoundingMode) -> Outcome<u64> {
         outcome_f64(ffi::sub_f64(a, b, encode_rounding(rounding)))
     }
 
-    /// Multiplies two IEEE binary64 values supplied as raw `u64` bit patterns.
+    /// Multiplies two IEEE binary64 raw `u64` bit patterns.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains the raw binary64 result and may report `INVALID`, `OVERFLOW`,
-    /// `UNDERFLOW`, or `INEXACT`. Its rounding facts record post-precision
-    /// tininess and discarded precision. Standard quiet NaN operands do not
-    /// themselves report [`ExceptionFlags::INVALID`];
-    /// signaling NaNs do, and every NaN result is canonical
-    /// `0x7FF8000000000000`. Guest policies are not applied.
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u64>`]
+    /// contains raw binary64 result bits and may report `INVALID`, `OVERFLOW`,
+    /// `UNDERFLOW`, or `INEXACT`.
     #[must_use]
     pub fn mul_f64(&self, a: u64, b: u64, rounding: RoundingMode) -> Outcome<u64> {
         outcome_f64(ffi::mul_f64(a, b, encode_rounding(rounding)))
     }
 
-    /// Divides two IEEE binary64 values supplied as raw `u64` bit patterns.
+    /// Divides two IEEE binary64 raw `u64` bit patterns.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains the raw binary64 result and may report `INVALID`,
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u64>`]
+    /// contains raw binary64 result bits and may report `INVALID`,
     /// [`ExceptionFlags::DIVIDE_BY_ZERO`], `OVERFLOW`, `UNDERFLOW`, or
-    /// `INEXACT`. Its rounding facts record post-precision tininess and
-    /// discarded precision. Standard quiet NaN operands do not themselves
-    /// report invalid; signaling NaNs do, and
-    /// every NaN result is canonical `0x7FF8000000000000`. Guest exception
-    /// policy is not applied.
+    /// `INEXACT`.
     #[must_use]
     pub fn div_f64(&self, a: u64, b: u64, rounding: RoundingMode) -> Outcome<u64> {
         outcome_f64(ffi::div_f64(a, b, encode_rounding(rounding)))
     }
 
-    /// Computes the square root of an IEEE binary64 raw `u64` bit pattern.
+    /// Computes an IEEE binary64 square root from a raw `u64` bit pattern.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains the raw binary64 result and may report `INVALID` or `INEXACT`;
-    /// its rounding facts record tininess and discarded precision. A standard
-    /// quiet NaN does not itself report invalid; a signaling NaN or a negative
-    /// nonzero finite operand reports
-    /// [`ExceptionFlags::INVALID`]. NaN results are canonical
-    /// `0x7FF8000000000000`. Guest exception and result policies are not
-    /// applied.
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u64>`]
+    /// contains raw binary64 result bits and may report `INEXACT`. A negative
+    /// nonzero finite operand reports [`ExceptionFlags::INVALID`].
     #[must_use]
     pub fn sqrt_f64(&self, value: u64, rounding: RoundingMode) -> Outcome<u64> {
         outcome_f64(ffi::sqrt_f64(value, encode_rounding(rounding)))
@@ -626,11 +585,9 @@ impl SoftFloatBackend {
 
     /// Quietly compares two IEEE binary32 raw `u32` bit patterns.
     ///
-    /// The returned [`Relation`] preserves numeric ordering and treats both
-    /// zero signs as equal. Any NaN produces [`Relation::Unordered`]; a standard
-    /// quiet NaN does not report invalid, while a signaling NaN reports
-    /// [`ExceptionFlags::INVALID`]. Both rounding facts are always `false`.
-    /// No guest condition encoding, status update, or trap policy is applied.
+    /// The returned [`Outcome<Relation>`] treats both zero signs as equal and
+    /// any NaN operand as [`Relation::Unordered`]. Comparison accepts no
+    /// rounding mode, and both rounding facts are `false`.
     #[must_use]
     pub fn compare_f32(&self, a: u32, b: u32) -> Outcome<Relation> {
         outcome_relation(ffi::compare_f32(a, b))
@@ -638,133 +595,115 @@ impl SoftFloatBackend {
 
     /// Quietly compares two IEEE binary64 raw `u64` bit patterns.
     ///
-    /// The returned [`Relation`] preserves numeric ordering and treats both
-    /// zero signs as equal. Any NaN produces [`Relation::Unordered`]; a standard
-    /// quiet NaN does not report invalid, while a signaling NaN reports
-    /// [`ExceptionFlags::INVALID`]. Both rounding facts are always `false`.
-    /// No guest condition encoding, status update, or trap policy is applied.
+    /// The returned [`Outcome<Relation>`] treats both zero signs as equal and
+    /// any NaN operand as [`Relation::Unordered`]. Comparison accepts no
+    /// rounding mode, and both rounding facts are `false`.
     #[must_use]
     pub fn compare_f64(&self, a: u64, b: u64) -> Outcome<Relation> {
         outcome_relation(ffi::compare_f64(a, b))
     }
 
-    /// Widens an IEEE binary32 raw `u32` bit pattern to binary64.
+    /// Widens an IEEE binary32 raw `u32` bit pattern to binary64 raw `u64` bits.
     ///
-    /// Finite values widen exactly, so no rounding mode is accepted and both
-    /// rounding facts are `false`. The returned [`Outcome`] contains a raw
-    /// binary64 `u64` result. A standard quiet NaN does not report invalid; a
-    /// signaling NaN reports [`ExceptionFlags::INVALID`], and either produces
-    /// canonical `0x7FF8000000000000`. Guest NaN and exception policies are
-    /// not applied.
+    /// Every finite input widens exactly, so no rounding mode is accepted. The
+    /// returned [`Outcome<u64>`] has both rounding facts set to `false`.
     #[must_use]
     pub fn f32_to_f64(&self, value: u32) -> Outcome<u64> {
         outcome_f64(ffi::f32_to_f64(value))
     }
 
-    /// Narrows an IEEE binary64 raw `u64` bit pattern to binary32.
+    /// Narrows an IEEE binary64 raw `u64` bit pattern to binary32 raw `u32` bits.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
-    /// contains a raw binary32 `u32` result and may report `INVALID`,
-    /// `OVERFLOW`, `UNDERFLOW`, or `INEXACT`. Its rounding facts record
-    /// post-precision tininess and discarded precision. A standard quiet
-    /// NaN does not report invalid; a signaling NaN does, and all NaN results
-    /// are canonical `0x7FC00000`. Guest result and exception policies are not
-    /// applied.
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u32>`]
+    /// may report `INVALID`, `OVERFLOW`, `UNDERFLOW`, or `INEXACT`.
     #[must_use]
     pub fn f64_to_f32(&self, value: u64, rounding: RoundingMode) -> Outcome<u32> {
         outcome_f32(ffi::f64_to_f32(value, encode_rounding(rounding)))
     }
 
-    /// Converts an `i32` value to an IEEE binary32 raw `u32` bit pattern.
+    /// Converts a signed `i32` to an IEEE binary32 raw `u32` bit pattern.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u32>`]
     /// reports [`ExceptionFlags::INEXACT`] and discarded precision when the
-    /// integer is not exactly representable; post-rounding tininess is always
-    /// `false`. No guest status or exception policy is applied.
+    /// integer is not exactly representable; tininess is always `false`.
     #[must_use]
     pub fn i32_to_f32(&self, value: i32, rounding: RoundingMode) -> Outcome<u32> {
         outcome_f32(ffi::i32_to_f32(value, encode_rounding(rounding)))
     }
 
-    /// Converts an `i64` value to an IEEE binary32 raw `u32` bit pattern.
+    /// Converts a signed `i64` to an IEEE binary32 raw `u32` bit pattern.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u32>`]
     /// reports [`ExceptionFlags::INEXACT`] and discarded precision when the
-    /// integer is not exactly representable; post-rounding tininess is always
-    /// `false`. No guest status or exception policy is applied.
+    /// integer is not exactly representable; tininess is always `false`.
     #[must_use]
     pub fn i64_to_f32(&self, value: i64, rounding: RoundingMode) -> Outcome<u32> {
         outcome_f32(ffi::i64_to_f32(value, encode_rounding(rounding)))
     }
 
-    /// Converts an `i32` value exactly to an IEEE binary64 raw `u64` bit pattern.
+    /// Converts a signed `i32` exactly to an IEEE binary64 raw `u64` bit pattern.
     ///
     /// No rounding mode is accepted because every `i32` is representable. The
-    /// returned [`Outcome`] has empty flags and both rounding facts are
-    /// `false`. No guest status or exception policy is applied.
+    /// returned [`Outcome<u64>`] has empty flags and both rounding facts are
+    /// `false`.
     #[must_use]
     pub fn i32_to_f64(&self, value: i32) -> Outcome<u64> {
         outcome_f64(ffi::i32_to_f64(value))
     }
 
-    /// Converts an `i64` value to an IEEE binary64 raw `u64` bit pattern.
+    /// Converts a signed `i64` to an IEEE binary64 raw `u64` bit pattern.
     ///
-    /// `rounding` selects the rounding direction. The returned [`Outcome`]
+    /// `rounding` selects the rounding direction. The returned [`Outcome<u64>`]
     /// reports [`ExceptionFlags::INEXACT`] and discarded precision when the
-    /// integer is not exactly representable; post-rounding tininess is always
-    /// `false`. No guest status or exception policy is applied.
+    /// integer is not exactly representable; tininess is always `false`.
     #[must_use]
     pub fn i64_to_f64(&self, value: i64, rounding: RoundingMode) -> Outcome<u64> {
         outcome_f64(ffi::i64_to_f64(value, encode_rounding(rounding)))
     }
 
-    /// Converts an IEEE binary32 raw `u32` bit pattern to `i32`.
+    /// Converts an IEEE binary32 raw `u32` bit pattern to a signed `i32`.
     ///
     /// `rounding` selects the integer rounding direction. A finite in-range
     /// conversion returns `Some` and reports [`ExceptionFlags::INEXACT`] when
     /// fractional information is discarded. Any NaN, infinity, or out-of-range
-    /// result returns `None` with only [`ExceptionFlags::INVALID`]; the C
-    /// sentinel is ignored. Tininess is always `false`, and no guest exception
-    /// or integer-result policy is applied.
+    /// result returns `None` with only [`ExceptionFlags::INVALID`]. The returned
+    /// [`Outcome<Option<i32>>`] has tininess set to `false`.
     #[must_use]
     pub fn f32_to_i32(&self, value: u32, rounding: RoundingMode) -> Outcome<Option<i32>> {
         outcome_integer(ffi::f32_to_i32(value, encode_rounding(rounding)))
     }
 
-    /// Converts an IEEE binary32 raw `u32` bit pattern to `i64`.
+    /// Converts an IEEE binary32 raw `u32` bit pattern to a signed `i64`.
     ///
     /// `rounding` selects the integer rounding direction. A finite in-range
     /// conversion returns `Some` and reports [`ExceptionFlags::INEXACT`] when
     /// fractional information is discarded. Any NaN, infinity, or out-of-range
-    /// result returns `None` with only [`ExceptionFlags::INVALID`]; the C
-    /// sentinel is ignored. Tininess is always `false`, and no guest exception
-    /// or integer-result policy is applied.
+    /// result returns `None` with only [`ExceptionFlags::INVALID`]. The returned
+    /// [`Outcome<Option<i64>>`] has tininess set to `false`.
     #[must_use]
     pub fn f32_to_i64(&self, value: u32, rounding: RoundingMode) -> Outcome<Option<i64>> {
         outcome_integer(ffi::f32_to_i64(value, encode_rounding(rounding)))
     }
 
-    /// Converts an IEEE binary64 raw `u64` bit pattern to `i32`.
+    /// Converts an IEEE binary64 raw `u64` bit pattern to a signed `i32`.
     ///
     /// `rounding` selects the integer rounding direction. A finite in-range
     /// conversion returns `Some` and reports [`ExceptionFlags::INEXACT`] when
     /// fractional information is discarded. Any NaN, infinity, or out-of-range
-    /// result returns `None` with only [`ExceptionFlags::INVALID`]; the C
-    /// sentinel is ignored. Tininess is always `false`, and no guest exception
-    /// or integer-result policy is applied.
+    /// result returns `None` with only [`ExceptionFlags::INVALID`]. The returned
+    /// [`Outcome<Option<i32>>`] has tininess set to `false`.
     #[must_use]
     pub fn f64_to_i32(&self, value: u64, rounding: RoundingMode) -> Outcome<Option<i32>> {
         outcome_integer(ffi::f64_to_i32(value, encode_rounding(rounding)))
     }
 
-    /// Converts an IEEE binary64 raw `u64` bit pattern to `i64`.
+    /// Converts an IEEE binary64 raw `u64` bit pattern to a signed `i64`.
     ///
     /// `rounding` selects the integer rounding direction. A finite in-range
     /// conversion returns `Some` and reports [`ExceptionFlags::INEXACT`] when
     /// fractional information is discarded. Any NaN, infinity, or out-of-range
-    /// result returns `None` with only [`ExceptionFlags::INVALID`]; the C
-    /// sentinel is ignored. Tininess is always `false`, and no guest exception
-    /// or integer-result policy is applied.
+    /// result returns `None` with only [`ExceptionFlags::INVALID`]. The returned
+    /// [`Outcome<Option<i64>>`] has tininess set to `false`.
     #[must_use]
     pub fn f64_to_i64(&self, value: u64, rounding: RoundingMode) -> Outcome<Option<i64>> {
         outcome_integer(ffi::f64_to_i64(value, encode_rounding(rounding)))
