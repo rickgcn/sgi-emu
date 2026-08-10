@@ -1,0 +1,53 @@
+#ifndef SE_FLOAT_RENAME_H
+#define SE_FLOAT_RENAME_H
+
+#define extF80_roundingPrecision se_float_sf_extF80_roundingPrecision
+#define f32_add se_float_sf_f32_add
+#define f32_div se_float_sf_f32_div
+#define f32_eq se_float_sf_f32_eq
+#define f32_lt_quiet se_float_sf_f32_lt_quiet
+#define f32_mul se_float_sf_f32_mul
+#define f32_sqrt se_float_sf_f32_sqrt
+#define f32_sub se_float_sf_f32_sub
+#define f32_to_f64 se_float_sf_f32_to_f64
+#define f32_to_i32 se_float_sf_f32_to_i32
+#define f32_to_i64 se_float_sf_f32_to_i64
+#define f64_add se_float_sf_f64_add
+#define f64_div se_float_sf_f64_div
+#define f64_eq se_float_sf_f64_eq
+#define f64_lt_quiet se_float_sf_f64_lt_quiet
+#define f64_mul se_float_sf_f64_mul
+#define f64_sqrt se_float_sf_f64_sqrt
+#define f64_sub se_float_sf_f64_sub
+#define f64_to_f32 se_float_sf_f64_to_f32
+#define f64_to_i32 se_float_sf_f64_to_i32
+#define f64_to_i64 se_float_sf_f64_to_i64
+#define i32_to_f32 se_float_sf_i32_to_f32
+#define i32_to_f64 se_float_sf_i32_to_f64
+#define i64_to_f32 se_float_sf_i64_to_f32
+#define i64_to_f64 se_float_sf_i64_to_f64
+#define softfloat_addMagsF32 se_float_sf_addMagsF32
+#define softfloat_addMagsF64 se_float_sf_addMagsF64
+#define softfloat_approxRecip_1k0s se_float_sf_approxRecip_1k0s
+#define softfloat_approxRecip_1k1s se_float_sf_approxRecip_1k1s
+#define softfloat_approxRecipSqrt_1k0s se_float_sf_approxRecipSqrt_1k0s
+#define softfloat_approxRecipSqrt_1k1s se_float_sf_approxRecipSqrt_1k1s
+#define softfloat_countLeadingZeros8 se_float_sf_countLeadingZeros8
+#define softfloat_detectTininess se_float_sf_detectTininess
+#define softfloat_exceptionFlags se_float_sf_exceptionFlags
+#define softfloat_normRoundPackToF32 se_float_sf_normRoundPackToF32
+#define softfloat_normRoundPackToF64 se_float_sf_normRoundPackToF64
+#define softfloat_normSubnormalF32Sig se_float_sf_normSubnormalF32Sig
+#define softfloat_normSubnormalF64Sig se_float_sf_normSubnormalF64Sig
+#define softfloat_propagateNaNF32UI se_float_sf_propagateNaNF32UI
+#define softfloat_propagateNaNF64UI se_float_sf_propagateNaNF64UI
+#define softfloat_raiseFlags se_float_sf_raiseFlags
+#define softfloat_roundingMode se_float_sf_roundingMode
+#define softfloat_roundPackToF32 se_float_sf_roundPackToF32
+#define softfloat_roundPackToF64 se_float_sf_roundPackToF64
+#define softfloat_roundToI32 se_float_sf_roundToI32
+#define softfloat_roundToI64 se_float_sf_roundToI64
+#define softfloat_subMagsF32 se_float_sf_subMagsF32
+#define softfloat_subMagsF64 se_float_sf_subMagsF64
+
+#endif
