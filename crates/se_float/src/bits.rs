@@ -3,12 +3,10 @@
 //! These helpers describe only standard IEEE encodings. Guest NaN polarity,
 //! register formats, and denormal policies remain outside this module.
 
-#[cfg(test)]
 pub(crate) const fn is_nonzero_subnormal_f32(bits: u32) -> bool {
     bits & 0x7f80_0000 == 0 && bits & 0x007f_ffff != 0
 }
 
-#[cfg(test)]
 pub(crate) const fn is_nonzero_subnormal_f64(bits: u64) -> bool {
     bits & 0x7ff0_0000_0000_0000 == 0 && bits & 0x000f_ffff_ffff_ffff != 0
 }

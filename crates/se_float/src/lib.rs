@@ -26,7 +26,11 @@ pub mod env;
 /// rounding modes or exception state between calls. The engine preserves
 /// gradual underflow, reports per-operation flags and rounding facts, and uses
 /// positive canonical quiet NaNs `0x7FC00000` and `0x7FF8000000000000` for
-/// binary32 and binary64 results.
+/// binary32 and binary64 results. Standard quiet NaN operands do not
+/// themselves report invalid, while signaling NaNs do. Conversion of any NaN
+/// to a signed integer reports invalid and returns `None`. Guest NaN polarity,
+/// payload selection, status-register updates, traps, and denormal policy
+/// remain the caller's responsibility.
 #[derive(Debug, Default)]
 pub struct SoftFloatBackend;
 
