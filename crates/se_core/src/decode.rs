@@ -569,7 +569,7 @@ struct ResolvedRoute {
 pub enum DeviceSlotError {
     /// The registry contains no such identity.
     UnknownDevice(DeviceId),
-    /// The device is already out for an event callback or external operation.
+    /// The device is already out for an event callback or internal operation.
     DeviceTaken(DeviceId),
     /// A put operation targeted a slot that still contains its device.
     DevicePresent(DeviceId),
@@ -598,7 +598,7 @@ impl Error for DeviceSlotError {}
 /// Reports a failure to dispatch a scheduled device event.
 #[derive(Debug)]
 pub enum DeviceDispatchError {
-    /// The destination cannot be taken from the device registry.
+    /// The destination cannot be taken from or returned to the device registry.
     Slot(DeviceSlotError),
     /// The destination device rejected its event callback.
     Device(DeviceError),
@@ -628,6 +628,8 @@ impl Error for DeviceDispatchError {
 /// Block transfers may cross adjacent mappings and are split in increasing address
 /// order, so a later fault can occur after earlier chunks have completed. A direct
 /// span is limited to the current mapping before the device receives the request.
+/// Device-slot extraction and replacement remain crate-internal so callers cannot
+/// substitute a different device behind a stable [`DeviceId`].
 ///
 /// Taking a device temporarily leaves its identity and routes intact. Transactions
 /// through any of its windows then return [`BusFault::Fault`] until the device is
@@ -761,7 +763,7 @@ impl Decoder {
         }
     }
 
-    /// Temporarily removes a device while retaining its identity and routes.
+    /// Temporarily removes a device for crate-internal callback dispatch.
     ///
     /// Until [`Self::put_device`] returns it, transactions through all of its
     /// windows fail with [`BusFault::Fault`].
@@ -771,7 +773,7 @@ impl Decoder {
     /// Returns [`DeviceSlotError::UnknownDevice`] when `id` is outside the
     /// registry, or [`DeviceSlotError::DeviceTaken`] when its slot is already
     /// empty.
-    pub fn take_device(&mut self, id: DeviceId) -> Result<Box<dyn Device>, DeviceSlotError> {
+    pub(crate) fn take_device(&mut self, id: DeviceId) -> Result<Box<dyn Device>, DeviceSlotError> {
         let slot = self
             .devices
             .get_mut(id.get() as usize)
@@ -779,15 +781,17 @@ impl Decoder {
         slot.take().ok_or(DeviceSlotError::DeviceTaken(id))
     }
 
-    /// Returns a temporarily removed device to its exact registry slot.
+    /// Returns a temporarily removed device to its crate-internal registry slot.
     ///
-    /// On failure, the error tuple returns ownership of `device` to the caller.
+    /// The caller must use the identity associated with the matching
+    /// [`Self::take_device`] operation. On failure, the error tuple returns
+    /// ownership of `device` to the caller.
     ///
     /// # Errors
     ///
     /// Returns [`DeviceSlotError::UnknownDevice`] when `id` is outside the
     /// registry, or [`DeviceSlotError::DevicePresent`] when the slot is occupied.
-    pub fn put_device(
+    pub(crate) fn put_device(
         &mut self,
         id: DeviceId,
         device: Box<dyn Device>,
@@ -811,9 +815,9 @@ impl Decoder {
     ///
     /// # Errors
     ///
-    /// Returns [`DeviceDispatchError::Slot`] if the target identity cannot be
-    /// taken, or [`DeviceDispatchError::Device`] if [`Device::on_event`] rejects
-    /// the callback.
+    /// Returns [`DeviceDispatchError::Slot`] if the crate-internal slot protocol
+    /// cannot take or restore the target, or [`DeviceDispatchError::Device`] if
+    /// [`Device::on_event`] rejects the callback.
     pub fn dispatch_event(
         &mut self,
         event: ScheduledEvent,
@@ -831,8 +835,10 @@ impl Decoder {
             };
             device.on_event(event.tag, event.payload, &mut context)
         };
-        self.devices[id.get() as usize] = Some(device);
-        result.map_err(DeviceDispatchError::Device)
+        match self.put_device(id, device) {
+            Ok(()) => result.map_err(DeviceDispatchError::Device),
+            Err((error, _)) => Err(DeviceDispatchError::Slot(error)),
+        }
     }
 
     /// Returns counts describing the selected compiled representations.
