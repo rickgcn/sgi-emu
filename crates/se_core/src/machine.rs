@@ -28,7 +28,7 @@ pub enum CpuExit {
     Deadline,
     /// A scheduling change invalidated the current burst deadline.
     Reschedule,
-    /// Pending host-control work ended the burst.
+    /// Pending host-control work ended the burst at a CPU safe point.
     HostWake,
     /// A debugger breakpoint ended the burst.
     Breakpoint,
@@ -163,8 +163,12 @@ pub trait Machine: SnapshotTarget + Introspect {
     ///
     /// Before returning [`CpuExit::HostWake`], the CPU complex consumes the
     /// corresponding [`crate::interrupt::HOST_WAKE`] doorbell with acquire
-    /// ordering without changing guest interrupt lines. The runtime then drains
-    /// its host-control channel before resuming guest execution.
+    /// ordering at a CPU safe point without changing guest interrupt lines. A
+    /// safe point has no partially committed instruction and has committed local
+    /// CPU time and state. It includes method entry at the current machine time,
+    /// even when that time lies between instruction retirement boundaries, so a
+    /// host wake never requires advancing to the next boundary. The runtime then
+    /// drains its host-control channel before resuming guest execution.
     ///
     /// # Errors
     ///

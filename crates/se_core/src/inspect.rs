@@ -4,6 +4,9 @@
 //! [`Introspect::execute`] writes command output through [`std::fmt::Write`]. A
 //! command's [`InspectCommand::mutates_state`] flag declares guest-visible
 //! mutation for callers; the interface does not enforce that declaration.
+//! Command output is presentation text, not a stable structured-state schema.
+//! Typed debugger or user-interface data belongs on a separate query surface and
+//! must not be reconstructed by parsing this output.
 
 use std::error::Error;
 use std::fmt;
@@ -85,7 +88,10 @@ impl From<fmt::Error> for InspectError {
     }
 }
 
-/// Exposes an object-safe introspection command surface.
+/// Exposes an object-safe text-command surface for monitors and diagnostics.
+///
+/// Command output has no typed compatibility contract. Structured debugger and
+/// user-interface clients use a separate data model rather than parsing it.
 pub trait Introspect {
     /// Returns the target's ordered command manifest.
     fn commands(&self) -> &[InspectCommand];
