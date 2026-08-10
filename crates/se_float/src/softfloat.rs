@@ -852,6 +852,34 @@ mod source_contract_tests {
     }
 
     #[test]
+    fn c_warning_profiles_keep_diagnostics_enabled() {
+        let build_script = include_str!("../build.rs");
+
+        for forbidden in [
+            ".warnings(false)",
+            ".extra_warnings(false)",
+            "flag(\"-w\")",
+            "flag(\"-W0\")",
+            "flag(\"/W0\")",
+            "flag_if_supported",
+        ] {
+            assert!(!build_script.contains(forbidden));
+        }
+        for required in [
+            "flag(\"-Wall\")",
+            "flag(\"-Wextra\")",
+            "flag(\"-Wpedantic\")",
+            "flag(\"-Werror\")",
+            "flag(\"/W4\")",
+            "flag(\"/WX\")",
+        ] {
+            assert_eq!(occurrences(build_script, required), 1);
+        }
+        assert_eq!(occurrences(build_script, "-Wno-unused-parameter"), 1);
+        assert_eq!(occurrences(build_script, "-Wno-unused-variable"), 1);
+    }
+
+    #[test]
     fn platform_and_round_pack_replacements_are_unique() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let build_script = include_str!("../build.rs");

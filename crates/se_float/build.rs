@@ -228,8 +228,6 @@ fn configured_build(
     build
         .target(target)
         .std("c11")
-        .warnings(false)
-        .extra_warnings(false)
         .include(csrc_dir)
         .include(source_dir.join("RISCV"))
         .include(source_dir.join("include"))
@@ -267,10 +265,17 @@ fn strict_warnings(build: &mut cc::Build, profile: CompilerProfile) {
 
 fn upstream_warnings(build: &mut cc::Build, profile: CompilerProfile) {
     strict_warnings(build, profile);
-    if let CompilerProfile::Msvc = profile {
-        build.flag("/wd4100");
-        build.flag("/wd4101");
-        build.flag("/wd4146");
-        build.flag("/wd4244");
+    match profile {
+        CompilerProfile::Gcc => {
+            build.flag("-Wno-unused-parameter");
+            build.flag("-Wno-unused-variable");
+        }
+        CompilerProfile::AppleClang => {}
+        CompilerProfile::Msvc => {
+            build.flag("/wd4100");
+            build.flag("/wd4101");
+            build.flag("/wd4146");
+            build.flag("/wd4244");
+        }
     }
 }
