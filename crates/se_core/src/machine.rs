@@ -26,8 +26,8 @@ use crate::time::VTime;
 pub enum CpuExit {
     /// The CPU complex reached the requested virtual-time deadline.
     Deadline,
-    /// A guest interrupt or burst truncation request ended the burst.
-    Interrupt,
+    /// A scheduling change invalidated the current burst deadline.
+    Reschedule,
     /// Pending host-control work ended the burst.
     HostWake,
     /// A debugger breakpoint ended the burst.
@@ -155,10 +155,16 @@ pub trait Machine: SnapshotTarget + Introspect {
     /// reasons may return earlier, and no successful call moves machine time beyond
     /// a finite deadline.
     ///
+    /// [`CpuExit::Reschedule`] reports an event-truncation request. The runtime
+    /// queries the next event deadline again before resuming the CPU complex.
+    /// Guest interrupt lines do not produce a machine exit: the CPU architecture
+    /// samples them, enters its guest exception state when enabled, and continues
+    /// execution until another exit reason applies.
+    ///
     /// Before returning [`CpuExit::HostWake`], the CPU complex consumes the
-    /// corresponding [`crate::interrupt::HOST_WAKE`] doorbell without changing
-    /// guest interrupt lines. The runtime then drains its separately synchronized
-    /// host-control channel before resuming guest execution.
+    /// corresponding [`crate::interrupt::HOST_WAKE`] doorbell with acquire
+    /// ordering without changing guest interrupt lines. The runtime then drains
+    /// its host-control channel before resuming guest execution.
     ///
     /// # Errors
     ///

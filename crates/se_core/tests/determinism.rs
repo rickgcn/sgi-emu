@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use se_core::device::DeviceId;
 use se_core::event::{ScheduleToken, ScheduledEvent, SchedulerShared};
 use se_core::inspect::{InspectCommand, InspectError, Introspect};
-use se_core::interrupt::{EVENT_TRUNCATE, GUEST_INTERRUPT_MASK, HOST_WAKE, InterruptWord};
+use se_core::interrupt::{
+    EVENT_TRUNCATE, GUEST_INTERRUPT_MASK, HOST_WAKE, InterruptSink, InterruptWord, WordLineSink,
+};
 use se_core::machine::{
     CpuExit, Machine, MachineCreateError, MachineError, MachineFactory, StateDigest,
 };
@@ -22,7 +24,8 @@ const DEVICE: DeviceId = DeviceId::from_raw(0);
 const INSTRUCTION_NS: VTime = 10;
 const PERIODIC_TAG: u32 = 1;
 const INTERRUPT_TAG: u32 = 2;
-const INTERRUPT_LINE: u64 = 1 << 4;
+const INTERRUPT_LINE: u8 = 4;
+const INTERRUPT_MASK: u64 = 1 << INTERRUPT_LINE;
 
 #[derive(Serialize, Deserialize)]
 struct CpuState {
@@ -30,7 +33,6 @@ struct CpuState {
     next_boundary: VTime,
     accumulator: u64,
     interrupt_seen_at: Option<u64>,
-    pending_interrupts: u64,
     schedule_at_retired: Option<u64>,
 }
 
@@ -48,12 +50,15 @@ struct DeviceState {
     dispatch_count: u64,
     last_event_time: Option<u64>,
     token: Option<u64>,
+    interrupt_asserted: bool,
 }
 
 struct MockDevice {
     dispatch_count: u64,
     last_event_time: Option<VTime>,
     token: Option<ScheduleToken>,
+    interrupt_asserted: bool,
+    interrupt_sink: WordLineSink,
 }
 
 struct DeterministicMachine {
@@ -65,6 +70,8 @@ struct DeterministicMachine {
 
 impl DeterministicMachine {
     fn new() -> Self {
+        let interrupt_word = InterruptWord::new();
+        let interrupt_sink = WordLineSink::new(interrupt_word.clone(), INTERRUPT_LINE).unwrap();
         Self {
             manifest: vec![
                 SnapshotComponent {
@@ -89,13 +96,15 @@ impl DeterministicMachine {
                 next_boundary: INSTRUCTION_NS,
                 accumulator: 0x1234_5678_9abc_def0,
                 interrupt_seen_at: None,
-                interrupt_word: InterruptWord::new(),
+                interrupt_word,
                 schedule_at_retired: None,
             },
             device: MockDevice {
                 dispatch_count: 0,
                 last_event_time: None,
                 token: None,
+                interrupt_asserted: false,
+                interrupt_sink,
             },
         }
     }
@@ -115,7 +124,6 @@ impl DeterministicMachine {
             next_boundary: self.cpu.next_boundary,
             accumulator: self.cpu.accumulator,
             interrupt_seen_at: self.cpu.interrupt_seen_at,
-            pending_interrupts: self.cpu.interrupt_word.load_relaxed() & GUEST_INTERRUPT_MASK,
             schedule_at_retired: self.cpu.schedule_at_retired,
         }
     }
@@ -125,7 +133,13 @@ impl DeterministicMachine {
             dispatch_count: self.device.dispatch_count,
             last_event_time: self.device.last_event_time,
             token: self.device.token.map(ScheduleToken::to_raw),
+            interrupt_asserted: self.device.interrupt_asserted,
         }
+    }
+
+    fn drive_interrupt_line(&mut self, asserted: bool) {
+        self.device.interrupt_asserted = asserted;
+        self.device.interrupt_sink.set(asserted);
     }
 }
 
@@ -160,11 +174,6 @@ impl SnapshotTarget for DeterministicMachine {
             "core/event-queue" => self.scheduler.load(version, reader),
             "cpu/0" => {
                 let state: CpuState = reader.deserialize()?;
-                if state.pending_interrupts & !GUEST_INTERRUPT_MASK != 0 {
-                    return Err(StateError::InvalidState(
-                        "CPU snapshot contains reserved interrupt bits".to_owned(),
-                    ));
-                }
                 let expected_next_boundary = state
                     .retired
                     .checked_add(1)
@@ -177,8 +186,6 @@ impl SnapshotTarget for DeterministicMachine {
                         "CPU snapshot contains an inconsistent clock phase".to_owned(),
                     ));
                 }
-                self.cpu.interrupt_word.clear_mask(GUEST_INTERRUPT_MASK);
-                self.cpu.interrupt_word.set_mask(state.pending_interrupts);
                 self.cpu.retired = state.retired;
                 self.cpu.next_boundary = state.next_boundary;
                 self.cpu.accumulator = state.accumulator;
@@ -191,6 +198,7 @@ impl SnapshotTarget for DeterministicMachine {
                 self.device.dispatch_count = state.dispatch_count;
                 self.device.last_event_time = state.last_event_time;
                 self.device.token = state.token.map(ScheduleToken::from_raw);
+                self.drive_interrupt_line(state.interrupt_asserted);
                 Ok(())
             }
             _ => Err(StateError::UnknownComponent(key.to_string())),
@@ -216,6 +224,12 @@ impl SnapshotTarget for DeterministicMachine {
         {
             return Err(StateError::InvalidState(
                 "device event token does not name a live event".to_owned(),
+            ));
+        }
+        let line_asserted = self.cpu.interrupt_word.load_relaxed() & INTERRUPT_MASK != 0;
+        if line_asserted != self.device.interrupt_asserted {
+            return Err(StateError::InvalidState(
+                "device interrupt state does not match its output line".to_owned(),
             ));
         }
         Ok(())
@@ -269,16 +283,17 @@ impl Machine for DeterministicMachine {
                 debug_assert!(consumed);
                 return Ok(CpuExit::HostWake);
             }
-            if self.now() == previous_boundary && pending & GUEST_INTERRUPT_MASK != 0 {
-                self.cpu.interrupt_seen_at = Some(self.now());
-                self.cpu.interrupt_word.clear_mask(GUEST_INTERRUPT_MASK);
-                return Ok(CpuExit::Interrupt);
-            }
             if pending & EVENT_TRUNCATE != 0 {
-                return Ok(CpuExit::Interrupt);
+                return Ok(CpuExit::Reschedule);
             }
             if self.now() == deadline {
                 return Ok(CpuExit::Deadline);
+            }
+            if self.now() == previous_boundary
+                && pending & GUEST_INTERRUPT_MASK != 0
+                && self.cpu.interrupt_seen_at.is_none()
+            {
+                self.cpu.interrupt_seen_at = Some(self.now());
             }
             let completion = self.cpu.next_boundary;
             if completion > deadline {
@@ -337,7 +352,7 @@ impl Machine for DeterministicMachine {
                 self.device.token = Some(token);
             }
             PERIODIC_TAG => {}
-            INTERRUPT_TAG => self.cpu.interrupt_word.set_mask(INTERRUPT_LINE),
+            INTERRUPT_TAG => self.drive_interrupt_line(true),
             _ => return Err(MachineError::Failed("unknown mock event tag".to_owned())),
         }
         Ok(())
@@ -413,7 +428,7 @@ fn off_grid_events_preserve_absolute_cpu_phase() {
 fn earlier_event_scheduled_inside_burst_requests_truncation() {
     let mut machine = DeterministicMachine::new();
     machine.cpu.schedule_at_retired = Some(2);
-    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Interrupt);
+    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Reschedule);
     assert_eq!(machine.now(), 20);
     assert_eq!(machine.front_event_time(), Some(30));
     assert_eq!(
@@ -423,19 +438,23 @@ fn earlier_event_scheduled_inside_burst_requests_truncation() {
 }
 
 #[test]
-fn interrupt_is_observed_at_exact_instruction_boundary() {
+fn guest_interrupt_is_handled_inside_cpu_at_exact_instruction_boundary() {
     let mut machine = DeterministicMachine::new();
     machine.schedule_at(30, INTERRUPT_TAG, 0);
     assert_eq!(machine.run_cpu_until(30).unwrap(), CpuExit::Deadline);
     let event = machine.pop_event().unwrap().unwrap();
     machine.dispatch_event(event).unwrap();
-    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Interrupt);
+    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Deadline);
     assert_eq!(machine.cpu.interrupt_seen_at, Some(30));
-    assert_eq!(machine.cpu.retired, 3);
+    assert_eq!(machine.cpu.retired, 10);
+    assert_eq!(
+        machine.cpu.interrupt_word.load_relaxed() & INTERRUPT_MASK,
+        INTERRUPT_MASK
+    );
 }
 
 #[test]
-fn equal_time_events_are_drained_before_interrupt_sampling() {
+fn equal_time_events_are_drained_before_guest_interrupt_sampling() {
     let mut machine = DeterministicMachine::new();
     machine.schedule_at(30, INTERRUPT_TAG, 0);
     machine.schedule_at(30, PERIODIC_TAG, 0);
@@ -444,30 +463,30 @@ fn equal_time_events_are_drained_before_interrupt_sampling() {
     assert_eq!(machine.cpu.interrupt_seen_at, None);
     assert_eq!(machine.cpu.retired, 3);
 
-    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Interrupt);
+    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Deadline);
     assert_eq!(machine.cpu.interrupt_seen_at, Some(30));
-    assert_eq!(machine.cpu.retired, 3);
+    assert_eq!(machine.cpu.retired, 10);
 }
 
 #[test]
-fn off_grid_interrupt_waits_for_the_next_instruction_boundary() {
+fn off_grid_guest_interrupt_waits_for_the_next_instruction_boundary() {
     let mut machine = DeterministicMachine::new();
     machine.schedule_at(25, INTERRUPT_TAG, 0);
     drive_until(&mut machine, 25);
     assert_eq!(machine.cpu.interrupt_seen_at, None);
     assert_eq!(machine.cpu.retired, 2);
 
-    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Interrupt);
+    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Deadline);
     assert_eq!(machine.cpu.interrupt_seen_at, Some(30));
-    assert_eq!(machine.cpu.retired, 3);
-    assert_eq!(machine.cpu.next_boundary, 40);
+    assert_eq!(machine.cpu.retired, 10);
+    assert_eq!(machine.cpu.next_boundary, 110);
 }
 
 #[test]
 fn host_wake_exits_without_advancing_guest_state() {
     let mut machine = DeterministicMachine::new();
     let wake = machine.cpu.interrupt_word.host_wake_handle();
-    machine.cpu.interrupt_word.set_mask(INTERRUPT_LINE);
+    machine.drive_interrupt_line(true);
     wake.request();
 
     assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::HostWake);
@@ -475,15 +494,17 @@ fn host_wake_exits_without_advancing_guest_state() {
     assert_eq!(machine.cpu.retired, 0);
     assert_eq!(machine.cpu.interrupt_word.load_relaxed() & HOST_WAKE, 0);
     assert_eq!(
-        machine.cpu.interrupt_word.load_relaxed() & INTERRUPT_LINE,
-        INTERRUPT_LINE
+        machine.cpu.interrupt_word.load_relaxed() & INTERRUPT_MASK,
+        INTERRUPT_MASK
     );
 
-    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Interrupt);
-    assert_eq!(machine.cpu.interrupt_seen_at, Some(0));
-    assert_eq!(machine.cpu.retired, 0);
     assert_eq!(machine.run_cpu_until(20).unwrap(), CpuExit::Deadline);
+    assert_eq!(machine.cpu.interrupt_seen_at, Some(0));
     assert_eq!(machine.cpu.retired, 2);
+    assert_eq!(
+        machine.cpu.interrupt_word.load_relaxed() & INTERRUPT_MASK,
+        INTERRUPT_MASK
+    );
 }
 
 #[test]
@@ -502,6 +523,25 @@ fn host_wake_is_excluded_from_snapshot_and_state_digest() {
     assert_eq!(
         machine.cpu.interrupt_word.load_relaxed() & HOST_WAKE,
         HOST_WAKE
+    );
+}
+
+#[test]
+fn device_owned_interrupt_level_round_trips_without_machine_exit() {
+    let mut uninterrupted = DeterministicMachine::new();
+    uninterrupted.drive_interrupt_line(true);
+    let snapshot = encode_snapshot(&uninterrupted, BUILD, PROFILE).unwrap();
+
+    let mut restored = decode_snapshot(&snapshot, BUILD, &DeterministicFactory).unwrap();
+    assert_eq!(uninterrupted.run_cpu_until(20).unwrap(), CpuExit::Deadline);
+    assert_eq!(restored.run_cpu_until(20).unwrap(), CpuExit::Deadline);
+    assert_eq!(
+        uninterrupted.state_digest().unwrap(),
+        restored.state_digest().unwrap()
+    );
+    assert_eq!(
+        encode_snapshot(&uninterrupted, BUILD, PROFILE).unwrap(),
+        encode_snapshot(restored.as_ref(), BUILD, PROFILE).unwrap()
     );
 }
 
