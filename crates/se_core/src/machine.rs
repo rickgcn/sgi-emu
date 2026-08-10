@@ -138,6 +138,13 @@ pub trait Machine: SnapshotTarget + Introspect {
     /// time. Per-CPU phase and any fractional-rate remainder are guest-visible
     /// state and therefore contribute to snapshots and state digests.
     ///
+    /// An implementation may batch time in CPU-local state only while execution
+    /// cannot call a device or otherwise expose stale machine time. Before every
+    /// CPU-originated [`crate::bus::Bus`] call, including direct-span discovery, it
+    /// advances the event scheduler to the transaction's architectural timestamp.
+    /// It also commits local time before returning or switching guest CPUs. A
+    /// synchronization target never exceeds a finite `deadline`.
+    ///
     /// CPU work timestamped exactly at a finite deadline completes before the
     /// method returns [`CpuExit::Deadline`]. A runtime can then dispatch events at
     /// that timestamp, preserving CPU-before-event ordering for equal times.

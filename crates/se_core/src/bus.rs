@@ -7,6 +7,10 @@
 //!
 //! [`DirectSpan`] exposes borrowed direct memory without granting pointer
 //! stability beyond the bus or device borrow that produced it.
+//!
+//! Within a machine, a CPU synchronizes the event scheduler to a transaction's
+//! virtual time before entering this bus surface. CPU-local time batching is only
+//! valid while an already established direct-memory path cannot invoke a device.
 
 use std::error::Error;
 use std::fmt;
@@ -167,6 +171,12 @@ impl<'a> DirectSpan<'a> {
 /// physical route did not cover the complete access. [`BusFault::Fault`] means a
 /// mapped device rejected the transaction; the bus does not promise to roll back
 /// device side effects associated with that rejection.
+///
+/// Before a CPU-originated call within a [`crate::machine::Machine`], the caller
+/// synchronizes the machine event scheduler to the transaction's exact virtual
+/// time. This applies to every method, including [`Bus::direct_span`]; only later
+/// accesses through an already acquired, side-effect-free direct-memory path may
+/// retain time solely in CPU-local state.
 pub trait Bus {
     /// Reads one byte.
     fn read8(&mut self, addr: PhysAddr) -> Result<u8, BusFault>;
@@ -253,6 +263,13 @@ pub trait Bus {
 /// Each fixed-width method receives one indivisible transaction in guest
 /// big-endian value form. Returning [`BusFault::Fault`] does not promise rollback
 /// of device side effects.
+///
+/// For a CPU transaction delivered by a [`crate::machine::Machine`], the event
+/// scheduler is already synchronized to the transaction time before this trait is
+/// entered. An implementation may therefore use a retained
+/// [`crate::event::SchedulerHandle`] to observe that time or schedule relative
+/// events. Direct callers outside a machine establish this timing precondition
+/// when the device depends on scheduler time.
 pub trait MmioDevice {
     /// Reads one byte.
     fn read8(&mut self, access: MmioAccess) -> Result<u8, BusFault>;

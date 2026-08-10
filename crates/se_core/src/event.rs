@@ -790,6 +790,11 @@ impl SchedulerHandle {
 
     /// Schedules an event relative to the current virtual time.
     ///
+    /// The base is the shared scheduler time, not time retained locally by a CPU.
+    /// A machine therefore synchronizes its scheduler before entering a
+    /// CPU-originated [`crate::bus::Bus`] transaction whose device may call this
+    /// method.
+    ///
     /// # Errors
     ///
     /// Returns [`EventQueueError::DeadlineOverflow`] when the current time plus
