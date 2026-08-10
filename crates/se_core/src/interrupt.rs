@@ -16,6 +16,10 @@
 //! Mutation authority is split by API: [`WordLineSink`] can change one validated
 //! guest line, [`HostWakeHandle`] can only request [`HOST_WAKE`], and the event
 //! scheduler alone controls [`EVENT_TRUNCATE`].
+//!
+//! A direct [`WordLineSink`] carries one already aggregated level from exactly one
+//! logical driver. Multiple interrupt sources first enter a controller through
+//! distinct input sinks; the controller alone drives its direct output line.
 
 use std::error::Error;
 use std::fmt;
@@ -157,8 +161,13 @@ impl Error for InterruptLineError {}
 /// A sink wired directly to one validated guest line in one CPU interrupt word.
 ///
 /// Holding this sink grants no access to either execution-control bit or to any
-/// other guest line.
-#[derive(Clone, Debug)]
+/// other guest line. One `(InterruptWord, line)` connection has exactly one
+/// logical driver. This sink stores the aggregate level rather than a contribution
+/// count, so constructing another sink for the same bit creates an invalid
+/// topology: either sink could clear the other source's asserted level. Shared
+/// sources use distinct interrupt-controller inputs, and only the controller owns
+/// the direct output sink.
+#[derive(Debug)]
 pub struct WordLineSink {
     word: InterruptWord,
     mask: u64,
@@ -166,6 +175,10 @@ pub struct WordLineSink {
 
 impl WordLineSink {
     /// Connects a guest interrupt line to a CPU interrupt word.
+    ///
+    /// This constructor validates the bit assignment but cannot detect another
+    /// sink created for the same word and line. Machine composition guarantees
+    /// the single-logical-driver invariant.
     ///
     /// # Errors
     ///
