@@ -20,6 +20,7 @@ use crate::address::{AddressSpaceConfig, DeviceAddr, PhysAddr, PhysRange};
 use crate::bus::{Bus, BusFault, BusInitiator, DirectAccess, DirectSpan, MmioAccess};
 use crate::device::{Device, DeviceCtx, DeviceError, DeviceId};
 use crate::event::{ScheduledEvent, SchedulerShared};
+use crate::time::VTime;
 
 const BANK_SHIFT: u32 = 32;
 const BANK_SIZE: u128 = 1_u128 << BANK_SHIFT;
@@ -598,6 +599,13 @@ impl Error for DeviceSlotError {}
 /// Reports a failure to dispatch a scheduled device event.
 #[derive(Debug)]
 pub enum DeviceDispatchError {
+    /// The event timestamp does not equal the scheduler's current time.
+    EventTimeMismatch {
+        /// Timestamp carried by the rejected event.
+        event_vtime: VTime,
+        /// Scheduler time observed before dispatch.
+        scheduler_now: VTime,
+    },
     /// The destination cannot be taken from or returned to the device registry.
     Slot(DeviceSlotError),
     /// The destination device rejected its event callback.
@@ -607,6 +615,13 @@ pub enum DeviceDispatchError {
 impl fmt::Display for DeviceDispatchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EventTimeMismatch {
+                event_vtime,
+                scheduler_now,
+            } => write!(
+                formatter,
+                "event time {event_vtime} does not match scheduler time {scheduler_now}"
+            ),
             Self::Slot(error) => write!(formatter, "cannot dispatch event: {error}"),
             Self::Device(error) => write!(formatter, "device event failed: {error}"),
         }
@@ -616,6 +631,7 @@ impl fmt::Display for DeviceDispatchError {
 impl Error for DeviceDispatchError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::EventTimeMismatch { .. } => None,
             Self::Slot(error) => Some(error),
             Self::Device(error) => Some(error),
         }
@@ -808,28 +824,37 @@ impl Decoder {
 
     /// Dispatches one event while keeping every window of its target faulted.
     ///
-    /// The callback receives the scheduler's current time, a scheduling handle
-    /// bound to the destination identity, and a bus port whose initiator is that
-    /// device. The target is returned to its slot even when the callback reports an
-    /// error.
+    /// The event timestamp must equal the scheduler's current time. The callback
+    /// receives that time, a scheduling handle bound to the destination identity,
+    /// and a bus port whose initiator is that device. The target is returned to its
+    /// slot even when the callback reports an error.
     ///
     /// # Errors
     ///
-    /// Returns [`DeviceDispatchError::Slot`] if the crate-internal slot protocol
-    /// cannot take or restore the target, or [`DeviceDispatchError::Device`] if
+    /// Returns [`DeviceDispatchError::EventTimeMismatch`] before taking the target
+    /// when the event and scheduler times differ,
+    /// [`DeviceDispatchError::Slot`] if the crate-internal slot protocol cannot
+    /// take or restore the target, or [`DeviceDispatchError::Device`] if
     /// [`Device::on_event`] rejects the callback.
     pub fn dispatch_event(
         &mut self,
         event: ScheduledEvent,
         scheduler: &SchedulerShared,
     ) -> Result<(), DeviceDispatchError> {
+        let scheduler_now = scheduler.now();
+        if event.vtime != scheduler_now {
+            return Err(DeviceDispatchError::EventTimeMismatch {
+                event_vtime: event.vtime,
+                scheduler_now,
+            });
+        }
         let id = event.device;
         let mut device = self.take_device(id).map_err(DeviceDispatchError::Slot)?;
         let handle = scheduler.handle(id);
         let result = {
             let mut port = self.port(BusInitiator::Device(id));
             let mut context = DeviceCtx {
-                now: scheduler.now(),
+                now: scheduler_now,
                 bus: &mut port,
                 sched: &handle,
             };
@@ -1267,8 +1292,8 @@ mod tests {
     use crate::save::{Saveable, StateError, StateReader, StateWriter};
 
     use super::{
-        AddressMap, AddressMapError, Decoder, DecoderBuildError, DeviceRegistryBuilder,
-        DeviceSlotError,
+        AddressMap, AddressMapError, Decoder, DecoderBuildError, DeviceDispatchError,
+        DeviceRegistryBuilder, DeviceSlotError,
     };
 
     enum TestStorage {
@@ -1889,6 +1914,39 @@ mod tests {
                 &scheduler,
             )
             .unwrap();
+        assert_eq!(
+            test_device(&decoder, id).event_bus_fault,
+            Some(BusFault::Fault)
+        );
+    }
+
+    #[test]
+    fn event_dispatch_rejects_unsynchronized_scheduler_time_before_callback() {
+        let (mut decoder, id) = single_device_decoder(
+            32,
+            TestDevice::memory(4),
+            range(0x1000, 4),
+            DeviceAddr::new(0),
+        );
+        let scheduler = SchedulerShared::new();
+        let event = ScheduledEvent {
+            vtime: 1,
+            device: id,
+            tag: 1,
+            payload: 0x1000,
+        };
+
+        assert!(matches!(
+            decoder.dispatch_event(event, &scheduler),
+            Err(DeviceDispatchError::EventTimeMismatch {
+                event_vtime: 1,
+                scheduler_now: 0
+            })
+        ));
+        assert_eq!(test_device(&decoder, id).event_bus_fault, None);
+
+        scheduler.advance_to(1).unwrap();
+        decoder.dispatch_event(event, &scheduler).unwrap();
         assert_eq!(
             test_device(&decoder, id).event_bus_fault,
             Some(BusFault::Fault)
