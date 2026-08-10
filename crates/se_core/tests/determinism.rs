@@ -27,6 +27,7 @@ const INTERRUPT_LINE: u64 = 1 << 4;
 #[derive(Serialize, Deserialize)]
 struct CpuState {
     retired: u64,
+    next_boundary: VTime,
     accumulator: u64,
     interrupt_seen_at: Option<u64>,
     pending_interrupts: u64,
@@ -35,6 +36,7 @@ struct CpuState {
 
 struct MockCpu {
     retired: u64,
+    next_boundary: VTime,
     accumulator: u64,
     interrupt_seen_at: Option<VTime>,
     interrupt_word: InterruptWord,
@@ -84,6 +86,7 @@ impl DeterministicMachine {
             scheduler: SchedulerShared::new(),
             cpu: MockCpu {
                 retired: 0,
+                next_boundary: INSTRUCTION_NS,
                 accumulator: 0x1234_5678_9abc_def0,
                 interrupt_seen_at: None,
                 interrupt_word: InterruptWord::new(),
@@ -109,6 +112,7 @@ impl DeterministicMachine {
     fn cpu_state(&self) -> CpuState {
         CpuState {
             retired: self.cpu.retired,
+            next_boundary: self.cpu.next_boundary,
             accumulator: self.cpu.accumulator,
             interrupt_seen_at: self.cpu.interrupt_seen_at,
             pending_interrupts: self.cpu.interrupt_word.load_relaxed() & GUEST_INTERRUPT_MASK,
@@ -161,9 +165,22 @@ impl SnapshotTarget for DeterministicMachine {
                         "CPU snapshot contains reserved interrupt bits".to_owned(),
                     ));
                 }
+                let expected_next_boundary = state
+                    .retired
+                    .checked_add(1)
+                    .and_then(|boundary| boundary.checked_mul(INSTRUCTION_NS))
+                    .ok_or_else(|| {
+                        StateError::InvalidState("CPU clock phase overflows VTime".to_owned())
+                    })?;
+                if state.next_boundary != expected_next_boundary {
+                    return Err(StateError::InvalidState(
+                        "CPU snapshot contains an inconsistent clock phase".to_owned(),
+                    ));
+                }
                 self.cpu.interrupt_word.clear_mask(u64::MAX);
                 self.cpu.interrupt_word.set_mask(state.pending_interrupts);
                 self.cpu.retired = state.retired;
+                self.cpu.next_boundary = state.next_boundary;
                 self.cpu.accumulator = state.accumulator;
                 self.cpu.interrupt_seen_at = state.interrupt_seen_at;
                 self.cpu.schedule_at_retired = state.schedule_at_retired;
@@ -182,6 +199,18 @@ impl SnapshotTarget for DeterministicMachine {
 
     fn validate_loaded_snapshot(&self) -> Result<(), StateError> {
         self.scheduler.validate_device_ids(1)?;
+        let previous_boundary = self
+            .cpu
+            .next_boundary
+            .checked_sub(INSTRUCTION_NS)
+            .ok_or_else(|| {
+                StateError::InvalidState("CPU clock phase precedes its epoch".to_owned())
+            })?;
+        if !(previous_boundary..self.cpu.next_boundary).contains(&self.now()) {
+            return Err(StateError::InvalidState(
+                "machine time lies outside the CPU clock phase".to_owned(),
+            ));
+        }
         if let Some(token) = self.device.token
             && !self.scheduler.handle(DEVICE).is_scheduled(token)
         {
@@ -228,8 +257,14 @@ impl Machine for DeterministicMachine {
             .begin_burst(deadline, self.cpu.interrupt_word.clone())
             .map_err(|error| MachineError::Failed(error.to_string()))?;
         loop {
+            if self.cpu.next_boundary <= self.now() {
+                return Err(MachineError::Failed(
+                    "CPU clock phase does not follow machine time".to_owned(),
+                ));
+            }
+            let previous_boundary = self.cpu.next_boundary - INSTRUCTION_NS;
             let pending = self.cpu.interrupt_word.load_relaxed();
-            if pending & GUEST_INTERRUPT_MASK != 0 {
+            if self.now() == previous_boundary && pending & GUEST_INTERRUPT_MASK != 0 {
                 self.cpu.interrupt_seen_at = Some(self.now());
                 self.cpu.interrupt_word.clear_mask(GUEST_INTERRUPT_MASK);
                 return Ok(CpuExit::Interrupt);
@@ -240,16 +275,22 @@ impl Machine for DeterministicMachine {
             if self.now() == deadline {
                 return Ok(CpuExit::Deadline);
             }
-            let completion = self
-                .now()
-                .checked_add(INSTRUCTION_NS)
-                .ok_or_else(|| MachineError::Failed("instruction time overflow".to_owned()))?;
+            let completion = self.cpu.next_boundary;
             if completion > deadline {
                 self.scheduler.advance_to(deadline)?;
                 return Ok(CpuExit::Deadline);
             }
+            let next_boundary = completion
+                .checked_add(INSTRUCTION_NS)
+                .ok_or_else(|| MachineError::Failed("instruction time overflow".to_owned()))?;
+            let retired = self
+                .cpu
+                .retired
+                .checked_add(1)
+                .ok_or_else(|| MachineError::Failed("retired count overflow".to_owned()))?;
             self.scheduler.advance_to(completion)?;
-            self.cpu.retired += 1;
+            self.cpu.next_boundary = next_boundary;
+            self.cpu.retired = retired;
             self.cpu.accumulator = self
                 .cpu
                 .accumulator
@@ -346,6 +387,24 @@ fn event_dispatch_occurs_at_exact_virtual_time() {
 }
 
 #[test]
+fn off_grid_events_preserve_absolute_cpu_phase() {
+    let mut machine = DeterministicMachine::new();
+    machine.schedule_at(25, PERIODIC_TAG, 0);
+    drive_until(&mut machine, 25);
+    assert_eq!(machine.cpu.retired, 2);
+    assert_eq!(machine.cpu.next_boundary, 30);
+
+    machine.schedule_at(27, PERIODIC_TAG, 0);
+    drive_until(&mut machine, 27);
+    assert_eq!(machine.cpu.retired, 2);
+    assert_eq!(machine.cpu.next_boundary, 30);
+
+    assert_eq!(machine.run_cpu_until(30).unwrap(), CpuExit::Deadline);
+    assert_eq!(machine.cpu.retired, 3);
+    assert_eq!(machine.cpu.next_boundary, 40);
+}
+
+#[test]
 fn earlier_event_scheduled_inside_burst_requests_truncation() {
     let mut machine = DeterministicMachine::new();
     machine.cpu.schedule_at_retired = Some(2);
@@ -368,6 +427,51 @@ fn interrupt_is_observed_at_exact_instruction_boundary() {
     assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Interrupt);
     assert_eq!(machine.cpu.interrupt_seen_at, Some(30));
     assert_eq!(machine.cpu.retired, 3);
+}
+
+#[test]
+fn equal_time_events_are_drained_before_interrupt_sampling() {
+    let mut machine = DeterministicMachine::new();
+    machine.schedule_at(30, INTERRUPT_TAG, 0);
+    machine.schedule_at(30, PERIODIC_TAG, 0);
+    drive_until(&mut machine, 30);
+    assert_eq!(machine.device.dispatch_count, 2);
+    assert_eq!(machine.cpu.interrupt_seen_at, None);
+    assert_eq!(machine.cpu.retired, 3);
+
+    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Interrupt);
+    assert_eq!(machine.cpu.interrupt_seen_at, Some(30));
+    assert_eq!(machine.cpu.retired, 3);
+}
+
+#[test]
+fn off_grid_interrupt_waits_for_the_next_instruction_boundary() {
+    let mut machine = DeterministicMachine::new();
+    machine.schedule_at(25, INTERRUPT_TAG, 0);
+    drive_until(&mut machine, 25);
+    assert_eq!(machine.cpu.interrupt_seen_at, None);
+    assert_eq!(machine.cpu.retired, 2);
+
+    assert_eq!(machine.run_cpu_until(100).unwrap(), CpuExit::Interrupt);
+    assert_eq!(machine.cpu.interrupt_seen_at, Some(30));
+    assert_eq!(machine.cpu.retired, 3);
+    assert_eq!(machine.cpu.next_boundary, 40);
+}
+
+#[test]
+fn snapshot_resume_preserves_off_grid_cpu_phase() {
+    let mut uninterrupted = DeterministicMachine::new();
+    uninterrupted.schedule_at(25, PERIODIC_TAG, 0);
+    drive_until(&mut uninterrupted, 25);
+    let snapshot = encode_snapshot(&uninterrupted, BUILD, PROFILE).unwrap();
+
+    let mut restored = decode_snapshot(&snapshot, BUILD, &DeterministicFactory).unwrap();
+    assert_eq!(uninterrupted.run_cpu_until(40).unwrap(), CpuExit::Deadline);
+    assert_eq!(restored.run_cpu_until(40).unwrap(), CpuExit::Deadline);
+    assert_eq!(
+        uninterrupted.state_digest().unwrap(),
+        restored.state_digest().unwrap()
+    );
 }
 
 #[test]
