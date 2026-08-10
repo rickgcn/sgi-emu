@@ -43,6 +43,7 @@ struct MockCpu {
     interrupt_seen_at: Option<VTime>,
     interrupt_word: InterruptWord,
     schedule_at_retired: Option<u64>,
+    host_wake_at_retired: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,6 +99,7 @@ impl DeterministicMachine {
                 interrupt_seen_at: None,
                 interrupt_word,
                 schedule_at_retired: None,
+                host_wake_at_retired: None,
             },
             device: MockDevice {
                 dispatch_count: 0,
@@ -325,6 +327,10 @@ impl Machine for DeterministicMachine {
                 self.device.token = Some(token);
                 self.cpu.schedule_at_retired = None;
             }
+            if self.cpu.host_wake_at_retired == Some(self.cpu.retired) {
+                self.cpu.interrupt_word.host_wake_handle().request();
+                self.cpu.host_wake_at_retired = None;
+            }
         }
     }
 
@@ -505,6 +511,38 @@ fn host_wake_exits_without_advancing_guest_state() {
         machine.cpu.interrupt_word.load_relaxed() & INTERRUPT_MASK,
         INTERRUPT_MASK
     );
+}
+
+#[test]
+fn host_wake_wins_over_reschedule_without_losing_the_earlier_event() {
+    let mut machine = DeterministicMachine::new();
+    machine.schedule_at(100, PERIODIC_TAG, 0);
+    machine.cpu.schedule_at_retired = Some(2);
+    machine.cpu.host_wake_at_retired = Some(2);
+
+    let stale_horizon = machine.front_event_time().unwrap();
+    assert_eq!(stale_horizon, 100);
+    assert_eq!(
+        machine.run_cpu_until(stale_horizon).unwrap(),
+        CpuExit::HostWake
+    );
+    assert_eq!(machine.now(), 20);
+    assert_eq!(
+        machine.cpu.interrupt_word.load_relaxed() & (HOST_WAKE | EVENT_TRUNCATE),
+        0
+    );
+
+    let refreshed_horizon = machine.front_event_time().unwrap();
+    assert_eq!(refreshed_horizon, 30);
+    assert_eq!(
+        machine.run_cpu_until(refreshed_horizon).unwrap(),
+        CpuExit::Deadline
+    );
+    let event = machine.pop_event().unwrap().unwrap();
+    assert_eq!(event.vtime, 30);
+    machine.dispatch_event(event).unwrap();
+    assert_eq!(machine.device.last_event_time, Some(30));
+    assert_eq!(machine.front_event_time(), Some(100));
 }
 
 #[test]

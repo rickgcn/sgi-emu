@@ -155,8 +155,15 @@ pub trait Machine: SnapshotTarget + Introspect {
     /// reasons may return earlier, and no successful call moves machine time beyond
     /// a finite deadline.
     ///
-    /// [`CpuExit::Reschedule`] reports an event-truncation request. The runtime
-    /// queries the next event deadline again before resuming the CPU complex.
+    /// The deadline supplied to a successful call is single-use. After any return,
+    /// the runtime discards it. After [`CpuExit::Deadline`], the runtime drains due
+    /// events before querying the event horizon again. After any other exit, it
+    /// handles that reason and queries the event horizon again before resuming the
+    /// CPU complex. This re-query is required even when another exit wins over a
+    /// simultaneous event-truncation request: burst teardown clears the transient
+    /// request, but the newly scheduled event remains in the queue.
+    ///
+    /// [`CpuExit::Reschedule`] specifically reports an event-truncation request.
     /// Guest interrupt lines do not produce a machine exit: the CPU architecture
     /// samples them, enters its guest exception state when enabled, and continues
     /// execution until another exit reason applies.
