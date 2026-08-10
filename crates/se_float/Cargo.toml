@@ -8,3 +8,7 @@ authors.workspace = true
 
 [build-dependencies]
 cc.workspace = true
+
+[[bench]]
+name = "native_softfloat"
+harness = false
