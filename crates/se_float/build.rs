@@ -268,6 +268,7 @@ fn strict_warnings(build: &mut cc::Build, profile: CompilerProfile) {
 fn upstream_warnings(build: &mut cc::Build, profile: CompilerProfile) {
     strict_warnings(build, profile);
     if let CompilerProfile::Msvc = profile {
+        build.flag("/wd4100");
         build.flag("/wd4146");
         build.flag("/wd4244");
     }
