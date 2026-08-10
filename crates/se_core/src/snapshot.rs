@@ -564,11 +564,12 @@ fn map_component_save_error(key: &ComponentKey, error: StateError) -> SnapshotEr
 /// Writes one canonical snapshot directly into an empty seekable stream.
 ///
 /// The stream must have length zero and be positioned at zero. The function writes
-/// component payloads directly, backpatches their lengths, rereads all framed
-/// bytes to compute the integrity digest, appends that digest, and flushes the
-/// stream. A failure after writing begins may leave a partial snapshot in
-/// `output`. `build` and `profile` are written verbatim; deriving them and matching
-/// them to `machine` are composition-root responsibilities.
+/// component payloads directly, backpatches their lengths, flushes those writes
+/// before rereading all framed bytes, appends the resulting integrity digest, and
+/// flushes the completed stream. A failure after writing begins may leave a
+/// partial snapshot in `output`. `build` and `profile` are written verbatim;
+/// deriving them and matching them to `machine` are composition-root
+/// responsibilities.
 ///
 /// # Errors
 ///
@@ -634,6 +635,7 @@ pub fn write_snapshot<W: Read + Write + Seek>(
     }
 
     let checksum_position = output.stream_position()?;
+    output.flush()?;
     output.seek(SeekFrom::Start(0))?;
     let mut hasher = blake3::Hasher::new();
     let mut remaining = checksum_position;
@@ -968,6 +970,98 @@ mod tests {
         }
     }
 
+    struct FlushPublishedOutput {
+        logical: Vec<u8>,
+        readable: Vec<u8>,
+        position: u64,
+        flush_count: u32,
+    }
+
+    impl FlushPublishedOutput {
+        fn new() -> Self {
+            Self {
+                logical: Vec::new(),
+                readable: Vec::new(),
+                position: 0,
+                flush_count: 0,
+            }
+        }
+
+        fn into_readable(self) -> Vec<u8> {
+            self.readable
+        }
+
+        fn offset_position(base: u64, offset: i64) -> io::Result<u64> {
+            let position = if offset < 0 {
+                base.checked_sub(offset.unsigned_abs())
+            } else {
+                base.checked_add(offset.unsigned_abs())
+            };
+            position.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "seek position is out of range")
+            })
+        }
+    }
+
+    impl Read for FlushPublishedOutput {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let readable_len = u64::try_from(self.readable.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "readable length exceeds u64")
+            })?;
+            if self.position >= readable_len {
+                return Ok(0);
+            }
+            let start = usize::try_from(self.position).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "read position exceeds usize")
+            })?;
+            let count = output.len().min(self.readable.len() - start);
+            output[..count].copy_from_slice(&self.readable[start..start + count]);
+            self.position += count as u64;
+            Ok(count)
+        }
+    }
+
+    impl Write for FlushPublishedOutput {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            let start = usize::try_from(self.position).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "write position exceeds usize")
+            })?;
+            let end = start.checked_add(input.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "write range exceeds usize")
+            })?;
+            if end > self.logical.len() {
+                self.logical.resize(end, 0);
+            }
+            self.logical[start..end].copy_from_slice(input);
+            self.position = u64::try_from(end).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "write position exceeds u64")
+            })?;
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.readable.clone_from(&self.logical);
+            self.flush_count += 1;
+            Ok(())
+        }
+    }
+
+    impl Seek for FlushPublishedOutput {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.position = match position {
+                SeekFrom::Start(position) => position,
+                SeekFrom::End(offset) => {
+                    let end = u64::try_from(self.logical.len()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "stream length exceeds u64")
+                    })?;
+                    Self::offset_position(end, offset)?
+                }
+                SeekFrom::Current(offset) => Self::offset_position(self.position, offset)?,
+            };
+            Ok(self.position)
+        }
+    }
+
     struct MockMachine {
         manifest: Vec<SnapshotComponent>,
         values: Vec<u64>,
@@ -1112,6 +1206,18 @@ mod tests {
     }
 
     impl MockFactory {
+        fn empty() -> Self {
+            Self {
+                profile: PROFILE,
+                keys: Vec::new(),
+                maximums: Vec::new(),
+                initial_values: Vec::new(),
+                create_count: Rc::new(Cell::new(0)),
+                load_count: Rc::new(Cell::new(0)),
+                validation_fails: false,
+            }
+        }
+
         fn two_components() -> Self {
             Self {
                 profile: PROFILE,
@@ -1546,6 +1652,18 @@ mod tests {
             }
             result => panic!("unexpected snapshot result: {result:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_flushes_framed_writes_before_checksum_read() {
+        let factory = MockFactory::empty();
+        let mut output = FlushPublishedOutput::new();
+
+        write_snapshot(&factory.machine(&[]), BUILD, PROFILE, &mut output).unwrap();
+
+        assert_eq!(output.flush_count, 2);
+        let snapshot = output.into_readable();
+        assert!(decode_snapshot(&snapshot, BUILD, &factory).is_ok());
     }
 
     #[test]
