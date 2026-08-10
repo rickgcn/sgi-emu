@@ -5,9 +5,17 @@
 //! [`HostWakeHandle`] lets a host worker request the CPU slow path without access
 //! to the deterministic event queue.
 //!
-//! All bit operations use relaxed ordering. The control bits are coalescing
-//! doorbells, not memory-publication primitives; event ownership and a separately
-//! synchronized host channel establish the ordering of associated state.
+//! Guest-line and event-truncation operations use relaxed ordering. Host workers
+//! publish work before a release-ordered request, and the CPU slow path consumes
+//! that request with acquire ordering before reading the work. The initial CPU
+//! poll remains relaxed and does not acquire host state.
+//!
+//! Guest interrupt bits represent input levels. The CPU observes those bits but
+//! does not clear them when accepting an architectural interrupt; the device or
+//! interrupt controller that owns a line drives it low through [`InterruptSink`].
+//! Mutation authority is split by API: [`WordLineSink`] can change one validated
+//! guest line, [`HostWakeHandle`] can only request [`HOST_WAKE`], and the event
+//! scheduler alone controls [`EVENT_TRUNCATE`].
 
 use std::error::Error;
 use std::fmt;
@@ -28,6 +36,8 @@ pub const GUEST_INTERRUPT_MASK: u64 = HOST_WAKE - 1;
 /// Cloning this value creates another handle to the same atomic bitset.
 #[derive(Clone, Debug)]
 pub struct InterruptWord {
+    // Keep every mutation as an atomic read-modify-write so unrelated bit changes
+    // preserve a HOST_WAKE release sequence until the slow path consumes it.
     bits: Arc<AtomicU64>,
 }
 
@@ -43,39 +53,33 @@ impl InterruptWord {
     /// Loads all interrupt bits with relaxed ordering.
     ///
     /// This operation observes only the bitset and does not acquire other state.
+    /// After observing [`HOST_WAKE`], the slow path calls
+    /// [`Self::take_host_wake`] before reading host work.
     #[inline]
     #[must_use]
     pub fn load_relaxed(&self) -> u64 {
         self.bits.load(Ordering::Relaxed)
     }
 
-    /// Atomically sets every bit in `mask` with relaxed ordering.
-    ///
-    /// Callers assigning guest interrupt lines exclude [`HOST_WAKE`] and
-    /// [`EVENT_TRUNCATE`], whose lifecycles belong to their dedicated APIs.
     #[inline]
-    pub fn set_mask(&self, mask: u64) {
+    fn set_mask(&self, mask: u64) {
         self.bits.fetch_or(mask, Ordering::Relaxed);
     }
 
-    /// Atomically clears every bit in `mask` with relaxed ordering.
-    ///
-    /// Callers assigning guest interrupt lines exclude [`HOST_WAKE`] and
-    /// [`EVENT_TRUNCATE`], whose lifecycles belong to their dedicated APIs.
     #[inline]
-    pub fn clear_mask(&self, mask: u64) {
+    fn clear_mask(&self, mask: u64) {
         self.bits.fetch_and(!mask, Ordering::Relaxed);
     }
 
     /// Requests that the current CPU burst stop at its next instruction boundary.
     #[inline]
-    pub fn request_event_truncate(&self) {
+    pub(crate) fn request_event_truncate(&self) {
         self.set_mask(EVENT_TRUNCATE);
     }
 
     /// Clears the burst-local truncation request without changing guest lines.
     #[inline]
-    pub fn clear_event_truncate(&self) {
+    pub(crate) fn clear_event_truncate(&self) {
         self.clear_mask(EVENT_TRUNCATE);
     }
 
@@ -90,12 +94,13 @@ impl InterruptWord {
     /// Consumes a pending host wake and reports whether one was present.
     ///
     /// The CPU calls this on its slow path before the runtime drains the host
-    /// channel. A concurrent request after this atomic operation remains set for
-    /// the current or next drain. This operation does not acquire channel data.
+    /// channel. When it consumes a release-ordered request, subsequent reads
+    /// observe work published before that request. A concurrent request after
+    /// this atomic operation remains set for the current or next drain.
     #[inline]
     #[must_use]
     pub fn take_host_wake(&self) -> bool {
-        self.bits.fetch_and(!HOST_WAKE, Ordering::Relaxed) & HOST_WAKE != 0
+        self.bits.fetch_and(!HOST_WAKE, Ordering::Acquire) & HOST_WAKE != 0
     }
 }
 
@@ -109,18 +114,20 @@ impl Default for InterruptWord {
 ///
 /// The bit is a coalescing doorbell: repeated requests before consumption remain
 /// one request. Associated commands or ingress data must be published through a
-/// separately synchronized channel before [`Self::request`] is called. Signaling
-/// the bit does not wake a parked host execution thread.
+/// thread-safe channel before [`Self::request`] is called. The release/acquire
+/// doorbell pair publishes preceding work, while the channel remains responsible
+/// for race-free storage, ownership, and multi-producer ordering. Signaling the
+/// bit does not wake a parked host execution thread.
 #[derive(Clone, Debug)]
 pub struct HostWakeHandle {
     bits: Arc<AtomicU64>,
 }
 
 impl HostWakeHandle {
-    /// Requests a host-control exit with relaxed ordering.
+    /// Publishes preceding host work and requests a host-control exit.
     #[inline]
     pub fn request(&self) {
-        self.bits.fetch_or(HOST_WAKE, Ordering::Relaxed);
+        self.bits.fetch_or(HOST_WAKE, Ordering::Release);
     }
 }
 
@@ -147,7 +154,10 @@ impl fmt::Display for InterruptLineError {
 
 impl Error for InterruptLineError {}
 
-/// A sink wired directly to one line in one CPU's interrupt word.
+/// A sink wired directly to one validated guest line in one CPU interrupt word.
+///
+/// Holding this sink grants no access to either execution-control bit or to any
+/// other guest line.
 #[derive(Clone, Debug)]
 pub struct WordLineSink {
     word: InterruptWord,
@@ -191,6 +201,7 @@ impl InterruptSink for WordLineSink {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -231,7 +242,8 @@ mod tests {
     fn host_wake_is_coalesced_and_consumed_independently() {
         let word = InterruptWord::new();
         let wake = word.host_wake_handle();
-        word.set_mask(1_u64 << 17);
+        let sink = WordLineSink::new(word.clone(), 17).unwrap();
+        sink.set(true);
         word.request_event_truncate();
 
         wake.request();
@@ -262,5 +274,26 @@ mod tests {
         barrier.wait();
         worker.join().unwrap();
         assert_eq!(word.load_relaxed() & HOST_WAKE, HOST_WAKE);
+    }
+
+    #[test]
+    fn host_wake_acquire_observes_preceding_worker_publication() {
+        const PAYLOAD: u64 = 0x1234_5678_9abc_def0;
+
+        let word = InterruptWord::new();
+        let wake = word.host_wake_handle();
+        let payload = Arc::new(AtomicU64::new(0));
+        let worker_payload = Arc::clone(&payload);
+        let worker = thread::spawn(move || {
+            worker_payload.store(PAYLOAD, Ordering::Relaxed);
+            wake.request();
+        });
+
+        while word.load_relaxed() & HOST_WAKE == 0 {
+            std::hint::spin_loop();
+        }
+        assert!(word.take_host_wake());
+        assert_eq!(payload.load(Ordering::Relaxed), PAYLOAD);
+        worker.join().unwrap();
     }
 }
