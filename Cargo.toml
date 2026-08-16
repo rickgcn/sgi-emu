@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/se_core", "crates/se_float"]
+members = ["crates/se_core", "crates/se_float", "crates/se_runtime"]
 resolver = "3"
 
 [workspace.package]
