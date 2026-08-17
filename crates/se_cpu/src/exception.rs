@@ -7,14 +7,23 @@
 use crate::pc::PcState;
 
 /// Identifies an architectural `Cause.ExcCode` class.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExceptionCode {
-    AddressErrorLoad,
-    AddressErrorStore,
-    Syscall,
-    Breakpoint,
-    ReservedInstruction,
-    IntegerOverflow,
+    AddressErrorLoad = 4,
+    AddressErrorStore = 5,
+    InstructionBusError = 6,
+    DataBusError = 7,
+    Syscall = 8,
+    Breakpoint = 9,
+    ReservedInstruction = 10,
+    IntegerOverflow = 12,
+}
+
+impl ExceptionCode {
+    pub(crate) const fn raw(self) -> u8 {
+        self as u8
+    }
 }
 
 /// Describes why normal retirement is replaced by guest exception entry.
@@ -24,6 +33,8 @@ pub(crate) enum ExceptionRequest {
     Syscall,
     Breakpoint,
     ReservedInstruction,
+    InstructionBusError,
+    DataBusError,
     AddressErrorLoad { bad_vaddr: u64 },
     AddressErrorStore { bad_vaddr: u64 },
 }
@@ -35,6 +46,8 @@ impl ExceptionRequest {
             Self::Syscall => ExceptionCode::Syscall,
             Self::Breakpoint => ExceptionCode::Breakpoint,
             Self::ReservedInstruction => ExceptionCode::ReservedInstruction,
+            Self::InstructionBusError => ExceptionCode::InstructionBusError,
+            Self::DataBusError => ExceptionCode::DataBusError,
             Self::AddressErrorLoad { .. } => ExceptionCode::AddressErrorLoad,
             Self::AddressErrorStore { .. } => ExceptionCode::AddressErrorStore,
         }
@@ -48,7 +61,9 @@ impl ExceptionRequest {
             Self::IntegerOverflow
             | Self::Syscall
             | Self::Breakpoint
-            | Self::ReservedInstruction => None,
+            | Self::ReservedInstruction
+            | Self::InstructionBusError
+            | Self::DataBusError => None,
         }
     }
 }
@@ -107,6 +122,16 @@ mod tests {
                 None,
             ),
             (
+                ExceptionRequest::InstructionBusError,
+                ExceptionCode::InstructionBusError,
+                None,
+            ),
+            (
+                ExceptionRequest::DataBusError,
+                ExceptionCode::DataBusError,
+                None,
+            ),
+            (
                 ExceptionRequest::AddressErrorLoad { bad_vaddr: 0x123 },
                 ExceptionCode::AddressErrorLoad,
                 Some(0x123),
@@ -122,6 +147,18 @@ mod tests {
             assert_eq!(request.exception_code(), code);
             assert_eq!(request.bad_vaddr(), bad_vaddr);
         }
+    }
+
+    #[test]
+    fn cause_codes_match_the_r10000_architectural_encoding() {
+        assert_eq!(ExceptionCode::AddressErrorLoad.raw(), 4);
+        assert_eq!(ExceptionCode::AddressErrorStore.raw(), 5);
+        assert_eq!(ExceptionCode::InstructionBusError.raw(), 6);
+        assert_eq!(ExceptionCode::DataBusError.raw(), 7);
+        assert_eq!(ExceptionCode::Syscall.raw(), 8);
+        assert_eq!(ExceptionCode::Breakpoint.raw(), 9);
+        assert_eq!(ExceptionCode::ReservedInstruction.raw(), 10);
+        assert_eq!(ExceptionCode::IntegerOverflow.raw(), 12);
     }
 
     #[test]

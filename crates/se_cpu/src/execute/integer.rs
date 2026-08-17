@@ -94,6 +94,7 @@ mod tests {
     use crate::execute::{ExecuteError, InstructionOutcome};
     use crate::gpr::{GprFile, Reg};
     use crate::pc::PcState;
+    use crate::timing::ProcessorClock;
 
     fn reg(index: u8) -> Reg {
         Reg::new(index).expect("test register index must be architectural")
@@ -104,7 +105,12 @@ mod tests {
         for &(register, value) in initial {
             gpr.write(register, value);
         }
-        Cpu::from_parts(gpr, PcState::new(0x1000), Cp0::synthetic_test_state(false))
+        Cpu::from_parts(
+            gpr,
+            PcState::new(0x1000),
+            Cp0::synthetic_test_state(false),
+            ProcessorClock::new(1_000_000_000).unwrap(),
+        )
     }
 
     fn apply_commit(cpu: &mut Cpu, outcome: InstructionOutcome) {

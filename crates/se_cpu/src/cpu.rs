@@ -1,31 +1,51 @@
-//! Owns the live GPR, program-counter, and required CP0 exception state.
+//! Owns CPU architectural state, absolute retirement phase, and control delivery.
 //!
 //! Execution borrows [`Cpu`] immutably and produces either a [`CpuCommit`] or an
 //! [`ExceptionRequest`]. [`Cpu::apply_commit`] is the ordinary normal-retirement
 //! mutation path, while [`Cpu::apply_exception`] is the distinct synchronous
 //! exception-entry path. Instruction handlers cannot expose partially applied
-//! architectural state.
+//! architectural state. The processor clock and phase place those transitions on
+//! machine time; the interrupt word is transient execution control rather than
+//! guest architectural state.
 
 use crate::commit::CpuCommit;
 use crate::cp0::Cp0;
 use crate::exception::{ExceptionLocation, ExceptionRequest};
 use crate::gpr::{GprFile, Reg};
 use crate::pc::PcState;
+use crate::timing::{ProcessorClock, RetirementPhase, TimingError};
+use se_core::interrupt::InterruptWord;
+use se_core::time::VTime;
 
-/// Holds the authoritative architectural state consumed by instruction semantics.
+/// Holds one CPU's architectural state, retirement phase, and control-delivery word.
 ///
-/// Typed execution cannot mutate this state. [`Self::apply_commit`] applies normal
-/// retirement, while [`Self::apply_exception`] applies synchronous exception entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Instruction semantics receive shared access and cannot mutate architectural
+/// fields. [`Self::apply_commit`] applies normal retirement, while
+/// [`Self::apply_exception`] applies synchronous exception entry.
+#[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct Cpu {
     gpr: GprFile,
     pc: PcState,
     cp0: Cp0,
+    clock: ProcessorClock,
+    phase: RetirementPhase,
+    interrupt_word: InterruptWord,
 }
 
 impl Cpu {
-    pub(crate) const fn from_parts(gpr: GprFile, pc: PcState, cp0: Cp0) -> Self {
-        Self { gpr, pc, cp0 }
+    /// Constructs a CPU scheduled to transition on the first PClk edge.
+    ///
+    /// The execution-control word starts cleared.
+    pub(crate) fn from_parts(gpr: GprFile, pc: PcState, cp0: Cp0, clock: ProcessorClock) -> Self {
+        Self {
+            gpr,
+            pc,
+            cp0,
+            clock,
+            phase: RetirementPhase::initial(),
+            interrupt_word: InterruptWord::new(),
+        }
     }
 
     pub(crate) fn read_gpr(&self, reg: Reg) -> u64 {
@@ -38,6 +58,30 @@ impl Cpu {
 
     pub(crate) const fn cp0(&self) -> &Cp0 {
         &self.cp0
+    }
+
+    pub(crate) const fn next_pclk_tick(&self) -> u64 {
+        self.phase.next_pclk_tick()
+    }
+
+    pub(crate) fn next_boundary(&self) -> Result<VTime, TimingError> {
+        self.clock.boundary(self.phase)
+    }
+
+    pub(crate) fn boundary_for_phase(&self, phase: RetirementPhase) -> Result<VTime, TimingError> {
+        self.clock.boundary(phase)
+    }
+
+    pub(crate) const fn phase(&self) -> RetirementPhase {
+        self.phase
+    }
+
+    pub(crate) fn commit_phase(&mut self, phase: RetirementPhase) {
+        self.phase = phase;
+    }
+
+    pub(crate) const fn interrupt_word(&self) -> &InterruptWord {
+        &self.interrupt_word
     }
 
     /// Applies a write-set for one ordinary instruction's normal retirement.
@@ -69,6 +113,23 @@ impl Cpu {
     }
 }
 
+// Execution-control delivery is transient and deliberately excluded from test
+// state comparisons. Cloning a test CPU shares the delivery word, so pending
+// control bits cannot be treated as copied architectural state.
+#[cfg(test)]
+impl PartialEq for Cpu {
+    fn eq(&self, other: &Self) -> bool {
+        self.gpr == other.gpr
+            && self.pc == other.pc
+            && self.cp0 == other.cp0
+            && self.clock == other.clock
+            && self.phase == other.phase
+    }
+}
+
+#[cfg(test)]
+impl Eq for Cpu {}
+
 #[cfg(test)]
 mod tests {
     use super::Cpu;
@@ -76,9 +137,10 @@ mod tests {
     use crate::cp0::Cp0;
     use crate::decode::Instruction;
     use crate::exception::{ExceptionCode, ExceptionRequest};
-    use crate::execute::{InstructionOutcome, execute};
+    use crate::execute::{InstructionDisposition, InstructionOutcome, execute};
     use crate::gpr::{GprFile, Reg};
     use crate::pc::{PcEffect, PcState};
+    use crate::timing::ProcessorClock;
 
     fn reg(index: u8) -> Reg {
         Reg::new(index).expect("test register index must be architectural")
@@ -89,6 +151,7 @@ mod tests {
             GprFile::new(),
             PcState::new(current),
             Cp0::synthetic_test_state(bev),
+            ProcessorClock::new(1_000_000_000).unwrap(),
         )
     }
 
@@ -98,14 +161,22 @@ mod tests {
         let destination = reg(2);
         let mut gpr = GprFile::new();
         gpr.write(source, 0x1234);
-        let mut cpu = Cpu::from_parts(gpr, PcState::new(0x1000), Cp0::synthetic_test_state(false));
+        let mut cpu = Cpu::from_parts(
+            gpr,
+            PcState::new(0x1000),
+            Cp0::synthetic_test_state(false),
+            ProcessorClock::new(1_000_000_000).unwrap(),
+        );
         let instruction = Instruction::Ori {
             rt: destination,
             rs: source,
             immediate: 0x00f0,
         };
 
-        let outcome = execute(&cpu, instruction).expect("ORI must execute normally");
+        let disposition = execute(&cpu, instruction).expect("ORI must execute normally");
+        let InstructionDisposition::Architectural(outcome) = disposition else {
+            panic!("ORI must not require timed memory");
+        };
         let InstructionOutcome::Commit(commit) = outcome else {
             panic!("ORI must produce a normal commit");
         };
@@ -195,6 +266,8 @@ mod tests {
             ExceptionRequest::Syscall,
             ExceptionRequest::Breakpoint,
             ExceptionRequest::ReservedInstruction,
+            ExceptionRequest::InstructionBusError,
+            ExceptionRequest::DataBusError,
         ];
 
         for request in requests {

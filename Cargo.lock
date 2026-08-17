@@ -203,6 +203,9 @@ dependencies = [
 [[package]]
 name = "se_cpu"
 version = "0.1.0"
+dependencies = [
+ "se_core",
+]
 
 [[package]]
 name = "se_float"

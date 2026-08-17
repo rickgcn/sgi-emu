@@ -7,3 +7,4 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+se_core = { path = "../se_core" }

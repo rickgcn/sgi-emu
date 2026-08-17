@@ -8,9 +8,10 @@ use crate::cp0::Cp0;
 use crate::cpu::Cpu;
 use crate::decode::{DecodeGap, DecodeOutcome, decode};
 use crate::exception::{ExceptionCode, ExceptionRequest};
-use crate::execute::{ExecuteError, InstructionOutcome, execute};
+use crate::execute::{ExecuteError, InstructionDisposition, InstructionOutcome, execute};
 use crate::gpr::{GprFile, Reg};
 use crate::pc::PcState;
+use crate::timing::ProcessorClock;
 
 pub(crate) struct SemanticHarness {
     cpu: Cpu,
@@ -26,6 +27,9 @@ pub(crate) enum HarnessOutcome {
 pub(crate) enum HarnessError {
     Decode(DecodeGap),
     Execute(ExecuteError),
+    TimedMemoryRequired {
+        instruction: crate::decode::Instruction,
+    },
 }
 
 impl SemanticHarness {
@@ -43,7 +47,12 @@ impl SemanticHarness {
             gpr.write(register, value);
         }
         Self {
-            cpu: Cpu::from_parts(gpr, PcState::new(entry_pc), Cp0::synthetic_test_state(bev)),
+            cpu: Cpu::from_parts(
+                gpr,
+                PcState::new(entry_pc),
+                Cp0::synthetic_test_state(bev),
+                ProcessorClock::new(1_000_000_000).expect("test PClk must be representable"),
+            ),
         }
     }
 
@@ -98,7 +107,14 @@ impl SemanticHarness {
             DecodeOutcome::ImplementationGap(gap) => return Err(HarnessError::Decode(gap)),
         };
 
-        match execute(&self.cpu, instruction).map_err(HarnessError::Execute)? {
+        let outcome = match execute(&self.cpu, instruction).map_err(HarnessError::Execute)? {
+            InstructionDisposition::Architectural(outcome) => outcome,
+            InstructionDisposition::Memory(_) => {
+                return Err(HarnessError::TimedMemoryRequired { instruction });
+            }
+        };
+
+        match outcome {
             InstructionOutcome::Commit(commit) => {
                 self.cpu.apply_commit(commit);
                 Ok(HarnessOutcome::Retired)

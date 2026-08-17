@@ -1,4 +1,4 @@
-//! Maps typed instructions and immutable CPU pre-state to architectural outcomes.
+//! Maps typed instructions and immutable CPU pre-state to context-free dispositions.
 //!
 //! Handlers receive `&Cpu`, so they cannot mutate live architectural state. The
 //! error channel reports architecturally undefined or unpredictable cases; it does
@@ -12,6 +12,7 @@ use crate::commit::CpuCommit;
 use crate::cpu::Cpu;
 use crate::decode::Instruction;
 use crate::exception::ExceptionRequest;
+use crate::memory::{MemoryPreparation, MemoryRequest};
 
 /// Represents one instruction's mutually exclusive normal or guest-exception outcome.
 ///
@@ -23,6 +24,13 @@ pub(crate) enum InstructionOutcome {
     Exception(ExceptionRequest),
 }
 
+/// Separates complete context-free semantics from a prepared timed memory access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstructionDisposition {
+    Architectural(InstructionOutcome),
+    Memory(MemoryRequest),
+}
+
 /// Identifies a non-guest condition for which no normal commit can be produced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecuteError {
@@ -32,10 +40,11 @@ pub(crate) enum ExecuteError {
     UndefinedResult { instruction: Instruction },
 }
 
-/// Computes one architectural outcome from immutable pre-state.
+/// Computes one context-free instruction disposition from immutable pre-state.
 ///
-/// A commit and an exception request are mutually exclusive. Failure leaves
-/// [`Cpu`] unchanged and represents an emulator stop rather than a guest exception.
+/// A complete architectural outcome and a prepared memory request are mutually
+/// exclusive. Failure leaves [`Cpu`] unchanged and represents an emulator stop
+/// rather than a guest exception.
 ///
 /// # Errors
 ///
@@ -45,32 +54,57 @@ pub(crate) enum ExecuteError {
 pub(crate) fn execute(
     cpu: &Cpu,
     instruction: Instruction,
-) -> Result<InstructionOutcome, ExecuteError> {
+) -> Result<InstructionDisposition, ExecuteError> {
     match instruction {
-        Instruction::Sll { rd, rt, shift } => Ok(InstructionOutcome::Commit(integer::execute_sll(
-            cpu, rd, rt, shift,
+        Instruction::Sll { rd, rt, shift } => Ok(architectural(InstructionOutcome::Commit(
+            integer::execute_sll(cpu, rd, rt, shift),
         ))),
-        Instruction::Add { rd, rs, rt } => integer::execute_add(cpu, rd, rs, rt),
-        Instruction::Addiu { rt, rs, immediate } => {
-            integer::execute_addiu(cpu, rt, rs, immediate).map(InstructionOutcome::Commit)
-        }
-        Instruction::Or { rd, rs, rt } => Ok(InstructionOutcome::Commit(integer::execute_or(
-            cpu, rd, rs, rt,
+        Instruction::Add { rd, rs, rt } => integer::execute_add(cpu, rd, rs, rt).map(architectural),
+        Instruction::Addiu { rt, rs, immediate } => integer::execute_addiu(cpu, rt, rs, immediate)
+            .map(InstructionOutcome::Commit)
+            .map(architectural),
+        Instruction::Or { rd, rs, rt } => Ok(architectural(InstructionOutcome::Commit(
+            integer::execute_or(cpu, rd, rs, rt),
         ))),
-        Instruction::Ori { rt, rs, immediate } => Ok(InstructionOutcome::Commit(
+        Instruction::Ori { rt, rs, immediate } => Ok(architectural(InstructionOutcome::Commit(
             integer::execute_ori(cpu, rt, rs, immediate),
-        )),
-        Instruction::Lui { rt, immediate } => Ok(InstructionOutcome::Commit(integer::execute_lui(
-            rt, immediate,
         ))),
-        Instruction::Beq { rs, rt, offset } => {
-            branch::execute_beq(cpu, rs, rt, offset).map(InstructionOutcome::Commit)
+        Instruction::Lui { rt, immediate } => Ok(architectural(InstructionOutcome::Commit(
+            integer::execute_lui(rt, immediate),
+        ))),
+        Instruction::Beq { rs, rt, offset } => branch::execute_beq(cpu, rs, rt, offset)
+            .map(InstructionOutcome::Commit)
+            .map(architectural),
+        Instruction::Bne { rs, rt, offset } => branch::execute_bne(cpu, rs, rt, offset)
+            .map(InstructionOutcome::Commit)
+            .map(architectural),
+        Instruction::J { index } => branch::execute_j(cpu, index)
+            .map(InstructionOutcome::Commit)
+            .map(architectural),
+        Instruction::Lw {
+            rt,
+            base,
+            immediate,
+        } => crate::memory::prepare_lw(cpu, rt, base, immediate).map(memory_disposition),
+        Instruction::Sw {
+            rt,
+            base,
+            immediate,
+        } => crate::memory::prepare_sw(cpu, rt, base, immediate).map(memory_disposition),
+        Instruction::Syscall { code } => Ok(architectural(system::execute_syscall(code))),
+        Instruction::Break { code } => Ok(architectural(system::execute_break(code))),
+    }
+}
+
+const fn architectural(outcome: InstructionOutcome) -> InstructionDisposition {
+    InstructionDisposition::Architectural(outcome)
+}
+
+const fn memory_disposition(preparation: MemoryPreparation) -> InstructionDisposition {
+    match preparation {
+        MemoryPreparation::Exception(request) => {
+            architectural(InstructionOutcome::Exception(request))
         }
-        Instruction::Bne { rs, rt, offset } => {
-            branch::execute_bne(cpu, rs, rt, offset).map(InstructionOutcome::Commit)
-        }
-        Instruction::J { index } => branch::execute_j(cpu, index).map(InstructionOutcome::Commit),
-        Instruction::Syscall { code } => Ok(system::execute_syscall(code)),
-        Instruction::Break { code } => Ok(system::execute_break(code)),
+        MemoryPreparation::Access(request) => InstructionDisposition::Memory(request),
     }
 }

@@ -15,6 +15,8 @@ const OPCODE_BNE: u8 = 0x05;
 const OPCODE_ADDIU: u8 = 0x09;
 const OPCODE_ORI: u8 = 0x0d;
 const OPCODE_LUI: u8 = 0x0f;
+const OPCODE_LW: u8 = 0x23;
+const OPCODE_SW: u8 = 0x2b;
 const FIRST_RESERVED_PRIMARY_OPCODE: u8 = 0x1c;
 const LAST_RESERVED_PRIMARY_OPCODE: u8 = 0x1f;
 
@@ -37,6 +39,8 @@ pub(crate) enum Instruction {
     Beq { rs: Reg, rt: Reg, offset: i16 },
     Bne { rs: Reg, rt: Reg, offset: i16 },
     J { index: u32 },
+    Lw { rt: Reg, base: Reg, immediate: i16 },
+    Sw { rt: Reg, base: Reg, immediate: i16 },
     Syscall { code: u32 },
     Break { code: u32 },
 }
@@ -93,6 +97,16 @@ pub(crate) fn decode(raw: u32) -> DecodeOutcome {
             immediate: unsigned_immediate(raw),
         }),
         OPCODE_LUI => decode_lui(raw),
+        OPCODE_LW => DecodeOutcome::Instruction(Instruction::Lw {
+            rt: register(raw, 16),
+            base: register(raw, 21),
+            immediate: signed_immediate(raw),
+        }),
+        OPCODE_SW => DecodeOutcome::Instruction(Instruction::Sw {
+            rt: register(raw, 16),
+            base: register(raw, 21),
+            immediate: signed_immediate(raw),
+        }),
         FIRST_RESERVED_PRIMARY_OPCODE..=LAST_RESERVED_PRIMARY_OPCODE => {
             // Table A-40 marks every primary opcode in this range as reserved in MIPS IV.
             DecodeOutcome::ReservedEncoding { raw }
@@ -334,6 +348,26 @@ mod tests {
         assert_eq!(
             decode(raw),
             DecodeOutcome::Instruction(Instruction::J { index })
+        );
+    }
+
+    #[test]
+    fn decodes_lw_and_sw_with_signed_offsets() {
+        assert_eq!(
+            decode(encode_i(0x23, 3, 4, 0xfffc)),
+            DecodeOutcome::Instruction(Instruction::Lw {
+                rt: reg(4),
+                base: reg(3),
+                immediate: -4,
+            })
+        );
+        assert_eq!(
+            decode(encode_i(0x2b, 5, 6, 0x7ffc)),
+            DecodeOutcome::Instruction(Instruction::Sw {
+                rt: reg(6),
+                base: reg(5),
+                immediate: 0x7ffc,
+            })
         );
     }
 

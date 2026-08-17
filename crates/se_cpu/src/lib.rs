@@ -1,17 +1,20 @@
-//! Implements deterministic MIPS register, control-flow, and synchronous exception transitions.
+//! Implements deterministic MIPS architectural transitions and their machine-time shell.
 //!
 //! Decoding classifies a raw 32-bit word and normalizes supported instructions
 //! into typed operands. Execution reads immutable architectural pre-state and
 //! produces either a bounded CPU write-set or a synchronous exception request.
 //! Normal retirement applies a write-set to general-purpose register and
 //! program-counter state. Exception entry instead updates the required `CP0`
-//! exception state and redirects the program counter precisely.
+//! exception state and redirects the program counter precisely. A scalarized
+//! processor-clock model schedules one complete architectural transition per
+//! PClk, while timed context methods couple physical bus access to the shared
+//! machine timeline.
 //!
-//! The current semantic kernel does not yet implement machine-timed execution,
-//! CPU-originated memory transactions and address translation, `CP1`/floating-point
-//! state, snapshot state, or host-control integration. Later milestones add those
-//! CPU responsibilities without moving machine-time ownership, physical `Bus`
-//! topology, or runtime host control into this crate.
+//! The memory execution surface consists of timed instruction fetch plus `LW` and
+//! `SW` through 32-bit-compatible kernel direct segments. TLB-managed translation,
+//! privilege-mode validation, guest interrupt acceptance, and `CP1` instructions
+//! are outside this surface. Machine time, physical bus topology, event dispatch,
+//! and runtime host control remain machine-owned.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
@@ -27,4 +30,9 @@ mod execute;
 mod gpr;
 #[cfg(test)]
 mod harness;
+mod memory;
 mod pc;
+mod run;
+#[cfg(test)]
+mod timed_execution_tests;
+mod timing;

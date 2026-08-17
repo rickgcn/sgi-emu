@@ -82,6 +82,7 @@ mod tests {
     use crate::execute::ExecuteError;
     use crate::gpr::{GprFile, Reg};
     use crate::pc::{PcEffect, PcState};
+    use crate::timing::ProcessorClock;
 
     fn reg(index: u8) -> Reg {
         Reg::new(index).expect("test register index must be architectural")
@@ -92,7 +93,12 @@ mod tests {
         for &(register, value) in initial {
             gpr.write(register, value);
         }
-        Cpu::from_parts(gpr, PcState::new(current), Cp0::synthetic_test_state(false))
+        Cpu::from_parts(
+            gpr,
+            PcState::new(current),
+            Cp0::synthetic_test_state(false),
+            ProcessorClock::new(1_000_000_000).unwrap(),
+        )
     }
 
     #[test]
