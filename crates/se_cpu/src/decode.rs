@@ -19,6 +19,9 @@ const FIRST_RESERVED_PRIMARY_OPCODE: u8 = 0x1c;
 const LAST_RESERVED_PRIMARY_OPCODE: u8 = 0x1f;
 
 const FUNCTION_SLL: u8 = 0x00;
+const FUNCTION_SYSCALL: u8 = 0x0c;
+const FUNCTION_BREAK: u8 = 0x0d;
+const FUNCTION_ADD: u8 = 0x20;
 const FUNCTION_ADDU: u8 = 0x21;
 const FUNCTION_OR: u8 = 0x25;
 
@@ -26,6 +29,7 @@ const FUNCTION_OR: u8 = 0x25;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Instruction {
     Sll { rd: Reg, rt: Reg, shift: u8 },
+    Add { rd: Reg, rs: Reg, rt: Reg },
     Addiu { rt: Reg, rs: Reg, immediate: i16 },
     Or { rd: Reg, rs: Reg, rt: Reg },
     Ori { rt: Reg, rs: Reg, immediate: u16 },
@@ -33,6 +37,8 @@ pub(crate) enum Instruction {
     Beq { rs: Reg, rt: Reg, offset: i16 },
     Bne { rs: Reg, rt: Reg, offset: i16 },
     J { index: u32 },
+    Syscall { code: u32 },
+    Break { code: u32 },
 }
 
 /// Classifies a raw word that has no typed semantic handler and is not proven reserved.
@@ -104,6 +110,17 @@ fn decode_special(raw: u32) -> DecodeOutcome {
                 shift: shift_amount(raw),
             })
         }
+        FUNCTION_SYSCALL => DecodeOutcome::Instruction(Instruction::Syscall {
+            code: special_code(raw),
+        }),
+        FUNCTION_BREAK => DecodeOutcome::Instruction(Instruction::Break {
+            code: special_code(raw),
+        }),
+        FUNCTION_ADD if shift_amount(raw) == 0 => DecodeOutcome::Instruction(Instruction::Add {
+            rd: register(raw, 11),
+            rs: register(raw, 21),
+            rt: register(raw, 16),
+        }),
         FUNCTION_ADDU if shift_amount(raw) == 0 => {
             DecodeOutcome::ImplementationGap(DecodeGap::ValidButUnimplemented { raw })
         }
@@ -164,6 +181,10 @@ fn jump_index(raw: u32) -> u32 {
     raw & 0x03ff_ffff
 }
 
+fn special_code(raw: u32) -> u32 {
+    (raw >> 6) & 0x000f_ffff
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DecodeGap, DecodeOutcome, Instruction, decode};
@@ -186,6 +207,10 @@ mod tests {
             | (u32::from(rs) << 21)
             | (u32::from(rt) << 16)
             | u32::from(immediate)
+    }
+
+    fn encode_special_code(code: u32, function: u8) -> u32 {
+        ((code & 0x000f_ffff) << 6) | u32::from(function)
     }
 
     #[test]
@@ -225,6 +250,32 @@ mod tests {
                 rs: reg(3),
                 rt: reg(4),
             })
+        );
+    }
+
+    #[test]
+    fn decodes_add_with_its_fixed_shift_field() {
+        let raw = encode_r(3, 4, 5, 0, 0x20);
+
+        assert_eq!(
+            decode(raw),
+            DecodeOutcome::Instruction(Instruction::Add {
+                rd: reg(5),
+                rs: reg(3),
+                rt: reg(4),
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_syscall_and_break_code_fields() {
+        assert_eq!(
+            decode(encode_special_code(0xabcde, 0x0c)),
+            DecodeOutcome::Instruction(Instruction::Syscall { code: 0xabcde })
+        );
+        assert_eq!(
+            decode(encode_special_code(0x54321, 0x0d)),
+            DecodeOutcome::Instruction(Instruction::Break { code: 0x54321 })
         );
     }
 
@@ -315,12 +366,14 @@ mod tests {
 
     #[test]
     fn unmatched_fixed_fields_are_not_guessed_to_be_reserved() {
-        let raw = encode_r(1, 2, 3, 0, 0x00);
+        let cases = [encode_r(1, 2, 3, 0, 0x00), encode_r(1, 2, 3, 1, 0x20)];
 
-        assert_eq!(
-            decode(raw),
-            DecodeOutcome::ImplementationGap(DecodeGap::UnclassifiedEncoding { raw })
-        );
+        for raw in cases {
+            assert_eq!(
+                decode(raw),
+                DecodeOutcome::ImplementationGap(DecodeGap::UnclassifiedEncoding { raw })
+            );
+        }
     }
 
     #[test]

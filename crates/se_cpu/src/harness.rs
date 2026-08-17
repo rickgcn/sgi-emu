@@ -1,13 +1,14 @@
-//! Drives raw words through decode, execute, and normal retirement in tests.
+//! Drives raw words through decode and one of the two architectural retirement paths.
 //!
-//! The harness constructs synthetic GPR and PC pre-state. Reserved encodings
-//! produce guest exception requests, while decoder gaps and execution stops remain
-//! distinct errors.
+//! The harness constructs synthetic GPR, PC, and minimal CP0 pre-state. Reserved
+//! encodings and instruction-generated exceptions are taken architecturally, while
+//! decoder gaps and execution stops remain distinct errors.
 
+use crate::cp0::Cp0;
 use crate::cpu::Cpu;
 use crate::decode::{DecodeGap, DecodeOutcome, decode};
-use crate::exception::ExceptionRequest;
-use crate::execute::{ExecuteError, execute};
+use crate::exception::{ExceptionCode, ExceptionRequest};
+use crate::execute::{ExecuteError, InstructionOutcome, execute};
 use crate::gpr::{GprFile, Reg};
 use crate::pc::PcState;
 
@@ -18,7 +19,7 @@ pub(crate) struct SemanticHarness {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HarnessOutcome {
     Retired,
-    ExceptionRequested(ExceptionRequest),
+    ExceptionTaken(ExceptionRequest),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,12 +34,16 @@ impl SemanticHarness {
     }
 
     pub(crate) fn with_gprs(entry_pc: u64, initial: &[(Reg, u64)]) -> Self {
+        Self::with_gprs_and_bev(entry_pc, initial, false)
+    }
+
+    pub(crate) fn with_gprs_and_bev(entry_pc: u64, initial: &[(Reg, u64)], bev: bool) -> Self {
         let mut gpr = GprFile::new();
         for &(register, value) in initial {
             gpr.write(register, value);
         }
         Self {
-            cpu: Cpu::from_parts(gpr, PcState::new(entry_pc)),
+            cpu: Cpu::from_parts(gpr, PcState::new(entry_pc), Cp0::synthetic_test_state(bev)),
         }
     }
 
@@ -58,28 +63,60 @@ impl SemanticHarness {
         self.cpu.pc_state().delay_slot_of()
     }
 
+    pub(crate) fn exl(&self) -> bool {
+        self.cpu.cp0().exl()
+    }
+
+    pub(crate) fn bev(&self) -> bool {
+        self.cpu.cp0().bev()
+    }
+
+    pub(crate) fn exception_code(&self) -> ExceptionCode {
+        self.cpu.cp0().exception_code()
+    }
+
+    pub(crate) fn branch_delay(&self) -> bool {
+        self.cpu.cp0().branch_delay()
+    }
+
+    pub(crate) fn epc(&self) -> u64 {
+        self.cpu.cp0().epc()
+    }
+
+    pub(crate) fn bad_vaddr(&self) -> u64 {
+        self.cpu.cp0().bad_vaddr()
+    }
+
     pub(crate) fn step(&mut self, raw: u32) -> Result<HarnessOutcome, HarnessError> {
         let instruction = match decode(raw) {
             DecodeOutcome::Instruction(instruction) => instruction,
             DecodeOutcome::ReservedEncoding { .. } => {
-                return Ok(HarnessOutcome::ExceptionRequested(
-                    ExceptionRequest::ReservedInstruction,
-                ));
+                let request = ExceptionRequest::ReservedInstruction;
+                self.cpu.apply_exception(request);
+                return Ok(HarnessOutcome::ExceptionTaken(request));
             }
             DecodeOutcome::ImplementationGap(gap) => return Err(HarnessError::Decode(gap)),
         };
 
-        let commit = execute(&self.cpu, instruction).map_err(HarnessError::Execute)?;
-        self.cpu.apply_commit(commit);
-        Ok(HarnessOutcome::Retired)
+        match execute(&self.cpu, instruction).map_err(HarnessError::Execute)? {
+            InstructionOutcome::Commit(commit) => {
+                self.cpu.apply_commit(commit);
+                Ok(HarnessOutcome::Retired)
+            }
+            InstructionOutcome::Exception(request) => {
+                self.cpu.apply_exception(request);
+                Ok(HarnessOutcome::ExceptionTaken(request))
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{HarnessError, HarnessOutcome, SemanticHarness};
-    use crate::decode::DecodeGap;
-    use crate::exception::ExceptionRequest;
+    use crate::decode::{DecodeGap, Instruction};
+    use crate::exception::{ExceptionCode, ExceptionRequest};
+    use crate::execute::ExecuteError;
     use crate::gpr::Reg;
 
     fn reg(index: u8) -> Reg {
@@ -99,6 +136,26 @@ mod tests {
             | (u32::from(rs) << 21)
             | (u32::from(rt) << 16)
             | u32::from(immediate)
+    }
+
+    fn encode_special_code(code: u32, function: u8) -> u32 {
+        ((code & 0x000f_ffff) << 6) | u32::from(function)
+    }
+
+    fn assert_exception_state(
+        harness: &SemanticHarness,
+        code: ExceptionCode,
+        epc: u64,
+        branch_delay: bool,
+        vector: u64,
+    ) {
+        assert!(harness.exl());
+        assert_eq!(harness.exception_code(), code);
+        assert_eq!(harness.epc(), epc);
+        assert_eq!(harness.branch_delay(), branch_delay);
+        assert_eq!(harness.current_pc(), vector);
+        assert_eq!(harness.next_pc(), vector.wrapping_add(4));
+        assert_eq!(harness.delay_slot_of(), None);
     }
 
     #[test]
@@ -169,24 +226,30 @@ mod tests {
     }
 
     #[test]
-    fn reserved_encoding_requests_guest_exception_without_retirement() {
+    fn reserved_encoding_takes_guest_exception_without_retirement() {
         let mut harness = SemanticHarness::new(0x1000);
         let raw = 0x1c_u32 << 26;
 
         assert_eq!(
             harness.step(raw),
-            Ok(HarnessOutcome::ExceptionRequested(
+            Ok(HarnessOutcome::ExceptionTaken(
                 ExceptionRequest::ReservedInstruction
             ))
         );
-        assert_eq!(harness.current_pc(), 0x1000);
-        assert_eq!(harness.next_pc(), 0x1004);
+        assert_exception_state(
+            &harness,
+            ExceptionCode::ReservedInstruction,
+            0x1000,
+            false,
+            0xffff_ffff_8000_0180,
+        );
     }
 
     #[test]
     fn valid_unimplemented_instruction_is_not_a_guest_exception() {
         let mut harness = SemanticHarness::new(0x1000);
         let raw = encode_r(1, 2, 3, 0, 0x21);
+        let before = harness.cpu.clone();
 
         assert_eq!(
             harness.step(raw),
@@ -194,13 +257,14 @@ mod tests {
                 raw
             }))
         );
-        assert_eq!(harness.current_pc(), 0x1000);
+        assert_eq!(harness.cpu, before);
     }
 
     #[test]
     fn unclassified_encoding_is_not_a_guest_exception() {
         let mut harness = SemanticHarness::new(0x1000);
         let raw = 0x10_u32 << 26;
+        let before = harness.cpu.clone();
 
         assert_eq!(
             harness.step(raw),
@@ -208,6 +272,271 @@ mod tests {
                 raw
             }))
         );
-        assert_eq!(harness.current_pc(), 0x1000);
+        assert_eq!(harness.cpu, before);
+    }
+
+    #[test]
+    fn add_retires_positive_and_negative_results() {
+        let left = reg(1);
+        let right = reg(2);
+        let destination = reg(3);
+        let mut positive = SemanticHarness::with_gprs(0x1000, &[(left, 2), (right, 3)]);
+        let mut negative = SemanticHarness::with_gprs(0x1000, &[(left, u64::MAX - 2), (right, 1)]);
+
+        assert_eq!(
+            positive.step(encode_r(1, 2, 3, 0, 0x20)),
+            Ok(HarnessOutcome::Retired)
+        );
+        assert_eq!(positive.read_gpr(destination), 5);
+        assert_eq!(positive.current_pc(), 0x1004);
+
+        assert_eq!(
+            negative.step(encode_r(1, 2, 3, 0, 0x20)),
+            Ok(HarnessOutcome::Retired)
+        );
+        assert_eq!(negative.read_gpr(destination), u64::MAX - 1);
+        assert_eq!(negative.current_pc(), 0x1004);
+    }
+
+    #[test]
+    fn add_write_to_zero_retires_without_changing_zero() {
+        let left = reg(1);
+        let right = reg(2);
+        let mut harness = SemanticHarness::with_gprs(0x1000, &[(left, 2), (right, 3)]);
+
+        assert_eq!(
+            harness.step(encode_r(1, 2, 0, 0, 0x20)),
+            Ok(HarnessOutcome::Retired)
+        );
+        assert_eq!(harness.read_gpr(Reg::ZERO), 0);
+        assert_eq!(harness.current_pc(), 0x1004);
+    }
+
+    #[test]
+    fn add_positive_overflow_takes_a_precise_exception() {
+        let left = reg(1);
+        let right = reg(2);
+        let destination = reg(3);
+        let mut harness = SemanticHarness::with_gprs(
+            0x1000,
+            &[(left, 0x7fff_ffff), (right, 1), (destination, 42)],
+        );
+
+        assert_eq!(
+            harness.step(encode_r(1, 2, 3, 0, 0x20)),
+            Ok(HarnessOutcome::ExceptionTaken(
+                ExceptionRequest::IntegerOverflow
+            ))
+        );
+        assert_eq!(harness.read_gpr(destination), 42);
+        assert_exception_state(
+            &harness,
+            ExceptionCode::IntegerOverflow,
+            0x1000,
+            false,
+            0xffff_ffff_8000_0180,
+        );
+    }
+
+    #[test]
+    fn add_negative_overflow_takes_a_precise_exception() {
+        let left = reg(1);
+        let right = reg(2);
+        let destination = reg(3);
+        let mut harness = SemanticHarness::with_gprs(
+            0x1000,
+            &[
+                (left, 0xffff_ffff_8000_0000),
+                (right, u64::MAX),
+                (destination, 42),
+            ],
+        );
+
+        assert_eq!(
+            harness.step(encode_r(1, 2, 3, 0, 0x20)),
+            Ok(HarnessOutcome::ExceptionTaken(
+                ExceptionRequest::IntegerOverflow
+            ))
+        );
+        assert_eq!(harness.read_gpr(destination), 42);
+        assert_eq!(harness.exception_code(), ExceptionCode::IntegerOverflow);
+    }
+
+    #[test]
+    fn add_noncanonical_operand_leaves_all_state_unchanged() {
+        let left = reg(1);
+        let right = reg(2);
+        let destination = reg(3);
+        let mut harness = SemanticHarness::with_gprs(
+            0x1000,
+            &[(left, 0x0000_0001_0000_0000), (right, 1), (destination, 42)],
+        );
+        let raw = encode_r(1, 2, 3, 0, 0x20);
+        let before = harness.cpu.clone();
+
+        assert_eq!(
+            harness.step(raw),
+            Err(HarnessError::Execute(ExecuteError::UndefinedResult {
+                instruction: Instruction::Add {
+                    rd: destination,
+                    rs: left,
+                    rt: right,
+                },
+            }))
+        );
+        assert_eq!(harness.cpu, before);
+    }
+
+    #[test]
+    fn syscall_and_break_take_distinct_guest_exceptions() {
+        let cases = [
+            (
+                encode_special_code(0xabcde, 0x0c),
+                ExceptionRequest::Syscall,
+                ExceptionCode::Syscall,
+            ),
+            (
+                encode_special_code(0x54321, 0x0d),
+                ExceptionRequest::Breakpoint,
+                ExceptionCode::Breakpoint,
+            ),
+        ];
+
+        for (raw, request, code) in cases {
+            let mut harness = SemanticHarness::new(0x1000);
+
+            assert_eq!(
+                harness.step(raw),
+                Ok(HarnessOutcome::ExceptionTaken(request))
+            );
+            assert_exception_state(&harness, code, 0x1000, false, 0xffff_ffff_8000_0180);
+        }
+    }
+
+    #[test]
+    fn syscall_and_break_are_valid_in_a_branch_delay_slot() {
+        let cases = [
+            (
+                encode_special_code(1, 0x0c),
+                ExceptionRequest::Syscall,
+                ExceptionCode::Syscall,
+            ),
+            (
+                encode_special_code(2, 0x0d),
+                ExceptionRequest::Breakpoint,
+                ExceptionCode::Breakpoint,
+            ),
+        ];
+
+        for (raw, request, code) in cases {
+            let mut harness = SemanticHarness::new(0x1000);
+            assert_eq!(
+                harness.step(encode_i(0x04, 0, 0, 3)),
+                Ok(HarnessOutcome::Retired)
+            );
+
+            assert_eq!(
+                harness.step(raw),
+                Ok(HarnessOutcome::ExceptionTaken(request))
+            );
+            assert_exception_state(&harness, code, 0x1000, true, 0xffff_ffff_8000_0180);
+        }
+    }
+
+    #[test]
+    fn bev_and_bad_vaddr_are_available_as_read_only_test_state() {
+        let mut harness = SemanticHarness::with_gprs_and_bev(0x1000, &[], true);
+        harness
+            .cpu
+            .apply_exception(ExceptionRequest::AddressErrorLoad { bad_vaddr: 0x123 });
+
+        assert!(harness.bev());
+        assert_eq!(harness.bad_vaddr(), 0x123);
+        assert_exception_state(
+            &harness,
+            ExceptionCode::AddressErrorLoad,
+            0x1000,
+            false,
+            0xffff_ffff_bfc0_0380,
+        );
+    }
+
+    #[test]
+    fn reserved_instruction_in_delay_slot_records_branch_origin() {
+        let mut harness = SemanticHarness::new(0x1000);
+
+        assert_eq!(
+            harness.step(encode_i(0x04, 0, 0, 3)),
+            Ok(HarnessOutcome::Retired)
+        );
+        assert_eq!(harness.delay_slot_of(), Some(0x1000));
+        assert_eq!(
+            harness.step(0x1c_u32 << 26),
+            Ok(HarnessOutcome::ExceptionTaken(
+                ExceptionRequest::ReservedInstruction
+            ))
+        );
+        assert_exception_state(
+            &harness,
+            ExceptionCode::ReservedInstruction,
+            0x1000,
+            true,
+            0xffff_ffff_8000_0180,
+        );
+    }
+
+    #[test]
+    fn add_overflow_in_delay_slot_is_the_m1_graduation_path() {
+        let left = reg(1);
+        let right = reg(2);
+        let destination = reg(3);
+        let mut harness = SemanticHarness::with_gprs(
+            0x1000,
+            &[(left, 0x7fff_ffff), (right, 1), (destination, 42)],
+        );
+
+        assert_eq!(
+            harness.step(encode_i(0x04, 0, 0, 3)),
+            Ok(HarnessOutcome::Retired)
+        );
+        assert_eq!(harness.current_pc(), 0x1004);
+        assert_eq!(harness.delay_slot_of(), Some(0x1000));
+
+        assert_eq!(
+            harness.step(encode_r(1, 2, 3, 0, 0x20)),
+            Ok(HarnessOutcome::ExceptionTaken(
+                ExceptionRequest::IntegerOverflow
+            ))
+        );
+        assert_eq!(harness.read_gpr(destination), 42);
+        assert_exception_state(
+            &harness,
+            ExceptionCode::IntegerOverflow,
+            0x1000,
+            true,
+            0xffff_ffff_8000_0180,
+        );
+    }
+
+    #[test]
+    fn delayed_control_flow_error_leaves_all_state_unchanged() {
+        let mut harness = SemanticHarness::new(0x1000);
+        assert_eq!(
+            harness.step(encode_i(0x04, 0, 0, 3)),
+            Ok(HarnessOutcome::Retired)
+        );
+        let before = harness.cpu.clone();
+        let raw_jump = 0x02_u32 << 26;
+
+        assert_eq!(
+            harness.step(raw_jump),
+            Err(HarnessError::Execute(
+                ExecuteError::UnpredictableControlFlow {
+                    instruction_pc: 0x1004,
+                    branch_pc: 0x1000,
+                }
+            ))
+        );
+        assert_eq!(harness.cpu, before);
     }
 }

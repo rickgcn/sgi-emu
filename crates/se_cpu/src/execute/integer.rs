@@ -1,19 +1,46 @@
-//! Computes register writes for integer instructions.
+//! Computes normal write-sets and guest exception requests for integer instructions.
 //!
 //! Word operations use the low 32 bits and sign-extend their results to 64 bits.
-//! Full-width logical operations preserve all 64 bits. `ADDIU` reports
-//! [`ExecuteError::UndefinedResult`] when its source is not a sign-extended word.
+//! Full-width logical operations preserve all 64 bits. Word additions report
+//! [`ExecuteError::UndefinedResult`] when an input is not a sign-extended word;
+//! signed `ADD` overflow produces a guest exception request instead.
 
 use crate::commit::CpuCommit;
 use crate::cpu::Cpu;
 use crate::decode::Instruction;
-use crate::execute::ExecuteError;
+use crate::exception::ExceptionRequest;
+use crate::execute::{ExecuteError, InstructionOutcome};
 use crate::gpr::Reg;
 use crate::pc::PcEffect;
 
 pub(super) fn execute_sll(cpu: &Cpu, rd: Reg, rt: Reg, shift: u8) -> CpuCommit {
     let word = (cpu.read_gpr(rt) as u32) << shift;
     CpuCommit::new(PcEffect::Sequential).with_gpr_write(rd, sign_extend_word(word))
+}
+
+pub(super) fn execute_add(
+    cpu: &Cpu,
+    rd: Reg,
+    rs: Reg,
+    rt: Reg,
+) -> Result<InstructionOutcome, ExecuteError> {
+    let left = cpu.read_gpr(rs);
+    let right = cpu.read_gpr(rt);
+    if !is_sign_extended_word(left) || !is_sign_extended_word(right) {
+        return Err(ExecuteError::UndefinedResult {
+            instruction: Instruction::Add { rd, rs, rt },
+        });
+    }
+
+    let Some(result) = (left as u32 as i32).checked_add(right as u32 as i32) else {
+        return Ok(InstructionOutcome::Exception(
+            ExceptionRequest::IntegerOverflow,
+        ));
+    };
+
+    Ok(InstructionOutcome::Commit(
+        CpuCommit::new(PcEffect::Sequential).with_gpr_write(rd, sign_extend_word(result as u32)),
+    ))
 }
 
 pub(super) fn execute_addiu(
@@ -59,10 +86,12 @@ fn sign_extend_word(value: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_addiu, execute_lui, execute_or, execute_ori, execute_sll};
+    use super::{execute_add, execute_addiu, execute_lui, execute_or, execute_ori, execute_sll};
+    use crate::cp0::Cp0;
     use crate::cpu::Cpu;
     use crate::decode::Instruction;
-    use crate::execute::ExecuteError;
+    use crate::exception::ExceptionRequest;
+    use crate::execute::{ExecuteError, InstructionOutcome};
     use crate::gpr::{GprFile, Reg};
     use crate::pc::PcState;
 
@@ -75,7 +104,14 @@ mod tests {
         for &(register, value) in initial {
             gpr.write(register, value);
         }
-        Cpu::from_parts(gpr, PcState::new(0x1000))
+        Cpu::from_parts(gpr, PcState::new(0x1000), Cp0::synthetic_test_state(false))
+    }
+
+    fn apply_commit(cpu: &mut Cpu, outcome: InstructionOutcome) {
+        let InstructionOutcome::Commit(commit) = outcome else {
+            panic!("test instruction must produce a normal commit");
+        };
+        cpu.apply_commit(commit);
     }
 
     #[test]
@@ -101,6 +137,62 @@ mod tests {
         cpu.apply_commit(commit);
 
         assert_eq!(cpu.read_gpr(destination), 0xffff_ffff_8000_0000);
+    }
+
+    #[test]
+    fn add_sign_extends_a_negative_word_result() {
+        let left = reg(1);
+        let right = reg(2);
+        let destination = reg(3);
+        let mut cpu = cpu_with(&[(left, u64::MAX - 2), (right, 1)]);
+
+        let outcome = execute_add(&cpu, destination, left, right)
+            .expect("canonical ADD operands must have defined semantics");
+        apply_commit(&mut cpu, outcome);
+
+        assert_eq!(cpu.read_gpr(destination), u64::MAX - 1);
+    }
+
+    #[test]
+    fn add_reports_positive_and_negative_word_overflow() {
+        let left = reg(1);
+        let right = reg(2);
+        let destination = reg(3);
+        let positive = cpu_with(&[(left, 0x7fff_ffff), (right, 1)]);
+        let negative = cpu_with(&[(left, 0xffff_ffff_8000_0000), (right, u64::MAX)]);
+
+        for cpu in [&positive, &negative] {
+            assert_eq!(
+                execute_add(cpu, destination, left, right),
+                Ok(InstructionOutcome::Exception(
+                    ExceptionRequest::IntegerOverflow
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn add_rejects_either_noncanonical_word_operand() {
+        let left = reg(1);
+        let right = reg(2);
+        let destination = reg(3);
+        let cases = [
+            cpu_with(&[(left, 0x0000_0001_0000_0000), (right, 1)]),
+            cpu_with(&[(left, 1), (right, 0x0000_0001_0000_0000)]),
+        ];
+
+        for cpu in cases {
+            assert_eq!(
+                execute_add(&cpu, destination, left, right),
+                Err(ExecuteError::UndefinedResult {
+                    instruction: Instruction::Add {
+                        rd: destination,
+                        rs: left,
+                        rt: right,
+                    },
+                })
+            );
+        }
     }
 
     #[test]

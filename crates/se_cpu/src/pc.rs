@@ -1,10 +1,10 @@
-//! Centralizes sequential and delayed program-counter transitions.
+//! Centralizes normal and exception program-counter transitions.
 //!
 //! [`PcState`] owns the current address, selected successor, and delay-slot origin.
-//! Instruction handlers supply a [`PcEffect`]; branch conditions and targets are
-//! resolved before this module mutates state. [`PcEffect::DelayedTransfer`] records
-//! only the address selected after one delay slot and does not classify the
-//! originating instruction as a branch or jump.
+//! For normal retirement, instruction handlers supply a [`PcEffect`]; branch
+//! conditions and targets are resolved before this module mutates state.
+//! Exception entry bypasses [`PcEffect`] and replaces all control-flow state with
+//! the selected vector and its sequential successor.
 
 /// Describes the program-counter state change of a normal retirement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,7 +55,7 @@ impl PcState {
         self.delay_slot_of.is_some()
     }
 
-    /// Applies a validated program-counter effect for normal retirement.
+    /// Applies a program-counter effect for normal retirement.
     ///
     /// # Panics
     ///
@@ -79,6 +79,16 @@ impl PcState {
                 self.delay_slot_of = Some(origin);
             }
         }
+    }
+
+    /// Replaces all control-flow state with an exception vector's sequential state.
+    ///
+    /// This transition does not apply a normal [`PcEffect`]. Successor arithmetic
+    /// wraps, and any delay-slot origin is discarded.
+    pub(crate) fn enter_exception(&mut self, vector: u64) {
+        self.current = vector;
+        self.next = vector.wrapping_add(4);
+        self.delay_slot_of = None;
     }
 }
 
@@ -133,5 +143,19 @@ mod tests {
 
         assert_eq!(pc.current(), 0);
         assert_eq!(pc.next(), 4);
+    }
+
+    #[test]
+    fn exception_entry_replaces_all_control_flow_state() {
+        let mut pc = PcState::new(0x1000);
+        pc.apply(PcEffect::DelayedTransfer {
+            after_delay_slot: 0x2000,
+        });
+
+        pc.enter_exception(u64::MAX - 3);
+
+        assert_eq!(pc.current(), u64::MAX - 3);
+        assert_eq!(pc.next(), 0);
+        assert_eq!(pc.delay_slot_of(), None);
     }
 }

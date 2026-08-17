@@ -77,6 +77,7 @@ fn jump_target(current_pc: u64, index: u32) -> u64 {
 mod tests {
     use super::{execute_beq, execute_bne, execute_j};
     use crate::commit::CpuCommit;
+    use crate::cp0::Cp0;
     use crate::cpu::Cpu;
     use crate::execute::ExecuteError;
     use crate::gpr::{GprFile, Reg};
@@ -91,7 +92,7 @@ mod tests {
         for &(register, value) in initial {
             gpr.write(register, value);
         }
-        Cpu::from_parts(gpr, PcState::new(current))
+        Cpu::from_parts(gpr, PcState::new(current), Cp0::synthetic_test_state(false))
     }
 
     #[test]
