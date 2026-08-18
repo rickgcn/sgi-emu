@@ -3,8 +3,8 @@
 //! [`PcState`] owns the current address, selected successor, and delay-slot origin.
 //! For normal retirement, instruction handlers supply a [`PcEffect`]; branch
 //! conditions and targets are resolved before this module mutates state.
-//! Exception entry bypasses [`PcEffect`] and replaces all control-flow state with
-//! the selected vector and its sequential successor.
+//! Exception entry and exception return bypass [`PcEffect`] and replace all
+//! control-flow state with a selected address and its sequential successor.
 
 /// Describes the program-counter state change of a normal retirement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,8 +86,19 @@ impl PcState {
     /// This transition does not apply a normal [`PcEffect`]. Successor arithmetic
     /// wraps, and any delay-slot origin is discarded.
     pub(crate) fn enter_exception(&mut self, vector: u64) {
-        self.current = vector;
-        self.next = vector.wrapping_add(4);
+        self.replace_with_sequential(vector);
+    }
+
+    /// Replaces all control-flow state with an exception-return target.
+    ///
+    /// Successor arithmetic wraps, and any delay-slot origin is discarded.
+    pub(crate) fn return_from_exception(&mut self, target: u64) {
+        self.replace_with_sequential(target);
+    }
+
+    fn replace_with_sequential(&mut self, current: u64) {
+        self.current = current;
+        self.next = current.wrapping_add(4);
         self.delay_slot_of = None;
     }
 }

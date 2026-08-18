@@ -1,15 +1,18 @@
 //! Drives complete CPU transitions against a narrow machine-owned timed context.
 //!
-//! Runtime exits are considered only at safe points. Once a transition timestamp
-//! is selected, fetch through normal or exception commit and phase advancement is
-//! one atomic region with respect to host-control exits.
+//! Each safe point takes one relaxed interrupt-word snapshot for host control and
+//! guest interrupt lines. Once that snapshot authorizes a CPU transition,
+//! synchronization to its architectural boundary, interrupt acceptance or
+//! instruction execution, and phase advancement form one atomic region with
+//! respect to later control requests.
 //!
 //! Safe points give host wake priority over event truncation and the deadline.
-//! The initial relaxed interrupt-word load selects control bits only; consuming a
-//! host wake performs the acquire operation that publishes host work. Event
-//! truncation carries no host payload and remains scheduler-owned. A truncation
-//! raised during a transition is observed only after that transition completes.
-//! Guest interrupt lines are not interpreted by this execution loop.
+//! The relaxed snapshot itself does not acquire host state; consuming a host wake
+//! performs the acquire operation that publishes host work. Event truncation
+//! carries no host payload and remains scheduler-owned. A truncation raised during
+//! a transition is observed only after that transition completes. Eligible
+//! external guest interrupts are accepted before instruction fetch and consume one
+//! complete processor-clock transition.
 
 use std::error::Error;
 use std::fmt;
@@ -25,6 +28,7 @@ use crate::cpu::Cpu;
 use crate::decode::{DecodeGap, DecodeOutcome, decode};
 use crate::exception::ExceptionRequest;
 use crate::execute::{ExecuteError, InstructionDisposition, InstructionOutcome, execute};
+use crate::interrupt::external_pending_ip;
 use crate::memory::{MemoryRequest, TranslationError, translate_compat_kernel_direct};
 use crate::pc::PcEffect;
 use crate::timing::TimingError;
@@ -52,6 +56,10 @@ pub(crate) trait CpuRunContext {
     fn now(&self) -> VTime;
 
     /// Monotonically synchronizes machine time to an absolute timestamp.
+    ///
+    /// Synchronization does not dispatch events or invoke devices, so deterministic
+    /// guest interrupt levels cannot change during this call. An asynchronous host
+    /// wake may arrive and remains pending for the next safe point.
     ///
     /// # Errors
     ///
@@ -147,16 +155,19 @@ impl<E> From<TimingError> for CpuRunError<E> {
 impl Cpu {
     /// Runs complete architectural transitions through the inclusive `deadline`.
     ///
-    /// At each safe point, host wake precedes event truncation, then the deadline.
-    /// A transition whose boundary equals `deadline` completes before a deadline
-    /// exit. Fetch, data bus operations, architectural commit, and phase advance
-    /// for one transition share one timestamp and cannot be interrupted by a
-    /// runtime exit.
+    /// At each safe point, one relaxed interrupt-word snapshot gives host wake
+    /// priority over event truncation. If the next boundary is within `deadline`,
+    /// the same snapshot supplies external interrupt levels after synchronization.
+    /// A request arriving after the snapshot remains pending until the next safe
+    /// point and does not interrupt the authorized transition. A transition whose
+    /// boundary equals `deadline` completes before a deadline exit. Interrupt
+    /// acceptance, or fetch through instruction commit or exception entry, shares
+    /// one timestamp with phase advancement.
     ///
     /// An error may follow earlier completed transitions or synchronization and
     /// fetch at the failing transition's timestamp. Machine time and bus or device
     /// side effects are not rolled back; the failing transition does not advance
-    /// CPU phase or apply a normal CPU commit.
+    /// CPU phase or apply an instruction commit.
     ///
     /// # Errors
     ///
@@ -190,7 +201,11 @@ impl Cpu {
                 .into());
             }
 
-            if let Some(exit) = self.host_control_exit() {
+            // One relaxed snapshot arbitrates host control, burst truncation, and
+            // guest lines. Requests arriving later remain set for the next safe
+            // point instead of adding another atomic load to this transition.
+            let pending = self.interrupt_word().load_relaxed();
+            if let Some(exit) = self.host_control_exit_from(pending) {
                 return Ok(exit);
             }
 
@@ -203,17 +218,28 @@ impl Cpu {
                 return Ok(CpuExit::Deadline);
             }
 
-            // Preflight phase advancement before entering the atomic region so a
-            // transition never commits without a representable successor phase.
+            // Preflight phase advancement before synchronizing so a transition
+            // never commits without a representable successor phase.
             let advanced_phase = self.phase().advanced()?;
             self.boundary_for_phase(advanced_phase)?;
+
+            context
+                .synchronize_to(next_boundary)
+                .map_err(CpuRunError::Context)?;
+
+            let pending_ip = external_pending_ip(pending);
+            if self.cp0().interrupt_eligible(pending_ip) {
+                self.apply_exception(ExceptionRequest::Interrupt);
+                self.commit_phase(advanced_phase);
+                continue;
+            }
+
             self.execute_at(context, next_boundary)?;
             self.commit_phase(advanced_phase);
         }
     }
 
-    fn host_control_exit(&self) -> Option<CpuExit> {
-        let pending = self.interrupt_word().load_relaxed();
+    fn host_control_exit_from(&self, pending: u64) -> Option<CpuExit> {
         if pending & HOST_WAKE != 0 {
             let consumed = self.interrupt_word().take_host_wake();
             debug_assert!(consumed, "the CPU is the only HostWake consumer");
@@ -232,12 +258,6 @@ impl Cpu {
         context: &mut C,
         timestamp: VTime,
     ) -> Result<(), CpuRunError<C::Error>> {
-        // This establishes the whole-transition timestamp even when a CPU-side
-        // fetch check faults before a physical transaction is issued.
-        context
-            .synchronize_to(timestamp)
-            .map_err(CpuRunError::Context)?;
-
         let instruction_address = self.pc_state().current();
         if !instruction_address.is_multiple_of(4) {
             self.apply_exception(ExceptionRequest::AddressErrorLoad {

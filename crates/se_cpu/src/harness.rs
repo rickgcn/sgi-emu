@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn add_overflow_in_delay_slot_is_the_m1_graduation_path() {
+    fn add_overflow_in_delay_slot_uses_precise_exception_entry() {
         let left = reg(1);
         let right = reg(2);
         let destination = reg(3);

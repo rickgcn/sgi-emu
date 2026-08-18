@@ -1,17 +1,18 @@
 //! Owns CPU architectural state, absolute retirement phase, and control delivery.
 //!
 //! Execution borrows [`Cpu`] immutably and produces either a [`CpuCommit`] or an
-//! [`ExceptionRequest`]. [`Cpu::apply_commit`] is the ordinary normal-retirement
-//! mutation path, while [`Cpu::apply_exception`] is the distinct synchronous
-//! exception-entry path. Instruction handlers cannot expose partially applied
+//! [`ExceptionRequest`]. [`Cpu::apply_commit`] is the instruction-commit mutation
+//! path, while [`Cpu::apply_exception`] is the distinct exception-entry path.
+//! Instruction handlers cannot expose partially applied
 //! architectural state. The processor clock and phase place those transitions on
-//! machine time; the interrupt word is transient execution control rather than
-//! guest architectural state.
+//! machine time. The interrupt word supplies live host-control and guest-line
+//! inputs rather than stored guest architectural state.
 
-use crate::commit::CpuCommit;
+use crate::commit::{CpuCommit, PcCommitEffect};
 use crate::cp0::Cp0;
 use crate::exception::{ExceptionLocation, ExceptionRequest};
 use crate::gpr::{GprFile, Reg};
+use crate::interrupt::external_pending_ip;
 use crate::pc::PcState;
 use crate::timing::{ProcessorClock, RetirementPhase, TimingError};
 use se_core::interrupt::InterruptWord;
@@ -20,8 +21,8 @@ use se_core::time::VTime;
 /// Holds one CPU's architectural state, retirement phase, and control-delivery word.
 ///
 /// Instruction semantics receive shared access and cannot mutate architectural
-/// fields. [`Self::apply_commit`] applies normal retirement, while
-/// [`Self::apply_exception`] applies synchronous exception entry.
+/// fields. [`Self::apply_commit`] applies instruction commits, while
+/// [`Self::apply_exception`] applies exception entry.
 #[derive(Debug)]
 #[cfg_attr(test, derive(Clone))]
 pub(crate) struct Cpu {
@@ -84,26 +85,38 @@ impl Cpu {
         &self.interrupt_word
     }
 
-    /// Applies a write-set for one ordinary instruction's normal retirement.
+    /// Returns the live external portion of the architectural `Cause.IP` view.
+    pub(crate) fn cause_pending_ip(&self) -> u8 {
+        external_pending_ip(self.interrupt_word.load_relaxed())
+    }
+
+    /// Applies a write-set for one instruction's architectural commit.
     ///
-    /// This is the only mutation path for ordinary instruction normal retirement.
+    /// This is the only mutation path for instruction commits. Exception-return
+    /// CP0 and PC effects are applied without an intervening safe point.
     ///
     /// # Panics
     ///
     /// Panics if the commit contains a delayed transfer while the current
     /// instruction already occupies a delay slot.
     pub(crate) fn apply_commit(&mut self, commit: CpuCommit) {
-        let (gpr, pc) = commit.into_parts();
-        self.pc.apply(pc);
+        let (gpr, cp0, pc) = commit.into_parts();
+        match pc {
+            PcCommitEffect::Normal(effect) => self.pc.apply(effect),
+            PcCommitEffect::ExceptionReturn { target } => self.pc.return_from_exception(target),
+        }
+        if let Some(effect) = cp0 {
+            self.cp0.apply_effect(effect);
+        }
         if let Some(write) = gpr {
             let (destination, value) = write.into_parts();
             self.gpr.write(destination, value);
         }
     }
 
-    /// Applies one synchronous exception as a complete architectural transition.
+    /// Applies one exception as a complete architectural transition.
     ///
-    /// This captures the fault and delay-slot location before updating `CP0`, then
+    /// This captures the current and delay-slot location before updating `CP0`, then
     /// redirects the program counter to the selected vector. Redirection is
     /// infallible, so guest input cannot leave partially applied `CP0` and PC state.
     pub(crate) fn apply_exception(&mut self, request: ExceptionRequest) {
@@ -250,6 +263,33 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_and_coprocessor_unusable_share_precise_exception_entry() {
+        let mut interrupt = cpu_at(0x1000, false);
+        interrupt.apply_commit(CpuCommit::new(PcEffect::DelayedTransfer {
+            after_delay_slot: 0x2000,
+        }));
+
+        interrupt.apply_exception(ExceptionRequest::Interrupt);
+
+        assert_eq!(interrupt.cp0().exception_code(), ExceptionCode::Interrupt);
+        assert_eq!(interrupt.cp0().epc(), 0x1000);
+        assert!(interrupt.cp0().branch_delay());
+        assert_eq!(interrupt.pc_state().current(), 0xffff_ffff_8000_0180);
+
+        let mut unusable = cpu_at(0x3000, false);
+        unusable.apply_exception(ExceptionRequest::CoprocessorUnusable { coprocessor: 3 });
+
+        assert_eq!(
+            unusable.cp0().exception_code(),
+            ExceptionCode::CoprocessorUnusable
+        );
+        assert_eq!(unusable.cp0().coprocessor_error(), 3);
+        assert_eq!(unusable.cp0().epc(), 0x3000);
+        assert!(!unusable.cp0().branch_delay());
+        assert_eq!(unusable.pc_state().current(), 0xffff_ffff_8000_0180);
+    }
+
+    #[test]
     fn address_exception_updates_bad_vaddr() {
         let mut cpu = cpu_at(0x1000, false);
 
@@ -262,12 +302,14 @@ mod tests {
     #[test]
     fn current_policy_preserves_bad_vaddr_for_non_address_exceptions() {
         let requests = [
+            ExceptionRequest::Interrupt,
             ExceptionRequest::IntegerOverflow,
             ExceptionRequest::Syscall,
             ExceptionRequest::Breakpoint,
             ExceptionRequest::ReservedInstruction,
             ExceptionRequest::InstructionBusError,
             ExceptionRequest::DataBusError,
+            ExceptionRequest::CoprocessorUnusable { coprocessor: 0 },
         ];
 
         for request in requests {

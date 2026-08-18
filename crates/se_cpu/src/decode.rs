@@ -15,6 +15,7 @@ const OPCODE_BNE: u8 = 0x05;
 const OPCODE_ADDIU: u8 = 0x09;
 const OPCODE_ORI: u8 = 0x0d;
 const OPCODE_LUI: u8 = 0x0f;
+const OPCODE_COP0: u8 = 0x10;
 const OPCODE_LW: u8 = 0x23;
 const OPCODE_SW: u8 = 0x2b;
 const FIRST_RESERVED_PRIMARY_OPCODE: u8 = 0x1c;
@@ -26,6 +27,7 @@ const FUNCTION_BREAK: u8 = 0x0d;
 const FUNCTION_ADD: u8 = 0x20;
 const FUNCTION_ADDU: u8 = 0x21;
 const FUNCTION_OR: u8 = 0x25;
+const ERET_ENCODING: u32 = 0x4200_0018;
 
 /// Represents an architectural instruction with encoding details normalized into typed operands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +45,7 @@ pub(crate) enum Instruction {
     Sw { rt: Reg, base: Reg, immediate: i16 },
     Syscall { code: u32 },
     Break { code: u32 },
+    Eret,
 }
 
 /// Classifies a raw word that has no typed semantic handler and is not proven reserved.
@@ -97,6 +100,7 @@ pub(crate) fn decode(raw: u32) -> DecodeOutcome {
             immediate: unsigned_immediate(raw),
         }),
         OPCODE_LUI => decode_lui(raw),
+        OPCODE_COP0 => decode_cop0(raw),
         OPCODE_LW => DecodeOutcome::Instruction(Instruction::Lw {
             rt: register(raw, 16),
             base: register(raw, 21),
@@ -112,6 +116,14 @@ pub(crate) fn decode(raw: u32) -> DecodeOutcome {
             DecodeOutcome::ReservedEncoding { raw }
         }
         _ => unclassified(raw),
+    }
+}
+
+fn decode_cop0(raw: u32) -> DecodeOutcome {
+    if raw == ERET_ENCODING {
+        DecodeOutcome::Instruction(Instruction::Eret)
+    } else {
+        unclassified(raw)
     }
 }
 
@@ -201,7 +213,7 @@ fn special_code(raw: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeGap, DecodeOutcome, Instruction, decode};
+    use super::{DecodeGap, DecodeOutcome, ERET_ENCODING, Instruction, decode};
     use crate::gpr::Reg;
 
     fn reg(index: u8) -> Reg {
@@ -291,6 +303,21 @@ mod tests {
             decode(encode_special_code(0x54321, 0x0d)),
             DecodeOutcome::Instruction(Instruction::Break { code: 0x54321 })
         );
+    }
+
+    #[test]
+    fn decodes_only_the_exact_eret_encoding() {
+        assert_eq!(
+            decode(ERET_ENCODING),
+            DecodeOutcome::Instruction(Instruction::Eret)
+        );
+
+        for raw in [ERET_ENCODING ^ 1, ERET_ENCODING ^ (1 << 6)] {
+            assert_eq!(
+                decode(raw),
+                DecodeOutcome::ImplementationGap(DecodeGap::UnclassifiedEncoding { raw })
+            );
+        }
     }
 
     #[test]

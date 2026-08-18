@@ -3,8 +3,8 @@
 //! Decoding classifies a raw 32-bit word and normalizes supported instructions
 //! into typed operands. Execution reads immutable architectural pre-state and
 //! produces either a bounded CPU write-set or a synchronous exception request.
-//! Normal retirement applies a write-set to general-purpose register and
-//! program-counter state. Exception entry instead updates the required `CP0`
+//! Instruction commits apply bounded general-purpose register, `CP0`, and
+//! program-counter effects. Exception entry instead updates the required `CP0`
 //! exception state and redirects the program counter precisely. A scalarized
 //! processor-clock model schedules one complete architectural transition per
 //! PClk, while timed context methods couple physical bus access to the shared
@@ -12,9 +12,11 @@
 //!
 //! The memory execution surface consists of timed instruction fetch plus `LW` and
 //! `SW` through 32-bit-compatible kernel direct segments. TLB-managed translation,
-//! privilege-mode validation, guest interrupt acceptance, and `CP1` instructions
-//! are outside this surface. Machine time, physical bus topology, event dispatch,
-//! and runtime host control remain machine-owned.
+//! privilege-aware translation and `CP1` instructions are outside this surface.
+//! External R10000 interrupt inputs are sampled at architectural boundaries and
+//! use the same exception-entry path as synchronous exceptions. Machine time,
+//! physical bus topology, event dispatch, and runtime host control remain
+//! machine-owned.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
@@ -30,6 +32,7 @@ mod execute;
 mod gpr;
 #[cfg(test)]
 mod harness;
+mod interrupt;
 mod memory;
 mod pc;
 mod run;

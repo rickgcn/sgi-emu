@@ -1,16 +1,20 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::rc::Rc;
 
 use se_core::address::PhysAddr;
 use se_core::bus::{Bus, BusFault, BusInitiator, CpuId, DirectAccess, DirectSpan};
 use se_core::device::DeviceId;
 use se_core::event::{EventQueueError, SchedulerHandle, SchedulerShared};
-use se_core::interrupt::{EVENT_TRUNCATE, GUEST_INTERRUPT_MASK, InterruptSink, WordLineSink};
+use se_core::interrupt::{
+    EVENT_TRUNCATE, GUEST_INTERRUPT_MASK, HostWakeHandle, InterruptSink, WordLineSink,
+};
 use se_core::machine::CpuExit;
 use se_core::time::VTime;
 
-use crate::cp0::Cp0;
+use crate::cp0::{Cp0, OperatingMode, SyntheticCp0State};
 use crate::cpu::Cpu;
 use crate::decode::Instruction;
 use crate::exception::ExceptionCode;
@@ -27,6 +31,10 @@ const BOOT_VIRTUAL: u64 = 0xffff_ffff_bfc0_0000;
 const BOOT_PHYSICAL: u64 = 0x1fc0_0000;
 const DATA_VIRTUAL: u64 = 0xffff_ffff_a000_1000;
 const DATA_PHYSICAL: u64 = 0x1000;
+const EXCEPTION_PHYSICAL: u64 = 0x180;
+const IRQ_CLEAR_VIRTUAL: u64 = 0xffff_ffff_a000_2000;
+const IRQ_CLEAR_PHYSICAL: u64 = 0x2000;
+const ERET: u32 = 0x4200_0018;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransactionKind {
@@ -42,6 +50,33 @@ struct Transaction {
     time: VTime,
 }
 
+struct TestIrqDevice {
+    pending: Cell<bool>,
+    clear_writes: Cell<u32>,
+    line: WordLineSink,
+}
+
+impl TestIrqDevice {
+    fn new(line: WordLineSink) -> Self {
+        Self {
+            pending: Cell::new(false),
+            clear_writes: Cell::new(0),
+            line,
+        }
+    }
+
+    fn set_pending(&self, pending: bool) {
+        self.pending.set(pending);
+        self.line.set(pending);
+    }
+
+    fn clear_from_mmio(&self, _value: u32) {
+        self.clear_writes
+            .set(self.clear_writes.get().wrapping_add(1));
+        self.set_pending(false);
+    }
+}
+
 struct TestBus {
     scheduler: SchedulerShared,
     schedule_handle: SchedulerHandle,
@@ -50,6 +85,7 @@ struct TestBus {
     write_faults: BTreeMap<u64, BusFault>,
     schedule_on_read: BTreeMap<u64, VTime>,
     schedule_on_write: BTreeMap<u64, VTime>,
+    irq_clear_devices: BTreeMap<u64, Rc<TestIrqDevice>>,
     transactions: Vec<Transaction>,
 }
 
@@ -64,6 +100,7 @@ impl TestBus {
             write_faults: BTreeMap::new(),
             schedule_on_read: BTreeMap::new(),
             schedule_on_write: BTreeMap::new(),
+            irq_clear_devices: BTreeMap::new(),
             transactions: Vec::new(),
         }
     }
@@ -146,6 +183,9 @@ impl Bus for TestBus {
         // The write is intentionally visible before a configured mapped-device
         // fault, matching the core Bus contract's lack of side-effect rollback.
         self.words.insert(address.get(), value);
+        if let Some(device) = self.irq_clear_devices.get(&address.get()) {
+            device.clear_from_mmio(value);
+        }
         if let Some(delay) = self.schedule_on_write.remove(&address.get()) {
             self.schedule_after_callback(delay);
         }
@@ -197,6 +237,7 @@ struct TestContext<'a> {
     bus: &'a mut TestBus,
     cpu_id: CpuId,
     fail_synchronization: bool,
+    host_wake_on_synchronize: Option<(VTime, HostWakeHandle)>,
 }
 
 impl CpuRunContext for TestContext<'_> {
@@ -210,7 +251,20 @@ impl CpuRunContext for TestContext<'_> {
         if self.fail_synchronization {
             return Err(TestContextError::Injected);
         }
-        self.scheduler.advance_to(time).map_err(Into::into)
+        self.scheduler.advance_to(time)?;
+
+        if self
+            .host_wake_on_synchronize
+            .as_ref()
+            .is_some_and(|(trigger, _)| time >= *trigger)
+        {
+            let (_, handle) = self
+                .host_wake_on_synchronize
+                .take()
+                .expect("checked host-wake injection must exist");
+            handle.request();
+        }
+        Ok(())
     }
 
     fn read32_at(&mut self, time: VTime, address: PhysAddr) -> TimedBusResult<u32, Self::Error> {
@@ -238,6 +292,20 @@ struct TestMachine {
 
 impl TestMachine {
     fn new(frequency_hz: u64, entry_pc: u64, initial_gprs: &[(Reg, u64)]) -> Self {
+        Self::new_with_cp0(
+            frequency_hz,
+            entry_pc,
+            initial_gprs,
+            Cp0::synthetic_test_state(false),
+        )
+    }
+
+    fn new_with_cp0(
+        frequency_hz: u64,
+        entry_pc: u64,
+        initial_gprs: &[(Reg, u64)],
+        cp0: Cp0,
+    ) -> Self {
         let scheduler = SchedulerShared::new();
         let mut gpr = GprFile::new();
         for &(register, value) in initial_gprs {
@@ -246,7 +314,7 @@ impl TestMachine {
         let cpu = Cpu::from_parts(
             gpr,
             PcState::new(entry_pc),
-            Cp0::synthetic_test_state(false),
+            cp0,
             ProcessorClock::new(frequency_hz).expect("test PClk must be representable"),
         );
         let bus = TestBus::new(scheduler.clone());
@@ -259,6 +327,14 @@ impl TestMachine {
     }
 
     fn run_until(&mut self, deadline: VTime) -> Result<CpuExit, CpuRunError<TestContextError>> {
+        self.run_until_with_host_wake(deadline, None)
+    }
+
+    fn run_until_with_host_wake(
+        &mut self,
+        deadline: VTime,
+        host_wake_at: Option<VTime>,
+    ) -> Result<CpuExit, CpuRunError<TestContextError>> {
         let Self {
             cpu,
             scheduler,
@@ -273,15 +349,34 @@ impl TestMachine {
             bus,
             cpu_id: *cpu_id,
             fail_synchronization: false,
+            host_wake_on_synchronize: host_wake_at
+                .map(|time| (time, cpu.interrupt_word().host_wake_handle())),
         };
         cpu.run_until(&mut context, deadline)
     }
 
     fn install_program(&mut self, instructions: &[u32]) {
+        self.install_at(BOOT_PHYSICAL, instructions);
+    }
+
+    fn install_handler(&mut self, instructions: &[u32]) {
+        self.install_at(EXCEPTION_PHYSICAL, instructions);
+    }
+
+    fn install_at(&mut self, physical_base: u64, instructions: &[u32]) {
         for (index, instruction) in instructions.iter().copied().enumerate() {
             let offset = u64::try_from(index).unwrap() * 4;
-            self.bus.words.insert(BOOT_PHYSICAL + offset, instruction);
+            self.bus.words.insert(physical_base + offset, instruction);
         }
+    }
+
+    fn attach_irq_device(&mut self, line: u8) -> Rc<TestIrqDevice> {
+        let sink = WordLineSink::new(self.cpu.interrupt_word().clone(), line).unwrap();
+        let device = Rc::new(TestIrqDevice::new(sink));
+        self.bus
+            .irq_clear_devices
+            .insert(IRQ_CLEAR_PHYSICAL, Rc::clone(&device));
+        device
     }
 }
 
@@ -294,6 +389,18 @@ fn encode_i(opcode: u8, base: u8, rt: u8, immediate: u16) -> u32 {
         | (u32::from(base) << 21)
         | (u32::from(rt) << 16)
         | u32::from(immediate)
+}
+
+fn interrupt_enabled_cp0(mask: u8) -> Cp0 {
+    Cp0::synthetic_test_state_with(
+        SyntheticCp0State::new(false)
+            .with_interrupts(true, mask)
+            .with_operating_mode(OperatingMode::Kernel, false),
+    )
+}
+
+fn install_clearing_irq_handler(machine: &mut TestMachine, clear_base: u8) {
+    machine.install_handler(&[encode_i(0x2b, clear_base, 0, 0), ERET]);
 }
 
 fn assert_exception(machine: &TestMachine, code: ExceptionCode, bad_vaddr: u64) {
@@ -414,6 +521,7 @@ fn deadline_before_machine_time_is_rejected_without_rebasing_phase() {
         bus: &mut machine.bus,
         cpu_id: machine.cpu_id,
         fail_synchronization: false,
+        host_wake_on_synchronize: None,
     };
 
     assert_eq!(
@@ -463,6 +571,7 @@ fn host_wake_wins_over_entry_truncation_and_leaves_the_event_queued() {
             bus,
             cpu_id: *cpu_id,
             fail_synchronization: false,
+            host_wake_on_synchronize: None,
         };
         cpu.run_until(&mut context, 100)
     };
@@ -475,7 +584,7 @@ fn host_wake_wins_over_entry_truncation_and_leaves_the_event_queued() {
 }
 
 #[test]
-fn guest_interrupt_line_is_ignored_and_never_cleared_in_m2() {
+fn disabled_guest_interrupt_remains_pending_without_acceptance() {
     let mut machine = TestMachine::new(100_000_000, BOOT_VIRTUAL, &[]);
     machine.install_program(&[0]);
     let sink = WordLineSink::new(machine.cpu.interrupt_word().clone(), 4).unwrap();
@@ -486,6 +595,7 @@ fn guest_interrupt_line_is_ignored_and_never_cleared_in_m2() {
         machine.cpu.interrupt_word().load_relaxed() & GUEST_INTERRUPT_MASK,
         1 << 4
     );
+    assert_eq!(machine.cpu.cause_pending_ip(), 1 << 6);
     assert_eq!(machine.cpu.next_pclk_tick(), 2);
 }
 
@@ -695,6 +805,7 @@ fn context_failure_is_not_misclassified_as_guest_bus_error() {
         bus,
         cpu_id: *cpu_id,
         fail_synchronization: true,
+        host_wake_on_synchronize: None,
     };
 
     assert_eq!(
@@ -766,4 +877,492 @@ fn fetch_side_truncation_waits_until_the_fetched_instruction_completes() {
     assert_eq!(machine.cpu.read_gpr(reg(1)), 42);
     assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 4);
     assert_eq!(machine.cpu.next_pclk_tick(), 2);
+}
+
+#[test]
+fn equal_boundary_control_exit_leaves_cpu_work_pending_for_reentry() {
+    let mut machine = TestMachine::new(100_000_000, BOOT_VIRTUAL, &[]);
+    machine.install_program(&[encode_i(0x09, 0, 1, 7)]);
+    machine.scheduler.advance_to(10).unwrap();
+    machine.cpu.interrupt_word().host_wake_handle().request();
+
+    assert_eq!(machine.run_until(10), Ok(CpuExit::HostWake));
+    assert_eq!(machine.scheduler.now(), 10);
+    assert_eq!(machine.cpu.next_pclk_tick(), 1);
+    assert_eq!(machine.cpu.read_gpr(reg(1)), 0);
+    assert!(machine.bus.transactions.is_empty());
+
+    assert_eq!(machine.run_until(10), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.next_pclk_tick(), 2);
+    assert_eq!(machine.cpu.read_gpr(reg(1)), 7);
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 4);
+}
+
+#[test]
+fn host_wake_during_off_grid_deadline_sync_is_deferred_to_reentry() {
+    let mut machine = TestMachine::new(100_000_000, BOOT_VIRTUAL, &[]);
+
+    assert_eq!(
+        machine.run_until_with_host_wake(5, Some(5)),
+        Ok(CpuExit::Deadline)
+    );
+    assert_eq!(machine.scheduler.now(), 5);
+    assert_eq!(machine.cpu.next_pclk_tick(), 1);
+
+    assert_eq!(machine.run_until(5), Ok(CpuExit::HostWake));
+    assert_eq!(machine.scheduler.now(), 5);
+    assert_eq!(machine.cpu.next_pclk_tick(), 1);
+}
+
+#[test]
+fn host_wake_during_boundary_sync_follows_the_authorized_instruction() {
+    let mut machine = TestMachine::new(100_000_000, BOOT_VIRTUAL, &[]);
+    machine.install_program(&[encode_i(0x09, 0, 1, 7)]);
+
+    assert_eq!(
+        machine.run_until_with_host_wake(100, Some(10)),
+        Ok(CpuExit::HostWake)
+    );
+    assert_eq!(machine.scheduler.now(), 10);
+    assert_eq!(machine.cpu.next_pclk_tick(), 2);
+    assert_eq!(machine.cpu.read_gpr(reg(1)), 7);
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 4);
+    assert_eq!(machine.bus.transactions.len(), 1);
+}
+
+#[test]
+fn pending_view_stays_live_when_status_blocks_interrupt_acceptance() {
+    let states = [
+        SyntheticCp0State::new(false).with_interrupts(false, 1 << 2),
+        SyntheticCp0State::new(false).with_interrupts(true, 0),
+        SyntheticCp0State::new(false)
+            .with_interrupts(true, 1 << 2)
+            .with_exception_levels(true, false),
+        SyntheticCp0State::new(false)
+            .with_interrupts(true, 1 << 2)
+            .with_exception_levels(false, true),
+    ];
+
+    for state in states {
+        let mut machine = TestMachine::new_with_cp0(
+            100_000_000,
+            BOOT_VIRTUAL,
+            &[],
+            Cp0::synthetic_test_state_with(state),
+        );
+        machine.install_program(&[0]);
+        let sink = WordLineSink::new(machine.cpu.interrupt_word().clone(), 0).unwrap();
+        sink.set(true);
+
+        assert_eq!(machine.cpu.cause_pending_ip(), 1 << 2);
+        assert_eq!(machine.run_until(10), Ok(CpuExit::Deadline));
+        assert_eq!(machine.cpu.cause_pending_ip(), 1 << 2);
+        assert_eq!(
+            machine.cpu.cp0().exception_code(),
+            ExceptionCode::ReservedInstruction
+        );
+        assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 4);
+        assert_eq!(machine.cpu.next_pclk_tick(), 2);
+        assert_eq!(machine.bus.transactions.len(), 1);
+    }
+}
+
+#[test]
+fn multiple_external_lines_take_one_generic_interrupt_without_clearing_levels() {
+    let mut machine =
+        TestMachine::new_with_cp0(100_000_000, BOOT_VIRTUAL, &[], interrupt_enabled_cp0(0x7c));
+    let sinks: Vec<_> = (0..5)
+        .map(|line| WordLineSink::new(machine.cpu.interrupt_word().clone(), line).unwrap())
+        .collect();
+    for sink in &sinks {
+        sink.set(true);
+    }
+
+    assert_eq!(machine.cpu.cause_pending_ip(), 0x7c);
+    assert_eq!(machine.run_until(10), Ok(CpuExit::Deadline));
+
+    assert_eq!(machine.cpu.cp0().exception_code(), ExceptionCode::Interrupt);
+    assert_eq!(machine.cpu.cp0().epc(), BOOT_VIRTUAL);
+    assert!(!machine.cpu.cp0().branch_delay());
+    assert_eq!(machine.cpu.cause_pending_ip(), 0x7c);
+    assert_eq!(
+        machine.cpu.interrupt_word().load_relaxed() & GUEST_INTERRUPT_MASK,
+        0x1f
+    );
+    assert_eq!(machine.cpu.next_pclk_tick(), 2);
+    assert!(machine.bus.transactions.is_empty());
+}
+
+#[test]
+fn off_grid_irq_assertion_waits_for_the_next_architectural_boundary() {
+    let mut machine = TestMachine::new_with_cp0(
+        100_000_000,
+        BOOT_VIRTUAL,
+        &[],
+        interrupt_enabled_cp0(1 << 2),
+    );
+    machine.install_program(&[0]);
+    machine.scheduler.advance_to(5).unwrap();
+    let sink = WordLineSink::new(machine.cpu.interrupt_word().clone(), 0).unwrap();
+    sink.set(true);
+
+    assert_eq!(machine.run_until(9), Ok(CpuExit::Deadline));
+    assert_eq!(machine.scheduler.now(), 9);
+    assert_eq!(machine.cpu.next_pclk_tick(), 1);
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL);
+    assert!(machine.bus.transactions.is_empty());
+
+    assert_eq!(machine.run_until(10), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.cp0().exception_code(), ExceptionCode::Interrupt);
+    assert_eq!(machine.cpu.next_pclk_tick(), 2);
+    assert!(machine.bus.transactions.is_empty());
+}
+
+#[test]
+fn host_wake_during_boundary_sync_follows_the_authorized_irq() {
+    let mut machine = TestMachine::new_with_cp0(
+        100_000_000,
+        BOOT_VIRTUAL,
+        &[],
+        interrupt_enabled_cp0(1 << 2),
+    );
+    let sink = WordLineSink::new(machine.cpu.interrupt_word().clone(), 0).unwrap();
+    sink.set(true);
+
+    assert_eq!(
+        machine.run_until_with_host_wake(100, Some(10)),
+        Ok(CpuExit::HostWake)
+    );
+    assert_eq!(machine.scheduler.now(), 10);
+    assert_eq!(machine.cpu.next_pclk_tick(), 2);
+    assert_eq!(machine.cpu.cp0().exception_code(), ExceptionCode::Interrupt);
+    assert_eq!(machine.cpu.cp0().epc(), BOOT_VIRTUAL);
+    assert_eq!(machine.cpu.pc_state().current(), 0xffff_ffff_8000_0180);
+    assert_eq!(machine.cpu.cause_pending_ip(), 1 << 2);
+    assert!(machine.bus.transactions.is_empty());
+}
+
+#[test]
+fn entry_event_truncation_beats_an_eligible_irq() {
+    let mut machine = TestMachine::new_with_cp0(
+        100_000_000,
+        BOOT_VIRTUAL,
+        &[],
+        interrupt_enabled_cp0(1 << 2),
+    );
+    let sink = WordLineSink::new(machine.cpu.interrupt_word().clone(), 0).unwrap();
+    sink.set(true);
+    let TestMachine {
+        cpu,
+        scheduler,
+        bus,
+        cpu_id,
+    } = &mut machine;
+    let burst = scheduler
+        .begin_burst(100, cpu.interrupt_word().clone())
+        .unwrap();
+    scheduler.handle(TEST_DEVICE).schedule_at(50, 1, 0).unwrap();
+    assert_ne!(cpu.interrupt_word().load_relaxed() & EVENT_TRUNCATE, 0);
+
+    let exit = {
+        let mut context = TestContext {
+            scheduler,
+            bus,
+            cpu_id: *cpu_id,
+            fail_synchronization: false,
+            host_wake_on_synchronize: None,
+        };
+        cpu.run_until(&mut context, 100)
+    };
+
+    assert_eq!(exit, Ok(CpuExit::Reschedule));
+    drop(burst);
+    assert_eq!(scheduler.now(), 0);
+    assert_eq!(scheduler.front_time(), Some(50));
+    assert_eq!(cpu.next_pclk_tick(), 1);
+    assert_eq!(cpu.pc_state().current(), BOOT_VIRTUAL);
+    assert_eq!(
+        cpu.cp0().exception_code(),
+        ExceptionCode::ReservedInstruction
+    );
+    assert_eq!(cpu.cause_pending_ip(), 1 << 2);
+    assert!(bus.transactions.is_empty());
+}
+
+#[test]
+fn equal_time_event_assertion_affects_only_a_later_cpu_boundary() {
+    let mut asserted_before = TestMachine::new_with_cp0(
+        100_000_000,
+        BOOT_VIRTUAL,
+        &[],
+        interrupt_enabled_cp0(1 << 2),
+    );
+    let before_device = asserted_before.attach_irq_device(0);
+    asserted_before
+        .scheduler
+        .handle(TEST_DEVICE)
+        .schedule_at(5, 1, 0)
+        .unwrap();
+
+    assert_eq!(asserted_before.run_until(5), Ok(CpuExit::Deadline));
+    assert!(asserted_before.scheduler.pop_due().unwrap().is_some());
+    before_device.set_pending(true);
+    assert_eq!(asserted_before.run_until(10), Ok(CpuExit::Deadline));
+    assert_eq!(
+        asserted_before.cpu.cp0().exception_code(),
+        ExceptionCode::Interrupt
+    );
+    assert!(asserted_before.bus.transactions.is_empty());
+
+    let mut asserted_at = TestMachine::new_with_cp0(
+        100_000_000,
+        BOOT_VIRTUAL,
+        &[],
+        interrupt_enabled_cp0(1 << 2),
+    );
+    asserted_at.install_program(&[encode_i(0x09, 0, 1, 7)]);
+    let at_device = asserted_at.attach_irq_device(0);
+    asserted_at
+        .scheduler
+        .handle(TEST_DEVICE)
+        .schedule_at(10, 1, 0)
+        .unwrap();
+
+    assert_eq!(asserted_at.run_until(10), Ok(CpuExit::Deadline));
+    assert_eq!(asserted_at.cpu.read_gpr(reg(1)), 7);
+    assert_eq!(asserted_at.cpu.pc_state().current(), BOOT_VIRTUAL + 4);
+    assert_eq!(asserted_at.cpu.next_pclk_tick(), 2);
+    assert!(asserted_at.scheduler.pop_due().unwrap().is_some());
+    at_device.set_pending(true);
+
+    assert_eq!(asserted_at.run_until(20), Ok(CpuExit::Deadline));
+    assert_eq!(
+        asserted_at.cpu.cp0().exception_code(),
+        ExceptionCode::Interrupt
+    );
+    assert_eq!(asserted_at.cpu.cp0().epc(), BOOT_VIRTUAL + 4);
+    assert_eq!(asserted_at.cpu.next_pclk_tick(), 3);
+    assert_eq!(asserted_at.bus.transactions.len(), 1);
+}
+
+#[test]
+fn asserted_source_reenters_interrupt_after_eret() {
+    let mut machine = TestMachine::new_with_cp0(
+        100_000_000,
+        BOOT_VIRTUAL,
+        &[],
+        interrupt_enabled_cp0(1 << 2),
+    );
+    machine.install_handler(&[ERET]);
+    machine.install_program(&[encode_i(0x09, 0, 1, 1)]);
+    let sink = WordLineSink::new(machine.cpu.interrupt_word().clone(), 0).unwrap();
+    sink.set(true);
+
+    assert_eq!(machine.run_until(10), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.cp0().epc(), BOOT_VIRTUAL);
+    assert!(machine.cpu.cp0().exl());
+    assert_eq!(machine.cpu.next_pclk_tick(), 2);
+
+    assert_eq!(machine.run_until(20), Ok(CpuExit::Deadline));
+    assert!(!machine.cpu.cp0().exl());
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL);
+    assert_eq!(machine.cpu.next_pclk_tick(), 3);
+
+    assert_eq!(machine.run_until(30), Ok(CpuExit::Deadline));
+    assert!(machine.cpu.cp0().exl());
+    assert_eq!(machine.cpu.cp0().exception_code(), ExceptionCode::Interrupt);
+    assert_eq!(machine.cpu.cp0().epc(), BOOT_VIRTUAL);
+    assert_eq!(machine.cpu.read_gpr(reg(1)), 0);
+    assert_eq!(machine.cpu.cause_pending_ip(), 1 << 2);
+    assert_eq!(machine.cpu.next_pclk_tick(), 4);
+    assert_eq!(machine.bus.transactions.len(), 1);
+}
+
+#[test]
+fn ordinary_irq_handler_clears_returns_and_resumes_exactly_once() {
+    let clear_base = reg(20);
+    let mut machine = TestMachine::new_with_cp0(
+        100_000_000,
+        BOOT_VIRTUAL,
+        &[(clear_base, IRQ_CLEAR_VIRTUAL)],
+        interrupt_enabled_cp0(1 << 2),
+    );
+    machine.install_program(&[encode_i(0x09, 0, 1, 1), encode_i(0x09, 2, 2, 1), 0]);
+    install_clearing_irq_handler(&mut machine, 20);
+    let device = machine.attach_irq_device(0);
+    machine
+        .scheduler
+        .handle(TEST_DEVICE)
+        .schedule_at(15, 1, 0)
+        .unwrap();
+
+    assert_eq!(machine.run_until(15), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.read_gpr(reg(1)), 1);
+    assert_eq!(machine.cpu.read_gpr(reg(2)), 0);
+    assert_eq!(machine.cpu.next_pclk_tick(), 2);
+    assert!(machine.scheduler.pop_due().unwrap().is_some());
+    device.set_pending(true);
+    assert!(device.pending.get());
+    assert_eq!(machine.cpu.cause_pending_ip(), 1 << 2);
+
+    assert_eq!(machine.run_until(20), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.cp0().exception_code(), ExceptionCode::Interrupt);
+    assert_eq!(machine.cpu.cp0().epc(), BOOT_VIRTUAL + 4);
+    assert!(!machine.cpu.cp0().branch_delay());
+    assert_eq!(machine.cpu.pc_state().current(), 0xffff_ffff_8000_0180);
+    assert_eq!(machine.cpu.next_pclk_tick(), 3);
+    assert!(device.pending.get());
+    assert_eq!(device.clear_writes.get(), 0);
+    assert_eq!(machine.bus.transactions.len(), 1);
+
+    assert_eq!(machine.run_until(30), Ok(CpuExit::Deadline));
+    assert!(!device.pending.get());
+    assert_eq!(device.clear_writes.get(), 1);
+    assert_eq!(machine.cpu.cause_pending_ip(), 0);
+    assert_eq!(machine.cpu.pc_state().current(), 0xffff_ffff_8000_0184);
+    assert_eq!(machine.cpu.next_pclk_tick(), 4);
+
+    assert_eq!(machine.run_until(40), Ok(CpuExit::Deadline));
+    assert!(!machine.cpu.cp0().exl());
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 4);
+    assert_eq!(machine.cpu.pc_state().next(), BOOT_VIRTUAL + 8);
+    assert_eq!(machine.cpu.next_pclk_tick(), 5);
+
+    assert_eq!(machine.run_until(50), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.read_gpr(reg(2)), 1);
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 8);
+    assert_eq!(machine.cpu.next_pclk_tick(), 6);
+    assert_eq!(
+        machine
+            .bus
+            .transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.kind == TransactionKind::Read32
+                    && transaction.address == PhysAddr::new(BOOT_PHYSICAL + 4)
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn delay_slot_irq_handler_restarts_branch_and_executes_slot_once() {
+    let clear_base = reg(20);
+    let mut machine = TestMachine::new_with_cp0(
+        100_000_000,
+        BOOT_VIRTUAL,
+        &[(clear_base, IRQ_CLEAR_VIRTUAL)],
+        interrupt_enabled_cp0(1 << 2),
+    );
+    machine.install_program(&[
+        encode_i(0x04, 0, 0, 3),
+        encode_i(0x09, 5, 5, 1),
+        encode_i(0x09, 7, 7, 1),
+        encode_i(0x09, 7, 7, 1),
+        encode_i(0x09, 6, 6, 1),
+    ]);
+    install_clearing_irq_handler(&mut machine, 20);
+    let device = machine.attach_irq_device(0);
+    machine
+        .scheduler
+        .handle(TEST_DEVICE)
+        .schedule_at(15, 1, 0)
+        .unwrap();
+
+    assert_eq!(machine.run_until(15), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 4);
+    assert_eq!(machine.cpu.pc_state().next(), BOOT_VIRTUAL + 16);
+    assert_eq!(machine.cpu.pc_state().delay_slot_of(), Some(BOOT_VIRTUAL));
+    assert_eq!(machine.cpu.read_gpr(reg(5)), 0);
+    assert!(machine.scheduler.pop_due().unwrap().is_some());
+    device.set_pending(true);
+
+    assert_eq!(machine.run_until(20), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.cp0().exception_code(), ExceptionCode::Interrupt);
+    assert_eq!(machine.cpu.cp0().epc(), BOOT_VIRTUAL);
+    assert!(machine.cpu.cp0().branch_delay());
+    assert_eq!(machine.cpu.read_gpr(reg(5)), 0);
+    assert_eq!(machine.cpu.next_pclk_tick(), 3);
+    assert_eq!(machine.bus.transactions.len(), 1);
+    assert!(device.pending.get());
+
+    assert_eq!(machine.run_until(30), Ok(CpuExit::Deadline));
+    assert!(!device.pending.get());
+    assert_eq!(device.clear_writes.get(), 1);
+    assert_eq!(machine.cpu.next_pclk_tick(), 4);
+
+    assert_eq!(machine.run_until(40), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL);
+    assert_eq!(machine.cpu.pc_state().next(), BOOT_VIRTUAL + 4);
+    assert_eq!(machine.cpu.pc_state().delay_slot_of(), None);
+    assert_eq!(machine.cpu.next_pclk_tick(), 5);
+
+    assert_eq!(machine.run_until(50), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 4);
+    assert_eq!(machine.cpu.pc_state().next(), BOOT_VIRTUAL + 16);
+    assert_eq!(machine.cpu.pc_state().delay_slot_of(), Some(BOOT_VIRTUAL));
+
+    assert_eq!(machine.run_until(60), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.read_gpr(reg(5)), 1);
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 16);
+    assert_eq!(machine.cpu.pc_state().delay_slot_of(), None);
+
+    assert_eq!(machine.run_until(70), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.read_gpr(reg(5)), 1);
+    assert_eq!(machine.cpu.read_gpr(reg(6)), 1);
+    assert_eq!(machine.cpu.read_gpr(reg(7)), 0);
+    assert_eq!(machine.cpu.next_pclk_tick(), 8);
+    assert_eq!(
+        machine
+            .bus
+            .transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.kind == TransactionKind::Read32
+                    && transaction.address == PhysAddr::new(BOOT_PHYSICAL)
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        machine
+            .bus
+            .transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.kind == TransactionKind::Read32
+                    && transaction.address == PhysAddr::new(BOOT_PHYSICAL + 4)
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn eret_in_a_delay_slot_stops_before_cp0_usability_without_advancing_phase() {
+    let cp0 = Cp0::synthetic_test_state_with(
+        SyntheticCp0State::new(false)
+            .with_operating_mode(OperatingMode::User, false)
+            .with_return_addresses(BOOT_VIRTUAL + 8, 0),
+    );
+    let mut machine = TestMachine::new_with_cp0(100_000_000, BOOT_VIRTUAL, &[], cp0);
+    machine.install_program(&[encode_i(0x04, 0, 0, 1), ERET, 0]);
+
+    assert_eq!(machine.run_until(10), Ok(CpuExit::Deadline));
+    let before = machine.cpu.clone();
+
+    assert_eq!(
+        machine.run_until(20),
+        Err(CpuRunError::Execute(
+            ExecuteError::UnpredictableControlFlow {
+                instruction_pc: BOOT_VIRTUAL + 4,
+                branch_pc: BOOT_VIRTUAL,
+            }
+        ))
+    );
+    assert_eq!(machine.scheduler.now(), 20);
+    assert_eq!(machine.cpu, before);
+    assert_eq!(machine.cpu.next_pclk_tick(), 2);
+    assert_eq!(machine.cpu.pc_state().delay_slot_of(), Some(BOOT_VIRTUAL));
 }

@@ -34,7 +34,7 @@ pub(crate) enum InstructionDisposition {
 /// Identifies a non-guest condition for which no normal commit can be produced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecuteError {
-    /// A control transfer occurs in a delay slot, where its behavior is unpredictable.
+    /// A control-flow instruction occupies a delay slot, where its behavior is unpredictable.
     UnpredictableControlFlow { instruction_pc: u64, branch_pc: u64 },
     /// The instruction result is undefined for the observed operands.
     UndefinedResult { instruction: Instruction },
@@ -48,9 +48,9 @@ pub(crate) enum ExecuteError {
 ///
 /// # Errors
 ///
-/// Returns [`ExecuteError::UnpredictableControlFlow`] for a delayed transfer in a
-/// delay slot, or [`ExecuteError::UndefinedResult`] when operand values make the
-/// instruction result undefined.
+/// Returns [`ExecuteError::UnpredictableControlFlow`] for a control-flow
+/// instruction in a delay slot, or [`ExecuteError::UndefinedResult`] when operand
+/// values make the instruction result undefined.
 pub(crate) fn execute(
     cpu: &Cpu,
     instruction: Instruction,
@@ -93,6 +93,7 @@ pub(crate) fn execute(
         } => crate::memory::prepare_sw(cpu, rt, base, immediate).map(memory_disposition),
         Instruction::Syscall { code } => Ok(architectural(system::execute_syscall(code))),
         Instruction::Break { code } => Ok(architectural(system::execute_break(code))),
+        Instruction::Eret => system::execute_eret(cpu).map(architectural),
     }
 }
 

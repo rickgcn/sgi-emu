@@ -2,7 +2,7 @@
 //!
 //! A request identifies the guest event without selecting an exception vector or
 //! modifying exception-control state. [`ExceptionLocation`] captures the precise
-//! fault and branch-origin addresses before exception entry mutates the PC.
+//! current and branch-origin addresses before exception entry mutates the PC.
 
 use crate::pc::PcState;
 
@@ -10,6 +10,7 @@ use crate::pc::PcState;
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExceptionCode {
+    Interrupt = 0,
     AddressErrorLoad = 4,
     AddressErrorStore = 5,
     InstructionBusError = 6,
@@ -17,6 +18,7 @@ pub(crate) enum ExceptionCode {
     Syscall = 8,
     Breakpoint = 9,
     ReservedInstruction = 10,
+    CoprocessorUnusable = 11,
     IntegerOverflow = 12,
 }
 
@@ -29,6 +31,7 @@ impl ExceptionCode {
 /// Describes why normal retirement is replaced by guest exception entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExceptionRequest {
+    Interrupt,
     IntegerOverflow,
     Syscall,
     Breakpoint,
@@ -37,11 +40,13 @@ pub(crate) enum ExceptionRequest {
     DataBusError,
     AddressErrorLoad { bad_vaddr: u64 },
     AddressErrorStore { bad_vaddr: u64 },
+    CoprocessorUnusable { coprocessor: u8 },
 }
 
 impl ExceptionRequest {
     pub(crate) const fn exception_code(self) -> ExceptionCode {
         match self {
+            Self::Interrupt => ExceptionCode::Interrupt,
             Self::IntegerOverflow => ExceptionCode::IntegerOverflow,
             Self::Syscall => ExceptionCode::Syscall,
             Self::Breakpoint => ExceptionCode::Breakpoint,
@@ -50,6 +55,7 @@ impl ExceptionRequest {
             Self::DataBusError => ExceptionCode::DataBusError,
             Self::AddressErrorLoad { .. } => ExceptionCode::AddressErrorLoad,
             Self::AddressErrorStore { .. } => ExceptionCode::AddressErrorStore,
+            Self::CoprocessorUnusable { .. } => ExceptionCode::CoprocessorUnusable,
         }
     }
 
@@ -59,19 +65,36 @@ impl ExceptionRequest {
                 Some(bad_vaddr)
             }
             Self::IntegerOverflow
+            | Self::Interrupt
             | Self::Syscall
             | Self::Breakpoint
             | Self::ReservedInstruction
             | Self::InstructionBusError
-            | Self::DataBusError => None,
+            | Self::DataBusError
+            | Self::CoprocessorUnusable { .. } => None,
+        }
+    }
+
+    pub(crate) const fn coprocessor(self) -> Option<u8> {
+        match self {
+            Self::CoprocessorUnusable { coprocessor } => Some(coprocessor),
+            Self::Interrupt
+            | Self::IntegerOverflow
+            | Self::Syscall
+            | Self::Breakpoint
+            | Self::ReservedInstruction
+            | Self::InstructionBusError
+            | Self::DataBusError
+            | Self::AddressErrorLoad { .. }
+            | Self::AddressErrorStore { .. } => None,
         }
     }
 }
 
-/// Captures the faulting instruction address and authoritative delay-slot origin.
+/// Captures the current instruction address and authoritative delay-slot origin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExceptionLocation {
-    fault_pc: u64,
+    current_pc: u64,
     branch_pc: Option<u64>,
 }
 
@@ -79,20 +102,20 @@ impl ExceptionLocation {
     /// Captures exception location before any program-counter mutation.
     pub(crate) const fn from_pc_state(pc: &PcState) -> Self {
         Self {
-            fault_pc: pc.current(),
+            current_pc: pc.current(),
             branch_pc: pc.delay_slot_of(),
         }
     }
 
     /// Returns the architectural `(epc, branch_delay)` pair.
     ///
-    /// A recorded branch origin supplies `epc`; otherwise the faulting instruction
+    /// A recorded branch origin supplies `epc`; otherwise the current instruction
     /// address does. The branch origin is never reconstructed by subtracting from
     /// that address.
     pub(crate) const fn exception_program_counter(self) -> (u64, bool) {
         match self.branch_pc {
             Some(branch_pc) => (branch_pc, true),
-            None => (self.fault_pc, false),
+            None => (self.current_pc, false),
         }
     }
 }
@@ -105,6 +128,7 @@ mod tests {
     #[test]
     fn exception_requests_centralize_cause_and_address_information() {
         let cases = [
+            (ExceptionRequest::Interrupt, ExceptionCode::Interrupt, None),
             (
                 ExceptionRequest::IntegerOverflow,
                 ExceptionCode::IntegerOverflow,
@@ -141,16 +165,28 @@ mod tests {
                 ExceptionCode::AddressErrorStore,
                 Some(0x456),
             ),
+            (
+                ExceptionRequest::CoprocessorUnusable { coprocessor: 2 },
+                ExceptionCode::CoprocessorUnusable,
+                None,
+            ),
         ];
 
         for (request, code, bad_vaddr) in cases {
             assert_eq!(request.exception_code(), code);
             assert_eq!(request.bad_vaddr(), bad_vaddr);
         }
+
+        assert_eq!(
+            ExceptionRequest::CoprocessorUnusable { coprocessor: 2 }.coprocessor(),
+            Some(2)
+        );
+        assert_eq!(ExceptionRequest::Interrupt.coprocessor(), None);
     }
 
     #[test]
     fn cause_codes_match_the_r10000_architectural_encoding() {
+        assert_eq!(ExceptionCode::Interrupt.raw(), 0);
         assert_eq!(ExceptionCode::AddressErrorLoad.raw(), 4);
         assert_eq!(ExceptionCode::AddressErrorStore.raw(), 5);
         assert_eq!(ExceptionCode::InstructionBusError.raw(), 6);
@@ -158,6 +194,7 @@ mod tests {
         assert_eq!(ExceptionCode::Syscall.raw(), 8);
         assert_eq!(ExceptionCode::Breakpoint.raw(), 9);
         assert_eq!(ExceptionCode::ReservedInstruction.raw(), 10);
+        assert_eq!(ExceptionCode::CoprocessorUnusable.raw(), 11);
         assert_eq!(ExceptionCode::IntegerOverflow.raw(), 12);
     }
 
