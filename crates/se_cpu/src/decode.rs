@@ -28,6 +28,31 @@ const FUNCTION_ADD: u8 = 0x20;
 const FUNCTION_ADDU: u8 = 0x21;
 const FUNCTION_OR: u8 = 0x25;
 const ERET_ENCODING: u32 = 0x4200_0018;
+const TLBWI_ENCODING: u32 = 0x4200_0002;
+const COP0_MFC0: u8 = 0;
+const COP0_MTC0: u8 = 4;
+
+/// Identifies one five-bit CP0 register number encoded by a move instruction.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Cp0Register(u8);
+
+impl Cp0Register {
+    /// The indexed TLB-write target register.
+    pub(crate) const INDEX: Self = Self(0);
+    /// The even-page TLB staging register.
+    pub(crate) const ENTRY_LO0: Self = Self(2);
+    /// The odd-page TLB staging register.
+    pub(crate) const ENTRY_LO1: Self = Self(3);
+    /// The 32-bit page-table pointer register.
+    pub(crate) const CONTEXT: Self = Self(4);
+    /// The processor status register.
+    pub(crate) const STATUS: Self = Self(12);
+
+    const fn from_field(value: u8) -> Self {
+        Self(value & 0x1f)
+    }
+}
 
 /// Represents an architectural instruction with encoding details normalized into typed operands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +70,9 @@ pub(crate) enum Instruction {
     Sw { rt: Reg, base: Reg, immediate: i16 },
     Syscall { code: u32 },
     Break { code: u32 },
+    Mfc0 { rt: Reg, register: Cp0Register },
+    Mtc0 { rt: Reg, register: Cp0Register },
+    Tlbwi,
     Eret,
 }
 
@@ -120,10 +148,21 @@ pub(crate) fn decode(raw: u32) -> DecodeOutcome {
 }
 
 fn decode_cop0(raw: u32) -> DecodeOutcome {
-    if raw == ERET_ENCODING {
-        DecodeOutcome::Instruction(Instruction::Eret)
-    } else {
-        unclassified(raw)
+    match raw {
+        ERET_ENCODING => DecodeOutcome::Instruction(Instruction::Eret),
+        TLBWI_ENCODING => DecodeOutcome::Instruction(Instruction::Tlbwi),
+        _ if raw & 0x7ff == 0 => match register_field(raw, 21) {
+            COP0_MFC0 => DecodeOutcome::Instruction(Instruction::Mfc0 {
+                rt: register(raw, 16),
+                register: Cp0Register::from_field(register_field(raw, 11)),
+            }),
+            COP0_MTC0 => DecodeOutcome::Instruction(Instruction::Mtc0 {
+                rt: register(raw, 16),
+                register: Cp0Register::from_field(register_field(raw, 11)),
+            }),
+            _ => unclassified(raw),
+        },
+        _ => unclassified(raw),
     }
 }
 
@@ -213,7 +252,9 @@ fn special_code(raw: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeGap, DecodeOutcome, ERET_ENCODING, Instruction, decode};
+    use super::{
+        Cp0Register, DecodeGap, DecodeOutcome, ERET_ENCODING, Instruction, TLBWI_ENCODING, decode,
+    };
     use crate::gpr::Reg;
 
     fn reg(index: u8) -> Reg {
@@ -321,6 +362,47 @@ mod tests {
     }
 
     #[test]
+    fn decodes_exact_cp0_moves_and_tlbwi() {
+        let mfc0 = (0x10_u32 << 26) | (2 << 16) | (4 << 11);
+        let mtc0 = (0x10_u32 << 26) | (4 << 21) | (3 << 16) | (2 << 11);
+
+        assert_eq!(
+            decode(mfc0),
+            DecodeOutcome::Instruction(Instruction::Mfc0 {
+                rt: reg(2),
+                register: Cp0Register::CONTEXT,
+            })
+        );
+        assert_eq!(
+            decode(mtc0),
+            DecodeOutcome::Instruction(Instruction::Mtc0 {
+                rt: reg(3),
+                register: Cp0Register::ENTRY_LO0,
+            })
+        );
+        assert_eq!(
+            decode(TLBWI_ENCODING),
+            DecodeOutcome::Instruction(Instruction::Tlbwi)
+        );
+    }
+
+    #[test]
+    fn cp0_encodings_with_nonzero_fixed_fields_remain_unclassified() {
+        let cases = [
+            ((0x10_u32 << 26) | (2 << 16) | (4 << 11)) | 1,
+            ((0x10_u32 << 26) | (4 << 21) | (3 << 16) | (2 << 11)) | (1 << 6),
+            TLBWI_ENCODING ^ (1 << 6),
+        ];
+
+        for raw in cases {
+            assert_eq!(
+                decode(raw),
+                DecodeOutcome::ImplementationGap(DecodeGap::UnclassifiedEncoding { raw })
+            );
+        }
+    }
+
+    #[test]
     fn decodes_typed_signed_and_unsigned_immediates() {
         assert_eq!(
             decode(encode_i(0x09, 1, 2, 0xffff)),
@@ -417,7 +499,7 @@ mod tests {
 
     #[test]
     fn default_unknown_is_unclassified() {
-        let raw = 0x10_u32 << 26;
+        let raw = (0x10_u32 << 26) | 1;
 
         assert_eq!(
             decode(raw),

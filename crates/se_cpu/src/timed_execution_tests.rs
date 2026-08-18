@@ -20,9 +20,8 @@ use crate::decode::Instruction;
 use crate::exception::ExceptionCode;
 use crate::execute::ExecuteError;
 use crate::gpr::{GprFile, Reg};
-use crate::memory::TranslationError;
 use crate::pc::PcState;
-use crate::run::{CpuRunContext, CpuRunError, TimedBusResult, TranslationAccess};
+use crate::run::{CpuRunContext, CpuRunError, TimedBusResult};
 use crate::timing::{ProcessorClock, TimingError};
 
 const CPU_ID: CpuId = CpuId::from_raw(7);
@@ -31,10 +30,16 @@ const BOOT_VIRTUAL: u64 = 0xffff_ffff_bfc0_0000;
 const BOOT_PHYSICAL: u64 = 0x1fc0_0000;
 const DATA_VIRTUAL: u64 = 0xffff_ffff_a000_1000;
 const DATA_PHYSICAL: u64 = 0x1000;
+const MAPPED_VIRTUAL: u64 = 0x0040_0000;
+const MAPPED_PHYSICAL: u64 = 0x4000;
+const TLB_REFILL_PHYSICAL: u64 = 0;
+const PTE_PAIR_PHYSICAL: u64 = 0x2000;
+const CONTEXT_PTE_BASE: u64 = 0xffff_ffff_a000_0000;
 const EXCEPTION_PHYSICAL: u64 = 0x180;
 const IRQ_CLEAR_VIRTUAL: u64 = 0xffff_ffff_a000_2000;
 const IRQ_CLEAR_PHYSICAL: u64 = 0x2000;
 const ERET: u32 = 0x4200_0018;
+const TLBWI: u32 = 0x4200_0002;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransactionKind {
@@ -391,6 +396,50 @@ fn encode_i(opcode: u8, base: u8, rt: u8, immediate: u16) -> u32 {
         | u32::from(immediate)
 }
 
+fn encode_cp0_move(rs: u8, rt: u8, register: u8) -> u32 {
+    (0x10_u32 << 26) | (u32::from(rs) << 21) | (u32::from(rt) << 16) | (u32::from(register) << 11)
+}
+
+fn context_refill_cp0() -> Cp0 {
+    Cp0::synthetic_test_state_with(
+        SyntheticCp0State::new(false)
+            .with_entry_hi_asid(0x42)
+            .with_context_pte_base(CONTEXT_PTE_BASE)
+            .with_xcontext_pte_base(0x1234_5600_0000_0000),
+    )
+}
+
+fn entry_lo_word(physical_page: u64, valid: bool, dirty: bool, global: bool) -> u32 {
+    assert!(physical_page.is_multiple_of(0x1000));
+    let pfn = u32::try_from(physical_page >> 12).expect("test PFN must fit in a PTE word");
+    (pfn << 6) | (u32::from(dirty) << 2) | (u32::from(valid) << 1) | u32::from(global)
+}
+
+fn install_context_refill_handler(machine: &mut TestMachine, index: u8) {
+    machine.install_at(
+        TLB_REFILL_PHYSICAL,
+        &[
+            encode_cp0_move(0, 26, 4),
+            encode_i(0x23, 26, 27, 0),
+            encode_cp0_move(4, 27, 2),
+            encode_i(0x23, 26, 27, 4),
+            encode_cp0_move(4, 27, 3),
+            encode_i(0x09, 0, 27, u16::from(index)),
+            encode_cp0_move(4, 27, 0),
+            TLBWI,
+            ERET,
+        ],
+    );
+    machine.bus.words.insert(
+        PTE_PAIR_PHYSICAL,
+        entry_lo_word(MAPPED_PHYSICAL, true, true, false),
+    );
+    machine.bus.words.insert(
+        PTE_PAIR_PHYSICAL + 4,
+        entry_lo_word(MAPPED_PHYSICAL + 0x1000, true, true, false),
+    );
+}
+
 fn interrupt_enabled_cp0(mask: u8) -> Cp0 {
     Cp0::synthetic_test_state_with(
         SyntheticCp0State::new(false)
@@ -717,21 +766,177 @@ fn mips_iv_non_word_offset_is_an_execute_stop_even_if_effective_address_aligns()
 }
 
 #[test]
-fn mapped_data_address_reports_tlb_gap_without_fake_translation() {
+fn mapped_data_address_takes_refill_before_target_bus_access() {
     let mut machine = TestMachine::new(100_000_000, BOOT_VIRTUAL, &[(reg(1), 0x1000)]);
     machine.install_program(&[encode_i(0x23, 1, 2, 0)]);
 
-    assert_eq!(
-        machine.run_until(10),
-        Err(CpuRunError::Translation {
-            access: TranslationAccess::LoadWord,
-            error: TranslationError::TlbRequired {
-                virtual_address: 0x1000,
-            },
-        })
-    );
-    assert_eq!(machine.cpu.next_pclk_tick(), 1);
+    assert_eq!(machine.run_until(10), Ok(CpuExit::Deadline));
+    assert_eq!(machine.cpu.cp0().exception_code(), ExceptionCode::TlbLoad);
+    assert_eq!(machine.cpu.cp0().bad_vaddr(), 0x1000);
+    assert_eq!(machine.cpu.pc_state().current(), 0xffff_ffff_8000_0000);
+    assert_eq!(machine.cpu.next_pclk_tick(), 2);
     assert_eq!(machine.bus.transactions.len(), 1);
+}
+
+#[test]
+fn guest_refill_handler_installs_mapping_and_retries_load() {
+    let base = reg(1);
+    let destination = reg(2);
+    let mut machine = TestMachine::new_with_cp0(
+        100_000_000,
+        BOOT_VIRTUAL,
+        &[(base, MAPPED_VIRTUAL), (destination, 0x55)],
+        context_refill_cp0(),
+    );
+    machine.install_program(&[encode_i(0x23, 1, 2, 0)]);
+    install_context_refill_handler(&mut machine, 9);
+    machine.bus.words.insert(MAPPED_PHYSICAL, 0x8000_0001);
+
+    assert_eq!(machine.run_until(110), Ok(CpuExit::Deadline));
+
+    assert_eq!(machine.cpu.read_gpr(destination), 0xffff_ffff_8000_0001);
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 4);
+    assert_eq!(machine.cpu.cp0().epc(), BOOT_VIRTUAL);
+    assert!(!machine.cpu.cp0().exl());
+    assert!(!machine.cpu.cp0().tlb_shutdown());
+    assert_eq!(machine.cpu.cp0().entry_hi().asid(), 0x42);
+    assert_eq!(
+        machine
+            .bus
+            .transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.kind == TransactionKind::Read32
+                    && transaction.address == PhysAddr::new(MAPPED_PHYSICAL)
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        machine
+            .bus
+            .transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.kind == TransactionKind::Read32
+                    && matches!(transaction.address.get(), PTE_PAIR_PHYSICAL | 0x2004)
+            })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn guest_refill_handler_retries_mapped_instruction_fetch() {
+    let mut machine =
+        TestMachine::new_with_cp0(100_000_000, MAPPED_VIRTUAL, &[], context_refill_cp0());
+    install_context_refill_handler(&mut machine, 10);
+    machine
+        .bus
+        .words
+        .insert(MAPPED_PHYSICAL, encode_i(0x09, 0, 5, 7));
+
+    assert_eq!(machine.run_until(110), Ok(CpuExit::Deadline));
+
+    assert_eq!(machine.cpu.read_gpr(reg(5)), 7);
+    assert_eq!(machine.cpu.pc_state().current(), MAPPED_VIRTUAL + 4);
+    assert_eq!(machine.cpu.cp0().epc(), MAPPED_VIRTUAL);
+    assert!(!machine.cpu.cp0().exl());
+    let target_reads: Vec<_> = machine
+        .bus
+        .transactions
+        .iter()
+        .filter(|transaction| {
+            transaction.kind == TransactionKind::Read32
+                && transaction.address == PhysAddr::new(MAPPED_PHYSICAL)
+        })
+        .collect();
+    assert_eq!(target_reads.len(), 1);
+    assert_eq!(target_reads[0].time, 110);
+}
+
+#[test]
+fn delay_slot_store_refill_restarts_branch_and_writes_once() {
+    let base = reg(1);
+    let source = reg(2);
+    let mut machine = TestMachine::new_with_cp0(
+        100_000_000,
+        BOOT_VIRTUAL,
+        &[(base, MAPPED_VIRTUAL), (source, 0x1234_5678_9abc_def0)],
+        context_refill_cp0(),
+    );
+    machine.install_program(&[
+        encode_i(0x04, 0, 0, 3),
+        encode_i(0x2b, 1, 2, 0),
+        encode_i(0x09, 7, 7, 1),
+        encode_i(0x09, 7, 7, 1),
+        encode_i(0x09, 6, 6, 1),
+    ]);
+    install_context_refill_handler(&mut machine, 11);
+
+    assert_eq!(machine.run_until(140), Ok(CpuExit::Deadline));
+
+    assert_eq!(machine.bus.words.get(&MAPPED_PHYSICAL), Some(&0x9abc_def0));
+    assert_eq!(machine.cpu.read_gpr(reg(6)), 1);
+    assert_eq!(machine.cpu.read_gpr(reg(7)), 0);
+    assert_eq!(machine.cpu.pc_state().current(), BOOT_VIRTUAL + 20);
+    assert_eq!(machine.cpu.cp0().epc(), BOOT_VIRTUAL);
+    assert!(machine.cpu.cp0().branch_delay());
+    assert!(!machine.cpu.cp0().exl());
+    let target_transactions: Vec<_> = machine
+        .bus
+        .transactions
+        .iter()
+        .filter(|transaction| transaction.address == PhysAddr::new(MAPPED_PHYSICAL))
+        .collect();
+    assert_eq!(target_transactions.len(), 1);
+    assert_eq!(target_transactions[0].kind, TransactionKind::Write32);
+    assert_eq!(target_transactions[0].time, 130);
+    assert_eq!(
+        machine
+            .bus
+            .transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.kind == TransactionKind::Read32
+                    && transaction.address == PhysAddr::new(BOOT_PHYSICAL)
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        machine
+            .bus
+            .transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.kind == TransactionKind::Read32
+                    && transaction.address == PhysAddr::new(BOOT_PHYSICAL + 4)
+            })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn illegal_fetch_addresses_fault_before_translation_and_bus_access() {
+    let cases = [
+        (0x0000_0000_8000_0000, Cp0::synthetic_test_state(false)),
+        (
+            BOOT_VIRTUAL,
+            Cp0::synthetic_test_state_with(
+                SyntheticCp0State::new(false).with_operating_mode(OperatingMode::User, false),
+            ),
+        ),
+    ];
+
+    for (bad_pc, cp0) in cases {
+        let mut machine = TestMachine::new_with_cp0(100_000_000, bad_pc, &[], cp0);
+
+        assert_eq!(machine.run_until(10), Ok(CpuExit::Deadline));
+        assert_exception(&machine, ExceptionCode::AddressErrorLoad, bad_pc);
+        assert!(machine.bus.transactions.is_empty());
+    }
 }
 
 #[test]
@@ -1342,9 +1547,7 @@ fn delay_slot_irq_handler_restarts_branch_and_executes_slot_once() {
 #[test]
 fn eret_in_a_delay_slot_stops_before_cp0_usability_without_advancing_phase() {
     let cp0 = Cp0::synthetic_test_state_with(
-        SyntheticCp0State::new(false)
-            .with_operating_mode(OperatingMode::User, false)
-            .with_return_addresses(BOOT_VIRTUAL + 8, 0),
+        SyntheticCp0State::new(false).with_return_addresses(BOOT_VIRTUAL + 8, 0),
     );
     let mut machine = TestMachine::new_with_cp0(100_000_000, BOOT_VIRTUAL, &[], cp0);
     machine.install_program(&[encode_i(0x04, 0, 0, 1), ERET, 0]);

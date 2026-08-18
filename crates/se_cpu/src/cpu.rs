@@ -13,8 +13,10 @@ use crate::cp0::Cp0;
 use crate::exception::{ExceptionLocation, ExceptionRequest};
 use crate::gpr::{GprFile, Reg};
 use crate::interrupt::external_pending_ip;
+use crate::memory::AccessKind;
 use crate::pc::PcState;
 use crate::timing::{ProcessorClock, RetirementPhase, TimingError};
+use crate::tlb::{Tlb, TlbEntry, TlbInvariantError, TlbPage, TlbTranslation, TlbWriteDecision};
 use se_core::interrupt::InterruptWord;
 use se_core::time::VTime;
 
@@ -29,6 +31,7 @@ pub(crate) struct Cpu {
     gpr: GprFile,
     pc: PcState,
     cp0: Cp0,
+    tlb: Tlb,
     clock: ProcessorClock,
     phase: RetirementPhase,
     interrupt_word: InterruptWord,
@@ -43,6 +46,7 @@ impl Cpu {
             gpr,
             pc,
             cp0,
+            tlb: Tlb::new(),
             clock,
             phase: RetirementPhase::initial(),
             interrupt_word: InterruptWord::new(),
@@ -59,6 +63,44 @@ impl Cpu {
 
     pub(crate) const fn cp0(&self) -> &Cp0 {
         &self.cp0
+    }
+
+    /// Translates one canonical 32-bit guest virtual byte address already
+    /// classified as mapped.
+    ///
+    /// The current ASID comes only from `EntryHi`; no parallel ASID authority is
+    /// retained by the CPU.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlbInvariantError`] if authoritative entries permit more than one
+    /// match.
+    pub(crate) fn translate_mapped_address(
+        &self,
+        virtual_address: u64,
+        access: AccessKind,
+    ) -> Result<TlbTranslation, TlbInvariantError> {
+        self.tlb
+            .translate(virtual_address, self.cp0.entry_hi().asid(), access)
+    }
+
+    /// Computes an indexed TLB-write decision without mutating CP0 or the TLB.
+    ///
+    /// The replacement is global only when both staged `EntryLo` values are
+    /// global. The decision also captures every conflicting non-target slot that
+    /// commit must invalidate.
+    pub(crate) fn tlbwi_decision(&self) -> TlbWriteDecision {
+        let entry_hi = self.cp0.entry_hi();
+        let entry_lo0 = self.cp0.entry_lo0();
+        let entry_lo1 = self.cp0.entry_lo1();
+        let entry = TlbEntry::new(
+            entry_hi.vpn2(),
+            entry_hi.asid(),
+            entry_lo0.global() && entry_lo1.global(),
+            TlbPage::new(entry_lo0.pfn(), entry_lo0.valid(), entry_lo0.dirty()),
+            TlbPage::new(entry_lo1.pfn(), entry_lo1.valid(), entry_lo1.dirty()),
+        );
+        self.tlb.prepare_indexed_write(self.cp0.index(), entry)
     }
 
     pub(crate) const fn next_pclk_tick(&self) -> u64 {
@@ -100,10 +142,13 @@ impl Cpu {
     /// Panics if the commit contains a delayed transfer while the current
     /// instruction already occupies a delay slot.
     pub(crate) fn apply_commit(&mut self, commit: CpuCommit) {
-        let (gpr, cp0, pc) = commit.into_parts();
+        let (gpr, cp0, tlb, pc) = commit.into_parts();
         match pc {
             PcCommitEffect::Normal(effect) => self.pc.apply(effect),
             PcCommitEffect::ExceptionReturn { target } => self.pc.return_from_exception(target),
+        }
+        if let Some(decision) = tlb {
+            self.tlb.apply_indexed_write(decision);
         }
         if let Some(effect) = cp0 {
             self.cp0.apply_effect(effect);
@@ -135,6 +180,7 @@ impl PartialEq for Cpu {
         self.gpr == other.gpr
             && self.pc == other.pc
             && self.cp0 == other.cp0
+            && self.tlb == other.tlb
             && self.clock == other.clock
             && self.phase == other.phase
     }
@@ -147,13 +193,15 @@ impl Eq for Cpu {}
 mod tests {
     use super::Cpu;
     use crate::commit::CpuCommit;
-    use crate::cp0::Cp0;
+    use crate::cp0::{Cp0, Cp0Effect, SyntheticCp0State};
     use crate::decode::Instruction;
     use crate::exception::{ExceptionCode, ExceptionRequest};
     use crate::execute::{InstructionDisposition, InstructionOutcome, execute};
     use crate::gpr::{GprFile, Reg};
+    use crate::memory::AccessKind;
     use crate::pc::{PcEffect, PcState};
     use crate::timing::ProcessorClock;
+    use crate::tlb::{TlbEntry, TlbFault, TlbFaultReason, TlbPage, TlbTranslation};
 
     fn reg(index: u8) -> Reg {
         Reg::new(index).expect("test register index must be architectural")
@@ -166,6 +214,10 @@ mod tests {
             Cp0::synthetic_test_state(bev),
             ProcessorClock::new(1_000_000_000).unwrap(),
         )
+    }
+
+    const fn entry_lo(pfn: u32, global: bool) -> u64 {
+        (pfn as u64) << 6 | (1 << 2) | (1 << 1) | global as u64
     }
 
     #[test]
@@ -325,5 +377,84 @@ mod tests {
             assert_eq!(cpu.cp0().bad_vaddr(), 0xdead_beef);
             assert_eq!(cpu.cp0().exception_code(), request.exception_code());
         }
+    }
+
+    #[test]
+    fn indexed_tlb_commit_uses_index_and_combines_both_global_bits() {
+        const VIRTUAL_ADDRESS: u64 = 0x0040_0123;
+        let mut cpu = Cpu::from_parts(
+            GprFile::new(),
+            PcState::new(0x1000),
+            Cp0::synthetic_test_state_with(SyntheticCp0State::new(false).with_entry_hi_asid(7)),
+            ProcessorClock::new(1_000_000_000).unwrap(),
+        );
+        cpu.apply_exception(ExceptionRequest::Tlb(TlbFault::new_for_test(
+            TlbFaultReason::Refill,
+            AccessKind::Load,
+            VIRTUAL_ADDRESS,
+        )));
+        cpu.apply_commit(
+            CpuCommit::new(PcEffect::Sequential).with_cp0_effect(Cp0Effect::write_index(37)),
+        );
+        cpu.apply_commit(
+            CpuCommit::new(PcEffect::Sequential)
+                .with_cp0_effect(Cp0Effect::write_entry_lo0(entry_lo(4, true))),
+        );
+        cpu.apply_commit(
+            CpuCommit::new(PcEffect::Sequential)
+                .with_cp0_effect(Cp0Effect::write_entry_lo1(entry_lo(5, false))),
+        );
+
+        let decision = cpu.tlbwi_decision();
+        cpu.apply_commit(CpuCommit::tlb_write(decision));
+
+        let nonglobal = TlbEntry::new(
+            0x200,
+            7,
+            false,
+            TlbPage::new(4, true, true),
+            TlbPage::new(5, true, true),
+        );
+        assert_eq!(cpu.tlb.entry_for_test(0), None);
+        assert_eq!(cpu.tlb.entry_for_test(37), Some(nonglobal));
+        let TlbTranslation::Fault(fault) = cpu
+            .tlb
+            .translate(VIRTUAL_ADDRESS, 8, AccessKind::Load)
+            .expect("one installed slot must be unambiguous")
+        else {
+            panic!("one clear G bit must keep the installed entry ASID-scoped");
+        };
+        assert_eq!(fault.reason(), TlbFaultReason::Refill);
+
+        cpu.apply_commit(
+            CpuCommit::new(PcEffect::Sequential).with_cp0_effect(Cp0Effect::write_index(41)),
+        );
+        cpu.apply_commit(
+            CpuCommit::new(PcEffect::Sequential)
+                .with_cp0_effect(Cp0Effect::write_entry_lo0(entry_lo(8, true))),
+        );
+        cpu.apply_commit(
+            CpuCommit::new(PcEffect::Sequential)
+                .with_cp0_effect(Cp0Effect::write_entry_lo1(entry_lo(9, true))),
+        );
+
+        let decision = cpu.tlbwi_decision();
+        cpu.apply_commit(CpuCommit::tlb_write(decision));
+
+        let global = TlbEntry::new(
+            0x200,
+            7,
+            true,
+            TlbPage::new(8, true, true),
+            TlbPage::new(9, true, true),
+        );
+        assert_eq!(cpu.tlb.entry_for_test(37), None);
+        assert_eq!(cpu.tlb.entry_for_test(41), Some(global));
+        assert_eq!(
+            cpu.tlb.translate(VIRTUAL_ADDRESS, 8, AccessKind::Load),
+            Ok(TlbTranslation::Translated(se_core::address::PhysAddr::new(
+                0x8123
+            )))
+        );
     }
 }

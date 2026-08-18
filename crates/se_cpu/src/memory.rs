@@ -1,13 +1,13 @@
-//! Prepares CPU word accesses and translates compatibility-kernel direct addresses.
+//! Prepares CPU word accesses and classifies canonical 32-bit virtual addresses.
 //!
-//! This module classifies guest virtual addresses before constructing
-//! [`PhysAddr`] values. It has no knowledge of machine bus routes, device-local
-//! addresses, or event scheduling. Address classification assumes a
-//! kernel-compatible boot/direct-access context and does not validate `Status.KSU`
-//! or `KX`/`SX`/`UX`; callers must not treat it as general-mode translation.
+//! Address classification validates the complete 64-bit representation and the
+//! effective operating mode before choosing a direct physical route or a mapped
+//! TLB route. It has no knowledge of TLB contents, machine bus routes,
+//! device-local addresses, or event scheduling.
 
 use se_core::address::PhysAddr;
 
+use crate::cp0::OperatingMode;
 use crate::cpu::Cpu;
 use crate::decode::Instruction;
 use crate::exception::ExceptionRequest;
@@ -17,17 +17,29 @@ use crate::gpr::Reg;
 const KSEG0_START: u32 = 0x8000_0000;
 const KSEG1_START: u32 = 0xa000_0000;
 const KSEG2_START: u32 = 0xc000_0000;
+const KSEG3_START: u32 = 0xe000_0000;
 
-/// Identifies a virtual address path outside compatibility-kernel direct translation.
+/// Identifies the CPU operation presenting a virtual address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationError {
-    /// A canonical 32-bit-compatible mapped segment requires TLB translation.
-    TlbRequired { virtual_address: u64 },
-    /// The address does not belong to the supported compatibility-space subset.
-    AddressSpaceUnimplemented { virtual_address: u64 },
+pub(crate) enum AccessKind {
+    /// Instruction fetch.
+    Fetch,
+    /// Data load.
+    Load,
+    /// Data store.
+    Store,
 }
 
-/// Holds a validated virtual word access awaiting address translation and bus I/O.
+/// Selects the next stage after 32-bit address legality checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AddressRoute {
+    /// Uses the contained physical byte address without a TLB lookup.
+    Direct(PhysAddr),
+    /// Presents the contained canonical guest virtual byte address to the TLB.
+    Mapped { virtual_address: u64 },
+}
+
+/// Holds an aligned virtual word access awaiting address classification and bus I/O.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MemoryRequest {
     /// Reads a guest-big-endian word and writes its sign-extended value to a GPR.
@@ -57,7 +69,8 @@ pub(crate) enum MemoryPreparation {
 
 /// Prepares an `LW` without performing address translation or bus I/O.
 ///
-/// A misaligned effective address produces
+/// The effective address is the base GPR plus the sign-extended `immediate`
+/// modulo 2^64. A misaligned effective address produces
 /// [`MemoryPreparation::Exception`]. Otherwise the returned request retains the
 /// guest virtual address and destination register for timed completion.
 ///
@@ -93,9 +106,10 @@ pub(crate) fn prepare_lw(
 
 /// Prepares an `SW` without performing address translation or bus I/O.
 ///
-/// The request captures the source GPR's low 32 bits. A misaligned effective
-/// address instead produces [`MemoryPreparation::Exception`] without a data bus
-/// transaction.
+/// The effective address is the base GPR plus the sign-extended `immediate`
+/// modulo 2^64. The request captures the source GPR's low 32 bits. A misaligned
+/// effective address instead produces [`MemoryPreparation::Exception`] without a
+/// data bus transaction.
 ///
 /// # Errors
 ///
@@ -140,37 +154,65 @@ fn effective_address(base: u64, immediate: i16) -> u64 {
     base.wrapping_add(i64::from(immediate) as u64)
 }
 
-/// Translates sign-extended compatibility-kernel direct addresses to physical space.
+/// Classifies one guest virtual byte address under canonical 32-bit rules.
 ///
-/// The inclusive virtual ranges `0xffff_ffff_8000_0000..=0xffff_ffff_9fff_ffff`
-/// and `0xffff_ffff_a000_0000..=0xffff_ffff_bfff_ffff` map to physical
-/// `0x0000_0000..=0x1fff_ffff`. The caller supplies a kernel-compatible
-/// boot/direct-access context; this function does not validate privilege or
-/// extended-address mode bits.
+/// A valid address equals the sign extension of its low 32 bits. User mode maps
+/// `useg` (`0x0000_0000_0000_0000..=0x0000_0000_7fff_ffff`). Supervisor mode
+/// additionally maps `sseg`
+/// (`0xffff_ffff_c000_0000..=0xffff_ffff_dfff_ffff`), and Kernel mode additionally
+/// maps `kseg3` (`0xffff_ffff_e000_0000..=0xffff_ffff_ffff_ffff`). In Kernel mode,
+/// `kseg0` (`0xffff_ffff_8000_0000..=0xffff_ffff_9fff_ffff`) and `kseg1`
+/// (`0xffff_ffff_a000_0000..=0xffff_ffff_bfff_ffff`) each map to physical
+/// `0x0000_0000..=0x1fff_ffff`. With `mode` set to Kernel and `erl` set, virtual
+/// `0x0000_0000..=0x7fff_ffff` maps directly to the same physical byte address.
+/// Direct routes still require the caller to use the physical bus.
 ///
 /// # Errors
 ///
-/// Returns [`TranslationError::TlbRequired`] for canonical 32-bit-compatible
-/// mapped segments. Returns [`TranslationError::AddressSpaceUnimplemented`] for
-/// zero-extended kernel aliases and other unsupported 64-bit address forms.
-pub(crate) fn translate_compat_kernel_direct(
+/// Returns the access-appropriate Address Error request, containing the original
+/// offending value, when the address is noncanonical or inaccessible in `mode`.
+pub(crate) fn classify_32_bit_address(
     virtual_address: u64,
-) -> Result<PhysAddr, TranslationError> {
-    let upper = virtual_address >> 32;
+    mode: OperatingMode,
+    erl: bool,
+    access: AccessKind,
+) -> Result<AddressRoute, ExceptionRequest> {
     let low = virtual_address as u32;
-
-    if upper == 0 && low < KSEG0_START {
-        return Err(TranslationError::TlbRequired { virtual_address });
-    }
-    if upper != u64::from(u32::MAX) {
-        return Err(TranslationError::AddressSpaceUnimplemented { virtual_address });
+    let canonical = i64::from(low as i32) as u64;
+    if virtual_address != canonical {
+        return Err(address_error(access, virtual_address));
     }
 
-    match low {
-        KSEG0_START..KSEG1_START => Ok(PhysAddr::new(u64::from(low - KSEG0_START))),
-        KSEG1_START..KSEG2_START => Ok(PhysAddr::new(u64::from(low - KSEG1_START))),
-        KSEG2_START..=u32::MAX => Err(TranslationError::TlbRequired { virtual_address }),
-        _ => Err(TranslationError::AddressSpaceUnimplemented { virtual_address }),
+    let mapped = || AddressRoute::Mapped { virtual_address };
+
+    match mode {
+        OperatingMode::User if low < KSEG0_START => Ok(mapped()),
+        OperatingMode::User => Err(address_error(access, virtual_address)),
+        OperatingMode::Supervisor if low < KSEG0_START => Ok(mapped()),
+        OperatingMode::Supervisor if (KSEG2_START..KSEG3_START).contains(&low) => Ok(mapped()),
+        OperatingMode::Supervisor => Err(address_error(access, virtual_address)),
+        OperatingMode::Kernel if erl && low < KSEG0_START => {
+            Ok(AddressRoute::Direct(PhysAddr::new(u64::from(low))))
+        }
+        OperatingMode::Kernel if low < KSEG0_START => Ok(mapped()),
+        OperatingMode::Kernel if low < KSEG1_START => Ok(AddressRoute::Direct(PhysAddr::new(
+            u64::from(low - KSEG0_START),
+        ))),
+        OperatingMode::Kernel if low < KSEG2_START => Ok(AddressRoute::Direct(PhysAddr::new(
+            u64::from(low - KSEG1_START),
+        ))),
+        OperatingMode::Kernel => Ok(mapped()),
+    }
+}
+
+pub(crate) const fn address_error(access: AccessKind, virtual_address: u64) -> ExceptionRequest {
+    match access {
+        AccessKind::Fetch | AccessKind::Load => ExceptionRequest::AddressErrorLoad {
+            bad_vaddr: virtual_address,
+        },
+        AccessKind::Store => ExceptionRequest::AddressErrorStore {
+            bad_vaddr: virtual_address,
+        },
     }
 }
 
@@ -178,45 +220,134 @@ pub(crate) fn translate_compat_kernel_direct(
 mod tests {
     use se_core::address::PhysAddr;
 
-    use super::{TranslationError, translate_compat_kernel_direct};
+    use super::{AccessKind, AddressRoute, classify_32_bit_address};
+    use crate::cp0::OperatingMode;
+    use crate::exception::ExceptionRequest;
 
     #[test]
-    fn compatibility_kernel_segments_translate_only_after_positive_classification() {
-        assert_eq!(
-            translate_compat_kernel_direct(0xffff_ffff_8000_0180),
-            Ok(PhysAddr::new(0x180))
-        );
-        assert_eq!(
-            translate_compat_kernel_direct(0xffff_ffff_bfc0_0000),
-            Ok(PhysAddr::new(0x1fc0_0000))
-        );
-        assert_eq!(
-            translate_compat_kernel_direct(0xffff_ffff_bfff_ffff),
-            Ok(PhysAddr::new(0x1fff_ffff))
-        );
-    }
+    fn classifier_requires_the_canonical_sign_extended_representation() {
+        let cases = [
+            0x0000_0000_8000_0000,
+            0xffff_ffff_7fff_ffff,
+            0x8000_0000_0000_0000,
+        ];
 
-    #[test]
-    fn mapped_compatibility_segments_require_the_deferred_tlb() {
-        for virtual_address in [0x1000, 0xffff_ffff_c000_0000, u64::MAX] {
+        for virtual_address in cases {
             assert_eq!(
-                translate_compat_kernel_direct(virtual_address),
-                Err(TranslationError::TlbRequired { virtual_address })
+                classify_32_bit_address(
+                    virtual_address,
+                    OperatingMode::Kernel,
+                    false,
+                    AccessKind::Load,
+                ),
+                Err(ExceptionRequest::AddressErrorLoad {
+                    bad_vaddr: virtual_address,
+                })
             );
         }
     }
 
     #[test]
-    fn zero_extended_kernel_aliases_and_other_64_bit_spaces_are_not_invented() {
+    fn user_mode_maps_only_useg_and_selects_access_specific_address_errors() {
+        assert_eq!(
+            classify_32_bit_address(0x1234, OperatingMode::User, false, AccessKind::Fetch),
+            Ok(AddressRoute::Mapped {
+                virtual_address: 0x1234,
+            })
+        );
+        assert_eq!(
+            classify_32_bit_address(
+                0xffff_ffff_c000_0000,
+                OperatingMode::User,
+                false,
+                AccessKind::Store,
+            ),
+            Err(ExceptionRequest::AddressErrorStore {
+                bad_vaddr: 0xffff_ffff_c000_0000,
+            })
+        );
+    }
+
+    #[test]
+    fn supervisor_mode_maps_useg_and_sseg_but_rejects_kernel_spaces() {
+        for virtual_address in [0x1234, 0xffff_ffff_c000_1234] {
+            assert_eq!(
+                classify_32_bit_address(
+                    virtual_address,
+                    OperatingMode::Supervisor,
+                    false,
+                    AccessKind::Load,
+                ),
+                Ok(AddressRoute::Mapped { virtual_address })
+            );
+        }
+
         for virtual_address in [
-            0x0000_0000_8000_0000,
-            0x0000_0000_bfc0_0000,
-            0x8000_0000_0000_0000,
+            0xffff_ffff_8000_0000,
+            0xffff_ffff_a000_0000,
+            0xffff_ffff_e000_0000,
         ] {
             assert_eq!(
-                translate_compat_kernel_direct(virtual_address),
-                Err(TranslationError::AddressSpaceUnimplemented { virtual_address })
+                classify_32_bit_address(
+                    virtual_address,
+                    OperatingMode::Supervisor,
+                    false,
+                    AccessKind::Load,
+                ),
+                Err(ExceptionRequest::AddressErrorLoad {
+                    bad_vaddr: virtual_address,
+                })
             );
         }
+    }
+
+    #[test]
+    fn kernel_direct_segments_select_the_expected_physical_addresses() {
+        assert_eq!(
+            classify_32_bit_address(
+                0xffff_ffff_8000_0180,
+                OperatingMode::Kernel,
+                false,
+                AccessKind::Fetch,
+            ),
+            Ok(AddressRoute::Direct(PhysAddr::new(0x180)))
+        );
+        assert_eq!(
+            classify_32_bit_address(
+                0xffff_ffff_bfc0_0000,
+                OperatingMode::Kernel,
+                false,
+                AccessKind::Load,
+            ),
+            Ok(AddressRoute::Direct(PhysAddr::new(0x1fc0_0000)))
+        );
+    }
+
+    #[test]
+    fn kernel_mapped_segments_are_kept_distinct_from_direct_routes() {
+        for virtual_address in [
+            0x1000,
+            0xffff_ffff_c000_0000,
+            0xffff_ffff_e000_0000,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                classify_32_bit_address(
+                    virtual_address,
+                    OperatingMode::Kernel,
+                    false,
+                    AccessKind::Load,
+                ),
+                Ok(AddressRoute::Mapped { virtual_address })
+            );
+        }
+    }
+
+    #[test]
+    fn erl_routes_the_low_two_gibibytes_directly() {
+        assert_eq!(
+            classify_32_bit_address(0x1234_5678, OperatingMode::Kernel, true, AccessKind::Store,),
+            Ok(AddressRoute::Direct(PhysAddr::new(0x1234_5678)))
+        );
     }
 }

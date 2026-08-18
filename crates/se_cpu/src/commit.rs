@@ -2,12 +2,13 @@
 //!
 //! Instruction handlers construct [`CpuCommit`] without mutating live CPU state.
 //! A commit carries at most one GPR write, an optional bounded CP0 effect, and
-//! exactly one program-counter effect. Memory and device effects are not
-//! represented here.
+//! an optional indexed TLB-write decision together with exactly one
+//! program-counter effect. Memory and device effects are not represented here.
 
 use crate::cp0::{Cp0Effect, ExceptionReturnDecision};
 use crate::gpr::Reg;
 use crate::pc::PcEffect;
+use crate::tlb::TlbWriteDecision;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GprWrite {
@@ -36,13 +37,14 @@ pub(crate) enum PcCommitEffect {
 
 /// Carries one instruction's bounded architectural write-set.
 ///
-/// The write-set contains at most one GPR write, an optional CP0 effect, and
-/// exactly one program-counter effect. Constructing a commit does not modify live
-/// CPU state.
+/// The write-set contains at most one GPR write, an optional CP0 effect, an
+/// optional indexed TLB-write decision, and exactly one program-counter effect.
+/// Constructing a commit does not modify live CPU state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CpuCommit {
     gpr: Option<GprWrite>,
     cp0: Option<Cp0Effect>,
+    tlb: Option<TlbWriteDecision>,
     pc: PcCommitEffect,
 }
 
@@ -51,6 +53,7 @@ impl CpuCommit {
         Self {
             gpr: None,
             cp0: None,
+            tlb: None,
             pc: PcCommitEffect::Normal(pc),
         }
     }
@@ -62,6 +65,7 @@ impl CpuCommit {
             cp0: Some(Cp0Effect::ExceptionReturn {
                 level: decision.level(),
             }),
+            tlb: None,
             pc: PcCommitEffect::ExceptionReturn {
                 target: decision.target(),
             },
@@ -74,7 +78,30 @@ impl CpuCommit {
         self
     }
 
-    pub(crate) const fn into_parts(self) -> (Option<GprWrite>, Option<Cp0Effect>, PcCommitEffect) {
-        (self.gpr, self.cp0, self.pc)
+    /// Sets the pending bounded CP0 mutation, replacing any previously selected effect.
+    pub(crate) const fn with_cp0_effect(mut self, effect: Cp0Effect) -> Self {
+        self.cp0 = Some(effect);
+        self
+    }
+
+    /// Constructs a sequential commit with inseparable TLB replacement and `Status.TS` effects.
+    pub(crate) const fn tlb_write(decision: TlbWriteDecision) -> Self {
+        Self {
+            gpr: None,
+            cp0: Some(Cp0Effect::set_tlb_shutdown(decision.conflict_detected())),
+            tlb: Some(decision),
+            pc: PcCommitEffect::Normal(PcEffect::Sequential),
+        }
+    }
+
+    pub(crate) const fn into_parts(
+        self,
+    ) -> (
+        Option<GprWrite>,
+        Option<Cp0Effect>,
+        Option<TlbWriteDecision>,
+        PcCommitEffect,
+    ) {
+        (self.gpr, self.cp0, self.tlb, self.pc)
     }
 }

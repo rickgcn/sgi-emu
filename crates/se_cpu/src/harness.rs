@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn unclassified_encoding_is_not_a_guest_exception() {
         let mut harness = SemanticHarness::new(0x1000);
-        let raw = 0x10_u32 << 26;
+        let raw = (0x10_u32 << 26) | 1;
         let before = harness.cpu.clone();
 
         assert_eq!(

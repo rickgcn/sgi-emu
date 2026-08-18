@@ -29,9 +29,12 @@ use crate::decode::{DecodeGap, DecodeOutcome, decode};
 use crate::exception::ExceptionRequest;
 use crate::execute::{ExecuteError, InstructionDisposition, InstructionOutcome, execute};
 use crate::interrupt::external_pending_ip;
-use crate::memory::{MemoryRequest, TranslationError, translate_compat_kernel_direct};
+use crate::memory::{
+    AccessKind, AddressRoute, MemoryRequest, address_error, classify_32_bit_address,
+};
 use crate::pc::PcEffect;
 use crate::timing::TimingError;
+use crate::tlb::{TlbInvariantError, TlbTranslation};
 
 /// Separates a physical bus result from a failure of the timed machine context.
 ///
@@ -91,17 +94,6 @@ pub(crate) trait CpuRunContext {
     ) -> TimedBusResult<(), Self::Error>;
 }
 
-/// Identifies which CPU access could not use the supported translation subset.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TranslationAccess {
-    /// Instruction fetch address.
-    InstructionFetch,
-    /// `LW` data address.
-    LoadWord,
-    /// `SW` data address.
-    StoreWord,
-}
-
 /// Reports a fatal emulator or execution-environment failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CpuRunError<E> {
@@ -113,13 +105,8 @@ pub(crate) enum CpuRunError<E> {
     Decode(DecodeGap),
     /// Instruction operands require undefined or unpredictable behavior.
     Execute(ExecuteError),
-    /// A virtual address lies outside the supported translation subset.
-    Translation {
-        /// CPU operation that supplied the virtual address.
-        access: TranslationAccess,
-        /// Address classification failure.
-        error: TranslationError,
-    },
+    /// Authoritative TLB state permitted an ambiguous translation.
+    TlbInvariant(TlbInvariantError),
 }
 
 impl<E: fmt::Display> fmt::Display for CpuRunError<E> {
@@ -129,9 +116,7 @@ impl<E: fmt::Display> fmt::Display for CpuRunError<E> {
             Self::Context(error) => write!(formatter, "CPU run context failure: {error}"),
             Self::Decode(error) => write!(formatter, "CPU decode gap: {error:?}"),
             Self::Execute(error) => write!(formatter, "CPU execution failure: {error:?}"),
-            Self::Translation { access, error } => {
-                write!(formatter, "CPU {access:?} translation gap: {error:?}")
-            }
+            Self::TlbInvariant(error) => write!(formatter, "CPU TLB invariant failure: {error}"),
         }
     }
 }
@@ -141,7 +126,8 @@ impl<E: Error + 'static> Error for CpuRunError<E> {
         match self {
             Self::Timing(error) => Some(error),
             Self::Context(error) => Some(error),
-            Self::Decode(_) | Self::Execute(_) | Self::Translation { .. } => None,
+            Self::TlbInvariant(error) => Some(error),
+            Self::Decode(_) | Self::Execute(_) => None,
         }
     }
 }
@@ -175,8 +161,8 @@ impl Cpu {
     /// machine time and deadline. Returns [`CpuRunError::Context`] when timed
     /// synchronization fails, [`CpuRunError::Decode`] or [`CpuRunError::Execute`]
     /// when guest semantics cannot be determined, and
-    /// [`CpuRunError::Translation`] when an address requires unsupported
-    /// translation.
+    /// [`CpuRunError::TlbInvariant`] when authoritative entries would make a
+    /// mapped lookup ambiguous.
     pub(crate) fn run_until<C: CpuRunContext>(
         &mut self,
         context: &mut C,
@@ -260,19 +246,20 @@ impl Cpu {
     ) -> Result<(), CpuRunError<C::Error>> {
         let instruction_address = self.pc_state().current();
         if !instruction_address.is_multiple_of(4) {
-            self.apply_exception(ExceptionRequest::AddressErrorLoad {
-                bad_vaddr: instruction_address,
-            });
+            self.apply_exception(address_error(AccessKind::Fetch, instruction_address));
             return Ok(());
         }
 
-        let physical_address =
-            translate_compat_kernel_direct(instruction_address).map_err(|error| {
-                CpuRunError::Translation {
-                    access: TranslationAccess::InstructionFetch,
-                    error,
-                }
-            })?;
+        let physical_address = match self
+            .resolve_address(instruction_address, AccessKind::Fetch)
+            .map_err(CpuRunError::TlbInvariant)?
+        {
+            AddressResolution::Physical(address) => address,
+            AddressResolution::Exception(request) => {
+                self.apply_exception(request);
+                return Ok(());
+            }
+        };
         let raw = match context
             .read32_at(timestamp, physical_address)
             .map_err(CpuRunError::Context)?
@@ -322,13 +309,16 @@ impl Cpu {
                 destination,
                 virtual_address,
             } => {
-                let physical_address =
-                    translate_compat_kernel_direct(virtual_address).map_err(|error| {
-                        CpuRunError::Translation {
-                            access: TranslationAccess::LoadWord,
-                            error,
-                        }
-                    })?;
+                let physical_address = match self
+                    .resolve_address(virtual_address, AccessKind::Load)
+                    .map_err(CpuRunError::TlbInvariant)?
+                {
+                    AddressResolution::Physical(address) => address,
+                    AddressResolution::Exception(request) => {
+                        self.apply_exception(request);
+                        return Ok(());
+                    }
+                };
                 let value = match context
                     .read32_at(timestamp, physical_address)
                     .map_err(CpuRunError::Context)?
@@ -349,13 +339,16 @@ impl Cpu {
                 value,
                 virtual_address,
             } => {
-                let physical_address =
-                    translate_compat_kernel_direct(virtual_address).map_err(|error| {
-                        CpuRunError::Translation {
-                            access: TranslationAccess::StoreWord,
-                            error,
-                        }
-                    })?;
+                let physical_address = match self
+                    .resolve_address(virtual_address, AccessKind::Store)
+                    .map_err(CpuRunError::TlbInvariant)?
+                {
+                    AddressResolution::Physical(address) => address,
+                    AddressResolution::Exception(request) => {
+                        self.apply_exception(request);
+                        return Ok(());
+                    }
+                };
                 match context
                     .write32_at(timestamp, physical_address, value)
                     .map_err(CpuRunError::Context)?
@@ -367,6 +360,39 @@ impl Cpu {
             }
         }
     }
+
+    fn resolve_address(
+        &self,
+        virtual_address: u64,
+        access: AccessKind,
+    ) -> Result<AddressResolution, TlbInvariantError> {
+        let route = match classify_32_bit_address(
+            virtual_address,
+            self.cp0().effective_mode(),
+            self.cp0().erl(),
+            access,
+        ) {
+            Ok(route) => route,
+            Err(request) => return Ok(AddressResolution::Exception(request)),
+        };
+
+        match route {
+            AddressRoute::Direct(address) => Ok(AddressResolution::Physical(address)),
+            AddressRoute::Mapped { virtual_address } => {
+                match self.translate_mapped_address(virtual_address, access)? {
+                    TlbTranslation::Translated(address) => Ok(AddressResolution::Physical(address)),
+                    TlbTranslation::Fault(fault) => {
+                        Ok(AddressResolution::Exception(ExceptionRequest::Tlb(fault)))
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum AddressResolution {
+    Physical(PhysAddr),
+    Exception(ExceptionRequest),
 }
 
 fn instruction_bus_exception(fault: BusFault) -> ExceptionRequest {

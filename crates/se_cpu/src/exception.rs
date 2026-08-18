@@ -5,12 +5,16 @@
 //! current and branch-origin addresses before exception entry mutates the PC.
 
 use crate::pc::PcState;
+use crate::tlb::{TlbFault, TlbFaultReason};
 
 /// Identifies an architectural `Cause.ExcCode` class.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExceptionCode {
     Interrupt = 0,
+    TlbModified = 1,
+    TlbLoad = 2,
+    TlbStore = 3,
     AddressErrorLoad = 4,
     AddressErrorStore = 5,
     InstructionBusError = 6,
@@ -32,6 +36,7 @@ impl ExceptionCode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExceptionRequest {
     Interrupt,
+    Tlb(TlbFault),
     IntegerOverflow,
     Syscall,
     Breakpoint,
@@ -47,6 +52,15 @@ impl ExceptionRequest {
     pub(crate) const fn exception_code(self) -> ExceptionCode {
         match self {
             Self::Interrupt => ExceptionCode::Interrupt,
+            Self::Tlb(fault) => match fault.reason() {
+                TlbFaultReason::Modified => ExceptionCode::TlbModified,
+                TlbFaultReason::Refill | TlbFaultReason::Invalid => match fault.access() {
+                    crate::memory::AccessKind::Fetch | crate::memory::AccessKind::Load => {
+                        ExceptionCode::TlbLoad
+                    }
+                    crate::memory::AccessKind::Store => ExceptionCode::TlbStore,
+                },
+            },
             Self::IntegerOverflow => ExceptionCode::IntegerOverflow,
             Self::Syscall => ExceptionCode::Syscall,
             Self::Breakpoint => ExceptionCode::Breakpoint,
@@ -61,6 +75,7 @@ impl ExceptionRequest {
 
     pub(crate) const fn bad_vaddr(self) -> Option<u64> {
         match self {
+            Self::Tlb(fault) => Some(fault.virtual_address()),
             Self::AddressErrorLoad { bad_vaddr } | Self::AddressErrorStore { bad_vaddr } => {
                 Some(bad_vaddr)
             }
@@ -75,10 +90,27 @@ impl ExceptionRequest {
         }
     }
 
+    pub(crate) const fn tlb_fault(self) -> Option<TlbFault> {
+        match self {
+            Self::Tlb(fault) => Some(fault),
+            Self::Interrupt
+            | Self::IntegerOverflow
+            | Self::Syscall
+            | Self::Breakpoint
+            | Self::ReservedInstruction
+            | Self::InstructionBusError
+            | Self::DataBusError
+            | Self::AddressErrorLoad { .. }
+            | Self::AddressErrorStore { .. }
+            | Self::CoprocessorUnusable { .. } => None,
+        }
+    }
+
     pub(crate) const fn coprocessor(self) -> Option<u8> {
         match self {
             Self::CoprocessorUnusable { coprocessor } => Some(coprocessor),
             Self::Interrupt
+            | Self::Tlb(_)
             | Self::IntegerOverflow
             | Self::Syscall
             | Self::Breakpoint
@@ -123,12 +155,41 @@ impl ExceptionLocation {
 #[cfg(test)]
 mod tests {
     use super::{ExceptionCode, ExceptionLocation, ExceptionRequest};
+    use crate::memory::AccessKind;
     use crate::pc::{PcEffect, PcState};
+    use crate::tlb::{TlbFault, TlbFaultReason};
 
     #[test]
     fn exception_requests_centralize_cause_and_address_information() {
         let cases = [
             (ExceptionRequest::Interrupt, ExceptionCode::Interrupt, None),
+            (
+                ExceptionRequest::Tlb(TlbFault::new_for_test(
+                    TlbFaultReason::Refill,
+                    AccessKind::Fetch,
+                    0x123,
+                )),
+                ExceptionCode::TlbLoad,
+                Some(0x123),
+            ),
+            (
+                ExceptionRequest::Tlb(TlbFault::new_for_test(
+                    TlbFaultReason::Invalid,
+                    AccessKind::Store,
+                    0x456,
+                )),
+                ExceptionCode::TlbStore,
+                Some(0x456),
+            ),
+            (
+                ExceptionRequest::Tlb(TlbFault::new_for_test(
+                    TlbFaultReason::Modified,
+                    AccessKind::Store,
+                    0x789,
+                )),
+                ExceptionCode::TlbModified,
+                Some(0x789),
+            ),
             (
                 ExceptionRequest::IntegerOverflow,
                 ExceptionCode::IntegerOverflow,
@@ -187,6 +248,9 @@ mod tests {
     #[test]
     fn cause_codes_match_the_r10000_architectural_encoding() {
         assert_eq!(ExceptionCode::Interrupt.raw(), 0);
+        assert_eq!(ExceptionCode::TlbModified.raw(), 1);
+        assert_eq!(ExceptionCode::TlbLoad.raw(), 2);
+        assert_eq!(ExceptionCode::TlbStore.raw(), 3);
         assert_eq!(ExceptionCode::AddressErrorLoad.raw(), 4);
         assert_eq!(ExceptionCode::AddressErrorStore.raw(), 5);
         assert_eq!(ExceptionCode::InstructionBusError.raw(), 6);

@@ -38,6 +38,8 @@ pub(crate) enum ExecuteError {
     UnpredictableControlFlow { instruction_pc: u64, branch_pc: u64 },
     /// The instruction result is undefined for the observed operands.
     UndefinedResult { instruction: Instruction },
+    /// A valid CP0 move names a register outside the implemented guest surface.
+    Cp0RegisterImplementationGap { instruction: Instruction },
 }
 
 /// Computes one context-free instruction disposition from immutable pre-state.
@@ -49,8 +51,10 @@ pub(crate) enum ExecuteError {
 /// # Errors
 ///
 /// Returns [`ExecuteError::UnpredictableControlFlow`] for a control-flow
-/// instruction in a delay slot, or [`ExecuteError::UndefinedResult`] when operand
-/// values make the instruction result undefined.
+/// instruction in a delay slot, [`ExecuteError::UndefinedResult`] when operand
+/// values make the instruction result undefined, or
+/// [`ExecuteError::Cp0RegisterImplementationGap`] when an otherwise valid CP0
+/// move names a register outside the bounded implemented surface.
 pub(crate) fn execute(
     cpu: &Cpu,
     instruction: Instruction,
@@ -93,6 +97,13 @@ pub(crate) fn execute(
         } => crate::memory::prepare_sw(cpu, rt, base, immediate).map(memory_disposition),
         Instruction::Syscall { code } => Ok(architectural(system::execute_syscall(code))),
         Instruction::Break { code } => Ok(architectural(system::execute_break(code))),
+        Instruction::Mfc0 { rt, register } => {
+            system::execute_mfc0(cpu, rt, register).map(architectural)
+        }
+        Instruction::Mtc0 { rt, register } => {
+            system::execute_mtc0(cpu, rt, register).map(architectural)
+        }
+        Instruction::Tlbwi => Ok(architectural(system::execute_tlbwi(cpu))),
         Instruction::Eret => system::execute_eret(cpu).map(architectural),
     }
 }
