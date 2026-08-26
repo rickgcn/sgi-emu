@@ -1,13 +1,17 @@
 //! MIPS R3000 processor model.
 
 mod alu;
+mod control;
 mod decode;
 mod mmu;
 mod state;
 
 use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 
-use self::{decode::decode, state::State};
+use self::{
+    decode::{Instruction, decode},
+    state::State,
+};
 
 /// An error encountered while executing one processor step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,8 +72,10 @@ impl R3000 {
 
     /// Fetches and executes one instruction.
     ///
-    /// A successful step advances the program counter by four bytes. If an
-    /// error occurs, the architectural processor state remains unchanged.
+    /// A successful step commits one instruction and updates the program
+    /// counter according to the processor's delayed control-flow semantics.
+    /// If an error occurs, the architectural processor state remains
+    /// unchanged.
     ///
     /// # Errors
     ///
@@ -84,8 +90,17 @@ impl R3000 {
             instruction: word,
         })?;
 
-        alu::execute(&mut self.state, instruction);
-        self.state.advance_pc();
+        let delayed_resume_pc = match instruction {
+            Instruction::Alu(instruction) => {
+                alu::execute(&mut self.state, instruction);
+                None
+            }
+            Instruction::Control(instruction) => {
+                Some(control::execute(&mut self.state, instruction))
+            }
+        };
+
+        self.state.complete_instruction(delayed_resume_pc);
 
         Ok(())
     }
@@ -154,6 +169,11 @@ mod tests {
             std::array::from_fn(|index| processor.state.read_gpr(index)),
             processor.state.pc(),
         )
+    }
+
+    fn step_with_word(processor: &mut R3000, word: u32) -> Result<(), StepError> {
+        let mut bus = TestBus::new(word.to_be_bytes());
+        processor.step(&mut bus)
     }
 
     #[test]
@@ -243,5 +263,100 @@ mod tests {
             }
         );
         assert_eq!(snapshot(&processor), before);
+    }
+
+    #[test]
+    fn taken_branch_executes_delay_slot_before_resuming_at_target() {
+        let mut processor = R3000::new();
+
+        step_with_word(&mut processor, 0x1000_0002).expect("BEQ should succeed");
+
+        assert_eq!(processor.state.pc(), 0xbfc0_0004);
+        assert_eq!(processor.state.read_gpr(1), 0);
+
+        step_with_word(&mut processor, 0x2401_0001).expect("delay slot should succeed");
+
+        assert_eq!(processor.state.read_gpr(1), 1);
+        assert_eq!(processor.state.pc(), 0xbfc0_000c);
+    }
+
+    #[test]
+    fn not_taken_branch_executes_delay_slot_before_falling_through() {
+        let mut processor = R3000::new();
+
+        step_with_word(&mut processor, 0x1400_0002).expect("BNE should succeed");
+
+        assert_eq!(processor.state.pc(), 0xbfc0_0004);
+
+        step_with_word(&mut processor, 0x2401_0001).expect("delay slot should succeed");
+
+        assert_eq!(processor.state.read_gpr(1), 1);
+        assert_eq!(processor.state.pc(), 0xbfc0_0008);
+    }
+
+    #[test]
+    fn jump_and_link_writes_link_before_executing_delay_slot() {
+        let mut processor = R3000::new();
+
+        step_with_word(&mut processor, 0x0ff0_0010).expect("JAL should succeed");
+
+        assert_eq!(processor.state.read_gpr(31), 0xbfc0_0008);
+        assert_eq!(processor.state.pc(), 0xbfc0_0004);
+
+        step_with_word(&mut processor, 0).expect("NOP delay slot should succeed");
+
+        assert_eq!(processor.state.read_gpr(31), 0xbfc0_0008);
+        assert_eq!(processor.state.pc(), 0xbfc0_0040);
+    }
+
+    #[test]
+    fn bus_fault_in_delay_slot_preserves_pending_jump_and_link() {
+        let mut processor = R3000::new();
+        step_with_word(&mut processor, 0x0ff0_0010).expect("JAL should succeed");
+        let before = snapshot(&processor);
+        let mut bus = TestBus::new([0; 4]);
+        bus.fault = Some(BusFault::Unmapped);
+
+        let error = processor
+            .step(&mut bus)
+            .expect_err("delay-slot fetch should fault");
+
+        assert_eq!(
+            error,
+            StepError::BusFault {
+                address: PhysAddr::new(0x1fc0_0004),
+                fault: BusFault::Unmapped,
+            }
+        );
+        assert_eq!(snapshot(&processor), before);
+        assert_eq!(processor.state.read_gpr(31), 0xbfc0_0008);
+
+        step_with_word(&mut processor, 0).expect("retry should execute delay slot");
+
+        assert_eq!(processor.state.pc(), 0xbfc0_0040);
+        assert_eq!(processor.state.read_gpr(31), 0xbfc0_0008);
+    }
+
+    #[test]
+    fn unsupported_instruction_in_delay_slot_preserves_pending_branch() {
+        let mut processor = R3000::new();
+        step_with_word(&mut processor, 0x1000_0002).expect("BEQ should succeed");
+        let before = snapshot(&processor);
+
+        let error = step_with_word(&mut processor, 0x2001_0001)
+            .expect_err("ADDI should remain unsupported");
+
+        assert_eq!(
+            error,
+            StepError::UnsupportedInstruction {
+                pc: 0xbfc0_0004,
+                instruction: 0x2001_0001,
+            }
+        );
+        assert_eq!(snapshot(&processor), before);
+
+        step_with_word(&mut processor, 0).expect("retry should execute delay slot");
+
+        assert_eq!(processor.state.pc(), 0xbfc0_000c);
     }
 }

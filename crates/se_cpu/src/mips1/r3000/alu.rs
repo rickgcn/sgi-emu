@@ -1,8 +1,8 @@
-use super::{decode::Instruction, state::State};
+use super::{decode::AluInstruction, state::State};
 
-pub(super) fn execute(state: &mut State, instruction: Instruction) {
+pub(super) fn execute(state: &mut State, instruction: AluInstruction) {
     match instruction {
-        Instruction::Sll {
+        AluInstruction::Sll {
             rd,
             rt,
             shift_amount,
@@ -10,7 +10,7 @@ pub(super) fn execute(state: &mut State, instruction: Instruction) {
             let value = state.read_gpr(rt) << shift_amount;
             state.write_gpr(rd, value);
         }
-        Instruction::Srl {
+        AluInstruction::Srl {
             rd,
             rt,
             shift_amount,
@@ -18,7 +18,7 @@ pub(super) fn execute(state: &mut State, instruction: Instruction) {
             let value = state.read_gpr(rt) >> shift_amount;
             state.write_gpr(rd, value);
         }
-        Instruction::Sra {
+        AluInstruction::Sra {
             rd,
             rt,
             shift_amount,
@@ -26,81 +26,81 @@ pub(super) fn execute(state: &mut State, instruction: Instruction) {
             let value = ((state.read_gpr(rt) as i32) >> shift_amount) as u32;
             state.write_gpr(rd, value);
         }
-        Instruction::Sllv { rd, rt, rs } => {
+        AluInstruction::Sllv { rd, rt, rs } => {
             let shift_amount = state.read_gpr(rs) & 0x1f;
             let value = state.read_gpr(rt) << shift_amount;
             state.write_gpr(rd, value);
         }
-        Instruction::Srlv { rd, rt, rs } => {
+        AluInstruction::Srlv { rd, rt, rs } => {
             let shift_amount = state.read_gpr(rs) & 0x1f;
             let value = state.read_gpr(rt) >> shift_amount;
             state.write_gpr(rd, value);
         }
-        Instruction::Srav { rd, rt, rs } => {
+        AluInstruction::Srav { rd, rt, rs } => {
             let shift_amount = state.read_gpr(rs) & 0x1f;
             let value = ((state.read_gpr(rt) as i32) >> shift_amount) as u32;
             state.write_gpr(rd, value);
         }
-        Instruction::Addu { rd, rs, rt } => {
+        AluInstruction::Addu { rd, rs, rt } => {
             let value = state.read_gpr(rs).wrapping_add(state.read_gpr(rt));
             state.write_gpr(rd, value);
         }
-        Instruction::Subu { rd, rs, rt } => {
+        AluInstruction::Subu { rd, rs, rt } => {
             let value = state.read_gpr(rs).wrapping_sub(state.read_gpr(rt));
             state.write_gpr(rd, value);
         }
-        Instruction::And { rd, rs, rt } => {
+        AluInstruction::And { rd, rs, rt } => {
             let value = state.read_gpr(rs) & state.read_gpr(rt);
             state.write_gpr(rd, value);
         }
-        Instruction::Or { rd, rs, rt } => {
+        AluInstruction::Or { rd, rs, rt } => {
             let value = state.read_gpr(rs) | state.read_gpr(rt);
             state.write_gpr(rd, value);
         }
-        Instruction::Xor { rd, rs, rt } => {
+        AluInstruction::Xor { rd, rs, rt } => {
             let value = state.read_gpr(rs) ^ state.read_gpr(rt);
             state.write_gpr(rd, value);
         }
-        Instruction::Nor { rd, rs, rt } => {
+        AluInstruction::Nor { rd, rs, rt } => {
             let value = !(state.read_gpr(rs) | state.read_gpr(rt));
             state.write_gpr(rd, value);
         }
-        Instruction::Slt { rd, rs, rt } => {
+        AluInstruction::Slt { rd, rs, rt } => {
             let value = u32::from((state.read_gpr(rs) as i32) < (state.read_gpr(rt) as i32));
             state.write_gpr(rd, value);
         }
-        Instruction::Sltu { rd, rs, rt } => {
+        AluInstruction::Sltu { rd, rs, rt } => {
             let value = u32::from(state.read_gpr(rs) < state.read_gpr(rt));
             state.write_gpr(rd, value);
         }
-        Instruction::Addiu { rt, rs, immediate } => {
+        AluInstruction::Addiu { rt, rs, immediate } => {
             let value = state
                 .read_gpr(rs)
                 .wrapping_add(sign_extend_immediate(immediate));
             state.write_gpr(rt, value);
         }
-        Instruction::Slti { rt, rs, immediate } => {
+        AluInstruction::Slti { rt, rs, immediate } => {
             let value =
                 u32::from((state.read_gpr(rs) as i32) < (sign_extend_immediate(immediate) as i32));
             state.write_gpr(rt, value);
         }
-        Instruction::Sltiu { rt, rs, immediate } => {
+        AluInstruction::Sltiu { rt, rs, immediate } => {
             let value = u32::from(state.read_gpr(rs) < sign_extend_immediate(immediate));
             state.write_gpr(rt, value);
         }
-        Instruction::Andi { rt, rs, immediate } => {
+        AluInstruction::Andi { rt, rs, immediate } => {
             let value = state.read_gpr(rs) & u32::from(immediate);
             state.write_gpr(rt, value);
         }
-        Instruction::Ori { rt, rs, immediate } => {
+        AluInstruction::Ori { rt, rs, immediate } => {
             let value = state.read_gpr(rs) | u32::from(immediate);
             state.write_gpr(rt, value);
         }
-        Instruction::Xori { rt, rs, immediate } => {
+        AluInstruction::Xori { rt, rs, immediate } => {
             let value = state.read_gpr(rs) ^ u32::from(immediate);
             state.write_gpr(rt, value);
         }
-        Instruction::Lui { rt, immediate } => {
+        AluInstruction::Lui { rt, immediate } => {
             state.write_gpr(rt, u32::from(immediate) << 16);
         }
     }
@@ -112,7 +112,7 @@ fn sign_extend_immediate(immediate: u16) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instruction, State, execute};
+    use super::{AluInstruction as Instruction, State, execute};
 
     fn run(instruction: Instruction, registers: &[(usize, u32)], destination: usize) -> u32 {
         let mut state = State::new();
