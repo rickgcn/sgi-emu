@@ -1,7 +1,24 @@
+const COPROCESSOR_TRANSFER_RESERVED_MASK: u32 = 0x7ff;
+
+const CP0_TLBR: u32 = 0x4200_0001;
+const CP0_TLBWI: u32 = 0x4200_0002;
+const CP0_TLBWR: u32 = 0x4200_0006;
+const CP0_TLBP: u32 = 0x4200_0008;
+const CP0_RFE: u32 = 0x4200_0010;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DecodeResult {
+    Implemented(Instruction),
+    Unimplemented,
+    Reserved,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Instruction {
     Alu(AluInstruction),
     Control(ControlInstruction),
+    Syscall,
+    Breakpoint,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,7 +53,17 @@ pub(super) enum AluInstruction {
         rt: usize,
         rs: usize,
     },
+    Add {
+        rd: usize,
+        rs: usize,
+        rt: usize,
+    },
     Addu {
+        rd: usize,
+        rs: usize,
+        rt: usize,
+    },
+    Sub {
         rd: usize,
         rs: usize,
         rt: usize,
@@ -81,6 +108,11 @@ pub(super) enum AluInstruction {
         rs: usize,
         immediate: u16,
     },
+    Addi {
+        rt: usize,
+        rs: usize,
+        immediate: u16,
+    },
     Slti {
         rt: usize,
         rs: usize,
@@ -116,6 +148,8 @@ pub(super) enum AluInstruction {
 pub(super) enum ControlInstruction {
     J { target: u32 },
     Jal { target: u32 },
+    Jr { rs: usize },
+    Jalr { rd: usize, rs: usize },
     Beq { rs: usize, rt: usize, offset: u16 },
     Bne { rs: usize, rt: usize, offset: u16 },
     Blez { rs: usize, offset: u16 },
@@ -126,167 +160,232 @@ pub(super) enum ControlInstruction {
     Bgezal { rs: usize, offset: u16 },
 }
 
-pub(super) fn decode(word: u32) -> Option<Instruction> {
+pub(super) fn decode(word: u32) -> DecodeResult {
     match opcode(word) {
-        0x00 => decode_special(word).map(Instruction::Alu),
-        0x01 => decode_regimm(word).map(Instruction::Control),
-        0x02 => Some(Instruction::Control(ControlInstruction::J {
+        0x00 => decode_special(word),
+        0x01 => decode_regimm(word),
+        0x02 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::J {
             target: target(word),
         })),
-        0x03 => Some(Instruction::Control(ControlInstruction::Jal {
+        0x03 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Jal {
             target: target(word),
         })),
-        0x04 => Some(Instruction::Control(ControlInstruction::Beq {
+        0x04 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Beq {
             rs: rs(word),
             rt: rt(word),
             offset: immediate(word),
         })),
-        0x05 => Some(Instruction::Control(ControlInstruction::Bne {
+        0x05 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Bne {
             rs: rs(word),
             rt: rt(word),
             offset: immediate(word),
         })),
-        0x06 if rt(word) == 0 => Some(Instruction::Control(ControlInstruction::Blez {
-            rs: rs(word),
-            offset: immediate(word),
-        })),
-        0x07 if rt(word) == 0 => Some(Instruction::Control(ControlInstruction::Bgtz {
-            rs: rs(word),
-            offset: immediate(word),
-        })),
-        0x09 => Some(Instruction::Alu(AluInstruction::Addiu {
+        0x06 if rt(word) == 0 => {
+            DecodeResult::Implemented(Instruction::Control(ControlInstruction::Blez {
+                rs: rs(word),
+                offset: immediate(word),
+            }))
+        }
+        0x06 => DecodeResult::Reserved,
+        0x07 if rt(word) == 0 => {
+            DecodeResult::Implemented(Instruction::Control(ControlInstruction::Bgtz {
+                rs: rs(word),
+                offset: immediate(word),
+            }))
+        }
+        0x07 => DecodeResult::Reserved,
+        0x08 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Addi {
             rt: rt(word),
             rs: rs(word),
             immediate: immediate(word),
         })),
-        0x0a => Some(Instruction::Alu(AluInstruction::Slti {
+        0x09 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Addiu {
             rt: rt(word),
             rs: rs(word),
             immediate: immediate(word),
         })),
-        0x0b => Some(Instruction::Alu(AluInstruction::Sltiu {
+        0x0a => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Slti {
             rt: rt(word),
             rs: rs(word),
             immediate: immediate(word),
         })),
-        0x0c => Some(Instruction::Alu(AluInstruction::Andi {
+        0x0b => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Sltiu {
             rt: rt(word),
             rs: rs(word),
             immediate: immediate(word),
         })),
-        0x0d => Some(Instruction::Alu(AluInstruction::Ori {
+        0x0c => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Andi {
             rt: rt(word),
             rs: rs(word),
             immediate: immediate(word),
         })),
-        0x0e => Some(Instruction::Alu(AluInstruction::Xori {
+        0x0d => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Ori {
             rt: rt(word),
             rs: rs(word),
             immediate: immediate(word),
         })),
-        0x0f => Some(Instruction::Alu(AluInstruction::Lui {
+        0x0e => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Xori {
+            rt: rt(word),
+            rs: rs(word),
+            immediate: immediate(word),
+        })),
+        0x0f => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Lui {
             rt: rt(word),
             immediate: immediate(word),
         })),
-        _ => None,
+        0x10 => decode_cp0(word),
+        0x11..=0x13 => decode_coprocessor(word),
+        0x20..=0x26 | 0x28..=0x2b | 0x2e | 0x31..=0x33 | 0x39..=0x3b => DecodeResult::Unimplemented,
+        _ => DecodeResult::Reserved,
     }
 }
 
-fn decode_special(word: u32) -> Option<AluInstruction> {
+fn decode_special(word: u32) -> DecodeResult {
     match function(word) {
-        0x00 => Some(AluInstruction::Sll {
+        0x00 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Sll {
             rd: rd(word),
             rt: rt(word),
             shift_amount: shift_amount(word),
-        }),
-        0x02 => Some(AluInstruction::Srl {
+        })),
+        0x02 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Srl {
             rd: rd(word),
             rt: rt(word),
             shift_amount: shift_amount(word),
-        }),
-        0x03 => Some(AluInstruction::Sra {
+        })),
+        0x03 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Sra {
             rd: rd(word),
             rt: rt(word),
             shift_amount: shift_amount(word),
-        }),
-        0x04 => Some(AluInstruction::Sllv {
+        })),
+        0x04 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Sllv {
             rd: rd(word),
             rt: rt(word),
             rs: rs(word),
-        }),
-        0x06 => Some(AluInstruction::Srlv {
+        })),
+        0x06 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Srlv {
             rd: rd(word),
             rt: rt(word),
             rs: rs(word),
-        }),
-        0x07 => Some(AluInstruction::Srav {
+        })),
+        0x07 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Srav {
             rd: rd(word),
             rt: rt(word),
             rs: rs(word),
-        }),
-        0x21 => Some(AluInstruction::Addu {
+        })),
+        0x08 if rd(word) == 0 => {
+            DecodeResult::Implemented(Instruction::Control(ControlInstruction::Jr {
+                rs: rs(word),
+            }))
+        }
+        0x08 => DecodeResult::Reserved,
+        0x09 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Jalr {
+            rd: rd(word),
+            rs: rs(word),
+        })),
+        0x0c => DecodeResult::Implemented(Instruction::Syscall),
+        0x0d => DecodeResult::Implemented(Instruction::Breakpoint),
+        0x10..=0x13 | 0x18..=0x1b => DecodeResult::Unimplemented,
+        0x20 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Add {
             rd: rd(word),
             rs: rs(word),
             rt: rt(word),
-        }),
-        0x23 => Some(AluInstruction::Subu {
+        })),
+        0x21 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Addu {
             rd: rd(word),
             rs: rs(word),
             rt: rt(word),
-        }),
-        0x24 => Some(AluInstruction::And {
+        })),
+        0x22 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Sub {
             rd: rd(word),
             rs: rs(word),
             rt: rt(word),
-        }),
-        0x25 => Some(AluInstruction::Or {
+        })),
+        0x23 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Subu {
             rd: rd(word),
             rs: rs(word),
             rt: rt(word),
-        }),
-        0x26 => Some(AluInstruction::Xor {
+        })),
+        0x24 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::And {
             rd: rd(word),
             rs: rs(word),
             rt: rt(word),
-        }),
-        0x27 => Some(AluInstruction::Nor {
+        })),
+        0x25 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Or {
             rd: rd(word),
             rs: rs(word),
             rt: rt(word),
-        }),
-        0x2a => Some(AluInstruction::Slt {
+        })),
+        0x26 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Xor {
             rd: rd(word),
             rs: rs(word),
             rt: rt(word),
-        }),
-        0x2b => Some(AluInstruction::Sltu {
+        })),
+        0x27 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Nor {
             rd: rd(word),
             rs: rs(word),
             rt: rt(word),
-        }),
-        _ => None,
+        })),
+        0x2a => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Slt {
+            rd: rd(word),
+            rs: rs(word),
+            rt: rt(word),
+        })),
+        0x2b => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Sltu {
+            rd: rd(word),
+            rs: rs(word),
+            rt: rt(word),
+        })),
+        _ => DecodeResult::Reserved,
     }
 }
 
-fn decode_regimm(word: u32) -> Option<ControlInstruction> {
+fn decode_regimm(word: u32) -> DecodeResult {
     match rt(word) {
-        0x00 => Some(ControlInstruction::Bltz {
+        0x00 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Bltz {
             rs: rs(word),
             offset: immediate(word),
-        }),
-        0x01 => Some(ControlInstruction::Bgez {
+        })),
+        0x01 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Bgez {
             rs: rs(word),
             offset: immediate(word),
-        }),
-        0x10 => Some(ControlInstruction::Bltzal {
+        })),
+        0x10 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Bltzal {
             rs: rs(word),
             offset: immediate(word),
-        }),
-        0x11 => Some(ControlInstruction::Bgezal {
+        })),
+        0x11 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Bgezal {
             rs: rs(word),
             offset: immediate(word),
-        }),
-        _ => None,
+        })),
+        _ => DecodeResult::Reserved,
+    }
+}
+
+fn decode_cp0(word: u32) -> DecodeResult {
+    match rs(word) {
+        0x00 | 0x02 | 0x04 | 0x06 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::Unimplemented
+        }
+        0x00 | 0x02 | 0x04 | 0x06 => DecodeResult::Reserved,
+        0x08 if matches!(rt(word), 0x00 | 0x01) => DecodeResult::Unimplemented,
+        0x08 => DecodeResult::Reserved,
+        0x10..=0x1f if matches!(word, CP0_TLBR | CP0_TLBWI | CP0_TLBWR | CP0_TLBP | CP0_RFE) => {
+            DecodeResult::Unimplemented
+        }
+        _ => DecodeResult::Reserved,
+    }
+}
+
+fn decode_coprocessor(word: u32) -> DecodeResult {
+    match rs(word) {
+        0x00 | 0x02 | 0x04 | 0x06 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::Unimplemented
+        }
+        0x00 | 0x02 | 0x04 | 0x06 => DecodeResult::Reserved,
+        0x08 if matches!(rt(word), 0x00 | 0x01) => DecodeResult::Unimplemented,
+        0x08 => DecodeResult::Reserved,
+        0x10..=0x1f => DecodeResult::Unimplemented,
+        _ => DecodeResult::Reserved,
     }
 }
 
@@ -324,7 +423,10 @@ fn target(word: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AluInstruction, ControlInstruction, Instruction, decode};
+    use super::{
+        AluInstruction, CP0_RFE, CP0_TLBP, CP0_TLBR, CP0_TLBWI, CP0_TLBWR, ControlInstruction,
+        DecodeResult, Instruction, decode,
+    };
 
     fn encode_register(rs: u32, rt: u32, rd: u32, shift_amount: u32, function: u32) -> u32 {
         (rs << 21) | (rt << 16) | (rd << 11) | (shift_amount << 6) | function
@@ -338,12 +440,16 @@ mod tests {
         (opcode << 26) | target
     }
 
-    fn alu(instruction: AluInstruction) -> Instruction {
-        Instruction::Alu(instruction)
+    fn encode_coprocessor(opcode: u32, selector: u32, rt: u32, rd: u32, low_bits: u32) -> u32 {
+        (opcode << 26) | (selector << 21) | (rt << 16) | (rd << 11) | (low_bits & 0x7ff)
     }
 
-    fn control(instruction: ControlInstruction) -> Instruction {
-        Instruction::Control(instruction)
+    fn alu(instruction: AluInstruction) -> DecodeResult {
+        DecodeResult::Implemented(Instruction::Alu(instruction))
+    }
+
+    fn control(instruction: ControlInstruction) -> DecodeResult {
+        DecodeResult::Implemented(Instruction::Control(instruction))
     }
 
     #[test]
@@ -398,8 +504,24 @@ mod tests {
                 }),
             ),
             (
+                encode_register(1, 2, 3, 31, 0x20),
+                alu(AluInstruction::Add {
+                    rd: 3,
+                    rs: 1,
+                    rt: 2,
+                }),
+            ),
+            (
                 encode_register(1, 2, 3, 0, 0x21),
                 alu(AluInstruction::Addu {
+                    rd: 3,
+                    rs: 1,
+                    rt: 2,
+                }),
+            ),
+            (
+                encode_register(1, 2, 3, 31, 0x22),
+                alu(AluInstruction::Sub {
                     rd: 3,
                     rs: 1,
                     rt: 2,
@@ -462,6 +584,14 @@ mod tests {
                 }),
             ),
             (
+                encode_immediate(0x08, 1, 2, 0x8001),
+                alu(AluInstruction::Addi {
+                    rt: 2,
+                    rs: 1,
+                    immediate: 0x8001,
+                }),
+            ),
+            (
                 encode_immediate(0x09, 1, 2, 0x8001),
                 alu(AluInstruction::Addiu {
                     rt: 2,
@@ -519,7 +649,7 @@ mod tests {
         ];
 
         for (word, expected) in cases {
-            assert_eq!(decode(word), Some(expected));
+            assert_eq!(decode(word), expected);
         }
     }
 
@@ -537,6 +667,14 @@ mod tests {
                 control(ControlInstruction::Jal {
                     target: 0x02ab_cdef,
                 }),
+            ),
+            (
+                encode_register(1, 31, 0, 31, 0x08),
+                control(ControlInstruction::Jr { rs: 1 }),
+            ),
+            (
+                encode_register(1, 31, 3, 31, 0x09),
+                control(ControlInstruction::Jalr { rd: 3, rs: 1 }),
             ),
             (
                 encode_immediate(0x04, 1, 2, 0x8001),
@@ -599,17 +737,31 @@ mod tests {
         ];
 
         for (word, expected) in cases {
-            assert_eq!(decode(word), Some(expected));
+            assert_eq!(decode(word), expected);
         }
+    }
+
+    #[test]
+    fn decodes_explicit_exception_instructions_and_ignores_code() {
+        let code = 0x0a_bcde;
+
+        assert_eq!(
+            decode((code << 6) | 0x0c),
+            DecodeResult::Implemented(Instruction::Syscall)
+        );
+        assert_eq!(
+            decode((code << 6) | 0x0d),
+            DecodeResult::Implemented(Instruction::Breakpoint)
+        );
     }
 
     #[test]
     fn extracts_all_twenty_six_jump_target_bits() {
         assert_eq!(
             decode(encode_jump(0x02, 0x03ff_ffff)),
-            Some(control(ControlInstruction::J {
+            control(ControlInstruction::J {
                 target: 0x03ff_ffff,
-            }))
+            })
         );
     }
 
@@ -666,28 +818,133 @@ mod tests {
         ];
 
         for (word, expected) in cases {
-            assert_eq!(decode(word), Some(expected));
+            assert_eq!(decode(word), expected);
         }
     }
 
     #[test]
-    fn rejects_invalid_control_fields_and_later_branch_encodings() {
-        assert_eq!(decode(encode_immediate(0x06, 1, 1, 0)), None);
-        assert_eq!(decode(encode_immediate(0x07, 1, 31, 0)), None);
+    fn classifies_legal_unimplemented_mips_i_encodings() {
+        for function in [0x10, 0x11, 0x12, 0x13, 0x18, 0x19, 0x1a, 0x1b] {
+            assert_eq!(
+                decode(encode_register(1, 2, 3, 0, function)),
+                DecodeResult::Unimplemented
+            );
+        }
+
+        for selector in [0x00, 0x02, 0x04, 0x06] {
+            assert_eq!(
+                decode(encode_coprocessor(0x10, selector, 2, 3, 0)),
+                DecodeResult::Unimplemented
+            );
+        }
+
+        for condition in [0x00, 0x01] {
+            assert_eq!(
+                decode(encode_immediate(0x10, 0x08, condition, 0x8001)),
+                DecodeResult::Unimplemented
+            );
+        }
+
+        for word in [CP0_TLBR, CP0_TLBWI, CP0_TLBWR, CP0_TLBP, CP0_RFE] {
+            assert_eq!(decode(word), DecodeResult::Unimplemented);
+        }
+
+        for opcode in [
+            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x28, 0x29, 0x2a, 0x2b, 0x2e,
+        ] {
+            assert_eq!(
+                decode(encode_immediate(opcode, 1, 2, 0x8001)),
+                DecodeResult::Unimplemented
+            );
+        }
+
+        for opcode in 0x11..=0x13 {
+            for selector in [0x00, 0x02, 0x04, 0x06] {
+                assert_eq!(
+                    decode(encode_coprocessor(opcode, selector, 2, 3, 0)),
+                    DecodeResult::Unimplemented
+                );
+            }
+
+            for condition in [0x00, 0x01] {
+                assert_eq!(
+                    decode(encode_immediate(opcode, 0x08, condition, 0x8001)),
+                    DecodeResult::Unimplemented
+                );
+            }
+
+            assert_eq!(
+                decode(encode_coprocessor(opcode, 0x1f, 2, 3, 0x155)),
+                DecodeResult::Unimplemented
+            );
+        }
+
+        for opcode in [0x31, 0x32, 0x33, 0x39, 0x3a, 0x3b] {
+            assert_eq!(
+                decode(encode_immediate(opcode, 1, 2, 0x8001)),
+                DecodeResult::Unimplemented
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_reserved_encodings() {
+        assert_eq!(
+            decode(encode_register(1, 2, 3, 0, 0x01)),
+            DecodeResult::Reserved
+        );
+        assert_eq!(
+            decode(encode_register(1, 2, 3, 0, 0x08)),
+            DecodeResult::Reserved
+        );
+        assert_eq!(
+            decode(encode_immediate(0x06, 1, 1, 0)),
+            DecodeResult::Reserved
+        );
+        assert_eq!(
+            decode(encode_immediate(0x07, 1, 31, 0)),
+            DecodeResult::Reserved
+        );
 
         for selector in [0x02, 0x03, 0x12, 0x13, 0x1f] {
-            assert_eq!(decode(encode_immediate(0x01, 1, selector, 0)), None);
+            assert_eq!(
+                decode(encode_immediate(0x01, 1, selector, 0)),
+                DecodeResult::Reserved
+            );
         }
 
         for opcode in [0x14, 0x15, 0x16, 0x17] {
-            assert_eq!(decode(encode_immediate(opcode, 1, 0, 0)), None);
+            assert_eq!(
+                decode(encode_immediate(opcode, 1, 0, 0)),
+                DecodeResult::Reserved
+            );
         }
-    }
 
-    #[test]
-    fn rejects_unknown_and_unimplemented_encodings() {
-        assert_eq!(decode(encode_register(1, 2, 3, 0, 0x01)), None);
-        assert_eq!(decode(encode_immediate(0x08, 1, 2, 1)), None);
-        assert_eq!(decode(encode_immediate(0x3f, 1, 2, 1)), None);
+        for opcode in [
+            0x18, 0x1f, 0x27, 0x2c, 0x2d, 0x2f, 0x30, 0x34, 0x37, 0x38, 0x3c, 0x3f,
+        ] {
+            assert_eq!(
+                decode(encode_immediate(opcode, 1, 2, 1)),
+                DecodeResult::Reserved
+            );
+        }
+
+        for opcode in [0x10, 0x11] {
+            assert_eq!(
+                decode(encode_coprocessor(opcode, 0x00, 2, 3, 1)),
+                DecodeResult::Reserved
+            );
+            assert_eq!(
+                decode(encode_immediate(opcode, 0x08, 0x02, 0)),
+                DecodeResult::Reserved
+            );
+            assert_eq!(
+                decode(encode_coprocessor(opcode, 0x01, 2, 3, 0)),
+                DecodeResult::Reserved
+            );
+        }
+
+        assert_eq!(decode(CP0_TLBR | (1 << 6)), DecodeResult::Reserved);
+        assert_eq!(decode(0x4200_0000), DecodeResult::Reserved);
     }
 }

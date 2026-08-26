@@ -1,6 +1,6 @@
-use super::{decode::AluInstruction, state::State};
+use super::{cp0::Exception, decode::AluInstruction, state::State};
 
-pub(super) fn execute(state: &mut State, instruction: AluInstruction) {
+pub(super) fn execute(state: &mut State, instruction: AluInstruction) -> Result<(), Exception> {
     match instruction {
         AluInstruction::Sll {
             rd,
@@ -41,9 +41,27 @@ pub(super) fn execute(state: &mut State, instruction: AluInstruction) {
             let value = ((state.read_gpr(rt) as i32) >> shift_amount) as u32;
             state.write_gpr(rd, value);
         }
+        AluInstruction::Add { rd, rs, rt } => {
+            let lhs = state.read_gpr(rs) as i32;
+            let rhs = state.read_gpr(rt) as i32;
+            let (value, overflowed) = lhs.overflowing_add(rhs);
+            if overflowed {
+                return Err(Exception::Overflow);
+            }
+            state.write_gpr(rd, value as u32);
+        }
         AluInstruction::Addu { rd, rs, rt } => {
             let value = state.read_gpr(rs).wrapping_add(state.read_gpr(rt));
             state.write_gpr(rd, value);
+        }
+        AluInstruction::Sub { rd, rs, rt } => {
+            let lhs = state.read_gpr(rs) as i32;
+            let rhs = state.read_gpr(rt) as i32;
+            let (value, overflowed) = lhs.overflowing_sub(rhs);
+            if overflowed {
+                return Err(Exception::Overflow);
+            }
+            state.write_gpr(rd, value as u32);
         }
         AluInstruction::Subu { rd, rs, rt } => {
             let value = state.read_gpr(rs).wrapping_sub(state.read_gpr(rt));
@@ -72,6 +90,15 @@ pub(super) fn execute(state: &mut State, instruction: AluInstruction) {
         AluInstruction::Sltu { rd, rs, rt } => {
             let value = u32::from(state.read_gpr(rs) < state.read_gpr(rt));
             state.write_gpr(rd, value);
+        }
+        AluInstruction::Addi { rt, rs, immediate } => {
+            let lhs = state.read_gpr(rs) as i32;
+            let rhs = i32::from(immediate as i16);
+            let (value, overflowed) = lhs.overflowing_add(rhs);
+            if overflowed {
+                return Err(Exception::Overflow);
+            }
+            state.write_gpr(rt, value as u32);
         }
         AluInstruction::Addiu { rt, rs, immediate } => {
             let value = state
@@ -104,6 +131,8 @@ pub(super) fn execute(state: &mut State, instruction: AluInstruction) {
             state.write_gpr(rt, u32::from(immediate) << 16);
         }
     }
+
+    Ok(())
 }
 
 fn sign_extend_immediate(immediate: u16) -> u32 {
@@ -112,7 +141,7 @@ fn sign_extend_immediate(immediate: u16) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AluInstruction as Instruction, State, execute};
+    use super::{AluInstruction as Instruction, Exception, State, execute};
 
     fn run(instruction: Instruction, registers: &[(usize, u32)], destination: usize) -> u32 {
         let mut state = State::new();
@@ -120,9 +149,23 @@ mod tests {
             state.write_gpr(index, value);
         }
 
-        execute(&mut state, instruction);
+        execute(&mut state, instruction).expect("instruction should not trap");
 
         state.read_gpr(destination)
+    }
+
+    fn assert_overflow(instruction: Instruction, registers: &[(usize, u32)], destination: usize) {
+        let sentinel = 0xdead_beef;
+        let mut state = State::new();
+        for &(index, value) in registers {
+            state.write_gpr(index, value);
+        }
+        state.write_gpr(destination, sentinel);
+
+        let result = execute(&mut state, instruction);
+
+        assert_eq!(result, Err(Exception::Overflow));
+        assert_eq!(state.read_gpr(destination), sentinel);
     }
 
     #[test]
@@ -313,6 +356,153 @@ mod tests {
             ),
             0x8000_0000
         );
+    }
+
+    #[test]
+    fn signed_arithmetic_produces_expected_results() {
+        assert_eq!(
+            run(
+                Instruction::Add {
+                    rd: 3,
+                    rs: 1,
+                    rt: 2,
+                },
+                &[(1, 5), (2, 7)],
+                3,
+            ),
+            12
+        );
+        assert_eq!(
+            run(
+                Instruction::Add {
+                    rd: 3,
+                    rs: 1,
+                    rt: 2,
+                },
+                &[(1, u32::MAX), (2, 1)],
+                3,
+            ),
+            0
+        );
+        assert_eq!(
+            run(
+                Instruction::Sub {
+                    rd: 3,
+                    rs: 1,
+                    rt: 2,
+                },
+                &[(1, 5), (2, 7)],
+                3,
+            ),
+            0xffff_fffe
+        );
+
+        for (immediate, expected) in [
+            (0x7fff, 0x0000_7fff),
+            (0x8000, 0xffff_8000),
+            (0xffff, u32::MAX),
+        ] {
+            assert_eq!(
+                run(
+                    Instruction::Addi {
+                        rt: 1,
+                        rs: 0,
+                        immediate,
+                    },
+                    &[],
+                    1,
+                ),
+                expected
+            );
+        }
+
+        assert_eq!(
+            run(
+                Instruction::Add {
+                    rd: 1,
+                    rs: 1,
+                    rt: 2,
+                },
+                &[(1, 5), (2, 7)],
+                1,
+            ),
+            12
+        );
+    }
+
+    #[test]
+    fn signed_arithmetic_reports_overflow_without_writing_destination() {
+        assert_overflow(
+            Instruction::Add {
+                rd: 3,
+                rs: 1,
+                rt: 2,
+            },
+            &[(1, i32::MAX as u32), (2, 1)],
+            3,
+        );
+        assert_overflow(
+            Instruction::Add {
+                rd: 3,
+                rs: 1,
+                rt: 2,
+            },
+            &[(1, i32::MIN as u32), (2, u32::MAX)],
+            3,
+        );
+        assert_overflow(
+            Instruction::Sub {
+                rd: 3,
+                rs: 1,
+                rt: 2,
+            },
+            &[(1, i32::MAX as u32), (2, u32::MAX)],
+            3,
+        );
+        assert_overflow(
+            Instruction::Sub {
+                rd: 3,
+                rs: 1,
+                rt: 2,
+            },
+            &[(1, i32::MIN as u32), (2, 1)],
+            3,
+        );
+        assert_overflow(
+            Instruction::Addi {
+                rt: 3,
+                rs: 1,
+                immediate: 1,
+            },
+            &[(1, i32::MAX as u32)],
+            3,
+        );
+        assert_overflow(
+            Instruction::Addi {
+                rt: 3,
+                rs: 1,
+                immediate: 0xffff,
+            },
+            &[(1, i32::MIN as u32)],
+            3,
+        );
+
+        let mut state = State::new();
+        state.write_gpr(1, i32::MAX as u32);
+        state.write_gpr(2, 1);
+
+        assert_eq!(
+            execute(
+                &mut state,
+                Instruction::Add {
+                    rd: 0,
+                    rs: 1,
+                    rt: 2,
+                },
+            ),
+            Err(Exception::Overflow)
+        );
+        assert_eq!(state.read_gpr(0), 0);
     }
 
     #[test]
@@ -520,7 +710,8 @@ mod tests {
                 rs: 1,
                 rt: 2,
             },
-        );
+        )
+        .expect("ADDU should not trap");
         execute(
             &mut state,
             Instruction::Or {
@@ -528,7 +719,8 @@ mod tests {
                 rs: 1,
                 rt: 2,
             },
-        );
+        )
+        .expect("OR should not trap");
 
         assert_eq!(state.read_gpr(1), 12);
         assert_eq!(state.read_gpr(0), 0);

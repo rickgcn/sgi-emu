@@ -9,6 +9,12 @@ pub(super) fn execute(state: &mut State, instruction: ControlInstruction) -> u32
             state.write_gpr(31, pc.wrapping_add(8));
             jump_target(pc, target)
         }
+        ControlInstruction::Jr { rs } => state.read_gpr(rs),
+        ControlInstruction::Jalr { rd, rs } => {
+            let target = state.read_gpr(rs);
+            state.write_gpr(rd, pc.wrapping_add(8));
+            target
+        }
         ControlInstruction::Beq { rs, rt, offset } => {
             branch_resume_pc(pc, offset, state.read_gpr(rs) == state.read_gpr(rt))
         }
@@ -108,6 +114,37 @@ mod tests {
 
         assert_eq!(resume_pc, 0xb000_000c);
         assert_eq!(state.read_gpr(31), instruction_pc.wrapping_add(8));
+        assert_eq!(state.pc(), instruction_pc);
+    }
+
+    #[test]
+    fn register_jumps_produce_expected_results() {
+        let instruction_pc = State::new().pc();
+        let target = 0xbfc0_0041;
+        let (state, resume_pc) = run(
+            ControlInstruction::Jr { rs: 1 },
+            &[(1, target), (31, 0x1234_5678)],
+        );
+
+        assert_eq!(resume_pc, target);
+        assert_eq!(state.read_gpr(1), target);
+        assert_eq!(state.read_gpr(31), 0x1234_5678);
+        assert_eq!(state.pc(), instruction_pc);
+
+        let (state, resume_pc) = run(
+            ControlInstruction::Jalr { rd: 3, rs: 1 },
+            &[(1, target), (3, 0x1234_5678)],
+        );
+
+        assert_eq!(resume_pc, target);
+        assert_eq!(state.read_gpr(1), target);
+        assert_eq!(state.read_gpr(3), instruction_pc.wrapping_add(8));
+        assert_eq!(state.pc(), instruction_pc);
+
+        let (state, resume_pc) = run(ControlInstruction::Jalr { rd: 0, rs: 1 }, &[(1, target)]);
+
+        assert_eq!(resume_pc, target);
+        assert_eq!(state.read_gpr(0), 0);
         assert_eq!(state.pc(), instruction_pc);
     }
 

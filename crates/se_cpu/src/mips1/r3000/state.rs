@@ -1,3 +1,5 @@
+use super::cp0::{Cp0, Exception};
+
 const RESET_PC: u32 = 0xbfc0_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,6 +12,7 @@ pub(super) struct State {
     gpr: [u32; 32],
     pc: u32,
     delay_slot: Option<DelaySlot>,
+    cp0: Cp0,
 }
 
 impl State {
@@ -18,10 +21,13 @@ impl State {
             gpr: [0; 32],
             pc: RESET_PC,
             delay_slot: None,
+            cp0: Cp0::new(),
         }
     }
 
     pub(super) fn reset(&mut self) {
+        let interrupted_pc = self.pc;
+        self.cp0.reset(interrupted_pc);
         self.gpr[0] = 0;
         self.pc = RESET_PC;
         self.delay_slot = None;
@@ -54,11 +60,20 @@ impl State {
             resume_pc,
         });
     }
+
+    pub(super) fn take_exception(&mut self, exception: Exception) {
+        let (epc, in_delay_slot) = match self.delay_slot.take() {
+            Some(delay_slot) => (delay_slot.origin_pc, true),
+            None => (self.pc, false),
+        };
+
+        self.pc = self.cp0.take_exception(exception, epc, in_delay_slot);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DelaySlot, RESET_PC, State};
+    use super::{Cp0, DelaySlot, Exception, RESET_PC, State};
 
     #[test]
     fn new_initializes_deterministic_state() {
@@ -67,6 +82,7 @@ mod tests {
         assert_eq!(state.gpr, [0; 32]);
         assert_eq!(state.pc, RESET_PC);
         assert_eq!(state.delay_slot, None);
+        assert_eq!(state.cp0, Cp0::new());
     }
 
     #[test]
@@ -81,6 +97,8 @@ mod tests {
             resume_pc: 0x1234_5678,
         });
         let preserved_gpr = state.gpr;
+        let mut expected_cp0 = Cp0::new();
+        expected_cp0.reset(state.pc);
 
         state.reset();
 
@@ -88,6 +106,7 @@ mod tests {
         assert_eq!(state.gpr[1..], preserved_gpr[1..]);
         assert_eq!(state.pc, RESET_PC);
         assert_eq!(state.delay_slot, None);
+        assert_eq!(state.cp0, expected_cp0);
     }
 
     #[test]
@@ -171,5 +190,39 @@ mod tests {
         state.complete_instruction(None);
         assert_eq!(state.pc(), 0);
         assert_eq!(state.delay_slot, None);
+    }
+
+    #[test]
+    fn exception_outside_delay_slot_uses_current_pc() {
+        let mut state = State::new();
+        state.pc = 0xbfc0_0040;
+        state.write_gpr(1, 0x1234_5678);
+        let mut expected_cp0 = Cp0::new();
+        let expected_pc = expected_cp0.take_exception(Exception::Syscall, state.pc, false);
+
+        state.take_exception(Exception::Syscall);
+
+        assert_eq!(state.cp0, expected_cp0);
+        assert_eq!(state.pc, expected_pc);
+        assert_eq!(state.delay_slot, None);
+        assert_eq!(state.read_gpr(1), 0x1234_5678);
+    }
+
+    #[test]
+    fn exception_in_delay_slot_uses_origin_and_cancels_resume() {
+        let mut state = State::new();
+        let origin_pc = state.pc;
+        let resume_pc = 0xbfc0_0040;
+        state.write_gpr(31, origin_pc.wrapping_add(8));
+        state.complete_instruction(Some(resume_pc));
+        let mut expected_cp0 = Cp0::new();
+        let expected_pc = expected_cp0.take_exception(Exception::Overflow, origin_pc, true);
+
+        state.take_exception(Exception::Overflow);
+
+        assert_eq!(state.cp0, expected_cp0);
+        assert_eq!(state.pc, expected_pc);
+        assert_eq!(state.delay_slot, None);
+        assert_eq!(state.read_gpr(31), origin_pc.wrapping_add(8));
     }
 }

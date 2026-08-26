@@ -2,6 +2,7 @@
 
 mod alu;
 mod control;
+mod cp0;
 mod decode;
 mod mmu;
 mod state;
@@ -9,7 +10,8 @@ mod state;
 use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 
 use self::{
-    decode::{Instruction, decode},
+    cp0::Exception,
+    decode::{DecodeResult, Instruction, decode},
     state::State,
 };
 
@@ -31,7 +33,8 @@ pub enum StepError {
         fault: BusFault,
     },
 
-    /// The fetched instruction is not supported by this processor model.
+    /// The instruction is valid for the R3000 but is not implemented by this
+    /// processor model.
     UnsupportedInstruction {
         /// The virtual address of the instruction.
         pc: u32,
@@ -70,37 +73,56 @@ impl R3000 {
         self.state.reset();
     }
 
-    /// Fetches and executes one instruction.
+    /// Executes one architectural processor step.
     ///
-    /// A successful step commits one instruction and updates the program
-    /// counter according to the processor's delayed control-flow semantics.
-    /// If an error occurs, the architectural processor state remains
-    /// unchanged.
+    /// A successful step either completes one instruction or enters a guest
+    /// exception. Guest exceptions are architectural state transitions and do
+    /// not produce [`StepError`]. If an error occurs, the architectural
+    /// processor state remains unchanged.
     ///
     /// # Errors
     ///
     /// Returns [`StepError`] when the instruction address is unsupported, the
-    /// physical bus rejects the fetch, or the fetched instruction is not
-    /// supported.
+    /// physical bus rejects the fetch, or a valid R3000 instruction is not
+    /// implemented by this processor model.
     pub fn step(&mut self, bus: &mut dyn PhysicalBus) -> Result<(), StepError> {
         let pc = self.state.pc();
-        let word = fetch_instruction(pc, bus)?;
-        let instruction = decode(word).ok_or(StepError::UnsupportedInstruction {
-            pc,
-            instruction: word,
-        })?;
+        if pc & 3 != 0 {
+            self.state
+                .take_exception(Exception::InstructionAddressError { address: pc });
+            return Ok(());
+        }
 
-        let delayed_resume_pc = match instruction {
-            Instruction::Alu(instruction) => {
-                alu::execute(&mut self.state, instruction);
-                None
+        let word = fetch_instruction(pc, bus)?;
+        let instruction = match decode(word) {
+            DecodeResult::Implemented(instruction) => instruction,
+            DecodeResult::Unimplemented => {
+                return Err(StepError::UnsupportedInstruction {
+                    pc,
+                    instruction: word,
+                });
             }
-            Instruction::Control(instruction) => {
-                Some(control::execute(&mut self.state, instruction))
+            DecodeResult::Reserved => {
+                self.state.take_exception(Exception::ReservedInstruction);
+                return Ok(());
             }
         };
 
-        self.state.complete_instruction(delayed_resume_pc);
+        let outcome: Result<Option<u32>, Exception> = match instruction {
+            Instruction::Alu(instruction) => {
+                alu::execute(&mut self.state, instruction).map(|()| None)
+            }
+            Instruction::Control(instruction) => {
+                Ok(Some(control::execute(&mut self.state, instruction)))
+            }
+            Instruction::Syscall => Err(Exception::Syscall),
+            Instruction::Breakpoint => Err(Exception::Breakpoint),
+        };
+
+        match outcome {
+            Ok(delayed_resume_pc) => self.state.complete_instruction(delayed_resume_pc),
+            Err(exception) => self.state.take_exception(exception),
+        }
 
         Ok(())
     }
@@ -124,6 +146,8 @@ mod tests {
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 
     use super::{R3000, StepError, fetch_instruction};
+
+    const BOOT_GENERAL_EXCEPTION_VECTOR: u32 = 0xbfc0_0180;
 
     struct TestBus {
         bytes: [u8; 4],
@@ -174,6 +198,10 @@ mod tests {
     fn step_with_word(processor: &mut R3000, word: u32) -> Result<(), StepError> {
         let mut bus = TestBus::new(word.to_be_bytes());
         processor.step(&mut bus)
+    }
+
+    fn encode_register(rs: u32, rt: u32, rd: u32, function: u32) -> u32 {
+        (rs << 21) | (rt << 16) | (rd << 11) | function
     }
 
     #[test]
@@ -249,20 +277,55 @@ mod tests {
         processor.state.write_gpr(1, 0x1234_5678);
         processor.state.write_gpr(31, 0x89ab_cdef);
         let before = snapshot(&processor);
-        let mut bus = TestBus::new([0x20, 0x01, 0x00, 0x01]);
+        let mut bus = TestBus::new([0x8c, 0x01, 0x00, 0x00]);
 
         let error = processor
             .step(&mut bus)
-            .expect_err("ADDI should not be supported");
+            .expect_err("LW should not be supported");
 
         assert_eq!(
             error,
             StepError::UnsupportedInstruction {
                 pc: 0xbfc0_0000,
-                instruction: 0x2001_0001,
+                instruction: 0x8c01_0000,
             }
         );
         assert_eq!(snapshot(&processor), before);
+    }
+
+    #[test]
+    fn step_takes_explicit_instruction_exceptions() {
+        for word in [0x0000_000c, 0x0000_000d] {
+            let mut processor = R3000::new();
+
+            step_with_word(&mut processor, word).expect("guest exception should succeed");
+
+            assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        }
+    }
+
+    #[test]
+    fn step_takes_reserved_instruction_exception() {
+        let mut processor = R3000::new();
+
+        step_with_word(&mut processor, 0x0000_0001)
+            .expect("reserved instruction exception should succeed");
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+    }
+
+    #[test]
+    fn step_takes_overflow_without_writing_destination() {
+        let mut processor = R3000::new();
+        processor.state.write_gpr(1, i32::MAX as u32);
+        processor.state.write_gpr(2, 1);
+        processor.state.write_gpr(3, 0xdead_beef);
+        let add = encode_register(1, 2, 3, 0x20);
+
+        step_with_word(&mut processor, add).expect("overflow exception should succeed");
+
+        assert_eq!(processor.state.read_gpr(3), 0xdead_beef);
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
     }
 
     #[test]
@@ -338,19 +401,57 @@ mod tests {
     }
 
     #[test]
+    fn exception_in_delay_slot_preserves_link_and_cancels_resume() {
+        let mut processor = R3000::new();
+        step_with_word(&mut processor, 0x0ff0_0010).expect("JAL should succeed");
+
+        step_with_word(&mut processor, 0x0000_000c).expect("delay-slot exception should succeed");
+
+        assert_eq!(processor.state.read_gpr(31), 0xbfc0_0008);
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+
+        step_with_word(&mut processor, 0).expect("exception vector instruction should succeed");
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR + 4);
+    }
+
+    #[test]
+    fn misaligned_register_jump_target_faults_after_delay_slot() {
+        let mut processor = R3000::new();
+        let target = 0xbfc0_0041;
+        processor.state.write_gpr(1, target);
+        let jr = encode_register(1, 0, 0, 0x08);
+
+        step_with_word(&mut processor, jr).expect("JR should succeed");
+        assert_eq!(processor.state.pc(), 0xbfc0_0004);
+
+        step_with_word(&mut processor, 0).expect("delay slot should succeed");
+        assert_eq!(processor.state.pc(), target);
+
+        let mut bus = TestBus::new([0; 4]);
+        processor
+            .step(&mut bus)
+            .expect("address error exception should succeed");
+
+        assert_eq!(bus.read_address, None);
+        assert_eq!(bus.read_length, None);
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+    }
+
+    #[test]
     fn unsupported_instruction_in_delay_slot_preserves_pending_branch() {
         let mut processor = R3000::new();
         step_with_word(&mut processor, 0x1000_0002).expect("BEQ should succeed");
         let before = snapshot(&processor);
 
-        let error = step_with_word(&mut processor, 0x2001_0001)
-            .expect_err("ADDI should remain unsupported");
+        let error =
+            step_with_word(&mut processor, 0x8c01_0000).expect_err("LW should remain unsupported");
 
         assert_eq!(
             error,
             StepError::UnsupportedInstruction {
                 pc: 0xbfc0_0004,
-                instruction: 0x2001_0001,
+                instruction: 0x8c01_0000,
             }
         );
         assert_eq!(snapshot(&processor), before);
