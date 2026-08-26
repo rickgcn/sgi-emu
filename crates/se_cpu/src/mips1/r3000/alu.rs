@@ -41,6 +41,57 @@ pub(super) fn execute(state: &mut State, instruction: AluInstruction) -> Result<
             let value = ((state.read_gpr(rt) as i32) >> shift_amount) as u32;
             state.write_gpr(rd, value);
         }
+        AluInstruction::Mfhi { rd } => {
+            state.write_gpr(rd, state.read_hi());
+        }
+        AluInstruction::Mthi { rs } => {
+            state.write_hi(state.read_gpr(rs));
+        }
+        AluInstruction::Mflo { rd } => {
+            state.write_gpr(rd, state.read_lo());
+        }
+        AluInstruction::Mtlo { rs } => {
+            state.write_lo(state.read_gpr(rs));
+        }
+        AluInstruction::Mult { rs, rt } => {
+            let lhs = i64::from(state.read_gpr(rs) as i32);
+            let rhs = i64::from(state.read_gpr(rt) as i32);
+            let product = (lhs * rhs) as u64;
+            state.write_hi((product >> 32) as u32);
+            state.write_lo(product as u32);
+        }
+        AluInstruction::Multu { rs, rt } => {
+            let lhs = u64::from(state.read_gpr(rs));
+            let rhs = u64::from(state.read_gpr(rt));
+            let product = lhs * rhs;
+            state.write_hi((product >> 32) as u32);
+            state.write_lo(product as u32);
+        }
+        AluInstruction::Div { rs, rt } => {
+            let dividend = state.read_gpr(rs) as i32;
+            let divisor = state.read_gpr(rt) as i32;
+            let (hi, lo) = if divisor == 0 {
+                let quotient = if dividend >= 0 { u32::MAX } else { 1 };
+                (dividend as u32, quotient)
+            } else if dividend == i32::MIN && divisor == -1 {
+                (0, i32::MIN as u32)
+            } else {
+                ((dividend % divisor) as u32, (dividend / divisor) as u32)
+            };
+            state.write_hi(hi);
+            state.write_lo(lo);
+        }
+        AluInstruction::Divu { rs, rt } => {
+            let dividend = state.read_gpr(rs);
+            let divisor = state.read_gpr(rt);
+            let (hi, lo) = if divisor == 0 {
+                (dividend, u32::MAX)
+            } else {
+                (dividend % divisor, dividend / divisor)
+            };
+            state.write_hi(hi);
+            state.write_lo(lo);
+        }
         AluInstruction::Add { rd, rs, rt } => {
             let lhs = state.read_gpr(rs) as i32;
             let rhs = state.read_gpr(rt) as i32;
@@ -154,6 +205,17 @@ mod tests {
         state.read_gpr(destination)
     }
 
+    fn run_hilo(instruction: Instruction, registers: &[(usize, u32)]) -> (u32, u32) {
+        let mut state = State::new();
+        for &(index, value) in registers {
+            state.write_gpr(index, value);
+        }
+
+        execute(&mut state, instruction).expect("instruction should not trap");
+
+        (state.read_hi(), state.read_lo())
+    }
+
     fn assert_overflow(instruction: Instruction, registers: &[(usize, u32)], destination: usize) {
         let sentinel = 0xdead_beef;
         let mut state = State::new();
@@ -166,6 +228,136 @@ mod tests {
 
         assert_eq!(result, Err(Exception::Overflow));
         assert_eq!(state.read_gpr(destination), sentinel);
+    }
+
+    #[test]
+    fn hi_lo_transfers_preserve_the_companion_register() {
+        let mut state = State::new();
+        state.write_gpr(1, 0x1234_5678);
+        state.write_gpr(2, 0x89ab_cdef);
+        state.write_hi(0xaaaa_aaaa);
+        state.write_lo(0xbbbb_bbbb);
+
+        execute(&mut state, Instruction::Mthi { rs: 1 }).expect("MTHI should not trap");
+        assert_eq!(state.read_hi(), 0x1234_5678);
+        assert_eq!(state.read_lo(), 0xbbbb_bbbb);
+
+        execute(&mut state, Instruction::Mtlo { rs: 2 }).expect("MTLO should not trap");
+        assert_eq!(state.read_hi(), 0x1234_5678);
+        assert_eq!(state.read_lo(), 0x89ab_cdef);
+
+        execute(&mut state, Instruction::Mfhi { rd: 3 }).expect("MFHI should not trap");
+        execute(&mut state, Instruction::Mflo { rd: 4 }).expect("MFLO should not trap");
+        execute(&mut state, Instruction::Mfhi { rd: 0 }).expect("MFHI should not trap");
+        execute(&mut state, Instruction::Mflo { rd: 0 }).expect("MFLO should not trap");
+
+        assert_eq!(state.read_gpr(3), 0x1234_5678);
+        assert_eq!(state.read_gpr(4), 0x89ab_cdef);
+        assert_eq!(state.read_gpr(0), 0);
+    }
+
+    #[test]
+    fn signed_multiplication_produces_the_full_product() {
+        let cases = [
+            (7_i32, 3_i32, 0, 21),
+            (-7, 3, u32::MAX, 0xffff_ffeb),
+            (7, -3, u32::MAX, 0xffff_ffeb),
+            (-7, -3, 0, 21),
+            (i32::MIN, i32::MIN, 0x4000_0000, 0),
+        ];
+
+        for (lhs, rhs, expected_hi, expected_lo) in cases {
+            assert_eq!(
+                run_hilo(
+                    Instruction::Mult { rs: 1, rt: 2 },
+                    &[(1, lhs as u32), (2, rhs as u32)],
+                ),
+                (expected_hi, expected_lo)
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_multiplication_produces_the_full_product() {
+        assert_eq!(
+            run_hilo(
+                Instruction::Multu { rs: 1, rt: 2 },
+                &[(1, 0), (2, u32::MAX)],
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            run_hilo(
+                Instruction::Multu { rs: 1, rt: 2 },
+                &[(1, u32::MAX), (2, u32::MAX)],
+            ),
+            (0xffff_fffe, 1)
+        );
+    }
+
+    #[test]
+    fn signed_division_truncates_toward_zero() {
+        let cases = [
+            (7_i32, 3_i32, 1_i32, 2_i32),
+            (-7, 3, -1, -2),
+            (7, -3, 1, -2),
+            (-7, -3, -1, 2),
+        ];
+
+        for (dividend, divisor, remainder, quotient) in cases {
+            assert_eq!(
+                run_hilo(
+                    Instruction::Div { rs: 1, rt: 2 },
+                    &[(1, dividend as u32), (2, divisor as u32)],
+                ),
+                (remainder as u32, quotient as u32)
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_division_produces_quotient_and_remainder() {
+        assert_eq!(
+            run_hilo(Instruction::Divu { rs: 1, rt: 2 }, &[(1, 12), (2, 3)],),
+            (0, 4)
+        );
+        assert_eq!(
+            run_hilo(Instruction::Divu { rs: 1, rt: 2 }, &[(1, u32::MAX), (2, 2)],),
+            (1, 0x7fff_ffff)
+        );
+    }
+
+    #[test]
+    fn division_special_cases_have_deterministic_results() {
+        assert_eq!(
+            run_hilo(
+                Instruction::Divu { rs: 1, rt: 2 },
+                &[(1, 0x1234_5678), (2, 0)],
+            ),
+            (0x1234_5678, u32::MAX)
+        );
+
+        for (dividend, expected_hi, expected_lo) in [
+            (7_i32, 7_u32, u32::MAX),
+            (0, 0, u32::MAX),
+            (-7, (-7_i32) as u32, 1),
+        ] {
+            assert_eq!(
+                run_hilo(
+                    Instruction::Div { rs: 1, rt: 2 },
+                    &[(1, dividend as u32), (2, 0)],
+                ),
+                (expected_hi, expected_lo)
+            );
+        }
+
+        assert_eq!(
+            run_hilo(
+                Instruction::Div { rs: 1, rt: 2 },
+                &[(1, i32::MIN as u32), (2, (-1_i32) as u32)],
+            ),
+            (0, i32::MIN as u32)
+        );
     }
 
     #[test]

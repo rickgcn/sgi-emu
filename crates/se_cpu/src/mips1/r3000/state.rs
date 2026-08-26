@@ -10,6 +10,8 @@ struct DelaySlot {
 
 pub(super) struct State {
     gpr: [u32; 32],
+    hi: u32,
+    lo: u32,
     pc: u32,
     delay_slot: Option<DelaySlot>,
     cp0: Cp0,
@@ -19,6 +21,8 @@ impl State {
     pub(super) fn new() -> Self {
         Self {
             gpr: [0; 32],
+            hi: 0,
+            lo: 0,
             pc: RESET_PC,
             delay_slot: None,
             cp0: Cp0::new(),
@@ -45,6 +49,22 @@ impl State {
         if index != 0 {
             self.gpr[index] = value;
         }
+    }
+
+    pub(super) fn read_hi(&self) -> u32 {
+        self.hi
+    }
+
+    pub(super) fn write_hi(&mut self, value: u32) {
+        self.hi = value;
+    }
+
+    pub(super) fn read_lo(&self) -> u32 {
+        self.lo
+    }
+
+    pub(super) fn write_lo(&mut self, value: u32) {
+        self.lo = value;
     }
 
     pub(super) fn complete_instruction(&mut self, delayed_resume_pc: Option<u32>) {
@@ -80,6 +100,8 @@ mod tests {
         let state = State::new();
 
         assert_eq!(state.gpr, [0; 32]);
+        assert_eq!(state.hi, 0);
+        assert_eq!(state.lo, 0);
         assert_eq!(state.pc, RESET_PC);
         assert_eq!(state.delay_slot, None);
         assert_eq!(state.cp0, Cp0::new());
@@ -91,12 +113,16 @@ mod tests {
         for (index, register) in state.gpr.iter_mut().enumerate() {
             *register = index as u32 + 1;
         }
+        state.write_hi(0x1234_5678);
+        state.write_lo(0x89ab_cdef);
         state.pc = 0;
         state.delay_slot = Some(DelaySlot {
             origin_pc: 0xffff_fff8,
             resume_pc: 0x1234_5678,
         });
         let preserved_gpr = state.gpr;
+        let preserved_hi = state.read_hi();
+        let preserved_lo = state.read_lo();
         let mut expected_cp0 = Cp0::new();
         expected_cp0.reset(state.pc);
 
@@ -104,6 +130,8 @@ mod tests {
 
         assert_eq!(state.gpr[0], 0);
         assert_eq!(state.gpr[1..], preserved_gpr[1..]);
+        assert_eq!(state.read_hi(), preserved_hi);
+        assert_eq!(state.read_lo(), preserved_lo);
         assert_eq!(state.pc, RESET_PC);
         assert_eq!(state.delay_slot, None);
         assert_eq!(state.cp0, expected_cp0);
@@ -121,6 +149,19 @@ mod tests {
         assert_eq!(state.read_gpr(1), 0x1234_5678);
         assert_eq!(state.read_gpr(31), 0x89ab_cdef);
         assert_eq!(state.gpr[0], 0);
+    }
+
+    #[test]
+    fn hi_and_lo_accessors_are_independent() {
+        let mut state = State::new();
+
+        state.write_hi(0x1234_5678);
+        assert_eq!(state.read_hi(), 0x1234_5678);
+        assert_eq!(state.read_lo(), 0);
+
+        state.write_lo(0x89ab_cdef);
+        assert_eq!(state.read_hi(), 0x1234_5678);
+        assert_eq!(state.read_lo(), 0x89ab_cdef);
     }
 
     #[test]

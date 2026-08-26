@@ -56,8 +56,8 @@ pub struct R3000 {
 impl R3000 {
     /// Creates a processor at the reset vector.
     ///
-    /// General-purpose registers without architecturally defined reset values
-    /// are initialized to zero.
+    /// General-purpose registers and the HI/LO registers without
+    /// architecturally defined reset values are initialized to zero.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -67,8 +67,9 @@ impl R3000 {
 
     /// Restores the architecturally defined core reset state.
     ///
-    /// General-purpose registers other than register zero are preserved
-    /// because their reset values are architecturally unspecified.
+    /// General-purpose registers other than register zero and the HI/LO
+    /// registers are preserved because their reset values are architecturally
+    /// unspecified.
     pub fn reset(&mut self) {
         self.state.reset();
     }
@@ -188,9 +189,11 @@ mod tests {
         }
     }
 
-    fn snapshot(processor: &R3000) -> ([u32; 32], u32) {
+    fn snapshot(processor: &R3000) -> ([u32; 32], u32, u32, u32) {
         (
             std::array::from_fn(|index| processor.state.read_gpr(index)),
+            processor.state.read_hi(),
+            processor.state.read_lo(),
             processor.state.pc(),
         )
     }
@@ -244,6 +247,8 @@ mod tests {
         let mut processor = R3000::new();
         processor.state.write_gpr(1, 0x1234_5678);
         processor.state.write_gpr(31, 0x89ab_cdef);
+        processor.state.write_hi(0x1357_9bdf);
+        processor.state.write_lo(0x2468_ace0);
         let before = snapshot(&processor);
         let mut bus = TestBus::new([0; 4]);
         bus.fault = Some(BusFault::Unmapped);
@@ -272,10 +277,40 @@ mod tests {
     }
 
     #[test]
+    fn step_executes_multiply_and_reads_both_results() {
+        let mut processor = R3000::new();
+        processor.state.write_gpr(1, (-2_i32) as u32);
+        processor.state.write_gpr(2, 3);
+
+        step_with_word(&mut processor, encode_register(1, 2, 0, 0x18))
+            .expect("MULT should succeed");
+
+        assert_eq!(processor.state.read_hi(), u32::MAX);
+        assert_eq!(processor.state.read_lo(), 0xffff_fffa);
+        assert_eq!(processor.state.pc(), 0xbfc0_0004);
+
+        step_with_word(&mut processor, encode_register(0, 0, 3, 0x12))
+            .expect("MFLO should succeed");
+
+        assert_eq!(processor.state.read_gpr(3), 0xffff_fffa);
+        assert_eq!(processor.state.pc(), 0xbfc0_0008);
+
+        step_with_word(&mut processor, encode_register(0, 0, 4, 0x10))
+            .expect("MFHI should succeed");
+
+        assert_eq!(processor.state.read_gpr(4), u32::MAX);
+        assert_eq!(processor.state.read_hi(), u32::MAX);
+        assert_eq!(processor.state.read_lo(), 0xffff_fffa);
+        assert_eq!(processor.state.pc(), 0xbfc0_000c);
+    }
+
+    #[test]
     fn step_preserves_processor_state_for_unsupported_instruction() {
         let mut processor = R3000::new();
         processor.state.write_gpr(1, 0x1234_5678);
         processor.state.write_gpr(31, 0x89ab_cdef);
+        processor.state.write_hi(0x1357_9bdf);
+        processor.state.write_lo(0x2468_ace0);
         let before = snapshot(&processor);
         let mut bus = TestBus::new([0x8c, 0x01, 0x00, 0x00]);
 

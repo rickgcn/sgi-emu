@@ -53,6 +53,34 @@ pub(super) enum AluInstruction {
         rt: usize,
         rs: usize,
     },
+    Mfhi {
+        rd: usize,
+    },
+    Mthi {
+        rs: usize,
+    },
+    Mflo {
+        rd: usize,
+    },
+    Mtlo {
+        rs: usize,
+    },
+    Mult {
+        rs: usize,
+        rt: usize,
+    },
+    Multu {
+        rs: usize,
+        rt: usize,
+    },
+    Div {
+        rs: usize,
+        rt: usize,
+    },
+    Divu {
+        rs: usize,
+        rt: usize,
+    },
     Add {
         rd: usize,
         rs: usize,
@@ -284,7 +312,42 @@ fn decode_special(word: u32) -> DecodeResult {
         })),
         0x0c => DecodeResult::Implemented(Instruction::Syscall),
         0x0d => DecodeResult::Implemented(Instruction::Breakpoint),
-        0x10..=0x13 | 0x18..=0x1b => DecodeResult::Unimplemented,
+        0x10 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mfhi { rd: rd(word) })),
+        0x11 if rd(word) == 0 => {
+            DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mthi { rs: rs(word) }))
+        }
+        0x11 => DecodeResult::Reserved,
+        0x12 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mflo { rd: rd(word) })),
+        0x13 if rd(word) == 0 => {
+            DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mtlo { rs: rs(word) }))
+        }
+        0x13 => DecodeResult::Reserved,
+        0x18 if rd(word) == 0 => {
+            DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mult {
+                rs: rs(word),
+                rt: rt(word),
+            }))
+        }
+        0x18 => DecodeResult::Reserved,
+        0x19 if rd(word) == 0 => {
+            DecodeResult::Implemented(Instruction::Alu(AluInstruction::Multu {
+                rs: rs(word),
+                rt: rt(word),
+            }))
+        }
+        0x19 => DecodeResult::Reserved,
+        0x1a if rd(word) == 0 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Div {
+            rs: rs(word),
+            rt: rt(word),
+        })),
+        0x1a => DecodeResult::Reserved,
+        0x1b if rd(word) == 0 => {
+            DecodeResult::Implemented(Instruction::Alu(AluInstruction::Divu {
+                rs: rs(word),
+                rt: rt(word),
+            }))
+        }
+        0x1b => DecodeResult::Reserved,
         0x20 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Add {
             rd: rd(word),
             rs: rs(word),
@@ -502,6 +565,38 @@ mod tests {
                     rt: 2,
                     rs: 1,
                 }),
+            ),
+            (
+                encode_register(0, 0, 31, 0, 0x10),
+                alu(AluInstruction::Mfhi { rd: 31 }),
+            ),
+            (
+                encode_register(31, 0, 0, 0, 0x11),
+                alu(AluInstruction::Mthi { rs: 31 }),
+            ),
+            (
+                encode_register(0, 0, 0, 0, 0x12),
+                alu(AluInstruction::Mflo { rd: 0 }),
+            ),
+            (
+                encode_register(0, 0, 0, 0, 0x13),
+                alu(AluInstruction::Mtlo { rs: 0 }),
+            ),
+            (
+                encode_register(31, 0, 0, 0, 0x18),
+                alu(AluInstruction::Mult { rs: 31, rt: 0 }),
+            ),
+            (
+                encode_register(0, 31, 0, 0, 0x19),
+                alu(AluInstruction::Multu { rs: 0, rt: 31 }),
+            ),
+            (
+                encode_register(31, 1, 0, 0, 0x1a),
+                alu(AluInstruction::Div { rs: 31, rt: 1 }),
+            ),
+            (
+                encode_register(1, 31, 0, 0, 0x1b),
+                alu(AluInstruction::Divu { rs: 1, rt: 31 }),
             ),
             (
                 encode_register(1, 2, 3, 31, 0x20),
@@ -801,6 +896,38 @@ mod tests {
                 }),
             ),
             (
+                encode_register(31, 30, 3, 29, 0x10),
+                alu(AluInstruction::Mfhi { rd: 3 }),
+            ),
+            (
+                encode_register(31, 30, 3, 29, 0x12),
+                alu(AluInstruction::Mflo { rd: 3 }),
+            ),
+            (
+                encode_register(1, 31, 0, 30, 0x11),
+                alu(AluInstruction::Mthi { rs: 1 }),
+            ),
+            (
+                encode_register(1, 31, 0, 30, 0x13),
+                alu(AluInstruction::Mtlo { rs: 1 }),
+            ),
+            (
+                encode_register(1, 2, 0, 31, 0x18),
+                alu(AluInstruction::Mult { rs: 1, rt: 2 }),
+            ),
+            (
+                encode_register(1, 2, 0, 31, 0x19),
+                alu(AluInstruction::Multu { rs: 1, rt: 2 }),
+            ),
+            (
+                encode_register(1, 2, 0, 31, 0x1a),
+                alu(AluInstruction::Div { rs: 1, rt: 2 }),
+            ),
+            (
+                encode_register(1, 2, 0, 31, 0x1b),
+                alu(AluInstruction::Divu { rs: 1, rt: 2 }),
+            ),
+            (
                 encode_register(1, 2, 3, 31, 0x21),
                 alu(AluInstruction::Addu {
                     rd: 3,
@@ -824,13 +951,6 @@ mod tests {
 
     #[test]
     fn classifies_legal_unimplemented_mips_i_encodings() {
-        for function in [0x10, 0x11, 0x12, 0x13, 0x18, 0x19, 0x1a, 0x1b] {
-            assert_eq!(
-                decode(encode_register(1, 2, 3, 0, function)),
-                DecodeResult::Unimplemented
-            );
-        }
-
         for selector in [0x00, 0x02, 0x04, 0x06] {
             assert_eq!(
                 decode(encode_coprocessor(0x10, selector, 2, 3, 0)),
@@ -897,6 +1017,14 @@ mod tests {
             decode(encode_register(1, 2, 3, 0, 0x08)),
             DecodeResult::Reserved
         );
+
+        for function in [0x11, 0x13, 0x18, 0x19, 0x1a, 0x1b] {
+            assert_eq!(
+                decode(encode_register(1, 2, 3, 31, function)),
+                DecodeResult::Reserved
+            );
+        }
+
         assert_eq!(
             decode(encode_immediate(0x06, 1, 1, 0)),
             DecodeResult::Reserved
