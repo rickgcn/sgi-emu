@@ -17,6 +17,7 @@ pub(super) enum DecodeResult {
 pub(super) enum Instruction {
     Alu(AluInstruction),
     Control(ControlInstruction),
+    Cp0(Cp0Instruction),
     Syscall,
     Breakpoint,
 }
@@ -186,6 +187,17 @@ pub(super) enum ControlInstruction {
     Bgez { rs: usize, offset: u16 },
     Bltzal { rs: usize, offset: u16 },
     Bgezal { rs: usize, offset: u16 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Cp0Instruction {
+    Mfc0 { rt: usize, rd: usize },
+    Cfc0 { rt: usize, rd: usize },
+    Mtc0 { rt: usize, rd: usize },
+    Ctc0 { rt: usize, rd: usize },
+    Bc0f { offset: u16 },
+    Bc0t { offset: u16 },
+    Rfe,
 }
 
 pub(super) fn decode(word: u32) -> DecodeResult {
@@ -426,13 +438,46 @@ fn decode_regimm(word: u32) -> DecodeResult {
 
 fn decode_cp0(word: u32) -> DecodeResult {
     match rs(word) {
-        0x00 | 0x02 | 0x04 | 0x06 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
-            DecodeResult::Unimplemented
+        0x00 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Mfc0 {
+                rt: rt(word),
+                rd: rd(word),
+            }))
+        }
+        0x02 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Cfc0 {
+                rt: rt(word),
+                rd: rd(word),
+            }))
+        }
+        0x04 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Mtc0 {
+                rt: rt(word),
+                rd: rd(word),
+            }))
+        }
+        0x06 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Ctc0 {
+                rt: rt(word),
+                rd: rd(word),
+            }))
         }
         0x00 | 0x02 | 0x04 | 0x06 => DecodeResult::Reserved,
-        0x08 if matches!(rt(word), 0x00 | 0x01) => DecodeResult::Unimplemented,
+        0x08 if rt(word) == 0 => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Bc0f {
+                offset: immediate(word),
+            }))
+        }
+        0x08 if rt(word) == 1 => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Bc0t {
+                offset: immediate(word),
+            }))
+        }
         0x08 => DecodeResult::Reserved,
-        0x10..=0x1f if matches!(word, CP0_TLBR | CP0_TLBWI | CP0_TLBWR | CP0_TLBP | CP0_RFE) => {
+        0x10..=0x1f if word == CP0_RFE => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Rfe))
+        }
+        0x10..=0x1f if matches!(word, CP0_TLBR | CP0_TLBWI | CP0_TLBWR | CP0_TLBP) => {
             DecodeResult::Unimplemented
         }
         _ => DecodeResult::Reserved,
@@ -488,7 +533,7 @@ fn target(word: u32) -> u32 {
 mod tests {
     use super::{
         AluInstruction, CP0_RFE, CP0_TLBP, CP0_TLBR, CP0_TLBWI, CP0_TLBWR, ControlInstruction,
-        DecodeResult, Instruction, decode,
+        Cp0Instruction, DecodeResult, Instruction, decode,
     };
 
     fn encode_register(rs: u32, rt: u32, rd: u32, shift_amount: u32, function: u32) -> u32 {
@@ -513,6 +558,10 @@ mod tests {
 
     fn control(instruction: ControlInstruction) -> DecodeResult {
         DecodeResult::Implemented(Instruction::Control(instruction))
+    }
+
+    fn cp0(instruction: Cp0Instruction) -> DecodeResult {
+        DecodeResult::Implemented(Instruction::Cp0(instruction))
     }
 
     #[test]
@@ -837,6 +886,41 @@ mod tests {
     }
 
     #[test]
+    fn decodes_every_supported_cp0_instruction() {
+        let cases = [
+            (
+                encode_coprocessor(0x10, 0x00, 0, 31, 0),
+                cp0(Cp0Instruction::Mfc0 { rt: 0, rd: 31 }),
+            ),
+            (
+                encode_coprocessor(0x10, 0x02, 31, 0, 0),
+                cp0(Cp0Instruction::Cfc0 { rt: 31, rd: 0 }),
+            ),
+            (
+                encode_coprocessor(0x10, 0x04, 1, 12, 0),
+                cp0(Cp0Instruction::Mtc0 { rt: 1, rd: 12 }),
+            ),
+            (
+                encode_coprocessor(0x10, 0x06, 2, 13, 0),
+                cp0(Cp0Instruction::Ctc0 { rt: 2, rd: 13 }),
+            ),
+            (
+                encode_immediate(0x10, 0x08, 0, 0x8001),
+                cp0(Cp0Instruction::Bc0f { offset: 0x8001 }),
+            ),
+            (
+                encode_immediate(0x10, 0x08, 1, 0x7fff),
+                cp0(Cp0Instruction::Bc0t { offset: 0x7fff }),
+            ),
+            (CP0_RFE, cp0(Cp0Instruction::Rfe)),
+        ];
+
+        for (word, expected) in cases {
+            assert_eq!(decode(word), expected);
+        }
+    }
+
+    #[test]
     fn decodes_explicit_exception_instructions_and_ignores_code() {
         let code = 0x0a_bcde;
 
@@ -951,21 +1035,7 @@ mod tests {
 
     #[test]
     fn classifies_legal_unimplemented_mips_i_encodings() {
-        for selector in [0x00, 0x02, 0x04, 0x06] {
-            assert_eq!(
-                decode(encode_coprocessor(0x10, selector, 2, 3, 0)),
-                DecodeResult::Unimplemented
-            );
-        }
-
-        for condition in [0x00, 0x01] {
-            assert_eq!(
-                decode(encode_immediate(0x10, 0x08, condition, 0x8001)),
-                DecodeResult::Unimplemented
-            );
-        }
-
-        for word in [CP0_TLBR, CP0_TLBWI, CP0_TLBWR, CP0_TLBP, CP0_RFE] {
+        for word in [CP0_TLBR, CP0_TLBWI, CP0_TLBWR, CP0_TLBP] {
             assert_eq!(decode(word), DecodeResult::Unimplemented);
         }
 
@@ -1057,6 +1127,13 @@ mod tests {
             );
         }
 
+        for selector in [0x00, 0x02, 0x04, 0x06] {
+            assert_eq!(
+                decode(encode_coprocessor(0x10, selector, 2, 3, 1)),
+                DecodeResult::Reserved
+            );
+        }
+
         for opcode in [0x10, 0x11] {
             assert_eq!(
                 decode(encode_coprocessor(opcode, 0x00, 2, 3, 1)),
@@ -1073,6 +1150,7 @@ mod tests {
         }
 
         assert_eq!(decode(CP0_TLBR | (1 << 6)), DecodeResult::Reserved);
+        assert_eq!(decode(CP0_RFE | (1 << 6)), DecodeResult::Reserved);
         assert_eq!(decode(0x4200_0000), DecodeResult::Reserved);
     }
 }

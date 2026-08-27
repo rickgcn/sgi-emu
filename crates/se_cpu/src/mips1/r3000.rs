@@ -12,7 +12,7 @@ use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 use self::{
     cp0::Exception,
     decode::{DecodeResult, Instruction, decode},
-    state::State,
+    state::{InstructionEffect, State},
 };
 
 /// An error encountered while executing one processor step.
@@ -47,6 +47,7 @@ pub enum StepError {
 /// An architectural R3000 processor.
 pub struct R3000 {
     state: State,
+    cp0_condition: bool,
 }
 
 #[expect(
@@ -62,6 +63,7 @@ impl R3000 {
     pub fn new() -> Self {
         Self {
             state: State::new(),
+            cp0_condition: false,
         }
     }
 
@@ -69,9 +71,15 @@ impl R3000 {
     ///
     /// General-purpose registers other than register zero and the HI/LO
     /// registers are preserved because their reset values are architecturally
-    /// unspecified.
+    /// unspecified. The external CP0 condition input is preserved because it
+    /// is driven by the containing machine.
     pub fn reset(&mut self) {
         self.state.reset();
+    }
+
+    /// Sets the external CP0 condition input sampled by CP0 branches.
+    pub fn set_cp0_condition(&mut self, condition: bool) {
+        self.cp0_condition = condition;
     }
 
     /// Executes one architectural processor step.
@@ -109,19 +117,25 @@ impl R3000 {
             }
         };
 
-        let outcome: Result<Option<u32>, Exception> = match instruction {
+        let outcome: Result<(Option<u32>, Option<InstructionEffect>), Exception> = match instruction
+        {
             Instruction::Alu(instruction) => {
-                alu::execute(&mut self.state, instruction).map(|()| None)
+                alu::execute(&mut self.state, instruction).map(|()| (None, None))
             }
             Instruction::Control(instruction) => {
-                Ok(Some(control::execute(&mut self.state, instruction)))
+                Ok((Some(control::execute(&mut self.state, instruction)), None))
+            }
+            Instruction::Cp0(instruction) => {
+                cp0::execute(&mut self.state, instruction, self.cp0_condition)
             }
             Instruction::Syscall => Err(Exception::Syscall),
             Instruction::Breakpoint => Err(Exception::Breakpoint),
         };
 
         match outcome {
-            Ok(delayed_resume_pc) => self.state.complete_instruction(delayed_resume_pc),
+            Ok((delayed_resume_pc, effect)) => {
+                self.state.complete_instruction(delayed_resume_pc, effect);
+            }
             Err(exception) => self.state.take_exception(exception),
         }
 
@@ -205,6 +219,14 @@ mod tests {
 
     fn encode_register(rs: u32, rt: u32, rd: u32, function: u32) -> u32 {
         (rs << 21) | (rt << 16) | (rd << 11) | function
+    }
+
+    fn encode_cp0_transfer(selector: u32, rt: u32, rd: u32) -> u32 {
+        (0x10 << 26) | (selector << 21) | (rt << 16) | (rd << 11)
+    }
+
+    fn encode_cp0_branch(condition: u32, offset: u16) -> u32 {
+        (0x10 << 26) | (0x08 << 21) | (condition << 16) | u32::from(offset)
     }
 
     #[test]
@@ -493,6 +515,205 @@ mod tests {
 
         step_with_word(&mut processor, 0).expect("retry should execute delay slot");
 
+        assert_eq!(processor.state.pc(), 0xbfc0_000c);
+    }
+
+    #[test]
+    fn cp0_transfers_observe_their_instruction_delay() {
+        let mut processor = R3000::new();
+        processor.state.write_gpr(1, 0x1111_1111);
+        processor.state.write_gpr(2, 0x1234_5678);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x04, 2, 14))
+            .expect("MTC0 should succeed");
+        assert_eq!(processor.state.read_cp0(14), 0);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x00, 1, 14))
+            .expect("MFC0 should succeed");
+        assert_eq!(processor.state.read_cp0(14), 0x1234_5678);
+        assert_eq!(processor.state.read_gpr(1), 0x1111_1111);
+
+        step_with_word(&mut processor, 0x2423_0001).expect("ADDIU should succeed");
+        assert_eq!(processor.state.read_gpr(1), 0);
+        assert_eq!(processor.state.read_gpr(3), 0x1111_1112);
+
+        processor.state.write_gpr(2, 0x89ab_cdef);
+        step_with_word(&mut processor, encode_cp0_transfer(0x06, 2, 14))
+            .expect("CTC0 should succeed");
+        step_with_word(&mut processor, 0).expect("intervening instruction should succeed");
+        assert_eq!(processor.state.read_cp0(14), 0x89ab_cdef);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x02, 4, 14))
+            .expect("CFC0 should succeed");
+        assert_eq!(processor.state.read_gpr(4), 0);
+        step_with_word(&mut processor, 0).expect("intervening instruction should succeed");
+        assert_eq!(processor.state.read_gpr(4), 0x89ab_cdef);
+    }
+
+    #[test]
+    fn direct_gpr_result_overrides_delayed_mfc0_result() {
+        let mut processor = R3000::new();
+        processor.state.write_gpr(1, 7);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x00, 1, 15))
+            .expect("MFC0 should succeed");
+        step_with_word(&mut processor, 0x2421_0001).expect("ADDIU should succeed");
+
+        assert_eq!(processor.state.read_gpr(1), 8);
+    }
+
+    #[test]
+    fn mfc0_random_captures_the_predecrement_value() {
+        let mut processor = R3000::new();
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x00, 1, 1))
+            .expect("MFC0 Random should succeed");
+        assert_eq!(processor.state.read_cp0(1), 62 << 8);
+        assert_eq!(processor.state.read_gpr(1), 0);
+
+        step_with_word(&mut processor, 0).expect("intervening instruction should succeed");
+
+        assert_eq!(processor.state.read_cp0(1), 61 << 8);
+        assert_eq!(processor.state.read_gpr(1), 63 << 8);
+    }
+
+    #[test]
+    fn step_error_stalls_pending_transfer_and_random() {
+        let mut processor = R3000::new();
+        processor.state.write_gpr(1, 0x1111_1111);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x00, 1, 15))
+            .expect("MFC0 should succeed");
+        let stalled_pc = processor.state.pc();
+        let stalled_random = processor.state.read_cp0(1);
+
+        let error =
+            step_with_word(&mut processor, 0x8c02_0000).expect_err("LW should remain unsupported");
+
+        assert_eq!(
+            error,
+            StepError::UnsupportedInstruction {
+                pc: stalled_pc,
+                instruction: 0x8c02_0000,
+            }
+        );
+        assert_eq!(processor.state.pc(), stalled_pc);
+        assert_eq!(processor.state.read_cp0(1), stalled_random);
+        assert_eq!(processor.state.read_gpr(1), 0x1111_1111);
+
+        step_with_word(&mut processor, 0).expect("retry should succeed");
+
+        assert_eq!(processor.state.read_gpr(1), 0x0000_0230);
+        assert_eq!(processor.state.read_cp0(1), stalled_random - (1 << 8));
+    }
+
+    #[test]
+    fn bus_fault_stalls_pending_transfer_and_random() {
+        let mut processor = R3000::new();
+        processor.state.write_gpr(1, 0x1111_1111);
+        step_with_word(&mut processor, encode_cp0_transfer(0x00, 1, 15))
+            .expect("MFC0 should succeed");
+        let stalled_pc = processor.state.pc();
+        let stalled_random = processor.state.read_cp0(1);
+        let mut bus = TestBus::new([0; 4]);
+        bus.fault = Some(BusFault::Unmapped);
+
+        let error = processor.step(&mut bus).expect_err("fetch should fault");
+
+        assert_eq!(
+            error,
+            StepError::BusFault {
+                address: PhysAddr::new(0x1fc0_0004),
+                fault: BusFault::Unmapped,
+            }
+        );
+        assert_eq!(processor.state.pc(), stalled_pc);
+        assert_eq!(processor.state.read_cp0(1), stalled_random);
+        assert_eq!(processor.state.read_gpr(1), 0x1111_1111);
+
+        step_with_word(&mut processor, 0).expect("retry should succeed");
+        assert_eq!(processor.state.read_gpr(1), 0x0000_0230);
+    }
+
+    #[test]
+    fn cp0_condition_drives_taken_and_not_taken_branches() {
+        let mut processor = R3000::new();
+
+        processor.set_cp0_condition(false);
+        step_with_word(&mut processor, encode_cp0_branch(0, 2)).expect("BC0F should succeed");
+        step_with_word(&mut processor, 0).expect("delay slot should succeed");
+        assert_eq!(processor.state.pc(), 0xbfc0_000c);
+
+        processor.reset();
+        processor.set_cp0_condition(false);
+        step_with_word(&mut processor, encode_cp0_branch(1, 2)).expect("BC0T should succeed");
+        step_with_word(&mut processor, 0).expect("delay slot should succeed");
+        assert_eq!(processor.state.pc(), 0xbfc0_0008);
+
+        processor.reset();
+        processor.set_cp0_condition(true);
+        step_with_word(&mut processor, encode_cp0_branch(1, 2)).expect("BC0T should succeed");
+        step_with_word(&mut processor, 0).expect("delay slot should succeed");
+        assert_eq!(processor.state.pc(), 0xbfc0_000c);
+    }
+
+    #[test]
+    fn rfe_restores_status_without_loading_epc() {
+        const STATUS_BEV: u32 = 1 << 22;
+
+        let mut processor = R3000::new();
+        processor.state.write_gpr(1, STATUS_BEV | 0x0c);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x04, 1, 12))
+            .expect("MTC0 should succeed");
+        step_with_word(&mut processor, 0).expect("intervening instruction should succeed");
+        let rfe_pc = processor.state.pc();
+
+        step_with_word(&mut processor, 0x4200_0010).expect("RFE should succeed");
+
+        assert_eq!(processor.state.read_cp0(12) & 0x3f, 0x03);
+        assert_eq!(processor.state.read_cp0(14), 0);
+        assert_eq!(processor.state.pc(), rfe_pc + 4);
+    }
+
+    #[test]
+    fn user_mode_cp0_access_takes_coprocessor_unusable() {
+        const STATUS_BEV: u32 = 1 << 22;
+        const STATUS_KUC: u32 = 1 << 1;
+
+        let mut processor = R3000::new();
+        processor.state.write_gpr(1, STATUS_BEV | STATUS_KUC);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x04, 1, 12))
+            .expect("MTC0 should succeed");
+        step_with_word(&mut processor, 0).expect("intervening instruction should succeed");
+        let fault_pc = processor.state.pc();
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x00, 2, 15))
+            .expect("guest exception should succeed");
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), fault_pc);
+        assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 11);
+        assert_eq!((processor.state.read_cp0(13) >> 28) & 3, 0);
+        assert_eq!(processor.state.read_gpr(2), 0);
+    }
+
+    #[test]
+    fn reset_clears_transfer_and_preserves_cp0_condition() {
+        let mut processor = R3000::new();
+        processor.state.write_gpr(1, 0x1111_1111);
+        processor.set_cp0_condition(true);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x00, 1, 15))
+            .expect("MFC0 should succeed");
+        processor.reset();
+
+        assert_eq!(processor.state.read_cp0(1), 63 << 8);
+        step_with_word(&mut processor, encode_cp0_branch(1, 2)).expect("BC0T should succeed");
+        step_with_word(&mut processor, 0).expect("delay slot should succeed");
+
+        assert_eq!(processor.state.read_gpr(1), 0x1111_1111);
         assert_eq!(processor.state.pc(), 0xbfc0_000c);
     }
 }

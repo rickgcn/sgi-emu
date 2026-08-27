@@ -46,7 +46,7 @@ pub(super) fn execute(state: &mut State, instruction: ControlInstruction) -> u32
     }
 }
 
-fn branch_resume_pc(pc: u32, offset: u16, condition: bool) -> u32 {
+pub(super) fn branch_resume_pc(pc: u32, offset: u16, condition: bool) -> u32 {
     if condition {
         let displacement = (i32::from(offset as i16) as u32).wrapping_shl(2);
         pc.wrapping_add(4).wrapping_add(displacement)

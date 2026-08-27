@@ -1,11 +1,35 @@
+use super::{
+    control::branch_resume_pc,
+    decode::Cp0Instruction,
+    state::{InstructionEffect, State},
+};
+
+const INDEX_PROBE_FAILURE: u32 = 1 << 31;
+const INDEX_INDEX_MASK: u32 = 0x0000_3f00;
+const ENTRY_LO_VISIBLE_MASK: u32 = 0xffff_ff00;
+const CONTEXT_VISIBLE_MASK: u32 = 0xffff_fffc;
+const CONTEXT_PTE_BASE_MASK: u32 = 0xffe0_0000;
+const ENTRY_HI_VISIBLE_MASK: u32 = 0xffff_ffc0;
+
+const PRID: u32 = 0x0000_0230;
+const RANDOM_RESET: u32 = 63 << 8;
+
 const STATUS_BEV: u32 = 1 << 22;
 const STATUS_TS: u32 = 1 << 21;
+const STATUS_PE: u32 = 1 << 20;
 const STATUS_KUC: u32 = 1 << 1;
 const STATUS_IEC: u32 = 1;
 const STATUS_MODE_STACK_MASK: u32 = 0x3f;
+const STATUS_CU0: u32 = 1 << 28;
+const STATUS_CU_MASK: u32 = 0xf000_0000;
+const STATUS_INTERRUPT_CONTROL_MASK: u32 = 0x0000_ff01;
+const STATUS_VISIBLE_MASK: u32 = 0xf27f_ff3f;
+const STATUS_WRITABLE_MASK: u32 = 0xf247_ff3f;
 
 const CAUSE_BD: u32 = 1 << 31;
 const CAUSE_IP_MASK: u32 = 0x0000_ff00;
+const CAUSE_SOFTWARE_IP_MASK: u32 = 0x0000_0300;
+const CAUSE_VISIBLE_MASK: u32 = 0xb000_ff7c;
 
 const GENERAL_EXCEPTION_VECTOR: u32 = 0x8000_0080;
 const BOOT_GENERAL_EXCEPTION_VECTOR: u32 = 0xbfc0_0180;
@@ -16,30 +40,132 @@ pub(super) enum Exception {
     Syscall,
     Breakpoint,
     ReservedInstruction,
+    CoprocessorUnusable,
     Overflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FunctionalState {
+    coprocessor_usable: u32,
+    interrupt_control: u32,
+    software_interrupts: u32,
+}
+
+impl FunctionalState {
+    const fn from_registers(status: u32, cause: u32) -> Self {
+        Self {
+            coprocessor_usable: status & STATUS_CU_MASK,
+            interrupt_control: status & STATUS_INTERRUPT_CONTROL_MASK,
+            software_interrupts: cause & CAUSE_SOFTWARE_IP_MASK,
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct Cp0 {
+    index: u32,
+    random: u32,
+    entry_lo: u32,
+    context: u32,
+    bad_vaddr: u32,
+    entry_hi: u32,
     status: u32,
     cause: u32,
     epc: u32,
-    bad_vaddr: u32,
+    effective: FunctionalState,
+    pending_functional: Option<FunctionalState>,
 }
 
 impl Cp0 {
     pub(super) const fn new() -> Self {
         Self {
+            index: 0,
+            random: RANDOM_RESET,
+            entry_lo: 0,
+            context: 0,
+            bad_vaddr: 0,
+            entry_hi: 0,
             status: STATUS_BEV,
             cause: 0,
             epc: 0,
-            bad_vaddr: 0,
+            effective: FunctionalState::from_registers(STATUS_BEV, 0),
+            pending_functional: None,
         }
     }
 
     pub(super) fn reset(&mut self, interrupted_pc: u32) {
         self.status = (self.status | STATUS_BEV) & !(STATUS_TS | STATUS_KUC | STATUS_IEC);
         self.epc = interrupted_pc;
+        self.random = RANDOM_RESET;
+        self.effective = FunctionalState::from_registers(self.status, self.cause);
+        self.pending_functional = None;
+    }
+
+    pub(super) fn read_register(&self, index: usize) -> u32 {
+        match index {
+            0 => self.index & (INDEX_PROBE_FAILURE | INDEX_INDEX_MASK),
+            1 => self.random & INDEX_INDEX_MASK,
+            2 => self.entry_lo & ENTRY_LO_VISIBLE_MASK,
+            4 => self.context & CONTEXT_VISIBLE_MASK,
+            8 => self.bad_vaddr,
+            10 => self.entry_hi & ENTRY_HI_VISIBLE_MASK,
+            12 => self.status & STATUS_VISIBLE_MASK,
+            13 => self.cause & CAUSE_VISIBLE_MASK,
+            14 => self.epc,
+            15 => PRID,
+            _ => 0,
+        }
+    }
+
+    pub(super) fn write_register(&mut self, index: usize, value: u32) {
+        match index {
+            0 => {
+                self.index = (self.index & INDEX_PROBE_FAILURE) | (value & INDEX_INDEX_MASK);
+            }
+            1 | 8 | 15 => {}
+            2 => self.entry_lo = value & ENTRY_LO_VISIBLE_MASK,
+            4 => {
+                self.context =
+                    (self.context & !CONTEXT_PTE_BASE_MASK) | (value & CONTEXT_PTE_BASE_MASK);
+            }
+            10 => self.entry_hi = value & ENTRY_HI_VISIBLE_MASK,
+            12 => self.write_status(value),
+            13 => self.write_cause(value),
+            14 => self.epc = value,
+            _ => {}
+        }
+    }
+
+    pub(super) fn status(&self) -> u32 {
+        self.status
+    }
+
+    pub(super) fn is_usable(&self) -> bool {
+        self.status & STATUS_KUC == 0 || self.effective.coprocessor_usable & STATUS_CU0 != 0
+    }
+
+    pub(super) fn commit_pending_functional(&mut self) {
+        if let Some(functional) = self.pending_functional.take() {
+            self.effective = functional;
+        }
+    }
+
+    pub(super) fn restore_status(&mut self, value: u32) {
+        self.status = (self.status & !0x0f) | (value & 0x0f);
+
+        let interrupt_enable = self.status & STATUS_IEC;
+        self.effective.interrupt_control =
+            (self.effective.interrupt_control & !STATUS_IEC) | interrupt_enable;
+        if let Some(functional) = &mut self.pending_functional {
+            functional.interrupt_control =
+                (functional.interrupt_control & !STATUS_IEC) | interrupt_enable;
+        }
+    }
+
+    pub(super) fn advance_random(&mut self) {
+        let current = (self.random & INDEX_INDEX_MASK) >> 8;
+        let next = if current <= 8 { 63 } else { current - 1 };
+        self.random = next << 8;
     }
 
     pub(super) fn take_exception(
@@ -53,6 +179,7 @@ impl Cp0 {
             Exception::Syscall => (8, None),
             Exception::Breakpoint => (9, None),
             Exception::ReservedInstruction => (10, None),
+            Exception::CoprocessorUnusable => (11, None),
             Exception::Overflow => (12, None),
         };
 
@@ -67,30 +194,115 @@ impl Cp0 {
             self.bad_vaddr = address;
         }
 
+        self.effective.interrupt_control &= !STATUS_IEC;
+        if let Some(functional) = &mut self.pending_functional {
+            functional.interrupt_control &= !STATUS_IEC;
+        }
+
         if self.status & STATUS_BEV == 0 {
             GENERAL_EXCEPTION_VECTOR
         } else {
             BOOT_GENERAL_EXCEPTION_VECTOR
         }
     }
+
+    fn write_status(&mut self, value: u32) {
+        let preserved = self.status & !(STATUS_WRITABLE_MASK | STATUS_PE);
+        let parity_error = if value & STATUS_PE == 0 {
+            self.status & STATUS_PE
+        } else {
+            0
+        };
+        self.status = preserved | (value & STATUS_WRITABLE_MASK) | parity_error;
+
+        let mut functional = self.effective;
+        functional.coprocessor_usable = self.status & STATUS_CU_MASK;
+        functional.interrupt_control = self.status & STATUS_INTERRUPT_CONTROL_MASK;
+        self.pending_functional = Some(functional);
+    }
+
+    fn write_cause(&mut self, value: u32) {
+        self.cause = (self.cause & !CAUSE_SOFTWARE_IP_MASK) | (value & CAUSE_SOFTWARE_IP_MASK);
+
+        let mut functional = self.effective;
+        functional.software_interrupts = self.cause & CAUSE_SOFTWARE_IP_MASK;
+        self.pending_functional = Some(functional);
+    }
+}
+
+pub(super) fn execute(
+    state: &mut State,
+    instruction: Cp0Instruction,
+    condition: bool,
+) -> Result<(Option<u32>, Option<InstructionEffect>), Exception> {
+    if !state.cp0_usable() {
+        return Err(Exception::CoprocessorUnusable);
+    }
+
+    let outcome = match instruction {
+        Cp0Instruction::Mfc0 { rt, rd } | Cp0Instruction::Cfc0 { rt, rd } => (
+            None,
+            Some(InstructionEffect::DelayedGprWrite {
+                index: rt,
+                value: state.read_cp0(rd),
+            }),
+        ),
+        Cp0Instruction::Mtc0 { rt, rd } | Cp0Instruction::Ctc0 { rt, rd } => (
+            None,
+            Some(InstructionEffect::DelayedCp0Write {
+                index: rd,
+                value: state.read_gpr(rt),
+            }),
+        ),
+        Cp0Instruction::Bc0f { offset } => {
+            (Some(branch_resume_pc(state.pc(), offset, !condition)), None)
+        }
+        Cp0Instruction::Bc0t { offset } => {
+            (Some(branch_resume_pc(state.pc(), offset, condition)), None)
+        }
+        Cp0Instruction::Rfe => {
+            let status = state.cp0_status();
+            let restored = (status & !0x0f) | ((status >> 2) & 0x0f);
+            (
+                None,
+                Some(InstructionEffect::RestoreStatus { value: restored }),
+            )
+        }
+    };
+
+    Ok(outcome)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOT_GENERAL_EXCEPTION_VECTOR, CAUSE_BD, CAUSE_IP_MASK, Cp0, Exception,
-        GENERAL_EXCEPTION_VECTOR, STATUS_BEV, STATUS_IEC, STATUS_KUC, STATUS_MODE_STACK_MASK,
-        STATUS_TS,
+        BOOT_GENERAL_EXCEPTION_VECTOR, CAUSE_BD, CAUSE_IP_MASK, CAUSE_SOFTWARE_IP_MASK,
+        CAUSE_VISIBLE_MASK, CONTEXT_PTE_BASE_MASK, Cp0, Cp0Instruction, ENTRY_HI_VISIBLE_MASK,
+        ENTRY_LO_VISIBLE_MASK, Exception, FunctionalState, GENERAL_EXCEPTION_VECTOR,
+        INDEX_INDEX_MASK, INDEX_PROBE_FAILURE, InstructionEffect, PRID, RANDOM_RESET, STATUS_BEV,
+        STATUS_CU_MASK, STATUS_CU0, STATUS_IEC, STATUS_INTERRUPT_CONTROL_MASK, STATUS_KUC,
+        STATUS_MODE_STACK_MASK, STATUS_PE, STATUS_TS, STATUS_VISIBLE_MASK, STATUS_WRITABLE_MASK,
+        State, execute,
     };
 
     #[test]
     fn new_initializes_deterministic_state() {
         let cp0 = Cp0::new();
 
+        assert_eq!(cp0.index, 0);
+        assert_eq!(cp0.random, RANDOM_RESET);
+        assert_eq!(cp0.entry_lo, 0);
+        assert_eq!(cp0.context, 0);
+        assert_eq!(cp0.entry_hi, 0);
         assert_eq!(cp0.status, STATUS_BEV);
         assert_eq!(cp0.cause, 0);
         assert_eq!(cp0.epc, 0);
         assert_eq!(cp0.bad_vaddr, 0);
+        assert_eq!(
+            cp0.effective,
+            FunctionalState::from_registers(STATUS_BEV, 0)
+        );
+        assert_eq!(cp0.pending_functional, None);
     }
 
     #[test]
@@ -99,12 +311,18 @@ mod tests {
         let original_cause = 0x8123_4500;
         let original_bad_vaddr = 0x1234_5678;
         let interrupted_pc = 0x89ab_cdef;
-        let mut cp0 = Cp0 {
-            status: original_status,
-            cause: original_cause,
-            epc: 0x7654_3210,
-            bad_vaddr: original_bad_vaddr,
-        };
+        let mut cp0 = Cp0::new();
+        cp0.index = INDEX_PROBE_FAILURE | INDEX_INDEX_MASK;
+        cp0.random = 8 << 8;
+        cp0.entry_lo = ENTRY_LO_VISIBLE_MASK;
+        cp0.context = 0xaaaa_aaa8;
+        cp0.entry_hi = ENTRY_HI_VISIBLE_MASK;
+        cp0.status = original_status;
+        cp0.cause = original_cause;
+        cp0.epc = 0x7654_3210;
+        cp0.bad_vaddr = original_bad_vaddr;
+        cp0.effective = FunctionalState::from_registers(0, 0);
+        cp0.pending_functional = Some(FunctionalState::from_registers(u32::MAX, u32::MAX));
 
         cp0.reset(interrupted_pc);
 
@@ -115,6 +333,16 @@ mod tests {
         assert_eq!(cp0.cause, original_cause);
         assert_eq!(cp0.epc, interrupted_pc);
         assert_eq!(cp0.bad_vaddr, original_bad_vaddr);
+        assert_eq!(cp0.index, INDEX_PROBE_FAILURE | INDEX_INDEX_MASK);
+        assert_eq!(cp0.random, RANDOM_RESET);
+        assert_eq!(cp0.entry_lo, ENTRY_LO_VISIBLE_MASK);
+        assert_eq!(cp0.context, 0xaaaa_aaa8);
+        assert_eq!(cp0.entry_hi, ENTRY_HI_VISIBLE_MASK);
+        assert_eq!(
+            cp0.effective,
+            FunctionalState::from_registers(cp0.status, cp0.cause)
+        );
+        assert_eq!(cp0.pending_functional, None);
     }
 
     #[test]
@@ -151,6 +379,7 @@ mod tests {
             (Exception::Syscall, 8, true),
             (Exception::Breakpoint, 9, false),
             (Exception::ReservedInstruction, 10, true),
+            (Exception::CoprocessorUnusable, 11, false),
             (Exception::Overflow, 12, false),
         ];
 
@@ -192,6 +421,7 @@ mod tests {
             Exception::Syscall,
             Exception::Breakpoint,
             Exception::ReservedInstruction,
+            Exception::CoprocessorUnusable,
             Exception::Overflow,
         ] {
             cp0.bad_vaddr = original_bad_vaddr;
@@ -199,6 +429,331 @@ mod tests {
             cp0.take_exception(exception, 0, false);
 
             assert_eq!(cp0.bad_vaddr, original_bad_vaddr);
+        }
+    }
+
+    #[test]
+    fn register_access_applies_masks_and_read_only_rules() {
+        let mut cp0 = Cp0::new();
+
+        cp0.index = INDEX_PROBE_FAILURE;
+        cp0.write_register(0, u32::MAX);
+        assert_eq!(cp0.read_register(0), INDEX_PROBE_FAILURE | INDEX_INDEX_MASK);
+
+        cp0.write_register(1, 0);
+        assert_eq!(cp0.read_register(1), RANDOM_RESET);
+
+        cp0.write_register(2, u32::MAX);
+        assert_eq!(cp0.read_register(2), ENTRY_LO_VISIBLE_MASK);
+
+        let bad_vpn = 0x001f_fffc;
+        cp0.context = bad_vpn;
+        cp0.write_register(4, u32::MAX);
+        assert_eq!(cp0.read_register(4), CONTEXT_PTE_BASE_MASK | bad_vpn);
+
+        cp0.bad_vaddr = 0x1234_5678;
+        cp0.write_register(8, u32::MAX);
+        assert_eq!(cp0.read_register(8), 0x1234_5678);
+
+        cp0.write_register(10, u32::MAX);
+        assert_eq!(cp0.read_register(10), ENTRY_HI_VISIBLE_MASK);
+
+        cp0.write_register(14, 0x89ab_cdef);
+        assert_eq!(cp0.read_register(14), 0x89ab_cdef);
+
+        cp0.write_register(15, 0);
+        assert_eq!(cp0.read_register(15), PRID);
+        cp0.write_register(3, u32::MAX);
+        assert_eq!(cp0.read_register(3), 0);
+        assert_eq!(cp0.read_register(31), 0);
+    }
+
+    #[test]
+    fn status_and_cause_writes_preserve_hardware_fields() {
+        const STATUS_CM: u32 = 1 << 19;
+
+        let mut cp0 = Cp0::new();
+        cp0.status = STATUS_TS | STATUS_PE | STATUS_CM;
+
+        cp0.write_register(12, u32::MAX);
+
+        assert_eq!(
+            cp0.read_register(12),
+            (STATUS_TS | STATUS_CM | STATUS_WRITABLE_MASK) & STATUS_VISIBLE_MASK
+        );
+        assert_eq!(cp0.status & STATUS_PE, 0);
+
+        cp0.status = STATUS_TS | STATUS_PE | STATUS_CM;
+        cp0.write_register(12, 0);
+        assert_eq!(cp0.read_register(12), STATUS_TS | STATUS_PE | STATUS_CM);
+
+        let original_cause = CAUSE_BD | (3 << 28) | 0x0000_fc7c;
+        cp0.cause = original_cause;
+        cp0.write_register(13, 0x0000_0100);
+        assert_eq!(
+            cp0.cause,
+            (original_cause & !CAUSE_SOFTWARE_IP_MASK) | 0x0000_0100
+        );
+        assert_eq!(cp0.read_register(13), cp0.cause & CAUSE_VISIBLE_MASK);
+    }
+
+    #[test]
+    fn random_decrements_and_wraps_at_the_wired_range() {
+        let mut cp0 = Cp0::new();
+
+        assert_eq!(cp0.read_register(1), 63 << 8);
+        cp0.advance_random();
+        assert_eq!(cp0.read_register(1), 62 << 8);
+
+        cp0.random = 9 << 8;
+        cp0.advance_random();
+        assert_eq!(cp0.read_register(1), 8 << 8);
+        cp0.advance_random();
+        assert_eq!(cp0.read_register(1), 63 << 8);
+    }
+
+    #[test]
+    fn functional_control_changes_only_when_committed() {
+        let mut cp0 = Cp0::new();
+        let status = STATUS_BEV | STATUS_KUC | STATUS_CU0 | 0x0000_5500 | STATUS_IEC;
+
+        cp0.write_register(12, status);
+
+        assert_eq!(cp0.read_register(12), status);
+        assert!(!cp0.is_usable());
+        assert_eq!(cp0.effective.coprocessor_usable, 0);
+        assert_eq!(cp0.effective.interrupt_control, 0);
+
+        cp0.commit_pending_functional();
+
+        assert!(cp0.is_usable());
+        assert_eq!(cp0.effective.coprocessor_usable, status & STATUS_CU_MASK);
+        assert_eq!(
+            cp0.effective.interrupt_control,
+            status & STATUS_INTERRUPT_CONTROL_MASK
+        );
+
+        cp0.write_register(13, CAUSE_SOFTWARE_IP_MASK);
+        assert_eq!(cp0.effective.software_interrupts, 0);
+        cp0.commit_pending_functional();
+        assert_eq!(cp0.effective.software_interrupts, CAUSE_SOFTWARE_IP_MASK);
+    }
+
+    #[test]
+    fn consecutive_functional_writes_preserve_staggered_groups() {
+        let mut cp0 = Cp0::new();
+        let status = STATUS_BEV | STATUS_CU0 | 0x0000_5500 | STATUS_IEC;
+
+        cp0.write_register(12, status);
+        assert_eq!(
+            cp0.effective,
+            FunctionalState::from_registers(STATUS_BEV, 0)
+        );
+
+        cp0.commit_pending_functional();
+        cp0.write_register(13, 0x0000_0200);
+
+        assert_eq!(cp0.effective.coprocessor_usable, STATUS_CU0);
+        assert_eq!(cp0.effective.interrupt_control, 0x0000_5501);
+        assert_eq!(cp0.effective.software_interrupts, 0);
+        assert_eq!(
+            cp0.pending_functional,
+            Some(FunctionalState {
+                coprocessor_usable: STATUS_CU0,
+                interrupt_control: 0x0000_5501,
+                software_interrupts: 0x0000_0200,
+            })
+        );
+
+        cp0.commit_pending_functional();
+
+        assert_eq!(
+            cp0.effective,
+            FunctionalState::from_registers(status, 0x0000_0200)
+        );
+    }
+
+    #[test]
+    fn restore_status_synchronizes_interrupt_enable_only() {
+        let mut cp0 = Cp0::new();
+        cp0.status = STATUS_BEV | STATUS_CU0 | 0x0000_aa00 | 0x3d;
+        cp0.effective = FunctionalState {
+            coprocessor_usable: STATUS_CU0,
+            interrupt_control: 0x0000_aa00,
+            software_interrupts: 0x0000_0100,
+        };
+        cp0.pending_functional = Some(FunctionalState {
+            coprocessor_usable: 0,
+            interrupt_control: 0x0000_5500,
+            software_interrupts: 0x0000_0200,
+        });
+        let restored = (cp0.status & !0x0f) | ((cp0.status >> 2) & 0x0f);
+
+        cp0.restore_status(restored);
+
+        assert_eq!(cp0.status, (STATUS_BEV | STATUS_CU0 | 0x0000_aa00 | 0x3f));
+        assert_eq!(cp0.effective.coprocessor_usable, STATUS_CU0);
+        assert_eq!(cp0.effective.interrupt_control, 0x0000_aa01);
+        assert_eq!(cp0.effective.software_interrupts, 0x0000_0100);
+        assert_eq!(
+            cp0.pending_functional,
+            Some(FunctionalState {
+                coprocessor_usable: 0,
+                interrupt_control: 0x0000_5501,
+                software_interrupts: 0x0000_0200,
+            })
+        );
+    }
+
+    #[test]
+    fn exception_entry_cancels_delayed_interrupt_enable() {
+        let mut cp0 = Cp0::new();
+        cp0.status |= STATUS_IEC;
+        cp0.effective.interrupt_control |= STATUS_IEC;
+        cp0.pending_functional = Some(FunctionalState {
+            coprocessor_usable: STATUS_CU0,
+            interrupt_control: 0x0000_ff01,
+            software_interrupts: CAUSE_SOFTWARE_IP_MASK,
+        });
+
+        cp0.take_exception(Exception::CoprocessorUnusable, 0, false);
+
+        assert_eq!(cp0.status & STATUS_IEC, 0);
+        assert_eq!(cp0.effective.interrupt_control & STATUS_IEC, 0);
+        assert_eq!(
+            cp0.pending_functional
+                .expect("functional state should remain pending")
+                .interrupt_control
+                & STATUS_IEC,
+            0
+        );
+        assert_eq!(cp0.cause & (3 << 28), 0);
+        assert_eq!((cp0.cause >> 2) & 0x1f, 11);
+    }
+
+    #[test]
+    fn instruction_execution_captures_values_and_branches() {
+        let mut state = State::new();
+        state.write_gpr(2, 0x1234_5678);
+
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Mfc0 { rt: 1, rd: 15 }, false),
+            Ok((
+                None,
+                Some(InstructionEffect::DelayedGprWrite {
+                    index: 1,
+                    value: PRID,
+                })
+            ))
+        );
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Cfc0 { rt: 1, rd: 15 }, false),
+            Ok((
+                None,
+                Some(InstructionEffect::DelayedGprWrite {
+                    index: 1,
+                    value: PRID,
+                })
+            ))
+        );
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Mfc0 { rt: 5, rd: 1 }, false),
+            Ok((
+                None,
+                Some(InstructionEffect::DelayedGprWrite {
+                    index: 5,
+                    value: RANDOM_RESET,
+                })
+            ))
+        );
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Mtc0 { rt: 2, rd: 14 }, false),
+            Ok((
+                None,
+                Some(InstructionEffect::DelayedCp0Write {
+                    index: 14,
+                    value: 0x1234_5678,
+                })
+            ))
+        );
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Ctc0 { rt: 2, rd: 14 }, false),
+            Ok((
+                None,
+                Some(InstructionEffect::DelayedCp0Write {
+                    index: 14,
+                    value: 0x1234_5678,
+                })
+            ))
+        );
+
+        let pc = state.pc();
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Bc0f { offset: 2 }, false),
+            Ok((Some(pc + 12), None))
+        );
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Bc0t { offset: 2 }, false),
+            Ok((Some(pc + 8), None))
+        );
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Rfe, false),
+            Ok((
+                None,
+                Some(InstructionEffect::RestoreStatus { value: STATUS_BEV })
+            ))
+        );
+    }
+
+    #[test]
+    fn cp0_usability_uses_raw_mode_and_effective_cu0() {
+        let mut state = State::new();
+        let user_with_cu0 = STATUS_BEV | STATUS_KUC | STATUS_CU0;
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp0Write {
+                index: 12,
+                value: user_with_cu0,
+            }),
+        );
+        state.complete_instruction(None, None);
+
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Mfc0 { rt: 1, rd: 15 }, false),
+            Err(Exception::CoprocessorUnusable)
+        );
+
+        state.complete_instruction(None, None);
+
+        assert!(execute(&mut state, Cp0Instruction::Mfc0 { rt: 1, rd: 15 }, false).is_ok());
+    }
+
+    #[test]
+    fn every_cp0_instruction_checks_usability_before_execution() {
+        let mut state = State::new();
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp0Write {
+                index: 12,
+                value: STATUS_BEV | STATUS_KUC,
+            }),
+        );
+        state.complete_instruction(None, None);
+
+        for instruction in [
+            Cp0Instruction::Mfc0 { rt: 1, rd: 15 },
+            Cp0Instruction::Cfc0 { rt: 1, rd: 15 },
+            Cp0Instruction::Mtc0 { rt: 1, rd: 14 },
+            Cp0Instruction::Ctc0 { rt: 1, rd: 14 },
+            Cp0Instruction::Bc0f { offset: 0 },
+            Cp0Instruction::Bc0t { offset: 0 },
+            Cp0Instruction::Rfe,
+        ] {
+            assert_eq!(
+                execute(&mut state, instruction, false),
+                Err(Exception::CoprocessorUnusable)
+            );
         }
     }
 }
