@@ -1,6 +1,13 @@
-use super::cp0::{Cp0, Exception};
+use se_core::bus::PhysAddr;
+
+use super::{
+    ExecutionError,
+    cp0::{Cp0, Exception, TlbFaultKind},
+    mmu::{AccessType, Mmu, ProbeResult, TranslationFault},
+};
 
 const RESET_PC: u32 = 0xbfc0_0000;
+const TLB_PROBE_FAILURE: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DelaySlot {
@@ -15,16 +22,43 @@ struct PendingGprWrite {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingCp0Write {
-    index: usize,
-    value: u32,
+enum PendingCp0Write {
+    Register { index: usize, value: u32 },
+    TlbRead { entry_hi: u32, entry_lo: u32 },
+    TlbProbe { index: u32 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InstructionEffect {
-    DelayedGprWrite { index: usize, value: u32 },
-    DelayedCp0Write { index: usize, value: u32 },
-    RestoreStatus { value: u32 },
+    DelayedGprWrite {
+        index: usize,
+        value: u32,
+    },
+    DelayedCp0Write {
+        index: usize,
+        value: u32,
+    },
+    DelayedTlbRead {
+        entry_hi: u32,
+        entry_lo: u32,
+    },
+    DelayedTlbProbe {
+        index: u32,
+    },
+    TlbWrite {
+        index: usize,
+        entry_hi: u32,
+        entry_lo: u32,
+    },
+    RestoreStatus {
+        value: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TranslationError {
+    Exception(Exception),
+    TlbShutdown,
 }
 
 pub(super) struct State {
@@ -34,6 +68,7 @@ pub(super) struct State {
     pc: u32,
     delay_slot: Option<DelaySlot>,
     cp0: Cp0,
+    mmu: Mmu,
     pending_gpr_write: Option<PendingGprWrite>,
     pending_cp0_write: Option<PendingCp0Write>,
 }
@@ -47,6 +82,7 @@ impl State {
             pc: RESET_PC,
             delay_slot: None,
             cp0: Cp0::new(),
+            mmu: Mmu::new(),
             pending_gpr_write: None,
             pending_cp0_write: None,
         }
@@ -55,6 +91,7 @@ impl State {
     pub(super) fn reset(&mut self) {
         let interrupted_pc = self.pc;
         self.cp0.reset(interrupted_pc);
+        self.mmu.reset();
         self.gpr[0] = 0;
         self.pc = RESET_PC;
         self.delay_slot = None;
@@ -109,6 +146,73 @@ impl State {
         self.cp0.is_usable()
     }
 
+    pub(super) fn is_tlb_shutdown(&self) -> bool {
+        self.cp0.is_tlb_shutdown()
+    }
+
+    pub(super) fn translate_address(
+        &mut self,
+        virtual_address: u32,
+        access: AccessType,
+    ) -> Result<PhysAddr, TranslationError> {
+        let result = self.mmu.translate(
+            virtual_address,
+            self.cp0.current_asid(),
+            self.cp0.is_kernel_mode(),
+            access,
+        );
+
+        match result {
+            Ok(address) => Ok(address),
+            Err(TranslationFault::Shutdown) => {
+                self.cp0.enter_tlb_shutdown();
+                Err(TranslationError::TlbShutdown)
+            }
+            Err(fault) => Err(TranslationError::Exception(Self::translation_exception(
+                virtual_address,
+                access,
+                fault,
+            ))),
+        }
+    }
+
+    pub(super) fn tlbr_effect(&self) -> InstructionEffect {
+        let (entry_hi, entry_lo) = self.mmu.read_indexed(self.cp0.tlb_index());
+        InstructionEffect::DelayedTlbRead { entry_hi, entry_lo }
+    }
+
+    pub(super) fn tlbwi_effect(&self) -> InstructionEffect {
+        let (entry_hi, entry_lo) = self.cp0.tlb_staging();
+        InstructionEffect::TlbWrite {
+            index: self.cp0.tlb_index(),
+            entry_hi,
+            entry_lo,
+        }
+    }
+
+    pub(super) fn tlbwr_effect(&self) -> InstructionEffect {
+        let (entry_hi, entry_lo) = self.cp0.tlb_staging();
+        InstructionEffect::TlbWrite {
+            index: self.cp0.random_tlb_index(),
+            entry_hi,
+            entry_lo,
+        }
+    }
+
+    pub(super) fn tlbp_effect(&mut self) -> Result<InstructionEffect, ExecutionError> {
+        let (entry_hi, _) = self.cp0.tlb_staging();
+        let index = match self.mmu.probe(entry_hi) {
+            ProbeResult::Miss => TLB_PROBE_FAILURE,
+            ProbeResult::Match(index) => (index as u32) << 8,
+            ProbeResult::Shutdown => {
+                self.cp0.enter_tlb_shutdown();
+                return Err(ExecutionError::TlbShutdown);
+            }
+        };
+
+        Ok(InstructionEffect::DelayedTlbProbe { index })
+    }
+
     pub(super) fn complete_instruction(
         &mut self,
         delayed_resume_pc: Option<u32>,
@@ -118,17 +222,40 @@ impl State {
         self.commit_pending_gpr_write();
         self.commit_pending_cp0_write();
 
-        match effect {
+        let tlb_write = match effect {
             Some(InstructionEffect::DelayedGprWrite { index, value }) => {
                 self.pending_gpr_write = Some(PendingGprWrite { index, value });
+                None
             }
             Some(InstructionEffect::DelayedCp0Write { index, value }) => {
-                self.pending_cp0_write = Some(PendingCp0Write { index, value });
+                self.pending_cp0_write = Some(PendingCp0Write::Register { index, value });
+                None
             }
+            Some(InstructionEffect::DelayedTlbRead { entry_hi, entry_lo }) => {
+                self.pending_cp0_write = Some(PendingCp0Write::TlbRead { entry_hi, entry_lo });
+                None
+            }
+            Some(InstructionEffect::DelayedTlbProbe { index }) => {
+                self.pending_cp0_write = Some(PendingCp0Write::TlbProbe { index });
+                None
+            }
+            Some(InstructionEffect::TlbWrite {
+                index,
+                entry_hi,
+                entry_lo,
+            }) => Some((index, entry_hi, entry_lo)),
             Some(InstructionEffect::RestoreStatus { value }) => {
                 self.cp0.restore_status(value);
+                None
             }
-            None => {}
+            None => None,
+        };
+
+        match tlb_write {
+            Some((index, entry_hi, entry_lo)) => {
+                self.mmu.complete_write(index, entry_hi, entry_lo);
+            }
+            None => self.mmu.advance_instruction_view(),
         }
 
         let origin_pc = self.pc;
@@ -156,6 +283,7 @@ impl State {
         };
 
         self.pc = self.cp0.take_exception(exception, epc, in_delay_slot);
+        self.mmu.advance_instruction_view();
         self.cp0.advance_random();
     }
 
@@ -167,17 +295,84 @@ impl State {
 
     fn commit_pending_cp0_write(&mut self) {
         if let Some(write) = self.pending_cp0_write.take() {
-            self.cp0.write_register(write.index, write.value);
+            match write {
+                PendingCp0Write::Register { index, value } => {
+                    self.cp0.write_register(index, value);
+                }
+                PendingCp0Write::TlbRead { entry_hi, entry_lo } => {
+                    self.cp0.write_tlb_read_result(entry_hi, entry_lo)
+                }
+                PendingCp0Write::TlbProbe { index } => {
+                    self.cp0.write_tlb_probe_result(index);
+                }
+            }
+        }
+    }
+
+    fn translation_exception(
+        virtual_address: u32,
+        access: AccessType,
+        fault: TranslationFault,
+    ) -> Exception {
+        match (access, fault) {
+            (AccessType::Instruction, TranslationFault::AddressError) => {
+                Exception::InstructionAddressError {
+                    address: virtual_address,
+                }
+            }
+            (AccessType::Load, TranslationFault::AddressError) => Exception::LoadAddressError {
+                address: virtual_address,
+            },
+            (AccessType::Store, TranslationFault::AddressError) => Exception::StoreAddressError {
+                address: virtual_address,
+            },
+            (AccessType::Instruction | AccessType::Load, TranslationFault::Miss) => {
+                Exception::TlbLoad {
+                    address: virtual_address,
+                    fault: TlbFaultKind::Miss,
+                }
+            }
+            (AccessType::Instruction | AccessType::Load, TranslationFault::Invalid) => {
+                Exception::TlbLoad {
+                    address: virtual_address,
+                    fault: TlbFaultKind::Invalid,
+                }
+            }
+            (AccessType::Store, TranslationFault::Miss) => Exception::TlbStore {
+                address: virtual_address,
+                fault: TlbFaultKind::Miss,
+            },
+            (AccessType::Store, TranslationFault::Invalid) => Exception::TlbStore {
+                address: virtual_address,
+                fault: TlbFaultKind::Invalid,
+            },
+            (AccessType::Store, TranslationFault::Modified) => Exception::TlbModified {
+                address: virtual_address,
+            },
+            (AccessType::Instruction | AccessType::Load, TranslationFault::Modified) => {
+                unreachable!("the MMU reports modified only for store translations")
+            }
+            (_, TranslationFault::Shutdown) => {
+                unreachable!("TLB shutdown is handled before exception mapping")
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use se_core::bus::PhysAddr;
+
     use super::{
-        Cp0, DelaySlot, Exception, InstructionEffect, PendingCp0Write, PendingGprWrite, RESET_PC,
-        State,
+        AccessType, Cp0, DelaySlot, Exception, ExecutionError, InstructionEffect, PendingCp0Write,
+        PendingGprWrite, RESET_PC, State, TlbFaultKind, TranslationError, TranslationFault,
     };
+
+    const ENTRY_LO_DIRTY: u32 = 1 << 10;
+    const ENTRY_LO_VALID: u32 = 1 << 9;
+    const STATUS_BEV: u32 = 1 << 22;
+    const STATUS_TS: u32 = 1 << 21;
+    const STATUS_KUC: u32 = 1 << 1;
 
     #[test]
     fn new_initializes_deterministic_state() {
@@ -210,7 +405,7 @@ mod tests {
             index: 1,
             value: 0xaaaa_aaaa,
         });
-        state.pending_cp0_write = Some(PendingCp0Write {
+        state.pending_cp0_write = Some(PendingCp0Write::Register {
             index: 14,
             value: 0xbbbb_bbbb,
         });
@@ -606,5 +801,402 @@ mod tests {
         assert_eq!(state.read_cp0(1), 62 << 8);
         state.take_exception(Exception::Syscall);
         assert_eq!(state.read_cp0(1), 61 << 8);
+    }
+
+    #[test]
+    fn translation_faults_map_to_precise_exceptions() {
+        let address = 0x1234_5678;
+        let cases = [
+            (
+                AccessType::Instruction,
+                TranslationFault::AddressError,
+                Exception::InstructionAddressError { address },
+            ),
+            (
+                AccessType::Load,
+                TranslationFault::AddressError,
+                Exception::LoadAddressError { address },
+            ),
+            (
+                AccessType::Store,
+                TranslationFault::AddressError,
+                Exception::StoreAddressError { address },
+            ),
+            (
+                AccessType::Instruction,
+                TranslationFault::Miss,
+                Exception::TlbLoad {
+                    address,
+                    fault: TlbFaultKind::Miss,
+                },
+            ),
+            (
+                AccessType::Load,
+                TranslationFault::Invalid,
+                Exception::TlbLoad {
+                    address,
+                    fault: TlbFaultKind::Invalid,
+                },
+            ),
+            (
+                AccessType::Store,
+                TranslationFault::Miss,
+                Exception::TlbStore {
+                    address,
+                    fault: TlbFaultKind::Miss,
+                },
+            ),
+            (
+                AccessType::Store,
+                TranslationFault::Invalid,
+                Exception::TlbStore {
+                    address,
+                    fault: TlbFaultKind::Invalid,
+                },
+            ),
+            (
+                AccessType::Store,
+                TranslationFault::Modified,
+                Exception::TlbModified { address },
+            ),
+        ];
+
+        for (access, fault, expected) in cases {
+            assert_eq!(
+                State::translation_exception(address, access, fault),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn translation_uses_current_cp0_asid_and_mode() {
+        let mut state = State::new();
+        let virtual_address = 0x1234_5000;
+        let asid = 0x15_u32;
+        let entry_hi = virtual_address | (asid << 6);
+        state.cp0.write_register(10, entry_hi);
+        state
+            .mmu
+            .complete_write(5, entry_hi, 0x4321_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY);
+
+        assert_eq!(
+            state.translate_address(virtual_address, AccessType::Load),
+            Ok(PhysAddr::new(0x4321_0000))
+        );
+
+        state
+            .cp0
+            .write_register(10, virtual_address | ((asid ^ 1) << 6));
+        assert_eq!(
+            state.translate_address(virtual_address, AccessType::Load),
+            Err(TranslationError::Exception(Exception::TlbLoad {
+                address: virtual_address,
+                fault: TlbFaultKind::Miss,
+            }))
+        );
+
+        state.cp0.write_register(12, STATUS_BEV | STATUS_KUC);
+        assert_eq!(
+            state.translate_address(0x8000_0000, AccessType::Instruction),
+            Err(TranslationError::Exception(
+                Exception::InstructionAddressError {
+                    address: 0x8000_0000,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn translation_shutdown_changes_only_status_ts() {
+        let mut state = State::new();
+        state.pending_gpr_write = Some(PendingGprWrite {
+            index: 1,
+            value: 0x1111_1111,
+        });
+        state.pending_cp0_write = Some(PendingCp0Write::Register {
+            index: 14,
+            value: 0x2222_2222,
+        });
+        let pc = state.pc;
+        let random = state.read_cp0(1);
+        let status = state.read_cp0(12);
+
+        assert_eq!(
+            state.translate_address(0, AccessType::Load),
+            Err(TranslationError::TlbShutdown)
+        );
+
+        assert_eq!(state.pc, pc);
+        assert_eq!(state.read_cp0(1), random);
+        assert_eq!(state.read_cp0(12), status | STATUS_TS);
+        assert_eq!(
+            state.pending_gpr_write,
+            Some(PendingGprWrite {
+                index: 1,
+                value: 0x1111_1111,
+            })
+        );
+        assert_eq!(
+            state.pending_cp0_write,
+            Some(PendingCp0Write::Register {
+                index: 14,
+                value: 0x2222_2222,
+            })
+        );
+    }
+
+    #[test]
+    fn tlb_instruction_effects_capture_current_staging_and_indices() {
+        let mut state = State::new();
+        state.cp0.write_register(0, 7 << 8);
+        state.cp0.write_register(10, 0x1234_5a80);
+        state.cp0.write_register(2, 0x9876_5f00);
+        state.mmu.complete_write(7, 0x4567_8b40, 0x3456_7e00);
+
+        assert_eq!(
+            state.tlbr_effect(),
+            InstructionEffect::DelayedTlbRead {
+                entry_hi: 0x4567_8b40,
+                entry_lo: 0x3456_7e00,
+            }
+        );
+        assert_eq!(
+            state.tlbwi_effect(),
+            InstructionEffect::TlbWrite {
+                index: 7,
+                entry_hi: 0x1234_5a80,
+                entry_lo: 0x9876_5f00,
+            }
+        );
+        assert_eq!(
+            state.tlbwr_effect(),
+            InstructionEffect::TlbWrite {
+                index: 63,
+                entry_hi: 0x1234_5a80,
+                entry_lo: 0x9876_5f00,
+            }
+        );
+    }
+
+    #[test]
+    fn tlb_probe_produces_delayed_index_results_and_shutdown() {
+        let mut state = State::new();
+        let entry_hi = 0x2345_6a80;
+        state.cp0.write_register(10, entry_hi);
+        state.mmu.complete_write(23, entry_hi, 0);
+
+        assert_eq!(
+            state.tlbp_effect(),
+            Ok(InstructionEffect::DelayedTlbProbe { index: 23 << 8 })
+        );
+
+        state.cp0.write_register(10, 0x3456_7a80);
+        assert_eq!(
+            state.tlbp_effect(),
+            Ok(InstructionEffect::DelayedTlbProbe { index: 0x8000_0000 })
+        );
+
+        state.mmu.complete_write(24, entry_hi, 0);
+        state.mmu.complete_write(25, entry_hi, 0);
+        state.cp0.write_register(10, entry_hi);
+        state.pending_cp0_write = Some(PendingCp0Write::Register {
+            index: 14,
+            value: 0x1234_5678,
+        });
+        let pc = state.pc;
+        let random = state.read_cp0(1);
+
+        assert_eq!(state.tlbp_effect(), Err(ExecutionError::TlbShutdown));
+        assert!(state.is_tlb_shutdown());
+        assert_eq!(state.pc, pc);
+        assert_eq!(state.read_cp0(1), random);
+        assert_eq!(
+            state.pending_cp0_write,
+            Some(PendingCp0Write::Register {
+                index: 14,
+                value: 0x1234_5678,
+            })
+        );
+    }
+
+    #[test]
+    fn tlb_read_and_probe_results_observe_cp0_delay() {
+        let mut state = State::new();
+        state.cp0.write_register(10, 0x1111_1a80);
+        state.cp0.write_register(2, 0x2222_2f00);
+        state.cp0.write_register(0, 4 << 8);
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedTlbRead {
+                entry_hi: 0x3333_3b40,
+                entry_lo: 0x4444_4e00,
+            }),
+        );
+        assert_eq!(
+            state.tlbwi_effect(),
+            InstructionEffect::TlbWrite {
+                index: 4,
+                entry_hi: 0x1111_1a80,
+                entry_lo: 0x2222_2f00,
+            }
+        );
+
+        state.complete_instruction(None, None);
+        assert_eq!(state.read_cp0(10), 0x3333_3b40);
+        assert_eq!(state.read_cp0(2), 0x4444_4e00);
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedTlbProbe { index: 0x8000_0000 }),
+        );
+        assert_eq!(state.read_cp0(0), 4 << 8);
+        state.complete_instruction(None, None);
+        assert_eq!(state.read_cp0(0), 0x8000_0000);
+    }
+
+    #[test]
+    fn tlb_operations_immediately_after_mtc0_read_old_cp0_values() {
+        let mut state = State::new();
+        state.cp0.write_register(0, 4 << 8);
+        state.cp0.write_register(10, 0x1111_1a80);
+        state.cp0.write_register(2, 0x2222_2f00);
+        state.mmu.complete_write(4, 0x3333_3b40, 0x4444_4e00);
+        state.mmu.complete_write(5, 0x5555_5c00, 0x6666_6d00);
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp0Write {
+                index: 0,
+                value: 5 << 8,
+            }),
+        );
+        let immediate_tlbr = state.tlbr_effect();
+        assert_eq!(
+            immediate_tlbr,
+            InstructionEffect::DelayedTlbRead {
+                entry_hi: 0x3333_3b40,
+                entry_lo: 0x4444_4e00,
+            }
+        );
+        state.complete_instruction(None, Some(immediate_tlbr));
+        assert_eq!(
+            state.tlbr_effect(),
+            InstructionEffect::DelayedTlbRead {
+                entry_hi: 0x5555_5c00,
+                entry_lo: 0x6666_6d00,
+            }
+        );
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp0Write {
+                index: 10,
+                value: 0x7777_7d40,
+            }),
+        );
+        assert_eq!(
+            state.tlbwi_effect(),
+            InstructionEffect::TlbWrite {
+                index: 5,
+                entry_hi: 0x3333_3b40,
+                entry_lo: 0x4444_4e00,
+            }
+        );
+    }
+
+    #[test]
+    fn tlb_write_is_immediate_for_main_view_and_delayed_for_instructions() {
+        let mut state = State::new();
+        let virtual_address = 0x4567_8000;
+        let old_entry_lo = 0x1000_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY;
+        let new_entry_lo = 0x2000_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY;
+        state.mmu.complete_write(8, virtual_address, old_entry_lo);
+        state.mmu.advance_instruction_view();
+        state.mmu.advance_instruction_view();
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::TlbWrite {
+                index: 8,
+                entry_hi: virtual_address,
+                entry_lo: new_entry_lo,
+            }),
+        );
+
+        assert_eq!(
+            state.translate_address(virtual_address, AccessType::Load),
+            Ok(PhysAddr::new(0x2000_0000))
+        );
+        assert_eq!(
+            state.translate_address(virtual_address, AccessType::Instruction),
+            Ok(PhysAddr::new(0x1000_0000))
+        );
+
+        state.complete_instruction(None, None);
+        assert_eq!(
+            state.translate_address(virtual_address, AccessType::Instruction),
+            Ok(PhysAddr::new(0x1000_0000))
+        );
+
+        state.take_exception(Exception::Syscall);
+        assert_eq!(
+            state.translate_address(virtual_address, AccessType::Instruction),
+            Ok(PhysAddr::new(0x2000_0000))
+        );
+    }
+
+    #[test]
+    fn tlb_exception_overrides_pending_tlbr_vpn_and_preserves_asid() {
+        let mut state = State::new();
+        let fault_address = 0xf234_5678;
+        let asid = 0x0000_0a80;
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedTlbRead {
+                entry_hi: 0x1234_5000 | asid,
+                entry_lo: 0x3456_7e00,
+            }),
+        );
+        state.take_exception(Exception::TlbLoad {
+            address: fault_address,
+            fault: TlbFaultKind::Invalid,
+        });
+
+        assert_eq!(state.read_cp0(10), (fault_address & 0xffff_f000) | asid);
+        assert_eq!(state.pending_cp0_write, None);
+    }
+
+    #[test]
+    fn reset_preserves_main_tlb_and_clears_translation_pending_state() {
+        let mut state = State::new();
+        let virtual_address = 0x5678_9000;
+        let entry_lo = 0x3000_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY;
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::TlbWrite {
+                index: 9,
+                entry_hi: virtual_address,
+                entry_lo,
+            }),
+        );
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedTlbProbe { index: 9 << 8 }),
+        );
+        state.cp0.enter_tlb_shutdown();
+
+        state.reset();
+
+        assert_eq!(state.mmu.read_indexed(9), (virtual_address, entry_lo));
+        assert_eq!(
+            state.translate_address(virtual_address, AccessType::Instruction),
+            Ok(PhysAddr::new(0x3000_0000))
+        );
+        assert_eq!(state.pending_cp0_write, None);
+        assert!(!state.is_tlb_shutdown());
     }
 }

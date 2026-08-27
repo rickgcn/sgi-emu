@@ -1,4 +1,5 @@
 use super::{
+    ExecutionError,
     control::branch_resume_pc,
     decode::Cp0Instruction,
     state::{InstructionEffect, State},
@@ -9,7 +10,10 @@ const INDEX_INDEX_MASK: u32 = 0x0000_3f00;
 const ENTRY_LO_VISIBLE_MASK: u32 = 0xffff_ff00;
 const CONTEXT_VISIBLE_MASK: u32 = 0xffff_fffc;
 const CONTEXT_PTE_BASE_MASK: u32 = 0xffe0_0000;
+const CONTEXT_BAD_VPN_MASK: u32 = 0x001f_fffc;
 const ENTRY_HI_VISIBLE_MASK: u32 = 0xffff_ffc0;
+const ENTRY_HI_VPN_MASK: u32 = 0xffff_f000;
+const ENTRY_HI_ASID_MASK: u32 = 0x0000_0fc0;
 
 const PRID: u32 = 0x0000_0230;
 const RANDOM_RESET: u32 = 63 << 8;
@@ -33,10 +37,23 @@ const CAUSE_VISIBLE_MASK: u32 = 0xb000_ff7c;
 
 const GENERAL_EXCEPTION_VECTOR: u32 = 0x8000_0080;
 const BOOT_GENERAL_EXCEPTION_VECTOR: u32 = 0xbfc0_0180;
+const TLB_REFILL_EXCEPTION_VECTOR: u32 = 0x8000_0000;
+const BOOT_TLB_REFILL_EXCEPTION_VECTOR: u32 = 0xbfc0_0100;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TlbFaultKind {
+    Miss,
+    Invalid,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Exception {
     InstructionAddressError { address: u32 },
+    LoadAddressError { address: u32 },
+    StoreAddressError { address: u32 },
+    TlbLoad { address: u32, fault: TlbFaultKind },
+    TlbStore { address: u32, fault: TlbFaultKind },
+    TlbModified { address: u32 },
     Syscall,
     Breakpoint,
     ReservedInstruction,
@@ -140,6 +157,46 @@ impl Cp0 {
         self.status
     }
 
+    pub(super) fn tlb_index(&self) -> usize {
+        ((self.index & INDEX_INDEX_MASK) >> 8) as usize
+    }
+
+    pub(super) fn random_tlb_index(&self) -> usize {
+        ((self.random & INDEX_INDEX_MASK) >> 8) as usize
+    }
+
+    pub(super) fn tlb_staging(&self) -> (u32, u32) {
+        (
+            self.entry_hi & ENTRY_HI_VISIBLE_MASK,
+            self.entry_lo & ENTRY_LO_VISIBLE_MASK,
+        )
+    }
+
+    pub(super) fn current_asid(&self) -> u8 {
+        ((self.entry_hi & ENTRY_HI_ASID_MASK) >> 6) as u8
+    }
+
+    pub(super) fn is_kernel_mode(&self) -> bool {
+        self.status & STATUS_KUC == 0
+    }
+
+    pub(super) fn is_tlb_shutdown(&self) -> bool {
+        self.status & STATUS_TS != 0
+    }
+
+    pub(super) fn enter_tlb_shutdown(&mut self) {
+        self.status |= STATUS_TS;
+    }
+
+    pub(super) fn write_tlb_read_result(&mut self, entry_hi: u32, entry_lo: u32) {
+        self.entry_hi = entry_hi & ENTRY_HI_VISIBLE_MASK;
+        self.entry_lo = entry_lo & ENTRY_LO_VISIBLE_MASK;
+    }
+
+    pub(super) fn write_tlb_probe_result(&mut self, index: u32) {
+        self.index = index & (INDEX_PROBE_FAILURE | INDEX_INDEX_MASK);
+    }
+
     pub(super) fn is_usable(&self) -> bool {
         self.status & STATUS_KUC == 0 || self.effective.coprocessor_usable & STATUS_CU0 != 0
     }
@@ -174,13 +231,28 @@ impl Cp0 {
         epc: u32,
         in_delay_slot: bool,
     ) -> u32 {
-        let (exception_code, bad_address) = match exception {
-            Exception::InstructionAddressError { address } => (4, Some(address)),
-            Exception::Syscall => (8, None),
-            Exception::Breakpoint => (9, None),
-            Exception::ReservedInstruction => (10, None),
-            Exception::CoprocessorUnusable => (11, None),
-            Exception::Overflow => (12, None),
+        let (exception_code, bad_address, tlb_address, use_refill_vector) = match exception {
+            Exception::InstructionAddressError { address }
+            | Exception::LoadAddressError { address } => (4, Some(address), None, false),
+            Exception::StoreAddressError { address } => (5, Some(address), None, false),
+            Exception::TlbLoad { address, fault } => (
+                2,
+                Some(address),
+                Some(address),
+                fault == TlbFaultKind::Miss && address < 0x8000_0000,
+            ),
+            Exception::TlbStore { address, fault } => (
+                3,
+                Some(address),
+                Some(address),
+                fault == TlbFaultKind::Miss && address < 0x8000_0000,
+            ),
+            Exception::TlbModified { address } => (1, Some(address), Some(address), false),
+            Exception::Syscall => (8, None, None, false),
+            Exception::Breakpoint => (9, None, None, false),
+            Exception::ReservedInstruction => (10, None, None, false),
+            Exception::CoprocessorUnusable => (11, None, None, false),
+            Exception::Overflow => (12, None, None, false),
         };
 
         self.status =
@@ -193,16 +265,22 @@ impl Cp0 {
         if let Some(address) = bad_address {
             self.bad_vaddr = address;
         }
+        if let Some(address) = tlb_address {
+            self.context =
+                (self.context & CONTEXT_PTE_BASE_MASK) | ((address >> 10) & CONTEXT_BAD_VPN_MASK);
+            self.entry_hi = (address & ENTRY_HI_VPN_MASK) | (self.entry_hi & ENTRY_HI_ASID_MASK);
+        }
 
         self.effective.interrupt_control &= !STATUS_IEC;
         if let Some(functional) = &mut self.pending_functional {
             functional.interrupt_control &= !STATUS_IEC;
         }
 
-        if self.status & STATUS_BEV == 0 {
-            GENERAL_EXCEPTION_VECTOR
-        } else {
-            BOOT_GENERAL_EXCEPTION_VECTOR
+        match (self.status & STATUS_BEV != 0, use_refill_vector) {
+            (false, false) => GENERAL_EXCEPTION_VECTOR,
+            (false, true) => TLB_REFILL_EXCEPTION_VECTOR,
+            (true, false) => BOOT_GENERAL_EXCEPTION_VECTOR,
+            (true, true) => BOOT_TLB_REFILL_EXCEPTION_VECTOR,
         }
     }
 
@@ -234,9 +312,9 @@ pub(super) fn execute(
     state: &mut State,
     instruction: Cp0Instruction,
     condition: bool,
-) -> Result<(Option<u32>, Option<InstructionEffect>), Exception> {
+) -> Result<(Option<u32>, Option<InstructionEffect>), ExecutionError> {
     if !state.cp0_usable() {
-        return Err(Exception::CoprocessorUnusable);
+        return Err(ExecutionError::Exception(Exception::CoprocessorUnusable));
     }
 
     let outcome = match instruction {
@@ -260,6 +338,10 @@ pub(super) fn execute(
         Cp0Instruction::Bc0t { offset } => {
             (Some(branch_resume_pc(state.pc(), offset, condition)), None)
         }
+        Cp0Instruction::Tlbr => (None, Some(state.tlbr_effect())),
+        Cp0Instruction::Tlbwi => (None, Some(state.tlbwi_effect())),
+        Cp0Instruction::Tlbwr => (None, Some(state.tlbwr_effect())),
+        Cp0Instruction::Tlbp => (None, Some(state.tlbp_effect()?)),
         Cp0Instruction::Rfe => {
             let status = state.cp0_status();
             let restored = (status & !0x0f) | ((status >> 2) & 0x0f);
@@ -276,13 +358,14 @@ pub(super) fn execute(
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOT_GENERAL_EXCEPTION_VECTOR, CAUSE_BD, CAUSE_IP_MASK, CAUSE_SOFTWARE_IP_MASK,
-        CAUSE_VISIBLE_MASK, CONTEXT_PTE_BASE_MASK, Cp0, Cp0Instruction, ENTRY_HI_VISIBLE_MASK,
-        ENTRY_LO_VISIBLE_MASK, Exception, FunctionalState, GENERAL_EXCEPTION_VECTOR,
-        INDEX_INDEX_MASK, INDEX_PROBE_FAILURE, InstructionEffect, PRID, RANDOM_RESET, STATUS_BEV,
-        STATUS_CU_MASK, STATUS_CU0, STATUS_IEC, STATUS_INTERRUPT_CONTROL_MASK, STATUS_KUC,
-        STATUS_MODE_STACK_MASK, STATUS_PE, STATUS_TS, STATUS_VISIBLE_MASK, STATUS_WRITABLE_MASK,
-        State, execute,
+        BOOT_GENERAL_EXCEPTION_VECTOR, BOOT_TLB_REFILL_EXCEPTION_VECTOR, CAUSE_BD, CAUSE_IP_MASK,
+        CAUSE_SOFTWARE_IP_MASK, CAUSE_VISIBLE_MASK, CONTEXT_BAD_VPN_MASK, CONTEXT_PTE_BASE_MASK,
+        Cp0, Cp0Instruction, ENTRY_HI_VISIBLE_MASK, ENTRY_HI_VPN_MASK, ENTRY_LO_VISIBLE_MASK,
+        Exception, ExecutionError, FunctionalState, GENERAL_EXCEPTION_VECTOR, INDEX_INDEX_MASK,
+        INDEX_PROBE_FAILURE, InstructionEffect, PRID, RANDOM_RESET, STATUS_BEV, STATUS_CU_MASK,
+        STATUS_CU0, STATUS_IEC, STATUS_INTERRUPT_CONTROL_MASK, STATUS_KUC, STATUS_MODE_STACK_MASK,
+        STATUS_PE, STATUS_TS, STATUS_VISIBLE_MASK, STATUS_WRITABLE_MASK, State,
+        TLB_REFILL_EXCEPTION_VECTOR, TlbFaultKind, execute,
     };
 
     #[test]
@@ -370,11 +453,48 @@ mod tests {
     fn exception_entry_records_epc_bd_and_exception_code() {
         let cases = [
             (
-                Exception::InstructionAddressError {
+                Exception::TlbModified {
                     address: 0x1111_1111,
+                },
+                1,
+                false,
+            ),
+            (
+                Exception::TlbLoad {
+                    address: 0x2222_2222,
+                    fault: TlbFaultKind::Miss,
+                },
+                2,
+                true,
+            ),
+            (
+                Exception::TlbStore {
+                    address: 0x3333_3333,
+                    fault: TlbFaultKind::Invalid,
+                },
+                3,
+                false,
+            ),
+            (
+                Exception::InstructionAddressError {
+                    address: 0x4444_4444,
                 },
                 4,
                 false,
+            ),
+            (
+                Exception::LoadAddressError {
+                    address: 0x5555_5555,
+                },
+                4,
+                false,
+            ),
+            (
+                Exception::StoreAddressError {
+                    address: 0x6666_6666,
+                },
+                5,
+                true,
             ),
             (Exception::Syscall, 8, true),
             (Exception::Breakpoint, 9, false),
@@ -402,20 +522,44 @@ mod tests {
     }
 
     #[test]
-    fn address_error_is_the_only_exception_that_updates_bad_vaddr() {
-        let original_bad_vaddr = 0x1234_5678;
-        let fault_address = 0x8765_4321;
-        let mut cp0 = Cp0::new();
-        cp0.bad_vaddr = original_bad_vaddr;
+    fn address_errors_update_only_bad_vaddr_and_use_general_vector() {
+        let context = 0xabc5_4320;
+        let entry_hi = 0x7654_3a80;
 
-        cp0.take_exception(
+        for exception in [
             Exception::InstructionAddressError {
-                address: fault_address,
+                address: 0x1111_1111,
             },
-            0,
-            false,
-        );
-        assert_eq!(cp0.bad_vaddr, fault_address);
+            Exception::LoadAddressError {
+                address: 0x2222_2222,
+            },
+            Exception::StoreAddressError {
+                address: 0x3333_3333,
+            },
+        ] {
+            let mut cp0 = Cp0::new();
+            cp0.context = context;
+            cp0.entry_hi = entry_hi;
+
+            let vector = cp0.take_exception(exception, 0, false);
+
+            let expected_address = match exception {
+                Exception::InstructionAddressError { address }
+                | Exception::LoadAddressError { address }
+                | Exception::StoreAddressError { address } => address,
+                _ => unreachable!(),
+            };
+            assert_eq!(vector, BOOT_GENERAL_EXCEPTION_VECTOR);
+            assert_eq!(cp0.bad_vaddr, expected_address);
+            assert_eq!(cp0.context, context);
+            assert_eq!(cp0.entry_hi, entry_hi);
+        }
+    }
+
+    #[test]
+    fn non_address_exceptions_preserve_bad_vaddr() {
+        let original_bad_vaddr = 0x1234_5678;
+        let mut cp0 = Cp0::new();
 
         for exception in [
             Exception::Syscall,
@@ -430,6 +574,123 @@ mod tests {
 
             assert_eq!(cp0.bad_vaddr, original_bad_vaddr);
         }
+    }
+
+    #[test]
+    fn tlb_exceptions_reconstruct_address_registers() {
+        let fault_address = 0xf123_4567;
+        let pte_base = 0xabc0_0000;
+        let asid = 0x0000_0a40;
+        let mut cp0 = Cp0::new();
+        cp0.context = pte_base | 0x0012_3454;
+        cp0.entry_hi = 0x4567_8000 | asid;
+
+        cp0.take_exception(
+            Exception::TlbLoad {
+                address: fault_address,
+                fault: TlbFaultKind::Invalid,
+            },
+            0,
+            false,
+        );
+
+        assert_eq!(cp0.bad_vaddr, fault_address);
+        assert_eq!(
+            cp0.context,
+            pte_base | ((fault_address >> 10) & CONTEXT_BAD_VPN_MASK)
+        );
+        assert_eq!(cp0.entry_hi, (fault_address & ENTRY_HI_VPN_MASK) | asid);
+    }
+
+    #[test]
+    fn tlb_exception_vectors_distinguish_refill_and_general_cases() {
+        let cases = [
+            (
+                false,
+                Exception::TlbLoad {
+                    address: 0x1234_5000,
+                    fault: TlbFaultKind::Miss,
+                },
+                TLB_REFILL_EXCEPTION_VECTOR,
+            ),
+            (
+                true,
+                Exception::TlbStore {
+                    address: 0x1234_5000,
+                    fault: TlbFaultKind::Miss,
+                },
+                BOOT_TLB_REFILL_EXCEPTION_VECTOR,
+            ),
+            (
+                false,
+                Exception::TlbLoad {
+                    address: 0xc123_4000,
+                    fault: TlbFaultKind::Miss,
+                },
+                GENERAL_EXCEPTION_VECTOR,
+            ),
+            (
+                true,
+                Exception::TlbLoad {
+                    address: 0x1234_5000,
+                    fault: TlbFaultKind::Invalid,
+                },
+                BOOT_GENERAL_EXCEPTION_VECTOR,
+            ),
+            (
+                false,
+                Exception::TlbModified {
+                    address: 0x1234_5000,
+                },
+                GENERAL_EXCEPTION_VECTOR,
+            ),
+        ];
+
+        for (bev, exception, expected_vector) in cases {
+            let mut cp0 = Cp0::new();
+            cp0.status = if bev { STATUS_BEV } else { 0 };
+
+            assert_eq!(cp0.take_exception(exception, 0, false), expected_vector);
+        }
+    }
+
+    #[test]
+    fn tlb_helpers_apply_register_masks_and_shutdown_rules() {
+        let mut cp0 = Cp0::new();
+        cp0.index = INDEX_PROBE_FAILURE | (37 << 8);
+        cp0.random = 8 << 8;
+        cp0.entry_hi = 0x1234_5a80;
+        cp0.entry_lo = 0x9876_5f00;
+
+        assert_eq!(cp0.tlb_index(), 37);
+        assert_eq!(cp0.random_tlb_index(), 8);
+        assert_eq!(cp0.tlb_staging(), (0x1234_5a80, 0x9876_5f00));
+        assert_eq!(cp0.current_asid(), 0x2a);
+        assert!(cp0.is_kernel_mode());
+
+        cp0.status |= STATUS_KUC;
+        assert!(!cp0.is_kernel_mode());
+
+        cp0.write_tlb_read_result(u32::MAX, u32::MAX);
+        assert_eq!(
+            cp0.tlb_staging(),
+            (ENTRY_HI_VISIBLE_MASK, ENTRY_LO_VISIBLE_MASK)
+        );
+
+        cp0.write_tlb_probe_result(INDEX_PROBE_FAILURE);
+        assert_eq!(cp0.read_register(0), INDEX_PROBE_FAILURE);
+        cp0.write_register(0, 12 << 8);
+        assert_eq!(cp0.read_register(0), INDEX_PROBE_FAILURE | (12 << 8));
+        cp0.write_tlb_probe_result(25 << 8);
+        assert_eq!(cp0.read_register(0), 25 << 8);
+
+        assert!(!cp0.is_tlb_shutdown());
+        cp0.enter_tlb_shutdown();
+        assert!(cp0.is_tlb_shutdown());
+        cp0.write_register(12, 0);
+        assert!(cp0.is_tlb_shutdown());
+        cp0.reset(0);
+        assert!(!cp0.is_tlb_shutdown());
     }
 
     #[test]
@@ -706,6 +967,49 @@ mod tests {
     }
 
     #[test]
+    fn tlb_instruction_execution_returns_state_coordinated_effects() {
+        let mut state = State::new();
+
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Tlbr, false),
+            Ok((
+                None,
+                Some(InstructionEffect::DelayedTlbRead {
+                    entry_hi: 0,
+                    entry_lo: 0,
+                })
+            ))
+        );
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Tlbwi, false),
+            Ok((
+                None,
+                Some(InstructionEffect::TlbWrite {
+                    index: 0,
+                    entry_hi: 0,
+                    entry_lo: 0,
+                })
+            ))
+        );
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Tlbwr, false),
+            Ok((
+                None,
+                Some(InstructionEffect::TlbWrite {
+                    index: 63,
+                    entry_hi: 0,
+                    entry_lo: 0,
+                })
+            ))
+        );
+        assert_eq!(
+            execute(&mut state, Cp0Instruction::Tlbp, false),
+            Err(ExecutionError::TlbShutdown)
+        );
+        assert!(state.is_tlb_shutdown());
+    }
+
+    #[test]
     fn cp0_usability_uses_raw_mode_and_effective_cu0() {
         let mut state = State::new();
         let user_with_cu0 = STATUS_BEV | STATUS_KUC | STATUS_CU0;
@@ -721,7 +1025,7 @@ mod tests {
 
         assert_eq!(
             execute(&mut state, Cp0Instruction::Mfc0 { rt: 1, rd: 15 }, false),
-            Err(Exception::CoprocessorUnusable)
+            Err(ExecutionError::Exception(Exception::CoprocessorUnusable))
         );
 
         state.complete_instruction(None, None);
@@ -748,11 +1052,15 @@ mod tests {
             Cp0Instruction::Ctc0 { rt: 1, rd: 14 },
             Cp0Instruction::Bc0f { offset: 0 },
             Cp0Instruction::Bc0t { offset: 0 },
+            Cp0Instruction::Tlbr,
+            Cp0Instruction::Tlbwi,
+            Cp0Instruction::Tlbwr,
+            Cp0Instruction::Tlbp,
             Cp0Instruction::Rfe,
         ] {
             assert_eq!(
                 execute(&mut state, instruction, false),
-                Err(Exception::CoprocessorUnusable)
+                Err(ExecutionError::Exception(Exception::CoprocessorUnusable))
             );
         }
     }

@@ -197,6 +197,10 @@ pub(super) enum Cp0Instruction {
     Ctc0 { rt: usize, rd: usize },
     Bc0f { offset: u16 },
     Bc0t { offset: u16 },
+    Tlbr,
+    Tlbwi,
+    Tlbwr,
+    Tlbp,
     Rfe,
 }
 
@@ -474,11 +478,20 @@ fn decode_cp0(word: u32) -> DecodeResult {
             }))
         }
         0x08 => DecodeResult::Reserved,
+        0x10..=0x1f if word == CP0_TLBR => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Tlbr))
+        }
+        0x10..=0x1f if word == CP0_TLBWI => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Tlbwi))
+        }
+        0x10..=0x1f if word == CP0_TLBWR => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Tlbwr))
+        }
+        0x10..=0x1f if word == CP0_TLBP => {
+            DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Tlbp))
+        }
         0x10..=0x1f if word == CP0_RFE => {
             DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Rfe))
-        }
-        0x10..=0x1f if matches!(word, CP0_TLBR | CP0_TLBWI | CP0_TLBWR | CP0_TLBP) => {
-            DecodeResult::Unimplemented
         }
         _ => DecodeResult::Reserved,
     }
@@ -912,6 +925,10 @@ mod tests {
                 encode_immediate(0x10, 0x08, 1, 0x7fff),
                 cp0(Cp0Instruction::Bc0t { offset: 0x7fff }),
             ),
+            (CP0_TLBR, cp0(Cp0Instruction::Tlbr)),
+            (CP0_TLBWI, cp0(Cp0Instruction::Tlbwi)),
+            (CP0_TLBWR, cp0(Cp0Instruction::Tlbwr)),
+            (CP0_TLBP, cp0(Cp0Instruction::Tlbp)),
             (CP0_RFE, cp0(Cp0Instruction::Rfe)),
         ];
 
@@ -1035,10 +1052,6 @@ mod tests {
 
     #[test]
     fn classifies_legal_unimplemented_mips_i_encodings() {
-        for word in [CP0_TLBR, CP0_TLBWI, CP0_TLBWR, CP0_TLBP] {
-            assert_eq!(decode(word), DecodeResult::Unimplemented);
-        }
-
         for opcode in [
             0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x28, 0x29, 0x2a, 0x2b, 0x2e,
         ] {
