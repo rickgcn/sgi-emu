@@ -9,7 +9,7 @@ const CP0_RFE: u32 = 0x4200_0010;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DecodeResult {
     Implemented(Instruction),
-    Unimplemented,
+    UnsupportedCoprocessor { unit: usize },
     Reserved,
 }
 
@@ -18,6 +18,7 @@ pub(super) enum Instruction {
     Alu(AluInstruction),
     Control(ControlInstruction),
     Cp0(Cp0Instruction),
+    Cp1(Cp1Instruction),
     Memory(MemoryInstruction),
     Syscall,
     Breakpoint,
@@ -206,6 +207,18 @@ pub(super) enum Cp0Instruction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Cp1Instruction {
+    Mfc1 { rt: usize, rd: usize },
+    Cfc1 { rt: usize, rd: usize },
+    Mtc1 { rt: usize, rd: usize },
+    Ctc1 { rt: usize, rd: usize },
+    Bc1f { offset: u16 },
+    Bc1t { offset: u16 },
+    Lwc1 { base: usize, ft: usize, offset: u16 },
+    Swc1 { base: usize, ft: usize, offset: u16 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MemoryInstruction {
     Lb { base: usize, rt: usize, offset: u16 },
     Lbu { base: usize, rt: usize, offset: u16 },
@@ -295,7 +308,8 @@ pub(super) fn decode(word: u32) -> DecodeResult {
             immediate: immediate(word),
         })),
         0x10 => decode_cp0(word),
-        0x11..=0x13 => decode_coprocessor(word),
+        0x11 => decode_cp1(word),
+        0x12..=0x13 => decode_unsupported_coprocessor(word),
         0x20 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Lb {
             base: rs(word),
             rt: rt(word),
@@ -331,6 +345,14 @@ pub(super) fn decode(word: u32) -> DecodeResult {
             rt: rt(word),
             offset: immediate(word),
         })),
+        0x31 => DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Lwc1 {
+            base: rs(word),
+            ft: rt(word),
+            offset: immediate(word),
+        })),
+        0x32..=0x33 => DecodeResult::UnsupportedCoprocessor {
+            unit: opcode(word) as usize - 0x30,
+        },
         0x28 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Sb {
             base: rs(word),
             rt: rt(word),
@@ -356,7 +378,14 @@ pub(super) fn decode(word: u32) -> DecodeResult {
             rt: rt(word),
             offset: immediate(word),
         })),
-        0x31..=0x33 | 0x39..=0x3b => DecodeResult::Unimplemented,
+        0x39 => DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Swc1 {
+            base: rs(word),
+            ft: rt(word),
+            offset: immediate(word),
+        })),
+        0x3a..=0x3b => DecodeResult::UnsupportedCoprocessor {
+            unit: opcode(word) as usize - 0x38,
+        },
         _ => DecodeResult::Reserved,
     }
 }
@@ -574,15 +603,60 @@ fn decode_cp0(word: u32) -> DecodeResult {
     }
 }
 
-fn decode_coprocessor(word: u32) -> DecodeResult {
+fn decode_cp1(word: u32) -> DecodeResult {
     match rs(word) {
-        0x00 | 0x02 | 0x04 | 0x06 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
-            DecodeResult::Unimplemented
+        0x00 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Mfc1 {
+                rt: rt(word),
+                rd: rd(word),
+            }))
+        }
+        0x02 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Cfc1 {
+                rt: rt(word),
+                rd: rd(word),
+            }))
+        }
+        0x04 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Mtc1 {
+                rt: rt(word),
+                rd: rd(word),
+            }))
+        }
+        0x06 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Ctc1 {
+                rt: rt(word),
+                rd: rd(word),
+            }))
         }
         0x00 | 0x02 | 0x04 | 0x06 => DecodeResult::Reserved,
-        0x08 if matches!(rt(word), 0x00 | 0x01) => DecodeResult::Unimplemented,
+        0x08 if rt(word) == 0 => {
+            DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Bc1f {
+                offset: immediate(word),
+            }))
+        }
+        0x08 if rt(word) == 1 => {
+            DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Bc1t {
+                offset: immediate(word),
+            }))
+        }
         0x08 => DecodeResult::Reserved,
-        0x10..=0x1f => DecodeResult::Unimplemented,
+        0x10..=0x1f => DecodeResult::UnsupportedCoprocessor { unit: 1 },
+        _ => DecodeResult::Reserved,
+    }
+}
+
+fn decode_unsupported_coprocessor(word: u32) -> DecodeResult {
+    let unit = opcode(word) as usize - 0x10;
+
+    match rs(word) {
+        0x00 | 0x02 | 0x04 | 0x06 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+            DecodeResult::UnsupportedCoprocessor { unit }
+        }
+        0x00 | 0x02 | 0x04 | 0x06 => DecodeResult::Reserved,
+        0x08 if matches!(rt(word), 0x00 | 0x01) => DecodeResult::UnsupportedCoprocessor { unit },
+        0x08 => DecodeResult::Reserved,
+        0x10..=0x1f => DecodeResult::UnsupportedCoprocessor { unit },
         _ => DecodeResult::Reserved,
     }
 }
@@ -623,7 +697,7 @@ fn target(word: u32) -> u32 {
 mod tests {
     use super::{
         AluInstruction, CP0_RFE, CP0_TLBP, CP0_TLBR, CP0_TLBWI, CP0_TLBWR, ControlInstruction,
-        Cp0Instruction, DecodeResult, Instruction, MemoryInstruction, decode,
+        Cp0Instruction, Cp1Instruction, DecodeResult, Instruction, MemoryInstruction, decode,
     };
 
     fn encode_register(rs: u32, rt: u32, rd: u32, shift_amount: u32, function: u32) -> u32 {
@@ -652,6 +726,10 @@ mod tests {
 
     fn cp0(instruction: Cp0Instruction) -> DecodeResult {
         DecodeResult::Implemented(Instruction::Cp0(instruction))
+    }
+
+    fn cp1(instruction: Cp1Instruction) -> DecodeResult {
+        DecodeResult::Implemented(Instruction::Cp1(instruction))
     }
 
     fn memory(instruction: MemoryInstruction) -> DecodeResult {
@@ -1019,6 +1097,40 @@ mod tests {
     }
 
     #[test]
+    fn decodes_every_supported_cp1_instruction() {
+        let cases = [
+            (
+                encode_coprocessor(0x11, 0x00, 0, 31, 0),
+                cp1(Cp1Instruction::Mfc1 { rt: 0, rd: 31 }),
+            ),
+            (
+                encode_coprocessor(0x11, 0x02, 31, 0, 0),
+                cp1(Cp1Instruction::Cfc1 { rt: 31, rd: 0 }),
+            ),
+            (
+                encode_coprocessor(0x11, 0x04, 1, 12, 0),
+                cp1(Cp1Instruction::Mtc1 { rt: 1, rd: 12 }),
+            ),
+            (
+                encode_coprocessor(0x11, 0x06, 2, 13, 0),
+                cp1(Cp1Instruction::Ctc1 { rt: 2, rd: 13 }),
+            ),
+            (
+                encode_immediate(0x11, 0x08, 0, 0x8001),
+                cp1(Cp1Instruction::Bc1f { offset: 0x8001 }),
+            ),
+            (
+                encode_immediate(0x11, 0x08, 1, 0x7fff),
+                cp1(Cp1Instruction::Bc1t { offset: 0x7fff }),
+            ),
+        ];
+
+        for (word, expected) in cases {
+            assert_eq!(decode(word), expected);
+        }
+    }
+
+    #[test]
     fn decodes_every_supported_memory_instruction() {
         let cases = [
             (
@@ -1123,6 +1235,35 @@ mod tests {
             assert_eq!(
                 decode(encode_immediate(opcode, 1, 31, 0x8001)),
                 memory(instruction)
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_cp1_memory_as_cp1_instructions() {
+        let cases = [
+            (
+                0x31,
+                Cp1Instruction::Lwc1 {
+                    base: 1,
+                    ft: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x39,
+                Cp1Instruction::Swc1 {
+                    base: 1,
+                    ft: 31,
+                    offset: 0x8001,
+                },
+            ),
+        ];
+
+        for (opcode, instruction) in cases {
+            assert_eq!(
+                decode(encode_immediate(opcode, 1, 31, 0x8001)),
+                cp1(instruction)
             );
         }
     }
@@ -1241,32 +1382,38 @@ mod tests {
     }
 
     #[test]
-    fn classifies_legal_unimplemented_mips_i_encodings() {
-        for opcode in 0x11..=0x13 {
+    fn classifies_unsupported_coprocessor_encodings() {
+        assert_eq!(
+            decode(encode_coprocessor(0x11, 0x10, 2, 3, 0x155)),
+            DecodeResult::UnsupportedCoprocessor { unit: 1 }
+        );
+
+        for opcode in 0x12..=0x13 {
+            let unit = opcode as usize - 0x10;
             for selector in [0x00, 0x02, 0x04, 0x06] {
                 assert_eq!(
                     decode(encode_coprocessor(opcode, selector, 2, 3, 0)),
-                    DecodeResult::Unimplemented
+                    DecodeResult::UnsupportedCoprocessor { unit }
                 );
             }
 
             for condition in [0x00, 0x01] {
                 assert_eq!(
                     decode(encode_immediate(opcode, 0x08, condition, 0x8001)),
-                    DecodeResult::Unimplemented
+                    DecodeResult::UnsupportedCoprocessor { unit }
                 );
             }
 
             assert_eq!(
                 decode(encode_coprocessor(opcode, 0x1f, 2, 3, 0x155)),
-                DecodeResult::Unimplemented
+                DecodeResult::UnsupportedCoprocessor { unit }
             );
         }
 
-        for opcode in [0x31, 0x32, 0x33, 0x39, 0x3a, 0x3b] {
+        for (opcode, unit) in [(0x32, 2), (0x33, 3), (0x3a, 2), (0x3b, 3)] {
             assert_eq!(
                 decode(encode_immediate(opcode, 1, 2, 0x8001)),
-                DecodeResult::Unimplemented
+                DecodeResult::UnsupportedCoprocessor { unit }
             );
         }
     }
@@ -1313,7 +1460,8 @@ mod tests {
         }
 
         for opcode in [
-            0x18, 0x1f, 0x27, 0x2c, 0x2d, 0x2f, 0x30, 0x34, 0x37, 0x38, 0x3c, 0x3f,
+            0x18, 0x1f, 0x27, 0x2c, 0x2d, 0x2f, 0x30, 0x34, 0x35, 0x36, 0x37, 0x38, 0x3c, 0x3d,
+            0x3e, 0x3f,
         ] {
             assert_eq!(
                 decode(encode_immediate(opcode, 1, 2, 1)),
@@ -1328,7 +1476,7 @@ mod tests {
             );
         }
 
-        for opcode in [0x10, 0x11] {
+        for opcode in 0x10..=0x13 {
             assert_eq!(
                 decode(encode_coprocessor(opcode, 0x00, 2, 3, 1)),
                 DecodeResult::Reserved

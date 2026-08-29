@@ -4,6 +4,7 @@ use super::{
     R3000Config, StepError,
     cache::{CacheBank, Caches},
     cp0::{Cp0, Exception, TlbFaultKind},
+    cp1::Cp1,
     mmu::{AccessType, Cacheability, Mmu, ProbeResult, Translation, TranslationFault},
 };
 
@@ -31,6 +32,12 @@ enum PendingCp0Write {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingCp1Write {
+    General { index: usize, value: u32 },
+    Control { index: usize, value: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InstructionEffect {
     DelayedGprWrite {
         index: usize,
@@ -38,6 +45,14 @@ pub(super) enum InstructionEffect {
         load_merge_bypass: bool,
     },
     DelayedCp0Write {
+        index: usize,
+        value: u32,
+    },
+    DelayedCp1GeneralWrite {
+        index: usize,
+        value: u32,
+    },
+    DelayedCp1ControlWrite {
         index: usize,
         value: u32,
     },
@@ -77,10 +92,12 @@ pub(super) struct State {
     pc: u32,
     delay_slot: Option<DelaySlot>,
     cp0: Cp0,
+    cp1: Cp1,
     mmu: Mmu,
     caches: Caches,
     pending_gpr_write: Option<PendingGprWrite>,
     pending_cp0_write: Option<PendingCp0Write>,
+    pending_cp1_write: Option<PendingCp1Write>,
 }
 
 impl State {
@@ -92,10 +109,12 @@ impl State {
             pc: RESET_PC,
             delay_slot: None,
             cp0: Cp0::new(),
+            cp1: Cp1::new(),
             mmu: Mmu::new(),
             caches: Caches::new(config),
             pending_gpr_write: None,
             pending_cp0_write: None,
+            pending_cp1_write: None,
         }
     }
 
@@ -108,6 +127,7 @@ impl State {
         self.delay_slot = None;
         self.pending_gpr_write = None;
         self.pending_cp0_write = None;
+        self.pending_cp1_write = None;
     }
 
     pub(super) fn pc(&self) -> u32 {
@@ -166,6 +186,26 @@ impl State {
 
     pub(super) fn cp0_usable(&self) -> bool {
         self.cp0.is_usable()
+    }
+
+    pub(super) fn coprocessor_usable(&self, unit: usize) -> bool {
+        self.cp0.coprocessor_usable(unit)
+    }
+
+    pub(super) fn read_cp1_general(&self, index: usize) -> u32 {
+        self.cp1.read_general_register(index)
+    }
+
+    pub(super) fn read_cp1_control(&self, index: usize) -> u32 {
+        self.cp1.read_control_register(index)
+    }
+
+    pub(super) fn cp1_condition(&self) -> bool {
+        self.cp1.condition()
+    }
+
+    pub(super) fn cp1_interrupt_asserted(&self) -> bool {
+        self.cp1.interrupt_asserted()
     }
 
     pub(super) fn set_hardware_interrupt_lines(&mut self, lines: u8) {
@@ -311,6 +351,7 @@ impl State {
         self.cp0.commit_pending_functional();
         self.commit_pending_gpr_write();
         self.commit_pending_cp0_write();
+        self.commit_pending_cp1_write();
 
         let tlb_write = match effect {
             Some(InstructionEffect::DelayedGprWrite {
@@ -327,6 +368,14 @@ impl State {
             }
             Some(InstructionEffect::DelayedCp0Write { index, value }) => {
                 self.pending_cp0_write = Some(PendingCp0Write::Register { index, value });
+                None
+            }
+            Some(InstructionEffect::DelayedCp1GeneralWrite { index, value }) => {
+                self.pending_cp1_write = Some(PendingCp1Write::General { index, value });
+                None
+            }
+            Some(InstructionEffect::DelayedCp1ControlWrite { index, value }) => {
+                self.pending_cp1_write = Some(PendingCp1Write::Control { index, value });
                 None
             }
             Some(InstructionEffect::DelayedTlbRead { entry_hi, entry_lo }) => {
@@ -374,6 +423,7 @@ impl State {
         self.cp0.commit_pending_functional();
         self.commit_pending_gpr_write();
         self.commit_pending_cp0_write();
+        self.commit_pending_cp1_write();
 
         let (epc, in_delay_slot) = match self.delay_slot.take() {
             Some(delay_slot) => (delay_slot.origin_pc, true),
@@ -402,6 +452,19 @@ impl State {
                 }
                 PendingCp0Write::TlbProbe { index } => {
                     self.cp0.write_tlb_probe_result(index);
+                }
+            }
+        }
+    }
+
+    fn commit_pending_cp1_write(&mut self) {
+        if let Some(write) = self.pending_cp1_write.take() {
+            match write {
+                PendingCp1Write::General { index, value } => {
+                    self.cp1.write_general_register(index, value);
+                }
+                PendingCp1Write::Control { index, value } => {
+                    self.cp1.write_control_register(index, value);
                 }
             }
         }
@@ -469,8 +532,8 @@ mod tests {
 
     use super::{
         AccessType, Cacheability, Cp0, DelaySlot, Exception, InstructionEffect, LoadKind,
-        PendingCp0Write, PendingGprWrite, RESET_PC, State, StepError, TlbFaultKind, Translation,
-        TranslationError, TranslationFault,
+        PendingCp0Write, PendingCp1Write, PendingGprWrite, RESET_PC, State, StepError,
+        TlbFaultKind, Translation, TranslationError, TranslationFault,
     };
 
     const ENTRY_LO_DIRTY: u32 = 1 << 10;
@@ -546,6 +609,7 @@ mod tests {
         assert_eq!(state.cp0, Cp0::new());
         assert_eq!(state.pending_gpr_write, None);
         assert_eq!(state.pending_cp0_write, None);
+        assert_eq!(state.pending_cp1_write, None);
     }
 
     #[test]
@@ -570,9 +634,19 @@ mod tests {
             index: 14,
             value: 0xbbbb_bbbb,
         });
+        state.cp1.write_general_register(5, 0x1357_9bdf);
+        state.cp1.write_control_register(30, 0x2468_ace0);
+        state.cp1.write_control_register(31, 1 << 17);
+        state.pending_cp1_write = Some(PendingCp1Write::General {
+            index: 5,
+            value: 0xcccc_cccc,
+        });
         let preserved_gpr = state.gpr;
         let preserved_hi = state.read_hi();
         let preserved_lo = state.read_lo();
+        let preserved_cp1_general = state.read_cp1_general(5);
+        let preserved_cp1_eir = state.read_cp1_control(30);
+        let preserved_cp1_csr = state.read_cp1_control(31);
         let mut expected_cp0 = Cp0::new();
         expected_cp0.reset(state.pc);
 
@@ -587,6 +661,11 @@ mod tests {
         assert_eq!(state.cp0, expected_cp0);
         assert_eq!(state.pending_gpr_write, None);
         assert_eq!(state.pending_cp0_write, None);
+        assert_eq!(state.pending_cp1_write, None);
+        assert_eq!(state.read_cp1_general(5), preserved_cp1_general);
+        assert_eq!(state.read_cp1_control(30), preserved_cp1_eir);
+        assert_eq!(state.read_cp1_control(31), preserved_cp1_csr);
+        assert!(state.cp1_interrupt_asserted());
     }
 
     #[test]
@@ -889,6 +968,55 @@ mod tests {
     }
 
     #[test]
+    fn cp1_writes_become_visible_after_one_instruction() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        state.cp1.write_general_register(5, 0x1111_1111);
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp1GeneralWrite {
+                index: 5,
+                value: 0x2222_2222,
+            }),
+        );
+        assert_eq!(state.read_cp1_general(5), 0x1111_1111);
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp1ControlWrite {
+                index: 31,
+                value: (1 << 23) | (1 << 17),
+            }),
+        );
+        assert_eq!(state.read_cp1_general(5), 0x2222_2222);
+        assert!(!state.cp1_condition());
+        assert!(!state.cp1_interrupt_asserted());
+
+        state.complete_instruction(None, None);
+        assert!(state.cp1_condition());
+        assert!(state.cp1_interrupt_asserted());
+    }
+
+    #[test]
+    fn exception_commits_an_older_cp1_write() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp1GeneralWrite {
+                index: 7,
+                value: 0x1234_5678,
+            }),
+        );
+        assert_eq!(state.read_cp1_general(7), 0);
+
+        state.take_exception(Exception::Syscall);
+
+        assert_eq!(state.read_cp1_general(7), 0x1234_5678);
+        assert_eq!(state.pending_cp1_write, None);
+    }
+
+    #[test]
     fn exception_commits_old_transfers_before_hardware_state() {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let exception_pc = state.pc().wrapping_add(8);
@@ -1017,11 +1145,16 @@ mod tests {
                 load_merge_bypass: false,
             }),
         );
+        state.pending_cp1_write = Some(PendingCp1Write::Control {
+            index: 31,
+            value: u32::MAX,
+        });
 
         state.reset();
 
         assert_eq!(state.pending_gpr_write, None);
         assert_eq!(state.pending_cp0_write, None);
+        assert_eq!(state.pending_cp1_write, None);
         assert_eq!(state.read_cp0(12) & STATUS_KUC, 0);
         assert!(state.cp0_usable());
     }

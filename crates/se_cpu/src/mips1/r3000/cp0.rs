@@ -34,6 +34,7 @@ const STATUS_VISIBLE_MASK: u32 = 0xf27f_ff3f;
 const STATUS_WRITABLE_MASK: u32 = 0xf247_ff3f;
 
 const CAUSE_BD: u32 = 1 << 31;
+const CAUSE_CE_SHIFT: u32 = 28;
 const CAUSE_IP_MASK: u32 = 0x0000_ff00;
 const CAUSE_HARDWARE_IP_MASK: u32 = 0x0000_fc00;
 const CAUSE_SOFTWARE_IP_MASK: u32 = 0x0000_0300;
@@ -64,7 +65,7 @@ pub(super) enum Exception {
     Syscall,
     Breakpoint,
     ReservedInstruction,
-    CoprocessorUnusable,
+    CoprocessorUnusable { unit: usize },
     Overflow,
 }
 
@@ -224,6 +225,11 @@ impl Cp0 {
         self.status & STATUS_KUC == 0 || self.effective.coprocessor_usable & STATUS_CU0 != 0
     }
 
+    pub(super) fn coprocessor_usable(&self, unit: usize) -> bool {
+        assert!(unit < 4);
+        self.effective.coprocessor_usable & (1 << (28 + unit)) != 0
+    }
+
     pub(super) fn set_hardware_interrupt_lines(&mut self, lines: u8) {
         assert!(lines & !0x3f == 0);
         self.cause = (self.cause & !CAUSE_HARDWARE_IP_MASK) | (u32::from(lines) << 10);
@@ -266,6 +272,10 @@ impl Cp0 {
         epc: u32,
         in_delay_slot: bool,
     ) -> u32 {
+        let coprocessor = match exception {
+            Exception::CoprocessorUnusable { unit } => unit as u32,
+            _ => 0,
+        };
         let (exception_code, bad_address, tlb_address, use_refill_vector) = match exception {
             Exception::Interrupt => (0, None, None, false),
             Exception::InstructionAddressError { address }
@@ -289,7 +299,7 @@ impl Cp0 {
             Exception::Syscall => (8, None, None, false),
             Exception::Breakpoint => (9, None, None, false),
             Exception::ReservedInstruction => (10, None, None, false),
-            Exception::CoprocessorUnusable => (11, None, None, false),
+            Exception::CoprocessorUnusable { .. } => (11, None, None, false),
             Exception::Overflow => (12, None, None, false),
         };
 
@@ -297,6 +307,7 @@ impl Cp0 {
             (self.status & !STATUS_MODE_STACK_MASK) | ((self.status << 2) & STATUS_MODE_STACK_MASK);
         self.cause = (self.cause & CAUSE_IP_MASK)
             | if in_delay_slot { CAUSE_BD } else { 0 }
+            | (coprocessor << CAUSE_CE_SHIFT)
             | (exception_code << 2);
         self.epc = epc;
 
@@ -352,7 +363,9 @@ pub(super) fn execute(
     condition: bool,
 ) -> InstructionResult {
     if !state.cp0_usable() {
-        return Ok(ExecutionOutcome::Exception(Exception::CoprocessorUnusable));
+        return Ok(ExecutionOutcome::Exception(
+            Exception::CoprocessorUnusable { unit: 0 },
+        ));
     }
 
     let outcome = match instruction {
@@ -397,7 +410,7 @@ pub(super) fn execute(
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOT_GENERAL_EXCEPTION_VECTOR, BOOT_TLB_REFILL_EXCEPTION_VECTOR, CAUSE_BD,
+        BOOT_GENERAL_EXCEPTION_VECTOR, BOOT_TLB_REFILL_EXCEPTION_VECTOR, CAUSE_BD, CAUSE_CE_SHIFT,
         CAUSE_HARDWARE_IP_MASK, CAUSE_IP_MASK, CAUSE_SOFTWARE_IP_MASK, CAUSE_VISIBLE_MASK,
         CONTEXT_BAD_VPN_MASK, CONTEXT_PTE_BASE_MASK, Cp0, Cp0Instruction, ENTRY_HI_VISIBLE_MASK,
         ENTRY_HI_VPN_MASK, ENTRY_LO_VISIBLE_MASK, Exception, ExecutionOutcome, FunctionalState,
@@ -653,7 +666,7 @@ mod tests {
             (Exception::Syscall, 8, true),
             (Exception::Breakpoint, 9, false),
             (Exception::ReservedInstruction, 10, true),
-            (Exception::CoprocessorUnusable, 11, false),
+            (Exception::CoprocessorUnusable { unit: 0 }, 11, false),
             (Exception::Overflow, 12, false),
         ];
 
@@ -672,6 +685,21 @@ mod tests {
                     | if in_delay_slot { CAUSE_BD } else { 0 }
                     | (exception_code << 2)
             );
+        }
+    }
+
+    #[test]
+    fn coprocessor_unusable_records_ce_and_other_exceptions_clear_it() {
+        for unit in 0..4 {
+            let mut cp0 = Cp0::new();
+
+            cp0.take_exception(Exception::CoprocessorUnusable { unit }, 0, false);
+
+            assert_eq!((cp0.cause >> CAUSE_CE_SHIFT) & 3, unit as u32);
+            assert_eq!((cp0.cause >> 2) & 0x1f, 11);
+
+            cp0.take_exception(Exception::Syscall, 0, false);
+            assert_eq!((cp0.cause >> CAUSE_CE_SHIFT) & 3, 0);
         }
     }
 
@@ -724,7 +752,7 @@ mod tests {
             Exception::Syscall,
             Exception::Breakpoint,
             Exception::ReservedInstruction,
-            Exception::CoprocessorUnusable,
+            Exception::CoprocessorUnusable { unit: 0 },
             Exception::Overflow,
         ] {
             cp0.bad_vaddr = original_bad_vaddr;
@@ -987,6 +1015,28 @@ mod tests {
     }
 
     #[test]
+    fn coprocessor_usability_uses_effective_cu_bits() {
+        let mut cp0 = Cp0::new();
+
+        cp0.write_register(12, STATUS_CU_MASK);
+        for unit in 0..4 {
+            assert!(!cp0.coprocessor_usable(unit));
+        }
+
+        cp0.commit_pending_functional();
+        for unit in 0..4 {
+            assert!(cp0.coprocessor_usable(unit));
+        }
+
+        cp0.write_register(12, 1 << 30);
+        cp0.commit_pending_functional();
+        assert!(!cp0.coprocessor_usable(0));
+        assert!(!cp0.coprocessor_usable(1));
+        assert!(cp0.coprocessor_usable(2));
+        assert!(!cp0.coprocessor_usable(3));
+    }
+
+    #[test]
     fn consecutive_functional_writes_preserve_staggered_groups() {
         let mut cp0 = Cp0::new();
         let status = STATUS_BEV | STATUS_CU0 | 0x0000_5500 | STATUS_IEC;
@@ -1063,7 +1113,7 @@ mod tests {
             software_interrupts: CAUSE_SOFTWARE_IP_MASK,
         });
 
-        cp0.take_exception(Exception::CoprocessorUnusable, 0, false);
+        cp0.take_exception(Exception::CoprocessorUnusable { unit: 0 }, 0, false);
 
         assert_eq!(cp0.status & STATUS_IEC, 0);
         assert_eq!(cp0.effective.interrupt_control & STATUS_IEC, 0);
@@ -1214,7 +1264,9 @@ mod tests {
 
         assert_eq!(
             execute(&mut state, Cp0Instruction::Mfc0 { rt: 1, rd: 15 }, false),
-            Ok(ExecutionOutcome::Exception(Exception::CoprocessorUnusable))
+            Ok(ExecutionOutcome::Exception(
+                Exception::CoprocessorUnusable { unit: 0 }
+            ))
         );
 
         state.complete_instruction(None, None);
@@ -1249,7 +1301,9 @@ mod tests {
         ] {
             assert_eq!(
                 execute(&mut state, instruction, false),
-                Ok(ExecutionOutcome::Exception(Exception::CoprocessorUnusable))
+                Ok(ExecutionOutcome::Exception(
+                    Exception::CoprocessorUnusable { unit: 0 }
+                ))
             );
         }
     }

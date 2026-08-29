@@ -213,7 +213,7 @@ pub(super) fn execute(
     Ok(ExecutionOutcome::Completed(Some(effect)))
 }
 
-fn load(
+pub(super) fn load(
     state: &mut State,
     base: usize,
     offset: u16,
@@ -250,7 +250,7 @@ fn load(
     Ok(ExecutionOutcome::Completed(()))
 }
 
-fn store(
+pub(super) fn store(
     state: &mut State,
     base: usize,
     offset: u16,

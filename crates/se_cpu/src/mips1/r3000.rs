@@ -4,6 +4,7 @@ mod alu;
 mod cache;
 mod control;
 mod cp0;
+mod cp1;
 mod decode;
 mod load_store;
 mod mmu;
@@ -148,8 +149,9 @@ impl R3000 {
     /// Creates a processor at the reset vector.
     ///
     /// General-purpose registers and the HI/LO registers without
-    /// architecturally defined reset values are initialized to zero. Cache
-    /// geometry and store policy come from `config`.
+    /// architecturally defined reset values are initialized to zero. CP1
+    /// general registers and writable control state are also initialized to
+    /// zero. Cache geometry and store policy come from `config`.
     #[must_use]
     pub fn new(config: R3000Config) -> Self {
         Self {
@@ -167,6 +169,8 @@ impl R3000 {
     /// translation-buffer entries are preserved, while pending
     /// instruction-translation visibility is discarded and synchronized with
     /// the main entries.
+    /// Committed CP1 general and control registers are preserved, while a
+    /// pending CP1 transfer is discarded.
     /// Cache contents and the construction-time cache configuration are
     /// preserved.
     pub fn reset(&mut self) {
@@ -176,6 +180,15 @@ impl R3000 {
     /// Sets the external CP0 condition input sampled by CP0 branches.
     pub fn set_cp0_condition(&mut self, condition: bool) {
         self.cp0_condition = condition;
+    }
+
+    /// Reports whether the CP1 external interrupt output is asserted.
+    ///
+    /// The containing machine is responsible for routing this output to an
+    /// R3000 hardware interrupt input.
+    #[must_use]
+    pub fn cp1_interrupt_asserted(&self) -> bool {
+        self.state.cp1_interrupt_asserted()
     }
 
     /// Sets the asserted state of the six hardware interrupt inputs.
@@ -243,11 +256,17 @@ impl R3000 {
         };
         let instruction = match decode(word) {
             DecodeResult::Implemented(instruction) => instruction,
-            DecodeResult::Unimplemented => {
-                return Err(StepError::UnsupportedInstruction {
-                    pc,
-                    instruction: word,
-                });
+            DecodeResult::UnsupportedCoprocessor { unit } => {
+                if self.state.coprocessor_usable(unit) {
+                    return Err(StepError::UnsupportedInstruction {
+                        pc,
+                        instruction: word,
+                    });
+                }
+
+                self.state
+                    .take_exception(Exception::CoprocessorUnusable { unit });
+                return Ok(());
             }
             DecodeResult::Reserved => {
                 self.state.take_exception(Exception::ReservedInstruction);
@@ -267,6 +286,7 @@ impl R3000 {
             Instruction::Cp0(instruction) => {
                 cp0::execute(&mut self.state, instruction, self.cp0_condition)
             }
+            Instruction::Cp1(instruction) => cp1::execute(&mut self.state, instruction, bus),
             Instruction::Memory(instruction) => {
                 match load_store::execute(&mut self.state, instruction, bus)? {
                     ExecutionOutcome::Completed(effect) => {
@@ -334,8 +354,12 @@ mod tests {
     const STATUS_ISC: u32 = 1 << 16;
     const STATUS_KUC: u32 = 1 << 1;
     const STATUS_IEC: u32 = 1;
+    const STATUS_CU1: u32 = 1 << 29;
+    const STATUS_CU2: u32 = 1 << 30;
+    const STATUS_CU3: u32 = 1 << 31;
     const STATUS_IM0: u32 = 1 << 8;
     const STATUS_IM2: u32 = 1 << 10;
+    const UNSUPPORTED_CP1_INSTRUCTION: u32 = 0x4600_0000;
 
     fn translation(address: u64, cacheability: Cacheability) -> Translation {
         Translation {
@@ -552,6 +576,11 @@ mod tests {
         processor.state.complete_instruction(None, None);
     }
 
+    fn enable_cp1(processor: &mut R3000) {
+        set_cp0_register_and_sync(processor, 12, processor.state.read_cp0(12) | STATUS_CU1);
+        processor.reset();
+    }
+
     fn jump_to(processor: &mut R3000, target: u32) {
         processor.state.write_gpr(3, target);
         step_with_word(processor, encode_register(3, 0, 0, 0x08)).expect("JR should succeed");
@@ -581,6 +610,18 @@ mod tests {
 
     fn encode_cp0_branch(condition: u32, offset: u16) -> u32 {
         (0x10 << 26) | (0x08 << 21) | (condition << 16) | u32::from(offset)
+    }
+
+    fn encode_cp1_transfer(selector: u32, rt: u32, rd: u32) -> u32 {
+        (0x11 << 26) | (selector << 21) | (rt << 16) | (rd << 11)
+    }
+
+    fn encode_cp1_branch(condition: u32, offset: u16) -> u32 {
+        (0x11 << 26) | (0x08 << 21) | (condition << 16) | u32::from(offset)
+    }
+
+    fn encode_coprocessor_operation(unit: u32, selector: u32, low_bits: u32) -> u32 {
+        ((0x10 + unit) << 26) | (selector << 21) | (low_bits & 0x1f_ffff)
     }
 
     #[test]
@@ -657,9 +698,10 @@ mod tests {
 
     #[test]
     fn direct_segments_distinguish_cached_hits_from_uncached_reads() {
-        let unsupported = 0xc401_0000;
+        let unsupported = UNSUPPORTED_CP1_INSTRUCTION;
 
         let mut kseg1_processor = R3000::new(super::TEST_CONFIG);
+        enable_cp1(&mut kseg1_processor);
         for _ in 0..2 {
             let mut bus = TestBus::new(word_bytes(unsupported));
             assert_eq!(
@@ -673,6 +715,7 @@ mod tests {
         }
 
         let mut kseg0_processor = R3000::new(super::TEST_CONFIG);
+        enable_cp1(&mut kseg0_processor);
         jump_to(&mut kseg0_processor, 0x8000_0100);
         let mut first_bus = TestBus::new(word_bytes(unsupported));
         assert_eq!(
@@ -700,8 +743,9 @@ mod tests {
     fn configured_instruction_refill_reads_each_word_in_order() {
         let config = R3000Config::new(32 * 1024, 32 * 1024, 64, 4, true);
         let mut processor = R3000::new(config);
+        enable_cp1(&mut processor);
         jump_to(&mut processor, 0x8000_0024);
-        let unsupported = 0xc401_0000;
+        let unsupported = UNSUPPORTED_CP1_INSTRUCTION;
         let mut bus = TestBus::new(word_bytes(unsupported));
 
         assert_eq!(
@@ -724,10 +768,11 @@ mod tests {
     fn mapped_entry_noncacheable_bit_controls_instruction_fetch() {
         let virtual_address = 0x0040_0000;
         let physical_address = 0x0010_0000;
-        let unsupported = 0xc401_0000;
+        let unsupported = UNSUPPORTED_CP1_INSTRUCTION;
 
         for (noncacheable, second_fetch_reads_bus) in [(false, false), (true, true)] {
             let mut processor = R3000::new(super::TEST_CONFIG);
+            enable_cp1(&mut processor);
             let flags = ENTRY_LO_VALID
                 | ENTRY_LO_DIRTY
                 | if noncacheable {
@@ -763,9 +808,14 @@ mod tests {
     #[test]
     fn instruction_fetch_ignores_isolation_and_honors_cache_swap() {
         let target = 0x8000_0300;
-        let unsupported = 0xc401_0000;
+        let unsupported = UNSUPPORTED_CP1_INSTRUCTION;
         let mut processor = R3000::new(super::TEST_CONFIG);
-        set_cp0_register(&mut processor, 12, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        enable_cp1(&mut processor);
+        set_cp0_register(
+            &mut processor,
+            12,
+            STATUS_BEV | STATUS_ISC | STATUS_SWC | STATUS_CU1,
+        );
         jump_to(&mut processor, target);
 
         let mut refill_bus = TestBus::new(word_bytes(unsupported));
@@ -783,7 +833,7 @@ mod tests {
         ));
         assert!(data_cache_hit_bus.read_addresses.is_empty());
 
-        set_cp0_register(&mut processor, 12, STATUS_BEV | STATUS_ISC);
+        set_cp0_register(&mut processor, 12, STATUS_BEV | STATUS_ISC | STATUS_CU1);
         jump_to(&mut processor, target);
         let mut instruction_cache_miss_bus = TestBus::new(word_bytes(unsupported));
         assert!(matches!(
@@ -2095,22 +2145,23 @@ mod tests {
     #[test]
     fn step_preserves_processor_state_for_unsupported_instruction() {
         let mut processor = R3000::new(super::TEST_CONFIG);
+        enable_cp1(&mut processor);
         processor.state.write_gpr(1, 0x1234_5678);
         processor.state.write_gpr(31, 0x89ab_cdef);
         processor.state.write_hi(0x1357_9bdf);
         processor.state.write_lo(0x2468_ace0);
         let before = snapshot(&processor);
-        let mut bus = TestBus::new([0xc4, 0x01, 0x00, 0x00]);
+        let mut bus = TestBus::new(UNSUPPORTED_CP1_INSTRUCTION.to_be_bytes());
 
         let error = processor
             .step(&mut bus)
-            .expect_err("LWC1 should not be supported");
+            .expect_err("the CP1 operation should not be supported");
 
         assert_eq!(
             error,
             StepError::UnsupportedInstruction {
                 pc: 0xbfc0_0000,
-                instruction: 0xc401_0000,
+                instruction: UNSUPPORTED_CP1_INSTRUCTION,
             }
         );
         assert_eq!(snapshot(&processor), before);
@@ -2305,17 +2356,18 @@ mod tests {
     #[test]
     fn unsupported_instruction_in_delay_slot_preserves_pending_branch() {
         let mut processor = R3000::new(super::TEST_CONFIG);
+        enable_cp1(&mut processor);
         step_with_word(&mut processor, 0x1000_0002).expect("BEQ should succeed");
         let before = snapshot(&processor);
 
-        let error = step_with_word(&mut processor, 0xc401_0000)
-            .expect_err("LWC1 should remain unsupported");
+        let error = step_with_word(&mut processor, UNSUPPORTED_CP1_INSTRUCTION)
+            .expect_err("the CP1 operation should remain unsupported");
 
         assert_eq!(
             error,
             StepError::UnsupportedInstruction {
                 pc: 0xbfc0_0004,
-                instruction: 0xc401_0000,
+                instruction: UNSUPPORTED_CP1_INSTRUCTION,
             }
         );
         assert_eq!(snapshot(&processor), before);
@@ -2507,6 +2559,7 @@ mod tests {
     #[test]
     fn step_error_stalls_pending_transfer_and_random() {
         let mut processor = R3000::new(super::TEST_CONFIG);
+        enable_cp1(&mut processor);
         processor.state.write_gpr(1, 0x1111_1111);
 
         step_with_word(&mut processor, encode_cp0_transfer(0x00, 1, 15))
@@ -2514,14 +2567,14 @@ mod tests {
         let stalled_pc = processor.state.pc();
         let stalled_random = processor.state.read_cp0(1);
 
-        let error = step_with_word(&mut processor, 0xc402_0000)
-            .expect_err("LWC1 should remain unsupported");
+        let error = step_with_word(&mut processor, UNSUPPORTED_CP1_INSTRUCTION)
+            .expect_err("the CP1 operation should remain unsupported");
 
         assert_eq!(
             error,
             StepError::UnsupportedInstruction {
                 pc: stalled_pc,
-                instruction: 0xc402_0000,
+                instruction: UNSUPPORTED_CP1_INSTRUCTION,
             }
         );
         assert_eq!(processor.state.pc(), stalled_pc);
@@ -2537,6 +2590,7 @@ mod tests {
     #[test]
     fn step_error_stalls_pending_instruction_translation() {
         let mut processor = R3000::new(super::TEST_CONFIG);
+        enable_cp1(&mut processor);
         let virtual_address = 0x0060_0000;
         install_and_sync_tlb_entry(
             &mut processor,
@@ -2554,7 +2608,8 @@ mod tests {
             }),
         );
 
-        step_with_word(&mut processor, 0xc401_0000).expect_err("LWC1 should remain unsupported");
+        step_with_word(&mut processor, UNSUPPORTED_CP1_INSTRUCTION)
+            .expect_err("the CP1 operation should remain unsupported");
         assert_eq!(
             processor
                 .state
@@ -2949,5 +3004,149 @@ mod tests {
 
         assert_eq!(processor.state.read_gpr(1), 0x1111_1111);
         assert_eq!(processor.state.pc(), 0xbfc0_000c);
+    }
+
+    #[test]
+    fn coprocessor_gates_distinguish_guest_exceptions_and_unsupported_steps() {
+        let cases = [
+            (encode_coprocessor_operation(1, 0x10, 0x155), 1, STATUS_CU1),
+            (encode_coprocessor_operation(2, 0x00, 0), 2, STATUS_CU2),
+            (encode_coprocessor_operation(3, 0x10, 0x155), 3, STATUS_CU3),
+        ];
+
+        for (word, unit, status_cu) in cases {
+            let mut disabled = R3000::new(super::TEST_CONFIG);
+            step_with_word(&mut disabled, word).expect("disabled coprocessor should take CpU");
+            assert_eq!((disabled.state.read_cp0(13) >> 2) & 0x1f, 11);
+            assert_eq!((disabled.state.read_cp0(13) >> 28) & 3, unit);
+
+            step_with_word(&mut disabled, 0x0000_000c)
+                .expect("a later exception should clear Cause.CE");
+            assert_eq!((disabled.state.read_cp0(13) >> 28) & 3, 0);
+
+            let mut enabled = R3000::new(super::TEST_CONFIG);
+            set_cp0_register_and_sync(&mut enabled, 12, STATUS_BEV | status_cu);
+            let pc = enabled.state.pc();
+
+            assert_eq!(
+                step_with_word(&mut enabled, word),
+                Err(StepError::UnsupportedInstruction {
+                    pc,
+                    instruction: word,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn cp1_transfers_and_branches_observe_their_delays() {
+        const CONTROL_STATUS_CONDITION: u32 = 1 << 23;
+        const CONTROL_STATUS_UNIMPLEMENTED: u32 = 1 << 17;
+
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_CU1);
+        processor.state.write_gpr(2, 0x1234_5678);
+
+        step_with_word(&mut processor, encode_cp1_transfer(0x04, 2, 5))
+            .expect("MTC1 should succeed");
+        step_with_word(&mut processor, encode_cp1_transfer(0x00, 3, 5))
+            .expect("MFC1 should succeed");
+        assert_eq!(processor.state.read_gpr(3), 0);
+
+        step_with_word(&mut processor, 0).expect("the transfer delay should complete");
+        assert_eq!(processor.state.read_gpr(3), 0);
+
+        step_with_word(&mut processor, encode_cp1_transfer(0x00, 3, 5))
+            .expect("the second MFC1 should succeed");
+        assert_eq!(processor.state.read_gpr(3), 0);
+        step_with_word(&mut processor, 0).expect("the second transfer delay should complete");
+        assert_eq!(processor.state.read_gpr(3), 0x1234_5678);
+
+        let control_status = CONTROL_STATUS_CONDITION | CONTROL_STATUS_UNIMPLEMENTED;
+        processor.state.write_gpr(2, control_status);
+        step_with_word(&mut processor, encode_cp1_transfer(0x06, 2, 31))
+            .expect("CTC1 should succeed");
+        assert!(!processor.cp1_interrupt_asserted());
+
+        let old_condition_branch_pc = processor.state.pc();
+        step_with_word(&mut processor, encode_cp1_branch(1, 2)).expect("BC1T should succeed");
+        assert!(processor.cp1_interrupt_asserted());
+        step_with_word(&mut processor, 0).expect("the branch delay slot should succeed");
+        assert_eq!(
+            processor.state.pc(),
+            old_condition_branch_pc.wrapping_add(8)
+        );
+
+        let new_condition_branch_pc = processor.state.pc();
+        step_with_word(&mut processor, encode_cp1_branch(1, 2)).expect("BC1T should succeed");
+        step_with_word(&mut processor, 0).expect("the branch delay slot should succeed");
+        assert_eq!(
+            processor.state.pc(),
+            new_condition_branch_pc.wrapping_add(12)
+        );
+
+        step_with_word(&mut processor, encode_cp1_transfer(0x02, 4, 31))
+            .expect("CFC1 should succeed");
+        assert_eq!(processor.state.read_gpr(4), 0);
+        step_with_word(&mut processor, 0).expect("the control transfer delay should complete");
+        assert_eq!(processor.state.read_gpr(4), control_status);
+
+        processor.state.write_gpr(2, 0);
+        step_with_word(&mut processor, encode_cp1_transfer(0x06, 2, 31))
+            .expect("the pending CTC1 should succeed");
+        processor.reset();
+
+        assert!(processor.cp1_interrupt_asserted());
+    }
+
+    #[test]
+    fn cp1_word_memory_executes_through_the_shared_bus_path() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_CU1);
+        processor.state.write_gpr(1, 0xa000_0100);
+
+        let instruction_pc = processor.state.pc();
+        let instruction_address = u64::from(instruction_pc & 0x1fff_ffff);
+        let mut bus = ByteBus::default();
+        bus.insert_word(instruction_address, encode_immediate(0x31, 1, 5, 0));
+        bus.insert_word(instruction_address + 4, 0);
+        bus.insert_word(instruction_address + 8, encode_immediate(0x39, 1, 5, 4));
+        bus.insert_word(0x100, 0x89ab_cdef);
+        bus.insert_word(0x104, 0);
+
+        processor.step(&mut bus).expect("LWC1 should succeed");
+        assert_eq!(processor.state.read_cp1_general(5), 0);
+        processor
+            .step(&mut bus)
+            .expect("the CP1 load delay instruction should succeed");
+        assert_eq!(processor.state.read_cp1_general(5), 0x89ab_cdef);
+        processor.step(&mut bus).expect("SWC1 should succeed");
+
+        assert_eq!(bus.bytes(0x104, 4), vec![0x89, 0xab, 0xcd, 0xef]);
+        assert!(
+            bus.writes
+                .contains(&(PhysAddr::new(0x104), vec![0x89, 0xab, 0xcd, 0xef]))
+        );
+    }
+
+    #[test]
+    fn disabled_cp1_memory_precedes_address_and_data_access() {
+        for word in [
+            encode_immediate(0x31, 1, 5, 0),
+            encode_immediate(0x39, 1, 5, 0),
+        ] {
+            let mut processor = R3000::new(super::TEST_CONFIG);
+            processor.state.write_gpr(1, 0xa000_0101);
+            let fetch_address = PhysAddr::new(u64::from(processor.state.pc() & 0x1fff_ffff));
+            let mut bus = TestBus::new(word.to_be_bytes());
+
+            processor
+                .step(&mut bus)
+                .expect("disabled CP1 memory should take CpU");
+
+            assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 11);
+            assert_eq!((processor.state.read_cp0(13) >> 28) & 3, 1);
+            assert_eq!(bus.read_addresses, [fetch_address]);
+        }
     }
 }
