@@ -103,11 +103,13 @@ const fn valid_refill_size(bytes: usize) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExecutionError {
+enum ExecutionOutcome<T> {
+    Completed(T),
     Exception(Exception),
-    TlbShutdown,
-    BusFault { address: PhysAddr, fault: BusFault },
 }
+
+type InstructionCompletion = (Option<u32>, Option<InstructionEffect>);
+type InstructionResult = Result<ExecutionOutcome<InstructionCompletion>, StepError>;
 
 /// An error encountered while executing one processor step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,34 +255,40 @@ impl R3000 {
             }
         };
 
-        let outcome: Result<(Option<u32>, Option<InstructionEffect>), ExecutionError> =
-            match instruction {
-                Instruction::Alu(instruction) => alu::execute(&mut self.state, instruction)
-                    .map(|()| (None, None))
-                    .map_err(ExecutionError::Exception),
-                Instruction::Control(instruction) => {
-                    Ok((Some(control::execute(&mut self.state, instruction)), None))
+        let outcome: InstructionResult = match instruction {
+            Instruction::Alu(instruction) => match alu::execute(&mut self.state, instruction) {
+                Ok(()) => Ok(ExecutionOutcome::Completed((None, None))),
+                Err(exception) => Ok(ExecutionOutcome::Exception(exception)),
+            },
+            Instruction::Control(instruction) => Ok(ExecutionOutcome::Completed((
+                Some(control::execute(&mut self.state, instruction)),
+                None,
+            ))),
+            Instruction::Cp0(instruction) => {
+                cp0::execute(&mut self.state, instruction, self.cp0_condition)
+            }
+            Instruction::Memory(instruction) => {
+                match load_store::execute(&mut self.state, instruction, bus)? {
+                    ExecutionOutcome::Completed(effect) => {
+                        Ok(ExecutionOutcome::Completed((None, effect)))
+                    }
+                    ExecutionOutcome::Exception(exception) => {
+                        Ok(ExecutionOutcome::Exception(exception))
+                    }
                 }
-                Instruction::Cp0(instruction) => {
-                    cp0::execute(&mut self.state, instruction, self.cp0_condition)
-                }
-                Instruction::Memory(instruction) => {
-                    load_store::execute(&mut self.state, instruction, bus)
-                        .map(|effect| (None, effect))
-                }
-                Instruction::Syscall => Err(ExecutionError::Exception(Exception::Syscall)),
-                Instruction::Breakpoint => Err(ExecutionError::Exception(Exception::Breakpoint)),
-            };
+            }
+            Instruction::Syscall => Ok(ExecutionOutcome::Exception(Exception::Syscall)),
+            Instruction::Breakpoint => Ok(ExecutionOutcome::Exception(Exception::Breakpoint)),
+        };
 
         match outcome {
-            Ok((delayed_resume_pc, effect)) => {
+            Ok(ExecutionOutcome::Completed((delayed_resume_pc, effect))) => {
                 self.state.complete_instruction(delayed_resume_pc, effect);
             }
-            Err(ExecutionError::Exception(exception)) => self.state.take_exception(exception),
-            Err(ExecutionError::TlbShutdown) => return Err(StepError::TlbShutdown),
-            Err(ExecutionError::BusFault { address, fault }) => {
-                return Err(StepError::BusFault { address, fault });
+            Ok(ExecutionOutcome::Exception(exception)) => {
+                self.state.take_exception(exception);
             }
+            Err(error) => return Err(error),
         }
 
         Ok(())

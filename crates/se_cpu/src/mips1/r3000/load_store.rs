@@ -1,7 +1,7 @@
 use se_core::bus::{PhysAddr, PhysicalBus};
 
 use super::{
-    ExecutionError,
+    ExecutionOutcome, StepError,
     cp0::Exception,
     decode::MemoryInstruction,
     mmu::{AccessType, Translation},
@@ -12,11 +12,16 @@ pub(super) fn execute(
     state: &mut State,
     instruction: MemoryInstruction,
     bus: &mut dyn PhysicalBus,
-) -> Result<Option<InstructionEffect>, ExecutionError> {
+) -> Result<ExecutionOutcome<Option<InstructionEffect>>, StepError> {
     let effect = match instruction {
         MemoryInstruction::Lb { base, rt, offset } => {
             let mut bytes = [0; 1];
-            load(state, base, offset, &mut bytes, bus)?;
+            match load(state, base, offset, &mut bytes, bus)? {
+                ExecutionOutcome::Completed(()) => {}
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            }
             InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: (bytes[0] as i8 as i32) as u32,
@@ -25,7 +30,12 @@ pub(super) fn execute(
         }
         MemoryInstruction::Lbu { base, rt, offset } => {
             let mut bytes = [0; 1];
-            load(state, base, offset, &mut bytes, bus)?;
+            match load(state, base, offset, &mut bytes, bus)? {
+                ExecutionOutcome::Completed(()) => {}
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            }
             InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: u32::from(bytes[0]),
@@ -34,7 +44,12 @@ pub(super) fn execute(
         }
         MemoryInstruction::Lh { base, rt, offset } => {
             let mut bytes = [0; 2];
-            load(state, base, offset, &mut bytes, bus)?;
+            match load(state, base, offset, &mut bytes, bus)? {
+                ExecutionOutcome::Completed(()) => {}
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            }
             InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: (i16::from_be_bytes(bytes) as i32) as u32,
@@ -43,7 +58,12 @@ pub(super) fn execute(
         }
         MemoryInstruction::Lhu { base, rt, offset } => {
             let mut bytes = [0; 2];
-            load(state, base, offset, &mut bytes, bus)?;
+            match load(state, base, offset, &mut bytes, bus)? {
+                ExecutionOutcome::Completed(()) => {}
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            }
             InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: u32::from(u16::from_be_bytes(bytes)),
@@ -53,12 +73,20 @@ pub(super) fn execute(
         MemoryInstruction::Lwl { base, rt, offset } => {
             let virtual_address = effective_address(state, base, offset);
             let byte = (virtual_address & 3) as usize;
-            let translation = translate_address(state, virtual_address, AccessType::Load)?;
+            let translation = match translate_address(state, virtual_address, AccessType::Load)? {
+                ExecutionOutcome::Completed(translation) => translation,
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            };
             let length = 4 - byte;
             let mut memory = [0; 4];
-            state
+            if state
                 .load_memory(LoadKind::Data, translation, &mut memory[..length], bus)
-                .map_err(|_| ExecutionError::Exception(Exception::DataBusError))?;
+                .is_err()
+            {
+                return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
+            }
 
             let mut bytes = state.read_gpr_for_load_merge(rt).to_be_bytes();
             bytes[..length].copy_from_slice(&memory[..length]);
@@ -70,7 +98,12 @@ pub(super) fn execute(
         }
         MemoryInstruction::Lw { base, rt, offset } => {
             let mut bytes = [0; 4];
-            load(state, base, offset, &mut bytes, bus)?;
+            match load(state, base, offset, &mut bytes, bus)? {
+                ExecutionOutcome::Completed(()) => {}
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            }
             InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: u32::from_be_bytes(bytes),
@@ -80,13 +113,22 @@ pub(super) fn execute(
         MemoryInstruction::Lwr { base, rt, offset } => {
             let virtual_address = effective_address(state, base, offset);
             let byte = (virtual_address & 3) as usize;
-            let mut translation = translate_address(state, virtual_address, AccessType::Load)?;
+            let mut translation = match translate_address(state, virtual_address, AccessType::Load)?
+            {
+                ExecutionOutcome::Completed(translation) => translation,
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            };
             translation.address = PhysAddr::new(translation.address.get() - byte as u64);
             let length = byte + 1;
             let mut memory = [0; 4];
-            state
+            if state
                 .load_memory(LoadKind::Data, translation, &mut memory[..length], bus)
-                .map_err(|_| ExecutionError::Exception(Exception::DataBusError))?;
+                .is_err()
+            {
+                return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
+            }
 
             let mut bytes = state.read_gpr_for_load_merge(rt).to_be_bytes();
             bytes[4 - length..].copy_from_slice(&memory[..length]);
@@ -98,51 +140,77 @@ pub(super) fn execute(
         }
         MemoryInstruction::Sb { base, rt, offset } => {
             let bytes = [state.read_gpr(rt) as u8];
-            store(state, base, offset, &bytes, bus)?;
-            return Ok(None);
+            match store(state, base, offset, &bytes, bus)? {
+                ExecutionOutcome::Completed(()) => {}
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            }
+            return Ok(ExecutionOutcome::Completed(None));
         }
         MemoryInstruction::Sh { base, rt, offset } => {
             let bytes = (state.read_gpr(rt) as u16).to_be_bytes();
-            store(state, base, offset, &bytes, bus)?;
-            return Ok(None);
+            match store(state, base, offset, &bytes, bus)? {
+                ExecutionOutcome::Completed(()) => {}
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            }
+            return Ok(ExecutionOutcome::Completed(None));
         }
         MemoryInstruction::Swl { base, rt, offset } => {
             let virtual_address = effective_address(state, base, offset);
             let byte = (virtual_address & 3) as usize;
-            let translation = translate_address(state, virtual_address, AccessType::Store)?;
+            let translation = match translate_address(state, virtual_address, AccessType::Store)? {
+                ExecutionOutcome::Completed(translation) => translation,
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            };
             let physical_address = translation.address;
             let bytes = state.read_gpr(rt).to_be_bytes();
             state
                 .store_memory(translation, &bytes[..4 - byte], bus)
-                .map_err(|fault| ExecutionError::BusFault {
+                .map_err(|fault| StepError::BusFault {
                     address: physical_address,
                     fault,
                 })?;
-            return Ok(None);
+            return Ok(ExecutionOutcome::Completed(None));
         }
         MemoryInstruction::Sw { base, rt, offset } => {
             let bytes = state.read_gpr(rt).to_be_bytes();
-            store(state, base, offset, &bytes, bus)?;
-            return Ok(None);
+            match store(state, base, offset, &bytes, bus)? {
+                ExecutionOutcome::Completed(()) => {}
+                ExecutionOutcome::Exception(exception) => {
+                    return Ok(ExecutionOutcome::Exception(exception));
+                }
+            }
+            return Ok(ExecutionOutcome::Completed(None));
         }
         MemoryInstruction::Swr { base, rt, offset } => {
             let virtual_address = effective_address(state, base, offset);
             let byte = (virtual_address & 3) as usize;
-            let mut translation = translate_address(state, virtual_address, AccessType::Store)?;
+            let mut translation =
+                match translate_address(state, virtual_address, AccessType::Store)? {
+                    ExecutionOutcome::Completed(translation) => translation,
+                    ExecutionOutcome::Exception(exception) => {
+                        return Ok(ExecutionOutcome::Exception(exception));
+                    }
+                };
             translation.address = PhysAddr::new(translation.address.get() - byte as u64);
             let physical_address = translation.address;
             let bytes = state.read_gpr(rt).to_be_bytes();
             state
                 .store_memory(translation, &bytes[3 - byte..], bus)
-                .map_err(|fault| ExecutionError::BusFault {
+                .map_err(|fault| StepError::BusFault {
                     address: physical_address,
                     fault,
                 })?;
-            return Ok(None);
+            return Ok(ExecutionOutcome::Completed(None));
         }
     };
 
-    Ok(Some(effect))
+    Ok(ExecutionOutcome::Completed(Some(effect)))
 }
 
 fn load(
@@ -151,7 +219,7 @@ fn load(
     offset: u16,
     data: &mut [u8],
     bus: &mut dyn PhysicalBus,
-) -> Result<(), ExecutionError> {
+) -> Result<ExecutionOutcome<()>, StepError> {
     let address = effective_address(state, base, offset);
     let misaligned = match data.len() {
         1 => false,
@@ -160,16 +228,26 @@ fn load(
         _ => unreachable!("aligned R3000 loads use one, two, or four bytes"),
     };
     if misaligned {
-        return Err(ExecutionError::Exception(Exception::LoadAddressError {
+        return Ok(ExecutionOutcome::Exception(Exception::LoadAddressError {
             address,
         }));
     }
 
-    let translation = translate_address(state, address, AccessType::Load)?;
+    let translation = match translate_address(state, address, AccessType::Load)? {
+        ExecutionOutcome::Completed(translation) => translation,
+        ExecutionOutcome::Exception(exception) => {
+            return Ok(ExecutionOutcome::Exception(exception));
+        }
+    };
 
-    state
+    if state
         .load_memory(LoadKind::Data, translation, data, bus)
-        .map_err(|_| ExecutionError::Exception(Exception::DataBusError))
+        .is_err()
+    {
+        return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
+    }
+
+    Ok(ExecutionOutcome::Completed(()))
 }
 
 fn store(
@@ -178,7 +256,7 @@ fn store(
     offset: u16,
     data: &[u8],
     bus: &mut dyn PhysicalBus,
-) -> Result<(), ExecutionError> {
+) -> Result<ExecutionOutcome<()>, StepError> {
     let address = effective_address(state, base, offset);
     let misaligned = match data.len() {
         1 => false,
@@ -187,20 +265,27 @@ fn store(
         _ => unreachable!("aligned R3000 stores use one, two, or four bytes"),
     };
     if misaligned {
-        return Err(ExecutionError::Exception(Exception::StoreAddressError {
+        return Ok(ExecutionOutcome::Exception(Exception::StoreAddressError {
             address,
         }));
     }
 
-    let translation = translate_address(state, address, AccessType::Store)?;
+    let translation = match translate_address(state, address, AccessType::Store)? {
+        ExecutionOutcome::Completed(translation) => translation,
+        ExecutionOutcome::Exception(exception) => {
+            return Ok(ExecutionOutcome::Exception(exception));
+        }
+    };
     let physical_address = translation.address;
 
     state
         .store_memory(translation, data, bus)
-        .map_err(|fault| ExecutionError::BusFault {
+        .map_err(|fault| StepError::BusFault {
             address: physical_address,
             fault,
-        })
+        })?;
+
+    Ok(ExecutionOutcome::Completed(()))
 }
 
 fn effective_address(state: &State, base: usize, offset: u16) -> u32 {
@@ -213,11 +298,11 @@ fn translate_address(
     state: &mut State,
     virtual_address: u32,
     access: AccessType,
-) -> Result<Translation, ExecutionError> {
+) -> Result<ExecutionOutcome<Translation>, StepError> {
     match state.translate_address(virtual_address, access) {
-        Ok(translation) => Ok(translation),
-        Err(TranslationError::Exception(exception)) => Err(ExecutionError::Exception(exception)),
-        Err(TranslationError::TlbShutdown) => Err(ExecutionError::TlbShutdown),
+        Ok(translation) => Ok(ExecutionOutcome::Completed(translation)),
+        Err(TranslationError::Exception(exception)) => Ok(ExecutionOutcome::Exception(exception)),
+        Err(TranslationError::TlbShutdown) => Err(StepError::TlbShutdown),
     }
 }
 
@@ -225,11 +310,22 @@ fn translate_address(
 mod tests {
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 
-    use super::{Exception, ExecutionError, InstructionEffect, MemoryInstruction, State, execute};
+    use super::{
+        Exception, ExecutionOutcome, InstructionEffect, MemoryInstruction, State, StepError,
+        execute,
+    };
     use crate::mips1::r3000::{TEST_CONFIG, cp0::TlbFaultKind};
 
     const ENTRY_LO_DIRTY: u32 = 1 << 10;
     const ENTRY_LO_VALID: u32 = 1 << 9;
+
+    fn completed<T>(value: T) -> Result<ExecutionOutcome<T>, StepError> {
+        Ok(ExecutionOutcome::Completed(value))
+    }
+
+    fn guest_exception<T>(value: Exception) -> Result<ExecutionOutcome<T>, StepError> {
+        Ok(ExecutionOutcome::Exception(value))
+    }
 
     struct TestBus {
         read_data: [u8; 4],
@@ -346,7 +442,7 @@ mod tests {
 
             assert_eq!(
                 execute(&mut state, instruction, &mut bus),
-                Ok(Some(InstructionEffect::DelayedGprWrite {
+                completed(Some(InstructionEffect::DelayedGprWrite {
                     index: 2,
                     value,
                     load_merge_bypass: true,
@@ -396,7 +492,7 @@ mod tests {
             state.write_gpr(2, 0x89ab_cdef);
             let mut bus = TestBus::new([0; 4]);
 
-            assert_eq!(execute(&mut state, instruction, &mut bus), Ok(None));
+            assert_eq!(execute(&mut state, instruction, &mut bus), completed(None));
             assert!(bus.reads.is_empty());
             assert_eq!(bus.writes, [(PhysAddr::new(address), bytes.to_vec())]);
         }
@@ -428,7 +524,7 @@ mod tests {
                     },
                     &mut bus,
                 ),
-                Ok(Some(InstructionEffect::DelayedGprWrite {
+                completed(Some(InstructionEffect::DelayedGprWrite {
                     index: 2,
                     value: expected,
                     load_merge_bypass: true,
@@ -455,7 +551,7 @@ mod tests {
                     },
                     &mut bus,
                 ),
-                Ok(Some(InstructionEffect::DelayedGprWrite {
+                completed(Some(InstructionEffect::DelayedGprWrite {
                     index: 2,
                     value: expected,
                     load_merge_bypass: true,
@@ -486,7 +582,7 @@ mod tests {
                     },
                     &mut bus,
                 ),
-                Ok(None)
+                completed(None)
             );
             assert!(bus.reads.is_empty());
             assert_eq!(
@@ -514,7 +610,7 @@ mod tests {
                     },
                     &mut bus,
                 ),
-                Ok(None)
+                completed(None)
             );
             assert!(bus.reads.is_empty());
             assert_eq!(
@@ -541,7 +637,7 @@ mod tests {
                 },
                 &mut bus,
             ),
-            Ok(Some(InstructionEffect::DelayedGprWrite {
+            completed(Some(InstructionEffect::DelayedGprWrite {
                 index: 2,
                 value: 0x2233_44dd,
                 load_merge_bypass: true,
@@ -561,10 +657,10 @@ mod tests {
                 },
                 &mut wrapping_bus,
             ),
-            Err(ExecutionError::Exception(Exception::TlbLoad {
+            guest_exception(Exception::TlbLoad {
                 address: u32::MAX,
                 fault: TlbFaultKind::Miss,
-            }))
+            })
         );
         assert!(wrapping_bus.reads.is_empty());
     }
@@ -585,7 +681,7 @@ mod tests {
                 },
                 &mut bus,
             ),
-            Ok(Some(InstructionEffect::DelayedGprWrite {
+            completed(Some(InstructionEffect::DelayedGprWrite {
                 index: 2,
                 value: 0x5a,
                 load_merge_bypass: true,
@@ -605,10 +701,10 @@ mod tests {
                 },
                 &mut wrapping_bus,
             ),
-            Err(ExecutionError::Exception(Exception::TlbLoad {
+            guest_exception(Exception::TlbLoad {
                 address: u32::MAX,
                 fault: TlbFaultKind::Miss,
-            }))
+            })
         );
         assert!(wrapping_bus.reads.is_empty());
     }
@@ -666,7 +762,7 @@ mod tests {
 
             assert_eq!(
                 execute(&mut state, instruction, &mut bus),
-                Err(ExecutionError::Exception(exception))
+                guest_exception(exception)
             );
             assert!(bus.reads.is_empty());
             assert!(bus.writes.is_empty());
@@ -685,7 +781,7 @@ mod tests {
                 },
                 &mut bus,
             ),
-            Ok(Some(InstructionEffect::DelayedGprWrite {
+            completed(Some(InstructionEffect::DelayedGprWrite {
                 index: 2,
                 value: 0x7f,
                 load_merge_bypass: true,
@@ -728,7 +824,7 @@ mod tests {
             let mut bus = TestBus::new([0; 4]);
             assert_eq!(
                 execute(&mut state, instruction, &mut bus),
-                Err(ExecutionError::Exception(exception))
+                guest_exception(exception)
             );
         }
 
@@ -762,7 +858,7 @@ mod tests {
             let mut bus = TestBus::new([0; 4]);
             assert_eq!(
                 execute(&mut state, instruction, &mut bus),
-                Err(ExecutionError::Exception(exception))
+                guest_exception(exception)
             );
         }
 
@@ -781,9 +877,9 @@ mod tests {
                 },
                 &mut bus,
             ),
-            Err(ExecutionError::Exception(Exception::TlbModified {
+            guest_exception(Exception::TlbModified {
                 address: virtual_address,
-            }))
+            })
         );
 
         let mut writable_state = State::new(TEST_CONFIG);
@@ -805,7 +901,7 @@ mod tests {
                 },
                 &mut writable_bus,
             ),
-            Ok(None)
+            completed(None)
         );
     }
 
@@ -826,7 +922,7 @@ mod tests {
                 },
                 &mut load_bus,
             ),
-            Err(ExecutionError::Exception(Exception::DataBusError))
+            guest_exception(Exception::DataBusError)
         );
 
         let mut store_state = State::new(TEST_CONFIG);
@@ -845,7 +941,7 @@ mod tests {
                 },
                 &mut store_bus,
             ),
-            Err(ExecutionError::BusFault {
+            Err(StepError::BusFault {
                 address: PhysAddr::new(0x100),
                 fault: BusFault::UnsupportedAccess,
             })
@@ -885,7 +981,7 @@ mod tests {
 
             assert_eq!(
                 execute(&mut state, instruction, &mut bus),
-                Err(ExecutionError::Exception(exception))
+                guest_exception(exception)
             );
             assert!(bus.reads.is_empty());
             assert!(bus.writes.is_empty());
@@ -906,9 +1002,9 @@ mod tests {
                 },
                 &mut modified_bus,
             ),
-            Err(ExecutionError::Exception(Exception::TlbModified {
+            guest_exception(Exception::TlbModified {
                 address: virtual_address,
-            }))
+            })
         );
 
         let mut load_state = State::new(TEST_CONFIG);
@@ -925,7 +1021,7 @@ mod tests {
                 },
                 &mut load_bus,
             ),
-            Err(ExecutionError::Exception(Exception::DataBusError))
+            guest_exception(Exception::DataBusError)
         );
         assert_eq!(load_bus.reads, [(PhysAddr::new(0x100), 3)]);
 
@@ -944,7 +1040,7 @@ mod tests {
                 },
                 &mut store_bus,
             ),
-            Err(ExecutionError::BusFault {
+            Err(StepError::BusFault {
                 address: PhysAddr::new(0x100),
                 fault: BusFault::UnsupportedAccess,
             })
@@ -994,7 +1090,7 @@ mod tests {
 
             assert_eq!(
                 execute(&mut state, instruction, &mut bus),
-                Err(ExecutionError::TlbShutdown)
+                Err(StepError::TlbShutdown)
             );
             assert!(state.is_tlb_shutdown());
             assert!(bus.reads.is_empty());

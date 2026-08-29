@@ -1,5 +1,5 @@
 use super::{
-    ExecutionError,
+    ExecutionOutcome, InstructionResult,
     control::branch_resume_pc,
     decode::Cp0Instruction,
     state::{InstructionEffect, State},
@@ -350,9 +350,9 @@ pub(super) fn execute(
     state: &mut State,
     instruction: Cp0Instruction,
     condition: bool,
-) -> Result<(Option<u32>, Option<InstructionEffect>), ExecutionError> {
+) -> InstructionResult {
     if !state.cp0_usable() {
-        return Err(ExecutionError::Exception(Exception::CoprocessorUnusable));
+        return Ok(ExecutionOutcome::Exception(Exception::CoprocessorUnusable));
     }
 
     let outcome = match instruction {
@@ -391,7 +391,7 @@ pub(super) fn execute(
         }
     };
 
-    Ok(outcome)
+    Ok(ExecutionOutcome::Completed(outcome))
 }
 
 #[cfg(test)]
@@ -400,13 +400,18 @@ mod tests {
         BOOT_GENERAL_EXCEPTION_VECTOR, BOOT_TLB_REFILL_EXCEPTION_VECTOR, CAUSE_BD,
         CAUSE_HARDWARE_IP_MASK, CAUSE_IP_MASK, CAUSE_SOFTWARE_IP_MASK, CAUSE_VISIBLE_MASK,
         CONTEXT_BAD_VPN_MASK, CONTEXT_PTE_BASE_MASK, Cp0, Cp0Instruction, ENTRY_HI_VISIBLE_MASK,
-        ENTRY_HI_VPN_MASK, ENTRY_LO_VISIBLE_MASK, Exception, ExecutionError, FunctionalState,
+        ENTRY_HI_VPN_MASK, ENTRY_LO_VISIBLE_MASK, Exception, ExecutionOutcome, FunctionalState,
         GENERAL_EXCEPTION_VECTOR, INDEX_INDEX_MASK, INDEX_PROBE_FAILURE, InstructionEffect, PRID,
         RANDOM_RESET, STATUS_BEV, STATUS_CM, STATUS_CU_MASK, STATUS_CU0, STATUS_IEC,
         STATUS_INTERRUPT_CONTROL_MASK, STATUS_ISC, STATUS_KUC, STATUS_MODE_STACK_MASK, STATUS_PE,
         STATUS_SWC, STATUS_TS, STATUS_VISIBLE_MASK, STATUS_WRITABLE_MASK, State,
         TLB_REFILL_EXCEPTION_VECTOR, TlbFaultKind, execute,
     };
+    use crate::mips1::r3000::StepError;
+
+    fn completed<T>(value: T) -> Result<ExecutionOutcome<T>, StepError> {
+        Ok(ExecutionOutcome::Completed(value))
+    }
 
     #[test]
     fn new_initializes_deterministic_state() {
@@ -1080,7 +1085,7 @@ mod tests {
 
         assert_eq!(
             execute(&mut state, Cp0Instruction::Mfc0 { rt: 1, rd: 15 }, false),
-            Ok((
+            completed((
                 None,
                 Some(InstructionEffect::DelayedGprWrite {
                     index: 1,
@@ -1091,7 +1096,7 @@ mod tests {
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Cfc0 { rt: 1, rd: 15 }, false),
-            Ok((
+            completed((
                 None,
                 Some(InstructionEffect::DelayedGprWrite {
                     index: 1,
@@ -1102,7 +1107,7 @@ mod tests {
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Mfc0 { rt: 5, rd: 1 }, false),
-            Ok((
+            completed((
                 None,
                 Some(InstructionEffect::DelayedGprWrite {
                     index: 5,
@@ -1113,7 +1118,7 @@ mod tests {
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Mtc0 { rt: 2, rd: 14 }, false),
-            Ok((
+            completed((
                 None,
                 Some(InstructionEffect::DelayedCp0Write {
                     index: 14,
@@ -1123,7 +1128,7 @@ mod tests {
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Ctc0 { rt: 2, rd: 14 }, false),
-            Ok((
+            completed((
                 None,
                 Some(InstructionEffect::DelayedCp0Write {
                     index: 14,
@@ -1135,15 +1140,15 @@ mod tests {
         let pc = state.pc();
         assert_eq!(
             execute(&mut state, Cp0Instruction::Bc0f { offset: 2 }, false),
-            Ok((Some(pc + 12), None))
+            completed((Some(pc + 12), None))
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Bc0t { offset: 2 }, false),
-            Ok((Some(pc + 8), None))
+            completed((Some(pc + 8), None))
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Rfe, false),
-            Ok((
+            completed((
                 None,
                 Some(InstructionEffect::RestoreStatus { value: STATUS_BEV })
             ))
@@ -1156,7 +1161,7 @@ mod tests {
 
         assert_eq!(
             execute(&mut state, Cp0Instruction::Tlbr, false),
-            Ok((
+            completed((
                 None,
                 Some(InstructionEffect::DelayedTlbRead {
                     entry_hi: 0,
@@ -1166,7 +1171,7 @@ mod tests {
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Tlbwi, false),
-            Ok((
+            completed((
                 None,
                 Some(InstructionEffect::TlbWrite {
                     index: 0,
@@ -1177,7 +1182,7 @@ mod tests {
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Tlbwr, false),
-            Ok((
+            completed((
                 None,
                 Some(InstructionEffect::TlbWrite {
                     index: 63,
@@ -1188,7 +1193,7 @@ mod tests {
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Tlbp, false),
-            Err(ExecutionError::TlbShutdown)
+            Err(StepError::TlbShutdown)
         );
         assert!(state.is_tlb_shutdown());
     }
@@ -1209,7 +1214,7 @@ mod tests {
 
         assert_eq!(
             execute(&mut state, Cp0Instruction::Mfc0 { rt: 1, rd: 15 }, false),
-            Err(ExecutionError::Exception(Exception::CoprocessorUnusable))
+            Ok(ExecutionOutcome::Exception(Exception::CoprocessorUnusable))
         );
 
         state.complete_instruction(None, None);
@@ -1244,7 +1249,7 @@ mod tests {
         ] {
             assert_eq!(
                 execute(&mut state, instruction, false),
-                Err(ExecutionError::Exception(Exception::CoprocessorUnusable))
+                Ok(ExecutionOutcome::Exception(Exception::CoprocessorUnusable))
             );
         }
     }

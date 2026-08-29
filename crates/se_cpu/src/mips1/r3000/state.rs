@@ -1,7 +1,7 @@
 use se_core::bus::{BusFault, PhysicalBus};
 
 use super::{
-    ExecutionError, R3000Config,
+    R3000Config, StepError,
     cache::{CacheBank, Caches},
     cp0::{Cp0, Exception, TlbFaultKind},
     mmu::{AccessType, Cacheability, Mmu, ProbeResult, Translation, TranslationFault},
@@ -289,14 +289,14 @@ impl State {
         }
     }
 
-    pub(super) fn tlbp_effect(&mut self) -> Result<InstructionEffect, ExecutionError> {
+    pub(super) fn tlbp_effect(&mut self) -> Result<InstructionEffect, StepError> {
         let (entry_hi, _) = self.cp0.tlb_staging();
         let index = match self.mmu.probe(entry_hi) {
             ProbeResult::Miss => TLB_PROBE_FAILURE,
             ProbeResult::Match(index) => (index as u32) << 8,
             ProbeResult::Shutdown => {
                 self.cp0.enter_tlb_shutdown();
-                return Err(ExecutionError::TlbShutdown);
+                return Err(StepError::TlbShutdown);
             }
         };
 
@@ -468,8 +468,8 @@ mod tests {
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 
     use super::{
-        AccessType, Cacheability, Cp0, DelaySlot, Exception, ExecutionError, InstructionEffect,
-        LoadKind, PendingCp0Write, PendingGprWrite, RESET_PC, State, TlbFaultKind, Translation,
+        AccessType, Cacheability, Cp0, DelaySlot, Exception, InstructionEffect, LoadKind,
+        PendingCp0Write, PendingGprWrite, RESET_PC, State, StepError, TlbFaultKind, Translation,
         TranslationError, TranslationFault,
     };
 
@@ -1243,7 +1243,7 @@ mod tests {
         let pc = state.pc;
         let random = state.read_cp0(1);
 
-        assert_eq!(state.tlbp_effect(), Err(ExecutionError::TlbShutdown));
+        assert_eq!(state.tlbp_effect(), Err(StepError::TlbShutdown));
         assert!(state.is_tlb_shutdown());
         assert_eq!(state.pc, pc);
         assert_eq!(state.read_cp0(1), random);
