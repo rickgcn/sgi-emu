@@ -1,10 +1,10 @@
-use se_core::bus::PhysicalBus;
+use se_core::bus::{PhysAddr, PhysicalBus};
 
 use super::{
     ExecutionError,
     cp0::Exception,
     decode::MemoryInstruction,
-    mmu::AccessType,
+    mmu::{AccessType, Translation},
     state::{InstructionEffect, LoadKind, State, TranslationError},
 };
 
@@ -20,6 +20,7 @@ pub(super) fn execute(
             InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: (bytes[0] as i8 as i32) as u32,
+                load_merge_bypass: true,
             }
         }
         MemoryInstruction::Lbu { base, rt, offset } => {
@@ -28,6 +29,7 @@ pub(super) fn execute(
             InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: u32::from(bytes[0]),
+                load_merge_bypass: true,
             }
         }
         MemoryInstruction::Lh { base, rt, offset } => {
@@ -36,6 +38,7 @@ pub(super) fn execute(
             InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: (i16::from_be_bytes(bytes) as i32) as u32,
+                load_merge_bypass: true,
             }
         }
         MemoryInstruction::Lhu { base, rt, offset } => {
@@ -44,6 +47,25 @@ pub(super) fn execute(
             InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: u32::from(u16::from_be_bytes(bytes)),
+                load_merge_bypass: true,
+            }
+        }
+        MemoryInstruction::Lwl { base, rt, offset } => {
+            let virtual_address = effective_address(state, base, offset);
+            let byte = (virtual_address & 3) as usize;
+            let translation = translate_address(state, virtual_address, AccessType::Load)?;
+            let length = 4 - byte;
+            let mut memory = [0; 4];
+            state
+                .load_memory(LoadKind::Data, translation, &mut memory[..length], bus)
+                .map_err(|_| ExecutionError::Exception(Exception::DataBusError))?;
+
+            let mut bytes = state.read_gpr_for_load_merge(rt).to_be_bytes();
+            bytes[..length].copy_from_slice(&memory[..length]);
+            InstructionEffect::DelayedGprWrite {
+                index: rt,
+                value: u32::from_be_bytes(bytes),
+                load_merge_bypass: true,
             }
         }
         MemoryInstruction::Lw { base, rt, offset } => {
@@ -52,6 +74,26 @@ pub(super) fn execute(
             InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: u32::from_be_bytes(bytes),
+                load_merge_bypass: true,
+            }
+        }
+        MemoryInstruction::Lwr { base, rt, offset } => {
+            let virtual_address = effective_address(state, base, offset);
+            let byte = (virtual_address & 3) as usize;
+            let mut translation = translate_address(state, virtual_address, AccessType::Load)?;
+            translation.address = PhysAddr::new(translation.address.get() - byte as u64);
+            let length = byte + 1;
+            let mut memory = [0; 4];
+            state
+                .load_memory(LoadKind::Data, translation, &mut memory[..length], bus)
+                .map_err(|_| ExecutionError::Exception(Exception::DataBusError))?;
+
+            let mut bytes = state.read_gpr_for_load_merge(rt).to_be_bytes();
+            bytes[4 - length..].copy_from_slice(&memory[..length]);
+            InstructionEffect::DelayedGprWrite {
+                index: rt,
+                value: u32::from_be_bytes(bytes),
+                load_merge_bypass: true,
             }
         }
         MemoryInstruction::Sb { base, rt, offset } => {
@@ -64,9 +106,38 @@ pub(super) fn execute(
             store(state, base, offset, &bytes, bus)?;
             return Ok(None);
         }
+        MemoryInstruction::Swl { base, rt, offset } => {
+            let virtual_address = effective_address(state, base, offset);
+            let byte = (virtual_address & 3) as usize;
+            let translation = translate_address(state, virtual_address, AccessType::Store)?;
+            let physical_address = translation.address;
+            let bytes = state.read_gpr(rt).to_be_bytes();
+            state
+                .store_memory(translation, &bytes[..4 - byte], bus)
+                .map_err(|fault| ExecutionError::BusFault {
+                    address: physical_address,
+                    fault,
+                })?;
+            return Ok(None);
+        }
         MemoryInstruction::Sw { base, rt, offset } => {
             let bytes = state.read_gpr(rt).to_be_bytes();
             store(state, base, offset, &bytes, bus)?;
+            return Ok(None);
+        }
+        MemoryInstruction::Swr { base, rt, offset } => {
+            let virtual_address = effective_address(state, base, offset);
+            let byte = (virtual_address & 3) as usize;
+            let mut translation = translate_address(state, virtual_address, AccessType::Store)?;
+            translation.address = PhysAddr::new(translation.address.get() - byte as u64);
+            let physical_address = translation.address;
+            let bytes = state.read_gpr(rt).to_be_bytes();
+            state
+                .store_memory(translation, &bytes[3 - byte..], bus)
+                .map_err(|fault| ExecutionError::BusFault {
+                    address: physical_address,
+                    fault,
+                })?;
             return Ok(None);
         }
     };
@@ -81,9 +152,7 @@ fn load(
     data: &mut [u8],
     bus: &mut dyn PhysicalBus,
 ) -> Result<(), ExecutionError> {
-    let address = state
-        .read_gpr(base)
-        .wrapping_add((offset as i16 as i32) as u32);
+    let address = effective_address(state, base, offset);
     let misaligned = match data.len() {
         1 => false,
         2 => address & 1 != 0,
@@ -96,13 +165,7 @@ fn load(
         }));
     }
 
-    let translation = match state.translate_address(address, AccessType::Load) {
-        Ok(translation) => translation,
-        Err(TranslationError::Exception(exception)) => {
-            return Err(ExecutionError::Exception(exception));
-        }
-        Err(TranslationError::TlbShutdown) => return Err(ExecutionError::TlbShutdown),
-    };
+    let translation = translate_address(state, address, AccessType::Load)?;
 
     state
         .load_memory(LoadKind::Data, translation, data, bus)
@@ -116,9 +179,7 @@ fn store(
     data: &[u8],
     bus: &mut dyn PhysicalBus,
 ) -> Result<(), ExecutionError> {
-    let address = state
-        .read_gpr(base)
-        .wrapping_add((offset as i16 as i32) as u32);
+    let address = effective_address(state, base, offset);
     let misaligned = match data.len() {
         1 => false,
         2 => address & 1 != 0,
@@ -131,13 +192,7 @@ fn store(
         }));
     }
 
-    let translation = match state.translate_address(address, AccessType::Store) {
-        Ok(translation) => translation,
-        Err(TranslationError::Exception(exception)) => {
-            return Err(ExecutionError::Exception(exception));
-        }
-        Err(TranslationError::TlbShutdown) => return Err(ExecutionError::TlbShutdown),
-    };
+    let translation = translate_address(state, address, AccessType::Store)?;
     let physical_address = translation.address;
 
     state
@@ -146,6 +201,24 @@ fn store(
             address: physical_address,
             fault,
         })
+}
+
+fn effective_address(state: &State, base: usize, offset: u16) -> u32 {
+    state
+        .read_gpr(base)
+        .wrapping_add((offset as i16 as i32) as u32)
+}
+
+fn translate_address(
+    state: &mut State,
+    virtual_address: u32,
+    access: AccessType,
+) -> Result<Translation, ExecutionError> {
+    match state.translate_address(virtual_address, access) {
+        Ok(translation) => Ok(translation),
+        Err(TranslationError::Exception(exception)) => Err(ExecutionError::Exception(exception)),
+        Err(TranslationError::TlbShutdown) => Err(ExecutionError::TlbShutdown),
+    }
 }
 
 #[cfg(test)]
@@ -273,7 +346,11 @@ mod tests {
 
             assert_eq!(
                 execute(&mut state, instruction, &mut bus),
-                Ok(Some(InstructionEffect::DelayedGprWrite { index: 2, value }))
+                Ok(Some(InstructionEffect::DelayedGprWrite {
+                    index: 2,
+                    value,
+                    load_merge_bypass: true,
+                }))
             );
             assert_eq!(state.read_gpr(2), 0x1111_1111);
             assert_eq!(bus.reads, [(PhysAddr::new(0x100), length)]);
@@ -326,6 +403,173 @@ mod tests {
     }
 
     #[test]
+    fn partial_loads_merge_all_offsets_and_issue_exact_transactions() {
+        let memory = [0x11, 0x22, 0x33, 0x44];
+        let old_value = 0xaabb_ccdd;
+        let lwl_results = [0x1122_3344, 0x2233_44dd, 0x3344_ccdd, 0x44bb_ccdd];
+        let lwr_results = [0xaabb_cc11, 0xaabb_1122, 0xaa11_2233, 0x1122_3344];
+
+        for (byte, expected) in lwl_results.into_iter().enumerate() {
+            let mut state = State::new(TEST_CONFIG);
+            state.write_gpr(1, 0xa000_0100 + byte as u32);
+            state.write_gpr(2, old_value);
+            let length = 4 - byte;
+            let mut read_data = [0; 4];
+            read_data[..length].copy_from_slice(&memory[byte..]);
+            let mut bus = TestBus::new(read_data);
+
+            assert_eq!(
+                execute(
+                    &mut state,
+                    MemoryInstruction::Lwl {
+                        base: 1,
+                        rt: 2,
+                        offset: 0,
+                    },
+                    &mut bus,
+                ),
+                Ok(Some(InstructionEffect::DelayedGprWrite {
+                    index: 2,
+                    value: expected,
+                    load_merge_bypass: true,
+                }))
+            );
+            assert_eq!(bus.reads, [(PhysAddr::new(0x100 + byte as u64), length)]);
+            assert!(bus.writes.is_empty());
+        }
+
+        for (byte, expected) in lwr_results.into_iter().enumerate() {
+            let mut state = State::new(TEST_CONFIG);
+            state.write_gpr(1, 0xa000_0100 + byte as u32);
+            state.write_gpr(2, old_value);
+            let length = byte + 1;
+            let mut bus = TestBus::new(memory);
+
+            assert_eq!(
+                execute(
+                    &mut state,
+                    MemoryInstruction::Lwr {
+                        base: 1,
+                        rt: 2,
+                        offset: 0,
+                    },
+                    &mut bus,
+                ),
+                Ok(Some(InstructionEffect::DelayedGprWrite {
+                    index: 2,
+                    value: expected,
+                    load_merge_bypass: true,
+                }))
+            );
+            assert_eq!(bus.reads, [(PhysAddr::new(0x100), length)]);
+            assert!(bus.writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn partial_stores_select_all_big_endian_slices_and_addresses() {
+        let bytes = 0xaabb_ccdd_u32.to_be_bytes();
+
+        for byte in 0..4 {
+            let mut state = State::new(TEST_CONFIG);
+            state.write_gpr(1, 0xa000_0100 + byte as u32);
+            state.write_gpr(2, u32::from_be_bytes(bytes));
+            let mut bus = TestBus::new([0; 4]);
+
+            assert_eq!(
+                execute(
+                    &mut state,
+                    MemoryInstruction::Swl {
+                        base: 1,
+                        rt: 2,
+                        offset: 0,
+                    },
+                    &mut bus,
+                ),
+                Ok(None)
+            );
+            assert!(bus.reads.is_empty());
+            assert_eq!(
+                bus.writes,
+                [(
+                    PhysAddr::new(0x100 + byte as u64),
+                    bytes[..4 - byte].to_vec(),
+                )]
+            );
+        }
+
+        for byte in 0..4 {
+            let mut state = State::new(TEST_CONFIG);
+            state.write_gpr(1, 0xa000_0100 + byte as u32);
+            state.write_gpr(2, u32::from_be_bytes(bytes));
+            let mut bus = TestBus::new([0; 4]);
+
+            assert_eq!(
+                execute(
+                    &mut state,
+                    MemoryInstruction::Swr {
+                        base: 1,
+                        rt: 2,
+                        offset: 0,
+                    },
+                    &mut bus,
+                ),
+                Ok(None)
+            );
+            assert!(bus.reads.is_empty());
+            assert_eq!(
+                bus.writes,
+                [(PhysAddr::new(0x100), bytes[3 - byte..].to_vec(),)]
+            );
+        }
+    }
+
+    #[test]
+    fn partial_accesses_sign_extend_wrap_and_never_raise_alignment_errors() {
+        let mut state = State::new(TEST_CONFIG);
+        state.write_gpr(1, 0xa000_0104);
+        state.write_gpr(2, 0xaabb_ccdd);
+        let mut bus = TestBus::new([0x22, 0x33, 0x44, 0]);
+
+        assert_eq!(
+            execute(
+                &mut state,
+                MemoryInstruction::Lwl {
+                    base: 1,
+                    rt: 2,
+                    offset: 0xfffd,
+                },
+                &mut bus,
+            ),
+            Ok(Some(InstructionEffect::DelayedGprWrite {
+                index: 2,
+                value: 0x2233_44dd,
+                load_merge_bypass: true,
+            }))
+        );
+        assert_eq!(bus.reads, [(PhysAddr::new(0x101), 3)]);
+
+        state.write_gpr(1, 0);
+        let mut wrapping_bus = TestBus::new([0; 4]);
+        assert_eq!(
+            execute(
+                &mut state,
+                MemoryInstruction::Lwr {
+                    base: 1,
+                    rt: 2,
+                    offset: 0xffff,
+                },
+                &mut wrapping_bus,
+            ),
+            Err(ExecutionError::Exception(Exception::TlbLoad {
+                address: u32::MAX,
+                fault: TlbFaultKind::Miss,
+            }))
+        );
+        assert!(wrapping_bus.reads.is_empty());
+    }
+
+    #[test]
     fn effective_addresses_sign_extend_and_wrap() {
         let mut state = State::new(TEST_CONFIG);
         state.write_gpr(1, 0xa000_0104);
@@ -344,6 +588,7 @@ mod tests {
             Ok(Some(InstructionEffect::DelayedGprWrite {
                 index: 2,
                 value: 0x5a,
+                load_merge_bypass: true,
             }))
         );
         assert_eq!(bus.reads, [(PhysAddr::new(0x100), 1)]);
@@ -443,6 +688,7 @@ mod tests {
             Ok(Some(InstructionEffect::DelayedGprWrite {
                 index: 2,
                 value: 0x7f,
+                load_merge_bypass: true,
             }))
         );
         assert_eq!(bus.reads, [(PhysAddr::new(0x101), 1)]);
@@ -604,5 +850,155 @@ mod tests {
                 fault: BusFault::UnsupportedAccess,
             })
         );
+    }
+
+    #[test]
+    fn partial_access_faults_preserve_original_translation_and_request_addresses() {
+        let virtual_address = 0x1234_5002;
+        for (instruction, exception) in [
+            (
+                MemoryInstruction::Lwr {
+                    base: 1,
+                    rt: 2,
+                    offset: 0,
+                },
+                Exception::TlbLoad {
+                    address: virtual_address,
+                    fault: TlbFaultKind::Miss,
+                },
+            ),
+            (
+                MemoryInstruction::Swr {
+                    base: 1,
+                    rt: 2,
+                    offset: 0,
+                },
+                Exception::TlbStore {
+                    address: virtual_address,
+                    fault: TlbFaultKind::Miss,
+                },
+            ),
+        ] {
+            let mut state = State::new(TEST_CONFIG);
+            state.write_gpr(1, virtual_address);
+            let mut bus = TestBus::new([0; 4]);
+
+            assert_eq!(
+                execute(&mut state, instruction, &mut bus),
+                Err(ExecutionError::Exception(exception))
+            );
+            assert!(bus.reads.is_empty());
+            assert!(bus.writes.is_empty());
+        }
+
+        let mut modified_state = State::new(TEST_CONFIG);
+        modified_state.write_gpr(1, virtual_address);
+        modified_state.write_gpr(2, 0x1234_5678);
+        install_tlb_entry(&mut modified_state, virtual_address, ENTRY_LO_VALID);
+        let mut modified_bus = TestBus::new([0; 4]);
+        assert_eq!(
+            execute(
+                &mut modified_state,
+                MemoryInstruction::Swr {
+                    base: 1,
+                    rt: 2,
+                    offset: 0,
+                },
+                &mut modified_bus,
+            ),
+            Err(ExecutionError::Exception(Exception::TlbModified {
+                address: virtual_address,
+            }))
+        );
+
+        let mut load_state = State::new(TEST_CONFIG);
+        load_state.write_gpr(1, 0xa000_0102);
+        let mut load_bus = TestBus::new([0; 4]);
+        load_bus.read_fault = Some(BusFault::Unmapped);
+        assert_eq!(
+            execute(
+                &mut load_state,
+                MemoryInstruction::Lwr {
+                    base: 1,
+                    rt: 2,
+                    offset: 0,
+                },
+                &mut load_bus,
+            ),
+            Err(ExecutionError::Exception(Exception::DataBusError))
+        );
+        assert_eq!(load_bus.reads, [(PhysAddr::new(0x100), 3)]);
+
+        let mut store_state = State::new(TEST_CONFIG);
+        store_state.write_gpr(1, 0xa000_0102);
+        store_state.write_gpr(2, 0x1234_5678);
+        let mut store_bus = TestBus::new([0; 4]);
+        store_bus.write_fault = Some(BusFault::UnsupportedAccess);
+        assert_eq!(
+            execute(
+                &mut store_state,
+                MemoryInstruction::Swr {
+                    base: 1,
+                    rt: 2,
+                    offset: 0,
+                },
+                &mut store_bus,
+            ),
+            Err(ExecutionError::BusFault {
+                address: PhysAddr::new(0x100),
+                fault: BusFault::UnsupportedAccess,
+            })
+        );
+        assert_eq!(
+            store_bus.writes,
+            [(
+                PhysAddr::new(0x100),
+                0x1234_5678_u32.to_be_bytes()[1..].to_vec(),
+            )]
+        );
+    }
+
+    #[test]
+    fn partial_accesses_report_duplicate_translation_shutdown() {
+        for instruction in [
+            MemoryInstruction::Lwl {
+                base: 1,
+                rt: 2,
+                offset: 0,
+            },
+            MemoryInstruction::Swr {
+                base: 1,
+                rt: 2,
+                offset: 0,
+            },
+        ] {
+            let mut state = State::new(TEST_CONFIG);
+            state.write_gpr(1, 0x1234_5002);
+            state.complete_instruction(
+                None,
+                Some(InstructionEffect::TlbWrite {
+                    index: 1,
+                    entry_hi: 0x1234_5000,
+                    entry_lo: 0x0010_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY,
+                }),
+            );
+            state.complete_instruction(
+                None,
+                Some(InstructionEffect::TlbWrite {
+                    index: 2,
+                    entry_hi: 0x1234_5000,
+                    entry_lo: 0x0020_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY,
+                }),
+            );
+            let mut bus = TestBus::new([0; 4]);
+
+            assert_eq!(
+                execute(&mut state, instruction, &mut bus),
+                Err(ExecutionError::TlbShutdown)
+            );
+            assert!(state.is_tlb_shutdown());
+            assert!(bus.reads.is_empty());
+            assert!(bus.writes.is_empty());
+        }
     }
 }

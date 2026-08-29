@@ -20,6 +20,7 @@ struct DelaySlot {
 struct PendingGprWrite {
     index: usize,
     value: u32,
+    load_merge_bypass: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +35,7 @@ pub(super) enum InstructionEffect {
     DelayedGprWrite {
         index: usize,
         value: u32,
+        load_merge_bypass: bool,
     },
     DelayedCp0Write {
         index: usize,
@@ -114,6 +116,17 @@ impl State {
 
     pub(super) fn read_gpr(&self, index: usize) -> u32 {
         if index == 0 { 0 } else { self.gpr[index] }
+    }
+
+    pub(super) fn read_gpr_for_load_merge(&self, index: usize) -> u32 {
+        if index == 0 {
+            return 0;
+        }
+
+        match self.pending_gpr_write {
+            Some(write) if write.index == index && write.load_merge_bypass => write.value,
+            _ => self.read_gpr(index),
+        }
     }
 
     pub(super) fn write_gpr(&mut self, index: usize, value: u32) {
@@ -292,8 +305,16 @@ impl State {
         self.commit_pending_cp0_write();
 
         let tlb_write = match effect {
-            Some(InstructionEffect::DelayedGprWrite { index, value }) => {
-                self.pending_gpr_write = Some(PendingGprWrite { index, value });
+            Some(InstructionEffect::DelayedGprWrite {
+                index,
+                value,
+                load_merge_bypass,
+            }) => {
+                self.pending_gpr_write = Some(PendingGprWrite {
+                    index,
+                    value,
+                    load_merge_bypass,
+                });
                 None
             }
             Some(InstructionEffect::DelayedCp0Write { index, value }) => {
@@ -534,6 +555,7 @@ mod tests {
         state.pending_gpr_write = Some(PendingGprWrite {
             index: 1,
             value: 0xaaaa_aaaa,
+            load_merge_bypass: false,
         });
         state.pending_cp0_write = Some(PendingCp0Write::Register {
             index: 14,
@@ -570,6 +592,37 @@ mod tests {
         assert_eq!(state.read_gpr(1), 0x1234_5678);
         assert_eq!(state.read_gpr(31), 0x89ab_cdef);
         assert_eq!(state.gpr[0], 0);
+    }
+
+    #[test]
+    fn load_merge_read_bypasses_only_a_matching_memory_load() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        state.write_gpr(1, 0x1111_1111);
+        state.write_gpr(2, 0x2222_2222);
+
+        assert_eq!(state.read_gpr_for_load_merge(1), 0x1111_1111);
+
+        let load = PendingGprWrite {
+            index: 1,
+            value: 0xaaaa_aaaa,
+            load_merge_bypass: true,
+        };
+        state.pending_gpr_write = Some(load);
+
+        assert_eq!(state.read_gpr_for_load_merge(1), 0xaaaa_aaaa);
+        assert_eq!(state.read_gpr_for_load_merge(2), 0x2222_2222);
+        assert_eq!(state.read_gpr_for_load_merge(0), 0);
+        assert_eq!(state.pending_gpr_write, Some(load));
+
+        let transfer = PendingGprWrite {
+            index: 1,
+            value: 0xbbbb_bbbb,
+            load_merge_bypass: false,
+        };
+        state.pending_gpr_write = Some(transfer);
+
+        assert_eq!(state.read_gpr_for_load_merge(1), 0x1111_1111);
+        assert_eq!(state.pending_gpr_write, Some(transfer));
     }
 
     #[test]
@@ -701,6 +754,7 @@ mod tests {
             Some(InstructionEffect::DelayedGprWrite {
                 index: 1,
                 value: 0x2222_2222,
+                load_merge_bypass: false,
             }),
         );
 
@@ -716,6 +770,7 @@ mod tests {
             Some(InstructionEffect::DelayedGprWrite {
                 index: 0,
                 value: u32::MAX,
+                load_merge_bypass: false,
             }),
         );
         state.complete_instruction(None, None);
@@ -731,6 +786,7 @@ mod tests {
             Some(InstructionEffect::DelayedGprWrite {
                 index: 1,
                 value: 0x2222_2222,
+                load_merge_bypass: false,
             }),
         );
 
@@ -753,6 +809,7 @@ mod tests {
             Some(InstructionEffect::DelayedGprWrite {
                 index: 1,
                 value: 0x2222_2222,
+                load_merge_bypass: false,
             }),
         );
         state.complete_instruction(
@@ -760,6 +817,7 @@ mod tests {
             Some(InstructionEffect::DelayedGprWrite {
                 index: 1,
                 value: 0x3333_3333,
+                load_merge_bypass: false,
             }),
         );
 
@@ -797,6 +855,7 @@ mod tests {
             Some(InstructionEffect::DelayedGprWrite {
                 index: 1,
                 value: 0x1234_5678,
+                load_merge_bypass: false,
             }),
         );
         state.complete_instruction(
@@ -827,6 +886,7 @@ mod tests {
             Some(InstructionEffect::DelayedGprWrite {
                 index: 1,
                 value: 0x2222_2222,
+                load_merge_bypass: false,
             }),
         );
         let branch_source = state.read_gpr(1);
@@ -911,6 +971,7 @@ mod tests {
             Some(InstructionEffect::DelayedGprWrite {
                 index: 1,
                 value: 0x1234_5678,
+                load_merge_bypass: false,
             }),
         );
 
@@ -1043,6 +1104,7 @@ mod tests {
         state.pending_gpr_write = Some(PendingGprWrite {
             index: 1,
             value: 0x1111_1111,
+            load_merge_bypass: false,
         });
         state.pending_cp0_write = Some(PendingCp0Write::Register {
             index: 14,
@@ -1065,6 +1127,7 @@ mod tests {
             Some(PendingGprWrite {
                 index: 1,
                 value: 0x1111_1111,
+                load_merge_bypass: false,
             })
         );
         assert_eq!(

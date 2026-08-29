@@ -211,10 +211,14 @@ pub(super) enum MemoryInstruction {
     Lbu { base: usize, rt: usize, offset: u16 },
     Lh { base: usize, rt: usize, offset: u16 },
     Lhu { base: usize, rt: usize, offset: u16 },
+    Lwl { base: usize, rt: usize, offset: u16 },
     Lw { base: usize, rt: usize, offset: u16 },
+    Lwr { base: usize, rt: usize, offset: u16 },
     Sb { base: usize, rt: usize, offset: u16 },
     Sh { base: usize, rt: usize, offset: u16 },
+    Swl { base: usize, rt: usize, offset: u16 },
     Sw { base: usize, rt: usize, offset: u16 },
+    Swr { base: usize, rt: usize, offset: u16 },
 }
 
 pub(super) fn decode(word: u32) -> DecodeResult {
@@ -302,7 +306,11 @@ pub(super) fn decode(word: u32) -> DecodeResult {
             rt: rt(word),
             offset: immediate(word),
         })),
-        0x22 => DecodeResult::Unimplemented,
+        0x22 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Lwl {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
         0x23 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Lw {
             base: rs(word),
             rt: rt(word),
@@ -318,7 +326,11 @@ pub(super) fn decode(word: u32) -> DecodeResult {
             rt: rt(word),
             offset: immediate(word),
         })),
-        0x26 => DecodeResult::Unimplemented,
+        0x26 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Lwr {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
         0x28 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Sb {
             base: rs(word),
             rt: rt(word),
@@ -329,13 +341,22 @@ pub(super) fn decode(word: u32) -> DecodeResult {
             rt: rt(word),
             offset: immediate(word),
         })),
-        0x2a => DecodeResult::Unimplemented,
+        0x2a => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Swl {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
         0x2b => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Sw {
             base: rs(word),
             rt: rt(word),
             offset: immediate(word),
         })),
-        0x2e | 0x31..=0x33 | 0x39..=0x3b => DecodeResult::Unimplemented,
+        0x2e => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Swr {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
+        0x31..=0x33 | 0x39..=0x3b => DecodeResult::Unimplemented,
         _ => DecodeResult::Reserved,
     }
 }
@@ -1033,8 +1054,24 @@ mod tests {
                 },
             ),
             (
+                0x22,
+                MemoryInstruction::Lwl {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
                 0x23,
                 MemoryInstruction::Lw {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x26,
+                MemoryInstruction::Lwr {
                     base: 1,
                     rt: 31,
                     offset: 0x8001,
@@ -1057,8 +1094,24 @@ mod tests {
                 },
             ),
             (
+                0x2a,
+                MemoryInstruction::Swl {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
                 0x2b,
                 MemoryInstruction::Sw {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x2e,
+                MemoryInstruction::Swr {
                     base: 1,
                     rt: 31,
                     offset: 0x8001,
@@ -1189,13 +1242,6 @@ mod tests {
 
     #[test]
     fn classifies_legal_unimplemented_mips_i_encodings() {
-        for opcode in [0x22, 0x26, 0x2a, 0x2e] {
-            assert_eq!(
-                decode(encode_immediate(opcode, 1, 2, 0x8001)),
-                DecodeResult::Unimplemented
-            );
-        }
-
         for opcode in 0x11..=0x13 {
             for selector in [0x00, 0x02, 0x04, 0x06] {
                 assert_eq!(

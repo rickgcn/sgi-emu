@@ -346,6 +346,7 @@ pub(super) fn execute(
             Some(InstructionEffect::DelayedGprWrite {
                 index: rt,
                 value: state.read_cp0(rd),
+                load_merge_bypass: false,
             }),
         ),
         Cp0Instruction::Mtc0 { rt, rd } | Cp0Instruction::Ctc0 { rt, rd } => (
@@ -960,6 +961,7 @@ mod tests {
                 Some(InstructionEffect::DelayedGprWrite {
                     index: 1,
                     value: PRID,
+                    load_merge_bypass: false,
                 })
             ))
         );
@@ -970,6 +972,7 @@ mod tests {
                 Some(InstructionEffect::DelayedGprWrite {
                     index: 1,
                     value: PRID,
+                    load_merge_bypass: false,
                 })
             ))
         );
@@ -980,6 +983,7 @@ mod tests {
                 Some(InstructionEffect::DelayedGprWrite {
                     index: 5,
                     value: RANDOM_RESET,
+                    load_merge_bypass: false,
                 })
             ))
         );
