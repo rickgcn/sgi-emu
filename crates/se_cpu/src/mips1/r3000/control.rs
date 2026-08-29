@@ -64,7 +64,7 @@ mod tests {
     use super::{ControlInstruction, State, branch_resume_pc, execute, jump_target};
 
     fn run(instruction: ControlInstruction, registers: &[(usize, u32)]) -> (State, u32) {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         for &(index, value) in registers {
             state.write_gpr(index, value);
         }
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn jump_and_jump_and_link_produce_expected_results() {
-        let instruction_pc = State::new().pc();
+        let instruction_pc = State::new(crate::mips1::r3000::TEST_CONFIG).pc();
         let (state, resume_pc) = run(ControlInstruction::J { target: 3 }, &[(31, 0x1234_5678)]);
 
         assert_eq!(resume_pc, 0xb000_000c);
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn register_jumps_produce_expected_results() {
-        let instruction_pc = State::new().pc();
+        let instruction_pc = State::new(crate::mips1::r3000::TEST_CONFIG).pc();
         let target = 0xbfc0_0041;
         let (state, resume_pc) = run(
             ControlInstruction::Jr { rs: 1 },
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn equality_branches_cover_taken_and_not_taken() {
-        let instruction_pc = State::new().pc();
+        let instruction_pc = State::new(crate::mips1::r3000::TEST_CONFIG).pc();
         let taken = branch_resume_pc(instruction_pc, 2, true);
         let not_taken = branch_resume_pc(instruction_pc, 2, false);
 
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn signed_zero_branches_cover_negative_zero_and_positive() {
-        let instruction_pc = State::new().pc();
+        let instruction_pc = State::new(crate::mips1::r3000::TEST_CONFIG).pc();
 
         for (value, blez_taken, bgtz_taken) in
             [(u32::MAX, true, false), (0, true, false), (1, false, true)]
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn sign_branches_cover_negative_and_nonnegative_values() {
-        let instruction_pc = State::new().pc();
+        let instruction_pc = State::new(crate::mips1::r3000::TEST_CONFIG).pc();
 
         for (value, bltz_taken, bgez_taken) in
             [(u32::MAX, true, false), (0, false, true), (1, false, true)]
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn link_branches_write_link_for_both_outcomes() {
-        let instruction_pc = State::new().pc();
+        let instruction_pc = State::new(crate::mips1::r3000::TEST_CONFIG).pc();
         let link = instruction_pc.wrapping_add(8);
         let cases = [
             (
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn link_branches_read_register_thirty_one_before_writing_it() {
-        let instruction_pc = State::new().pc();
+        let instruction_pc = State::new(crate::mips1::r3000::TEST_CONFIG).pc();
         let link = instruction_pc.wrapping_add(8);
 
         let (state, resume_pc) = run(

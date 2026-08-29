@@ -32,7 +32,7 @@ pub enum BusFault {
 ///
 /// Buffer elements correspond to consecutive physical addresses in ascending
 /// order. Transaction widths are expressed by buffer length. The contract
-/// recognizes lengths of one, two, and four bytes; implementations return
+/// recognizes lengths from one through four bytes; implementations return
 /// [`BusFault::UnsupportedAccess`] for other lengths or unsupported accesses.
 pub trait PhysicalBus {
     /// Reads one transaction into `data`.
@@ -52,12 +52,63 @@ pub trait PhysicalBus {
 
 #[cfg(test)]
 mod tests {
-    use super::PhysAddr;
+    use super::{BusFault, PhysAddr, PhysicalBus};
+
+    #[derive(Default)]
+    struct RecordingBus {
+        transactions: Vec<(PhysAddr, usize)>,
+    }
+
+    impl PhysicalBus for RecordingBus {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+            if !(1..=4).contains(&data.len()) {
+                return Err(BusFault::UnsupportedAccess);
+            }
+
+            self.transactions.push((address, data.len()));
+            data.fill(0);
+            Ok(())
+        }
+
+        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+            if !(1..=4).contains(&data.len()) {
+                return Err(BusFault::UnsupportedAccess);
+            }
+
+            self.transactions.push((address, data.len()));
+            Ok(())
+        }
+    }
 
     #[test]
     fn physical_address_round_trips() {
         let address = PhysAddr::new(0x1fc0_0000);
 
         assert_eq!(address.get(), 0x1fc0_0000);
+    }
+
+    #[test]
+    fn three_byte_access_is_one_transaction() {
+        let mut bus = RecordingBus::default();
+
+        bus.write(PhysAddr::new(0x100), &[1, 2, 3])
+            .expect("three-byte transaction should be supported");
+
+        assert_eq!(bus.transactions, vec![(PhysAddr::new(0x100), 3)]);
+    }
+
+    #[test]
+    fn widths_outside_one_through_four_are_rejected() {
+        let mut bus = RecordingBus::default();
+
+        assert_eq!(
+            bus.write(PhysAddr::new(0), &[]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert_eq!(
+            bus.write(PhysAddr::new(0), &[0; 5]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert!(bus.transactions.is_empty());
     }
 }

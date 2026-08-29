@@ -1,9 +1,10 @@
-use se_core::bus::PhysAddr;
+use se_core::bus::{BusFault, PhysicalBus};
 
 use super::{
-    ExecutionError,
+    ExecutionError, R3000Config,
+    cache::{CacheBank, Caches},
     cp0::{Cp0, Exception, TlbFaultKind},
-    mmu::{AccessType, Mmu, ProbeResult, TranslationFault},
+    mmu::{AccessType, Cacheability, Mmu, ProbeResult, Translation, TranslationFault},
 };
 
 const RESET_PC: u32 = 0xbfc0_0000;
@@ -61,6 +62,12 @@ pub(super) enum TranslationError {
     TlbShutdown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LoadKind {
+    Instruction,
+    Data,
+}
+
 pub(super) struct State {
     gpr: [u32; 32],
     hi: u32,
@@ -69,12 +76,13 @@ pub(super) struct State {
     delay_slot: Option<DelaySlot>,
     cp0: Cp0,
     mmu: Mmu,
+    caches: Caches,
     pending_gpr_write: Option<PendingGprWrite>,
     pending_cp0_write: Option<PendingCp0Write>,
 }
 
 impl State {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(config: R3000Config) -> Self {
         Self {
             gpr: [0; 32],
             hi: 0,
@@ -83,6 +91,7 @@ impl State {
             delay_slot: None,
             cp0: Cp0::new(),
             mmu: Mmu::new(),
+            caches: Caches::new(config),
             pending_gpr_write: None,
             pending_cp0_write: None,
         }
@@ -154,7 +163,7 @@ impl State {
         &mut self,
         virtual_address: u32,
         access: AccessType,
-    ) -> Result<PhysAddr, TranslationError> {
+    ) -> Result<Translation, TranslationError> {
         let result = self.mmu.translate(
             virtual_address,
             self.cp0.current_asid(),
@@ -163,7 +172,7 @@ impl State {
         );
 
         match result {
-            Ok(address) => Ok(address),
+            Ok(translation) => Ok(translation),
             Err(TranslationFault::Shutdown) => {
                 self.cp0.enter_tlb_shutdown();
                 Err(TranslationError::TlbShutdown)
@@ -173,6 +182,70 @@ impl State {
                 access,
                 fault,
             ))),
+        }
+    }
+
+    pub(super) fn load_memory(
+        &mut self,
+        kind: LoadKind,
+        translation: Translation,
+        data: &mut [u8],
+        bus: &mut dyn PhysicalBus,
+    ) -> Result<(), BusFault> {
+        validate_memory_access(translation, data.len());
+
+        if kind == LoadKind::Data && self.cp0.is_cache_isolated() {
+            let bank = self.cache_bank(kind);
+            let miss = self.caches.read_isolated(bank, translation.address, data);
+            self.cp0.set_cache_miss(miss);
+            return Ok(());
+        }
+
+        match translation.cacheability {
+            Cacheability::Cached => {
+                let bank = self.cache_bank(kind);
+                self.caches.read(bank, translation.address, data, bus)
+            }
+            Cacheability::Uncached => {
+                let mut staged = [0; 4];
+                bus.read(translation.address, &mut staged[..data.len()])?;
+                data.copy_from_slice(&staged[..data.len()]);
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Memory-store routing precedes the R3000 load/store instruction subset"
+    )]
+    pub(super) fn store_memory(
+        &mut self,
+        translation: Translation,
+        data: &[u8],
+        bus: &mut dyn PhysicalBus,
+    ) -> Result<(), BusFault> {
+        validate_memory_access(translation, data.len());
+
+        if self.cp0.is_cache_isolated() {
+            let bank = self.cache_bank(LoadKind::Data);
+            self.caches.write_isolated(bank, translation.address, data);
+            return Ok(());
+        }
+
+        match translation.cacheability {
+            Cacheability::Cached => {
+                let bank = self.cache_bank(LoadKind::Data);
+                self.caches.write(bank, translation.address, data, bus)
+            }
+            Cacheability::Uncached => bus.write(translation.address, data),
+        }
+    }
+
+    fn cache_bank(&self, kind: LoadKind) -> CacheBank {
+        match (kind, self.cp0.caches_swapped()) {
+            (LoadKind::Instruction, false) | (LoadKind::Data, true) => CacheBank::Instruction,
+            (LoadKind::Instruction, true) | (LoadKind::Data, false) => CacheBank::Data,
         }
     }
 
@@ -359,24 +432,85 @@ impl State {
     }
 }
 
+fn validate_memory_access(translation: Translation, length: usize) {
+    assert!((1..=4).contains(&length));
+    let offset = (translation.address.get() & 3) as usize;
+    assert!(offset + length <= 4);
+}
+
 #[cfg(test)]
 mod tests {
-    use se_core::bus::PhysAddr;
+    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 
     use super::{
-        AccessType, Cp0, DelaySlot, Exception, ExecutionError, InstructionEffect, PendingCp0Write,
-        PendingGprWrite, RESET_PC, State, TlbFaultKind, TranslationError, TranslationFault,
+        AccessType, Cacheability, Cp0, DelaySlot, Exception, ExecutionError, InstructionEffect,
+        LoadKind, PendingCp0Write, PendingGprWrite, RESET_PC, State, TlbFaultKind, Translation,
+        TranslationError, TranslationFault,
     };
 
     const ENTRY_LO_DIRTY: u32 = 1 << 10;
     const ENTRY_LO_VALID: u32 = 1 << 9;
     const STATUS_BEV: u32 = 1 << 22;
     const STATUS_TS: u32 = 1 << 21;
+    const STATUS_CM: u32 = 1 << 19;
+    const STATUS_SWC: u32 = 1 << 17;
+    const STATUS_ISC: u32 = 1 << 16;
     const STATUS_KUC: u32 = 1 << 1;
+
+    struct TestBus {
+        read_data: [u8; 4],
+        reads: Vec<(PhysAddr, usize)>,
+        writes: Vec<(PhysAddr, Vec<u8>)>,
+        read_fault: Option<BusFault>,
+        write_fault: Option<BusFault>,
+    }
+
+    impl TestBus {
+        fn new(read_data: [u8; 4]) -> Self {
+            Self {
+                read_data,
+                reads: Vec::new(),
+                writes: Vec::new(),
+                read_fault: None,
+                write_fault: None,
+            }
+        }
+    }
+
+    impl PhysicalBus for TestBus {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+            self.reads.push((address, data.len()));
+            if let Some(fault) = self.read_fault {
+                return Err(fault);
+            }
+            let source = self
+                .read_data
+                .get(..data.len())
+                .ok_or(BusFault::UnsupportedAccess)?;
+            data.copy_from_slice(source);
+            Ok(())
+        }
+
+        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+            if let Some(fault) = self.write_fault {
+                return Err(fault);
+            }
+
+            self.writes.push((address, data.to_vec()));
+            Ok(())
+        }
+    }
+
+    fn translation(address: u64, cacheability: Cacheability) -> Translation {
+        Translation {
+            address: PhysAddr::new(address),
+            cacheability,
+        }
+    }
 
     #[test]
     fn new_initializes_deterministic_state() {
-        let state = State::new();
+        let state = State::new(crate::mips1::r3000::TEST_CONFIG);
 
         assert_eq!(state.gpr, [0; 32]);
         assert_eq!(state.hi, 0);
@@ -390,7 +524,7 @@ mod tests {
 
     #[test]
     fn reset_restores_defined_state_only() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         for (index, register) in state.gpr.iter_mut().enumerate() {
             *register = index as u32 + 1;
         }
@@ -430,7 +564,7 @@ mod tests {
 
     #[test]
     fn general_register_access_preserves_register_zero() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
 
         state.write_gpr(1, 0x1234_5678);
         state.write_gpr(31, 0x89ab_cdef);
@@ -444,7 +578,7 @@ mod tests {
 
     #[test]
     fn hi_and_lo_accessors_are_independent() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
 
         state.write_hi(0x1234_5678);
         assert_eq!(state.read_hi(), 0x1234_5678);
@@ -457,7 +591,7 @@ mod tests {
 
     #[test]
     fn sequential_completion_advances_with_wrapping_arithmetic() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
 
         assert_eq!(state.pc(), RESET_PC);
         state.complete_instruction(None, None);
@@ -470,7 +604,7 @@ mod tests {
 
     #[test]
     fn control_flow_completion_enters_and_leaves_delay_slot() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let resume_pc = 0xbfc0_0040;
 
         state.complete_instruction(Some(resume_pc), None);
@@ -492,7 +626,7 @@ mod tests {
 
     #[test]
     fn not_taken_branch_still_records_delay_slot_origin() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let fallthrough = RESET_PC + 8;
 
         state.complete_instruction(Some(fallthrough), None);
@@ -513,7 +647,7 @@ mod tests {
 
     #[test]
     fn delay_slot_resume_address_can_wrap_to_zero() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.pc = 0xffff_fffc;
 
         state.complete_instruction(Some(0), None);
@@ -526,7 +660,7 @@ mod tests {
 
     #[test]
     fn exception_outside_delay_slot_uses_current_pc() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.pc = 0xbfc0_0040;
         state.write_gpr(1, 0x1234_5678);
         let mut expected_cp0 = Cp0::new();
@@ -543,7 +677,7 @@ mod tests {
 
     #[test]
     fn exception_in_delay_slot_uses_origin_and_cancels_resume() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let origin_pc = state.pc;
         let resume_pc = 0xbfc0_0040;
         state.write_gpr(31, origin_pc.wrapping_add(8));
@@ -563,7 +697,7 @@ mod tests {
 
     #[test]
     fn delayed_gpr_write_becomes_visible_after_one_instruction() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.write_gpr(1, 0x1111_1111);
 
         state.complete_instruction(
@@ -594,7 +728,7 @@ mod tests {
 
     #[test]
     fn direct_gpr_write_overrides_a_pending_transfer() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.write_gpr(1, 0x1111_1111);
         state.complete_instruction(
             None,
@@ -615,7 +749,7 @@ mod tests {
 
     #[test]
     fn consecutive_transfers_commit_in_order() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.write_gpr(1, 0x1111_1111);
 
         state.complete_instruction(
@@ -659,7 +793,7 @@ mod tests {
 
     #[test]
     fn exception_commits_old_transfers_before_hardware_state() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let exception_pc = state.pc().wrapping_add(8);
 
         state.complete_instruction(
@@ -688,7 +822,7 @@ mod tests {
 
     #[test]
     fn transfer_delay_coexists_with_a_branch_delay_slot() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let resume_pc = 0xbfc0_0040;
         state.write_gpr(1, 0x1111_1111);
 
@@ -718,7 +852,7 @@ mod tests {
         const STATUS_KUC: u32 = 1 << 1;
         const STATUS_CU0: u32 = 1 << 28;
 
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let user_with_cu0 = STATUS_BEV | STATUS_KUC | STATUS_CU0;
 
         state.complete_instruction(
@@ -744,7 +878,7 @@ mod tests {
         const STATUS_BEV: u32 = 1 << 22;
         const STATUS_CU0: u32 = 1 << 28;
 
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.complete_instruction(
             None,
             Some(InstructionEffect::DelayedCp0Write {
@@ -767,7 +901,7 @@ mod tests {
         const STATUS_KUC: u32 = 1 << 1;
         const STATUS_CU0: u32 = 1 << 28;
 
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.complete_instruction(
             None,
             Some(InstructionEffect::DelayedCp0Write {
@@ -794,7 +928,7 @@ mod tests {
 
     #[test]
     fn random_advances_for_normal_and_exception_completion() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
 
         assert_eq!(state.read_cp0(1), 63 << 8);
         state.complete_instruction(None, None);
@@ -871,7 +1005,7 @@ mod tests {
 
     #[test]
     fn translation_uses_current_cp0_asid_and_mode() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let virtual_address = 0x1234_5000;
         let asid = 0x15_u32;
         let entry_hi = virtual_address | (asid << 6);
@@ -882,7 +1016,7 @@ mod tests {
 
         assert_eq!(
             state.translate_address(virtual_address, AccessType::Load),
-            Ok(PhysAddr::new(0x4321_0000))
+            Ok(translation(0x4321_0000, Cacheability::Cached))
         );
 
         state
@@ -909,7 +1043,7 @@ mod tests {
 
     #[test]
     fn translation_shutdown_changes_only_status_ts() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.pending_gpr_write = Some(PendingGprWrite {
             index: 1,
             value: 0x1111_1111,
@@ -948,7 +1082,7 @@ mod tests {
 
     #[test]
     fn tlb_instruction_effects_capture_current_staging_and_indices() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.cp0.write_register(0, 7 << 8);
         state.cp0.write_register(10, 0x1234_5a80);
         state.cp0.write_register(2, 0x9876_5f00);
@@ -981,7 +1115,7 @@ mod tests {
 
     #[test]
     fn tlb_probe_produces_delayed_index_results_and_shutdown() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let entry_hi = 0x2345_6a80;
         state.cp0.write_register(10, entry_hi);
         state.mmu.complete_write(23, entry_hi, 0);
@@ -1022,7 +1156,7 @@ mod tests {
 
     #[test]
     fn tlb_read_and_probe_results_observe_cp0_delay() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.cp0.write_register(10, 0x1111_1a80);
         state.cp0.write_register(2, 0x2222_2f00);
         state.cp0.write_register(0, 4 << 8);
@@ -1058,7 +1192,7 @@ mod tests {
 
     #[test]
     fn tlb_operations_immediately_after_mtc0_read_old_cp0_values() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.cp0.write_register(0, 4 << 8);
         state.cp0.write_register(10, 0x1111_1a80);
         state.cp0.write_register(2, 0x2222_2f00);
@@ -1108,7 +1242,7 @@ mod tests {
 
     #[test]
     fn tlb_write_is_immediate_for_main_view_and_delayed_for_instructions() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let virtual_address = 0x4567_8000;
         let old_entry_lo = 0x1000_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY;
         let new_entry_lo = 0x2000_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY;
@@ -1127,29 +1261,29 @@ mod tests {
 
         assert_eq!(
             state.translate_address(virtual_address, AccessType::Load),
-            Ok(PhysAddr::new(0x2000_0000))
+            Ok(translation(0x2000_0000, Cacheability::Cached))
         );
         assert_eq!(
             state.translate_address(virtual_address, AccessType::Instruction),
-            Ok(PhysAddr::new(0x1000_0000))
+            Ok(translation(0x1000_0000, Cacheability::Cached))
         );
 
         state.complete_instruction(None, None);
         assert_eq!(
             state.translate_address(virtual_address, AccessType::Instruction),
-            Ok(PhysAddr::new(0x1000_0000))
+            Ok(translation(0x1000_0000, Cacheability::Cached))
         );
 
         state.take_exception(Exception::Syscall);
         assert_eq!(
             state.translate_address(virtual_address, AccessType::Instruction),
-            Ok(PhysAddr::new(0x2000_0000))
+            Ok(translation(0x2000_0000, Cacheability::Cached))
         );
     }
 
     #[test]
     fn tlb_exception_overrides_pending_tlbr_vpn_and_preserves_asid() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let fault_address = 0xf234_5678;
         let asid = 0x0000_0a80;
 
@@ -1171,7 +1305,7 @@ mod tests {
 
     #[test]
     fn reset_preserves_main_tlb_and_clears_translation_pending_state() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let virtual_address = 0x5678_9000;
         let entry_lo = 0x3000_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY;
 
@@ -1194,9 +1328,274 @@ mod tests {
         assert_eq!(state.mmu.read_indexed(9), (virtual_address, entry_lo));
         assert_eq!(
             state.translate_address(virtual_address, AccessType::Instruction),
-            Ok(PhysAddr::new(0x3000_0000))
+            Ok(translation(0x3000_0000, Cacheability::Cached))
         );
         assert_eq!(state.pending_cp0_write, None);
         assert!(!state.is_tlb_shutdown());
+    }
+
+    #[test]
+    fn memory_loads_route_cached_and_uncached_translations() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        let mut bus = TestBus::new([1, 2, 3, 4]);
+        let cached = translation(0x100, Cacheability::Cached);
+        let uncached = translation(0x1100, Cacheability::Uncached);
+        let mut data = [0; 4];
+
+        state.cp0.set_cache_miss(true);
+        state
+            .load_memory(LoadKind::Data, cached, &mut data, &mut bus)
+            .expect("cached load should refill");
+        assert_eq!(data, [1, 2, 3, 4]);
+        assert_eq!(bus.reads.len(), 1);
+        assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
+
+        bus.read_data = [5, 6, 7, 8];
+        state
+            .load_memory(LoadKind::Data, cached, &mut data, &mut bus)
+            .expect("cached load should hit");
+        assert_eq!(data, [1, 2, 3, 4]);
+        assert_eq!(bus.reads.len(), 1);
+
+        state
+            .load_memory(LoadKind::Data, uncached, &mut data, &mut bus)
+            .expect("uncached load should reach the bus");
+        assert_eq!(data, [5, 6, 7, 8]);
+        assert_eq!(bus.reads.len(), 2);
+        assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
+
+        bus.read_fault = Some(BusFault::Unmapped);
+        data = [0xaa; 4];
+        let pc = state.pc();
+        let status = state.read_cp0(12);
+        let random = state.read_cp0(1);
+        assert_eq!(
+            state.load_memory(LoadKind::Data, uncached, &mut data, &mut bus),
+            Err(BusFault::Unmapped)
+        );
+        assert_eq!(data, [0xaa; 4]);
+        assert_eq!(state.pc(), pc);
+        assert_eq!(state.read_cp0(12), status);
+        assert_eq!(state.read_cp0(1), random);
+
+        bus.read_fault = None;
+        state
+            .load_memory(LoadKind::Data, cached, &mut data, &mut bus)
+            .expect("uncached alias should not modify the resident cache entry");
+        assert_eq!(data, [1, 2, 3, 4]);
+        assert_eq!(bus.reads.len(), 3);
+    }
+
+    #[test]
+    fn cache_controls_follow_the_cp0_write_hazard() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp0Write {
+                index: 12,
+                value: STATUS_BEV | STATUS_ISC | STATUS_SWC,
+            }),
+        );
+
+        assert!(!state.cp0.is_cache_isolated());
+        assert!(!state.cp0.caches_swapped());
+
+        state.complete_instruction(None, None);
+
+        assert!(state.cp0.is_cache_isolated());
+        assert!(state.cp0.caches_swapped());
+    }
+
+    #[test]
+    fn isolation_and_swap_select_physical_cache_banks() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        let address = translation(0x100, Cacheability::Cached);
+        let mut bus = TestBus::new([9, 8, 7, 6]);
+
+        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        state
+            .store_memory(
+                translation(0x100, Cacheability::Uncached),
+                &[1, 2, 3, 4],
+                &mut bus,
+            )
+            .expect("isolated data-cache write should succeed");
+        state
+            .cp0
+            .write_register(12, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        state
+            .store_memory(address, &[5, 6, 7, 8], &mut bus)
+            .expect("isolated instruction-cache write should succeed");
+        assert!(bus.writes.is_empty());
+
+        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        let mut data = [0; 4];
+        state.cp0.set_cache_miss(true);
+        state
+            .load_memory(LoadKind::Instruction, address, &mut data, &mut bus)
+            .expect("unswapped instruction load should select the instruction cache");
+        assert_eq!(data, [5, 6, 7, 8]);
+        assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
+
+        state
+            .load_memory(LoadKind::Data, address, &mut data, &mut bus)
+            .expect("isolated data-cache read should succeed");
+        assert_eq!(data, [1, 2, 3, 4]);
+        assert_eq!(state.read_cp0(12) & STATUS_CM, 0);
+
+        let alias = translation(0x1100, Cacheability::Uncached);
+        state
+            .load_memory(LoadKind::Data, alias, &mut data, &mut bus)
+            .expect("isolated miss should still return indexed data");
+        assert_eq!(data, [1, 2, 3, 4]);
+        assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
+
+        state
+            .cp0
+            .write_register(12, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        state
+            .load_memory(LoadKind::Data, address, &mut data, &mut bus)
+            .expect("swapped isolated read should succeed");
+        assert_eq!(data, [5, 6, 7, 8]);
+        assert_eq!(state.read_cp0(12) & STATUS_CM, 0);
+
+        state.cp0.set_cache_miss(true);
+        let instruction_address = translation(0x204, Cacheability::Cached);
+        state
+            .load_memory(
+                LoadKind::Instruction,
+                instruction_address,
+                &mut data,
+                &mut bus,
+            )
+            .expect("instruction load should ignore cache isolation");
+        assert_eq!(data, [9, 8, 7, 6]);
+        assert_eq!(bus.reads, vec![(PhysAddr::new(0x204), 4)]);
+        assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
+
+        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        state
+            .load_memory(LoadKind::Data, instruction_address, &mut data, &mut bus)
+            .expect("swapped instruction refill should reside in the data cache");
+        assert_eq!(data, [9, 8, 7, 6]);
+        assert_eq!(state.read_cp0(12) & STATUS_CM, 0);
+        assert_eq!(bus.reads.len(), 1);
+    }
+
+    #[test]
+    fn stores_route_through_cacheability_and_isolation() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        let mut bus = TestBus::new([0; 4]);
+        state.cp0.set_cache_miss(true);
+
+        state
+            .store_memory(
+                translation(0x301, Cacheability::Uncached),
+                &[1, 2, 3],
+                &mut bus,
+            )
+            .expect("uncached partial store should reach the bus");
+        state
+            .store_memory(
+                translation(0x400, Cacheability::Cached),
+                &[4, 5, 6, 7],
+                &mut bus,
+            )
+            .expect("cached full store should write through");
+
+        assert_eq!(
+            bus.writes,
+            vec![
+                (PhysAddr::new(0x301), vec![1, 2, 3]),
+                (PhysAddr::new(0x400), vec![4, 5, 6, 7]),
+            ]
+        );
+        assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
+
+        bus.write_fault = Some(BusFault::Unmapped);
+        let pc = state.pc();
+        let status = state.read_cp0(12);
+        let random = state.read_cp0(1);
+        assert_eq!(
+            state.store_memory(translation(0x401, Cacheability::Cached), &[9, 8], &mut bus,),
+            Err(BusFault::Unmapped)
+        );
+        assert_eq!(state.pc(), pc);
+        assert_eq!(state.read_cp0(12), status);
+        assert_eq!(state.read_cp0(1), random);
+
+        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        let mut data = [0; 4];
+        state
+            .load_memory(
+                LoadKind::Data,
+                translation(0x400, Cacheability::Uncached),
+                &mut data,
+                &mut bus,
+            )
+            .expect("isolated read should ignore uncached translation");
+        assert_eq!(data, [4, 5, 6, 7]);
+        assert_eq!(state.read_cp0(12) & STATUS_CM, 0);
+    }
+
+    #[test]
+    fn uncached_store_does_not_modify_a_resident_cache_entry() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        let mut bus = TestBus::new([0; 4]);
+        state
+            .store_memory(
+                translation(0x300, Cacheability::Cached),
+                &[1, 2, 3, 4],
+                &mut bus,
+            )
+            .expect("cached store should establish a resident word");
+        state
+            .store_memory(
+                translation(0x1301, Cacheability::Uncached),
+                &[9, 8],
+                &mut bus,
+            )
+            .expect("uncached alias should bypass the cache");
+
+        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        let mut data = [0; 4];
+        state
+            .load_memory(
+                LoadKind::Data,
+                translation(0x300, Cacheability::Uncached),
+                &mut data,
+                &mut bus,
+            )
+            .expect("isolated read should observe the original resident word");
+
+        assert_eq!(data, [1, 2, 3, 4]);
+        assert_eq!(state.read_cp0(12) & STATUS_CM, 0);
+        assert_eq!(
+            bus.writes,
+            vec![
+                (PhysAddr::new(0x300), vec![1, 2, 3, 4]),
+                (PhysAddr::new(0x1301), vec![9, 8]),
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_preserves_cache_contents() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        let translation = translation(0x500, Cacheability::Cached);
+        let mut bus = TestBus::new([1, 2, 3, 4]);
+        let mut data = [0; 4];
+        state
+            .load_memory(LoadKind::Instruction, translation, &mut data, &mut bus)
+            .expect("initial fetch should refill");
+
+        state.reset();
+        bus.read_data = [5, 6, 7, 8];
+        state
+            .load_memory(LoadKind::Instruction, translation, &mut data, &mut bus)
+            .expect("reset cache entry should remain readable");
+
+        assert_eq!(data, [1, 2, 3, 4]);
+        assert_eq!(bus.reads.len(), 1);
     }
 }

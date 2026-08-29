@@ -21,6 +21,9 @@ const RANDOM_RESET: u32 = 63 << 8;
 const STATUS_BEV: u32 = 1 << 22;
 const STATUS_TS: u32 = 1 << 21;
 const STATUS_PE: u32 = 1 << 20;
+const STATUS_CM: u32 = 1 << 19;
+const STATUS_SWC: u32 = 1 << 17;
+const STATUS_ISC: u32 = 1 << 16;
 const STATUS_KUC: u32 = 1 << 1;
 const STATUS_IEC: u32 = 1;
 const STATUS_MODE_STACK_MASK: u32 = 0x3f;
@@ -48,12 +51,32 @@ pub(super) enum TlbFaultKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Exception {
-    InstructionAddressError { address: u32 },
-    LoadAddressError { address: u32 },
-    StoreAddressError { address: u32 },
-    TlbLoad { address: u32, fault: TlbFaultKind },
-    TlbStore { address: u32, fault: TlbFaultKind },
-    TlbModified { address: u32 },
+    InstructionAddressError {
+        address: u32,
+    },
+    LoadAddressError {
+        address: u32,
+    },
+    StoreAddressError {
+        address: u32,
+    },
+    TlbLoad {
+        address: u32,
+        fault: TlbFaultKind,
+    },
+    TlbStore {
+        address: u32,
+        fault: TlbFaultKind,
+    },
+    TlbModified {
+        address: u32,
+    },
+    InstructionBusError,
+    #[allow(
+        dead_code,
+        reason = "Data-bus exceptions precede the R3000 load instruction subset"
+    )]
+    DataBusError,
     Syscall,
     Breakpoint,
     ReservedInstruction,
@@ -184,6 +207,22 @@ impl Cp0 {
         self.status & STATUS_TS != 0
     }
 
+    pub(super) fn is_cache_isolated(&self) -> bool {
+        self.status & STATUS_ISC != 0
+    }
+
+    pub(super) fn caches_swapped(&self) -> bool {
+        self.status & STATUS_SWC != 0
+    }
+
+    pub(super) fn set_cache_miss(&mut self, miss: bool) {
+        if miss {
+            self.status |= STATUS_CM;
+        } else {
+            self.status &= !STATUS_CM;
+        }
+    }
+
     pub(super) fn enter_tlb_shutdown(&mut self) {
         self.status |= STATUS_TS;
     }
@@ -248,6 +287,8 @@ impl Cp0 {
                 fault == TlbFaultKind::Miss && address < 0x8000_0000,
             ),
             Exception::TlbModified { address } => (1, Some(address), Some(address), false),
+            Exception::InstructionBusError => (6, None, None, false),
+            Exception::DataBusError => (7, None, None, false),
             Exception::Syscall => (8, None, None, false),
             Exception::Breakpoint => (9, None, None, false),
             Exception::ReservedInstruction => (10, None, None, false),
@@ -362,10 +403,10 @@ mod tests {
         CAUSE_SOFTWARE_IP_MASK, CAUSE_VISIBLE_MASK, CONTEXT_BAD_VPN_MASK, CONTEXT_PTE_BASE_MASK,
         Cp0, Cp0Instruction, ENTRY_HI_VISIBLE_MASK, ENTRY_HI_VPN_MASK, ENTRY_LO_VISIBLE_MASK,
         Exception, ExecutionError, FunctionalState, GENERAL_EXCEPTION_VECTOR, INDEX_INDEX_MASK,
-        INDEX_PROBE_FAILURE, InstructionEffect, PRID, RANDOM_RESET, STATUS_BEV, STATUS_CU_MASK,
-        STATUS_CU0, STATUS_IEC, STATUS_INTERRUPT_CONTROL_MASK, STATUS_KUC, STATUS_MODE_STACK_MASK,
-        STATUS_PE, STATUS_TS, STATUS_VISIBLE_MASK, STATUS_WRITABLE_MASK, State,
-        TLB_REFILL_EXCEPTION_VECTOR, TlbFaultKind, execute,
+        INDEX_PROBE_FAILURE, InstructionEffect, PRID, RANDOM_RESET, STATUS_BEV, STATUS_CM,
+        STATUS_CU_MASK, STATUS_CU0, STATUS_IEC, STATUS_INTERRUPT_CONTROL_MASK, STATUS_ISC,
+        STATUS_KUC, STATUS_MODE_STACK_MASK, STATUS_PE, STATUS_SWC, STATUS_TS, STATUS_VISIBLE_MASK,
+        STATUS_WRITABLE_MASK, State, TLB_REFILL_EXCEPTION_VECTOR, TlbFaultKind, execute,
     };
 
     #[test]
@@ -496,6 +537,8 @@ mod tests {
                 5,
                 true,
             ),
+            (Exception::InstructionBusError, 6, false),
+            (Exception::DataBusError, 7, true),
             (Exception::Syscall, 8, true),
             (Exception::Breakpoint, 9, false),
             (Exception::ReservedInstruction, 10, true),
@@ -557,11 +600,15 @@ mod tests {
     }
 
     #[test]
-    fn non_address_exceptions_preserve_bad_vaddr() {
+    fn non_address_exceptions_preserve_translation_registers() {
         let original_bad_vaddr = 0x1234_5678;
+        let original_context = 0xabc0_0000;
+        let original_entry_hi = 0x5678_9a80;
         let mut cp0 = Cp0::new();
 
         for exception in [
+            Exception::InstructionBusError,
+            Exception::DataBusError,
             Exception::Syscall,
             Exception::Breakpoint,
             Exception::ReservedInstruction,
@@ -569,10 +616,14 @@ mod tests {
             Exception::Overflow,
         ] {
             cp0.bad_vaddr = original_bad_vaddr;
+            cp0.context = original_context;
+            cp0.entry_hi = original_entry_hi;
 
             cp0.take_exception(exception, 0, false);
 
             assert_eq!(cp0.bad_vaddr, original_bad_vaddr);
+            assert_eq!(cp0.context, original_context);
+            assert_eq!(cp0.entry_hi, original_entry_hi);
         }
     }
 
@@ -731,8 +782,6 @@ mod tests {
 
     #[test]
     fn status_and_cause_writes_preserve_hardware_fields() {
-        const STATUS_CM: u32 = 1 << 19;
-
         let mut cp0 = Cp0::new();
         cp0.status = STATUS_TS | STATUS_PE | STATUS_CM;
 
@@ -756,6 +805,31 @@ mod tests {
             (original_cause & !CAUSE_SOFTWARE_IP_MASK) | 0x0000_0100
         );
         assert_eq!(cp0.read_register(13), cp0.cause & CAUSE_VISIBLE_MASK);
+    }
+
+    #[test]
+    fn cache_status_helpers_use_raw_status_and_preserve_hardware_miss() {
+        const STATUS_PZ: u32 = 1 << 18;
+
+        let mut cp0 = Cp0::new();
+        cp0.write_register(12, STATUS_BEV | STATUS_PZ | STATUS_ISC | STATUS_SWC);
+
+        assert!(cp0.is_cache_isolated());
+        assert!(cp0.caches_swapped());
+        assert_eq!(cp0.read_register(12) & STATUS_PZ, STATUS_PZ);
+        assert_eq!(cp0.read_register(12) & STATUS_CM, 0);
+
+        cp0.set_cache_miss(true);
+        assert_eq!(cp0.read_register(12) & STATUS_PZ, STATUS_PZ);
+        assert_eq!(cp0.read_register(12) & STATUS_CM, STATUS_CM);
+
+        cp0.write_register(12, 0);
+        assert!(!cp0.is_cache_isolated());
+        assert!(!cp0.caches_swapped());
+        assert_eq!(cp0.read_register(12) & STATUS_CM, STATUS_CM);
+
+        cp0.set_cache_miss(false);
+        assert_eq!(cp0.read_register(12) & STATUS_CM, 0);
     }
 
     #[test]
@@ -894,7 +968,7 @@ mod tests {
 
     #[test]
     fn instruction_execution_captures_values_and_branches() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.write_gpr(2, 0x1234_5678);
 
         assert_eq!(
@@ -968,7 +1042,7 @@ mod tests {
 
     #[test]
     fn tlb_instruction_execution_returns_state_coordinated_effects() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
 
         assert_eq!(
             execute(&mut state, Cp0Instruction::Tlbr, false),
@@ -1011,7 +1085,7 @@ mod tests {
 
     #[test]
     fn cp0_usability_uses_raw_mode_and_effective_cu0() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let user_with_cu0 = STATUS_BEV | STATUS_KUC | STATUS_CU0;
 
         state.complete_instruction(
@@ -1035,7 +1109,7 @@ mod tests {
 
     #[test]
     fn every_cp0_instruction_checks_usability_before_execution() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.complete_instruction(
             None,
             Some(InstructionEffect::DelayedCp0Write {

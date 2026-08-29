@@ -195,7 +195,7 @@ mod tests {
     use super::{AluInstruction as Instruction, Exception, State, execute};
 
     fn run(instruction: Instruction, registers: &[(usize, u32)], destination: usize) -> u32 {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         for &(index, value) in registers {
             state.write_gpr(index, value);
         }
@@ -206,7 +206,7 @@ mod tests {
     }
 
     fn run_hilo(instruction: Instruction, registers: &[(usize, u32)]) -> (u32, u32) {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         for &(index, value) in registers {
             state.write_gpr(index, value);
         }
@@ -218,7 +218,7 @@ mod tests {
 
     fn assert_overflow(instruction: Instruction, registers: &[(usize, u32)], destination: usize) {
         let sentinel = 0xdead_beef;
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         for &(index, value) in registers {
             state.write_gpr(index, value);
         }
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn hi_lo_transfers_preserve_the_companion_register() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.write_gpr(1, 0x1234_5678);
         state.write_gpr(2, 0x89ab_cdef);
         state.write_hi(0xaaaa_aaaa);
@@ -679,7 +679,7 @@ mod tests {
             3,
         );
 
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.write_gpr(1, i32::MAX as u32);
         state.write_gpr(2, 1);
 
@@ -890,7 +890,7 @@ mod tests {
 
     #[test]
     fn execution_supports_aliasing_and_preserves_pc_and_register_zero() {
-        let mut state = State::new();
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.write_gpr(1, 5);
         state.write_gpr(2, 7);
         let pc = state.pc();

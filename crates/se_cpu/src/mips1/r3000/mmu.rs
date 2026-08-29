@@ -4,6 +4,8 @@ const TLB_ENTRY_COUNT: usize = 64;
 
 const KUSEG_END: u32 = 0x7fff_ffff;
 const KSEG0_START: u32 = 0x8000_0000;
+const KSEG0_END: u32 = 0x9fff_ffff;
+const KSEG1_START: u32 = 0xa000_0000;
 const KSEG1_END: u32 = 0xbfff_ffff;
 const PHYSICAL_ADDRESS_MASK: u32 = 0x1fff_ffff;
 
@@ -26,6 +28,18 @@ pub(super) enum AccessType {
     )]
     Load,
     Store,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Cacheability {
+    Cached,
+    Uncached,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Translation {
+    pub(super) address: PhysAddr,
+    pub(super) cacheability: Cacheability,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,12 +115,17 @@ impl Mmu {
         asid: u8,
         kernel_mode: bool,
         access: AccessType,
-    ) -> Result<PhysAddr, TranslationFault> {
+    ) -> Result<Translation, TranslationFault> {
         match virtual_address {
             0..=KUSEG_END => self.translate_mapped(virtual_address, asid, access),
-            KSEG0_START..=KSEG1_END if kernel_mode => Ok(PhysAddr::new(u64::from(
-                virtual_address & PHYSICAL_ADDRESS_MASK,
-            ))),
+            KSEG0_START..=KSEG0_END if kernel_mode => Ok(Translation {
+                address: PhysAddr::new(u64::from(virtual_address & PHYSICAL_ADDRESS_MASK)),
+                cacheability: Cacheability::Cached,
+            }),
+            KSEG1_START..=KSEG1_END if kernel_mode => Ok(Translation {
+                address: PhysAddr::new(u64::from(virtual_address & PHYSICAL_ADDRESS_MASK)),
+                cacheability: Cacheability::Uncached,
+            }),
             KSEG0_START..=KSEG1_END => Err(TranslationFault::AddressError),
             _ if kernel_mode => self.translate_mapped(virtual_address, asid, access),
             _ => Err(TranslationFault::AddressError),
@@ -150,7 +169,7 @@ impl Mmu {
         virtual_address: u32,
         asid: u8,
         access: AccessType,
-    ) -> Result<PhysAddr, TranslationFault> {
+    ) -> Result<Translation, TranslationFault> {
         let entries = match access {
             AccessType::Instruction => &self.instruction_entries,
             AccessType::Load | AccessType::Store => &self.entries,
@@ -178,7 +197,15 @@ impl Mmu {
 
         let physical_address =
             (entry.entry_lo & ENTRY_LO_PFN_MASK) | (virtual_address & !ENTRY_HI_VPN_MASK);
-        Ok(PhysAddr::new(u64::from(physical_address)))
+        let cacheability = if entry.entry_lo & ENTRY_LO_NONCACHEABLE == 0 {
+            Cacheability::Cached
+        } else {
+            Cacheability::Uncached
+        };
+        Ok(Translation {
+            address: PhysAddr::new(u64::from(physical_address)),
+            cacheability,
+        })
     }
 
     fn advance_instruction_view_with(&mut self, new_write: Option<PendingTlbWrite>) {
@@ -192,12 +219,12 @@ impl Mmu {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::PhysAddr;
-
     use super::{
-        AccessType, ENTRY_HI_ASID_MASK, ENTRY_HI_VPN_MASK, ENTRY_LO_DIRTY, ENTRY_LO_GLOBAL,
-        ENTRY_LO_NONCACHEABLE, ENTRY_LO_VALID, Mmu, ProbeResult, TLB_ENTRY_COUNT, TranslationFault,
+        AccessType, Cacheability, ENTRY_HI_ASID_MASK, ENTRY_HI_VPN_MASK, ENTRY_LO_DIRTY,
+        ENTRY_LO_GLOBAL, ENTRY_LO_NONCACHEABLE, ENTRY_LO_VALID, Mmu, ProbeResult, TLB_ENTRY_COUNT,
+        Translation, TranslationFault,
     };
+    use se_core::bus::PhysAddr;
 
     const ASID: u8 = 0x15;
 
@@ -207,6 +234,13 @@ mod tests {
 
     fn entry_lo(physical_address: u32, flags: u32) -> u32 {
         (physical_address & 0xffff_f000) | flags
+    }
+
+    fn translation(address: u64, cacheability: Cacheability) -> Translation {
+        Translation {
+            address: PhysAddr::new(address),
+            cacheability,
+        }
     }
 
     fn complete_and_sync(
@@ -243,16 +277,16 @@ mod tests {
     fn translates_kernel_direct_segments_and_rejects_user_access() {
         let mmu = Mmu::new();
 
-        for (virtual_address, physical_address) in [
-            (0x8000_0000, 0),
-            (0x9fff_ffff, 0x1fff_ffff),
-            (0xa000_0000, 0),
-            (0xbfc0_0000, 0x1fc0_0000),
-            (0xbfff_ffff, 0x1fff_ffff),
+        for (virtual_address, physical_address, cacheability) in [
+            (0x8000_0000, 0, Cacheability::Cached),
+            (0x9fff_ffff, 0x1fff_ffff, Cacheability::Cached),
+            (0xa000_0000, 0, Cacheability::Uncached),
+            (0xbfc0_0000, 0x1fc0_0000, Cacheability::Uncached),
+            (0xbfff_ffff, 0x1fff_ffff, Cacheability::Uncached),
         ] {
             assert_eq!(
                 mmu.translate(virtual_address, 0, true, AccessType::Instruction),
-                Ok(PhysAddr::new(physical_address))
+                Ok(translation(physical_address, cacheability))
             );
         }
 
@@ -285,13 +319,13 @@ mod tests {
             entry_hi(kseg2_address, 0),
             entry_lo(
                 0x7654_3000,
-                ENTRY_LO_VALID | ENTRY_LO_DIRTY | ENTRY_LO_GLOBAL,
+                ENTRY_LO_VALID | ENTRY_LO_DIRTY | ENTRY_LO_GLOBAL | ENTRY_LO_NONCACHEABLE,
             ),
         );
 
         assert_eq!(
             mmu.translate(kuseg_address, ASID, true, AccessType::Load),
-            Ok(PhysAddr::new(0x89ab_cabc))
+            Ok(translation(0x89ab_cabc, Cacheability::Cached))
         );
         assert_eq!(
             mmu.translate(kuseg_address, ASID ^ 1, true, AccessType::Load),
@@ -299,12 +333,44 @@ mod tests {
         );
         assert_eq!(
             mmu.translate(kseg2_address, 0x3f, true, AccessType::Store),
-            Ok(PhysAddr::new(0x7654_3def))
+            Ok(translation(0x7654_3def, Cacheability::Uncached))
         );
         assert_eq!(
             mmu.translate(kseg2_address, ASID, false, AccessType::Load),
             Err(TranslationFault::AddressError)
         );
+    }
+
+    #[test]
+    fn mapped_cacheability_is_shared_by_all_access_types() {
+        let mut mmu = Mmu::new();
+        let cached_address = 0x1234_5000;
+        let uncached_address = 0x2345_6000;
+        complete_and_sync(
+            &mut mmu,
+            5,
+            cached_address,
+            0x1000_0000,
+            ENTRY_LO_VALID | ENTRY_LO_DIRTY,
+        );
+        complete_and_sync(
+            &mut mmu,
+            6,
+            uncached_address,
+            0x2000_0000,
+            ENTRY_LO_VALID | ENTRY_LO_DIRTY | ENTRY_LO_NONCACHEABLE,
+        );
+
+        for access in [AccessType::Instruction, AccessType::Load, AccessType::Store] {
+            assert_eq!(
+                mmu.translate(cached_address, ASID, true, access),
+                Ok(translation(0x1000_0000, Cacheability::Cached))
+            );
+            assert_eq!(
+                mmu.translate(uncached_address, ASID, true, access),
+                Ok(translation(0x2000_0000, Cacheability::Uncached))
+            );
+        }
     }
 
     #[test]
@@ -325,7 +391,10 @@ mod tests {
             );
             assert_eq!(
                 mmu.translate(virtual_address, ASID, true, AccessType::Load),
-                Ok(PhysAddr::new(u64::from(physical_address)))
+                Ok(translation(
+                    u64::from(physical_address),
+                    Cacheability::Cached
+                ))
             );
         }
     }
@@ -349,11 +418,11 @@ mod tests {
         );
         assert_eq!(
             mmu.translate(clean_address, ASID, true, AccessType::Load),
-            Ok(PhysAddr::new(0x2000_0000))
+            Ok(translation(0x2000_0000, Cacheability::Cached))
         );
         assert_eq!(
             mmu.translate(clean_address, ASID, true, AccessType::Instruction),
-            Ok(PhysAddr::new(0x2000_0000))
+            Ok(translation(0x2000_0000, Cacheability::Cached))
         );
         assert_eq!(
             mmu.translate(clean_address, ASID, true, AccessType::Store),
@@ -427,23 +496,23 @@ mod tests {
 
         assert_eq!(
             mmu.translate(virtual_address, ASID, true, AccessType::Load),
-            Ok(PhysAddr::new(0x2222_2123))
+            Ok(translation(0x2222_2123, Cacheability::Cached))
         );
         assert_eq!(
             mmu.translate(virtual_address, ASID, true, AccessType::Instruction),
-            Ok(PhysAddr::new(0x1111_1123))
-        );
-
-        mmu.advance_instruction_view();
-        assert_eq!(
-            mmu.translate(virtual_address, ASID, true, AccessType::Instruction),
-            Ok(PhysAddr::new(0x1111_1123))
+            Ok(translation(0x1111_1123, Cacheability::Cached))
         );
 
         mmu.advance_instruction_view();
         assert_eq!(
             mmu.translate(virtual_address, ASID, true, AccessType::Instruction),
-            Ok(PhysAddr::new(0x2222_2123))
+            Ok(translation(0x1111_1123, Cacheability::Cached))
+        );
+
+        mmu.advance_instruction_view();
+        assert_eq!(
+            mmu.translate(virtual_address, ASID, true, AccessType::Instruction),
+            Ok(translation(0x2222_2123, Cacheability::Cached))
         );
     }
 
@@ -459,17 +528,17 @@ mod tests {
 
         assert_eq!(
             mmu.translate(virtual_address, ASID, true, AccessType::Instruction),
-            Ok(PhysAddr::new(0x1000_0000))
+            Ok(translation(0x1000_0000, Cacheability::Cached))
         );
         mmu.advance_instruction_view();
         assert_eq!(
             mmu.translate(virtual_address, ASID, true, AccessType::Instruction),
-            Ok(PhysAddr::new(0x2000_0000))
+            Ok(translation(0x2000_0000, Cacheability::Cached))
         );
         mmu.advance_instruction_view();
         assert_eq!(
             mmu.translate(virtual_address, ASID, true, AccessType::Instruction),
-            Ok(PhysAddr::new(0x3000_0000))
+            Ok(translation(0x3000_0000, Cacheability::Cached))
         );
     }
 
@@ -491,7 +560,7 @@ mod tests {
         assert_eq!(mmu.read_indexed(10), (high, low));
         assert_eq!(
             mmu.translate(virtual_address, ASID, true, AccessType::Instruction),
-            Ok(PhysAddr::new(0x4000_0000))
+            Ok(translation(0x4000_0000, Cacheability::Cached))
         );
         assert_eq!(mmu.pending_instruction_writes, [None; 2]);
     }
