@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/se_core", "crates/se_cpu"]
+members = ["crates/se_core", "crates/se_cpu", "crates/se_float"]
 resolver = "3"
 
 [workspace.package]
@@ -10,6 +10,8 @@ license = "GPL-3.0-or-later"
 authors = ["rickgcn"]
 
 [workspace.dependencies]
+bitflags = "2"
+cc = "1"
 se_core = { path = "crates/se_core" }
 
 [profile.release]
