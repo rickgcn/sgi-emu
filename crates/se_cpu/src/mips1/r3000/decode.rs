@@ -18,6 +18,7 @@ pub(super) enum Instruction {
     Alu(AluInstruction),
     Control(ControlInstruction),
     Cp0(Cp0Instruction),
+    Memory(MemoryInstruction),
     Syscall,
     Breakpoint,
 }
@@ -204,6 +205,18 @@ pub(super) enum Cp0Instruction {
     Rfe,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MemoryInstruction {
+    Lb { base: usize, rt: usize, offset: u16 },
+    Lbu { base: usize, rt: usize, offset: u16 },
+    Lh { base: usize, rt: usize, offset: u16 },
+    Lhu { base: usize, rt: usize, offset: u16 },
+    Lw { base: usize, rt: usize, offset: u16 },
+    Sb { base: usize, rt: usize, offset: u16 },
+    Sh { base: usize, rt: usize, offset: u16 },
+    Sw { base: usize, rt: usize, offset: u16 },
+}
+
 pub(super) fn decode(word: u32) -> DecodeResult {
     match opcode(word) {
         0x00 => decode_special(word),
@@ -279,7 +292,50 @@ pub(super) fn decode(word: u32) -> DecodeResult {
         })),
         0x10 => decode_cp0(word),
         0x11..=0x13 => decode_coprocessor(word),
-        0x20..=0x26 | 0x28..=0x2b | 0x2e | 0x31..=0x33 | 0x39..=0x3b => DecodeResult::Unimplemented,
+        0x20 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Lb {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
+        0x21 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Lh {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
+        0x22 => DecodeResult::Unimplemented,
+        0x23 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Lw {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
+        0x24 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Lbu {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
+        0x25 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Lhu {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
+        0x26 => DecodeResult::Unimplemented,
+        0x28 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Sb {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
+        0x29 => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Sh {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
+        0x2a => DecodeResult::Unimplemented,
+        0x2b => DecodeResult::Implemented(Instruction::Memory(MemoryInstruction::Sw {
+            base: rs(word),
+            rt: rt(word),
+            offset: immediate(word),
+        })),
+        0x2e | 0x31..=0x33 | 0x39..=0x3b => DecodeResult::Unimplemented,
         _ => DecodeResult::Reserved,
     }
 }
@@ -546,7 +602,7 @@ fn target(word: u32) -> u32 {
 mod tests {
     use super::{
         AluInstruction, CP0_RFE, CP0_TLBP, CP0_TLBR, CP0_TLBWI, CP0_TLBWR, ControlInstruction,
-        Cp0Instruction, DecodeResult, Instruction, decode,
+        Cp0Instruction, DecodeResult, Instruction, MemoryInstruction, decode,
     };
 
     fn encode_register(rs: u32, rt: u32, rd: u32, shift_amount: u32, function: u32) -> u32 {
@@ -575,6 +631,10 @@ mod tests {
 
     fn cp0(instruction: Cp0Instruction) -> DecodeResult {
         DecodeResult::Implemented(Instruction::Cp0(instruction))
+    }
+
+    fn memory(instruction: MemoryInstruction) -> DecodeResult {
+        DecodeResult::Implemented(Instruction::Memory(instruction))
     }
 
     #[test]
@@ -938,6 +998,83 @@ mod tests {
     }
 
     #[test]
+    fn decodes_every_supported_memory_instruction() {
+        let cases = [
+            (
+                0x20,
+                MemoryInstruction::Lb {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x24,
+                MemoryInstruction::Lbu {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x21,
+                MemoryInstruction::Lh {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x25,
+                MemoryInstruction::Lhu {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x23,
+                MemoryInstruction::Lw {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x28,
+                MemoryInstruction::Sb {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x29,
+                MemoryInstruction::Sh {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x2b,
+                MemoryInstruction::Sw {
+                    base: 1,
+                    rt: 31,
+                    offset: 0x8001,
+                },
+            ),
+        ];
+
+        for (opcode, instruction) in cases {
+            assert_eq!(
+                decode(encode_immediate(opcode, 1, 31, 0x8001)),
+                memory(instruction)
+            );
+        }
+    }
+
+    #[test]
     fn decodes_explicit_exception_instructions_and_ignores_code() {
         let code = 0x0a_bcde;
 
@@ -1052,9 +1189,7 @@ mod tests {
 
     #[test]
     fn classifies_legal_unimplemented_mips_i_encodings() {
-        for opcode in [
-            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x28, 0x29, 0x2a, 0x2b, 0x2e,
-        ] {
+        for opcode in [0x22, 0x26, 0x2a, 0x2e] {
             assert_eq!(
                 decode(encode_immediate(opcode, 1, 2, 0x8001)),
                 DecodeResult::Unimplemented

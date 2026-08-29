@@ -68,10 +68,6 @@ impl Cache {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "The cache store path precedes the R3000 load/store instruction subset"
-    )]
     fn write(
         &mut self,
         address: PhysAddr,
@@ -115,10 +111,6 @@ impl Cache {
         !(entry.valid && entry.page_frame == access.page_frame)
     }
 
-    #[allow(
-        dead_code,
-        reason = "The isolated store path precedes the R3000 load/store instruction subset"
-    )]
     fn write_isolated(&mut self, address: PhysAddr, data: &[u8]) {
         let access = self.access(address, data.len());
         if data.len() == WORD_BYTES {
@@ -175,10 +167,6 @@ pub(super) enum CacheBank {
 pub(super) struct Caches {
     instruction: Cache,
     data: Cache,
-    #[allow(
-        dead_code,
-        reason = "The store policy precedes the R3000 load/store instruction subset"
-    )]
     partial_store_enabled: bool,
 }
 
@@ -204,10 +192,6 @@ impl Caches {
         self.cache_mut(bank).read(address, data, bus)
     }
 
-    #[allow(
-        dead_code,
-        reason = "The cache store path precedes the R3000 load/store instruction subset"
-    )]
     pub(super) fn write(
         &mut self,
         bank: CacheBank,
@@ -229,10 +213,6 @@ impl Caches {
         self.cache(bank).read_isolated(address, data)
     }
 
-    #[allow(
-        dead_code,
-        reason = "The isolated store path precedes the R3000 load/store instruction subset"
-    )]
     pub(super) fn write_isolated(&mut self, bank: CacheBank, address: PhysAddr, data: &[u8]) {
         self.cache_mut(bank).write_isolated(address, data);
     }

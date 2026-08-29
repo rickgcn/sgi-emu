@@ -215,10 +215,6 @@ impl State {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "Memory-store routing precedes the R3000 load/store instruction subset"
-    )]
     pub(super) fn store_memory(
         &mut self,
         translation: Translation,

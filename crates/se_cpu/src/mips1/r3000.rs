@@ -5,6 +5,7 @@ mod cache;
 mod control;
 mod cp0;
 mod decode;
+mod load_store;
 mod mmu;
 mod state;
 
@@ -105,6 +106,7 @@ const fn valid_refill_size(bytes: usize) -> bool {
 enum ExecutionError {
     Exception(Exception),
     TlbShutdown,
+    BusFault { address: PhysAddr, fault: BusFault },
 }
 
 /// An error encountered while executing one processor step.
@@ -177,11 +179,12 @@ impl R3000 {
     ///
     /// A successful step either completes one instruction or enters a guest
     /// exception. Guest exceptions are architectural state transitions and do
-    /// not produce [`StepError`]. Instruction-fetch bus faults enter the guest
-    /// instruction-bus-error exception. Unsupported instructions leave
-    /// architectural registers unchanged, although a successful cached fetch
-    /// remains visible in the instruction cache. A newly detected translation
-    /// buffer shutdown changes only the CP0 shutdown state.
+    /// not produce [`StepError`]. Instruction and data read bus faults enter
+    /// the guest instruction- and data-bus-error exceptions, respectively.
+    /// Unsupported instructions leave architectural registers unchanged,
+    /// although a successful cached fetch remains visible in the instruction
+    /// cache. A newly detected translation buffer shutdown changes only the
+    /// CP0 shutdown state.
     ///
     /// # Errors
     ///
@@ -240,6 +243,10 @@ impl R3000 {
                 Instruction::Cp0(instruction) => {
                     cp0::execute(&mut self.state, instruction, self.cp0_condition)
                 }
+                Instruction::Memory(instruction) => {
+                    load_store::execute(&mut self.state, instruction, bus)
+                        .map(|effect| (None, effect))
+                }
                 Instruction::Syscall => Err(ExecutionError::Exception(Exception::Syscall)),
                 Instruction::Breakpoint => Err(ExecutionError::Exception(Exception::Breakpoint)),
             };
@@ -250,6 +257,9 @@ impl R3000 {
             }
             Err(ExecutionError::Exception(exception)) => self.state.take_exception(exception),
             Err(ExecutionError::TlbShutdown) => return Err(StepError::TlbShutdown),
+            Err(ExecutionError::BusFault { address, fault }) => {
+                return Err(StepError::BusFault { address, fault });
+            }
         }
 
         Ok(())
@@ -269,6 +279,8 @@ fn fetch_instruction(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 
     use super::{R3000, R3000Config, StepError, fetch_instruction};
@@ -279,11 +291,13 @@ mod tests {
 
     const BOOT_GENERAL_EXCEPTION_VECTOR: u32 = 0xbfc0_0180;
     const BOOT_TLB_REFILL_EXCEPTION_VECTOR: u32 = 0xbfc0_0100;
+    const BOOT_PHYSICAL_ADDRESS: u64 = 0x1fc0_0000;
     const ENTRY_LO_NONCACHEABLE: u32 = 1 << 11;
     const ENTRY_LO_DIRTY: u32 = 1 << 10;
     const ENTRY_LO_VALID: u32 = 1 << 9;
     const STATUS_BEV: u32 = 1 << 22;
     const STATUS_TS: u32 = 1 << 21;
+    const STATUS_CM: u32 = 1 << 19;
     const STATUS_SWC: u32 = 1 << 17;
     const STATUS_ISC: u32 = 1 << 16;
     const STATUS_KUC: u32 = 1 << 1;
@@ -375,6 +389,76 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ByteBus {
+        memory: BTreeMap<u64, u8>,
+        reads: Vec<(PhysAddr, usize)>,
+        writes: Vec<(PhysAddr, Vec<u8>)>,
+        read_fault: Option<(PhysAddr, BusFault)>,
+        write_fault: Option<(PhysAddr, BusFault)>,
+    }
+
+    impl ByteBus {
+        fn insert_bytes(&mut self, address: u64, bytes: &[u8]) {
+            for (offset, byte) in bytes.iter().copied().enumerate() {
+                self.memory.insert(address + offset as u64, byte);
+            }
+        }
+
+        fn insert_word(&mut self, address: u64, word: u32) {
+            self.insert_bytes(address, &word.to_be_bytes());
+        }
+
+        fn bytes(&self, address: u64, length: usize) -> Vec<u8> {
+            (0..length)
+                .map(|offset| {
+                    self.memory
+                        .get(&(address + offset as u64))
+                        .copied()
+                        .expect("test memory should contain the requested byte")
+                })
+                .collect()
+        }
+    }
+
+    impl PhysicalBus for ByteBus {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+            self.reads.push((address, data.len()));
+            if let Some((fault_address, fault)) = self.read_fault
+                && address == fault_address
+            {
+                return Err(fault);
+            }
+
+            let mut staged = Vec::with_capacity(data.len());
+            for offset in 0..data.len() {
+                let address = address.get() + offset as u64;
+                staged.push(
+                    self.memory
+                        .get(&address)
+                        .copied()
+                        .ok_or(BusFault::Unmapped)?,
+                );
+            }
+            data.copy_from_slice(&staged);
+            Ok(())
+        }
+
+        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+            self.writes.push((address, data.to_vec()));
+            if let Some((fault_address, fault)) = self.write_fault
+                && address == fault_address
+            {
+                return Err(fault);
+            }
+
+            for (offset, byte) in data.iter().copied().enumerate() {
+                self.memory.insert(address.get() + offset as u64, byte);
+            }
+            Ok(())
+        }
+    }
+
     fn snapshot(processor: &R3000) -> ([u32; 32], u32, u32, u32) {
         (
             std::array::from_fn(|index| processor.state.read_gpr(index)),
@@ -429,6 +513,10 @@ mod tests {
 
     fn encode_register(rs: u32, rt: u32, rd: u32, function: u32) -> u32 {
         (rs << 21) | (rt << 16) | (rd << 11) | function
+    }
+
+    fn encode_immediate(opcode: u32, rs: u32, rt: u32, immediate: u16) -> u32 {
+        (opcode << 26) | (rs << 21) | (rt << 16) | u32::from(immediate)
     }
 
     fn word_bytes(word: u32) -> [u8; 4] {
@@ -517,7 +605,7 @@ mod tests {
 
     #[test]
     fn direct_segments_distinguish_cached_hits_from_uncached_reads() {
-        let unsupported = 0x8c01_0000;
+        let unsupported = 0x8801_0000;
 
         let mut kseg1_processor = R3000::new(super::TEST_CONFIG);
         for _ in 0..2 {
@@ -561,7 +649,7 @@ mod tests {
         let config = R3000Config::new(32 * 1024, 32 * 1024, 64, 4, true);
         let mut processor = R3000::new(config);
         jump_to(&mut processor, 0x8000_0024);
-        let unsupported = 0x8c01_0000;
+        let unsupported = 0x8801_0000;
         let mut bus = TestBus::new(word_bytes(unsupported));
 
         assert_eq!(
@@ -584,7 +672,7 @@ mod tests {
     fn mapped_entry_noncacheable_bit_controls_instruction_fetch() {
         let virtual_address = 0x0040_0000;
         let physical_address = 0x0010_0000;
-        let unsupported = 0x8c01_0000;
+        let unsupported = 0x8801_0000;
 
         for (noncacheable, second_fetch_reads_bus) in [(false, false), (true, true)] {
             let mut processor = R3000::new(super::TEST_CONFIG);
@@ -623,7 +711,7 @@ mod tests {
     #[test]
     fn instruction_fetch_ignores_isolation_and_honors_cache_swap() {
         let target = 0x8000_0300;
-        let unsupported = 0x8c01_0000;
+        let unsupported = 0x8801_0000;
         let mut processor = R3000::new(super::TEST_CONFIG);
         set_cp0_register(&mut processor, 12, STATUS_BEV | STATUS_ISC | STATUS_SWC);
         jump_to(&mut processor, target);
@@ -811,6 +899,471 @@ mod tests {
     }
 
     #[test]
+    fn step_executes_every_aligned_load_instruction() {
+        let cases = [
+            (0x20, [0x80, 0x01, 0x23, 0x45], 1, 0xffff_ff80),
+            (0x24, [0x80, 0x01, 0x23, 0x45], 1, 0x0000_0080),
+            (0x21, [0x80, 0x01, 0x23, 0x45], 2, 0xffff_8001),
+            (0x25, [0x80, 0x01, 0x23, 0x45], 2, 0x0000_8001),
+            (0x23, [0x89, 0xab, 0xcd, 0xef], 4, 0x89ab_cdef),
+        ];
+
+        for (opcode, bytes, length, expected) in cases {
+            let mut processor = R3000::new(super::TEST_CONFIG);
+            processor.state.write_gpr(1, 0xa000_0100);
+            processor.state.write_gpr(2, 0x1111_1111);
+            let mut bus = ByteBus::default();
+            bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(opcode, 1, 2, 0));
+            bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, 0);
+            bus.insert_bytes(0x100, &bytes[..length]);
+
+            processor.step(&mut bus).expect("load should succeed");
+            assert_eq!(processor.state.read_gpr(2), 0x1111_1111);
+
+            processor
+                .step(&mut bus)
+                .expect("intervening instruction should succeed");
+            assert_eq!(processor.state.read_gpr(2), expected);
+            assert_eq!(
+                bus.reads,
+                [
+                    (PhysAddr::new(BOOT_PHYSICAL_ADDRESS), 4),
+                    (PhysAddr::new(0x100), length),
+                    (PhysAddr::new(BOOT_PHYSICAL_ADDRESS + 4), 4),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn step_executes_every_aligned_store_instruction() {
+        let cases: [(u32, u16, u64, &[u8]); 3] = [
+            (0x28, 3, 0x103, &[0xef]),
+            (0x29, 2, 0x102, &[0xcd, 0xef]),
+            (0x2b, 0, 0x100, &[0x89, 0xab, 0xcd, 0xef]),
+        ];
+
+        for (opcode, offset, address, expected) in cases {
+            let mut processor = R3000::new(super::TEST_CONFIG);
+            processor.state.write_gpr(1, 0xa000_0100);
+            processor.state.write_gpr(2, 0x89ab_cdef);
+            let mut bus = ByteBus::default();
+            bus.insert_word(
+                BOOT_PHYSICAL_ADDRESS,
+                encode_immediate(opcode, 1, 2, offset),
+            );
+
+            processor.step(&mut bus).expect("store should succeed");
+
+            assert_eq!(bus.writes, [(PhysAddr::new(address), expected.to_vec())]);
+            assert_eq!(bus.bytes(address, expected.len()), expected);
+            assert_eq!(processor.state.pc(), 0xbfc0_0004);
+        }
+    }
+
+    #[test]
+    fn load_to_register_zero_still_accesses_memory() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0xa000_0100);
+        let mut bus = ByteBus::default();
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 1, 0, 0));
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, 0);
+        bus.insert_word(0x100, 0x89ab_cdef);
+
+        processor.step(&mut bus).expect("LW should succeed");
+        processor.step(&mut bus).expect("NOP should succeed");
+
+        assert_eq!(processor.state.read_gpr(0), 0);
+        assert!(bus.reads.contains(&(PhysAddr::new(0x100), 4)));
+    }
+
+    #[test]
+    fn dependent_instruction_reads_preload_value() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0xa000_0100);
+        processor.state.write_gpr(2, 0x1111_1111);
+        let mut bus = ByteBus::default();
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 1, 2, 0));
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, encode_register(2, 0, 3, 0x21));
+        bus.insert_word(0x100, 0x2222_2222);
+
+        processor.step(&mut bus).expect("LW should succeed");
+        processor.step(&mut bus).expect("ADDU should succeed");
+
+        assert_eq!(processor.state.read_gpr(2), 0x2222_2222);
+        assert_eq!(processor.state.read_gpr(3), 0x1111_1111);
+    }
+
+    #[test]
+    fn direct_write_overrides_pending_load_result() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0xa000_0100);
+        processor.state.write_gpr(2, 5);
+        let mut bus = ByteBus::default();
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 1, 2, 0));
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, encode_immediate(0x09, 2, 2, 1));
+        bus.insert_word(0x100, 99);
+
+        processor.step(&mut bus).expect("LW should succeed");
+        processor.step(&mut bus).expect("ADDIU should succeed");
+
+        assert_eq!(processor.state.read_gpr(2), 6);
+    }
+
+    #[test]
+    fn consecutive_loads_commit_in_order() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0xa000_0100);
+        processor.state.write_gpr(2, 0xaaaa_aaaa);
+        let mut bus = ByteBus::default();
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 1, 2, 0));
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, encode_immediate(0x23, 1, 2, 4));
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 8, 0);
+        bus.insert_word(0x100, 0x1111_1111);
+        bus.insert_word(0x104, 0x2222_2222);
+
+        processor.step(&mut bus).expect("first LW should succeed");
+        assert_eq!(processor.state.read_gpr(2), 0xaaaa_aaaa);
+
+        processor.step(&mut bus).expect("second LW should succeed");
+        assert_eq!(processor.state.read_gpr(2), 0x1111_1111);
+
+        processor.step(&mut bus).expect("NOP should succeed");
+        assert_eq!(processor.state.read_gpr(2), 0x2222_2222);
+    }
+
+    #[test]
+    fn store_uses_preload_value_for_base_and_data() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0xa000_0100);
+        processor.state.write_gpr(2, 0xa000_0200);
+        let mut bus = ByteBus::default();
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 1, 2, 0));
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, encode_immediate(0x2b, 2, 2, 0));
+        bus.insert_word(0x100, 0xa000_0300);
+
+        processor.step(&mut bus).expect("LW should succeed");
+        processor.step(&mut bus).expect("SW should succeed");
+
+        assert_eq!(processor.state.read_gpr(2), 0xa000_0300);
+        assert_eq!(bus.bytes(0x200, 4), 0xa000_0200_u32.to_be_bytes());
+        assert_eq!(
+            bus.writes,
+            [(PhysAddr::new(0x200), 0xa000_0200_u32.to_be_bytes().to_vec())]
+        );
+    }
+
+    #[test]
+    fn guest_exception_commits_pending_load_result() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0xa000_0100);
+        processor.state.write_gpr(2, 0x1111_1111);
+        processor.state.write_gpr(3, 0x3333_3333);
+        let mut bus = ByteBus::default();
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 1, 2, 0));
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, encode_immediate(0x23, 1, 3, 1));
+        bus.insert_word(0x100, 0x2222_2222);
+
+        processor.step(&mut bus).expect("first LW should succeed");
+        processor
+            .step(&mut bus)
+            .expect("address error should enter a guest exception");
+
+        assert_eq!(processor.state.read_gpr(2), 0x2222_2222);
+        assert_eq!(processor.state.read_gpr(3), 0x3333_3333);
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), 0xbfc0_0004);
+        assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 4);
+    }
+
+    #[test]
+    fn store_step_error_stalls_pending_load_result() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0xa000_0100);
+        processor.state.write_gpr(2, 0x1111_1111);
+        processor.state.write_gpr(3, 0x3333_3333);
+        processor.state.write_gpr(4, 0xa000_0200);
+        let mut bus = ByteBus::default();
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 1, 2, 0));
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, encode_immediate(0x2b, 4, 3, 0));
+        bus.insert_word(0x100, 0x2222_2222);
+
+        processor.step(&mut bus).expect("LW should succeed");
+        let core_before = snapshot(&processor);
+        let cp0_before = cp0_snapshot(&processor);
+        bus.write_fault = Some((PhysAddr::new(0x200), BusFault::Unmapped));
+
+        assert_eq!(
+            processor.step(&mut bus),
+            Err(StepError::BusFault {
+                address: PhysAddr::new(0x200),
+                fault: BusFault::Unmapped,
+            })
+        );
+        assert_eq!(snapshot(&processor), core_before);
+        assert_eq!(cp0_snapshot(&processor), cp0_before);
+        assert_eq!(processor.state.read_gpr(2), 0x1111_1111);
+
+        bus.write_fault = None;
+        processor.step(&mut bus).expect("retry should succeed");
+        assert_eq!(processor.state.read_gpr(2), 0x2222_2222);
+        assert_eq!(bus.bytes(0x200, 4), 0x3333_3333_u32.to_be_bytes());
+    }
+
+    #[test]
+    fn data_alignment_errors_precede_tlb_and_bus_access() {
+        let cases = [
+            (0x21, 1, 4),
+            (0x25, 1, 4),
+            (0x23, 2, 4),
+            (0x29, 1, 5),
+            (0x2b, 2, 5),
+        ];
+
+        for (opcode, address, exception_code) in cases {
+            let mut processor = R3000::new(super::TEST_CONFIG);
+            processor.state.write_gpr(1, address);
+            processor.state.write_gpr(2, 0x1234_5678);
+            let mut bus = ByteBus::default();
+            bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(opcode, 1, 2, 0));
+
+            processor
+                .step(&mut bus)
+                .expect("alignment error should enter a guest exception");
+
+            assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+            assert_eq!(processor.state.read_cp0(8), address);
+            assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, exception_code);
+            assert_eq!(processor.state.read_cp0(12) & STATUS_TS, 0);
+            assert_eq!(bus.reads, [(PhysAddr::new(BOOT_PHYSICAL_ADDRESS), 4)]);
+            assert!(bus.writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn data_tlb_faults_update_cp0_and_select_their_vectors() {
+        let virtual_address = 0x0040_0000;
+        let cases = [
+            (0x23, None, 2, BOOT_TLB_REFILL_EXCEPTION_VECTOR),
+            (0x2b, None, 3, BOOT_TLB_REFILL_EXCEPTION_VECTOR),
+            (
+                0x23,
+                Some(ENTRY_LO_NONCACHEABLE),
+                2,
+                BOOT_GENERAL_EXCEPTION_VECTOR,
+            ),
+            (
+                0x2b,
+                Some(ENTRY_LO_NONCACHEABLE),
+                3,
+                BOOT_GENERAL_EXCEPTION_VECTOR,
+            ),
+            (
+                0x2b,
+                Some(ENTRY_LO_NONCACHEABLE | ENTRY_LO_VALID),
+                1,
+                BOOT_GENERAL_EXCEPTION_VECTOR,
+            ),
+        ];
+
+        for (opcode, entry_flags, exception_code, vector) in cases {
+            let mut processor = R3000::new(super::TEST_CONFIG);
+            if let Some(flags) = entry_flags {
+                install_and_sync_tlb_entry(&mut processor, 5, virtual_address, 0x0010_0000, flags);
+                processor.reset();
+            }
+            processor.state.write_gpr(1, virtual_address);
+            processor.state.write_gpr(2, 0x1234_5678);
+            let mut bus = ByteBus::default();
+            bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(opcode, 1, 2, 0));
+
+            processor
+                .step(&mut bus)
+                .expect("TLB fault should enter a guest exception");
+
+            assert_eq!(processor.state.pc(), vector);
+            assert_eq!(processor.state.read_cp0(8), virtual_address);
+            assert_eq!(
+                processor.state.read_cp0(4),
+                (virtual_address >> 10) & 0x001f_fffc
+            );
+            assert_eq!(processor.state.read_cp0(10) & 0xffff_f000, virtual_address);
+            assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, exception_code);
+            assert_eq!(bus.reads, [(PhysAddr::new(BOOT_PHYSICAL_ADDRESS), 4)]);
+            assert!(bus.writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn data_read_faults_enter_dbe_without_address_register_updates() {
+        for base in [0xa000_0100, 0x8000_0100] {
+            let mut processor = R3000::new(super::TEST_CONFIG);
+            processor.state.write_gpr(1, base);
+            processor.state.write_gpr(2, 0x1111_1111);
+            let translation_registers = [
+                processor.state.read_cp0(8),
+                processor.state.read_cp0(4),
+                processor.state.read_cp0(10),
+            ];
+            let mut bus = ByteBus::default();
+            bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 1, 2, 0));
+            bus.read_fault = Some((PhysAddr::new(0x100), BusFault::Unmapped));
+
+            processor
+                .step(&mut bus)
+                .expect("data read fault should enter DBE");
+
+            assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+            assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 7);
+            assert_eq!(
+                [
+                    processor.state.read_cp0(8),
+                    processor.state.read_cp0(4),
+                    processor.state.read_cp0(10),
+                ],
+                translation_registers
+            );
+            assert_eq!(processor.state.read_gpr(2), 0x1111_1111);
+        }
+    }
+
+    #[test]
+    fn data_bus_error_in_delay_slot_records_branch_epc_and_bd() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0xa000_0100);
+        step_with_word(&mut processor, encode_immediate(0x04, 0, 0, 1))
+            .expect("BEQ should succeed");
+        let mut bus = ByteBus::default();
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, encode_immediate(0x23, 1, 2, 0));
+        bus.read_fault = Some((PhysAddr::new(0x100), BusFault::Unmapped));
+
+        processor
+            .step(&mut bus)
+            .expect("delay-slot DBE should enter a guest exception");
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), 0xbfc0_0000);
+        assert_ne!(processor.state.read_cp0(13) & (1 << 31), 0);
+        assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 7);
+    }
+
+    #[test]
+    fn data_translation_shutdown_stalls_the_instruction() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0);
+        processor.state.write_gpr(2, 0x1111_1111);
+        let core_before = snapshot(&processor);
+        let cp0_before = cp0_snapshot(&processor);
+        let mut bus = ByteBus::default();
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 1, 2, 0));
+
+        assert_eq!(processor.step(&mut bus), Err(StepError::TlbShutdown));
+
+        let mut expected_cp0 = cp0_before;
+        expected_cp0[12] |= STATUS_TS;
+        assert_eq!(snapshot(&processor), core_before);
+        assert_eq!(cp0_snapshot(&processor), expected_cp0);
+        assert_eq!(bus.reads, [(PhysAddr::new(BOOT_PHYSICAL_ADDRESS), 4)]);
+    }
+
+    #[test]
+    fn cached_load_hits_after_the_first_data_refill() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0x8000_0100);
+        let mut bus = ByteBus::default();
+        for (index, word) in [
+            encode_immediate(0x23, 1, 2, 0),
+            0,
+            encode_immediate(0x23, 1, 3, 0),
+            0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bus.insert_word(BOOT_PHYSICAL_ADDRESS + (index * 4) as u64, word);
+        }
+        bus.insert_word(0x100, 0x89ab_cdef);
+
+        processor.step(&mut bus).expect("first LW should succeed");
+        processor.step(&mut bus).expect("first NOP should succeed");
+        bus.read_fault = Some((PhysAddr::new(0x100), BusFault::Unmapped));
+        processor
+            .step(&mut bus)
+            .expect("resident LW should avoid the bus fault");
+        processor.step(&mut bus).expect("second NOP should succeed");
+
+        assert_eq!(processor.state.read_gpr(2), 0x89ab_cdef);
+        assert_eq!(processor.state.read_gpr(3), 0x89ab_cdef);
+        assert_eq!(
+            bus.reads
+                .iter()
+                .filter(|&&(address, _)| address == PhysAddr::new(0x100))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cached_store_writes_through_and_supplies_a_following_load() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0x8000_0100);
+        processor.state.write_gpr(2, 0x89ab_cdef);
+        let mut bus = ByteBus::default();
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x2b, 1, 2, 0));
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, encode_immediate(0x23, 1, 3, 0));
+        bus.insert_word(BOOT_PHYSICAL_ADDRESS + 8, 0);
+
+        processor.step(&mut bus).expect("cached SW should succeed");
+        bus.read_fault = Some((PhysAddr::new(0x100), BusFault::Unmapped));
+        processor
+            .step(&mut bus)
+            .expect("resident LW should avoid the bus fault");
+        processor.step(&mut bus).expect("NOP should succeed");
+
+        assert_eq!(processor.state.read_gpr(3), 0x89ab_cdef);
+        assert_eq!(
+            bus.writes,
+            [(PhysAddr::new(0x100), 0x89ab_cdef_u32.to_be_bytes().to_vec())]
+        );
+        assert!(!bus.reads.contains(&(PhysAddr::new(0x100), 4)));
+    }
+
+    #[test]
+    fn isolated_load_store_instructions_honor_cache_swap() {
+        for swapped in [false, true] {
+            let mut processor = R3000::new(super::TEST_CONFIG);
+            let status = STATUS_BEV | STATUS_ISC | if swapped { STATUS_SWC } else { 0 };
+            set_cp0_register(&mut processor, 12, status);
+            processor.state.write_gpr(1, 0xa000_0100);
+            processor.state.write_gpr(2, 0x89ab_cdef);
+            processor.state.write_gpr(3, 0x1111_1111);
+            let instruction_pc = processor.state.pc();
+            let instruction_address = u64::from(instruction_pc - 0xa000_0000);
+            let mut bus = ByteBus::default();
+            bus.insert_word(instruction_address, encode_immediate(0x2b, 1, 2, 0));
+            bus.insert_word(instruction_address + 4, encode_immediate(0x23, 1, 3, 0));
+            bus.insert_word(instruction_address + 8, 0);
+
+            processor
+                .step(&mut bus)
+                .expect("isolated SW should succeed");
+            processor
+                .step(&mut bus)
+                .expect("isolated LW should succeed");
+            processor.step(&mut bus).expect("NOP should succeed");
+
+            assert_eq!(processor.state.read_gpr(3), 0x89ab_cdef);
+            assert_eq!(processor.state.read_cp0(12) & STATUS_CM, 0);
+            assert!(bus.writes.is_empty());
+            assert!(
+                bus.reads
+                    .iter()
+                    .all(|&(address, _)| address.get() >= instruction_address)
+            );
+        }
+    }
+
+    #[test]
     fn step_executes_multiply_and_reads_both_results() {
         let mut processor = R3000::new(super::TEST_CONFIG);
         processor.state.write_gpr(1, (-2_i32) as u32);
@@ -846,7 +1399,7 @@ mod tests {
         processor.state.write_hi(0x1357_9bdf);
         processor.state.write_lo(0x2468_ace0);
         let before = snapshot(&processor);
-        let mut bus = TestBus::new([0x8c, 0x01, 0x00, 0x00]);
+        let mut bus = TestBus::new([0x88, 0x01, 0x00, 0x00]);
 
         let error = processor
             .step(&mut bus)
@@ -856,7 +1409,7 @@ mod tests {
             error,
             StepError::UnsupportedInstruction {
                 pc: 0xbfc0_0000,
-                instruction: 0x8c01_0000,
+                instruction: 0x8801_0000,
             }
         );
         assert_eq!(snapshot(&processor), before);
@@ -1055,13 +1608,13 @@ mod tests {
         let before = snapshot(&processor);
 
         let error =
-            step_with_word(&mut processor, 0x8c01_0000).expect_err("LW should remain unsupported");
+            step_with_word(&mut processor, 0x8801_0000).expect_err("LWL should remain unsupported");
 
         assert_eq!(
             error,
             StepError::UnsupportedInstruction {
                 pc: 0xbfc0_0004,
-                instruction: 0x8c01_0000,
+                instruction: 0x8801_0000,
             }
         );
         assert_eq!(snapshot(&processor), before);
@@ -1261,13 +1814,13 @@ mod tests {
         let stalled_random = processor.state.read_cp0(1);
 
         let error =
-            step_with_word(&mut processor, 0x8c02_0000).expect_err("LW should remain unsupported");
+            step_with_word(&mut processor, 0x8802_0000).expect_err("LWL should remain unsupported");
 
         assert_eq!(
             error,
             StepError::UnsupportedInstruction {
                 pc: stalled_pc,
-                instruction: 0x8c02_0000,
+                instruction: 0x8802_0000,
             }
         );
         assert_eq!(processor.state.pc(), stalled_pc);
@@ -1300,7 +1853,7 @@ mod tests {
             }),
         );
 
-        step_with_word(&mut processor, 0x8c01_0000).expect_err("LW should remain unsupported");
+        step_with_word(&mut processor, 0x8801_0000).expect_err("LWL should remain unsupported");
         assert_eq!(
             processor
                 .state

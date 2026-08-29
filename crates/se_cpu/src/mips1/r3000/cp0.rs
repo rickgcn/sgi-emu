@@ -51,31 +51,13 @@ pub(super) enum TlbFaultKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Exception {
-    InstructionAddressError {
-        address: u32,
-    },
-    LoadAddressError {
-        address: u32,
-    },
-    StoreAddressError {
-        address: u32,
-    },
-    TlbLoad {
-        address: u32,
-        fault: TlbFaultKind,
-    },
-    TlbStore {
-        address: u32,
-        fault: TlbFaultKind,
-    },
-    TlbModified {
-        address: u32,
-    },
+    InstructionAddressError { address: u32 },
+    LoadAddressError { address: u32 },
+    StoreAddressError { address: u32 },
+    TlbLoad { address: u32, fault: TlbFaultKind },
+    TlbStore { address: u32, fault: TlbFaultKind },
+    TlbModified { address: u32 },
     InstructionBusError,
-    #[allow(
-        dead_code,
-        reason = "Data-bus exceptions precede the R3000 load instruction subset"
-    )]
     DataBusError,
     Syscall,
     Breakpoint,
