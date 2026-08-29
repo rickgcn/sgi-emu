@@ -168,6 +168,14 @@ impl State {
         self.cp0.is_usable()
     }
 
+    pub(super) fn set_hardware_interrupt_lines(&mut self, lines: u8) {
+        self.cp0.set_hardware_interrupt_lines(lines);
+    }
+
+    pub(super) fn interrupt_requested(&self) -> bool {
+        self.cp0.interrupt_requested()
+    }
+
     pub(super) fn is_tlb_shutdown(&self) -> bool {
         self.cp0.is_tlb_shutdown()
     }
@@ -473,6 +481,7 @@ mod tests {
     const STATUS_SWC: u32 = 1 << 17;
     const STATUS_ISC: u32 = 1 << 16;
     const STATUS_KUC: u32 = 1 << 1;
+    const STATUS_IEC: u32 = 1;
 
     struct TestBus {
         read_data: [u8; 4],
@@ -742,6 +751,40 @@ mod tests {
         assert_eq!(state.pc, expected_pc);
         assert_eq!(state.delay_slot, None);
         assert_eq!(state.read_gpr(31), origin_pc.wrapping_add(8));
+    }
+
+    #[test]
+    fn interrupt_input_reuses_exception_boundaries_and_survives_reset() {
+        const CAUSE_BD: u32 = 1 << 31;
+        const CAUSE_HARDWARE_IP_MASK: u32 = 0x0000_fc00;
+        const STATUS_IM2: u32 = 1 << 10;
+
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        state.set_hardware_interrupt_lines(1);
+
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM2);
+        assert!(!state.interrupt_requested());
+
+        state
+            .cp0
+            .write_register(12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+        state.cp0.commit_pending_functional();
+        assert!(state.interrupt_requested());
+
+        let branch_pc = state.pc();
+        state.complete_instruction(Some(0xbfc0_0040), None);
+        state.take_exception(Exception::Interrupt);
+
+        assert_eq!(state.read_cp0(14), branch_pc);
+        assert_eq!(state.read_cp0(13) & CAUSE_BD, CAUSE_BD);
+        assert_eq!((state.read_cp0(13) >> 2) & 0x1f, 0);
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM2);
+        assert!(!state.interrupt_requested());
+
+        state.reset();
+
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM2);
+        assert!(!state.interrupt_requested());
     }
 
     #[test]

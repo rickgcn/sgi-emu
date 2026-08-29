@@ -35,6 +35,7 @@ const STATUS_WRITABLE_MASK: u32 = 0xf247_ff3f;
 
 const CAUSE_BD: u32 = 1 << 31;
 const CAUSE_IP_MASK: u32 = 0x0000_ff00;
+const CAUSE_HARDWARE_IP_MASK: u32 = 0x0000_fc00;
 const CAUSE_SOFTWARE_IP_MASK: u32 = 0x0000_0300;
 const CAUSE_VISIBLE_MASK: u32 = 0xb000_ff7c;
 
@@ -51,6 +52,7 @@ pub(super) enum TlbFaultKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Exception {
+    Interrupt,
     InstructionAddressError { address: u32 },
     LoadAddressError { address: u32 },
     StoreAddressError { address: u32 },
@@ -222,6 +224,18 @@ impl Cp0 {
         self.status & STATUS_KUC == 0 || self.effective.coprocessor_usable & STATUS_CU0 != 0
     }
 
+    pub(super) fn set_hardware_interrupt_lines(&mut self, lines: u8) {
+        assert!(lines & !0x3f == 0);
+        self.cause = (self.cause & !CAUSE_HARDWARE_IP_MASK) | (u32::from(lines) << 10);
+    }
+
+    pub(super) fn interrupt_requested(&self) -> bool {
+        let pending = (self.cause & CAUSE_HARDWARE_IP_MASK) | self.effective.software_interrupts;
+        let control = self.effective.interrupt_control;
+
+        control & STATUS_IEC != 0 && pending & control & CAUSE_IP_MASK != 0
+    }
+
     pub(super) fn commit_pending_functional(&mut self) {
         if let Some(functional) = self.pending_functional.take() {
             self.effective = functional;
@@ -253,6 +267,7 @@ impl Cp0 {
         in_delay_slot: bool,
     ) -> u32 {
         let (exception_code, bad_address, tlb_address, use_refill_vector) = match exception {
+            Exception::Interrupt => (0, None, None, false),
             Exception::InstructionAddressError { address }
             | Exception::LoadAddressError { address } => (4, Some(address), None, false),
             Exception::StoreAddressError { address } => (5, Some(address), None, false),
@@ -382,14 +397,15 @@ pub(super) fn execute(
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOT_GENERAL_EXCEPTION_VECTOR, BOOT_TLB_REFILL_EXCEPTION_VECTOR, CAUSE_BD, CAUSE_IP_MASK,
-        CAUSE_SOFTWARE_IP_MASK, CAUSE_VISIBLE_MASK, CONTEXT_BAD_VPN_MASK, CONTEXT_PTE_BASE_MASK,
-        Cp0, Cp0Instruction, ENTRY_HI_VISIBLE_MASK, ENTRY_HI_VPN_MASK, ENTRY_LO_VISIBLE_MASK,
-        Exception, ExecutionError, FunctionalState, GENERAL_EXCEPTION_VECTOR, INDEX_INDEX_MASK,
-        INDEX_PROBE_FAILURE, InstructionEffect, PRID, RANDOM_RESET, STATUS_BEV, STATUS_CM,
-        STATUS_CU_MASK, STATUS_CU0, STATUS_IEC, STATUS_INTERRUPT_CONTROL_MASK, STATUS_ISC,
-        STATUS_KUC, STATUS_MODE_STACK_MASK, STATUS_PE, STATUS_SWC, STATUS_TS, STATUS_VISIBLE_MASK,
-        STATUS_WRITABLE_MASK, State, TLB_REFILL_EXCEPTION_VECTOR, TlbFaultKind, execute,
+        BOOT_GENERAL_EXCEPTION_VECTOR, BOOT_TLB_REFILL_EXCEPTION_VECTOR, CAUSE_BD,
+        CAUSE_HARDWARE_IP_MASK, CAUSE_IP_MASK, CAUSE_SOFTWARE_IP_MASK, CAUSE_VISIBLE_MASK,
+        CONTEXT_BAD_VPN_MASK, CONTEXT_PTE_BASE_MASK, Cp0, Cp0Instruction, ENTRY_HI_VISIBLE_MASK,
+        ENTRY_HI_VPN_MASK, ENTRY_LO_VISIBLE_MASK, Exception, ExecutionError, FunctionalState,
+        GENERAL_EXCEPTION_VECTOR, INDEX_INDEX_MASK, INDEX_PROBE_FAILURE, InstructionEffect, PRID,
+        RANDOM_RESET, STATUS_BEV, STATUS_CM, STATUS_CU_MASK, STATUS_CU0, STATUS_IEC,
+        STATUS_INTERRUPT_CONTROL_MASK, STATUS_ISC, STATUS_KUC, STATUS_MODE_STACK_MASK, STATUS_PE,
+        STATUS_SWC, STATUS_TS, STATUS_VISIBLE_MASK, STATUS_WRITABLE_MASK, State,
+        TLB_REFILL_EXCEPTION_VECTOR, TlbFaultKind, execute,
     };
 
     #[test]
@@ -453,6 +469,94 @@ mod tests {
     }
 
     #[test]
+    fn hardware_interrupt_lines_replace_the_snapshot_and_preserve_cause() {
+        let mut cp0 = Cp0::new();
+        let preserved = CAUSE_BD | (2 << 28) | CAUSE_SOFTWARE_IP_MASK | (11 << 2);
+        cp0.cause = preserved;
+
+        cp0.set_hardware_interrupt_lines(0b10_0001);
+
+        assert_eq!(
+            cp0.cause & CAUSE_HARDWARE_IP_MASK,
+            u32::from(0b10_0001_u8) << 10
+        );
+        assert_eq!(
+            cp0.cause & !CAUSE_HARDWARE_IP_MASK,
+            preserved & !CAUSE_HARDWARE_IP_MASK
+        );
+        assert_eq!(cp0.read_register(13), cp0.cause & CAUSE_VISIBLE_MASK);
+
+        cp0.set_hardware_interrupt_lines(0b00_0010);
+
+        assert_eq!(
+            cp0.cause & CAUSE_HARDWARE_IP_MASK,
+            u32::from(0b00_0010_u8) << 10
+        );
+        assert_eq!(
+            cp0.cause & !CAUSE_HARDWARE_IP_MASK,
+            preserved & !CAUSE_HARDWARE_IP_MASK
+        );
+
+        cp0.set_hardware_interrupt_lines(0);
+        assert_eq!(cp0.cause & CAUSE_HARDWARE_IP_MASK, 0);
+    }
+
+    #[test]
+    fn interrupt_request_requires_global_enable_and_a_matching_mask() {
+        let mut cp0 = Cp0::new();
+        cp0.set_hardware_interrupt_lines(0b10_0001);
+
+        cp0.effective.interrupt_control = 1 << 10;
+        assert!(!cp0.interrupt_requested());
+
+        cp0.effective.interrupt_control = STATUS_IEC | (1 << 11);
+        assert!(!cp0.interrupt_requested());
+
+        cp0.effective.interrupt_control = STATUS_IEC | (1 << 10);
+        assert!(cp0.interrupt_requested());
+
+        cp0.effective.interrupt_control = STATUS_IEC | (1 << 15);
+        assert!(cp0.interrupt_requested());
+
+        cp0.effective.software_interrupts = 1 << 8;
+        cp0.effective.interrupt_control = STATUS_IEC | (1 << 8) | (1 << 10) | (1 << 15);
+        assert!(cp0.interrupt_requested());
+
+        cp0.set_hardware_interrupt_lines(0);
+        cp0.effective.software_interrupts = 0;
+        assert!(!cp0.interrupt_requested());
+    }
+
+    #[test]
+    fn interrupt_request_observes_functional_state_hazards() {
+        let mut cp0 = Cp0::new();
+        let hardware_status = STATUS_BEV | STATUS_IEC | (1 << 10);
+        cp0.set_hardware_interrupt_lines(1);
+
+        cp0.write_register(12, hardware_status);
+        assert_eq!(cp0.read_register(12), hardware_status);
+        assert!(!cp0.interrupt_requested());
+
+        cp0.commit_pending_functional();
+        assert!(cp0.interrupt_requested());
+
+        cp0.write_register(12, STATUS_BEV | (1 << 10));
+        assert!(cp0.interrupt_requested());
+        cp0.commit_pending_functional();
+        assert!(!cp0.interrupt_requested());
+
+        cp0.set_hardware_interrupt_lines(0);
+        cp0.write_register(12, STATUS_BEV | STATUS_IEC | (1 << 8));
+        cp0.commit_pending_functional();
+        cp0.write_register(13, 1 << 8);
+        assert_eq!(cp0.read_register(13) & CAUSE_SOFTWARE_IP_MASK, 1 << 8);
+        assert!(!cp0.interrupt_requested());
+
+        cp0.commit_pending_functional();
+        assert!(cp0.interrupt_requested());
+    }
+
+    #[test]
     fn exception_entry_stacks_status_and_selects_vector() {
         for (bev, expected_vector) in [
             (false, GENERAL_EXCEPTION_VECTOR),
@@ -474,8 +578,27 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_exception_uses_general_vectors_and_preserves_pending_bits() {
+        for (bev, expected_vector) in [
+            (false, GENERAL_EXCEPTION_VECTOR),
+            (true, BOOT_GENERAL_EXCEPTION_VECTOR),
+        ] {
+            let mut cp0 = Cp0::new();
+            cp0.status = if bev { STATUS_BEV } else { 0 };
+            cp0.cause = CAUSE_IP_MASK;
+
+            let vector = cp0.take_exception(Exception::Interrupt, 0x1234_5678, false);
+
+            assert_eq!(vector, expected_vector);
+            assert_eq!(cp0.epc, 0x1234_5678);
+            assert_eq!(cp0.cause, CAUSE_IP_MASK);
+        }
+    }
+
+    #[test]
     fn exception_entry_records_epc_bd_and_exception_code() {
         let cases = [
+            (Exception::Interrupt, 0, false),
             (
                 Exception::TlbModified {
                     address: 0x1111_1111,
@@ -590,6 +713,7 @@ mod tests {
         let mut cp0 = Cp0::new();
 
         for exception in [
+            Exception::Interrupt,
             Exception::InstructionBusError,
             Exception::DataBusError,
             Exception::Syscall,

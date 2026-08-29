@@ -160,10 +160,11 @@ impl R3000 {
     ///
     /// General-purpose registers other than register zero and the HI/LO
     /// registers are preserved because their reset values are architecturally
-    /// unspecified. The external CP0 condition input is preserved because it
-    /// is driven by the containing machine. Main translation-buffer entries
-    /// are preserved, while pending instruction-translation visibility is
-    /// discarded and synchronized with the main entries.
+    /// unspecified. The external CP0 condition and hardware interrupt inputs
+    /// are preserved because they are driven by the containing machine. Main
+    /// translation-buffer entries are preserved, while pending
+    /// instruction-translation visibility is discarded and synchronized with
+    /// the main entries.
     /// Cache contents and the construction-time cache configuration are
     /// preserved.
     pub fn reset(&mut self) {
@@ -175,6 +176,20 @@ impl R3000 {
         self.cp0_condition = condition;
     }
 
+    /// Sets the asserted state of the six hardware interrupt inputs.
+    ///
+    /// Bits zero through five replace the complete current input snapshot and
+    /// map to `Cause.IP2` through `Cause.IP7`, respectively. A set bit means
+    /// that the corresponding logical interrupt input is asserted. Inputs are
+    /// level-sensitive and remain unchanged across processor reset.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either of the two unused high bits is set.
+    pub fn set_hardware_interrupt_lines(&mut self, lines: u8) {
+        self.state.set_hardware_interrupt_lines(lines);
+    }
+
     /// Executes one architectural processor step.
     ///
     /// A successful step either completes one instruction or enters a guest
@@ -184,7 +199,8 @@ impl R3000 {
     /// Unsupported instructions leave architectural registers unchanged,
     /// although a successful cached fetch remains visible in the instruction
     /// cache. A newly detected translation buffer shutdown changes only the
-    /// CP0 shutdown state.
+    /// CP0 shutdown state. Enabled interrupts are sampled after the shutdown
+    /// guard and before instruction fetch.
     ///
     /// # Errors
     ///
@@ -194,6 +210,11 @@ impl R3000 {
     pub fn step(&mut self, bus: &mut dyn PhysicalBus) -> Result<(), StepError> {
         if self.state.is_tlb_shutdown() {
             return Err(StepError::TlbShutdown);
+        }
+
+        if self.state.interrupt_requested() {
+            self.state.take_exception(Exception::Interrupt);
+            return Ok(());
         }
 
         let pc = self.state.pc();
@@ -286,7 +307,7 @@ mod tests {
     use super::{R3000, R3000Config, StepError, fetch_instruction};
     use super::{
         mmu::{AccessType, Cacheability, Translation},
-        state::{InstructionEffect, State},
+        state::{InstructionEffect, State, TranslationError},
     };
 
     const BOOT_GENERAL_EXCEPTION_VECTOR: u32 = 0xbfc0_0180;
@@ -295,12 +316,18 @@ mod tests {
     const ENTRY_LO_NONCACHEABLE: u32 = 1 << 11;
     const ENTRY_LO_DIRTY: u32 = 1 << 10;
     const ENTRY_LO_VALID: u32 = 1 << 9;
+    const CAUSE_BD: u32 = 1 << 31;
+    const CAUSE_IP_MASK: u32 = 0x0000_ff00;
+    const CAUSE_HARDWARE_IP_MASK: u32 = 0x0000_fc00;
     const STATUS_BEV: u32 = 1 << 22;
     const STATUS_TS: u32 = 1 << 21;
     const STATUS_CM: u32 = 1 << 19;
     const STATUS_SWC: u32 = 1 << 17;
     const STATUS_ISC: u32 = 1 << 16;
     const STATUS_KUC: u32 = 1 << 1;
+    const STATUS_IEC: u32 = 1;
+    const STATUS_IM0: u32 = 1 << 8;
+    const STATUS_IM2: u32 = 1 << 10;
 
     fn translation(address: u64, cacheability: Cacheability) -> Translation {
         Translation {
@@ -348,6 +375,18 @@ mod tests {
 
         fn write(&mut self, _address: PhysAddr, _data: &[u8]) -> Result<(), BusFault> {
             Err(BusFault::UnsupportedAccess)
+        }
+    }
+
+    struct RejectingBus;
+
+    impl PhysicalBus for RejectingBus {
+        fn read(&mut self, _address: PhysAddr, _data: &mut [u8]) -> Result<(), BusFault> {
+            panic!("an interrupt step must not read the physical bus")
+        }
+
+        fn write(&mut self, _address: PhysAddr, _data: &[u8]) -> Result<(), BusFault> {
+            panic!("an interrupt step must not write the physical bus")
         }
     }
 
@@ -497,6 +536,11 @@ mod tests {
             None,
             Some(InstructionEffect::DelayedCp0Write { index, value }),
         );
+        processor.state.complete_instruction(None, None);
+    }
+
+    fn set_cp0_register_and_sync(processor: &mut R3000, index: usize, value: u32) {
+        set_cp0_register(processor, index, value);
         processor.state.complete_instruction(None, None);
     }
 
@@ -2624,6 +2668,261 @@ mod tests {
         assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 11);
         assert_eq!((processor.state.read_cp0(13) >> 28) & 3, 0);
         assert_eq!(processor.state.read_gpr(2), 0);
+    }
+
+    #[test]
+    fn enabled_hardware_interrupt_enters_before_instruction_fetch() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(1);
+        let expected_epc = processor.state.pc();
+        let previous_random = processor.state.read_cp0(1);
+        let mut bus = RejectingBus;
+
+        processor
+            .step(&mut bus)
+            .expect("the interrupt should enter a guest exception");
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), expected_epc);
+        assert_eq!(processor.state.read_cp0(13) & CAUSE_BD, 0);
+        assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 0);
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            STATUS_IM2
+        );
+        assert_eq!(processor.state.read_cp0(1), previous_random - (1 << 8));
+    }
+
+    #[test]
+    fn disabled_and_masked_hardware_interrupts_allow_execution() {
+        for status in [
+            STATUS_BEV | STATUS_IM2,
+            STATUS_BEV | STATUS_IEC,
+            STATUS_BEV | STATUS_IEC | (1 << 11),
+        ] {
+            let mut processor = R3000::new(super::TEST_CONFIG);
+            set_cp0_register_and_sync(&mut processor, 12, status);
+            processor.set_hardware_interrupt_lines(1);
+            let instruction_pc = processor.state.pc();
+
+            step_with_word(&mut processor, 0).expect("the NOP should execute");
+
+            assert_eq!(processor.state.pc(), instruction_pc.wrapping_add(4));
+            assert_eq!(
+                processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+                STATUS_IM2
+            );
+        }
+    }
+
+    #[test]
+    fn interrupt_before_a_delay_slot_restarts_the_branch() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+        processor.state.write_gpr(1, 7);
+        let branch_pc = processor.state.pc();
+
+        step_with_word(&mut processor, encode_immediate(0x04, 0, 0, 2))
+            .expect("BEQ should succeed");
+        processor.set_hardware_interrupt_lines(1);
+        let mut bus = TestBus::new(encode_immediate(0x09, 1, 1, 1).to_be_bytes());
+
+        processor
+            .step(&mut bus)
+            .expect("the interrupt should enter a guest exception");
+
+        assert_eq!(bus.read_address, None);
+        assert_eq!(processor.state.read_gpr(1), 7);
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), branch_pc);
+        assert_eq!(processor.state.read_cp0(13) & CAUSE_BD, CAUSE_BD);
+    }
+
+    #[test]
+    fn multiple_interrupt_sources_preserve_the_complete_pending_bitmap() {
+        const PENDING: u32 = (1 << 15) | (1 << 10) | (1 << 9) | (1 << 8);
+
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IEC | PENDING);
+        set_cp0_register_and_sync(&mut processor, 13, (1 << 9) | (1 << 8));
+        processor.set_hardware_interrupt_lines(0b10_0001);
+        let mut bus = RejectingBus;
+
+        processor
+            .step(&mut bus)
+            .expect("the pending bitmap should request one interrupt");
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(13) & CAUSE_IP_MASK, PENDING);
+        assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 0);
+    }
+
+    #[test]
+    fn status_enable_hazard_delays_interrupt_recognition() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.set_hardware_interrupt_lines(1);
+        processor
+            .state
+            .write_gpr(1, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+        let first_pc = processor.state.pc();
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x04, 1, 12))
+            .expect("MTC0 Status should succeed");
+        assert_eq!(processor.state.pc(), first_pc.wrapping_add(4));
+
+        step_with_word(&mut processor, 0).expect("the first hazard instruction should execute");
+        assert_eq!(
+            processor.state.read_cp0(12) & (STATUS_IM2 | STATUS_IEC),
+            STATUS_IM2 | STATUS_IEC
+        );
+
+        step_with_word(&mut processor, 0).expect("the second hazard instruction should execute");
+        let expected_epc = processor.state.pc();
+        let mut bus = RejectingBus;
+
+        processor
+            .step(&mut bus)
+            .expect("the synchronized enable should request an interrupt");
+        assert_eq!(processor.state.read_cp0(14), expected_epc);
+    }
+
+    #[test]
+    fn status_disable_hazard_cannot_cancel_an_effective_interrupt() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+        processor.state.write_gpr(1, STATUS_BEV | STATUS_IM2);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x04, 1, 12))
+            .expect("MTC0 Status should succeed");
+        step_with_word(&mut processor, 0).expect("the raw write should become visible");
+        assert_eq!(processor.state.read_cp0(12) & STATUS_IEC, 0);
+
+        processor.set_hardware_interrupt_lines(1);
+        let expected_epc = processor.state.pc();
+        let mut bus = RejectingBus;
+
+        processor
+            .step(&mut bus)
+            .expect("the old effective enable should request an interrupt");
+        assert_eq!(processor.state.read_cp0(14), expected_epc);
+    }
+
+    #[test]
+    fn software_interrupt_hazard_delays_interrupt_recognition() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM0 | STATUS_IEC);
+        processor.state.write_gpr(1, STATUS_IM0);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x04, 1, 13))
+            .expect("MTC0 Cause should succeed");
+        step_with_word(&mut processor, 0).expect("the raw write should become visible");
+        assert_eq!(processor.state.read_cp0(13) & STATUS_IM0, STATUS_IM0);
+
+        step_with_word(&mut processor, 0).expect("the functional write should become visible");
+        let expected_epc = processor.state.pc();
+        let mut bus = RejectingBus;
+
+        processor
+            .step(&mut bus)
+            .expect("the synchronized software pending bit should interrupt");
+        assert_eq!(processor.state.read_cp0(14), expected_epc);
+        assert_eq!(processor.state.read_cp0(13) & STATUS_IM0, STATUS_IM0);
+    }
+
+    #[test]
+    fn rfe_reenables_a_held_interrupt_at_the_return_boundary() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(1);
+        let return_pc = processor.state.pc();
+        let mut bus = RejectingBus;
+
+        processor
+            .step(&mut bus)
+            .expect("the first interrupt should enter its handler");
+        processor.state.write_gpr(3, return_pc);
+        step_with_word(&mut processor, encode_register(3, 0, 0, 0x08)).expect("JR should succeed");
+        step_with_word(&mut processor, 0x4200_0010).expect("RFE should succeed");
+        assert_eq!(processor.state.pc(), return_pc);
+        assert_eq!(processor.state.read_cp0(12) & STATUS_IEC, STATUS_IEC);
+
+        let mut bus = RejectingBus;
+        processor
+            .step(&mut bus)
+            .expect("the held line should interrupt again");
+
+        assert_eq!(processor.state.read_cp0(14), return_pc);
+        assert_eq!(processor.state.read_cp0(13) & CAUSE_BD, 0);
+    }
+
+    #[test]
+    fn deasserted_hardware_interrupt_does_not_retrigger_after_rfe() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(1);
+        let return_pc = processor.state.pc();
+        let mut bus = RejectingBus;
+
+        processor
+            .step(&mut bus)
+            .expect("the interrupt should enter its handler");
+        processor.set_hardware_interrupt_lines(0);
+        assert_eq!(processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, 0);
+        processor.state.write_gpr(3, return_pc);
+        step_with_word(&mut processor, encode_register(3, 0, 0, 0x08)).expect("JR should succeed");
+        step_with_word(&mut processor, 0x4200_0010).expect("RFE should succeed");
+
+        step_with_word(&mut processor, 0).expect("the returned NOP should execute");
+        assert_eq!(processor.state.pc(), return_pc.wrapping_add(4));
+    }
+
+    #[test]
+    fn tlb_shutdown_precedes_an_enabled_interrupt() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(1);
+        assert_eq!(
+            processor
+                .state
+                .translate_address(0, AccessType::Instruction),
+            Err(TranslationError::TlbShutdown)
+        );
+        let epc = processor.state.read_cp0(14);
+        let random = processor.state.read_cp0(1);
+        let mut bus = RejectingBus;
+
+        assert_eq!(processor.step(&mut bus), Err(StepError::TlbShutdown));
+        assert_eq!(processor.state.read_cp0(14), epc);
+        assert_eq!(processor.state.read_cp0(1), random);
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            STATUS_IM2
+        );
+    }
+
+    #[test]
+    fn reset_preserves_hardware_interrupt_inputs_but_disables_them() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(0b10_0001);
+
+        processor.reset();
+
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            u32::from(0b10_0001_u8) << 10
+        );
+        assert_eq!(processor.state.read_cp0(12) & STATUS_IEC, 0);
+        step_with_word(&mut processor, 0).expect("reset should leave interrupts disabled");
+    }
+
+    #[test]
+    #[should_panic]
+    fn hardware_interrupt_input_rejects_nonexistent_lines() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+
+        processor.set_hardware_interrupt_lines(0x40);
     }
 
     #[test]
