@@ -25,6 +25,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
+name = "se_app"
+version = "0.1.0"
+dependencies = [
+ "se_cli",
+ "se_float",
+ "se_machine",
+ "se_runtime",
+ "se_ui",
+]
+
+[[package]]
+name = "se_cli"
+version = "0.1.0"
+
+[[package]]
 name = "se_core"
 version = "0.1.0"
 
@@ -37,11 +52,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "se_device"
+version = "0.1.0"
+dependencies = [
+ "se_core",
+]
+
+[[package]]
 name = "se_float"
 version = "0.1.0"
 dependencies = [
  "bitflags",
  "cc",
+]
+
+[[package]]
+name = "se_machine"
+version = "0.1.0"
+dependencies = [
+ "se_core",
+ "se_cpu",
+ "se_device",
+]
+
+[[package]]
+name = "se_runtime"
+version = "0.1.0"
+dependencies = [
+ "se_core",
+ "se_machine",
+]
+
+[[package]]
+name = "se_ui"
+version = "0.1.0"
+dependencies = [
+ "se_runtime",
 ]
 
 [[package]]

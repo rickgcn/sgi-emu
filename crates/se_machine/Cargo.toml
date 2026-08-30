@@ -1,0 +1,12 @@
+[package]
+name = "se_machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+se_core.workspace = true
+se_cpu.workspace = true
+se_device.workspace = true
