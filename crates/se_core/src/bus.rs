@@ -18,6 +18,24 @@ impl PhysAddr {
     }
 }
 
+/// A byte offset in a device's local address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceAddr(u64);
+
+impl DeviceAddr {
+    /// Creates a device address from its numeric value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric value of the device address.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// An error raised by a physical bus transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BusFault {
@@ -52,7 +70,7 @@ pub trait PhysicalBus {
 
 #[cfg(test)]
 mod tests {
-    use super::{BusFault, PhysAddr, PhysicalBus};
+    use super::{BusFault, DeviceAddr, PhysAddr, PhysicalBus};
 
     #[derive(Default)]
     struct RecordingBus {
@@ -85,6 +103,13 @@ mod tests {
         let address = PhysAddr::new(0x1fc0_0000);
 
         assert_eq!(address.get(), 0x1fc0_0000);
+    }
+
+    #[test]
+    fn device_address_round_trips() {
+        let address = DeviceAddr::new(0x1234);
+
+        assert_eq!(address.get(), 0x1234);
     }
 
     #[test]
