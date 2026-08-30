@@ -14,6 +14,21 @@ impl Float32 {
     pub const fn to_bits(self) -> u32 {
         self.0
     }
+
+    /// Reports whether this value is a NaN under the binary32 encoding.
+    pub const fn is_nan(self) -> bool {
+        self.0 & 0x7f80_0000 == 0x7f80_0000 && self.0 & 0x007f_ffff != 0
+    }
+
+    /// Reports whether this value is a signaling NaN under the legacy MIPS convention.
+    pub const fn is_signaling_nan(self) -> bool {
+        self.is_nan() && self.0 & 0x0040_0000 != 0
+    }
+
+    /// Reports whether this value is a nonzero subnormal binary32 value.
+    pub const fn is_subnormal(self) -> bool {
+        self.0 & 0x7f80_0000 == 0 && self.0 & 0x007f_ffff != 0
+    }
 }
 
 /// A binary64 value stored without applying host floating-point semantics.
@@ -29,5 +44,21 @@ impl Float64 {
     /// Returns the raw bits of this binary64 value.
     pub const fn to_bits(self) -> u64 {
         self.0
+    }
+
+    /// Reports whether this value is a NaN under the binary64 encoding.
+    pub const fn is_nan(self) -> bool {
+        self.0 & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
+            && self.0 & 0x000f_ffff_ffff_ffff != 0
+    }
+
+    /// Reports whether this value is a signaling NaN under the legacy MIPS convention.
+    pub const fn is_signaling_nan(self) -> bool {
+        self.is_nan() && self.0 & 0x0008_0000_0000_0000 != 0
+    }
+
+    /// Reports whether this value is a nonzero subnormal binary64 value.
+    pub const fn is_subnormal(self) -> bool {
+        self.0 & 0x7ff0_0000_0000_0000 == 0 && self.0 & 0x000f_ffff_ffff_ffff != 0
     }
 }

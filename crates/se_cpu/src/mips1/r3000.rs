@@ -11,6 +11,7 @@ mod mmu;
 mod state;
 
 use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+use se_float::backend::Backend;
 
 use self::{
     cp0::Exception,
@@ -23,9 +24,10 @@ const MINIMUM_CACHE_BYTES: usize = 4 * 1024;
 const MAXIMUM_CACHE_BYTES: usize = 256 * 1024;
 
 #[cfg(test)]
-const TEST_CONFIG: R3000Config = R3000Config::new(4 * 1024, 4 * 1024, 4, 4, true);
+const TEST_CONFIG: R3000Config =
+    R3000Config::new(4 * 1024, 4 * 1024, 4, 4, true, Backend::SoftFloat);
 
-/// Static properties of an R3000 cache implementation.
+/// Static properties of an R3000 processor and its attached R3010.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct R3000Config {
     instruction_cache_bytes: usize,
@@ -33,6 +35,7 @@ pub struct R3000Config {
     instruction_refill_bytes: usize,
     data_refill_bytes: usize,
     partial_store_enabled: bool,
+    floating_point_backend: Backend,
 }
 
 impl R3000Config {
@@ -49,6 +52,7 @@ impl R3000Config {
         instruction_refill_bytes: usize,
         data_refill_bytes: usize,
         partial_store_enabled: bool,
+        floating_point_backend: Backend,
     ) -> Self {
         assert!(valid_cache_size(instruction_cache_bytes));
         assert!(valid_cache_size(data_cache_bytes));
@@ -61,6 +65,7 @@ impl R3000Config {
             instruction_refill_bytes,
             data_refill_bytes,
             partial_store_enabled,
+            floating_point_backend,
         }
     }
 
@@ -92,6 +97,12 @@ impl R3000Config {
     #[must_use]
     pub const fn partial_store_enabled(&self) -> bool {
         self.partial_store_enabled
+    }
+
+    /// Returns the floating-point implementation selected for the attached R3010.
+    #[must_use]
+    pub const fn floating_point_backend(&self) -> Backend {
+        self.floating_point_backend
     }
 }
 
@@ -151,7 +162,8 @@ impl R3000 {
     /// General-purpose registers and the HI/LO registers without
     /// architecturally defined reset values are initialized to zero. CP1
     /// general registers and writable control state are also initialized to
-    /// zero. Cache geometry and store policy come from `config`.
+    /// zero. Cache geometry, store policy, and the R3010 floating-point
+    /// backend come from `config`.
     #[must_use]
     pub fn new(config: R3000Config) -> Self {
         Self {
@@ -170,7 +182,7 @@ impl R3000 {
     /// instruction-translation visibility is discarded and synchronized with
     /// the main entries.
     /// Committed CP1 general and control registers are preserved, while a
-    /// pending CP1 transfer is discarded.
+    /// pending CP1 write is discarded.
     /// Cache contents and the construction-time cache configuration are
     /// preserved.
     pub fn reset(&mut self) {
@@ -331,6 +343,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_float::backend::Backend;
 
     use super::{R3000, R3000Config, StepError, fetch_instruction};
     use super::{
@@ -359,7 +372,7 @@ mod tests {
     const STATUS_CU3: u32 = 1 << 31;
     const STATUS_IM0: u32 = 1 << 8;
     const STATUS_IM2: u32 = 1 << 10;
-    const UNSUPPORTED_CP1_INSTRUCTION: u32 = 0x4600_0000;
+    const UNSUPPORTED_CP2_INSTRUCTION: u32 = 0x4a00_0000;
 
     fn translation(address: u64, cacheability: Cacheability) -> Translation {
         Translation {
@@ -581,6 +594,11 @@ mod tests {
         processor.reset();
     }
 
+    fn enable_cp2(processor: &mut R3000) {
+        set_cp0_register_and_sync(processor, 12, processor.state.read_cp0(12) | STATUS_CU2);
+        processor.reset();
+    }
+
     fn jump_to(processor: &mut R3000, target: u32) {
         processor.state.write_gpr(3, target);
         step_with_word(processor, encode_register(3, 0, 0, 0x08)).expect("JR should succeed");
@@ -633,13 +651,14 @@ mod tests {
 
     #[test]
     fn configuration_exposes_validated_cache_properties() {
-        let config = R3000Config::new(32 * 1024, 32 * 1024, 64, 4, true);
+        let config = R3000Config::new(32 * 1024, 32 * 1024, 64, 4, true, Backend::SoftFloat);
 
         assert_eq!(config.instruction_cache_bytes(), 32 * 1024);
         assert_eq!(config.data_cache_bytes(), 32 * 1024);
         assert_eq!(config.instruction_refill_bytes(), 64);
         assert_eq!(config.data_refill_bytes(), 4);
         assert!(config.partial_store_enabled());
+        assert_eq!(config.floating_point_backend(), Backend::SoftFloat);
     }
 
     #[test]
@@ -647,7 +666,7 @@ mod tests {
     fn configuration_rejects_invalid_cache_size() {
         let invalid_bytes = std::hint::black_box(6 * 1024);
 
-        let _ = R3000Config::new(invalid_bytes, 4 * 1024, 4, 4, true);
+        let _ = R3000Config::new(invalid_bytes, 4 * 1024, 4, 4, true, Backend::SoftFloat);
     }
 
     #[test]
@@ -655,7 +674,14 @@ mod tests {
     fn configuration_rejects_invalid_refill_size() {
         let invalid_bytes = std::hint::black_box(8);
 
-        let _ = R3000Config::new(4 * 1024, 4 * 1024, invalid_bytes, 4, true);
+        let _ = R3000Config::new(
+            4 * 1024,
+            4 * 1024,
+            invalid_bytes,
+            4,
+            true,
+            Backend::SoftFloat,
+        );
     }
 
     #[test]
@@ -698,10 +724,10 @@ mod tests {
 
     #[test]
     fn direct_segments_distinguish_cached_hits_from_uncached_reads() {
-        let unsupported = UNSUPPORTED_CP1_INSTRUCTION;
+        let unsupported = UNSUPPORTED_CP2_INSTRUCTION;
 
         let mut kseg1_processor = R3000::new(super::TEST_CONFIG);
-        enable_cp1(&mut kseg1_processor);
+        enable_cp2(&mut kseg1_processor);
         for _ in 0..2 {
             let mut bus = TestBus::new(word_bytes(unsupported));
             assert_eq!(
@@ -715,7 +741,7 @@ mod tests {
         }
 
         let mut kseg0_processor = R3000::new(super::TEST_CONFIG);
-        enable_cp1(&mut kseg0_processor);
+        enable_cp2(&mut kseg0_processor);
         jump_to(&mut kseg0_processor, 0x8000_0100);
         let mut first_bus = TestBus::new(word_bytes(unsupported));
         assert_eq!(
@@ -741,11 +767,11 @@ mod tests {
 
     #[test]
     fn configured_instruction_refill_reads_each_word_in_order() {
-        let config = R3000Config::new(32 * 1024, 32 * 1024, 64, 4, true);
+        let config = R3000Config::new(32 * 1024, 32 * 1024, 64, 4, true, Backend::SoftFloat);
         let mut processor = R3000::new(config);
-        enable_cp1(&mut processor);
+        enable_cp2(&mut processor);
         jump_to(&mut processor, 0x8000_0024);
-        let unsupported = UNSUPPORTED_CP1_INSTRUCTION;
+        let unsupported = UNSUPPORTED_CP2_INSTRUCTION;
         let mut bus = TestBus::new(word_bytes(unsupported));
 
         assert_eq!(
@@ -768,11 +794,11 @@ mod tests {
     fn mapped_entry_noncacheable_bit_controls_instruction_fetch() {
         let virtual_address = 0x0040_0000;
         let physical_address = 0x0010_0000;
-        let unsupported = UNSUPPORTED_CP1_INSTRUCTION;
+        let unsupported = UNSUPPORTED_CP2_INSTRUCTION;
 
         for (noncacheable, second_fetch_reads_bus) in [(false, false), (true, true)] {
             let mut processor = R3000::new(super::TEST_CONFIG);
-            enable_cp1(&mut processor);
+            enable_cp2(&mut processor);
             let flags = ENTRY_LO_VALID
                 | ENTRY_LO_DIRTY
                 | if noncacheable {
@@ -808,13 +834,13 @@ mod tests {
     #[test]
     fn instruction_fetch_ignores_isolation_and_honors_cache_swap() {
         let target = 0x8000_0300;
-        let unsupported = UNSUPPORTED_CP1_INSTRUCTION;
+        let unsupported = UNSUPPORTED_CP2_INSTRUCTION;
         let mut processor = R3000::new(super::TEST_CONFIG);
-        enable_cp1(&mut processor);
+        enable_cp2(&mut processor);
         set_cp0_register(
             &mut processor,
             12,
-            STATUS_BEV | STATUS_ISC | STATUS_SWC | STATUS_CU1,
+            STATUS_BEV | STATUS_ISC | STATUS_SWC | STATUS_CU2,
         );
         jump_to(&mut processor, target);
 
@@ -833,7 +859,7 @@ mod tests {
         ));
         assert!(data_cache_hit_bus.read_addresses.is_empty());
 
-        set_cp0_register(&mut processor, 12, STATUS_BEV | STATUS_ISC | STATUS_CU1);
+        set_cp0_register(&mut processor, 12, STATUS_BEV | STATUS_ISC | STATUS_CU2);
         jump_to(&mut processor, target);
         let mut instruction_cache_miss_bus = TestBus::new(word_bytes(unsupported));
         assert!(matches!(
@@ -1602,7 +1628,7 @@ mod tests {
             [(PhysAddr::new(0x100), vec![0x11, 0xaa, 0xbb, 0xcc])]
         );
 
-        let config = R3000Config::new(4 * 1024, 4 * 1024, 4, 4, false);
+        let config = R3000Config::new(4 * 1024, 4 * 1024, 4, 4, false, Backend::SoftFloat);
         let mut disabled_processor = R3000::new(config);
         disabled_processor.state.write_gpr(1, 0x8000_0101);
         disabled_processor.state.write_gpr(2, 0xaabb_ccdd);
@@ -2145,23 +2171,23 @@ mod tests {
     #[test]
     fn step_preserves_processor_state_for_unsupported_instruction() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        enable_cp1(&mut processor);
+        enable_cp2(&mut processor);
         processor.state.write_gpr(1, 0x1234_5678);
         processor.state.write_gpr(31, 0x89ab_cdef);
         processor.state.write_hi(0x1357_9bdf);
         processor.state.write_lo(0x2468_ace0);
         let before = snapshot(&processor);
-        let mut bus = TestBus::new(UNSUPPORTED_CP1_INSTRUCTION.to_be_bytes());
+        let mut bus = TestBus::new(UNSUPPORTED_CP2_INSTRUCTION.to_be_bytes());
 
         let error = processor
             .step(&mut bus)
-            .expect_err("the CP1 operation should not be supported");
+            .expect_err("the CP2 operation should not be supported");
 
         assert_eq!(
             error,
             StepError::UnsupportedInstruction {
                 pc: 0xbfc0_0000,
-                instruction: UNSUPPORTED_CP1_INSTRUCTION,
+                instruction: UNSUPPORTED_CP2_INSTRUCTION,
             }
         );
         assert_eq!(snapshot(&processor), before);
@@ -2356,18 +2382,18 @@ mod tests {
     #[test]
     fn unsupported_instruction_in_delay_slot_preserves_pending_branch() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        enable_cp1(&mut processor);
+        enable_cp2(&mut processor);
         step_with_word(&mut processor, 0x1000_0002).expect("BEQ should succeed");
         let before = snapshot(&processor);
 
-        let error = step_with_word(&mut processor, UNSUPPORTED_CP1_INSTRUCTION)
-            .expect_err("the CP1 operation should remain unsupported");
+        let error = step_with_word(&mut processor, UNSUPPORTED_CP2_INSTRUCTION)
+            .expect_err("the CP2 operation should remain unsupported");
 
         assert_eq!(
             error,
             StepError::UnsupportedInstruction {
                 pc: 0xbfc0_0004,
-                instruction: UNSUPPORTED_CP1_INSTRUCTION,
+                instruction: UNSUPPORTED_CP2_INSTRUCTION,
             }
         );
         assert_eq!(snapshot(&processor), before);
@@ -2559,7 +2585,7 @@ mod tests {
     #[test]
     fn step_error_stalls_pending_transfer_and_random() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        enable_cp1(&mut processor);
+        enable_cp2(&mut processor);
         processor.state.write_gpr(1, 0x1111_1111);
 
         step_with_word(&mut processor, encode_cp0_transfer(0x00, 1, 15))
@@ -2567,14 +2593,14 @@ mod tests {
         let stalled_pc = processor.state.pc();
         let stalled_random = processor.state.read_cp0(1);
 
-        let error = step_with_word(&mut processor, UNSUPPORTED_CP1_INSTRUCTION)
-            .expect_err("the CP1 operation should remain unsupported");
+        let error = step_with_word(&mut processor, UNSUPPORTED_CP2_INSTRUCTION)
+            .expect_err("the CP2 operation should remain unsupported");
 
         assert_eq!(
             error,
             StepError::UnsupportedInstruction {
                 pc: stalled_pc,
-                instruction: UNSUPPORTED_CP1_INSTRUCTION,
+                instruction: UNSUPPORTED_CP2_INSTRUCTION,
             }
         );
         assert_eq!(processor.state.pc(), stalled_pc);
@@ -2590,7 +2616,7 @@ mod tests {
     #[test]
     fn step_error_stalls_pending_instruction_translation() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        enable_cp1(&mut processor);
+        enable_cp2(&mut processor);
         let virtual_address = 0x0060_0000;
         install_and_sync_tlb_entry(
             &mut processor,
@@ -2608,8 +2634,8 @@ mod tests {
             }),
         );
 
-        step_with_word(&mut processor, UNSUPPORTED_CP1_INSTRUCTION)
-            .expect_err("the CP1 operation should remain unsupported");
+        step_with_word(&mut processor, UNSUPPORTED_CP2_INSTRUCTION)
+            .expect_err("the CP2 operation should remain unsupported");
         assert_eq!(
             processor
                 .state
@@ -2632,6 +2658,23 @@ mod tests {
                 .translate_address(virtual_address, AccessType::Instruction),
             Ok(translation(0x0020_0000, Cacheability::Cached))
         );
+    }
+
+    #[test]
+    fn step_error_stalls_a_pending_cp1_condition_write() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        enable_cp2(&mut processor);
+        processor.state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp1ConditionWrite { value: true }),
+        );
+
+        step_with_word(&mut processor, UNSUPPORTED_CP2_INSTRUCTION)
+            .expect_err("the CP2 operation should remain unsupported");
+        assert!(!processor.state.cp1_condition());
+
+        step_with_word(&mut processor, 0).expect("a successful retry should complete the write");
+        assert!(processor.state.cp1_condition());
     }
 
     #[test]
@@ -3008,8 +3051,19 @@ mod tests {
 
     #[test]
     fn coprocessor_gates_distinguish_guest_exceptions_and_unsupported_steps() {
+        let cp1_word = encode_coprocessor_operation(1, 0x10, 0x155);
+        let mut disabled_cp1 = R3000::new(super::TEST_CONFIG);
+        step_with_word(&mut disabled_cp1, cp1_word).expect("disabled CP1 should take CpU");
+        assert_eq!((disabled_cp1.state.read_cp0(13) >> 2) & 0x1f, 11);
+        assert_eq!((disabled_cp1.state.read_cp0(13) >> 28) & 3, 1);
+
+        let mut enabled_cp1 = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut enabled_cp1, 12, STATUS_BEV | STATUS_CU1);
+        step_with_word(&mut enabled_cp1, cp1_word)
+            .expect("an unsupported R3010 operation should complete with U");
+        assert!(enabled_cp1.cp1_interrupt_asserted());
+
         let cases = [
-            (encode_coprocessor_operation(1, 0x10, 0x155), 1, STATUS_CU1),
             (encode_coprocessor_operation(2, 0x00, 0), 2, STATUS_CU2),
             (encode_coprocessor_operation(3, 0x10, 0x155), 3, STATUS_CU3),
         ];
@@ -3097,6 +3151,30 @@ mod tests {
         processor.reset();
 
         assert!(processor.cp1_interrupt_asserted());
+    }
+
+    #[test]
+    fn cp1_arithmetic_executes_through_step_with_both_backends() {
+        for backend in [Backend::SoftFloat, Backend::Native] {
+            let config = R3000Config::new(4 * 1024, 4 * 1024, 4, 4, true, backend);
+            let mut processor = R3000::new(config);
+            enable_cp1(&mut processor);
+            processor
+                .state
+                .cp1_mut()
+                .write_general_register(1, 1.0_f32.to_bits());
+            processor
+                .state
+                .cp1_mut()
+                .write_general_register(2, 2.0_f32.to_bits());
+            let add_single =
+                encode_coprocessor_operation(1, 0x10, (2 << 16) | (1 << 11) | (3 << 6));
+
+            step_with_word(&mut processor, add_single).expect("ADD.S should succeed");
+
+            assert_eq!(processor.state.read_cp1_general(3), 3.0_f32.to_bits());
+            assert_eq!(processor.state.read_cp1_control(31), 0);
+        }
     }
 
     #[test]

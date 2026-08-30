@@ -13,6 +13,7 @@ authors = ["rickgcn"]
 bitflags = "2"
 cc = "1"
 se_core = { path = "crates/se_core" }
+se_float = { path = "crates/se_float" }
 
 [profile.release]
 lto = "thin"

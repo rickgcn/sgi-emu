@@ -208,14 +208,94 @@ pub(super) enum Cp0Instruction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Cp1Instruction {
-    Mfc1 { rt: usize, rd: usize },
-    Cfc1 { rt: usize, rd: usize },
-    Mtc1 { rt: usize, rd: usize },
-    Ctc1 { rt: usize, rd: usize },
-    Bc1f { offset: u16 },
-    Bc1t { offset: u16 },
-    Lwc1 { base: usize, ft: usize, offset: u16 },
-    Swc1 { base: usize, ft: usize, offset: u16 },
+    Mfc1 {
+        rt: usize,
+        rd: usize,
+    },
+    Cfc1 {
+        rt: usize,
+        rd: usize,
+    },
+    Mtc1 {
+        rt: usize,
+        rd: usize,
+    },
+    Ctc1 {
+        rt: usize,
+        rd: usize,
+    },
+    Bc1f {
+        offset: u16,
+    },
+    Bc1t {
+        offset: u16,
+    },
+    Lwc1 {
+        base: usize,
+        ft: usize,
+        offset: u16,
+    },
+    Swc1 {
+        base: usize,
+        ft: usize,
+        offset: u16,
+    },
+    Binary {
+        operation: Cp1BinaryOperation,
+        format: Cp1FloatFormat,
+        ft: usize,
+        fs: usize,
+        fd: usize,
+    },
+    Unary {
+        operation: Cp1UnaryOperation,
+        format: Cp1FloatFormat,
+        fs: usize,
+        fd: usize,
+    },
+    Convert {
+        operation: Cp1Conversion,
+        fs: usize,
+        fd: usize,
+    },
+    Compare {
+        format: Cp1FloatFormat,
+        condition: u8,
+        fs: usize,
+        ft: usize,
+    },
+    UnimplementedOperation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Cp1FloatFormat {
+    Single,
+    Double,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Cp1BinaryOperation {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Cp1UnaryOperation {
+    Absolute,
+    Move,
+    Negate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Cp1Conversion {
+    SingleToDouble,
+    WordToDouble,
+    DoubleToSingle,
+    WordToSingle,
+    SingleToWord,
+    DoubleToWord,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -641,8 +721,103 @@ fn decode_cp1(word: u32) -> DecodeResult {
             }))
         }
         0x08 => DecodeResult::Reserved,
-        0x10..=0x1f => DecodeResult::UnsupportedCoprocessor { unit: 1 },
+        0x10..=0x1f => decode_cp1_computational(word),
         _ => DecodeResult::Reserved,
+    }
+}
+
+fn decode_cp1_computational(word: u32) -> DecodeResult {
+    let instruction = match (rs(word), function(word)) {
+        (0x10, 0x00..=0x03) => Cp1Instruction::Binary {
+            operation: decode_cp1_binary_operation(function(word)),
+            format: Cp1FloatFormat::Single,
+            ft: rt(word),
+            fs: rd(word),
+            fd: shift_amount(word) as usize,
+        },
+        (0x11, 0x00..=0x03) => Cp1Instruction::Binary {
+            operation: decode_cp1_binary_operation(function(word)),
+            format: Cp1FloatFormat::Double,
+            ft: rt(word),
+            fs: rd(word),
+            fd: shift_amount(word) as usize,
+        },
+        (0x10, 0x05..=0x07) => Cp1Instruction::Unary {
+            operation: decode_cp1_unary_operation(function(word)),
+            format: Cp1FloatFormat::Single,
+            fs: rd(word),
+            fd: shift_amount(word) as usize,
+        },
+        (0x11, 0x05..=0x07) => Cp1Instruction::Unary {
+            operation: decode_cp1_unary_operation(function(word)),
+            format: Cp1FloatFormat::Double,
+            fs: rd(word),
+            fd: shift_amount(word) as usize,
+        },
+        (0x10, 0x21) => Cp1Instruction::Convert {
+            operation: Cp1Conversion::SingleToDouble,
+            fs: rd(word),
+            fd: shift_amount(word) as usize,
+        },
+        (0x14, 0x21) => Cp1Instruction::Convert {
+            operation: Cp1Conversion::WordToDouble,
+            fs: rd(word),
+            fd: shift_amount(word) as usize,
+        },
+        (0x11, 0x20) => Cp1Instruction::Convert {
+            operation: Cp1Conversion::DoubleToSingle,
+            fs: rd(word),
+            fd: shift_amount(word) as usize,
+        },
+        (0x14, 0x20) => Cp1Instruction::Convert {
+            operation: Cp1Conversion::WordToSingle,
+            fs: rd(word),
+            fd: shift_amount(word) as usize,
+        },
+        (0x10, 0x24) => Cp1Instruction::Convert {
+            operation: Cp1Conversion::SingleToWord,
+            fs: rd(word),
+            fd: shift_amount(word) as usize,
+        },
+        (0x11, 0x24) => Cp1Instruction::Convert {
+            operation: Cp1Conversion::DoubleToWord,
+            fs: rd(word),
+            fd: shift_amount(word) as usize,
+        },
+        (0x10, 0x30..=0x3f) => Cp1Instruction::Compare {
+            format: Cp1FloatFormat::Single,
+            condition: (function(word) & 0x0f) as u8,
+            fs: rd(word),
+            ft: rt(word),
+        },
+        (0x11, 0x30..=0x3f) => Cp1Instruction::Compare {
+            format: Cp1FloatFormat::Double,
+            condition: (function(word) & 0x0f) as u8,
+            fs: rd(word),
+            ft: rt(word),
+        },
+        _ => Cp1Instruction::UnimplementedOperation,
+    };
+
+    DecodeResult::Implemented(Instruction::Cp1(instruction))
+}
+
+fn decode_cp1_binary_operation(function: u32) -> Cp1BinaryOperation {
+    match function {
+        0x00 => Cp1BinaryOperation::Add,
+        0x01 => Cp1BinaryOperation::Subtract,
+        0x02 => Cp1BinaryOperation::Multiply,
+        0x03 => Cp1BinaryOperation::Divide,
+        _ => unreachable!("binary operation decode is guarded by the function range"),
+    }
+}
+
+fn decode_cp1_unary_operation(function: u32) -> Cp1UnaryOperation {
+    match function {
+        0x05 => Cp1UnaryOperation::Absolute,
+        0x06 => Cp1UnaryOperation::Move,
+        0x07 => Cp1UnaryOperation::Negate,
+        _ => unreachable!("unary operation decode is guarded by the function range"),
     }
 }
 
@@ -697,7 +872,8 @@ fn target(word: u32) -> u32 {
 mod tests {
     use super::{
         AluInstruction, CP0_RFE, CP0_TLBP, CP0_TLBR, CP0_TLBWI, CP0_TLBWR, ControlInstruction,
-        Cp0Instruction, Cp1Instruction, DecodeResult, Instruction, MemoryInstruction, decode,
+        Cp0Instruction, Cp1BinaryOperation, Cp1Conversion, Cp1FloatFormat, Cp1Instruction,
+        Cp1UnaryOperation, DecodeResult, Instruction, MemoryInstruction, decode,
     };
 
     fn encode_register(rs: u32, rt: u32, rd: u32, shift_amount: u32, function: u32) -> u32 {
@@ -714,6 +890,10 @@ mod tests {
 
     fn encode_coprocessor(opcode: u32, selector: u32, rt: u32, rd: u32, low_bits: u32) -> u32 {
         (opcode << 26) | (selector << 21) | (rt << 16) | (rd << 11) | (low_bits & 0x7ff)
+    }
+
+    fn encode_cp1_computational(format: u32, ft: u32, fs: u32, fd: u32, function: u32) -> u32 {
+        (0x11 << 26) | (format << 21) | (ft << 16) | (fs << 11) | (fd << 6) | function
     }
 
     fn alu(instruction: AluInstruction) -> DecodeResult {
@@ -1131,6 +1311,111 @@ mod tests {
     }
 
     #[test]
+    fn decodes_cp1_arithmetic_unary_and_conversions() {
+        for (format_bits, format) in [
+            (0x10, Cp1FloatFormat::Single),
+            (0x11, Cp1FloatFormat::Double),
+        ] {
+            for (function, operation) in [
+                (0x00, Cp1BinaryOperation::Add),
+                (0x01, Cp1BinaryOperation::Subtract),
+                (0x02, Cp1BinaryOperation::Multiply),
+                (0x03, Cp1BinaryOperation::Divide),
+            ] {
+                assert_eq!(
+                    decode(encode_cp1_computational(format_bits, 2, 3, 4, function,)),
+                    cp1(Cp1Instruction::Binary {
+                        operation,
+                        format,
+                        ft: 2,
+                        fs: 3,
+                        fd: 4,
+                    })
+                );
+            }
+
+            for (function, operation) in [
+                (0x05, Cp1UnaryOperation::Absolute),
+                (0x06, Cp1UnaryOperation::Move),
+                (0x07, Cp1UnaryOperation::Negate),
+            ] {
+                assert_eq!(
+                    decode(encode_cp1_computational(format_bits, 31, 3, 4, function,)),
+                    cp1(Cp1Instruction::Unary {
+                        operation,
+                        format,
+                        fs: 3,
+                        fd: 4,
+                    })
+                );
+            }
+        }
+
+        for (format, function, operation) in [
+            (0x10, 0x21, Cp1Conversion::SingleToDouble),
+            (0x14, 0x21, Cp1Conversion::WordToDouble),
+            (0x11, 0x20, Cp1Conversion::DoubleToSingle),
+            (0x14, 0x20, Cp1Conversion::WordToSingle),
+            (0x10, 0x24, Cp1Conversion::SingleToWord),
+            (0x11, 0x24, Cp1Conversion::DoubleToWord),
+        ] {
+            assert_eq!(
+                decode(encode_cp1_computational(format, 31, 3, 4, function)),
+                cp1(Cp1Instruction::Convert {
+                    operation,
+                    fs: 3,
+                    fd: 4,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_all_cp1_comparison_conditions() {
+        for (format_bits, format) in [
+            (0x10, Cp1FloatFormat::Single),
+            (0x11, Cp1FloatFormat::Double),
+        ] {
+            for condition in 0..=0x0f {
+                assert_eq!(
+                    decode(encode_cp1_computational(
+                        format_bits,
+                        2,
+                        3,
+                        31,
+                        0x30 | condition,
+                    )),
+                    cp1(Cp1Instruction::Compare {
+                        format,
+                        condition: condition as u8,
+                        fs: 3,
+                        ft: 2,
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_cp1_computational_encodings_decode_as_unimplemented_operations() {
+        for (format, function) in [(0x10, 0x04), (0x11, 0x0c), (0x14, 0x03), (0x1f, 0x3f)] {
+            assert_eq!(
+                decode(encode_cp1_computational(format, 2, 3, 4, function)),
+                cp1(Cp1Instruction::UnimplementedOperation)
+            );
+        }
+
+        for format in 0x10..=0x1f {
+            for function in 0..=0x3f {
+                assert!(matches!(
+                    decode(encode_cp1_computational(format, 2, 3, 4, function)),
+                    DecodeResult::Implemented(Instruction::Cp1(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn decodes_every_supported_memory_instruction() {
         let cases = [
             (
@@ -1383,11 +1668,6 @@ mod tests {
 
     #[test]
     fn classifies_unsupported_coprocessor_encodings() {
-        assert_eq!(
-            decode(encode_coprocessor(0x11, 0x10, 2, 3, 0x155)),
-            DecodeResult::UnsupportedCoprocessor { unit: 1 }
-        );
-
         for opcode in 0x12..=0x13 {
             let unit = opcode as usize - 0x10;
             for selector in [0x00, 0x02, 0x04, 0x06] {

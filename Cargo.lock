@@ -33,6 +33,7 @@ name = "se_cpu"
 version = "0.1.0"
 dependencies = [
  "se_core",
+ "se_float",
 ]
 
 [[package]]

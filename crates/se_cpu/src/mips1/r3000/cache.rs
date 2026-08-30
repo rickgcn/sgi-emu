@@ -235,11 +235,13 @@ impl Caches {
 #[cfg(test)]
 mod tests {
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_float::backend::Backend;
 
     use super::{CacheBank, Caches};
     use crate::mips1::r3000::R3000Config;
 
-    const CONFIG: R3000Config = R3000Config::new(4 * 1024, 4 * 1024, 16, 4, true);
+    const CONFIG: R3000Config =
+        R3000Config::new(4 * 1024, 4 * 1024, 16, 4, true, Backend::SoftFloat);
 
     struct TestBus {
         memory: Vec<u8>,
@@ -309,11 +311,18 @@ mod tests {
             128 * 1024,
             256 * 1024,
         ] {
-            let config = R3000Config::new(cache_bytes, cache_bytes, 4, 4, true);
+            let config = R3000Config::new(cache_bytes, cache_bytes, 4, 4, true, Backend::SoftFloat);
             let _ = Caches::new(config);
         }
         for refill_bytes in [4, 16, 32, 64, 128] {
-            let config = R3000Config::new(4 * 1024, 4 * 1024, refill_bytes, refill_bytes, true);
+            let config = R3000Config::new(
+                4 * 1024,
+                4 * 1024,
+                refill_bytes,
+                refill_bytes,
+                true,
+                Backend::SoftFloat,
+            );
             let _ = Caches::new(config);
         }
 
@@ -321,7 +330,7 @@ mod tests {
             let cache_bytes = std::hint::black_box(cache_bytes);
             assert!(
                 std::panic::catch_unwind(|| {
-                    R3000Config::new(cache_bytes, 4 * 1024, 4, 4, true)
+                    R3000Config::new(cache_bytes, 4 * 1024, 4, 4, true, Backend::SoftFloat)
                 })
                 .is_err()
             );
@@ -330,7 +339,14 @@ mod tests {
             let refill_bytes = std::hint::black_box(refill_bytes);
             assert!(
                 std::panic::catch_unwind(|| {
-                    R3000Config::new(4 * 1024, 4 * 1024, refill_bytes, 4, true)
+                    R3000Config::new(
+                        4 * 1024,
+                        4 * 1024,
+                        refill_bytes,
+                        4,
+                        true,
+                        Backend::SoftFloat,
+                    )
                 })
                 .is_err()
             );
@@ -340,7 +356,7 @@ mod tests {
     #[test]
     fn index_wrap_uses_page_frame_tag_for_multiple_cache_sizes() {
         for cache_bytes in [4 * 1024, 8 * 1024] {
-            let config = R3000Config::new(cache_bytes, 4 * 1024, 4, 4, true);
+            let config = R3000Config::new(cache_bytes, 4 * 1024, 4, 4, true, Backend::SoftFloat);
             let mut caches = Caches::new(config);
             let first = PhysAddr::new(0x234);
             let alias = PhysAddr::new(0x234 + cache_bytes as u64);
@@ -399,7 +415,14 @@ mod tests {
     #[test]
     fn every_supported_refill_size_commits_words_in_address_order() {
         for refill_bytes in [4, 16, 32, 64, 128] {
-            let config = R3000Config::new(4 * 1024, 4 * 1024, refill_bytes, 4, true);
+            let config = R3000Config::new(
+                4 * 1024,
+                4 * 1024,
+                refill_bytes,
+                4,
+                true,
+                Backend::SoftFloat,
+            );
             let mut caches = Caches::new(config);
             let mut bus = TestBus::new();
             let address = PhysAddr::new(0x1ac);
@@ -536,7 +559,8 @@ mod tests {
 
     #[test]
     fn disabled_partial_stores_invalidate_after_a_successful_bus_write() {
-        const NO_PARTIAL: R3000Config = R3000Config::new(4 * 1024, 4 * 1024, 4, 4, false);
+        const NO_PARTIAL: R3000Config =
+            R3000Config::new(4 * 1024, 4 * 1024, 4, 4, false, Backend::SoftFloat);
         let mut caches = Caches::new(NO_PARTIAL);
         let mut bus = TestBus::new();
         caches.write_isolated(CacheBank::Data, PhysAddr::new(0x40), &[1, 2, 3, 4]);
@@ -582,7 +606,7 @@ mod tests {
 
     #[test]
     fn instruction_and_data_caches_keep_independent_geometry_and_state() {
-        let config = R3000Config::new(4 * 1024, 8 * 1024, 4, 4, true);
+        let config = R3000Config::new(4 * 1024, 8 * 1024, 4, 4, true, Backend::SoftFloat);
         let mut caches = Caches::new(config);
         caches.write_isolated(CacheBank::Instruction, PhysAddr::new(0), &[1, 2, 3, 4]);
         caches.write_isolated(CacheBank::Data, PhysAddr::new(0), &[5, 6, 7, 8]);

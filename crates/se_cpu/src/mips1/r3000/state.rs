@@ -35,6 +35,7 @@ enum PendingCp0Write {
 enum PendingCp1Write {
     General { index: usize, value: u32 },
     Control { index: usize, value: u32 },
+    Condition { value: bool },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +56,9 @@ pub(super) enum InstructionEffect {
     DelayedCp1ControlWrite {
         index: usize,
         value: u32,
+    },
+    DelayedCp1ConditionWrite {
+        value: bool,
     },
     DelayedTlbRead {
         entry_hi: u32,
@@ -109,7 +113,7 @@ impl State {
             pc: RESET_PC,
             delay_slot: None,
             cp0: Cp0::new(),
-            cp1: Cp1::new(),
+            cp1: Cp1::new(config.floating_point_backend()),
             mmu: Mmu::new(),
             caches: Caches::new(config),
             pending_gpr_write: None,
@@ -194,6 +198,14 @@ impl State {
 
     pub(super) fn read_cp1_general(&self, index: usize) -> u32 {
         self.cp1.read_general_register(index)
+    }
+
+    pub(super) fn cp1(&self) -> &Cp1 {
+        &self.cp1
+    }
+
+    pub(super) fn cp1_mut(&mut self) -> &mut Cp1 {
+        &mut self.cp1
     }
 
     pub(super) fn read_cp1_control(&self, index: usize) -> u32 {
@@ -378,6 +390,10 @@ impl State {
                 self.pending_cp1_write = Some(PendingCp1Write::Control { index, value });
                 None
             }
+            Some(InstructionEffect::DelayedCp1ConditionWrite { value }) => {
+                self.pending_cp1_write = Some(PendingCp1Write::Condition { value });
+                None
+            }
             Some(InstructionEffect::DelayedTlbRead { entry_hi, entry_lo }) => {
                 self.pending_cp0_write = Some(PendingCp0Write::TlbRead { entry_hi, entry_lo });
                 None
@@ -457,7 +473,7 @@ impl State {
         }
     }
 
-    fn commit_pending_cp1_write(&mut self) {
+    pub(super) fn commit_pending_cp1_write(&mut self) {
         if let Some(write) = self.pending_cp1_write.take() {
             match write {
                 PendingCp1Write::General { index, value } => {
@@ -465,6 +481,9 @@ impl State {
                 }
                 PendingCp1Write::Control { index, value } => {
                     self.cp1.write_control_register(index, value);
+                }
+                PendingCp1Write::Condition { value } => {
+                    self.cp1.write_condition(value);
                 }
             }
         }
@@ -995,6 +1014,28 @@ mod tests {
         state.complete_instruction(None, None);
         assert!(state.cp1_condition());
         assert!(state.cp1_interrupt_asserted());
+    }
+
+    #[test]
+    fn cp1_condition_write_commits_on_success_and_guest_exception() {
+        let mut successful = State::new(crate::mips1::r3000::TEST_CONFIG);
+        successful.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp1ConditionWrite { value: true }),
+        );
+        assert!(!successful.cp1_condition());
+        successful.complete_instruction(None, None);
+        assert!(successful.cp1_condition());
+
+        let mut exceptional = State::new(crate::mips1::r3000::TEST_CONFIG);
+        exceptional.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp1ConditionWrite { value: true }),
+        );
+        assert!(!exceptional.cp1_condition());
+        exceptional.take_exception(Exception::Syscall);
+        assert!(exceptional.cp1_condition());
+        assert_eq!(exceptional.pending_cp1_write, None);
     }
 
     #[test]
