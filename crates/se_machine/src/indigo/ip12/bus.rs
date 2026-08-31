@@ -4,11 +4,14 @@ use se_device::hpc1::Hpc1;
 use se_device::int2::Int2;
 use se_device::mdac::Mdac;
 use se_device::pic1::Pic1;
+use se_device::ram::Ram;
 use se_device::rom::Rom;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
 
 use super::PROM_BYTES;
+
+const LOCAL_MEMORY_END: u64 = 0x1000_0000;
 
 const PIC1_BASE: u64 = 0x1fa0_0000;
 const PIC1_END: u64 = 0x1fab_0000;
@@ -52,6 +55,7 @@ const PROM_END: u64 = PROM_BASE + PROM_BYTES as u64;
 
 pub(super) struct Ip12Bus {
     pic1: Pic1,
+    memory: [Option<Ram>; 4],
     hpc1: Hpc1,
     int2: Int2,
     scsi: Wd33c93b,
@@ -66,6 +70,7 @@ impl Ip12Bus {
     #[allow(clippy::too_many_arguments, reason = "the IP12 topology is fixed")]
     pub(super) const fn new(
         pic1: Pic1,
+        memory: [Option<Ram>; 4],
         hpc1: Hpc1,
         int2: Int2,
         scsi: Wd33c93b,
@@ -76,6 +81,7 @@ impl Ip12Bus {
     ) -> Self {
         Self {
             pic1,
+            memory,
             hpc1,
             int2,
             scsi,
@@ -103,7 +109,15 @@ impl Ip12Bus {
         self.pic1.take_system_reset_request()
     }
 
+    pub(super) fn error_interrupt_asserted(&self) -> bool {
+        self.pic1.error_interrupt_asserted()
+    }
+
     pub(super) fn debug_read(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        if address.get() < LOCAL_MEMORY_END {
+            return self.read_memory(address, data);
+        }
+
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.read(address, data),
             Target::Hpc1(address) => self.hpc1.read(address, data),
@@ -118,10 +132,59 @@ impl Ip12Bus {
             Target::Prom(address) => self.prom.read(address, data),
         }
     }
+
+    fn read_memory(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        if !local_memory_transaction_is_contained(address, data.len())? {
+            return Err(BusFault::Unmapped);
+        }
+
+        let Some((index, offset)) = self.pic1.decode_memory(address, data.len())? else {
+            return Err(BusFault::Unmapped);
+        };
+
+        let Some(ram) = &self.memory[index] else {
+            data.fill(0);
+            return Ok(());
+        };
+
+        match ram.read(offset, data) {
+            Ok(()) => Ok(()),
+            Err(BusFault::Unmapped) => {
+                data.fill(0);
+                Ok(())
+            }
+            Err(fault) => Err(fault),
+        }
+    }
+
+    fn write_memory(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+        if !local_memory_transaction_is_contained(address, data.len())? {
+            self.pic1.report_cpu_write_bus_error();
+            return Ok(());
+        }
+
+        let Some((index, offset)) = self.pic1.decode_memory(address, data.len())? else {
+            self.pic1.report_cpu_write_bus_error();
+            return Ok(());
+        };
+
+        let Some(ram) = &mut self.memory[index] else {
+            return Ok(());
+        };
+
+        match ram.write(offset, data) {
+            Ok(()) | Err(BusFault::Unmapped) => Ok(()),
+            Err(fault) => Err(fault),
+        }
+    }
 }
 
 impl PhysicalBus for Ip12Bus {
     fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        if address.get() < LOCAL_MEMORY_END {
+            return self.read_memory(address, data);
+        }
+
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.read(address, data),
             Target::Hpc1(address) => self.hpc1.read(address, data),
@@ -138,6 +201,10 @@ impl PhysicalBus for Ip12Bus {
     }
 
     fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+        if address.get() < LOCAL_MEMORY_END {
+            return self.write_memory(address, data);
+        }
+
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.write(address, data),
             Target::Hpc1(address) => {
@@ -158,6 +225,20 @@ impl PhysicalBus for Ip12Bus {
             Target::Prom(address) => self.prom.write(address, data),
         }
     }
+}
+
+fn local_memory_transaction_is_contained(
+    address: PhysAddr,
+    length: usize,
+) -> Result<bool, BusFault> {
+    if !(1..=4).contains(&length) {
+        return Err(BusFault::UnsupportedAccess);
+    }
+
+    let Some(end) = address.get().checked_add(length as u64) else {
+        return Ok(false);
+    };
+    Ok(end <= LOCAL_MEMORY_END)
 }
 
 enum Target {
@@ -325,6 +406,7 @@ mod tests {
     use se_device::int2::Int2;
     use se_device::mdac::Mdac;
     use se_device::pic1::Pic1;
+    use se_device::ram::Ram;
     use se_device::rom::Rom;
     use se_device::wd33c93b::Wd33c93b;
     use se_device::z85230::Z85230;
@@ -332,14 +414,19 @@ mod tests {
     use super::{
         BOARD_REVISION_BASE, CPU_AUX_CONTROL, HPC1_ENDIAN_CONTROL_BASE, HPC1_ETHERNET_FIFO_BASE,
         HPC1_ETHERNET_POINTER_BASE, HPC1_MISCELLANEOUS_CONTROL_BASE, HPC1_SCSI_CONTROL_BASE,
-        INT2_BASE, Ip12Bus, MDAC_BASE, PIC1_BASE, PROM_BASE, PROM_BYTES, PROM_END, RTC_BASE,
-        SCSI_BASE, SERIAL_0_BASE, SERIAL_1_BASE, SERIAL_2_BASE,
+        INT2_BASE, Ip12Bus, LOCAL_MEMORY_END, MDAC_BASE, PIC1_BASE, PROM_BASE, PROM_BYTES,
+        PROM_END, RTC_BASE, SCSI_BASE, SERIAL_0_BASE, SERIAL_1_BASE, SERIAL_2_BASE,
     };
 
     fn bus() -> Ip12Bus {
+        bus_with_memory([Some(Ram::new(8 * 1024 * 1024)), None, None, None])
+    }
+
+    fn bus_with_memory(memory: [Option<Ram>; 4]) -> Ip12Bus {
         let bytes = (0..PROM_BYTES).map(|index| index as u8).collect();
         Ip12Bus::new(
             Pic1::new(0xf7, 2, true),
+            memory,
             Hpc1::new(),
             Int2::new(),
             Wd33c93b::new(),
@@ -360,6 +447,161 @@ mod tests {
         let mut byte = [0];
         bus.read(PhysAddr::new(address), &mut byte)?;
         Ok(byte[0])
+    }
+
+    fn configure_memory(bus: &mut Ip12Bus, configuration_0: u32, configuration_1: u32) {
+        bus.write(
+            PhysAddr::new(PIC1_BASE + 0x1_0000),
+            &configuration_0.to_be_bytes(),
+        )
+        .unwrap();
+        bus.write(
+            PhysAddr::new(PIC1_BASE + 0x1_0004),
+            &configuration_1.to_be_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn routes_real_memory_through_the_pic1_configuration() {
+        let mut bus = bus();
+        configure_memory(&mut bus, 0x0f00_023f, 0x023f_023f);
+
+        assert_eq!(
+            bus.write(PhysAddr::new(0), &0x0123_4567_u32.to_be_bytes()),
+            Ok(())
+        );
+        assert_eq!(read_word(&mut bus, 0), Ok(0x0123_4567));
+        assert_eq!(
+            bus.write(
+                PhysAddr::new(8 * 1024 * 1024 - 4),
+                &0x89ab_cdef_u32.to_be_bytes()
+            ),
+            Ok(())
+        );
+        assert_eq!(read_word(&mut bus, 8 * 1024 * 1024 - 4), Ok(0x89ab_cdef));
+    }
+
+    #[test]
+    fn installed_storage_boundary_is_a_probe_hole_not_an_alias() {
+        let mut bus = bus();
+        configure_memory(&mut bus, 0x0f00_023f, 0x023f_023f);
+        bus.write(
+            PhysAddr::new(8 * 1024 * 1024 - 4),
+            &0x0123_4567_u32.to_be_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(read_word(&mut bus, 8 * 1024 * 1024), Ok(0));
+        assert_eq!(
+            bus.write(
+                PhysAddr::new(8 * 1024 * 1024),
+                &0x89ab_cdef_u32.to_be_bytes()
+            ),
+            Ok(())
+        );
+        assert_eq!(read_word(&mut bus, 8 * 1024 * 1024 - 4), Ok(0x0123_4567));
+
+        let mut crossing = [0xff; 4];
+        assert_eq!(
+            bus.read(PhysAddr::new(8 * 1024 * 1024 - 2), &mut crossing),
+            Ok(())
+        );
+        assert_eq!(crossing, [0; 4]);
+        assert_eq!(
+            bus.write(
+                PhysAddr::new(8 * 1024 * 1024 - 2),
+                &0xffff_ffff_u32.to_be_bytes()
+            ),
+            Ok(())
+        );
+        assert_eq!(read_word(&mut bus, 8 * 1024 * 1024 - 4), Ok(0x0123_4567));
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn uninstalled_descriptor_is_a_probe_hole() {
+        let mut bus = bus();
+        configure_memory(&mut bus, 0x0f00_0f10, 0x023f_023f);
+        let address = 16_u64 << 22;
+
+        assert_eq!(read_word(&mut bus, address), Ok(0));
+        assert_eq!(
+            bus.write(PhysAddr::new(address), &0x0123_4567_u32.to_be_bytes()),
+            Ok(())
+        );
+        assert_eq!(read_word(&mut bus, address), Ok(0));
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn unmatched_local_reads_fault_and_writes_latch_an_error() {
+        let mut bus = bus();
+        configure_memory(&mut bus, 0x023f_023f, 0x023f_023f);
+
+        assert_eq!(
+            bus.read(PhysAddr::new(0), &mut [0; 4]),
+            Err(BusFault::Unmapped)
+        );
+        assert_eq!(
+            bus.debug_read(PhysAddr::new(0), &mut [0; 4]),
+            Err(BusFault::Unmapped)
+        );
+        assert_eq!(
+            bus.write(PhysAddr::new(0), &0x0123_4567_u32.to_be_bytes()),
+            Ok(())
+        );
+        assert!(bus.error_interrupt_asserted());
+
+        bus.write(PhysAddr::new(PIC1_BASE + 0x1_0210), &[0])
+            .unwrap();
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn separate_ram_modules_do_not_alias() {
+        let mut bus = bus_with_memory([
+            Some(Ram::new(16 * 1024 * 1024)),
+            Some(Ram::new(32 * 1024 * 1024)),
+            None,
+            None,
+        ]);
+        configure_memory(&mut bus, 0x0300_0704, 0x023f_023f);
+        let second_base = 4_u64 << 22;
+
+        bus.write(PhysAddr::new(0), &0x0123_4567_u32.to_be_bytes())
+            .unwrap();
+        bus.write(PhysAddr::new(second_base), &0x89ab_cdef_u32.to_be_bytes())
+            .unwrap();
+
+        assert_eq!(read_word(&mut bus, 0), Ok(0x0123_4567));
+        assert_eq!(read_word(&mut bus, second_base), Ok(0x89ab_cdef));
+        assert_eq!(
+            bus.write(
+                PhysAddr::new(second_base + 32 * 1024 * 1024 - 4),
+                &0xfedc_ba98_u32.to_be_bytes()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            read_word(&mut bus, second_base + 32 * 1024 * 1024 - 4),
+            Ok(0xfedc_ba98)
+        );
+    }
+
+    #[test]
+    fn local_memory_window_crossing_writes_latch_an_error() {
+        let mut bus = bus();
+
+        assert_eq!(
+            bus.write(PhysAddr::new(LOCAL_MEMORY_END - 2), &[1, 2, 3, 4]),
+            Ok(())
+        );
+        assert!(bus.error_interrupt_asserted());
+        assert_eq!(
+            bus.read(PhysAddr::new(LOCAL_MEMORY_END - 2), &mut [0; 4]),
+            Err(BusFault::Unmapped)
+        );
     }
 
     #[test]
@@ -517,8 +759,16 @@ mod tests {
     }
 
     #[test]
-    fn reset_restores_volatile_devices_but_preserves_rtc_and_prom() {
+    fn reset_restores_volatile_devices_but_preserves_rtc_ram_and_prom() {
         let mut bus = bus();
+        configure_memory(&mut bus, 0x0100_023f, 0x023f_023f);
+        bus.write(
+            PhysAddr::new(6 * 1024 * 1024),
+            &0x0123_4567_u32.to_be_bytes(),
+        )
+        .unwrap();
+        bus.write(PhysAddr::new(12 * 1024 * 1024), &[0]).unwrap();
+        assert!(bus.error_interrupt_asserted());
         bus.write(
             PhysAddr::new(PIC1_BASE + 0xa_0000),
             &0x0123_4567_u32.to_be_bytes(),
@@ -532,6 +782,10 @@ mod tests {
 
         bus.reset();
 
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 0x1_0000), Ok(0));
+        assert!(!bus.error_interrupt_asserted());
+        configure_memory(&mut bus, 0x0100_023f, 0x023f_023f);
+        assert_eq!(read_word(&mut bus, 6 * 1024 * 1024), Ok(0x0123_4567));
         assert_eq!(read_word(&mut bus, PIC1_BASE + 0xa_0000), Ok(0));
         assert_eq!(read_word(&mut bus, HPC1_ENDIAN_CONTROL_BASE), Ok(0x40));
         assert_eq!(read_word(&mut bus, INT2_BASE + 4), Ok(0));

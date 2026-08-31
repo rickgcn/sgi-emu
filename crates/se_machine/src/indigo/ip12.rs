@@ -13,6 +13,7 @@ use se_device::hpc1::Hpc1;
 use se_device::int2::Int2;
 use se_device::mdac::Mdac;
 use se_device::pic1::Pic1;
+use se_device::ram::Ram;
 use se_device::rom::Rom;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
@@ -22,6 +23,7 @@ use self::bus::Ip12Bus;
 use self::prom::normalize_u56_prom;
 
 const PROM_BYTES: usize = 0x40000;
+const RAM_BYTES: usize = 8 * 1024 * 1024;
 
 /// An error encountered while constructing an Indigo IP12.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +69,7 @@ impl Ip12 {
             cpu: R3000::new(cpu_config(floating_point_backend)),
             bus: Ip12Bus::new(
                 Pic1::new(0xf7, 2, true),
+                [Some(Ram::new(RAM_BYTES)), None, None, None],
                 Hpc1::new(),
                 Int2::new(),
                 Wd33c93b::new(),
@@ -82,6 +85,7 @@ impl Ip12 {
     pub fn reset(&mut self) {
         self.cpu.reset();
         self.bus.reset();
+        self.update_interrupt_lines();
     }
 
     /// Executes one architectural processor instruction.
@@ -90,11 +94,20 @@ impl Ip12 {
     ///
     /// Returns [`StepError`] when the processor cannot complete the step.
     pub fn execute_instruction(&mut self) -> Result<(), StepError> {
+        self.update_interrupt_lines();
         self.cpu.step(&mut self.bus)?;
         if self.bus.take_system_reset_request() {
             self.reset();
         }
         Ok(())
+    }
+
+    fn update_interrupt_lines(&mut self) {
+        let mut interrupt_lines = u8::from(self.cpu.cp1_interrupt_asserted());
+        if self.bus.error_interrupt_asserted() {
+            interrupt_lines |= 1 << 5;
+        }
+        self.cpu.set_hardware_interrupt_lines(interrupt_lines);
     }
 
     /// Returns the virtual address of the next instruction to execute.
@@ -116,7 +129,10 @@ mod tests {
     use se_core::bus::{PhysAddr, PhysicalBus};
     use se_float::backend::Backend;
 
-    use super::{Ip12, Ip12Error, PROM_BYTES, cpu_config};
+    use super::{Ip12, Ip12Error, PROM_BYTES, RAM_BYTES, cpu_config};
+
+    const MEMORY_CONFIGURATION_INSTRUCTION_BUDGET: usize = 300_000;
+    const STACK_SETUP_INSTRUCTION_BUDGET: usize = 30_000;
 
     #[test]
     fn constructor_reports_invalid_prom_size() {
@@ -149,7 +165,26 @@ mod tests {
     }
 
     #[test]
-    fn reset_restores_the_cpu_and_asic_front_end_without_changing_prom() {
+    fn production_topology_contains_one_eight_megabyte_ram_module() {
+        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat).unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fa1_0000), &0x0f00_023f_u32.to_be_bytes())
+            .unwrap();
+
+        machine
+            .bus
+            .write(
+                PhysAddr::new(RAM_BYTES as u64 - 4),
+                &0x0123_4567_u32.to_be_bytes(),
+            )
+            .unwrap();
+        assert_eq!(read_word(&mut machine, RAM_BYTES as u64 - 4), 0x0123_4567);
+        assert_eq!(read_word(&mut machine, RAM_BYTES as u64), 0);
+    }
+
+    #[test]
+    fn reset_restores_the_cpu_and_asic_front_end_without_changing_ram_or_prom() {
         let mut raw_prom = vec![0; PROM_BYTES];
         raw_prom[0x100..0x104].copy_from_slice(&[0x34, 0x12, 0x78, 0x56]);
         let mut machine = Ip12::new(raw_prom, Backend::SoftFloat).unwrap();
@@ -176,6 +211,21 @@ mod tests {
             .bus
             .write(PhysAddr::new(0x1fb8_0e57), &[0xa5])
             .unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fa1_0000), &0x0100_023f_u32.to_be_bytes())
+            .unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x0060_0000), &0x89ab_cdef_u32.to_be_bytes())
+            .unwrap();
+        machine.bus.write(PhysAddr::new(0x00c0_0000), &[0]).unwrap();
+        assert!(machine.bus.error_interrupt_asserted());
+        machine.execute_instruction().unwrap();
+        assert_ne!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
+            0
+        );
 
         machine.reset();
 
@@ -187,7 +237,90 @@ mod tests {
         assert_eq!(read_byte(&mut machine, 0x1fb8_0e57), 0xa5);
         assert_eq!(read_word(&mut machine, 0x1fa0_0004), 0xf7);
         assert_eq!(read_word(&mut machine, 0x1fa0_0008), 0x88);
+        assert_eq!(read_word(&mut machine, 0x1fa1_0000), 0);
+        assert!(!machine.bus.error_interrupt_asserted());
+        assert_eq!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
+            0
+        );
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fa1_0000), &0x0100_023f_u32.to_be_bytes())
+            .unwrap();
+        assert_eq!(read_word(&mut machine, 0x0060_0000), 0x89ab_cdef);
         assert_eq!(read_word(&mut machine, 0x1fc0_0100), 0x1234_5678);
+    }
+
+    #[test]
+    fn pic1_error_output_drives_and_releases_cpu_interrupt_input_five() {
+        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat).unwrap();
+        machine
+            .bus
+            .write(
+                PhysAddr::new(4 * 1024 * 1024),
+                &0x0123_4567_u32.to_be_bytes(),
+            )
+            .unwrap();
+
+        machine.execute_instruction().unwrap();
+        assert_ne!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
+            0
+        );
+
+        machine.bus.write(PhysAddr::new(0x1fa1_0210), &[0]).unwrap();
+        machine.execute_instruction().unwrap();
+        assert_eq!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
+            0
+        );
+    }
+
+    #[test]
+    fn guest_store_error_is_sampled_at_the_next_instruction_boundary() {
+        let mut machine = machine_with_instructions(&[0x3c08_a040, 0xad00_0000, 0]);
+
+        machine.execute_instruction().unwrap();
+        machine.execute_instruction().unwrap();
+        assert!(machine.bus.error_interrupt_asserted());
+        assert_eq!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
+            0
+        );
+
+        machine.execute_instruction().unwrap();
+        assert_ne!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
+            0
+        );
+    }
+
+    #[test]
+    fn cp1_error_output_drives_cpu_interrupt_input_zero() {
+        let mut machine = machine_with_instructions(&[
+            0x3c08_2040,
+            0x4088_6000,
+            0,
+            0x3c08_0002,
+            0x44c8_f800,
+            0,
+            0,
+        ]);
+
+        for _ in 0..6 {
+            machine.execute_instruction().unwrap();
+        }
+        assert!(machine.cpu.cp1_interrupt_asserted());
+        assert_eq!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 10),
+            0
+        );
+
+        machine.execute_instruction().unwrap();
+        assert_ne!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 10),
+            0
+        );
     }
 
     #[test]
@@ -223,6 +356,18 @@ mod tests {
         let mut byte = [0];
         machine.bus.read(PhysAddr::new(address), &mut byte).unwrap();
         byte[0]
+    }
+
+    fn machine_with_instructions(instructions: &[u32]) -> Ip12 {
+        let mut raw_prom = vec![0; PROM_BYTES];
+        for (destination, instruction) in raw_prom
+            .chunks_exact_mut(4)
+            .zip(instructions.iter().copied())
+        {
+            let [first, second, third, fourth] = instruction.to_be_bytes();
+            destination.copy_from_slice(&[second, first, fourth, third]);
+        }
+        Ip12::new(raw_prom, Backend::SoftFloat).unwrap()
     }
 
     #[test]
@@ -284,5 +429,70 @@ mod tests {
         }
 
         assert_eq!(machine.execution_address(), 0xbfc0_0320);
+    }
+
+    #[test]
+    #[ignore = "requires an external 070-8088-002 IP12 PROM dump"]
+    fn memory_initialization_reaches_stack_setup() {
+        let path = env::var_os("SE_INDIGO_IP12_PROM")
+            .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
+        let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
+        let mut machine =
+            Ip12::new(raw_prom, Backend::SoftFloat).expect("the PROM dump should be valid");
+
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fa1_0000), &0x0100_003f_u32.to_be_bytes())
+            .unwrap();
+        for address in (0x0038_0000..0x0040_0000).step_by(4) {
+            machine
+                .bus
+                .write(PhysAddr::new(address), &0xa5a5_a5a5_u32.to_be_bytes())
+                .unwrap();
+        }
+        machine.reset();
+
+        execute_until(
+            &mut machine,
+            0xbfc0_0328,
+            MEMORY_CONFIGURATION_INSTRUCTION_BUDGET,
+        );
+        assert_eq!(read_word(&mut machine, 0x1fa1_0000), 0x0100_003f);
+        assert_eq!(read_word(&mut machine, 0x1fa1_0004), 0x003f_003f);
+        assert_ne!(read_word(&mut machine, 0x1fa0_0000) & 0x400, 0);
+        assert!(!machine.bus.error_interrupt_asserted());
+
+        for offset in (0..0x28).step_by(4) {
+            assert_eq!(
+                read_word(&mut machine, offset),
+                read_word(&mut machine, 0x1fc0_0950 + offset)
+            );
+        }
+        for address in (0x0038_0000..0x0040_0000).step_by(4) {
+            assert_eq!(read_word(&mut machine, address), 0);
+        }
+
+        execute_until(&mut machine, 0xbfc0_0fb0, STACK_SETUP_INSTRUCTION_BUDGET);
+        assert_eq!(read_word(&mut machine, 0x0038_21c0), 0xfeed_dead);
+        assert_eq!(read_word(&mut machine, 0x0038_21c4), 0xa03f_fff0);
+        let stack_pointer = machine.cpu.debug_snapshot().gpr[29];
+        assert!((0xa038_0000..0xa040_0000).contains(&stack_pointer));
+        assert!(!machine.bus.error_interrupt_asserted());
+    }
+
+    fn execute_until(machine: &mut Ip12, target: u32, budget: usize) {
+        for _ in 0..budget {
+            if machine.execution_address() == target {
+                return;
+            }
+            machine
+                .execute_instruction()
+                .expect("the PROM memory initialization should execute");
+        }
+
+        panic!(
+            "instruction budget exhausted at 0x{:08x}, expected 0x{target:08x}",
+            machine.execution_address()
+        )
     }
 }
