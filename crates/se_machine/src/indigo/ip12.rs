@@ -8,10 +8,14 @@ use std::error::Error;
 use std::fmt;
 
 use se_cpu::mips1::r3000::{R3000, R3000Config, StepError};
+use se_device::dp8573a::Dp8573a;
 use se_device::hpc1::Hpc1;
 use se_device::int2::Int2;
+use se_device::mdac::Mdac;
 use se_device::pic1::Pic1;
 use se_device::rom::Rom;
+use se_device::wd33c93b::Wd33c93b;
+use se_device::z85230::Z85230;
 use se_float::backend::Backend;
 
 use self::bus::Ip12Bus;
@@ -61,7 +65,16 @@ impl Ip12 {
         let prom = Rom::new(normalize_u56_prom(raw_prom)?);
         Ok(Self {
             cpu: R3000::new(cpu_config(floating_point_backend)),
-            bus: Ip12Bus::new(Pic1::new(0xf7, 2, true), Hpc1::new(), Int2::new(), prom),
+            bus: Ip12Bus::new(
+                Pic1::new(0xf7, 2, true),
+                Hpc1::new(),
+                Int2::new(),
+                Wd33c93b::new(),
+                [Z85230::new(), Z85230::new()],
+                Dp8573a::new(),
+                Mdac::new(),
+                prom,
+            ),
         })
     }
 
@@ -155,6 +168,14 @@ mod tests {
             .bus
             .write(PhysAddr::new(0x1fb8_01c7), &[0xa5])
             .unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fb8_01bf), &[0x0f])
+            .unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fb8_0e57), &[0xa5])
+            .unwrap();
 
         machine.reset();
 
@@ -162,6 +183,8 @@ mod tests {
         assert_eq!(read_word(&mut machine, 0x1faa_0000), 0);
         assert_eq!(read_word(&mut machine, 0x1fb8_00c0), 0x40);
         assert_eq!(read_word(&mut machine, 0x1fb8_01c4), 0);
+        assert_eq!(read_byte(&mut machine, 0x1fb8_01bf), 0);
+        assert_eq!(read_byte(&mut machine, 0x1fb8_0e57), 0xa5);
         assert_eq!(read_word(&mut machine, 0x1fa0_0004), 0xf7);
         assert_eq!(read_word(&mut machine, 0x1fa0_0008), 0x88);
         assert_eq!(read_word(&mut machine, 0x1fc0_0100), 0x1234_5678);
@@ -194,6 +217,12 @@ mod tests {
             .read(PhysAddr::new(address), &mut bytes)
             .unwrap();
         u32::from_be_bytes(bytes)
+    }
+
+    fn read_byte(machine: &mut Ip12, address: u64) -> u8 {
+        let mut byte = [0];
+        machine.bus.read(PhysAddr::new(address), &mut byte).unwrap();
+        byte[0]
     }
 
     #[test]
@@ -234,5 +263,26 @@ mod tests {
         }
 
         assert_eq!(machine.execution_address(), 0xbfc0_02f0);
+    }
+
+    #[test]
+    #[ignore = "requires an external 070-8088-002 IP12 PROM dump"]
+    fn board_diagnostics_reach_memory_initialization() {
+        let path = env::var_os("SE_INDIGO_IP12_PROM")
+            .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
+        let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
+        let mut machine =
+            Ip12::new(raw_prom, Backend::SoftFloat).expect("the PROM dump should be valid");
+
+        for _ in 0..20_000 {
+            if machine.execution_address() == 0xbfc0_0320 {
+                return;
+            }
+            machine
+                .execute_instruction()
+                .expect("the board diagnostics should execute");
+        }
+
+        assert_eq!(machine.execution_address(), 0xbfc0_0320);
     }
 }
