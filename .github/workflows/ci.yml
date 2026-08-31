@@ -31,6 +31,15 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+
       - name: Show Rust toolchain
         run: rustc --version --verbose
 
@@ -55,10 +64,16 @@ jobs:
         include:
           - platform: Linux x86_64
             runner: ubuntu-24.04
+            qt_host: linux
+            qt_arch: linux_gcc_64
           - platform: Windows x86_64
             runner: windows-2025
+            qt_host: windows
+            qt_arch: win64_msvc2022_64
           - platform: macOS aarch64
             runner: macos-15
+            qt_host: mac
+            qt_arch: clang_64
 
     runs-on: ${{ matrix.runner }}
 
@@ -69,8 +84,19 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: ${{ matrix.qt_host }}
+          target: desktop
+          arch: ${{ matrix.qt_arch }}
+          cache: true
+
       - name: Show Rust toolchain
         run: rustc --version --verbose
 
       - name: Run tests
-        run: cargo test --workspace --locked
+        env:
+          DYLD_FRAMEWORK_PATH: ${{ env.QT_ROOT_DIR }}/lib
+        run: cargo test --release --workspace --locked

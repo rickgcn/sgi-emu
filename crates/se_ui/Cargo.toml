@@ -7,4 +7,9 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+cxx.workspace = true
 se_runtime.workspace = true
+
+[build-dependencies]
+cxx-build.workspace = true
+qt-build-utils.workspace = true

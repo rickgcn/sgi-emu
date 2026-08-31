@@ -22,6 +22,11 @@ authors = ["rickgcn"]
 [workspace.dependencies]
 bitflags = "2"
 cc = "1"
+cxx = { version = "=1.0.199", features = ["c++17"] }
+cxx-build = "=1.0.199"
+directories = "6"
+qt-build-utils = "=0.10.0"
+serde = { version = "1", features = ["derive"] }
 se_cli = { path = "crates/se_cli" }
 se_core = { path = "crates/se_core" }
 se_cpu = { path = "crates/se_cpu" }
@@ -30,6 +35,7 @@ se_float = { path = "crates/se_float" }
 se_machine = { path = "crates/se_machine" }
 se_runtime = { path = "crates/se_runtime" }
 se_ui = { path = "crates/se_ui" }
+toml = "1"
 
 [profile.release]
 lto = "thin"
