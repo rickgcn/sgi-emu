@@ -12,6 +12,8 @@ const VME_INTERRUPT_1_MASK: u64 = 0x18;
 const OUTPUT_PORT: u64 = 0x1c;
 const TIMER_ACKNOWLEDGE: u64 = 0x23;
 const PROGRAMMABLE_TIMER_CLOCK: u64 = 0x30;
+const SYSTEM_TIMER_COUNTER_2: u64 = 0x3b;
+const SYSTEM_TIMER_CONTROL: u64 = 0x3f;
 const REGISTER_BYTES: u64 = 4;
 const OUTPUT_BITS: u8 = 0x1f;
 
@@ -23,6 +25,9 @@ pub struct Int2 {
     timer_pending: [bool; 2],
     timer_programming: [u8; 3],
     timer_programming_length: usize,
+    system_timer_counter_2_programming: [u8; 2],
+    system_timer_counter_2_programming_length: usize,
+    system_timer_control: u8,
 }
 
 impl Int2 {
@@ -40,6 +45,9 @@ impl Int2 {
             timer_pending: [false; 2],
             timer_programming: [0; 3],
             timer_programming_length: 0,
+            system_timer_counter_2_programming: [0; 2],
+            system_timer_counter_2_programming_length: 0,
+            system_timer_control: 0,
         }
     }
 
@@ -51,6 +59,9 @@ impl Int2 {
         self.timer_pending = [false; 2];
         self.timer_programming = [0; 3];
         self.timer_programming_length = 0;
+        self.system_timer_counter_2_programming = [0; 2];
+        self.system_timer_counter_2_programming_length = 0;
+        self.system_timer_control = 0;
     }
 
     /// Reads one fixed-width device-local transaction.
@@ -78,6 +89,15 @@ impl Int2 {
         }
 
         if start == TIMER_ACKNOWLEDGE || start == PROGRAMMABLE_TIMER_CLOCK {
+            return Err(BusFault::UnsupportedAccess);
+        }
+
+        if start == SYSTEM_TIMER_COUNTER_2 && end == start + 1 {
+            data[0] = 0;
+            return Ok(());
+        }
+
+        if start == SYSTEM_TIMER_CONTROL {
             return Err(BusFault::UnsupportedAccess);
         }
 
@@ -135,7 +155,24 @@ impl Int2 {
             return Ok(());
         }
 
-        if start == TIMER_ACKNOWLEDGE || start == PROGRAMMABLE_TIMER_CLOCK {
+        if start == SYSTEM_TIMER_COUNTER_2 && end == start + 1 {
+            self.system_timer_counter_2_programming.rotate_left(1);
+            self.system_timer_counter_2_programming[1] = data[0];
+            self.system_timer_counter_2_programming_length =
+                (self.system_timer_counter_2_programming_length + 1).min(2);
+            return Ok(());
+        }
+
+        if start == SYSTEM_TIMER_CONTROL && end == start + 1 {
+            self.system_timer_control = data[0];
+            return Ok(());
+        }
+
+        if start == TIMER_ACKNOWLEDGE
+            || start == PROGRAMMABLE_TIMER_CLOCK
+            || start == SYSTEM_TIMER_COUNTER_2
+            || start == SYSTEM_TIMER_CONTROL
+        {
             return Err(BusFault::UnsupportedAccess);
         }
 
@@ -202,8 +239,9 @@ mod tests {
 
     use super::{
         Int2, LOCAL_INTERRUPT_0_MASK, LOCAL_INTERRUPT_0_STATUS, LOCAL_INTERRUPT_1_MASK,
-        LOCAL_INTERRUPT_1_STATUS, OUTPUT_PORT, PROGRAMMABLE_TIMER_CLOCK, TIMER_ACKNOWLEDGE,
-        VME_INTERRUPT_0_MASK, VME_INTERRUPT_1_MASK, VME_INTERRUPT_STATUS,
+        LOCAL_INTERRUPT_1_STATUS, OUTPUT_PORT, PROGRAMMABLE_TIMER_CLOCK, SYSTEM_TIMER_CONTROL,
+        SYSTEM_TIMER_COUNTER_2, TIMER_ACKNOWLEDGE, VME_INTERRUPT_0_MASK, VME_INTERRUPT_1_MASK,
+        VME_INTERRUPT_STATUS,
     };
 
     fn read_word(int2: &Int2, address: u64) -> Result<u32, BusFault> {
@@ -305,6 +343,35 @@ mod tests {
     }
 
     #[test]
+    fn inactive_system_timer_accepts_calibration_and_reads_as_expired() {
+        let mut int2 = Int2::new();
+
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0xb4])
+            .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[0x10])
+            .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[0x27])
+            .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0x80])
+            .unwrap();
+
+        let mut low = [0xff];
+        let mut high = [0xff];
+        assert_eq!(
+            int2.read(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &mut low),
+            Ok(())
+        );
+        assert_eq!(
+            int2.read(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &mut high),
+            Ok(())
+        );
+        assert_eq!([low[0], high[0]], [0; 2]);
+        assert_eq!(int2.system_timer_counter_2_programming, [0x10, 0x27]);
+        assert_eq!(int2.system_timer_counter_2_programming_length, 2);
+        assert_eq!(int2.system_timer_control, 0x80);
+    }
+
+    #[test]
     fn reset_clears_mutable_state() {
         let mut int2 = Int2::new();
         int2.write(DeviceAddr::new(LOCAL_INTERRUPT_0_MASK + 3), &[0xa5])
@@ -316,6 +383,10 @@ mod tests {
         int2.timer_pending = [true; 2];
         int2.write(DeviceAddr::new(PROGRAMMABLE_TIMER_CLOCK), &[0x42])
             .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[0x27])
+            .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0xb4])
+            .unwrap();
 
         int2.reset();
 
@@ -324,6 +395,8 @@ mod tests {
         assert_eq!(read_word(&int2, OUTPUT_PORT), Ok(0));
         assert_eq!(int2.timer_pending, [false; 2]);
         assert_eq!(int2.timer_programming_length, 0);
+        assert_eq!(int2.system_timer_counter_2_programming_length, 0);
+        assert_eq!(int2.system_timer_control, 0);
     }
 
     #[test]

@@ -9,9 +9,11 @@ use std::fmt;
 
 use se_cpu::mips1::r3000::{R3000, R3000Config, StepError};
 use se_device::dp8573a::Dp8573a;
+use se_device::dsp56001::Dsp56001;
 use se_device::hpc1::Hpc1;
 use se_device::int2::Int2;
 use se_device::mdac::Mdac;
+use se_device::nmc93cs46::Nmc93cs46;
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
@@ -76,6 +78,8 @@ impl Ip12 {
                 [Z85230::new(), Z85230::new()],
                 Dp8573a::new(),
                 Mdac::new(),
+                Nmc93cs46::new(),
+                Dsp56001::new(),
                 prom,
             ),
         })
@@ -132,6 +136,7 @@ mod tests {
     use super::{Ip12, Ip12Error, PROM_BYTES, RAM_BYTES, cpu_config};
 
     const MEMORY_CONFIGURATION_INSTRUCTION_BUDGET: usize = 300_000;
+    const ENVIRONMENT_INITIALIZATION_INSTRUCTION_BUDGET: usize = 2_100_000;
     const STACK_SETUP_INSTRUCTION_BUDGET: usize = 30_000;
 
     #[test]
@@ -478,6 +483,72 @@ mod tests {
         let stack_pointer = machine.cpu.debug_snapshot().gpr[29];
         assert!((0xa038_0000..0xa040_0000).contains(&stack_pointer));
         assert!(!machine.bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    #[ignore = "requires an external 070-8088-002 IP12 PROM dump"]
+    fn environment_initialization_reaches_device_detection() {
+        let path = env::var_os("SE_INDIGO_IP12_PROM")
+            .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
+        let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
+        let mut machine =
+            Ip12::new(raw_prom, Backend::SoftFloat).expect("the PROM dump should be valid");
+        let mut p5_started = false;
+        let mut headless_graphics_probe_observed = false;
+        for executed in 0..ENVIRONMENT_INITIALIZATION_INSTRUCTION_BUDGET {
+            let address = machine.execution_address();
+            if address == 0xbfc0_0fb0 {
+                p5_started = true;
+            }
+            if address == 0xbfc1_e69c {
+                headless_graphics_probe_observed = true;
+            }
+            if address == 0xbfc0_1020 {
+                break;
+            }
+            if let Err(error) = machine.execute_instruction() {
+                panic!(
+                    "PROM environment initialization failed at 0x{address:08x} after {executed} instructions: {error:?}"
+                );
+            }
+        }
+
+        assert_eq!(machine.execution_address(), 0xbfc0_1020);
+        assert!(p5_started);
+        assert!(headless_graphics_probe_observed);
+        assert_eq!(read_word(&mut machine, 0x1fa2_0008), 1);
+        assert_eq!(read_word(&mut machine, 0x1fa2_000c), 0xf2);
+        assert_eq!(read_word(&mut machine, 0x1fb8_01b0), 8);
+        assert_ne!(read_word(&mut machine, 0x1fbe_8000), 0);
+        assert!((0..64).any(|address| read_nvram_word(&mut machine, address) != u16::MAX));
+        assert!(!machine.bus.error_interrupt_asserted());
+    }
+
+    fn nvram_clock_bit(machine: &mut Ip12, bit: bool) -> bool {
+        let value = 0x02 | u8::from(bit) << 3;
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fb8_01bf), &[value])
+            .unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fb8_01bf), &[value | 0x04])
+            .unwrap();
+        read_byte(machine, 0x1fb8_01bf) & 0x10 != 0
+    }
+
+    fn read_nvram_word(machine: &mut Ip12, address: u16) -> u16 {
+        machine.bus.write(PhysAddr::new(0x1fb8_01bf), &[0]).unwrap();
+        let command = 0x0600 | address;
+        for bit in (0..11).rev() {
+            nvram_clock_bit(machine, command & (1 << bit) != 0);
+        }
+        let mut value = 0;
+        for _ in 0..16 {
+            value = value << 1 | u16::from(nvram_clock_bit(machine, false));
+        }
+        machine.bus.write(PhysAddr::new(0x1fb8_01bf), &[0]).unwrap();
+        value
     }
 
     fn execute_until(machine: &mut Ip12, target: u32, budget: usize) {

@@ -9,6 +9,8 @@ const MEMORY_CONFIGURATION_0: u64 = 0x1_0000;
 const MEMORY_CONFIGURATION_1: u64 = 0x1_0004;
 const PARITY_ERROR: u64 = 0x1_0200;
 const CLEAR_ERROR: u64 = 0x1_0210;
+const GIO_BURST: u64 = 0x2_0008;
+const GIO_DELAY: u64 = 0x2_000c;
 const DESCRIPTOR_ARRAY_BASE: u64 = 0xa_0000;
 
 const REGISTER_BYTES: u64 = 4;
@@ -27,6 +29,8 @@ pub struct Pic1 {
     memory_descriptors: [u16; 4],
     parity_error: u8,
     address_error_pending: bool,
+    gio_burst: u8,
+    gio_delay: u8,
     descriptor_array_base: u32,
     system_reset_requested: bool,
 }
@@ -49,6 +53,8 @@ impl Pic1 {
             memory_descriptors: [0; 4],
             parity_error: 0,
             address_error_pending: false,
+            gio_burst: 0,
+            gio_delay: 0,
             descriptor_array_base: 0,
             system_reset_requested: false,
         }
@@ -60,6 +66,8 @@ impl Pic1 {
         self.memory_descriptors = [0; 4];
         self.parity_error = 0;
         self.address_error_pending = false;
+        self.gio_burst = 0;
+        self.gio_delay = 0;
         self.descriptor_array_base = 0;
         self.system_reset_requested = false;
     }
@@ -90,6 +98,10 @@ impl Pic1 {
             read_register(u32::from(self.parity_error), offset, data);
         } else if register_offset(start, end, CLEAR_ERROR).is_some() {
             return Err(BusFault::UnsupportedAccess);
+        } else if let Some(offset) = register_offset(start, end, GIO_BURST) {
+            read_register(u32::from(self.gio_burst), offset, data);
+        } else if let Some(offset) = register_offset(start, end, GIO_DELAY) {
+            read_register(u32::from(self.gio_delay), offset, data);
         } else if let Some(offset) = register_offset(start, end, DESCRIPTOR_ARRAY_BASE) {
             read_register(self.descriptor_array_base, offset, data);
         } else {
@@ -130,6 +142,10 @@ impl Pic1 {
         } else if register_offset(start, end, CLEAR_ERROR).is_some() {
             self.parity_error = 0;
             self.address_error_pending = false;
+        } else if let Some(offset) = register_offset(start, end, GIO_BURST) {
+            self.gio_burst = write_register(u32::from(self.gio_burst), offset, data) as u8;
+        } else if let Some(offset) = register_offset(start, end, GIO_DELAY) {
+            self.gio_delay = write_register(u32::from(self.gio_delay), offset, data) as u8;
         } else if let Some(offset) = register_offset(start, end, DESCRIPTOR_ARRAY_BASE) {
             self.descriptor_array_base =
                 write_register(self.descriptor_array_base, offset, data) & DESCRIPTOR_ADDRESS_MASK;
@@ -268,8 +284,9 @@ mod tests {
     use se_core::bus::{BusFault, DeviceAddr, PhysAddr};
 
     use super::{
-        CLEAR_ERROR, CPU_CONTROL, DESCRIPTOR_ARRAY_BASE, MEMORY_CONFIGURATION_0,
-        MEMORY_CONFIGURATION_1, PARITY_ERROR, Pic1, RESET_CONFIGURATION, SYSTEM_ID,
+        CLEAR_ERROR, CPU_CONTROL, DESCRIPTOR_ARRAY_BASE, GIO_BURST, GIO_DELAY,
+        MEMORY_CONFIGURATION_0, MEMORY_CONFIGURATION_1, PARITY_ERROR, Pic1, RESET_CONFIGURATION,
+        SYSTEM_ID,
     };
 
     fn pic1() -> Pic1 {
@@ -292,6 +309,8 @@ mod tests {
         assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_0), Ok(0));
         assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_1), Ok(0));
         assert_eq!(read_word(&pic1, PARITY_ERROR), Ok(0));
+        assert_eq!(read_word(&pic1, GIO_BURST), Ok(0));
+        assert_eq!(read_word(&pic1, GIO_DELAY), Ok(0));
         assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0));
     }
 
@@ -368,6 +387,21 @@ mod tests {
             Ok(())
         );
         assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0x0fff_ffff));
+    }
+
+    #[test]
+    fn gio_registers_use_independent_low_big_endian_lanes() {
+        let mut pic1 = pic1();
+
+        assert_eq!(
+            pic1.write(DeviceAddr::new(GIO_BURST), &0xff00_0001_u32.to_be_bytes()),
+            Ok(())
+        );
+        assert_eq!(pic1.write(DeviceAddr::new(GIO_DELAY + 3), &[0xf2]), Ok(()));
+        assert_eq!(pic1.write(DeviceAddr::new(GIO_DELAY), &[0xff]), Ok(()));
+
+        assert_eq!(read_word(&pic1, GIO_BURST), Ok(1));
+        assert_eq!(read_word(&pic1, GIO_DELAY), Ok(0xf2));
     }
 
     #[test]
@@ -528,6 +562,8 @@ mod tests {
             &0x0123_4567_u32.to_be_bytes(),
         )
         .unwrap();
+        pic1.write(DeviceAddr::new(GIO_BURST + 3), &[1]).unwrap();
+        pic1.write(DeviceAddr::new(GIO_DELAY + 3), &[0xf2]).unwrap();
 
         pic1.reset();
 
@@ -535,6 +571,8 @@ mod tests {
         assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_0), Ok(0));
         assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_1), Ok(0));
         assert_eq!(read_word(&pic1, PARITY_ERROR), Ok(0));
+        assert_eq!(read_word(&pic1, GIO_BURST), Ok(0));
+        assert_eq!(read_word(&pic1, GIO_DELAY), Ok(0));
         assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0));
         assert_eq!(read_word(&pic1, RESET_CONFIGURATION), Ok(0xf7));
         assert_eq!(read_word(&pic1, SYSTEM_ID), Ok(0x88));

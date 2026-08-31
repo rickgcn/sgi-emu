@@ -1,8 +1,10 @@
 use se_core::bus::{BusFault, DeviceAddr, PhysAddr, PhysicalBus};
 use se_device::dp8573a::Dp8573a;
+use se_device::dsp56001::Dsp56001;
 use se_device::hpc1::Hpc1;
 use se_device::int2::Int2;
 use se_device::mdac::Mdac;
+use se_device::nmc93cs46::Nmc93cs46;
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
@@ -12,6 +14,9 @@ use se_device::z85230::Z85230;
 use super::PROM_BYTES;
 
 const LOCAL_MEMORY_END: u64 = 0x1000_0000;
+
+const GIO_BASE: u64 = 0x1f00_0000;
+const GIO_END: u64 = 0x1f40_0000;
 
 const PIC1_BASE: u64 = 0x1fa0_0000;
 const PIC1_END: u64 = 0x1fab_0000;
@@ -33,7 +38,7 @@ const SCSI_END: u64 = 0x1fb8_0127;
 const CPU_AUX_CONTROL: u64 = 0x1fb8_01bf;
 const CPU_AUX_OUTPUT_BITS: u8 = 0x0f;
 const INT2_BASE: u64 = 0x1fb8_01c0;
-const INT2_END: u64 = 0x1fb8_01f4;
+const INT2_END: u64 = 0x1fb8_0200;
 
 const SERIAL_0_BASE: u64 = 0x1fb8_0d00;
 const SERIAL_0_END: u64 = 0x1fb8_0d10;
@@ -50,6 +55,9 @@ const BOARD_REVISION_BASE: u64 = 0x1fbd_0000;
 const BOARD_REVISION_END: u64 = 0x1fbd_0004;
 const BOARD_REVISION: u32 = 0x0000_8000;
 
+const DSP56001_BASE: u64 = 0x1fbe_0000;
+const DSP56001_END: u64 = 0x1fc0_0000;
+
 const PROM_BASE: u64 = 0x1fc0_0000;
 const PROM_END: u64 = PROM_BASE + PROM_BYTES as u64;
 
@@ -62,6 +70,8 @@ pub(super) struct Ip12Bus {
     serial: [Z85230; 2],
     rtc: Dp8573a,
     mdac: Mdac,
+    nvram: Nmc93cs46,
+    dsp56001: Dsp56001,
     prom: Rom,
     cpu_aux_control: u8,
 }
@@ -77,6 +87,8 @@ impl Ip12Bus {
         serial: [Z85230; 2],
         rtc: Dp8573a,
         mdac: Mdac,
+        nvram: Nmc93cs46,
+        dsp56001: Dsp56001,
         prom: Rom,
     ) -> Self {
         Self {
@@ -88,6 +100,8 @@ impl Ip12Bus {
             serial,
             rtc,
             mdac,
+            nvram,
+            dsp56001,
             prom,
             cpu_aux_control: 0,
         }
@@ -102,6 +116,7 @@ impl Ip12Bus {
             serial.reset();
         }
         self.mdac.reset();
+        self.nvram.reset();
         self.cpu_aux_control = 0;
     }
 
@@ -122,14 +137,16 @@ impl Ip12Bus {
             Target::Pic1(address) => self.pic1.read(address, data),
             Target::Hpc1(address) => self.hpc1.read(address, data),
             Target::Scsi(address) => self.scsi.debug_read(address, data),
-            Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, data),
+            Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),
             Target::Int2(address) => self.int2.read(address, data),
             Target::Serial(index, address) => self.serial[index].debug_read(address, data),
             Target::UnpopulatedSerial(_) => Err(BusFault::Unmapped),
             Target::Mdac(address) => self.mdac.read(address, data),
             Target::Rtc(address) => self.rtc.read(address, data),
             Target::BoardRevision => read_board_revision(data),
+            Target::Dsp56001(address) => self.dsp56001.read(address, data),
             Target::Prom(address) => self.prom.read(address, data),
+            Target::UnpopulatedGio => read_unpopulated_gio(data),
         }
     }
 
@@ -189,14 +206,16 @@ impl PhysicalBus for Ip12Bus {
             Target::Pic1(address) => self.pic1.read(address, data),
             Target::Hpc1(address) => self.hpc1.read(address, data),
             Target::Scsi(address) => self.scsi.read(address, data),
-            Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, data),
+            Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),
             Target::Int2(address) => self.int2.read(address, data),
             Target::Serial(index, address) => self.serial[index].read(address, data),
             Target::UnpopulatedSerial(_) => Err(BusFault::Unmapped),
             Target::Mdac(address) => self.mdac.read(address, data),
             Target::Rtc(address) => self.rtc.read(address, data),
             Target::BoardRevision => read_board_revision(data),
+            Target::Dsp56001(address) => self.dsp56001.read(address, data),
             Target::Prom(address) => self.prom.read(address, data),
+            Target::UnpopulatedGio => read_unpopulated_gio(data),
         }
     }
 
@@ -215,14 +234,18 @@ impl PhysicalBus for Ip12Bus {
                 Ok(())
             }
             Target::Scsi(address) => self.scsi.write(address, data),
-            Target::CpuAuxControl => write_cpu_aux_control(&mut self.cpu_aux_control, data),
+            Target::CpuAuxControl => {
+                write_cpu_aux_control(&mut self.cpu_aux_control, &mut self.nvram, data)
+            }
             Target::Int2(address) => self.int2.write(address, data),
             Target::Serial(index, address) => self.serial[index].write(address, data),
             Target::UnpopulatedSerial(address) => write_unpopulated_serial(address, data),
             Target::Mdac(address) => self.mdac.write(address, data),
             Target::Rtc(address) => self.rtc.write(address, data),
             Target::BoardRevision => Err(BusFault::UnsupportedAccess),
-            Target::Prom(address) => self.prom.write(address, data),
+            Target::Dsp56001(address) => self.dsp56001.write(address, data),
+            Target::Prom(_) => Ok(()),
+            Target::UnpopulatedGio => Ok(()),
         }
     }
 }
@@ -252,7 +275,9 @@ enum Target {
     Mdac(DeviceAddr),
     Rtc(DeviceAddr),
     BoardRevision,
+    Dsp56001(DeviceAddr),
     Prom(DeviceAddr),
+    UnpopulatedGio,
 }
 
 fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault> {
@@ -263,6 +288,13 @@ fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault> {
     let start = address.get();
     let length = u64::try_from(length).map_err(|_| BusFault::UnsupportedAccess)?;
     let end = start.checked_add(length).ok_or(BusFault::Unmapped)?;
+
+    if contains(start, end, GIO_BASE, GIO_END) {
+        return Ok(Target::UnpopulatedGio);
+    }
+    if overlaps(start, end, GIO_BASE, GIO_END) {
+        return Err(BusFault::Unmapped);
+    }
 
     for (range_start, range_end) in [
         (HPC1_ETHERNET_POINTER_BASE, HPC1_ETHERNET_POINTER_END),
@@ -345,6 +377,13 @@ fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault> {
         return Err(BusFault::Unmapped);
     }
 
+    if contains(start, end, DSP56001_BASE, DSP56001_END) {
+        return Ok(Target::Dsp56001(DeviceAddr::new(start - DSP56001_BASE)));
+    }
+    if overlaps(start, end, DSP56001_BASE, DSP56001_END) {
+        return Err(BusFault::Unmapped);
+    }
+
     if contains(start, end, PIC1_BASE, PIC1_END) {
         return Ok(Target::Pic1(DeviceAddr::new(start - PIC1_BASE)));
     }
@@ -355,19 +394,29 @@ fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault> {
     Err(BusFault::Unmapped)
 }
 
-fn read_cpu_aux_control(value: u8, data: &mut [u8]) -> Result<(), BusFault> {
+fn read_cpu_aux_control(value: u8, nvram: &Nmc93cs46, data: &mut [u8]) -> Result<(), BusFault> {
     if data.len() != 1 {
         return Err(BusFault::UnsupportedAccess);
     }
-    data[0] = value & CPU_AUX_OUTPUT_BITS;
+    data[0] = value & CPU_AUX_OUTPUT_BITS | u8::from(nvram.data_out()) << 4;
     Ok(())
 }
 
-fn write_cpu_aux_control(value: &mut u8, data: &[u8]) -> Result<(), BusFault> {
+fn write_cpu_aux_control(
+    value: &mut u8,
+    nvram: &mut Nmc93cs46,
+    data: &[u8],
+) -> Result<(), BusFault> {
     if data.len() != 1 {
         return Err(BusFault::UnsupportedAccess);
     }
     *value = data[0] & CPU_AUX_OUTPUT_BITS;
+    nvram.drive_pins(
+        *value & 0x01 != 0,
+        *value & 0x02 != 0,
+        *value & 0x04 != 0,
+        *value & 0x08 != 0,
+    );
     Ok(())
 }
 
@@ -376,6 +425,11 @@ fn read_board_revision(data: &mut [u8]) -> Result<(), BusFault> {
         return Err(BusFault::UnsupportedAccess);
     }
     data.copy_from_slice(&BOARD_REVISION.to_be_bytes());
+    Ok(())
+}
+
+fn read_unpopulated_gio(data: &mut [u8]) -> Result<(), BusFault> {
+    data.fill(0);
     Ok(())
 }
 
@@ -402,9 +456,11 @@ const fn overlaps(start: u64, end: u64, range_start: u64, range_end: u64) -> boo
 mod tests {
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
     use se_device::dp8573a::Dp8573a;
+    use se_device::dsp56001::Dsp56001;
     use se_device::hpc1::Hpc1;
     use se_device::int2::Int2;
     use se_device::mdac::Mdac;
+    use se_device::nmc93cs46::Nmc93cs46;
     use se_device::pic1::Pic1;
     use se_device::ram::Ram;
     use se_device::rom::Rom;
@@ -412,10 +468,11 @@ mod tests {
     use se_device::z85230::Z85230;
 
     use super::{
-        BOARD_REVISION_BASE, CPU_AUX_CONTROL, HPC1_ENDIAN_CONTROL_BASE, HPC1_ETHERNET_FIFO_BASE,
-        HPC1_ETHERNET_POINTER_BASE, HPC1_MISCELLANEOUS_CONTROL_BASE, HPC1_SCSI_CONTROL_BASE,
-        INT2_BASE, Ip12Bus, LOCAL_MEMORY_END, MDAC_BASE, PIC1_BASE, PROM_BASE, PROM_BYTES,
-        PROM_END, RTC_BASE, SCSI_BASE, SERIAL_0_BASE, SERIAL_1_BASE, SERIAL_2_BASE,
+        BOARD_REVISION_BASE, CPU_AUX_CONTROL, DSP56001_BASE, DSP56001_END, GIO_BASE, GIO_END,
+        HPC1_ENDIAN_CONTROL_BASE, HPC1_ETHERNET_FIFO_BASE, HPC1_ETHERNET_POINTER_BASE,
+        HPC1_MISCELLANEOUS_CONTROL_BASE, HPC1_SCSI_CONTROL_BASE, INT2_BASE, Ip12Bus,
+        LOCAL_MEMORY_END, MDAC_BASE, PIC1_BASE, PROM_BASE, PROM_BYTES, PROM_END, RTC_BASE,
+        SCSI_BASE, SERIAL_0_BASE, SERIAL_1_BASE, SERIAL_2_BASE,
     };
 
     fn bus() -> Ip12Bus {
@@ -433,6 +490,8 @@ mod tests {
             [Z85230::new(), Z85230::new()],
             Dp8573a::new(),
             Mdac::new(),
+            Nmc93cs46::new(),
+            Dsp56001::new(),
             Rom::new(bytes),
         )
     }
@@ -460,6 +519,50 @@ mod tests {
             &configuration_1.to_be_bytes(),
         )
         .unwrap();
+    }
+
+    fn nvram_clock_bit(bus: &mut Ip12Bus, bit: bool) -> bool {
+        let value = 0x02 | u8::from(bit) << 3;
+        bus.write(PhysAddr::new(CPU_AUX_CONTROL), &[value]).unwrap();
+        bus.write(PhysAddr::new(CPU_AUX_CONTROL), &[value | 0x04])
+            .unwrap();
+        read_byte(bus, CPU_AUX_CONTROL).unwrap() & 0x10 != 0
+    }
+
+    fn nvram_shift_command(bus: &mut Ip12Bus, command: u16) {
+        for bit in (0..11).rev() {
+            nvram_clock_bit(bus, command & (1 << bit) != 0);
+        }
+    }
+
+    fn nvram_deselect(bus: &mut Ip12Bus) {
+        bus.write(PhysAddr::new(CPU_AUX_CONTROL), &[0]).unwrap();
+    }
+
+    fn nvram_command(bus: &mut Ip12Bus, command: u16) {
+        nvram_deselect(bus);
+        nvram_shift_command(bus, command);
+        nvram_deselect(bus);
+    }
+
+    fn nvram_write_word(bus: &mut Ip12Bus, address: u16, value: u16) {
+        nvram_deselect(bus);
+        nvram_shift_command(bus, 0x0500 | address);
+        for bit in (0..16).rev() {
+            nvram_clock_bit(bus, value & (1 << bit) != 0);
+        }
+        nvram_deselect(bus);
+    }
+
+    fn nvram_read_word(bus: &mut Ip12Bus, address: u16) -> u16 {
+        nvram_deselect(bus);
+        nvram_shift_command(bus, 0x0600 | address);
+        let mut value = 0;
+        for _ in 0..16 {
+            value = value << 1 | u16::from(nvram_clock_bit(bus, false));
+        }
+        nvram_deselect(bus);
+        value
     }
 
     #[test]
@@ -616,7 +719,7 @@ mod tests {
         assert_eq!(read_byte(&mut bus, SERIAL_1_BASE + 0x03), Ok(0x04));
 
         bus.write(PhysAddr::new(CPU_AUX_CONTROL), &[0xff]).unwrap();
-        assert_eq!(read_byte(&mut bus, CPU_AUX_CONTROL), Ok(0x0f));
+        assert_eq!(read_byte(&mut bus, CPU_AUX_CONTROL), Ok(0x1f));
         bus.write(PhysAddr::new(INT2_BASE + 7), &[0xa5]).unwrap();
         assert_eq!(read_word(&mut bus, INT2_BASE + 4), Ok(0xa5));
         bus.write(PhysAddr::new(MDAC_BASE), &[0x5a]).unwrap();
@@ -721,15 +824,73 @@ mod tests {
     }
 
     #[test]
+    fn prom_write_cycles_complete_without_changing_the_image() {
+        let mut bus = bus();
+
+        assert_eq!(
+            bus.write(PhysAddr::new(PROM_BASE), &0xffff_ffff_u32.to_be_bytes()),
+            Ok(())
+        );
+        assert_eq!(read_word(&mut bus, PROM_BASE), Ok(0x0001_0203));
+    }
+
+    #[test]
+    fn routes_p5_registers_and_device_windows() {
+        let mut bus = bus();
+
+        bus.write(PhysAddr::new(PIC1_BASE + 0x2_0008), &1_u32.to_be_bytes())
+            .unwrap();
+        bus.write(PhysAddr::new(PIC1_BASE + 0x2_000c), &0xf2_u32.to_be_bytes())
+            .unwrap();
+        bus.write(PhysAddr::new(DSP56001_BASE), &0xab12_3456_u32.to_be_bytes())
+            .unwrap();
+        bus.write(
+            PhysAddr::new(DSP56001_END - 4),
+            &0xcd65_4321_u32.to_be_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 0x2_0008), Ok(1));
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 0x2_000c), Ok(0xf2));
+        assert_eq!(read_word(&mut bus, DSP56001_BASE), Ok(0x0012_3456));
+        assert_eq!(read_word(&mut bus, DSP56001_END - 4), Ok(0x0065_4321));
+        assert_eq!(read_word(&mut bus, GIO_BASE), Ok(0));
+        assert_eq!(
+            bus.write(PhysAddr::new(GIO_END - 4), &0x1234_5678_u32.to_be_bytes()),
+            Ok(())
+        );
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn cpu_aux_control_drives_serial_nvram() {
+        let mut bus = bus();
+
+        for address in [0, 63] {
+            assert_eq!(nvram_read_word(&mut bus, address), u16::MAX);
+        }
+        nvram_command(&mut bus, 0x04c0);
+        nvram_write_word(&mut bus, 17, 0x8123);
+        assert_eq!(nvram_read_word(&mut bus, 17), 0x8123);
+        nvram_command(&mut bus, 0x0400);
+        nvram_write_word(&mut bus, 17, 0);
+        assert_eq!(nvram_read_word(&mut bus, 17), 0x8123);
+    }
+
+    #[test]
     fn rejects_unmapped_and_crossing_transactions_atomically() {
         let mut bus = bus();
 
-        for address in [PROM_BASE - 1, PROM_END, 0x1fff_ffff, u64::MAX] {
+        for address in [PROM_END, 0x1fff_ffff, u64::MAX] {
             assert_eq!(
                 bus.read(PhysAddr::new(address), &mut [0; 1]),
                 Err(BusFault::Unmapped)
             );
         }
+        assert_eq!(
+            bus.read(PhysAddr::new(PROM_BASE - 1), &mut [0; 1]),
+            Err(BusFault::UnsupportedAccess)
+        );
         assert_eq!(
             bus.read(PhysAddr::new(PROM_END - 2), &mut [0; 4]),
             Err(BusFault::Unmapped)
@@ -740,6 +901,10 @@ mod tests {
         );
         assert_eq!(
             bus.write(PhysAddr::new(HPC1_ETHERNET_POINTER_BASE + 3), &[0xaa, 0xbb]),
+            Err(BusFault::Unmapped)
+        );
+        assert_eq!(
+            bus.write(PhysAddr::new(DSP56001_END - 2), &[0xaa; 4]),
             Err(BusFault::Unmapped)
         );
     }
@@ -779,6 +944,17 @@ mod tests {
         bus.write(PhysAddr::new(INT2_BASE + 7), &[0xa5]).unwrap();
         bus.write(PhysAddr::new(CPU_AUX_CONTROL), &[0x0f]).unwrap();
         bus.write(PhysAddr::new(RTC_BASE + 0x57), &[0xa5]).unwrap();
+        nvram_command(&mut bus, 0x04c0);
+        nvram_write_word(&mut bus, 7, 0x5aa5);
+        bus.write(
+            PhysAddr::new(DSP56001_BASE + 4),
+            &0x0012_3456_u32.to_be_bytes(),
+        )
+        .unwrap();
+        bus.write(PhysAddr::new(PIC1_BASE + 0x2_000b), &[1])
+            .unwrap();
+        bus.write(PhysAddr::new(PIC1_BASE + 0x2_000f), &[0xf2])
+            .unwrap();
 
         bus.reset();
 
@@ -791,6 +967,10 @@ mod tests {
         assert_eq!(read_word(&mut bus, INT2_BASE + 4), Ok(0));
         assert_eq!(read_byte(&mut bus, CPU_AUX_CONTROL), Ok(0));
         assert_eq!(read_byte(&mut bus, RTC_BASE + 0x57), Ok(0xa5));
+        assert_eq!(nvram_read_word(&mut bus, 7), 0x5aa5);
+        assert_eq!(read_word(&mut bus, DSP56001_BASE + 4), Ok(0x0012_3456));
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 0x2_0008), Ok(0));
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 0x2_000c), Ok(0));
         let mut prom = [0; 4];
         assert_eq!(bus.read(PhysAddr::new(PROM_BASE), &mut prom), Ok(()));
         assert_eq!(prom, [0, 1, 2, 3]);
