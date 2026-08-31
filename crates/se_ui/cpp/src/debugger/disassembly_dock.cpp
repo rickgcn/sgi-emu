@@ -11,13 +11,16 @@
 #include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QTextBlock>
 #include <QTextCursor>
+#include <QTextDocument>
 #include <QVBoxLayout>
 #include <QWidget>
 
 #include <functional>
 #include <limits>
+#include <optional>
 #include <utility>
 
 namespace se_ui {
@@ -32,14 +35,55 @@ public:
         , toggle_breakpoint_(std::move(toggle_breakpoint)) {
     }
 
+    void follow_block(int block_number, std::uint32_t pc) {
+        const auto block = document()->findBlockByNumber(block_number);
+        if (!block.isValid()) {
+            return;
+        }
+
+        const bool center = !follow_target_.has_value()
+            || (pc != follow_target_->pc && pc != follow_target_->pc + 4U);
+        follow_target_ = FollowTarget {block_number, pc};
+
+        setTextCursor(QTextCursor(block));
+        if (center) {
+            centerCursor();
+        } else {
+            ensureCursorVisible();
+        }
+    }
+
+    void stop_following() {
+        follow_target_.reset();
+    }
+
 protected:
     void mouseDoubleClickEvent(QMouseEvent* event) override {
         QPlainTextEdit::mouseDoubleClickEvent(event);
         toggle_breakpoint_();
     }
 
+    void resizeEvent(QResizeEvent* event) override {
+        QPlainTextEdit::resizeEvent(event);
+        if (!follow_target_.has_value()) {
+            return;
+        }
+
+        const auto block = document()->findBlockByNumber(follow_target_->block_number);
+        if (block.isValid()) {
+            setTextCursor(QTextCursor(block));
+            ensureCursorVisible();
+        }
+    }
+
 private:
+    struct FollowTarget {
+        int block_number;
+        std::uint32_t pc;
+    };
+
     std::function<void()> toggle_breakpoint_;
+    std::optional<FollowTarget> follow_target_;
 };
 
 QString from_rust_string(const rust::String& value) {
@@ -78,6 +122,9 @@ DisassemblyDock::DisassemblyDock(const UiSession& session, QWidget* parent)
     connect(go_button, &QPushButton::clicked, this, &DisassemblyDock::apply_address);
     connect(address_edit_, &QLineEdit::returnPressed, this, &DisassemblyDock::apply_address);
     connect(follow_pc_, &QCheckBox::toggled, this, [this] {
+        if (!follow_pc_->isChecked()) {
+            static_cast<DisassemblyView*>(text_view_)->stop_following();
+        }
         revision_ = std::numeric_limits<std::uint64_t>::max();
         refresh();
     });
@@ -119,7 +166,11 @@ void DisassemblyDock::refresh() {
     line_addresses_.reserve(data.lines.size());
 
     QString text;
+    int current_block = -1;
     for (const auto& line : data.lines) {
+        if (line.current) {
+            current_block = static_cast<int>(line_addresses_.size());
+        }
         line_addresses_.push_back(line.address);
         const auto marker = line.current ? QStringLiteral("=>")
             : line.breakpoint             ? QStringLiteral(" *")
@@ -134,11 +185,16 @@ void DisassemblyDock::refresh() {
                     .arg(from_rust_string(line.text));
     }
     text_view_->setPlainText(text);
+    if (follow_pc_->isChecked() && current_block >= 0) {
+        const auto current_pc = line_addresses_[static_cast<std::size_t>(current_block)];
+        static_cast<DisassemblyView*>(text_view_)->follow_block(current_block, current_pc);
+    }
 }
 
 void DisassemblyDock::clear() {
     revision_ = std::numeric_limits<std::uint64_t>::max();
     line_addresses_.clear();
+    static_cast<DisassemblyView*>(text_view_)->stop_following();
     text_view_->setPlainText(QStringLiteral("No machine configured."));
 }
 
