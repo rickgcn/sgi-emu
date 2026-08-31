@@ -10,3 +10,4 @@ authors.workspace = true
 se_core.workspace = true
 se_cpu.workspace = true
 se_device.workspace = true
+se_float.workspace = true

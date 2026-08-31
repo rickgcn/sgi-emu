@@ -3,7 +3,7 @@ use se_core::bus::{BusFault, PhysicalBus};
 use super::{
     R3000Config, StepError,
     cache::{CacheBank, Caches},
-    cp0::{Cp0, Exception, TlbFaultKind},
+    cp0::{Cp0, Cp0FunctionalState, Exception, TlbFaultKind},
     cp1::Cp1,
     mmu::{AccessType, Cacheability, Mmu, ProbeResult, Translation, TranslationFault},
 };
@@ -12,27 +12,27 @@ const RESET_PC: u32 = 0xbfc0_0000;
 const TLB_PROBE_FAILURE: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DelaySlot {
-    origin_pc: u32,
-    resume_pc: u32,
+pub(super) struct DelaySlot {
+    pub(super) origin_pc: u32,
+    pub(super) resume_pc: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingGprWrite {
-    index: usize,
-    value: u32,
-    load_merge_bypass: bool,
+pub(super) struct PendingGprWrite {
+    pub(super) index: usize,
+    pub(super) value: u32,
+    pub(super) load_merge_bypass: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingCp0Write {
+pub(super) enum PendingCp0Write {
     Register { index: usize, value: u32 },
     TlbRead { entry_hi: u32, entry_lo: u32 },
     TlbProbe { index: u32 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingCp1Write {
+pub(super) enum PendingCp1Write {
     General { index: usize, value: u32 },
     Control { index: usize, value: u32 },
     Condition { value: bool },
@@ -136,6 +136,52 @@ impl State {
 
     pub(super) fn pc(&self) -> u32 {
         self.pc
+    }
+
+    pub(super) fn debug_delay_slot(&self) -> Option<DelaySlot> {
+        self.delay_slot
+    }
+
+    pub(super) fn debug_pending_gpr_write(&self) -> Option<PendingGprWrite> {
+        self.pending_gpr_write
+    }
+
+    pub(super) fn debug_pending_cp0_write(&self) -> Option<PendingCp0Write> {
+        self.pending_cp0_write
+    }
+
+    pub(super) fn debug_pending_cp1_write(&self) -> Option<PendingCp1Write> {
+        self.pending_cp1_write
+    }
+
+    pub(super) fn debug_cp0_functional_state(
+        &self,
+    ) -> (Cp0FunctionalState, Option<Cp0FunctionalState>) {
+        self.cp0.debug_functional_state()
+    }
+
+    pub(super) fn debug_tlb_entries(&self, instruction: bool) -> [(u32, u32); 64] {
+        self.mmu.debug_entries(instruction)
+    }
+
+    pub(super) fn debug_cache_entries(
+        &self,
+        bank: CacheBank,
+    ) -> (usize, Vec<(u32, [u8; 4], bool)>) {
+        self.caches.debug_entries(bank)
+    }
+
+    pub(super) fn debug_translate_address(
+        &self,
+        virtual_address: u32,
+        access: AccessType,
+    ) -> Result<Translation, TranslationFault> {
+        self.mmu.translate(
+            virtual_address,
+            self.cp0.current_asid(),
+            self.cp0.is_kernel_mode(),
+            access,
+        )
     }
 
     pub(super) fn read_gpr(&self, index: usize) -> u32 {

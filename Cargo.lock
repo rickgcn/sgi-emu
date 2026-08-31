@@ -360,6 +360,7 @@ dependencies = [
  "se_core",
  "se_cpu",
  "se_device",
+ "se_float",
 ]
 
 [[package]]
@@ -377,6 +378,8 @@ dependencies = [
  "cxx",
  "cxx-build",
  "qt-build-utils",
+ "se_cpu",
+ "se_machine",
  "se_runtime",
 ]
 

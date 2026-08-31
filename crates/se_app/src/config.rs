@@ -75,13 +75,22 @@ impl ApplicationConfig {
         }
     }
 
-    pub fn ui_startup_state(&self) -> UiStartupState {
+    pub fn machine_configuration(&self) -> (&str, &str, &str) {
+        (
+            &self.machine.model,
+            &self.machine.prom_path,
+            self.machine.float_backend.identifier(),
+        )
+    }
+
+    pub fn ui_startup_state(&self, startup_error: String) -> UiStartupState {
         UiStartupState {
             machine_model: self.machine.model.clone(),
             prom_path: self.machine.prom_path.clone(),
             float_backend: String::from(self.machine.float_backend.identifier()),
             window_geometry: self.ui.window_geometry.clone(),
             window_state: self.ui.window_state.clone(),
+            startup_error,
         }
     }
 

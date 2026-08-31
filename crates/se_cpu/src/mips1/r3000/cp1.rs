@@ -89,6 +89,10 @@ impl Cp1 {
         self.control_status & CONTROL_STATUS_UNIMPLEMENTED != 0 || enabled_causes != 0
     }
 
+    pub(super) const fn backend(&self) -> Backend {
+        self.backend
+    }
+
     pub(super) fn write_condition(&mut self, value: bool) {
         if value {
             self.control_status |= CONTROL_STATUS_CONDITION;

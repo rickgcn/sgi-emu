@@ -217,6 +217,19 @@ impl Caches {
         self.cache_mut(bank).write_isolated(address, data);
     }
 
+    pub(super) fn debug_entries(
+        &self,
+        bank: CacheBank,
+    ) -> (usize, Vec<(u32, [u8; WORD_BYTES], bool)>) {
+        let cache = self.cache(bank);
+        let entries = cache
+            .entries
+            .iter()
+            .map(|entry| (entry.page_frame, entry.data, entry.valid))
+            .collect();
+        (cache.refill_bytes, entries)
+    }
+
     fn cache(&self, bank: CacheBank) -> &Cache {
         match bank {
             CacheBank::Instruction => &self.instruction,

@@ -14,9 +14,14 @@
 #include <QCoreApplication>
 #include <QIcon>
 #include <QKeySequence>
+#include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
+#include <QMessageBox>
+#include <QSizePolicy>
+#include <QStatusBar>
 #include <QStyle>
+#include <QTimer>
 #include <QToolBar>
 
 #include <cstddef>
@@ -45,8 +50,9 @@ QByteArray decoded_bytes(const rust::String& value) {
 
 } // namespace
 
-MainWindow::MainWindow(const UiStartupState& startup)
-    : settings_ {
+MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
+    : session_(session)
+    , settings_ {
           from_rust_string(startup.machine_model),
           from_rust_string(startup.prom_path),
           from_rust_string(startup.float_backend),
@@ -60,7 +66,11 @@ MainWindow::MainWindow(const UiStartupState& startup)
     , registers_dock_(nullptr)
     , tlb_dock_(nullptr)
     , cache_dock_(nullptr)
-    , memory_dock_(nullptr) {
+    , memory_dock_(nullptr)
+    , update_timer_(new QTimer(this))
+    , machine_status_(new QLabel(this))
+    , execution_error_status_(new QLabel(this))
+    , runtime_status_(new QLabel(this)) {
     setObjectName(QStringLiteral("MainWindow"));
     setWindowTitle(QStringLiteral("sgi-emu"));
     setCentralWidget(new DisplayWidget(this));
@@ -70,8 +80,20 @@ MainWindow::MainWindow(const UiStartupState& startup)
     create_docks();
     create_menus();
     create_toolbar();
+    create_status_bar();
     set_default_dock_layout();
     restore_window_state(startup);
+
+    connect(update_timer_, &QTimer::timeout, this, &MainWindow::update_runtime);
+    update_timer_->start(100);
+    apply_runtime_status(session_.runtime_status(), false);
+
+    const auto startup_error = from_rust_string(startup.startup_error);
+    if (!startup_error.isEmpty()) {
+        QTimer::singleShot(0, this, [this, startup_error] {
+            QMessageBox::critical(this, QStringLiteral("Machine configuration"), startup_error);
+        });
+    }
 }
 
 UiExitState MainWindow::exit_state() const {
@@ -88,18 +110,34 @@ void MainWindow::create_actions() {
     run_action_ = new QAction(
         style()->standardIcon(QStyle::SP_MediaPlay), QStringLiteral("Run"), this);
     run_action_->setShortcut(QKeySequence(QStringLiteral("F5")));
+    connect(run_action_, &QAction::triggered, this, [this] {
+        apply_runtime_status(session_.run_machine(), true);
+    });
 
     reset_action_ = new QAction(
         style()->standardIcon(QStyle::SP_BrowserReload), QStringLiteral("Reset"), this);
     reset_action_->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+F5")));
+    connect(reset_action_, &QAction::triggered, this, [this] {
+        apply_runtime_status(session_.reset_machine(), true);
+        refresh_debuggers();
+        cache_dock_->clear();
+    });
 
     pause_action_ = new QAction(
         style()->standardIcon(QStyle::SP_MediaPause), QStringLiteral("Pause"), this);
     pause_action_->setShortcut(QKeySequence(QStringLiteral("F6")));
+    connect(pause_action_, &QAction::triggered, this, [this] {
+        apply_runtime_status(session_.pause_machine(), true);
+        refresh_debuggers();
+    });
 
     step_action_ = new QAction(
         style()->standardIcon(QStyle::SP_MediaSkipForward), QStringLiteral("Step"), this);
     step_action_->setShortcut(QKeySequence(QStringLiteral("F10")));
+    connect(step_action_, &QAction::triggered, this, [this] {
+        apply_runtime_status(session_.step_machine(), true);
+        refresh_debuggers();
+    });
 
     settings_action_ = new QAction(
         style()->standardIcon(QStyle::SP_FileDialogDetailedView),
@@ -107,19 +145,14 @@ void MainWindow::create_actions() {
         this);
     settings_action_->setShortcut(QKeySequence::Preferences);
     connect(settings_action_, &QAction::triggered, this, &MainWindow::show_settings);
-
-    run_action_->setEnabled(false);
-    reset_action_->setEnabled(false);
-    pause_action_->setEnabled(false);
-    step_action_->setEnabled(false);
 }
 
 void MainWindow::create_docks() {
-    disassembly_dock_ = new DisassemblyDock(this);
-    registers_dock_ = new RegistersDock(this);
-    tlb_dock_ = new TlbDock(this);
-    cache_dock_ = new CacheDock(this);
-    memory_dock_ = new MemoryDock(this);
+    disassembly_dock_ = new DisassemblyDock(session_, this);
+    registers_dock_ = new RegistersDock(session_, this);
+    tlb_dock_ = new TlbDock(session_, this);
+    cache_dock_ = new CacheDock(session_, this);
+    memory_dock_ = new MemoryDock(session_, this);
 }
 
 void MainWindow::create_menus() {
@@ -151,6 +184,16 @@ void MainWindow::create_toolbar() {
     toolbar->addAction(settings_action_);
 }
 
+void MainWindow::create_status_bar() {
+    execution_error_status_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    statusBar()->addWidget(machine_status_);
+    statusBar()->addWidget(execution_error_status_, 1);
+    statusBar()->addPermanentWidget(runtime_status_);
+    execution_error_status_->hide();
+    runtime_status_->setText(QStringLiteral("State: Unconfigured"));
+    update_machine_status();
+}
+
 void MainWindow::restore_window_state(const UiStartupState& startup) {
     if (!startup.window_geometry.empty()) {
         restoreGeometry(decoded_bytes(startup.window_geometry));
@@ -178,19 +221,118 @@ void MainWindow::set_default_dock_layout() {
 
 void MainWindow::show_settings() {
     SettingsDialog dialog(settings_, this);
-    if (dialog.exec() == QDialog::Accepted) {
-        settings_ = dialog.settings();
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    const auto selected = dialog.settings();
+    if (selected.machine_model == settings_.machine_model
+        && selected.prom_path == settings_.prom_path
+        && selected.float_backend == settings_.float_backend) {
+        return;
+    }
+    if (QMessageBox::question(
+            this,
+            QStringLiteral("Reset machine"),
+            QStringLiteral("Changing these settings will reset the emulated machine. Continue?"))
+        != QMessageBox::Yes) {
+        return;
+    }
+
+    const auto model = to_rust_string(selected.machine_model);
+    const auto prom = to_rust_string(selected.prom_path);
+    const auto backend = to_rust_string(selected.float_backend);
+    const auto status = session_.configure_machine(model, prom, backend);
+    if (!status.success) {
+        QMessageBox::critical(
+            this,
+            QStringLiteral("Machine configuration"),
+            from_rust_string(status.command_error));
+        return;
+    }
+
+    settings_ = selected;
+    update_machine_status();
+    registers_dock_->clear();
+    tlb_dock_->clear();
+    cache_dock_->clear();
+    disassembly_dock_->clear();
+    memory_dock_->clear();
+    apply_runtime_status(status, false);
+    refresh_debuggers();
+}
+
+void MainWindow::update_runtime() {
+    apply_runtime_status(session_.runtime_status(), false);
+    refresh_debuggers();
+}
+
+void MainWindow::refresh_debuggers() {
+    if (registers_dock_->isVisible()) {
+        registers_dock_->refresh();
+    }
+    if (tlb_dock_->isVisible()) {
+        tlb_dock_->refresh();
+    }
+    if (disassembly_dock_->isVisible()) {
+        disassembly_dock_->refresh();
+    }
+    if (memory_dock_->isVisible()) {
+        memory_dock_->refresh();
     }
 }
 
-UiExitState run_gui(const UiStartupState& startup) {
+void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool report_error) {
+    if (!status.success) {
+        run_action_->setEnabled(false);
+        reset_action_->setEnabled(false);
+        pause_action_->setEnabled(false);
+        step_action_->setEnabled(false);
+        if (report_error) {
+            QMessageBox::warning(
+                this, QStringLiteral("Machine command"), from_rust_string(status.command_error));
+        }
+        return;
+    }
+
+    const bool configured = status.state != 0;
+    const bool paused = status.state == 1;
+    const bool running = status.state == 2;
+    run_action_->setEnabled(paused);
+    reset_action_->setEnabled(configured);
+    pause_action_->setEnabled(running);
+    step_action_->setEnabled(paused);
+
+    const auto execution_error = from_rust_string(status.execution_error);
+    execution_error_status_->setText(
+        execution_error.isEmpty() ? QString() : QStringLiteral("Error: %1").arg(execution_error));
+    execution_error_status_->setToolTip(execution_error);
+    execution_error_status_->setVisible(!execution_error.isEmpty());
+
+    if (running) {
+        runtime_status_->setText(QStringLiteral("State: Running"));
+    } else if (paused) {
+        runtime_status_->setText(QStringLiteral("State: Paused"));
+    } else {
+        runtime_status_->setText(QStringLiteral("State: Unconfigured"));
+    }
+}
+
+void MainWindow::update_machine_status() {
+    const auto machine = settings_.machine_model == QStringLiteral("indigo-ip12")
+        ? QStringLiteral("Indigo IP12")
+        : settings_.machine_model;
+    machine_status_->setText(machine);
+}
+
+UiExitState run_gui(const UiSession& session, const UiStartupState& startup) {
     int argument_count = 1;
     char application_name[] = "sgi-emu";
     char* arguments[] = {application_name, nullptr};
     QApplication application(argument_count, arguments);
     QCoreApplication::setApplicationName(QStringLiteral("sgi-emu"));
 
-    MainWindow window(startup);
+    MainWindow window(session, startup);
     window.show();
     application.exec();
     return window.exit_state();

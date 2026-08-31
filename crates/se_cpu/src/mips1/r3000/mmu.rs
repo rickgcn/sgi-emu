@@ -137,6 +137,15 @@ impl Mmu {
         (entry.entry_hi, entry.entry_lo)
     }
 
+    pub(super) fn debug_entries(&self, instruction: bool) -> [(u32, u32); TLB_ENTRY_COUNT] {
+        let entries = if instruction {
+            &self.instruction_entries
+        } else {
+            &self.entries
+        };
+        entries.map(|entry| (entry.entry_hi, entry.entry_lo))
+    }
+
     pub(super) fn probe(&self, entry_hi: u32) -> ProbeResult {
         let virtual_page = entry_hi & ENTRY_HI_VPN_MASK;
         let asid = entry_hi & ENTRY_HI_ASID_MASK;

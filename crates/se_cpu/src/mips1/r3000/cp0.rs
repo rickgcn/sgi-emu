@@ -76,6 +76,8 @@ struct FunctionalState {
     software_interrupts: u32,
 }
 
+pub(super) type Cp0FunctionalState = (u32, u32, u32);
+
 impl FunctionalState {
     const fn from_registers(status: u32, cause: u32) -> Self {
         Self {
@@ -163,6 +165,24 @@ impl Cp0 {
 
     pub(super) fn status(&self) -> u32 {
         self.status
+    }
+
+    pub(super) fn debug_functional_state(
+        &self,
+    ) -> (Cp0FunctionalState, Option<Cp0FunctionalState>) {
+        let effective = (
+            self.effective.coprocessor_usable,
+            self.effective.interrupt_control,
+            self.effective.software_interrupts,
+        );
+        let pending = self.pending_functional.map(|state| {
+            (
+                state.coprocessor_usable,
+                state.interrupt_control,
+                state.software_interrupts,
+            )
+        });
+        (effective, pending)
     }
 
     pub(super) fn tlb_index(&self) -> usize {

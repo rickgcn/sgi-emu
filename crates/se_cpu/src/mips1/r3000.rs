@@ -1,10 +1,14 @@
 //! MIPS R3000 processor model.
 
+use std::error::Error;
+use std::fmt;
+
 mod alu;
 mod cache;
 mod control;
 mod cp0;
 mod cp1;
+pub mod debug;
 mod decode;
 mod load_store;
 mod mmu;
@@ -149,6 +153,25 @@ pub enum StepError {
         instruction: u32,
     },
 }
+
+impl fmt::Display for StepError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TlbShutdown => formatter.write_str("R3000 TLB is in shutdown state"),
+            Self::BusFault { address, fault } => write!(
+                formatter,
+                "physical bus fault at 0x{:08x}: {fault:?}",
+                address.get()
+            ),
+            Self::UnsupportedInstruction { pc, instruction } => write!(
+                formatter,
+                "unsupported R3000 instruction 0x{instruction:08x} at 0x{pc:08x}"
+            ),
+        }
+    }
+}
+
+impl Error for StepError {}
 
 /// An architectural R3000 processor.
 pub struct R3000 {

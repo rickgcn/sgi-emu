@@ -3,7 +3,11 @@
 mod config;
 
 use std::error::Error;
+use std::fs;
 
+use se_float::backend::Backend;
+use se_machine::indigo::ip12::Ip12;
+use se_machine::machine::Machine;
 use se_runtime::runtime::Runtime;
 use se_ui::session::UiSession;
 
@@ -12,9 +16,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut application_config = config::load(&config_path)?;
     application_config.apply_environment();
 
-    let startup = application_config.ui_startup_state();
-    let runtime = Runtime::new_unconfigured()?;
-    let mut session = UiSession::new(runtime);
+    let (model, prom_path, float_backend) = application_config.machine_configuration();
+    let (machine, startup_error) = if prom_path.is_empty() {
+        (None, String::new())
+    } else {
+        match build_machine(model, prom_path, float_backend) {
+            Ok(machine) => (Some(machine), String::new()),
+            Err(error) => (None, error),
+        }
+    };
+
+    let startup = application_config.ui_startup_state(startup_error);
+    let runtime = Runtime::new(machine)?;
+    let session = UiSession::new(runtime, Box::new(build_machine));
     let exit = session.run(&startup);
     session.shutdown()?;
 
@@ -22,4 +36,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     config::save(&config_path, &application_config)?;
 
     Ok(())
+}
+
+fn build_machine(model: &str, prom_path: &str, float_backend: &str) -> Result<Machine, String> {
+    match model {
+        "indigo-ip12" => {
+            let backend = match float_backend {
+                "softfloat" => Backend::SoftFloat,
+                "native" => Backend::Native,
+                _ => {
+                    return Err(format!(
+                        "unsupported floating-point backend: {float_backend}"
+                    ));
+                }
+            };
+            let raw_prom = fs::read(prom_path)
+                .map_err(|error| format!("failed to read PROM image '{prom_path}': {error}"))?;
+            Ip12::new(raw_prom, backend)
+                .map(Machine::IndigoIp12)
+                .map_err(|error| error.to_string())
+        }
+        _ => Err(format!("unsupported machine model: {model}")),
+    }
 }
