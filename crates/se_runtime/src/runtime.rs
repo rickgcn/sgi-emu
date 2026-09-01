@@ -1,6 +1,6 @@
 //! Lifetime management and commands for the host runtime worker.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -12,6 +12,7 @@ use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration, VirtualInstant};
 use se_machine::debug::{DebugRequest, DebugResponse};
 use se_machine::machine::{ExecutionError, Machine};
 use se_machine::output::MachineOutput;
+use se_machine::serial::SerialPort;
 
 use crate::control::{RuntimeState, RuntimeStatus};
 
@@ -36,6 +37,11 @@ enum Command {
     Debug {
         request: DebugRequest,
         reply: CommandReply<DebugReply>,
+    },
+    SendSerial {
+        port: SerialPort,
+        bytes: Vec<u8>,
+        reply: CommandReply<RuntimeStatus>,
     },
     SetOutputHandler {
         handler: Box<dyn FnMut(MachineOutput) + Send + 'static>,
@@ -203,6 +209,23 @@ impl Runtime {
         self.request(|reply| Command::Debug { request, reply })
     }
 
+    /// Supplies host bytes to one external serial port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] when no machine is configured or the worker is unavailable.
+    pub fn send_serial(
+        &self,
+        port: SerialPort,
+        bytes: &[u8],
+    ) -> Result<RuntimeStatus, RuntimeError> {
+        self.request(|reply| Command::SendSerial {
+            port,
+            bytes: bytes.to_vec(),
+            reply,
+        })
+    }
+
     /// Installs the frontend-neutral machine-output handler.
     ///
     /// # Errors
@@ -274,6 +297,7 @@ struct Worker {
     virtual_instant: VirtualInstant,
     machine_output: MachineOutput,
     output_handler: Option<Box<dyn FnMut(MachineOutput) + Send + 'static>>,
+    pending_serial: [VecDeque<u8>; 2],
     state: RuntimeState,
     revision: u64,
     last_error: Option<String>,
@@ -297,6 +321,7 @@ impl Worker {
             virtual_instant: VirtualInstant::ZERO,
             machine_output: MachineOutput::default(),
             output_handler: None,
+            pending_serial: [VecDeque::new(), VecDeque::new()],
             state,
             revision: 0,
             last_error: None,
@@ -341,6 +366,7 @@ impl Worker {
                 self.machine = Some(*machine);
                 self.virtual_instant = VirtualInstant::ZERO;
                 self.machine_output = MachineOutput::default();
+                self.pending_serial = [VecDeque::new(), VecDeque::new()];
                 self.state = RuntimeState::Paused;
                 self.last_error = None;
                 self.breakpoints.clear();
@@ -369,6 +395,7 @@ impl Worker {
                     }
                     self.virtual_instant = VirtualInstant::ZERO;
                     self.machine_output = MachineOutput::default();
+                    self.pending_serial = [VecDeque::new(), VecDeque::new()];
                     self.state = RuntimeState::Paused;
                     self.last_error = None;
                     self.ignore_breakpoint_once = None;
@@ -406,6 +433,15 @@ impl Worker {
                     || Err(rejection("no machine is configured")),
                     |machine| Ok(self.debug_reply(machine.debug(request))),
                 );
+                send_reply(reply, result);
+            }
+            Command::SendSerial { port, bytes, reply } => {
+                let result = self.require_machine().map(|()| {
+                    self.pending_serial[serial_port_index(port)].extend(bytes);
+                    self.refill_serial_input();
+                    self.advance_revision();
+                    self.status()
+                });
                 send_reply(reply, result);
             }
             Command::SetOutputHandler { handler, reply } => {
@@ -472,6 +508,7 @@ impl Worker {
             .as_mut()
             .expect("a timed instruction requires a configured machine")
             .execute_instruction()?;
+        self.refill_serial_input();
         let elapsed = self
             .cpu_clock
             .as_mut()
@@ -484,6 +521,17 @@ impl Worker {
             .advance_time(elapsed, &mut self.machine_output);
         self.deliver_output();
         Ok(())
+    }
+
+    fn refill_serial_input(&mut self) {
+        let Some(machine) = self.machine.as_mut() else {
+            return;
+        };
+        for (index, port) in [SerialPort::A, SerialPort::B].into_iter().enumerate() {
+            let pending = &mut self.pending_serial[index];
+            let consumed = machine.receive_serial(port, pending.make_contiguous());
+            pending.drain(..consumed);
+        }
     }
 
     fn deliver_output(&mut self) {
@@ -559,6 +607,13 @@ fn rejection(reason: &str) -> CommandRejection {
     }
 }
 
+const fn serial_port_index(port: SerialPort) -> usize {
+    match port {
+        SerialPort::A => 0,
+        SerialPort::B => 1,
+    }
+}
+
 fn send_reply<T>(reply: CommandReply<T>, result: Result<T, CommandRejection>) {
     let _ = reply.send(result);
 }
@@ -567,14 +622,14 @@ fn send_reply<T>(reply: CommandReply<T>, result: Result<T, CommandRejection>) {
 mod tests {
     use std::env;
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
 
     use se_core::time::ATTOSECONDS_PER_SECOND;
     use se_float::backend::Backend;
     use se_machine::indigo::ip12::Ip12;
     use se_machine::indigo::ip12::debug::{DebugRequest, DebugResponse, MemoryAddressSpace};
     use se_machine::machine::Machine;
-    use se_machine::output::SerialPort;
+    use se_machine::serial::SerialPort;
 
     use super::{CpuClock, Runtime, RuntimeError};
     use crate::control::RuntimeState;
@@ -652,7 +707,71 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             runtime.step(),
             Err(RuntimeError::CommandRejected { .. })
         ));
+        assert!(matches!(
+            runtime.send_serial(SerialPort::A, b"A"),
+            Err(RuntimeError::CommandRejected { .. })
+        ));
         assert_eq!(runtime.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn serial_input_waits_in_the_runtime_until_the_guest_frees_fifo_space() {
+        let instructions = [
+            0x3c08_bfb8,
+            0x3508_0d1b,
+            0x2409_0003,
+            0xa109_0000,
+            0x2409_0001,
+            0xa109_0000,
+            0x910a_0004,
+            0x1000_fffe,
+            0,
+        ];
+        let mut worker = super::Worker::new(Some(machine_with_instructions(&instructions)));
+        execute_instructions(&mut worker, 6);
+
+        let (reply, response) = mpsc::channel();
+        assert!(!worker.handle_command(super::Command::SendSerial {
+            port: SerialPort::A,
+            bytes: (0..9).collect(),
+            reply,
+        }));
+        response.recv().unwrap().unwrap();
+        assert_eq!(worker.pending_serial[0].len(), 1);
+
+        worker.execute_timed_instruction().unwrap();
+        assert!(worker.pending_serial[0].is_empty());
+    }
+
+    #[test]
+    fn reset_and_successful_configuration_discard_pending_serial_input() {
+        let mut worker = super::Worker::new(Some(machine_with_instructions(&[0])));
+        worker.pending_serial[0].extend(b"first");
+        worker.pending_serial[1].extend(b"second");
+
+        let (reset_reply, reset_response) = mpsc::channel();
+        assert!(!worker.handle_command(super::Command::Reset(reset_reply)));
+        reset_response.recv().unwrap().unwrap();
+        assert!(
+            worker
+                .pending_serial
+                .iter()
+                .all(|pending| pending.is_empty())
+        );
+
+        worker.pending_serial[0].extend(b"third");
+        let (configure_reply, configure_response) = mpsc::channel();
+        assert!(!worker.handle_command(super::Command::Configure {
+            machine: Box::new(machine_with_instructions(&[0])),
+            reply: configure_reply,
+        }));
+        configure_response.recv().unwrap().unwrap();
+        assert!(
+            worker
+                .pending_serial
+                .iter()
+                .all(|pending| pending.is_empty())
+        );
     }
 
     #[test]

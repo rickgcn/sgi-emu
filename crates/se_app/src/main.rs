@@ -4,7 +4,9 @@ mod config;
 
 use std::error::Error;
 use std::fs;
+use std::io;
 
+use se_cli::Arguments;
 use se_float::backend::Backend;
 use se_machine::indigo::ip12::Ip12;
 use se_machine::machine::Machine;
@@ -12,11 +14,20 @@ use se_runtime::runtime::Runtime;
 use se_ui::session::UiSession;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let arguments = Arguments::parse_process();
     let config_path = config::config_path()?;
     let mut application_config = config::load(&config_path)?;
     application_config.apply_environment();
+    application_config.apply_arguments(&arguments);
 
     let (model, prom_path, float_backend) = application_config.machine_configuration();
+    if arguments.headless() && prom_path.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "headless mode requires an Indigo IP12 PROM; use --prom or SE_INDIGO_IP12_PROM",
+        )
+        .into());
+    }
     let (machine, startup_error) = if prom_path.is_empty() {
         (None, String::new())
     } else {
@@ -25,6 +36,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             Err(error) => (None, error),
         }
     };
+
+    if arguments.headless() {
+        let machine = machine.ok_or_else(|| io::Error::other(startup_error))?;
+        return se_cli::headless::run(Runtime::new(Some(machine))?)
+            .map_err(|error| Box::new(error) as Box<dyn Error>);
+    }
 
     let startup = application_config.ui_startup_state(startup_error);
     let runtime = Runtime::new(machine)?;

@@ -21,6 +21,7 @@ const ATTOSECONDS_PER_COUNTER_TICK: u128 = 1_000_000_000_000;
 
 /// The software-visible INT2 state used by the IP12 machine.
 pub struct Int2 {
+    local_interrupt_status: [u8; 2],
     local_interrupt_masks: [u8; 2],
     vme_interrupt_masks: [u8; 2],
     output_port: u8,
@@ -47,6 +48,7 @@ impl Int2 {
     )]
     pub const fn new() -> Self {
         Self {
+            local_interrupt_status: [0; 2],
             local_interrupt_masks: [0; 2],
             vme_interrupt_masks: [0; 2],
             output_port: 0,
@@ -67,6 +69,7 @@ impl Int2 {
 
     /// Restores the mutable INT2 reset state.
     pub fn reset(&mut self) {
+        self.local_interrupt_status = [0; 2];
         self.local_interrupt_masks = [0; 2];
         self.vme_interrupt_masks = [0; 2];
         self.output_port = 0;
@@ -82,6 +85,21 @@ impl Int2 {
         self.system_timer_counter_2_mode_2 = false;
         self.system_timer_counter_2_latch = None;
         self.system_timer_counter_2_read_high = false;
+    }
+
+    /// Drives selected local-interrupt-zero input lines.
+    pub fn set_local_interrupt_0_input(&mut self, lines: u8, asserted: bool) {
+        if asserted {
+            self.local_interrupt_status[0] |= lines;
+        } else {
+            self.local_interrupt_status[0] &= !lines;
+        }
+    }
+
+    /// Reports the masked local-interrupt-zero output level.
+    #[must_use]
+    pub const fn local_interrupt_0_asserted(&self) -> bool {
+        self.local_interrupt_status[0] & self.local_interrupt_masks[0] != 0
     }
 
     /// Advances the one-megahertz system timer by guest virtual time.
@@ -115,9 +133,9 @@ impl Int2 {
 
         if let Some((register, offset)) = decode_word_register(start, end) {
             let value = match register {
-                Register::LocalInterrupt0Status
-                | Register::LocalInterrupt1Status
-                | Register::VmeInterruptStatus => 0,
+                Register::LocalInterrupt0Status => self.local_interrupt_status[0],
+                Register::LocalInterrupt1Status => self.local_interrupt_status[1],
+                Register::VmeInterruptStatus => 0,
                 Register::LocalInterrupt0Mask => self.local_interrupt_masks[0],
                 Register::LocalInterrupt1Mask => self.local_interrupt_masks[1],
                 Register::VmeInterrupt0Mask => self.vme_interrupt_masks[0],
@@ -155,9 +173,9 @@ impl Int2 {
 
         if let Some((register, offset)) = decode_word_register(start, end) {
             let value = match register {
-                Register::LocalInterrupt0Status
-                | Register::LocalInterrupt1Status
-                | Register::VmeInterruptStatus => 0,
+                Register::LocalInterrupt0Status => self.local_interrupt_status[0],
+                Register::LocalInterrupt1Status => self.local_interrupt_status[1],
+                Register::VmeInterruptStatus => 0,
                 Register::LocalInterrupt0Mask => self.local_interrupt_masks[0],
                 Register::LocalInterrupt1Mask => self.local_interrupt_masks[1],
                 Register::VmeInterrupt0Mask => self.vme_interrupt_masks[0],
@@ -430,6 +448,23 @@ mod tests {
     }
 
     #[test]
+    fn local_interrupt_zero_combines_live_inputs_with_the_guest_mask() {
+        let mut int2 = Int2::new();
+        int2.set_local_interrupt_0_input(1 << 5, true);
+
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_STATUS), Ok(1 << 5));
+        assert!(!int2.local_interrupt_0_asserted());
+
+        int2.write(DeviceAddr::new(LOCAL_INTERRUPT_0_MASK + 3), &[1 << 5])
+            .unwrap();
+        assert!(int2.local_interrupt_0_asserted());
+
+        int2.set_local_interrupt_0_input(1 << 5, false);
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_STATUS), Ok(0));
+        assert!(!int2.local_interrupt_0_asserted());
+    }
+
+    #[test]
     fn output_port_keeps_only_the_low_five_bits() {
         let mut int2 = Int2::new();
 
@@ -548,10 +583,12 @@ mod tests {
             .unwrap();
         int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0xb4])
             .unwrap();
+        int2.set_local_interrupt_0_input(1 << 5, true);
 
         int2.reset();
 
         assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_MASK), Ok(0));
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_STATUS), Ok(0));
         assert_eq!(read_word(&mut int2, VME_INTERRUPT_1_MASK), Ok(0));
         assert_eq!(read_word(&mut int2, OUTPUT_PORT), Ok(0));
         assert_eq!(int2.timer_pending, [false; 2]);

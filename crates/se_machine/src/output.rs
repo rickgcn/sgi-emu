@@ -1,13 +1,6 @@
 //! Frontend-visible output produced by an emulated machine.
 
-/// A host-visible serial port.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SerialPort {
-    /// The first external serial port.
-    A,
-    /// The second external serial port.
-    B,
-}
+use crate::serial::SerialPort;
 
 /// Output accumulated during one machine time advancement.
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -42,7 +35,9 @@ impl MachineOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{MachineOutput, SerialPort};
+    use crate::serial::SerialPort;
+
+    use super::MachineOutput;
 
     #[test]
     fn serial_ports_keep_independent_byte_order() {

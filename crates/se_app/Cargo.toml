@@ -19,3 +19,6 @@ se_machine.workspace = true
 se_runtime.workspace = true
 se_ui.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+clap.workspace = true

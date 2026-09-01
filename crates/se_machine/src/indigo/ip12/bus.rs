@@ -12,7 +12,8 @@ use se_device::rom::Rom;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::{Channel, Z85230};
 
-use crate::output::{MachineOutput, SerialPort};
+use crate::output::MachineOutput;
+use crate::serial::SerialPort;
 
 use super::PROM_BYTES;
 
@@ -44,6 +45,7 @@ const CPU_AUX_CONTROL: u64 = 0x1fb8_01bf;
 const CPU_AUX_OUTPUT_BITS: u8 = 0x0f;
 const INT2_BASE: u64 = 0x1fb8_01c0;
 const INT2_END: u64 = 0x1fb8_0200;
+const SERIAL_INTERRUPT: u8 = 1 << 5;
 
 const SERIAL_0_BASE: u64 = 0x1fb8_0d00;
 const SERIAL_0_END: u64 = 0x1fb8_0d10;
@@ -120,6 +122,7 @@ impl Ip12Bus {
         for serial in &mut self.serial {
             serial.reset();
         }
+        self.synchronize_serial_interrupt();
         self.mdac.reset();
         self.nvram.reset();
         self.cpu_aux_control = 0;
@@ -133,6 +136,20 @@ impl Ip12Bus {
         self.pic1.error_interrupt_asserted()
     }
 
+    pub(super) fn local_interrupt_0_asserted(&self) -> bool {
+        self.int2.local_interrupt_0_asserted()
+    }
+
+    pub(super) fn receive_serial(&mut self, port: SerialPort, bytes: &[u8]) -> usize {
+        let channel = match port {
+            SerialPort::A => Channel::A,
+            SerialPort::B => Channel::B,
+        };
+        let consumed = self.serial[1].receive(channel, bytes);
+        self.synchronize_serial_interrupt();
+        consumed
+    }
+
     pub(super) fn advance_time(&mut self, elapsed: VirtualDuration, output: &mut MachineOutput) {
         self.int2.advance_time(elapsed);
         self.rtc.advance_time(elapsed);
@@ -144,6 +161,12 @@ impl Ip12Bus {
             };
             output.push_serial(port, value);
         });
+    }
+
+    fn synchronize_serial_interrupt(&mut self) {
+        let asserted = self.serial.iter().any(Z85230::interrupt_asserted);
+        self.int2
+            .set_local_interrupt_0_input(SERIAL_INTERRUPT, asserted);
     }
 
     pub(super) fn debug_read(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
@@ -226,7 +249,11 @@ impl PhysicalBus for Ip12Bus {
             Target::Scsi(address) => self.scsi.read(address, data),
             Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),
             Target::Int2(address) => self.int2.read(address, data),
-            Target::Serial(index, address) => self.serial[index].read(address, data),
+            Target::Serial(index, address) => {
+                let result = self.serial[index].read(address, data);
+                self.synchronize_serial_interrupt();
+                result
+            }
             Target::UnpopulatedSerial(_) => Err(BusFault::Unmapped),
             Target::Mdac(address) => self.mdac.read(address, data),
             Target::Rtc(address) => self.rtc.read(address, data),
@@ -256,7 +283,11 @@ impl PhysicalBus for Ip12Bus {
                 write_cpu_aux_control(&mut self.cpu_aux_control, &mut self.nvram, data)
             }
             Target::Int2(address) => self.int2.write(address, data),
-            Target::Serial(index, address) => self.serial[index].write(address, data),
+            Target::Serial(index, address) => {
+                let result = self.serial[index].write(address, data);
+                self.synchronize_serial_interrupt();
+                result
+            }
             Target::UnpopulatedSerial(address) => write_unpopulated_serial(address, data),
             Target::Mdac(address) => self.mdac.write(address, data),
             Target::Rtc(address) => self.rtc.write(address, data),
@@ -487,7 +518,8 @@ mod tests {
     use se_device::wd33c93b::Wd33c93b;
     use se_device::z85230::Z85230;
 
-    use crate::output::{MachineOutput, SerialPort};
+    use crate::output::MachineOutput;
+    use crate::serial::SerialPort;
 
     use super::{
         BOARD_REVISION_BASE, CPU_AUX_CONTROL, DSP56001_BASE, DSP56001_END, GIO_BASE, GIO_END,
@@ -780,6 +812,23 @@ mod tests {
 
         assert_eq!(output.serial(SerialPort::A), [0x22]);
         assert!(output.serial(SerialPort::B).is_empty());
+    }
+
+    #[test]
+    fn external_serial_input_drives_the_masked_int2_local_interrupt() {
+        let mut bus = bus();
+        write_serial_register(&mut bus, SERIAL_1_BASE, 3, 1);
+        write_serial_register(&mut bus, SERIAL_1_BASE, 1, 0x10);
+        write_serial_register(&mut bus, SERIAL_1_BASE, 9, 1 << 3);
+        bus.write(PhysAddr::new(INT2_BASE + 7), &[1 << 5]).unwrap();
+
+        assert_eq!(bus.receive_serial(SerialPort::A, b"A"), 1);
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1 << 5));
+        assert!(bus.local_interrupt_0_asserted());
+
+        assert_eq!(read_byte(&mut bus, SERIAL_1_BASE + 0x0f), Ok(b'A'));
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
+        assert!(!bus.local_interrupt_0_asserted());
     }
 
     #[test]

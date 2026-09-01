@@ -1,31 +1,30 @@
 #include "se_ui/serial_console_dock.h"
 
-#include <QFontDatabase>
-#include <QMetaObject>
-#include <QPlainTextEdit>
-#include <QScrollBar>
-#include <QTabWidget>
-#include <QTextCursor>
+#include "se_ui/src/bridge.rs.h"
+#include "se_ui/vt100_widget.h"
 
-#include <algorithm>
+#include <QMetaObject>
+#include <QTabWidget>
+
+#include <cstddef>
 #include <utility>
 
 namespace se_ui {
 
-SerialConsoleDock::SerialConsoleDock(QWidget* parent)
+SerialConsoleDock::SerialConsoleDock(
+    const UiSession& session,
+    StatusHandler status_handler,
+    QWidget* parent)
     : QDockWidget(QStringLiteral("Serial Console"), parent)
-    , serial_a_(new QPlainTextEdit(this))
-    , serial_b_(new QPlainTextEdit(this))
-    , serial_a_was_carriage_return_(false)
-    , serial_b_was_carriage_return_(false) {
+    , session_(session)
+    , status_handler_(std::move(status_handler))
+    , serial_a_(new Vt100Widget(this))
+    , serial_b_(new Vt100Widget(this)) {
     setObjectName(QStringLiteral("SerialConsoleDock"));
-
-    const auto fixed_font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-    for (auto* editor : {serial_a_, serial_b_}) {
-        editor->setReadOnly(true);
-        editor->setFont(fixed_font);
-        editor->setUndoRedoEnabled(false);
-    }
+    serial_a_->set_input_handler(
+        [this](const auto& bytes) { send_serial(SerialPortDto::A, bytes); });
+    serial_b_->set_input_handler(
+        [this](const auto& bytes) { send_serial(SerialPortDto::B, bytes); });
 
     auto* tabs = new QTabWidget(this);
     tabs->addTab(serial_a_, QStringLiteral("Serial A"));
@@ -36,59 +35,20 @@ SerialConsoleDock::SerialConsoleDock(QWidget* parent)
 void SerialConsoleDock::append_serial(
     const std::vector<std::uint8_t>& serial_a,
     const std::vector<std::uint8_t>& serial_b) {
-    append_bytes(serial_a_, serial_a_was_carriage_return_, serial_a);
-    append_bytes(serial_b_, serial_b_was_carriage_return_, serial_b);
+    serial_a_->feed(serial_a);
+    serial_b_->feed(serial_b);
 }
 
-void SerialConsoleDock::clear() {
-    serial_a_->clear();
-    serial_b_->clear();
-    serial_a_was_carriage_return_ = false;
-    serial_b_was_carriage_return_ = false;
-}
-
-void SerialConsoleDock::append_bytes(
-    QPlainTextEdit* editor,
-    bool& previous_was_carriage_return,
-    const std::vector<std::uint8_t>& bytes) {
+void SerialConsoleDock::send_serial(
+    SerialPortDto port,
+    const std::vector<std::uint8_t>& bytes) const {
     if (bytes.empty()) {
         return;
     }
-
-    QString text;
-    text.reserve(static_cast<qsizetype>(bytes.size()));
-    for (const auto byte : bytes) {
-        if (byte == '\n' && previous_was_carriage_return) {
-            previous_was_carriage_return = false;
-            continue;
-        }
-        if (byte == '\r') {
-            text.append(QChar::fromLatin1('\n'));
-            previous_was_carriage_return = true;
-            continue;
-        }
-
-        previous_was_carriage_return = false;
-        text.append(QChar(byte));
-    }
-    if (text.isEmpty()) {
-        return;
-    }
-
-    auto* scrollbar = editor->verticalScrollBar();
-    const bool follow_output = scrollbar->value() == scrollbar->maximum();
-    const auto selection = editor->textCursor();
-    const bool restore_selection = selection.hasSelection();
-
-    QTextCursor insertion(editor->document());
-    insertion.movePosition(QTextCursor::End);
-    insertion.insertText(text);
-
-    if (restore_selection) {
-        editor->setTextCursor(selection);
-    }
-    if (follow_output) {
-        scrollbar->setValue(scrollbar->maximum());
+    const auto status = session_.send_serial(
+        port, rust::Slice<const std::uint8_t>(bytes.data(), bytes.size()));
+    if (status_handler_) {
+        status_handler_(status);
     }
 }
 

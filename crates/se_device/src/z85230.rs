@@ -8,9 +8,19 @@ const CHANNEL_B_DATA: u64 = 0x07;
 const CHANNEL_A_CONTROL: u64 = 0x0b;
 const CHANNEL_A_DATA: u64 = 0x0f;
 
+const RECEIVE_CHARACTER_AVAILABLE: u8 = 1;
 const TRANSMIT_BUFFER_EMPTY: u8 = 1 << 2;
 const ALL_SENT: u8 = 1;
+const ASYNC_EIGHT_BIT_RESIDUE: u8 = 0x06;
+const RECEIVER_ENABLE: u8 = 1;
+const AUTO_ENABLE: u8 = 1 << 5;
+const TRANSMITTER_ENABLE: u8 = 1 << 3;
+const MASTER_INTERRUPT_ENABLE: u8 = 1 << 3;
+const SOFTWARE_INTERRUPT_ACKNOWLEDGE: u8 = 1 << 5;
+const CHANNEL_B_RESET: u8 = 0x40;
+const CHANNEL_A_RESET: u8 = 0x80;
 const WHOLE_CHIP_RESET: u8 = 0xc0;
+const RECEIVE_FIFO_BYTES: usize = 8;
 const TRANSMIT_FIFO_BYTES: usize = 4;
 
 /// A channel within one Z85230 controller.
@@ -26,6 +36,9 @@ pub enum Channel {
 pub struct Z85230 {
     clock_hz: u64,
     channels: [ChannelState; 2],
+    interrupt_vector: u8,
+    master_interrupt_control: u8,
+    receive_interrupt_under_service: [bool; 2],
 }
 
 impl Z85230 {
@@ -40,12 +53,34 @@ impl Z85230 {
         Self {
             clock_hz,
             channels: [ChannelState::new(), ChannelState::new()],
+            interrupt_vector: 0,
+            master_interrupt_control: 0,
+            receive_interrupt_under_service: [false; 2],
         }
     }
 
     /// Restores both channels to their reset state.
     pub fn reset(&mut self) {
         self.channels = [ChannelState::new(), ChannelState::new()];
+        self.interrupt_vector = 0;
+        self.master_interrupt_control = 0;
+        self.receive_interrupt_under_service = [false; 2];
+    }
+
+    /// Supplies host bytes to one receiver.
+    ///
+    /// Returns the number of bytes consumed. A disabled receiver consumes and
+    /// discards the complete slice. An enabled receiver consumes only the
+    /// prefix that fits in its receive FIFO.
+    pub fn receive(&mut self, channel: Channel, bytes: &[u8]) -> usize {
+        self.channels[channel_index(channel)].receive(bytes)
+    }
+
+    /// Reports the controller interrupt output level.
+    #[must_use]
+    pub fn interrupt_asserted(&self) -> bool {
+        self.master_interrupt_control & MASTER_INTERRUPT_ENABLE != 0
+            && self.highest_pending_receive_interrupt().is_some()
     }
 
     /// Advances both transmitters and reports completed characters.
@@ -66,8 +101,8 @@ impl Z85230 {
     /// port.
     pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
         match decode_port(address, data.len())? {
-            Port::Control(channel) => data[0] = self.channels[channel].read_control(),
-            Port::Data(_) => data[0] = 0,
+            Port::Control(channel) => data[0] = self.read_control(channel),
+            Port::Data(channel) => data[0] = self.channels[channel].read_data(),
         }
         Ok(())
     }
@@ -80,8 +115,8 @@ impl Z85230 {
     /// port.
     pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
         match decode_port(address, data.len())? {
-            Port::Control(channel) => data[0] = self.channels[channel].peek_control(),
-            Port::Data(_) => data[0] = 0,
+            Port::Control(channel) => data[0] = self.peek_control(channel),
+            Port::Data(channel) => data[0] = self.channels[channel].peek_data(),
         }
         Ok(())
     }
@@ -94,19 +129,137 @@ impl Z85230 {
     /// port.
     pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
         match decode_port(address, data.len())? {
-            Port::Control(channel) => {
-                if self.channels[channel].write_control(data[0]) {
-                    self.reset();
-                } else {
-                    self.channels[channel].start_transmitter(self.clock_hz);
-                }
-            }
+            Port::Control(channel) => self.write_control(channel, data[0]),
             Port::Data(channel) => {
                 self.channels[channel].write_data(data[0]);
                 self.channels[channel].start_transmitter(self.clock_hz);
             }
         }
         Ok(())
+    }
+
+    fn read_control(&mut self, channel: usize) -> u8 {
+        let register = self.channels[channel].take_selected_register();
+        match register {
+            0 => self.channels[channel].read_register_zero(),
+            1 => self.channels[channel].read_register_one(),
+            2 => {
+                let value = self.read_interrupt_vector(channel);
+                if self.master_interrupt_control & SOFTWARE_INTERRUPT_ACKNOWLEDGE != 0
+                    && let Some(source) = self.highest_pending_receive_interrupt()
+                {
+                    self.receive_interrupt_under_service[source] = true;
+                }
+                value
+            }
+            3 if channel == 0 => self.interrupt_pending_register(),
+            8 => self.channels[channel].read_data(),
+            12 | 13 | 15 => self.channels[channel].write_register(register),
+            _ => 0,
+        }
+    }
+
+    fn peek_control(&self, channel: usize) -> u8 {
+        match self.channels[channel].selected_register {
+            0 => self.channels[channel].read_register_zero(),
+            1 => self.channels[channel].read_register_one(),
+            2 => self.read_interrupt_vector(channel),
+            3 if channel == 0 => self.interrupt_pending_register(),
+            8 => self.channels[channel].peek_data(),
+            12 | 13 | 15 => {
+                self.channels[channel].write_register(self.channels[channel].selected_register)
+            }
+            _ => 0,
+        }
+    }
+
+    fn write_control(&mut self, channel: usize, value: u8) {
+        let register = self.channels[channel].selected_register;
+        if register == 0 {
+            self.channels[channel].select_register(value);
+            self.execute_command(channel, value);
+            return;
+        }
+
+        self.channels[channel].selected_register = 0;
+        match register {
+            2 => self.interrupt_vector = value,
+            9 => self.write_master_interrupt_control(value),
+            7 if self.channels[channel].write_register(15) & 1 != 0 => {
+                self.channels[channel].write_register_prime_seven(value);
+            }
+            _ => self.channels[channel].set_write_register(register, value),
+        }
+        self.channels[channel].start_transmitter(self.clock_hz);
+    }
+
+    fn execute_command(&mut self, channel: usize, value: u8) {
+        match (value >> 3) & 0x07 {
+            4 => self.channels[channel].enable_interrupt_on_next_receive_character(),
+            6 => self.channels[channel].reset_receive_errors(),
+            7 => self.reset_highest_interrupt_under_service(),
+            _ => {}
+        }
+    }
+
+    fn write_master_interrupt_control(&mut self, value: u8) {
+        self.master_interrupt_control = value & 0x3f;
+        match value & 0xc0 {
+            CHANNEL_B_RESET => {
+                self.channels[1] = ChannelState::new();
+                self.receive_interrupt_under_service[1] = false;
+            }
+            CHANNEL_A_RESET => {
+                self.channels[0] = ChannelState::new();
+                self.receive_interrupt_under_service[0] = false;
+            }
+            WHOLE_CHIP_RESET => self.reset(),
+            _ => {}
+        }
+    }
+
+    fn highest_pending_receive_interrupt(&self) -> Option<usize> {
+        if self.receive_interrupt_under_service[0] {
+            return None;
+        }
+        if self.channels[0].receive_interrupt_pending() {
+            return Some(0);
+        }
+        if self.receive_interrupt_under_service[1] {
+            return None;
+        }
+        self.channels[1].receive_interrupt_pending().then_some(1)
+    }
+
+    fn reset_highest_interrupt_under_service(&mut self) {
+        if self.receive_interrupt_under_service[0] {
+            self.receive_interrupt_under_service[0] = false;
+        } else {
+            self.receive_interrupt_under_service[1] = false;
+        }
+    }
+
+    fn interrupt_pending_register(&self) -> u8 {
+        u8::from(self.channels[0].receive_interrupt_pending()) << 5
+            | u8::from(self.channels[1].receive_interrupt_pending()) << 2
+    }
+
+    fn read_interrupt_vector(&self, channel: usize) -> u8 {
+        if channel == 0 {
+            return self.interrupt_vector;
+        }
+
+        let status = match self.highest_pending_receive_interrupt() {
+            Some(0) => 0b110,
+            Some(1) => 0b010,
+            None => 0b011,
+            _ => unreachable!(),
+        };
+        if self.master_interrupt_control & 0x10 != 0 {
+            self.interrupt_vector & 0x8f | status << 4
+        } else {
+            self.interrupt_vector & 0xf1 | status << 1
+        }
     }
 }
 
@@ -117,9 +270,29 @@ struct ActiveCharacter {
 }
 
 #[derive(Clone, Copy)]
+struct ReceiveCharacter {
+    value: u8,
+    status: u8,
+}
+
+impl ReceiveCharacter {
+    const EMPTY: Self = Self {
+        value: 0,
+        status: ASYNC_EIGHT_BIT_RESIDUE,
+    };
+}
+
+#[derive(Clone, Copy)]
 struct ChannelState {
     selected_register: u8,
-    write_registers: [u8; 7],
+    write_registers: [u8; 16],
+    write_register_prime_seven: u8,
+    receive_fifo: [ReceiveCharacter; RECEIVE_FIFO_BYTES],
+    receive_fifo_head: usize,
+    receive_fifo_length: usize,
+    first_character_interrupt_armed: bool,
+    receive_error_latch: u8,
+    receive_fifo_locked: bool,
     transmit_fifo: [u8; TRANSMIT_FIFO_BYTES],
     transmit_fifo_head: usize,
     transmit_fifo_length: usize,
@@ -131,7 +304,14 @@ impl ChannelState {
     const fn new() -> Self {
         Self {
             selected_register: 0,
-            write_registers: [0; 7],
+            write_registers: [0; 16],
+            write_register_prime_seven: 0,
+            receive_fifo: [ReceiveCharacter::EMPTY; RECEIVE_FIFO_BYTES],
+            receive_fifo_head: 0,
+            receive_fifo_length: 0,
+            first_character_interrupt_armed: false,
+            receive_error_latch: 0,
+            receive_fifo_locked: false,
             transmit_fifo: [0; TRANSMIT_FIFO_BYTES],
             transmit_fifo_head: 0,
             transmit_fifo_length: 0,
@@ -140,36 +320,155 @@ impl ChannelState {
         }
     }
 
-    fn read_control(&mut self) -> u8 {
-        let value = self.peek_control();
+    fn take_selected_register(&mut self) -> u8 {
+        let register = self.selected_register;
         self.selected_register = 0;
+        register
+    }
+
+    fn select_register(&mut self, value: u8) {
+        let mut register = value & 0x07;
+        if (value >> 3) & 0x07 == 1 {
+            register += 8;
+        }
+        self.selected_register = register;
+    }
+
+    fn read_register_zero(&self) -> u8 {
+        let mut value = 0;
+        if self.receive_fifo_length != 0 {
+            value |= RECEIVE_CHARACTER_AVAILABLE;
+        }
+        if self.transmit_fifo_length < TRANSMIT_FIFO_BYTES {
+            value |= TRANSMIT_BUFFER_EMPTY;
+        }
         value
     }
 
-    const fn peek_control(&self) -> u8 {
-        match self.selected_register {
-            0 if self.transmit_fifo_length < TRANSMIT_FIFO_BYTES => TRANSMIT_BUFFER_EMPTY,
-            1 if self.transmit_fifo_length == 0 && self.active_character.is_none() => ALL_SENT,
-            _ => 0,
+    fn read_register_one(&self) -> u8 {
+        let status = if self.receive_fifo_length == 0 {
+            ASYNC_EIGHT_BIT_RESIDUE
+        } else {
+            self.receive_fifo[self.receive_fifo_head].status | self.receive_error_latch
+        };
+        if self.transmit_fifo_length == 0 && self.active_character.is_none() {
+            status | ALL_SENT
+        } else {
+            status
         }
     }
 
-    fn write_control(&mut self, value: u8) -> bool {
-        if self.selected_register == 0 {
-            self.selected_register = (value & 0x07) | (value & 0x08);
-            return false;
+    const fn write_register(&self, register: u8) -> u8 {
+        self.write_registers[register as usize]
+    }
+
+    fn set_write_register(&mut self, register: u8, value: u8) {
+        self.write_registers[register as usize] = value;
+        if register == 1 {
+            self.first_character_interrupt_armed = self.receive_interrupt_mode() == 1;
+        }
+    }
+
+    fn write_register_prime_seven(&mut self, value: u8) {
+        self.write_register_prime_seven = value;
+    }
+
+    fn receive(&mut self, bytes: &[u8]) -> usize {
+        if !self.receiver_enabled() {
+            return bytes.len();
         }
 
-        let register = self.selected_register;
-        self.selected_register = 0;
-        if register == 9 && value & 0xc0 == WHOLE_CHIP_RESET {
-            return true;
+        let consumed = bytes
+            .len()
+            .min(RECEIVE_FIFO_BYTES - self.receive_fifo_length);
+        for value in &bytes[..consumed] {
+            let tail = (self.receive_fifo_head + self.receive_fifo_length) % RECEIVE_FIFO_BYTES;
+            self.receive_fifo[tail] = ReceiveCharacter {
+                value: *value,
+                status: ASYNC_EIGHT_BIT_RESIDUE,
+            };
+            self.receive_fifo_length += 1;
         }
+        consumed
+    }
 
-        if let Some(index) = stored_register_index(register) {
-            self.write_registers[index] = value;
+    fn read_data(&mut self) -> u8 {
+        if self.receive_fifo_length == 0 {
+            return 0;
         }
-        false
+        let character = self.receive_fifo[self.receive_fifo_head];
+        if self.receive_fifo_locked {
+            return character.value;
+        }
+        let mode = self.receive_interrupt_mode();
+        if matches!(mode, 1 | 3) && character.status & 0xf0 != 0 {
+            self.receive_error_latch = character.status & 0xf0;
+            self.receive_fifo_locked = true;
+            self.first_character_interrupt_armed = false;
+            return character.value;
+        }
+        let value = character.value;
+        self.receive_fifo_head = (self.receive_fifo_head + 1) % RECEIVE_FIFO_BYTES;
+        self.receive_fifo_length -= 1;
+        if mode == 1 {
+            self.first_character_interrupt_armed = false;
+        }
+        value
+    }
+
+    fn peek_data(&self) -> u8 {
+        if self.receive_fifo_length == 0 {
+            0
+        } else {
+            self.receive_fifo[self.receive_fifo_head].value
+        }
+    }
+
+    fn receiver_enabled(&self) -> bool {
+        let wr3 = self.write_register(3);
+        wr3 & RECEIVER_ENABLE != 0 && (wr3 & AUTO_ENABLE == 0 || dcd_asserted())
+    }
+
+    fn receive_interrupt_pending(&self) -> bool {
+        match self.receive_interrupt_mode() {
+            0 => false,
+            1 => self.first_character_interrupt_armed && self.receive_fifo_length != 0,
+            2 => {
+                let threshold = if self.write_register_prime_seven & (1 << 3) == 0 {
+                    1
+                } else {
+                    4
+                };
+                self.receive_fifo_length >= threshold || self.has_special_receive_condition()
+            }
+            3 => self.has_special_receive_condition(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn receive_interrupt_mode(&self) -> u8 {
+        self.write_register(1) >> 3 & 0x03
+    }
+
+    fn has_special_receive_condition(&self) -> bool {
+        self.receive_error_latch != 0
+            || (0..self.receive_fifo_length).any(|offset| {
+                let index = (self.receive_fifo_head + offset) % RECEIVE_FIFO_BYTES;
+                self.receive_fifo[index].status & 0xf0 != 0
+            })
+    }
+
+    fn enable_interrupt_on_next_receive_character(&mut self) {
+        self.first_character_interrupt_armed = true;
+    }
+
+    fn reset_receive_errors(&mut self) {
+        if self.receive_fifo_locked {
+            self.receive_fifo_head = (self.receive_fifo_head + 1) % RECEIVE_FIFO_BYTES;
+            self.receive_fifo_length -= 1;
+        }
+        self.receive_error_latch = 0;
+        self.receive_fifo_locked = false;
     }
 
     fn write_data(&mut self, value: u8) {
@@ -235,7 +534,11 @@ impl ChannelState {
         let wr11 = self.write_register(11);
         let wr14 = self.write_register(14);
 
-        if wr5 & 0x08 == 0 || wr11 & 0x18 != 0x10 || wr14 & 0x01 == 0 {
+        if wr5 & TRANSMITTER_ENABLE == 0
+            || self.write_register(3) & AUTO_ENABLE != 0 && !cts_asserted()
+            || wr11 & 0x18 != 0x10
+            || wr14 & 0x01 == 0
+        {
             return None;
         }
 
@@ -266,13 +569,6 @@ impl ChannelState {
 
         Some(frame_half_bits * (u128::from(time_constant) + 2) * clock_factor)
     }
-
-    const fn write_register(&self, register: u8) -> u8 {
-        match stored_register_index(register) {
-            Some(index) => self.write_registers[index],
-            None => 0,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -295,17 +591,19 @@ fn decode_port(address: DeviceAddr, length: usize) -> Result<Port, BusFault> {
     }
 }
 
-const fn stored_register_index(register: u8) -> Option<usize> {
-    match register {
-        3 => Some(0),
-        4 => Some(1),
-        5 => Some(2),
-        11 => Some(3),
-        12 => Some(4),
-        13 => Some(5),
-        14 => Some(6),
-        _ => None,
+const fn channel_index(channel: Channel) -> usize {
+    match channel {
+        Channel::A => 0,
+        Channel::B => 1,
     }
+}
+
+const fn dcd_asserted() -> bool {
+    true
+}
+
+const fn cts_asserted() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -314,8 +612,8 @@ mod tests {
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
     use super::{
-        ALL_SENT, CHANNEL_A_CONTROL, CHANNEL_A_DATA, CHANNEL_B_CONTROL, CHANNEL_B_DATA, Channel,
-        TRANSMIT_BUFFER_EMPTY, Z85230, stored_register_index,
+        ALL_SENT, ASYNC_EIGHT_BIT_RESIDUE, CHANNEL_A_CONTROL, CHANNEL_A_DATA, CHANNEL_B_CONTROL,
+        CHANNEL_B_DATA, Channel, RECEIVE_CHARACTER_AVAILABLE, TRANSMIT_BUFFER_EMPTY, Z85230,
     };
 
     const CLOCK_HZ: u64 = 3_686_400;
@@ -365,7 +663,7 @@ mod tests {
 
         assert_eq!(serial.channels[0].selected_register, 0);
         assert_eq!(
-            serial.channels[0].write_registers[stored_register_index(register).unwrap()],
+            serial.channels[0].write_registers[usize::from(register)],
             0x6a
         );
     }
@@ -377,7 +675,10 @@ mod tests {
         serial
             .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[1])
             .unwrap();
-        assert_eq!(read_port(&mut serial, CHANNEL_A_CONTROL), Ok(ALL_SENT));
+        assert_eq!(
+            read_port(&mut serial, CHANNEL_A_CONTROL),
+            Ok(ASYNC_EIGHT_BIT_RESIDUE | ALL_SENT)
+        );
 
         configure_9600_8n1(&mut serial, CHANNEL_A_CONTROL);
         serial
@@ -386,7 +687,10 @@ mod tests {
         serial
             .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[1])
             .unwrap();
-        assert_eq!(read_port(&mut serial, CHANNEL_A_CONTROL), Ok(0));
+        assert_eq!(
+            read_port(&mut serial, CHANNEL_A_CONTROL),
+            Ok(ASYNC_EIGHT_BIT_RESIDUE)
+        );
 
         serial.advance_time(
             VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
@@ -395,7 +699,10 @@ mod tests {
         serial
             .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[1])
             .unwrap();
-        assert_eq!(read_port(&mut serial, CHANNEL_A_CONTROL), Ok(ALL_SENT));
+        assert_eq!(
+            read_port(&mut serial, CHANNEL_A_CONTROL),
+            Ok(ASYNC_EIGHT_BIT_RESIDUE | ALL_SENT)
+        );
     }
 
     #[test]
@@ -404,10 +711,7 @@ mod tests {
 
         write_register(&mut serial, CHANNEL_A_CONTROL, 0x0b, 0x50);
 
-        assert_eq!(
-            serial.channels[0].write_registers[stored_register_index(11).unwrap()],
-            0x50
-        );
+        assert_eq!(serial.channels[0].write_registers[11], 0x50);
     }
 
     #[test]
@@ -423,7 +727,8 @@ mod tests {
 
         for channel in &serial.channels {
             assert_eq!(channel.selected_register, 0);
-            assert_eq!(channel.write_registers, [0; 7]);
+            assert_eq!(channel.write_registers, [0; 16]);
+            assert_eq!(channel.receive_fifo_length, 0);
             assert_eq!(channel.transmit_fifo_length, 0);
             assert!(channel.active_character.is_none());
             assert_eq!(channel.timing_remainder, 0);
@@ -544,6 +849,147 @@ mod tests {
         );
 
         assert_eq!(output, [1, 2]);
+    }
+
+    #[test]
+    fn disabled_receiver_discards_all_host_input() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+
+        assert_eq!(serial.receive(Channel::A, &[1, 2, 3]), 3);
+        assert_eq!(
+            read_port(&mut serial, CHANNEL_A_CONTROL),
+            Ok(TRANSMIT_BUFFER_EMPTY)
+        );
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(0));
+    }
+
+    #[test]
+    fn enabled_receiver_accepts_only_the_available_fifo_capacity() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 3, 1);
+
+        assert_eq!(serial.receive(Channel::A, &[0, 1, 2, 3, 4, 5, 6, 7, 8]), 8);
+        assert_eq!(
+            read_port(&mut serial, CHANNEL_A_CONTROL),
+            Ok(RECEIVE_CHARACTER_AVAILABLE | TRANSMIT_BUFFER_EMPTY)
+        );
+        for expected in 0..8 {
+            assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(expected));
+        }
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(0));
+    }
+
+    #[test]
+    fn all_character_interrupt_obeys_the_programmed_fifo_threshold() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 3, 1);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 1, 0x10);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 15, 1);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 7, 1 << 3);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+
+        assert_eq!(serial.receive(Channel::A, &[1, 2, 3]), 3);
+        assert!(!serial.interrupt_asserted());
+        assert_eq!(serial.receive(Channel::A, &[4]), 1);
+        assert!(serial.interrupt_asserted());
+
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(1));
+        assert!(!serial.interrupt_asserted());
+    }
+
+    #[test]
+    fn first_character_interrupt_requires_rearming_after_data_is_read() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 3, 1);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 1, 1 << 3);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+
+        assert_eq!(serial.receive(Channel::A, b"A"), 1);
+        assert!(serial.interrupt_asserted());
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(b'A'));
+        assert!(!serial.interrupt_asserted());
+
+        assert_eq!(serial.receive(Channel::A, b"B"), 1);
+        assert!(!serial.interrupt_asserted());
+        serial
+            .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[4 << 3])
+            .unwrap();
+        assert!(serial.interrupt_asserted());
+    }
+
+    #[test]
+    fn special_condition_mode_locks_data_until_error_reset() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 3, 1);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 1, 3 << 3);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+        assert_eq!(serial.receive(Channel::A, b"E"), 1);
+        serial.channels[0].receive_fifo[0].status |= 1 << 4;
+
+        assert!(serial.interrupt_asserted());
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(b'E'));
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(b'E'));
+        assert_eq!(serial.channels[0].receive_fifo_length, 1);
+
+        serial
+            .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[6 << 3])
+            .unwrap();
+        assert_eq!(serial.channels[0].receive_fifo_length, 0);
+        assert!(!serial.interrupt_asserted());
+    }
+
+    #[test]
+    fn all_character_mode_does_not_lock_special_condition_data() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 3, 1);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 1, 2 << 3);
+        assert_eq!(serial.receive(Channel::A, b"E"), 1);
+        serial.channels[0].receive_fifo[0].status |= 1 << 4;
+
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(b'E'));
+        assert_eq!(serial.channels[0].receive_fifo_length, 0);
+        assert!(!serial.channels[0].receive_fifo_locked);
+    }
+
+    #[test]
+    fn software_acknowledge_requires_resetting_the_highest_ius() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 3, 1);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 1, 0x10);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, (1 << 5) | (1 << 3));
+        assert_eq!(serial.receive(Channel::A, &[0xa5]), 1);
+        assert!(serial.interrupt_asserted());
+
+        serial
+            .write(DeviceAddr::new(CHANNEL_B_CONTROL), &[2])
+            .unwrap();
+        let _ = read_port(&mut serial, CHANNEL_B_CONTROL).unwrap();
+        assert!(!serial.interrupt_asserted());
+
+        serial
+            .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[7 << 3])
+            .unwrap();
+        assert!(serial.interrupt_asserted());
+    }
+
+    #[test]
+    fn receive_interrupt_output_combines_both_channels() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        for control_port in [CHANNEL_A_CONTROL, CHANNEL_B_CONTROL] {
+            write_register(&mut serial, control_port, 3, 1);
+            write_register(&mut serial, control_port, 1, 0x10);
+        }
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+
+        assert_eq!(serial.receive(Channel::B, &[0xb0]), 1);
+        assert!(serial.interrupt_asserted());
+        assert_eq!(serial.receive(Channel::A, &[0xa0]), 1);
+        assert!(serial.interrupt_asserted());
+
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(0xa0));
+        assert!(serial.interrupt_asserted());
+        assert_eq!(read_port(&mut serial, CHANNEL_B_DATA), Ok(0xb0));
+        assert!(!serial.interrupt_asserted());
     }
 
     #[test]

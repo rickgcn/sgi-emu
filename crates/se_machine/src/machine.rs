@@ -9,6 +9,7 @@ use se_cpu::mips1::r3000::StepError;
 use crate::debug::{DebugRequest, DebugResponse};
 use crate::indigo::ip12::Ip12;
 use crate::output::MachineOutput;
+use crate::serial::SerialPort;
 
 /// A configured emulated machine.
 pub enum Machine {
@@ -73,6 +74,15 @@ impl Machine {
     pub fn advance_time(&mut self, elapsed: VirtualDuration, output: &mut MachineOutput) {
         match self {
             Self::IndigoIp12(machine) => machine.advance_time(elapsed, output),
+        }
+    }
+
+    /// Supplies host bytes to one external serial receiver.
+    ///
+    /// Returns the number of bytes consumed by the selected machine.
+    pub fn receive_serial(&mut self, port: SerialPort, bytes: &[u8]) -> usize {
+        match self {
+            Self::IndigoIp12(machine) => machine.receive_serial(port, bytes),
         }
     }
 

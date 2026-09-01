@@ -1,9 +1,67 @@
 //! Data transferred across the Rust and Qt boundary.
 
 use crate::session::UiSession;
+use crate::terminal::{TerminalModel, new_terminal_model, normalize_terminal_paste};
 
 #[cxx::bridge(namespace = "se_ui")]
 pub mod ffi {
+    /// A frontend-neutral external serial port.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum SerialPortDto {
+        A,
+        B,
+    }
+
+    /// A semantic terminal key interpreted by the Rust terminal model.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum TerminalKeyDto {
+        Text,
+        Control,
+        Up,
+        Down,
+        Right,
+        Left,
+        Keypad,
+        Pf1,
+        Pf2,
+        Pf3,
+        Pf4,
+        Enter,
+        Backspace,
+        Tab,
+        Escape,
+        Delete,
+    }
+
+    /// A terminal color encoded for Qt rendering.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct TerminalColorDto {
+        pub kind: u8,
+        pub value: u32,
+    }
+
+    /// One visible terminal cell.
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct TerminalCellDto {
+        pub text: String,
+        pub foreground: TerminalColorDto,
+        pub background: TerminalColorDto,
+        pub attributes: u8,
+    }
+
+    /// A complete visible terminal grid.
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct TerminalSnapshotDto {
+        pub columns: u16,
+        pub rows: u16,
+        pub cells: Vec<TerminalCellDto>,
+        pub cursor_row: u16,
+        pub cursor_column: u16,
+        pub cursor_visible: bool,
+        pub scrollback_rows: u32,
+        pub scrollback_offset: u32,
+    }
+
     /// Values used to initialize the Qt user interface.
     #[derive(Debug)]
     pub struct UiStartupState {
@@ -178,6 +236,24 @@ pub mod ffi {
 
     extern "Rust" {
         type UiSession;
+        type TerminalModel;
+
+        fn new_terminal_model() -> Box<TerminalModel>;
+        fn terminal_feed(self: Pin<&mut TerminalModel>, bytes: &[u8]) -> TerminalSnapshotDto;
+        fn terminal_snapshot(
+            self: Pin<&mut TerminalModel>,
+            scrollback_offset: u32,
+        ) -> TerminalSnapshotDto;
+        fn terminal_clear(self: Pin<&mut TerminalModel>) -> TerminalSnapshotDto;
+        fn terminal_encode_key(self: &TerminalModel, key: TerminalKeyDto, value: u8) -> Vec<u8>;
+        fn terminal_selection(
+            self: Pin<&mut TerminalModel>,
+            start_row: u32,
+            start_column: u16,
+            end_row: u32,
+            end_column: u16,
+        ) -> String;
+        fn normalize_terminal_paste(text: &str) -> Vec<u8>;
 
         fn runtime_status(self: &UiSession) -> RuntimeStatusDto;
         fn configure_machine(
@@ -201,6 +277,7 @@ pub mod ffi {
             length: u32,
         ) -> MemoryDto;
         fn toggle_breakpoint(self: &UiSession, address: u32) -> RuntimeStatusDto;
+        fn send_serial(self: &UiSession, port: SerialPortDto, bytes: &[u8]) -> RuntimeStatusDto;
         fn attach_machine_output(
             self: &UiSession,
             sink: SharedPtr<MachineOutputSink>,

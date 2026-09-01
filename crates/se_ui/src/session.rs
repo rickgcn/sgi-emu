@@ -8,13 +8,15 @@ use se_machine::indigo::ip12::debug::{
     DebugRequest as Ip12DebugRequest, DebugResponse as Ip12DebugResponse, MemoryAddressSpace,
 };
 use se_machine::machine::Machine;
-use se_machine::output::{MachineOutput, SerialPort};
+use se_machine::output::MachineOutput;
+use se_machine::serial::SerialPort;
 use se_runtime::control::{RuntimeState, RuntimeStatus};
 use se_runtime::runtime::{DebugReply, Runtime, RuntimeError, ShutdownError};
 
 use crate::bridge::ffi::{
     CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineOutputSink, MemoryDto,
-    RegistersDto, RuntimeStatusDto, TlbDto, TlbEntryDto, UiExitState, UiStartupState, run_gui,
+    RegistersDto, RuntimeStatusDto, SerialPortDto, TlbDto, TlbEntryDto, UiExitState,
+    UiStartupState, run_gui,
 };
 
 /// Constructs a machine from settings selected by a frontend.
@@ -331,6 +333,16 @@ impl UiSession {
             Ok(status) => status_dto(status),
             Err(error) => failed_status(error.to_string()),
         }
+    }
+
+    /// Supplies one byte batch to an external serial port.
+    pub fn send_serial(&self, port: SerialPortDto, bytes: &[u8]) -> RuntimeStatusDto {
+        let port = match port {
+            SerialPortDto::A => SerialPort::A,
+            SerialPortDto::B => SerialPort::B,
+            _ => return failed_status(String::from("unsupported serial port")),
+        };
+        self.runtime_command(|runtime| runtime.send_serial(port, bytes))
     }
 
     fn runtime_command(

@@ -2,11 +2,13 @@
 
 use std::env;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
+use se_cli::Arguments;
 use se_ui::bridge::ffi::{UiExitState, UiStartupState};
 use serde::{Deserialize, Serialize};
 
@@ -68,10 +70,25 @@ struct UiConfig {
 
 impl ApplicationConfig {
     pub fn apply_environment(&mut self) {
-        if self.machine.prom_path.is_empty()
-            && let Some(prom_path) = env::var_os("SE_INDIGO_IP12_PROM")
-        {
+        let prom_path = env::var_os("SE_INDIGO_IP12_PROM");
+        self.apply_environment_prom(prom_path.as_deref());
+    }
+
+    fn apply_environment_prom(&mut self, prom_path: Option<&OsStr>) {
+        if let Some(prom_path) = prom_path {
             self.machine.prom_path = prom_path.to_string_lossy().into_owned();
+        }
+    }
+
+    pub fn apply_arguments(&mut self, arguments: &Arguments) {
+        if let Some(model) = arguments.machine() {
+            self.machine.model = String::from(model);
+        }
+        if let Some(prom_path) = arguments.prom() {
+            self.machine.prom_path = prom_path.to_string_lossy().into_owned();
+        }
+        if let Some(float_backend) = arguments.float_backend() {
+            self.machine.float_backend = FloatBackend::from_identifier(float_backend);
         }
     }
 
@@ -143,7 +160,11 @@ pub fn save(path: &Path, config: &ApplicationConfig) -> Result<(), Box<dyn Error
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
+
+    use clap::Parser;
+    use se_cli::Arguments;
 
     use super::{ApplicationConfig, FloatBackend, load, save};
 
@@ -175,6 +196,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.machine.prom_path, "prom.bin");
+        assert!(matches!(config.machine.float_backend, FloatBackend::Native));
+    }
+
+    #[test]
+    fn environment_and_arguments_override_saved_machine_configuration_in_order() {
+        let mut config: ApplicationConfig = toml::from_str(
+            r#"
+                [machine]
+                model = "indigo-ip12"
+                prom_path = "saved.bin"
+                float_backend = "soft-float"
+            "#,
+        )
+        .unwrap();
+        config.apply_environment_prom(Some(OsStr::new("environment.bin")));
+        assert_eq!(config.machine.prom_path, "environment.bin");
+
+        let arguments = Arguments::try_parse_from([
+            "sgi-emu",
+            "--prom",
+            "command-line.bin",
+            "--float-backend",
+            "native",
+        ])
+        .unwrap();
+        config.apply_arguments(&arguments);
+
+        assert_eq!(config.machine.prom_path, "command-line.bin");
         assert!(matches!(config.machine.float_backend, FloatBackend::Native));
     }
 

@@ -5,33 +5,38 @@
 #include <QDockWidget>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
 
-class QPlainTextEdit;
-
 namespace se_ui {
+
+enum class SerialPortDto : std::uint8_t;
+struct RuntimeStatusDto;
+struct UiSession;
+class Vt100Widget;
 
 class SerialConsoleDock final : public QDockWidget {
 public:
-    explicit SerialConsoleDock(QWidget* parent = nullptr);
+    using StatusHandler = std::function<void(const RuntimeStatusDto&)>;
+
+    SerialConsoleDock(
+        const UiSession& session,
+        StatusHandler status_handler,
+        QWidget* parent = nullptr);
 
     void append_serial(
         const std::vector<std::uint8_t>& serial_a,
         const std::vector<std::uint8_t>& serial_b);
-    void clear();
 
 private:
-    static void append_bytes(
-        QPlainTextEdit* editor,
-        bool& previous_was_carriage_return,
-        const std::vector<std::uint8_t>& bytes);
+    void send_serial(SerialPortDto port, const std::vector<std::uint8_t>& bytes) const;
 
-    QPlainTextEdit* serial_a_;
-    QPlainTextEdit* serial_b_;
-    bool serial_a_was_carriage_return_;
-    bool serial_b_was_carriage_return_;
+    const UiSession& session_;
+    StatusHandler status_handler_;
+    Vt100Widget* serial_a_;
+    Vt100Widget* serial_b_;
 };
 
 class MachineOutputSink final : public std::enable_shared_from_this<MachineOutputSink> {

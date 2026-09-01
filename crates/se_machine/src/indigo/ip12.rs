@@ -23,6 +23,7 @@ use se_device::z85230::Z85230;
 use se_float::backend::Backend;
 
 use crate::output::MachineOutput;
+use crate::serial::SerialPort;
 
 use self::bus::Ip12Bus;
 use self::prom::normalize_u56_prom;
@@ -122,8 +123,20 @@ impl Ip12 {
         self.bus.advance_time(elapsed, output);
     }
 
+    /// Supplies host bytes to one external serial receiver.
+    ///
+    /// Returns the number of bytes consumed by the machine.
+    pub fn receive_serial(&mut self, port: SerialPort, bytes: &[u8]) -> usize {
+        let consumed = self.bus.receive_serial(port, bytes);
+        self.update_interrupt_lines();
+        consumed
+    }
+
     fn update_interrupt_lines(&mut self) {
         let mut interrupt_lines = u8::from(self.cpu.cp1_interrupt_asserted());
+        if self.bus.local_interrupt_0_asserted() {
+            interrupt_lines |= 1 << 1;
+        }
         if self.bus.error_interrupt_asserted() {
             interrupt_lines |= 1 << 5;
         }
@@ -154,6 +167,7 @@ mod tests {
     use std::env;
     use std::fs;
 
+    use crate::serial::SerialPort;
     use se_core::bus::{PhysAddr, PhysicalBus};
     use se_float::backend::Backend;
 
@@ -352,6 +366,31 @@ mod tests {
         machine.execute_instruction().unwrap();
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 10),
+            0
+        );
+    }
+
+    #[test]
+    fn serial_receive_interrupt_drives_cpu_interrupt_input_one() {
+        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat).unwrap();
+        for (register, value) in [(3, 1), (1, 0x10), (9, 1 << 3)] {
+            machine
+                .bus
+                .write(PhysAddr::new(0x1fb8_0d1b), &[register])
+                .unwrap();
+            machine
+                .bus
+                .write(PhysAddr::new(0x1fb8_0d1b), &[value])
+                .unwrap();
+        }
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fb8_01c7), &[1 << 5])
+            .unwrap();
+
+        assert_eq!(machine.receive_serial(SerialPort::A, b"A"), 1);
+        assert_ne!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 11),
             0
         );
     }

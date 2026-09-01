@@ -164,7 +164,10 @@ void MainWindow::create_docks() {
     tlb_dock_ = new TlbDock(session_, this);
     cache_dock_ = new CacheDock(session_, this);
     memory_dock_ = new MemoryDock(session_, this);
-    serial_console_dock_ = new SerialConsoleDock(this);
+    serial_console_dock_ = new SerialConsoleDock(
+        session_,
+        [this](const RuntimeStatusDto& status) { apply_runtime_status(status, false); },
+        this);
 }
 
 void MainWindow::create_menus() {
@@ -226,6 +229,7 @@ void MainWindow::set_default_dock_layout() {
     tabifyDockWidget(registers_dock_, cache_dock_);
     addDockWidget(Qt::BottomDockWidgetArea, memory_dock_);
     addDockWidget(Qt::BottomDockWidgetArea, serial_console_dock_);
+    resizeDocks({serial_console_dock_}, {480}, Qt::Vertical);
 
     disassembly_dock_->hide();
     registers_dock_->hide();
@@ -274,7 +278,6 @@ void MainWindow::show_settings() {
     cache_dock_->clear();
     disassembly_dock_->clear();
     memory_dock_->clear();
-    serial_console_dock_->clear();
     apply_runtime_status(status, false);
     refresh_debuggers();
 }
@@ -301,13 +304,11 @@ void MainWindow::refresh_debuggers() {
 
 void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool report_error) {
     if (!status.success) {
-        run_action_->setEnabled(false);
-        reset_action_->setEnabled(false);
-        pause_action_->setEnabled(false);
-        step_action_->setEnabled(false);
+        const auto command_error = from_rust_string(status.command_error);
+        statusBar()->showMessage(QStringLiteral("Error: %1").arg(command_error), 5000);
         if (report_error) {
             QMessageBox::warning(
-                this, QStringLiteral("Machine command"), from_rust_string(status.command_error));
+                this, QStringLiteral("Machine command"), command_error);
         }
         return;
     }
