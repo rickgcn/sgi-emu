@@ -321,6 +321,7 @@ struct Worker {
     pending_serial: [VecDeque<u8>; 2],
     state: RuntimeState,
     revision: u64,
+    completed_instructions: u64,
     last_error: Option<String>,
     breakpoints: BTreeSet<u32>,
     ignore_breakpoint_once: Option<u32>,
@@ -345,6 +346,7 @@ impl Worker {
             pending_serial: [VecDeque::new(), VecDeque::new()],
             state,
             revision: 0,
+            completed_instructions: 0,
             last_error: None,
             breakpoints: BTreeSet::new(),
             ignore_breakpoint_once: None,
@@ -549,6 +551,7 @@ impl Worker {
             .expect("a timed instruction requires a configured machine")
             .advance_time(elapsed, &mut self.machine_output);
         self.deliver_output();
+        self.completed_instructions = self.completed_instructions.wrapping_add(1);
         Ok(())
     }
 
@@ -586,6 +589,7 @@ impl Worker {
         RuntimeStatus {
             state: self.state,
             revision: self.revision,
+            completed_instructions: self.completed_instructions,
             last_error: self.last_error.clone(),
         }
     }
@@ -812,18 +816,20 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
     #[test]
     fn reset_and_successful_configuration_discard_pending_serial_input() {
         let mut worker = super::Worker::new(Some(machine_with_instructions(&[0])));
+        worker.execute_timed_instruction().unwrap();
         worker.pending_serial[0].extend(b"first");
         worker.pending_serial[1].extend(b"second");
 
         let (reset_reply, reset_response) = mpsc::channel();
         assert!(!worker.handle_command(super::Command::Reset(reset_reply)));
-        reset_response.recv().unwrap().unwrap();
+        let reset_status = reset_response.recv().unwrap().unwrap();
         assert!(
             worker
                 .pending_serial
                 .iter()
                 .all(|pending| pending.is_empty())
         );
+        assert_eq!(reset_status.completed_instructions, 1);
 
         worker.pending_serial[0].extend(b"third");
         let (configure_reply, configure_response) = mpsc::channel();
@@ -831,13 +837,14 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             machine: Box::new(machine_with_instructions(&[0])),
             reply: configure_reply,
         }));
-        configure_response.recv().unwrap().unwrap();
+        let configure_status = configure_response.recv().unwrap().unwrap();
         assert!(
             worker
                 .pending_serial
                 .iter()
                 .all(|pending| pending.is_empty())
         );
+        assert_eq!(configure_status.completed_instructions, 1);
     }
 
     #[test]
@@ -873,6 +880,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
                 worker.virtual_instant.as_attoseconds(),
                 ATTOSECONDS_PER_SECOND / 33_000_000
             );
+            assert_eq!(worker.completed_instructions, 1);
         }
     }
 
@@ -889,10 +897,22 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             worker.execute_timed_instruction().unwrap();
         }
         let before = worker.virtual_instant;
+        let completed_before = worker.completed_instructions;
 
         assert!(worker.execute_timed_instruction().is_err());
 
         assert_eq!(worker.virtual_instant, before);
+        assert_eq!(worker.completed_instructions, completed_before);
+    }
+
+    #[test]
+    fn completed_instruction_counter_wraps() {
+        let mut worker = super::Worker::new(Some(machine_with_instructions(&[0])));
+        worker.completed_instructions = u64::MAX;
+
+        worker.execute_timed_instruction().unwrap();
+
+        assert_eq!(worker.completed_instructions, 0);
     }
 
     #[test]

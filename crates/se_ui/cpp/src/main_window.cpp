@@ -71,8 +71,11 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , serial_console_dock_(nullptr)
     , machine_output_sink_()
     , update_timer_(new QTimer(this))
+    , performance_timer_()
+    , performance_instruction_baseline_(0)
     , machine_status_(new QLabel(this))
     , execution_error_status_(new QLabel(this))
+    , performance_status_(new QLabel(this))
     , runtime_status_(new QLabel(this)) {
     setObjectName(QStringLiteral("MainWindow"));
     setWindowTitle(QStringLiteral("sgi-emu"));
@@ -208,8 +211,10 @@ void MainWindow::create_status_bar() {
     execution_error_status_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     statusBar()->addWidget(machine_status_);
     statusBar()->addWidget(execution_error_status_, 1);
+    statusBar()->addPermanentWidget(performance_status_);
     statusBar()->addPermanentWidget(runtime_status_);
     execution_error_status_->hide();
+    performance_status_->setText(QStringLiteral("IPS: \u2014"));
     runtime_status_->setText(QStringLiteral("State: Unconfigured"));
     update_machine_status();
 }
@@ -286,7 +291,8 @@ void MainWindow::show_settings() {
 }
 
 void MainWindow::update_runtime() {
-    apply_runtime_status(session_.runtime_status(), false);
+    const auto status = session_.runtime_status();
+    apply_runtime_status(status, false);
     refresh_debuggers();
 }
 
@@ -319,6 +325,8 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
         return;
     }
 
+    update_performance_status(status);
+
     const bool configured = status.state != 0;
     const bool paused = status.state == 1;
     const bool running = status.state == 2;
@@ -340,6 +348,40 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
     } else {
         runtime_status_->setText(QStringLiteral("State: Unconfigured"));
     }
+}
+
+void MainWindow::update_performance_status(const RuntimeStatusDto& status) {
+    if (status.state != 2) {
+        performance_timer_.invalidate();
+        performance_status_->setText(QStringLiteral("IPS: \u2014"));
+        return;
+    }
+
+    if (!performance_timer_.isValid()) {
+        performance_instruction_baseline_ = status.completed_instructions;
+        performance_timer_.start();
+        return;
+    }
+
+    const auto elapsed_milliseconds = performance_timer_.elapsed();
+    if (elapsed_milliseconds < 1000) {
+        return;
+    }
+
+    const auto completed = status.completed_instructions - performance_instruction_baseline_;
+    const auto instructions_per_second = static_cast<double>(completed) * 1000.0
+        / static_cast<double>(elapsed_milliseconds);
+    QString formatted_rate;
+    if (instructions_per_second >= 1'000'000.0) {
+        formatted_rate = QStringLiteral("%1M").arg(instructions_per_second / 1'000'000.0, 0, 'f', 2);
+    } else if (instructions_per_second >= 1'000.0) {
+        formatted_rate = QStringLiteral("%1K").arg(instructions_per_second / 1'000.0, 0, 'f', 1);
+    } else {
+        formatted_rate = QString::number(instructions_per_second, 'f', 0);
+    }
+    performance_status_->setText(QStringLiteral("IPS: %1").arg(formatted_rate));
+    performance_instruction_baseline_ = status.completed_instructions;
+    performance_timer_.restart();
 }
 
 void MainWindow::update_machine_status() {

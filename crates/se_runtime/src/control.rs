@@ -18,6 +18,8 @@ pub struct RuntimeStatus {
     pub state: RuntimeState,
     /// Monotonic debugger-visible state revision.
     pub revision: u64,
+    /// Instructions completed during this runtime's lifetime.
+    pub completed_instructions: u64,
     /// Most recent execution error, when present.
     pub last_error: Option<String>,
 }

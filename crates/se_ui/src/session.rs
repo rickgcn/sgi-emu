@@ -371,6 +371,7 @@ fn status_dto(status: RuntimeStatus) -> RuntimeStatusDto {
         success: true,
         state: state_identifier(status.state),
         revision: status.revision,
+        completed_instructions: status.completed_instructions,
         execution_error: status.last_error.unwrap_or_default(),
         command_error: String::new(),
     }
@@ -389,6 +390,7 @@ fn failed_status(error: String) -> RuntimeStatusDto {
         success: false,
         state: 0,
         revision: 0,
+        completed_instructions: 0,
         execution_error: String::new(),
         command_error: error,
     }

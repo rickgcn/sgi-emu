@@ -2,8 +2,10 @@
 
 #include "se_ui/settings_dialog.h"
 
+#include <QElapsedTimer>
 #include <QMainWindow>
 
+#include <cstdint>
 #include <memory>
 
 class QAction;
@@ -45,6 +47,7 @@ private:
     void update_runtime();
     void refresh_debuggers();
     void apply_runtime_status(const RuntimeStatusDto& status, bool report_error);
+    void update_performance_status(const RuntimeStatusDto& status);
     void update_machine_status();
 
     const UiSession& session_;
@@ -64,8 +67,11 @@ private:
     SerialConsoleDock* serial_console_dock_;
     std::shared_ptr<MachineOutputSink> machine_output_sink_;
     QTimer* update_timer_;
+    QElapsedTimer performance_timer_;
+    std::uint64_t performance_instruction_baseline_;
     QLabel* machine_status_;
     QLabel* execution_error_status_;
+    QLabel* performance_status_;
     QLabel* runtime_status_;
 };
 

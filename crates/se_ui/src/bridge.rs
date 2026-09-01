@@ -103,6 +103,8 @@ pub mod ffi {
         pub state: u8,
         /// Debugger-visible revision.
         pub revision: u64,
+        /// Instructions completed during the runtime's lifetime.
+        pub completed_instructions: u64,
         /// Most recent execution error.
         pub execution_error: String,
         /// Command error when `success` is false.
