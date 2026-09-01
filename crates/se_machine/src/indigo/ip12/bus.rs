@@ -1,4 +1,5 @@
 use se_core::bus::{BusFault, DeviceAddr, PhysAddr, PhysicalBus};
+use se_core::time::VirtualDuration;
 use se_device::dp8573a::Dp8573a;
 use se_device::dsp56001::Dsp56001;
 use se_device::hpc1::Hpc1;
@@ -9,7 +10,9 @@ use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
 use se_device::wd33c93b::Wd33c93b;
-use se_device::z85230::Z85230;
+use se_device::z85230::{Channel, Z85230};
+
+use crate::output::{MachineOutput, SerialPort};
 
 use super::PROM_BYTES;
 
@@ -22,6 +25,8 @@ const PIC1_BASE: u64 = 0x1fa0_0000;
 const PIC1_END: u64 = 0x1fab_0000;
 
 const HPC1_BASE: u64 = 0x1fb8_0000;
+const HPC1_ETHERNET_STATUS_BASE: u64 = 0x1fb8_0034;
+const HPC1_ETHERNET_STATUS_END: u64 = 0x1fb8_0040;
 const HPC1_ETHERNET_POINTER_BASE: u64 = 0x1fb8_0058;
 const HPC1_ETHERNET_POINTER_END: u64 = 0x1fb8_005c;
 const HPC1_ETHERNET_FIFO_BASE: u64 = 0x1fb8_005c;
@@ -128,6 +133,18 @@ impl Ip12Bus {
         self.pic1.error_interrupt_asserted()
     }
 
+    pub(super) fn advance_time(&mut self, elapsed: VirtualDuration, output: &mut MachineOutput) {
+        self.int2.advance_time(elapsed);
+        self.serial[0].advance_time(elapsed, |_, _| {});
+        self.serial[1].advance_time(elapsed, |channel, value| {
+            let port = match channel {
+                Channel::A => SerialPort::A,
+                Channel::B => SerialPort::B,
+            };
+            output.push_serial(port, value);
+        });
+    }
+
     pub(super) fn debug_read(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
         if address.get() < LOCAL_MEMORY_END {
             return self.read_memory(address, data);
@@ -138,7 +155,7 @@ impl Ip12Bus {
             Target::Hpc1(address) => self.hpc1.read(address, data),
             Target::Scsi(address) => self.scsi.debug_read(address, data),
             Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),
-            Target::Int2(address) => self.int2.read(address, data),
+            Target::Int2(address) => self.int2.debug_read(address, data),
             Target::Serial(index, address) => self.serial[index].debug_read(address, data),
             Target::UnpopulatedSerial(_) => Err(BusFault::Unmapped),
             Target::Mdac(address) => self.mdac.read(address, data),
@@ -297,6 +314,7 @@ fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault> {
     }
 
     for (range_start, range_end) in [
+        (HPC1_ETHERNET_STATUS_BASE, HPC1_ETHERNET_STATUS_END),
         (HPC1_ETHERNET_POINTER_BASE, HPC1_ETHERNET_POINTER_END),
         (HPC1_ETHERNET_FIFO_BASE, HPC1_ETHERNET_FIFO_END),
         (HPC1_SCSI_CONTROL_BASE, HPC1_SCSI_CONTROL_END),
@@ -455,6 +473,7 @@ const fn overlaps(start: u64, end: u64, range_start: u64, range_end: u64) -> boo
 #[cfg(test)]
 mod tests {
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
     use se_device::dp8573a::Dp8573a;
     use se_device::dsp56001::Dsp56001;
     use se_device::hpc1::Hpc1;
@@ -466,6 +485,8 @@ mod tests {
     use se_device::rom::Rom;
     use se_device::wd33c93b::Wd33c93b;
     use se_device::z85230::Z85230;
+
+    use crate::output::{MachineOutput, SerialPort};
 
     use super::{
         BOARD_REVISION_BASE, CPU_AUX_CONTROL, DSP56001_BASE, DSP56001_END, GIO_BASE, GIO_END,
@@ -487,7 +508,7 @@ mod tests {
             Hpc1::new(),
             Int2::new(),
             Wd33c93b::new(),
-            [Z85230::new(), Z85230::new()],
+            [Z85230::new(3_686_400), Z85230::new(3_686_400)],
             Dp8573a::new(),
             Mdac::new(),
             Nmc93cs46::new(),
@@ -519,6 +540,17 @@ mod tests {
             &configuration_1.to_be_bytes(),
         )
         .unwrap();
+    }
+
+    fn write_serial_register(bus: &mut Ip12Bus, base: u64, control: u8, value: u8) {
+        bus.write(PhysAddr::new(base + 0x0b), &[control]).unwrap();
+        bus.write(PhysAddr::new(base + 0x0b), &[value]).unwrap();
+    }
+
+    fn configure_serial_a(bus: &mut Ip12Bus, base: u64) {
+        for (register, value) in [(4, 0x44), (11, 0x10), (12, 10), (13, 0), (14, 1), (5, 0x68)] {
+            write_serial_register(bus, base, register, value);
+        }
     }
 
     fn nvram_clock_bit(bus: &mut Ip12Bus, bit: bool) -> bool {
@@ -725,6 +757,28 @@ mod tests {
         bus.write(PhysAddr::new(MDAC_BASE), &[0x5a]).unwrap();
         bus.write(PhysAddr::new(RTC_BASE + 0x57), &[0xa5]).unwrap();
         assert_eq!(read_byte(&mut bus, RTC_BASE + 0x57), Ok(0xa5));
+    }
+
+    #[test]
+    fn only_the_second_serial_controller_reaches_external_machine_output() {
+        let mut bus = bus();
+        configure_serial_a(&mut bus, SERIAL_0_BASE);
+        configure_serial_a(&mut bus, SERIAL_1_BASE);
+        bus.write(PhysAddr::new(SERIAL_0_BASE + 0x0f), &[0x11])
+            .unwrap();
+        bus.write(PhysAddr::new(SERIAL_1_BASE + 0x0f), &[0x22])
+            .unwrap();
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND / 960 - 1),
+            &mut output,
+        );
+        assert!(output.is_empty());
+        bus.advance_time(VirtualDuration::from_attoseconds(1), &mut output);
+
+        assert_eq!(output.serial(SerialPort::A), [0x22]);
+        assert!(output.serial(SerialPort::B).is_empty());
     }
 
     #[test]

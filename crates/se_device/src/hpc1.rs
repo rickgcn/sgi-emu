@@ -2,6 +2,9 @@
 
 use se_core::bus::{BusFault, DeviceAddr};
 
+const ETHERNET_TRANSMIT_STATUS: u64 = 0x0034;
+const ETHERNET_RECEIVE_STATUS: u64 = 0x0038;
+const ETHERNET_RESET: u64 = 0x003c;
 const ETHERNET_RECEIVE_POINTER: u64 = 0x0058;
 const ETHERNET_RECEIVE_FIFO: u64 = 0x005c;
 const SCSI_CONTROL: u64 = 0x0094;
@@ -13,9 +16,16 @@ const REVISION: u8 = 0x40;
 const WRITABLE_ENDIAN_BITS: u8 = 0x1f;
 const WRITABLE_SCSI_BITS: u8 = 0x93;
 const SCSI_RESET: u8 = 0x01;
+const ETHERNET_RESET_CHANNEL: u32 = 0x01;
+const ETHERNET_TRANSMIT_STATUS_BITS: u32 = 0x00ff_0000;
+const ETHERNET_RECEIVE_STATUS_BITS: u32 = 0x0000_ff00;
+const ETHERNET_CONTROL_BITS: u32 = 0x0f;
 
 /// The software-visible HPC1.5 state used by the IP12 machine.
 pub struct Hpc1 {
+    ethernet_transmit_status: u32,
+    ethernet_receive_status: u32,
+    ethernet_control: u32,
     ethernet_receive_pointer: u8,
     scsi_control: u8,
     endian_control: u8,
@@ -32,6 +42,9 @@ impl Hpc1 {
     )]
     pub const fn new() -> Self {
         Self {
+            ethernet_transmit_status: 0,
+            ethernet_receive_status: 0,
+            ethernet_control: 0,
             ethernet_receive_pointer: 0,
             scsi_control: 0,
             endian_control: REVISION,
@@ -42,6 +55,9 @@ impl Hpc1 {
 
     /// Restores the mutable HPC1.5 reset state.
     pub fn reset(&mut self) {
+        self.ethernet_transmit_status = 0;
+        self.ethernet_receive_status = 0;
+        self.ethernet_control = 0;
         self.ethernet_receive_pointer = 0;
         self.scsi_control = 0;
         self.endian_control = REVISION;
@@ -58,7 +74,13 @@ impl Hpc1 {
     pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
-        if start == ETHERNET_RECEIVE_POINTER + 3 && end == start + 1 {
+        if let Some(offset) = register_offset(start, end, ETHERNET_TRANSMIT_STATUS) {
+            read_register(self.ethernet_transmit_status, offset, data);
+        } else if let Some(offset) = register_offset(start, end, ETHERNET_RECEIVE_STATUS) {
+            read_register(self.ethernet_receive_status, offset, data);
+        } else if let Some(offset) = register_offset(start, end, ETHERNET_RESET) {
+            read_register(self.ethernet_control, offset, data);
+        } else if start == ETHERNET_RECEIVE_POINTER + 3 && end == start + 1 {
             data[0] = self.ethernet_receive_pointer;
         } else if start == ETHERNET_RECEIVE_FIFO + 3 && end == start + 1 {
             data[0] = 0;
@@ -89,7 +111,20 @@ impl Hpc1 {
     pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
-        if start == ETHERNET_RECEIVE_POINTER + 3 && end == start + 1 {
+        if let Some(offset) = register_offset(start, end, ETHERNET_TRANSMIT_STATUS) {
+            let value = write_register(self.ethernet_transmit_status, offset, data);
+            self.ethernet_transmit_status = value & ETHERNET_TRANSMIT_STATUS_BITS;
+        } else if let Some(offset) = register_offset(start, end, ETHERNET_RECEIVE_STATUS) {
+            let value = write_register(self.ethernet_receive_status, offset, data);
+            self.ethernet_receive_status = value & ETHERNET_RECEIVE_STATUS_BITS;
+        } else if let Some(offset) = register_offset(start, end, ETHERNET_RESET) {
+            let value = write_register(self.ethernet_control, offset, data);
+            self.ethernet_control = value & ETHERNET_CONTROL_BITS;
+            if self.ethernet_control & ETHERNET_RESET_CHANNEL != 0 {
+                self.ethernet_transmit_status = 0;
+                self.ethernet_receive_status = 0;
+            }
+        } else if start == ETHERNET_RECEIVE_POINTER + 3 && end == start + 1 {
             self.ethernet_receive_pointer = data[0];
         } else if contains_register(start, end, ETHERNET_RECEIVE_FIFO) {
             return Err(BusFault::UnsupportedAccess);
@@ -162,8 +197,8 @@ mod tests {
     use se_core::bus::{BusFault, DeviceAddr};
 
     use super::{
-        ENDIAN_CONTROL, ETHERNET_RECEIVE_FIFO, ETHERNET_RECEIVE_POINTER, Hpc1,
-        MISCELLANEOUS_CONTROL, SCSI_CONTROL,
+        ENDIAN_CONTROL, ETHERNET_RECEIVE_FIFO, ETHERNET_RECEIVE_POINTER, ETHERNET_RECEIVE_STATUS,
+        ETHERNET_RESET, ETHERNET_TRANSMIT_STATUS, Hpc1, MISCELLANEOUS_CONTROL, SCSI_CONTROL,
     };
 
     fn read_word(hpc1: &Hpc1, address: u64) -> Result<u32, BusFault> {
@@ -232,6 +267,34 @@ mod tests {
             hpc1.write(DeviceAddr::new(ETHERNET_RECEIVE_FIFO + 3), &[1]),
             Err(BusFault::UnsupportedAccess)
         );
+    }
+
+    #[test]
+    fn ethernet_status_and_reset_use_the_documented_word_lanes() {
+        let mut hpc1 = Hpc1::new();
+
+        hpc1.write(
+            DeviceAddr::new(ETHERNET_TRANSMIT_STATUS),
+            &0xffff_ffff_u32.to_be_bytes(),
+        )
+        .unwrap();
+        hpc1.write(
+            DeviceAddr::new(ETHERNET_RECEIVE_STATUS),
+            &0xffff_ffff_u32.to_be_bytes(),
+        )
+        .unwrap();
+        assert_eq!(read_word(&hpc1, ETHERNET_TRANSMIT_STATUS), Ok(0x00ff_0000));
+        assert_eq!(read_word(&hpc1, ETHERNET_RECEIVE_STATUS), Ok(0x0000_ff00));
+
+        hpc1.write(DeviceAddr::new(ETHERNET_RESET), &5_u32.to_be_bytes())
+            .unwrap();
+        assert_eq!(read_word(&hpc1, ETHERNET_TRANSMIT_STATUS), Ok(0));
+        assert_eq!(read_word(&hpc1, ETHERNET_RECEIVE_STATUS), Ok(0));
+        assert_eq!(read_word(&hpc1, ETHERNET_RESET), Ok(5));
+
+        hpc1.write(DeviceAddr::new(ETHERNET_RESET), &4_u32.to_be_bytes())
+            .unwrap();
+        assert_eq!(read_word(&hpc1, ETHERNET_RESET), Ok(4));
     }
 
     #[test]

@@ -8,12 +8,13 @@ use se_machine::indigo::ip12::debug::{
     DebugRequest as Ip12DebugRequest, DebugResponse as Ip12DebugResponse, MemoryAddressSpace,
 };
 use se_machine::machine::Machine;
+use se_machine::output::{MachineOutput, SerialPort};
 use se_runtime::control::{RuntimeState, RuntimeStatus};
 use se_runtime::runtime::{DebugReply, Runtime, RuntimeError, ShutdownError};
 
 use crate::bridge::ffi::{
-    CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MemoryDto, RegistersDto,
-    RuntimeStatusDto, TlbDto, TlbEntryDto, UiExitState, UiStartupState, run_gui,
+    CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineOutputSink, MemoryDto,
+    RegistersDto, RuntimeStatusDto, TlbDto, TlbEntryDto, UiExitState, UiStartupState, run_gui,
 };
 
 /// Constructs a machine from settings selected by a frontend.
@@ -86,6 +87,29 @@ impl UiSession {
     /// Executes one instruction while paused.
     pub fn step_machine(&self) -> RuntimeStatusDto {
         self.runtime_command(Runtime::step)
+    }
+
+    /// Connects runtime machine output to the Qt delivery sink.
+    pub fn attach_machine_output(
+        &self,
+        sink: cxx::SharedPtr<MachineOutputSink>,
+    ) -> RuntimeStatusDto {
+        if sink.is_null() {
+            return failed_status(String::from("machine output sink is unavailable"));
+        }
+
+        self.runtime_command(|runtime| {
+            runtime.set_output_handler(Box::new(move |output: MachineOutput| {
+                sink.publish_serial(output.serial(SerialPort::A), output.serial(SerialPort::B));
+            }))
+        })
+    }
+
+    /// Disconnects the Qt delivery sink from the runtime worker.
+    pub fn detach_machine_output(&self) {
+        if let Some(runtime) = self.runtime.as_ref() {
+            let _ = runtime.clear_output_handler();
+        }
     }
 
     /// Samples processor registers and pending effects.

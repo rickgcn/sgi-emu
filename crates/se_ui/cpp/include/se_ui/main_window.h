@@ -4,6 +4,8 @@
 
 #include <QMainWindow>
 
+#include <memory>
+
 class QAction;
 class QDockWidget;
 class QLabel;
@@ -20,11 +22,14 @@ class CacheDock;
 class DisassemblyDock;
 class MemoryDock;
 class RegistersDock;
+class MachineOutputSink;
+class SerialConsoleDock;
 class TlbDock;
 
 class MainWindow final : public QMainWindow {
 public:
     MainWindow(const UiSession& session, const UiStartupState& startup);
+    ~MainWindow() override;
 
     [[nodiscard]] UiExitState exit_state() const;
 
@@ -56,6 +61,8 @@ private:
     TlbDock* tlb_dock_;
     CacheDock* cache_dock_;
     MemoryDock* memory_dock_;
+    SerialConsoleDock* serial_console_dock_;
+    std::shared_ptr<MachineOutputSink> machine_output_sink_;
     QTimer* update_timer_;
     QLabel* machine_status_;
     QLabel* execution_error_status_;

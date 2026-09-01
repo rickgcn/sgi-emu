@@ -201,12 +201,30 @@ pub mod ffi {
             length: u32,
         ) -> MemoryDto;
         fn toggle_breakpoint(self: &UiSession, address: u32) -> RuntimeStatusDto;
+        fn attach_machine_output(
+            self: &UiSession,
+            sink: SharedPtr<MachineOutputSink>,
+        ) -> RuntimeStatusDto;
+        fn detach_machine_output(self: &UiSession);
     }
 
     unsafe extern "C++" {
         include!("se_ui/main_window.h");
+        include!("se_ui/serial_console_dock.h");
+
+        type MachineOutputSink;
+
+        fn publish_serial(self: &MachineOutputSink, serial_a: &[u8], serial_b: &[u8]);
 
         /// Runs the Qt event loop and returns the final user-interface state.
         fn run_gui(session: &UiSession, startup: &UiStartupState) -> UiExitState;
     }
 }
+
+// SAFETY: `MachineOutputSink::publish_serial` only mutates mutex-protected
+// buffers and schedules GUI work through a queued Qt invocation.
+unsafe impl Send for ffi::MachineOutputSink {}
+
+// SAFETY: all shared state in `MachineOutputSink` is protected by its mutex;
+// the referenced Qt widgets are accessed only by the queued GUI-thread drain.
+unsafe impl Sync for ffi::MachineOutputSink {}

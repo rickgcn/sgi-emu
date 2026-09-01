@@ -1,6 +1,7 @@
 //! Silicon Graphics INT2 interrupt and timer register front end.
 
 use se_core::bus::{BusFault, DeviceAddr};
+use se_core::time::VirtualDuration;
 
 const LOCAL_INTERRUPT_0_STATUS: u64 = 0x00;
 const LOCAL_INTERRUPT_0_MASK: u64 = 0x04;
@@ -16,6 +17,7 @@ const SYSTEM_TIMER_COUNTER_2: u64 = 0x3b;
 const SYSTEM_TIMER_CONTROL: u64 = 0x3f;
 const REGISTER_BYTES: u64 = 4;
 const OUTPUT_BITS: u8 = 0x1f;
+const ATTOSECONDS_PER_COUNTER_TICK: u128 = 1_000_000_000_000;
 
 /// The software-visible INT2 state used by the IP12 machine.
 pub struct Int2 {
@@ -28,6 +30,12 @@ pub struct Int2 {
     system_timer_counter_2_programming: [u8; 2],
     system_timer_counter_2_programming_length: usize,
     system_timer_control: u8,
+    system_timer_phase: u128,
+    system_timer_counter_2_reload: u32,
+    system_timer_counter_2_value: u32,
+    system_timer_counter_2_mode_2: bool,
+    system_timer_counter_2_latch: Option<u16>,
+    system_timer_counter_2_read_high: bool,
 }
 
 impl Int2 {
@@ -48,6 +56,12 @@ impl Int2 {
             system_timer_counter_2_programming: [0; 2],
             system_timer_counter_2_programming_length: 0,
             system_timer_control: 0,
+            system_timer_phase: 0,
+            system_timer_counter_2_reload: 0,
+            system_timer_counter_2_value: 0,
+            system_timer_counter_2_mode_2: false,
+            system_timer_counter_2_latch: None,
+            system_timer_counter_2_read_high: false,
         }
     }
 
@@ -62,6 +76,32 @@ impl Int2 {
         self.system_timer_counter_2_programming = [0; 2];
         self.system_timer_counter_2_programming_length = 0;
         self.system_timer_control = 0;
+        self.system_timer_phase = 0;
+        self.system_timer_counter_2_reload = 0;
+        self.system_timer_counter_2_value = 0;
+        self.system_timer_counter_2_mode_2 = false;
+        self.system_timer_counter_2_latch = None;
+        self.system_timer_counter_2_read_high = false;
+    }
+
+    /// Advances the one-megahertz system timer by guest virtual time.
+    pub fn advance_time(&mut self, elapsed: VirtualDuration) {
+        let total = self.system_timer_phase + elapsed.as_attoseconds();
+        let ticks = total / ATTOSECONDS_PER_COUNTER_TICK;
+        self.system_timer_phase = total % ATTOSECONDS_PER_COUNTER_TICK;
+
+        if !self.system_timer_counter_2_mode_2
+            || self.system_timer_counter_2_reload == 0
+            || ticks == 0
+        {
+            return;
+        }
+
+        let reload = u128::from(self.system_timer_counter_2_reload);
+        let current = u128::from(self.system_timer_counter_2_value);
+        let offset = (current - 1 + reload - ticks % reload) % reload;
+        self.system_timer_counter_2_value = u32::try_from(offset + 1)
+            .expect("counter 2 value must remain within its 16-bit period");
     }
 
     /// Reads one fixed-width device-local transaction.
@@ -70,7 +110,7 @@ impl Int2 {
     ///
     /// Returns [`BusFault`] when the complete transaction is not mapped or the
     /// requested width or direction is unsupported.
-    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
         if let Some((register, offset)) = decode_word_register(start, end) {
@@ -93,7 +133,47 @@ impl Int2 {
         }
 
         if start == SYSTEM_TIMER_COUNTER_2 && end == start + 1 {
-            data[0] = 0;
+            data[0] = self.read_system_timer_counter_2();
+            return Ok(());
+        }
+
+        if start == SYSTEM_TIMER_CONTROL {
+            return Err(BusFault::UnsupportedAccess);
+        }
+
+        Err(BusFault::Unmapped)
+    }
+
+    /// Reads one fixed-width transaction without changing timer read state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BusFault`] when the complete transaction is not mapped or the
+    /// requested width or direction is unsupported.
+    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        let (start, end) = transaction_bounds(address, data.len())?;
+
+        if let Some((register, offset)) = decode_word_register(start, end) {
+            let value = match register {
+                Register::LocalInterrupt0Status
+                | Register::LocalInterrupt1Status
+                | Register::VmeInterruptStatus => 0,
+                Register::LocalInterrupt0Mask => self.local_interrupt_masks[0],
+                Register::LocalInterrupt1Mask => self.local_interrupt_masks[1],
+                Register::VmeInterrupt0Mask => self.vme_interrupt_masks[0],
+                Register::VmeInterrupt1Mask => self.vme_interrupt_masks[1],
+                Register::OutputPort => self.output_port,
+            };
+            read_register(u32::from(value), offset, data);
+            return Ok(());
+        }
+
+        if start == TIMER_ACKNOWLEDGE || start == PROGRAMMABLE_TIMER_CLOCK {
+            return Err(BusFault::UnsupportedAccess);
+        }
+
+        if start == SYSTEM_TIMER_COUNTER_2 && end == start + 1 {
+            data[0] = self.peek_system_timer_counter_2();
             return Ok(());
         }
 
@@ -156,15 +236,41 @@ impl Int2 {
         }
 
         if start == SYSTEM_TIMER_COUNTER_2 && end == start + 1 {
-            self.system_timer_counter_2_programming.rotate_left(1);
-            self.system_timer_counter_2_programming[1] = data[0];
-            self.system_timer_counter_2_programming_length =
-                (self.system_timer_counter_2_programming_length + 1).min(2);
+            if self.system_timer_counter_2_programming_length == 1 {
+                self.system_timer_counter_2_programming[1] = data[0];
+                self.system_timer_counter_2_programming_length = 2;
+                let programmed = u16::from_le_bytes(self.system_timer_counter_2_programming);
+                self.system_timer_counter_2_reload = if programmed == 0 {
+                    1 << 16
+                } else {
+                    u32::from(programmed)
+                };
+                self.system_timer_counter_2_value = self.system_timer_counter_2_reload;
+                self.system_timer_counter_2_latch = None;
+                self.system_timer_counter_2_read_high = false;
+            } else {
+                self.system_timer_counter_2_programming[0] = data[0];
+                self.system_timer_counter_2_programming_length = 1;
+            }
             return Ok(());
         }
 
         if start == SYSTEM_TIMER_CONTROL && end == start + 1 {
             self.system_timer_control = data[0];
+            match data[0] {
+                0xb4 => {
+                    self.system_timer_counter_2_programming_length = 0;
+                    self.system_timer_counter_2_mode_2 = true;
+                    self.system_timer_counter_2_latch = None;
+                    self.system_timer_counter_2_read_high = false;
+                }
+                0x80 => {
+                    self.system_timer_counter_2_latch =
+                        Some((self.system_timer_counter_2_value & u32::from(u16::MAX)) as u16);
+                    self.system_timer_counter_2_read_high = false;
+                }
+                _ => {}
+            }
             return Ok(());
         }
 
@@ -177,6 +283,27 @@ impl Int2 {
         }
 
         Err(BusFault::Unmapped)
+    }
+
+    fn read_system_timer_counter_2(&mut self) -> u8 {
+        let value = self.peek_system_timer_counter_2();
+        if self.system_timer_counter_2_latch.is_some() {
+            if self.system_timer_counter_2_read_high {
+                self.system_timer_counter_2_latch = None;
+                self.system_timer_counter_2_read_high = false;
+            } else {
+                self.system_timer_counter_2_read_high = true;
+            }
+        }
+        value
+    }
+
+    fn peek_system_timer_counter_2(&self) -> u8 {
+        let Some(latch) = self.system_timer_counter_2_latch else {
+            return 0;
+        };
+        let bytes = latch.to_le_bytes();
+        bytes[usize::from(self.system_timer_counter_2_read_high)]
     }
 }
 
@@ -236,15 +363,16 @@ fn write_byte_register(register: &mut u8, offset: usize, data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::time::VirtualDuration;
 
     use super::{
-        Int2, LOCAL_INTERRUPT_0_MASK, LOCAL_INTERRUPT_0_STATUS, LOCAL_INTERRUPT_1_MASK,
-        LOCAL_INTERRUPT_1_STATUS, OUTPUT_PORT, PROGRAMMABLE_TIMER_CLOCK, SYSTEM_TIMER_CONTROL,
-        SYSTEM_TIMER_COUNTER_2, TIMER_ACKNOWLEDGE, VME_INTERRUPT_0_MASK, VME_INTERRUPT_1_MASK,
-        VME_INTERRUPT_STATUS,
+        ATTOSECONDS_PER_COUNTER_TICK, Int2, LOCAL_INTERRUPT_0_MASK, LOCAL_INTERRUPT_0_STATUS,
+        LOCAL_INTERRUPT_1_MASK, LOCAL_INTERRUPT_1_STATUS, OUTPUT_PORT, PROGRAMMABLE_TIMER_CLOCK,
+        SYSTEM_TIMER_CONTROL, SYSTEM_TIMER_COUNTER_2, TIMER_ACKNOWLEDGE, VME_INTERRUPT_0_MASK,
+        VME_INTERRUPT_1_MASK, VME_INTERRUPT_STATUS,
     };
 
-    fn read_word(int2: &Int2, address: u64) -> Result<u32, BusFault> {
+    fn read_word(int2: &mut Int2, address: u64) -> Result<u32, BusFault> {
         let mut bytes = [0; 4];
         int2.read(DeviceAddr::new(address), &mut bytes)?;
         Ok(u32::from_be_bytes(bytes))
@@ -252,7 +380,7 @@ mod tests {
 
     #[test]
     fn reset_values_are_inactive() {
-        let int2 = Int2::new();
+        let mut int2 = Int2::new();
 
         for address in [
             LOCAL_INTERRUPT_0_STATUS,
@@ -264,7 +392,7 @@ mod tests {
             VME_INTERRUPT_1_MASK,
             OUTPUT_PORT,
         ] {
-            assert_eq!(read_word(&int2, address), Ok(0));
+            assert_eq!(read_word(&mut int2, address), Ok(0));
         }
         assert_eq!(int2.timer_pending, [false; 2]);
     }
@@ -280,7 +408,7 @@ mod tests {
             (VME_INTERRUPT_1_MASK, 0xc3),
         ] {
             int2.write(DeviceAddr::new(address + 3), &[value]).unwrap();
-            assert_eq!(read_word(&int2, address), Ok(u32::from(value)));
+            assert_eq!(read_word(&mut int2, address), Ok(u32::from(value)));
         }
     }
 
@@ -297,7 +425,7 @@ mod tests {
                 int2.write(DeviceAddr::new(address), &[0; 4]),
                 Err(BusFault::UnsupportedAccess)
             );
-            assert_eq!(read_word(&int2, address), Ok(0));
+            assert_eq!(read_word(&mut int2, address), Ok(0));
         }
     }
 
@@ -308,7 +436,7 @@ mod tests {
         int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0xf6])
             .unwrap();
 
-        assert_eq!(read_word(&int2, OUTPUT_PORT), Ok(0x16));
+        assert_eq!(read_word(&mut int2, OUTPUT_PORT), Ok(0x16));
     }
 
     #[test]
@@ -343,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_system_timer_accepts_calibration_and_reads_as_expired() {
+    fn system_timer_counts_and_returns_a_stable_latch() {
         let mut int2 = Int2::new();
 
         int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0xb4])
@@ -352,8 +480,16 @@ mod tests {
             .unwrap();
         int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[0x27])
             .unwrap();
+        int2.advance_time(VirtualDuration::from_attoseconds(123_456_789));
+        assert_eq!(int2.system_timer_phase, 123_456_789);
+        int2.advance_time(VirtualDuration::from_attoseconds(
+            2_345 * ATTOSECONDS_PER_COUNTER_TICK - 123_456_789,
+        ));
         int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0x80])
             .unwrap();
+        int2.advance_time(VirtualDuration::from_attoseconds(
+            10 * ATTOSECONDS_PER_COUNTER_TICK,
+        ));
 
         let mut low = [0xff];
         let mut high = [0xff];
@@ -365,10 +501,35 @@ mod tests {
             int2.read(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &mut high),
             Ok(())
         );
-        assert_eq!([low[0], high[0]], [0; 2]);
+        assert_eq!(u16::from_le_bytes([low[0], high[0]]), 7_655);
         assert_eq!(int2.system_timer_counter_2_programming, [0x10, 0x27]);
         assert_eq!(int2.system_timer_counter_2_programming_length, 2);
         assert_eq!(int2.system_timer_control, 0x80);
+        assert_eq!(int2.system_timer_counter_2_latch, None);
+        assert_eq!(int2.system_timer_counter_2_value, 7_645);
+    }
+
+    #[test]
+    fn debug_read_does_not_consume_the_latched_byte_order() {
+        let mut int2 = Int2::new();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0xb4])
+            .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[0x34])
+            .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[0x12])
+            .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0x80])
+            .unwrap();
+        let mut debug = [0];
+
+        int2.debug_read(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &mut debug)
+            .unwrap();
+        assert_eq!(debug, [0x34]);
+
+        let mut low = [0];
+        int2.read(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &mut low)
+            .unwrap();
+        assert_eq!(low, [0x34]);
     }
 
     #[test]
@@ -390,13 +551,14 @@ mod tests {
 
         int2.reset();
 
-        assert_eq!(read_word(&int2, LOCAL_INTERRUPT_0_MASK), Ok(0));
-        assert_eq!(read_word(&int2, VME_INTERRUPT_1_MASK), Ok(0));
-        assert_eq!(read_word(&int2, OUTPUT_PORT), Ok(0));
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_MASK), Ok(0));
+        assert_eq!(read_word(&mut int2, VME_INTERRUPT_1_MASK), Ok(0));
+        assert_eq!(read_word(&mut int2, OUTPUT_PORT), Ok(0));
         assert_eq!(int2.timer_pending, [false; 2]);
         assert_eq!(int2.timer_programming_length, 0);
         assert_eq!(int2.system_timer_counter_2_programming_length, 0);
         assert_eq!(int2.system_timer_control, 0);
+        assert_eq!(int2.system_timer_phase, 0);
     }
 
     #[test]
@@ -417,6 +579,6 @@ mod tests {
             int2.read(DeviceAddr::new(0x24), &mut [0]),
             Err(BusFault::Unmapped)
         );
-        assert_eq!(read_word(&int2, LOCAL_INTERRUPT_0_MASK), Ok(0x5a));
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_MASK), Ok(0x5a));
     }
 }

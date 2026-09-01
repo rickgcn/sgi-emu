@@ -1093,7 +1093,7 @@ mod tests {
 
     #[test]
     fn configuration_selects_and_reset_preserves_the_backend() {
-        let config = R3000Config::new(4 * 1024, 4 * 1024, 4, 4, true, Backend::Native);
+        let config = R3000Config::new(1, 4 * 1024, 4 * 1024, 4, 4, true, Backend::Native);
         let mut state = State::new(config);
         state.cp1_mut().write_general_register(5, 0x1234_5678);
         state.cp1_mut().write_control_register(30, 0x89ab_cdef);
@@ -1991,7 +1991,7 @@ mod tests {
 
     #[test]
     fn native_backend_executes_finite_values_and_keeps_r3010_prechecks() {
-        let config = R3000Config::new(4 * 1024, 4 * 1024, 4, 4, true, Backend::Native);
+        let config = R3000Config::new(1, 4 * 1024, 4 * 1024, 4, 4, true, Backend::Native);
         let mut state = State::new(config);
         state.complete_instruction(
             None,

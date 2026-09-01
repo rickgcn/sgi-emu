@@ -368,6 +368,7 @@ name = "se_runtime"
 version = "0.1.0"
 dependencies = [
  "se_core",
+ "se_float",
  "se_machine",
 ]
 

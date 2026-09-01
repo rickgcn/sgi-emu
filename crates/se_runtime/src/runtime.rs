@@ -4,11 +4,14 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::mem;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 
+use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration, VirtualInstant};
 use se_machine::debug::{DebugRequest, DebugResponse};
-use se_machine::machine::Machine;
+use se_machine::machine::{ExecutionError, Machine};
+use se_machine::output::MachineOutput;
 
 use crate::control::{RuntimeState, RuntimeStatus};
 
@@ -34,6 +37,11 @@ enum Command {
         request: DebugRequest,
         reply: CommandReply<DebugReply>,
     },
+    SetOutputHandler {
+        handler: Box<dyn FnMut(MachineOutput) + Send + 'static>,
+        reply: CommandReply<RuntimeStatus>,
+    },
+    ClearOutputHandler(CommandReply<RuntimeStatus>),
     Shutdown,
 }
 
@@ -195,6 +203,29 @@ impl Runtime {
         self.request(|reply| Command::Debug { request, reply })
     }
 
+    /// Installs the frontend-neutral machine-output handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] when the worker is unavailable.
+    pub fn set_output_handler(
+        &self,
+        handler: Box<dyn FnMut(MachineOutput) + Send + 'static>,
+    ) -> Result<RuntimeStatus, RuntimeError> {
+        self.request(|reply| Command::SetOutputHandler { handler, reply })
+    }
+
+    /// Removes the current machine-output handler.
+    ///
+    /// Once this method returns, the removed handler cannot be called again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] when the worker is unavailable.
+    pub fn clear_output_handler(&self) -> Result<RuntimeStatus, RuntimeError> {
+        self.request(Command::ClearOutputHandler)
+    }
+
     /// Requests shutdown and waits for the worker to exit.
     pub fn shutdown(mut self) -> Result<(), ShutdownError> {
         self.shutdown_inner()
@@ -239,6 +270,10 @@ impl Drop for Runtime {
 
 struct Worker {
     machine: Option<Machine>,
+    cpu_clock: Option<CpuClock>,
+    virtual_instant: VirtualInstant,
+    machine_output: MachineOutput,
+    output_handler: Option<Box<dyn FnMut(MachineOutput) + Send + 'static>>,
     state: RuntimeState,
     revision: u64,
     last_error: Option<String>,
@@ -253,8 +288,15 @@ impl Worker {
         } else {
             RuntimeState::Unconfigured
         };
+        let cpu_clock = machine
+            .as_ref()
+            .map(|machine| CpuClock::new(machine.cpu_frequency_hz()));
         Self {
             machine,
+            cpu_clock,
+            virtual_instant: VirtualInstant::ZERO,
+            machine_output: MachineOutput::default(),
+            output_handler: None,
             state,
             revision: 0,
             last_error: None,
@@ -295,7 +337,10 @@ impl Worker {
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
             Command::Configure { machine, reply } => {
+                self.cpu_clock = Some(CpuClock::new(machine.cpu_frequency_hz()));
                 self.machine = Some(*machine);
+                self.virtual_instant = VirtualInstant::ZERO;
+                self.machine_output = MachineOutput::default();
                 self.state = RuntimeState::Paused;
                 self.last_error = None;
                 self.breakpoints.clear();
@@ -319,6 +364,11 @@ impl Worker {
                     if let Some(machine) = self.machine.as_mut() {
                         machine.reset();
                     }
+                    if let Some(clock) = self.cpu_clock.as_mut() {
+                        clock.reset();
+                    }
+                    self.virtual_instant = VirtualInstant::ZERO;
+                    self.machine_output = MachineOutput::default();
                     self.state = RuntimeState::Paused;
                     self.last_error = None;
                     self.ignore_breakpoint_once = None;
@@ -358,6 +408,14 @@ impl Worker {
                 );
                 send_reply(reply, result);
             }
+            Command::SetOutputHandler { handler, reply } => {
+                self.output_handler = Some(handler);
+                send_reply(reply, Ok(self.status()));
+            }
+            Command::ClearOutputHandler(reply) => {
+                self.output_handler = None;
+                send_reply(reply, Ok(self.status()));
+            }
             Command::Shutdown => return true,
         }
         false
@@ -369,11 +427,9 @@ impl Worker {
             return Err(rejection("single-step requires a paused machine"));
         }
 
-        if let Some(machine) = self.machine.as_mut() {
-            match machine.execute_instruction() {
-                Ok(()) => self.last_error = None,
-                Err(error) => self.last_error = Some(error.to_string()),
-            }
+        match self.execute_timed_instruction() {
+            Ok(()) => self.last_error = None,
+            Err(error) => self.last_error = Some(error.to_string()),
         }
         self.state = RuntimeState::Paused;
         self.ignore_breakpoint_once = None;
@@ -396,7 +452,7 @@ impl Worker {
                 return;
             }
 
-            match machine.execute_instruction() {
+            match self.execute_timed_instruction() {
                 Ok(()) => {
                     self.last_error = None;
                     self.advance_revision();
@@ -408,6 +464,36 @@ impl Worker {
                     return;
                 }
             }
+        }
+    }
+
+    fn execute_timed_instruction(&mut self) -> Result<(), ExecutionError> {
+        self.machine
+            .as_mut()
+            .expect("a timed instruction requires a configured machine")
+            .execute_instruction()?;
+        let elapsed = self
+            .cpu_clock
+            .as_mut()
+            .expect("a configured machine requires a CPU clock")
+            .advance_cycle();
+        self.virtual_instant.advance(elapsed);
+        self.machine
+            .as_mut()
+            .expect("a timed instruction requires a configured machine")
+            .advance_time(elapsed, &mut self.machine_output);
+        self.deliver_output();
+        Ok(())
+    }
+
+    fn deliver_output(&mut self) {
+        if self.machine_output.is_empty() {
+            return;
+        }
+
+        let output = mem::take(&mut self.machine_output);
+        if let Some(handler) = self.output_handler.as_mut() {
+            handler(output);
         }
     }
 
@@ -441,6 +527,32 @@ impl Worker {
     }
 }
 
+struct CpuClock {
+    frequency_hz: u64,
+    remainder: u128,
+}
+
+impl CpuClock {
+    const fn new(frequency_hz: u64) -> Self {
+        assert!(frequency_hz != 0);
+        Self {
+            frequency_hz,
+            remainder: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.remainder = 0;
+    }
+
+    fn advance_cycle(&mut self) -> VirtualDuration {
+        let numerator = ATTOSECONDS_PER_SECOND + self.remainder;
+        let frequency_hz = u128::from(self.frequency_hz);
+        self.remainder = numerator % frequency_hz;
+        VirtualDuration::from_attoseconds(numerator / frequency_hz)
+    }
+}
+
 fn rejection(reason: &str) -> CommandRejection {
     CommandRejection {
         reason: String::from(reason),
@@ -453,8 +565,86 @@ fn send_reply<T>(reply: CommandReply<T>, result: Result<T, CommandRejection>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Runtime, RuntimeError};
+    use std::env;
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+
+    use se_core::time::ATTOSECONDS_PER_SECOND;
+    use se_float::backend::Backend;
+    use se_machine::indigo::ip12::Ip12;
+    use se_machine::indigo::ip12::debug::{DebugRequest, DebugResponse, MemoryAddressSpace};
+    use se_machine::machine::Machine;
+    use se_machine::output::SerialPort;
+
+    use super::{CpuClock, Runtime, RuntimeError};
     use crate::control::RuntimeState;
+
+    const PROM_BYTES: usize = 0x40000;
+    const EXTERNAL_PROM_EXECUTION_BUDGET: usize = 125_000_000;
+    const EXPECTED_PROMPT_INSTRUCTION: usize = 119_226_807;
+    const POST_PROMPT_INSTRUCTIONS: usize = 2_000_000;
+    const SERIAL_RECEIVE_POLL_PC: u32 = 0xbfc2_28a0;
+    const CPU_FREQUENCY_STRING_ADDRESS: u64 = 0x0038_06d8;
+    const EXPECTED_SERIAL_B: &[u8] =
+        b"\r\nNVRAM checksum is incorrect: reinitializing the NVRAM.\r\n\
+\r\nSCSI controller diagnostic                 *FAILED*\r\n\
+\r\n        Check or replace:  CPU board\r\n\
+Keyboard/Mouse diagnostic                  *FAILED*\r\n\
+\r\n        Check or replace:  CPU board\r\n\
+\r\n\r\nError-- gfx(0) keyboard not responding\r\n\
+\r\nError-- cannot open console \"gfx(0)\"\r\n\
+\r\n\r\ninitializing tod clock\r\n\
+setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
+\r\ninitializing tod clock\r\n\
+setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
+can't set tod clock\r\n\
+\n\rDiagnostics failed.\n\
+\r[Press any key to continue.]";
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ExternalPromRun {
+        serial_a: Vec<u8>,
+        serial_b: Vec<u8>,
+        prompt_instruction: usize,
+        receive_poll_count: usize,
+        cpu_frequency_string: Vec<Option<u8>>,
+    }
+
+    fn machine_with_instructions(instructions: &[u32]) -> Machine {
+        let mut raw_prom = vec![0; PROM_BYTES];
+        for (destination, instruction) in raw_prom
+            .chunks_exact_mut(4)
+            .zip(instructions.iter().copied())
+        {
+            let [first, second, third, fourth] = instruction.to_be_bytes();
+            destination.copy_from_slice(&[second, first, fourth, third]);
+        }
+        Machine::IndigoIp12(Ip12::new(raw_prom, Backend::SoftFloat).unwrap())
+    }
+
+    fn machine_that_transmits_serial_a(values: &[u8]) -> Machine {
+        const LOAD_SERIAL_A_CONTROL: [u32; 2] = [0x3c08_bfb8, 0x3508_0d1b];
+        const STORE_T1: u32 = 0xa109_0000;
+
+        let mut instructions = Vec::from(LOAD_SERIAL_A_CONTROL);
+        for (register, value) in [(4, 0x44), (11, 0x10), (12, 10), (13, 0), (14, 1), (5, 0x68)] {
+            instructions.extend([0x2409_0000 | register, STORE_T1]);
+            instructions.extend([0x2409_0000 | value, STORE_T1]);
+        }
+        instructions.push(0x2508_0004);
+        for value in values {
+            instructions.extend([0x2409_0000 | u32::from(*value), STORE_T1]);
+        }
+        instructions.extend([0x1000_ffff, 0]);
+
+        machine_with_instructions(&instructions)
+    }
+
+    fn execute_instructions(worker: &mut super::Worker, count: usize) {
+        for _ in 0..count {
+            worker.execute_timed_instruction().unwrap();
+        }
+    }
 
     #[test]
     fn unconfigured_runtime_rejects_execution_and_shuts_down_cleanly() {
@@ -466,5 +656,178 @@ mod tests {
             Err(RuntimeError::CommandRejected { .. })
         ));
         assert_eq!(runtime.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn cpu_clock_accumulates_fractional_cycles_without_drift() {
+        let mut clock = CpuClock::new(33_000_000);
+        let mut elapsed = 0;
+
+        for _ in 0..33_000 {
+            elapsed += clock.advance_cycle().as_attoseconds();
+        }
+
+        assert_eq!(elapsed, ATTOSECONDS_PER_SECOND / 1_000);
+        assert_eq!(clock.remainder, 0);
+    }
+
+    #[test]
+    fn cpu_clock_reset_discards_fractional_phase() {
+        let mut clock = CpuClock::new(3);
+        let first = clock.advance_cycle();
+        clock.reset();
+
+        assert_eq!(clock.advance_cycle(), first);
+    }
+
+    #[test]
+    fn successful_instruction_and_guest_exception_advance_virtual_time() {
+        for instruction in [0, 0x0000_000c] {
+            let mut worker = super::Worker::new(Some(machine_with_instructions(&[instruction])));
+
+            worker.execute_timed_instruction().unwrap();
+
+            assert_eq!(
+                worker.virtual_instant.as_attoseconds(),
+                ATTOSECONDS_PER_SECOND / 33_000_000
+            );
+        }
+    }
+
+    #[test]
+    fn step_error_does_not_advance_virtual_time() {
+        let mut worker = super::Worker::new(Some(machine_with_instructions(&[
+            0x3c08_4040,
+            0x4088_6000,
+            0,
+            0,
+            0x4a00_0000,
+        ])));
+        for _ in 0..4 {
+            worker.execute_timed_instruction().unwrap();
+        }
+        let before = worker.virtual_instant;
+
+        assert!(worker.execute_timed_instruction().is_err());
+
+        assert_eq!(worker.virtual_instant, before);
+    }
+
+    #[test]
+    fn machine_output_handler_has_no_backlog_and_can_be_cleared() {
+        const INSTRUCTIONS_PER_CHARACTER_INTERVAL: usize = 35_000;
+
+        let mut worker = super::Worker::new(Some(machine_that_transmits_serial_a(b"ABC")));
+        execute_instructions(&mut worker, INSTRUCTIONS_PER_CHARACTER_INTERVAL);
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let handler_received = Arc::clone(&received);
+        worker.output_handler = Some(Box::new(move |output| {
+            handler_received
+                .lock()
+                .unwrap()
+                .extend_from_slice(output.serial(SerialPort::A));
+        }));
+        execute_instructions(&mut worker, INSTRUCTIONS_PER_CHARACTER_INTERVAL);
+        assert_eq!(*received.lock().unwrap(), b"B");
+
+        worker.output_handler = None;
+        execute_instructions(&mut worker, INSTRUCTIONS_PER_CHARACTER_INTERVAL);
+        worker.output_handler = Some(Box::new(|_| {
+            panic!("discarded output must not be retained for a later handler")
+        }));
+        worker.execute_timed_instruction().unwrap();
+    }
+
+    fn run_external_ip12_prom(raw_prom: Vec<u8>) -> ExternalPromRun {
+        let machine = Machine::IndigoIp12(
+            Ip12::new(raw_prom, Backend::SoftFloat).expect("the PROM dump should be valid"),
+        );
+        let serial_a = Arc::new(Mutex::new(Vec::new()));
+        let serial_b = Arc::new(Mutex::new(Vec::new()));
+        let output_a = Arc::clone(&serial_a);
+        let output_b = Arc::clone(&serial_b);
+        let mut worker = super::Worker::new(Some(machine));
+        worker.output_handler = Some(Box::new(move |output| {
+            output_a
+                .lock()
+                .unwrap()
+                .extend_from_slice(output.serial(SerialPort::A));
+            output_b
+                .lock()
+                .unwrap()
+                .extend_from_slice(output.serial(SerialPort::B));
+        }));
+
+        let mut executed = 0;
+        let mut prompt_completed_at = None;
+        let mut receive_poll_count = 0;
+        while executed < EXTERNAL_PROM_EXECUTION_BUDGET {
+            let address = worker.machine.as_ref().unwrap().execution_address();
+            if prompt_completed_at.is_some() && address == SERIAL_RECEIVE_POLL_PC {
+                receive_poll_count += 1;
+            }
+            if let Err(error) = worker.execute_timed_instruction() {
+                panic!(
+                    "PROM execution failed at 0x{address:08x} after {executed} instructions: {error}"
+                );
+            }
+            executed += 1;
+
+            if prompt_completed_at.is_none()
+                && serial_b
+                    .lock()
+                    .unwrap()
+                    .ends_with(b"[Press any key to continue.]")
+            {
+                prompt_completed_at = Some(executed);
+            }
+            if let Some(prompt_instruction) = prompt_completed_at
+                && executed - prompt_instruction == POST_PROMPT_INSTRUCTIONS
+            {
+                break;
+            }
+        }
+
+        let prompt_instruction = prompt_completed_at.unwrap_or_else(|| {
+            panic!("PROM did not reach its input prompt within {EXTERNAL_PROM_EXECUTION_BUDGET} instructions")
+        });
+        let Machine::IndigoIp12(machine) = worker.machine.as_ref().unwrap();
+        let DebugResponse::Memory(cpu_frequency) = machine.debug(DebugRequest::Memory {
+            address_space: MemoryAddressSpace::Physical,
+            start: CPU_FREQUENCY_STRING_ADDRESS,
+            length: 3,
+        }) else {
+            unreachable!();
+        };
+
+        ExternalPromRun {
+            serial_a: serial_a.lock().unwrap().clone(),
+            serial_b: serial_b.lock().unwrap().clone(),
+            prompt_instruction,
+            receive_poll_count,
+            cpu_frequency_string: cpu_frequency.bytes,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an external 070-8088-002 IP12 PROM dump"]
+    fn ip12_prom_reaches_serial_receive_wait_deterministically() {
+        let path = env::var_os("SE_INDIGO_IP12_PROM")
+            .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
+        let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
+
+        let first = run_external_ip12_prom(raw_prom.clone());
+        let second = run_external_ip12_prom(raw_prom);
+
+        assert_eq!(first, second);
+        assert!(first.serial_a.is_empty());
+        assert_eq!(first.serial_b, EXPECTED_SERIAL_B);
+        assert_eq!(first.prompt_instruction, EXPECTED_PROMPT_INSTRUCTION);
+        assert!(first.receive_poll_count != 0);
+        assert_eq!(
+            first.cpu_frequency_string,
+            [Some(b'3'), Some(b'3'), Some(0)]
+        );
     }
 }

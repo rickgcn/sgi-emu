@@ -688,7 +688,7 @@ mod tests {
     use crate::mips1::r3000::R3000Config;
 
     const CONFIG: R3000Config =
-        R3000Config::new(4 * 1024, 4 * 1024, 4, 4, true, Backend::SoftFloat);
+        R3000Config::new(1, 4 * 1024, 4 * 1024, 4, 4, true, Backend::SoftFloat);
 
     #[test]
     fn reset_snapshot_contains_architectural_state() {

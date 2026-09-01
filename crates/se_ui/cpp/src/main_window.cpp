@@ -6,6 +6,7 @@
 #include "se_ui/debugger/registers_dock.h"
 #include "se_ui/debugger/tlb_dock.h"
 #include "se_ui/display_widget.h"
+#include "se_ui/serial_console_dock.h"
 #include "se_ui/src/bridge.rs.h"
 
 #include <QAction>
@@ -67,6 +68,8 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , tlb_dock_(nullptr)
     , cache_dock_(nullptr)
     , memory_dock_(nullptr)
+    , serial_console_dock_(nullptr)
+    , machine_output_sink_()
     , update_timer_(new QTimer(this))
     , machine_status_(new QLabel(this))
     , execution_error_status_(new QLabel(this))
@@ -84,6 +87,9 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     set_default_dock_layout();
     restore_window_state(startup);
 
+    machine_output_sink_ = std::make_shared<MachineOutputSink>(serial_console_dock_);
+    apply_runtime_status(session_.attach_machine_output(machine_output_sink_), true);
+
     connect(update_timer_, &QTimer::timeout, this, &MainWindow::update_runtime);
     update_timer_->start(100);
     apply_runtime_status(session_.runtime_status(), false);
@@ -94,6 +100,11 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
             QMessageBox::critical(this, QStringLiteral("Machine configuration"), startup_error);
         });
     }
+}
+
+MainWindow::~MainWindow() {
+    session_.detach_machine_output();
+    machine_output_sink_.reset();
 }
 
 UiExitState MainWindow::exit_state() const {
@@ -153,6 +164,7 @@ void MainWindow::create_docks() {
     tlb_dock_ = new TlbDock(session_, this);
     cache_dock_ = new CacheDock(session_, this);
     memory_dock_ = new MemoryDock(session_, this);
+    serial_console_dock_ = new SerialConsoleDock(this);
 }
 
 void MainWindow::create_menus() {
@@ -165,6 +177,8 @@ void MainWindow::create_menus() {
     machine_menu->addAction(settings_action_);
 
     auto* view_menu = menuBar()->addMenu(QStringLiteral("View"));
+    view_menu->addAction(serial_console_dock_->toggleViewAction());
+    view_menu->addSeparator();
     view_menu->addAction(disassembly_dock_->toggleViewAction());
     view_menu->addAction(registers_dock_->toggleViewAction());
     view_menu->addAction(tlb_dock_->toggleViewAction());
@@ -211,12 +225,14 @@ void MainWindow::set_default_dock_layout() {
     tabifyDockWidget(registers_dock_, tlb_dock_);
     tabifyDockWidget(registers_dock_, cache_dock_);
     addDockWidget(Qt::BottomDockWidgetArea, memory_dock_);
+    addDockWidget(Qt::BottomDockWidgetArea, serial_console_dock_);
 
     disassembly_dock_->hide();
     registers_dock_->hide();
     tlb_dock_->hide();
     cache_dock_->hide();
     memory_dock_->hide();
+    serial_console_dock_->show();
 }
 
 void MainWindow::show_settings() {
@@ -258,6 +274,7 @@ void MainWindow::show_settings() {
     cache_dock_->clear();
     disassembly_dock_->clear();
     memory_dock_->clear();
+    serial_console_dock_->clear();
     apply_runtime_status(status, false);
     refresh_debuggers();
 }

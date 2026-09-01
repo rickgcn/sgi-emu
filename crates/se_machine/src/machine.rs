@@ -3,10 +3,12 @@
 use std::error::Error;
 use std::fmt;
 
+use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::StepError;
 
 use crate::debug::{DebugRequest, DebugResponse};
 use crate::indigo::ip12::Ip12;
+use crate::output::MachineOutput;
 
 /// A configured emulated machine.
 pub enum Machine {
@@ -38,6 +40,14 @@ impl Error for ExecutionError {
 }
 
 impl Machine {
+    /// Returns the configured processor clock frequency in hertz.
+    #[must_use]
+    pub const fn cpu_frequency_hz(&self) -> u64 {
+        match self {
+            Self::IndigoIp12(machine) => machine.cpu_frequency_hz(),
+        }
+    }
+
     /// Restores the selected machine's reset state.
     pub fn reset(&mut self) {
         match self {
@@ -56,6 +66,13 @@ impl Machine {
             Self::IndigoIp12(machine) => machine
                 .execute_instruction()
                 .map_err(ExecutionError::IndigoIp12),
+        }
+    }
+
+    /// Advances timed devices and appends frontend-visible output.
+    pub fn advance_time(&mut self, elapsed: VirtualDuration, output: &mut MachineOutput) {
+        match self {
+            Self::IndigoIp12(machine) => machine.advance_time(elapsed, output),
         }
     }
 

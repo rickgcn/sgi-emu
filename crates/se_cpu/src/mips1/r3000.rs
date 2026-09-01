@@ -29,11 +29,12 @@ const MAXIMUM_CACHE_BYTES: usize = 256 * 1024;
 
 #[cfg(test)]
 const TEST_CONFIG: R3000Config =
-    R3000Config::new(4 * 1024, 4 * 1024, 4, 4, true, Backend::SoftFloat);
+    R3000Config::new(1, 4 * 1024, 4 * 1024, 4, 4, true, Backend::SoftFloat);
 
 /// Static properties of an R3000 processor and its attached R3010.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct R3000Config {
+    frequency_hz: u64,
     instruction_cache_bytes: usize,
     data_cache_bytes: usize,
     instruction_refill_bytes: usize,
@@ -51,6 +52,7 @@ impl R3000Config {
     /// 256 KiB and each refill size is 4, 16, 32, 64, or 128 bytes.
     #[must_use]
     pub const fn new(
+        frequency_hz: u64,
         instruction_cache_bytes: usize,
         data_cache_bytes: usize,
         instruction_refill_bytes: usize,
@@ -58,12 +60,14 @@ impl R3000Config {
         partial_store_enabled: bool,
         floating_point_backend: Backend,
     ) -> Self {
+        assert!(frequency_hz != 0);
         assert!(valid_cache_size(instruction_cache_bytes));
         assert!(valid_cache_size(data_cache_bytes));
         assert!(valid_refill_size(instruction_refill_bytes));
         assert!(valid_refill_size(data_refill_bytes));
 
         Self {
+            frequency_hz,
             instruction_cache_bytes,
             data_cache_bytes,
             instruction_refill_bytes,
@@ -71,6 +75,12 @@ impl R3000Config {
             partial_store_enabled,
             floating_point_backend,
         }
+    }
+
+    /// Returns the processor clock frequency in hertz.
+    #[must_use]
+    pub const fn frequency_hz(&self) -> u64 {
+        self.frequency_hz
     }
 
     /// Returns the instruction-cache capacity in bytes.
@@ -177,6 +187,7 @@ impl Error for StepError {}
 pub struct R3000 {
     state: State,
     cp0_condition: bool,
+    frequency_hz: u64,
 }
 
 impl R3000 {
@@ -192,6 +203,7 @@ impl R3000 {
         Self {
             state: State::new(config),
             cp0_condition: false,
+            frequency_hz: config.frequency_hz(),
         }
     }
 
@@ -210,6 +222,12 @@ impl R3000 {
     /// preserved.
     pub fn reset(&mut self) {
         self.state.reset();
+    }
+
+    /// Returns the processor clock frequency in hertz.
+    #[must_use]
+    pub const fn frequency_hz(&self) -> u64 {
+        self.frequency_hz
     }
 
     /// Sets the external CP0 condition input sampled by CP0 branches.
@@ -674,8 +692,17 @@ mod tests {
 
     #[test]
     fn configuration_exposes_validated_cache_properties() {
-        let config = R3000Config::new(32 * 1024, 32 * 1024, 64, 4, true, Backend::SoftFloat);
+        let config = R3000Config::new(
+            33_000_000,
+            32 * 1024,
+            32 * 1024,
+            64,
+            4,
+            true,
+            Backend::SoftFloat,
+        );
 
+        assert_eq!(config.frequency_hz(), 33_000_000);
         assert_eq!(config.instruction_cache_bytes(), 32 * 1024);
         assert_eq!(config.data_cache_bytes(), 32 * 1024);
         assert_eq!(config.instruction_refill_bytes(), 64);
@@ -689,7 +716,7 @@ mod tests {
     fn configuration_rejects_invalid_cache_size() {
         let invalid_bytes = std::hint::black_box(6 * 1024);
 
-        let _ = R3000Config::new(invalid_bytes, 4 * 1024, 4, 4, true, Backend::SoftFloat);
+        let _ = R3000Config::new(1, invalid_bytes, 4 * 1024, 4, 4, true, Backend::SoftFloat);
     }
 
     #[test]
@@ -698,6 +725,7 @@ mod tests {
         let invalid_bytes = std::hint::black_box(8);
 
         let _ = R3000Config::new(
+            1,
             4 * 1024,
             4 * 1024,
             invalid_bytes,
@@ -705,6 +733,12 @@ mod tests {
             true,
             Backend::SoftFloat,
         );
+    }
+
+    #[test]
+    #[should_panic]
+    fn configuration_rejects_zero_frequency() {
+        let _ = R3000Config::new(0, 4 * 1024, 4 * 1024, 4, 4, true, Backend::SoftFloat);
     }
 
     #[test]
@@ -790,7 +824,7 @@ mod tests {
 
     #[test]
     fn configured_instruction_refill_reads_each_word_in_order() {
-        let config = R3000Config::new(32 * 1024, 32 * 1024, 64, 4, true, Backend::SoftFloat);
+        let config = R3000Config::new(1, 32 * 1024, 32 * 1024, 64, 4, true, Backend::SoftFloat);
         let mut processor = R3000::new(config);
         enable_cp2(&mut processor);
         jump_to(&mut processor, 0x8000_0024);
@@ -1651,7 +1685,7 @@ mod tests {
             [(PhysAddr::new(0x100), vec![0x11, 0xaa, 0xbb, 0xcc])]
         );
 
-        let config = R3000Config::new(4 * 1024, 4 * 1024, 4, 4, false, Backend::SoftFloat);
+        let config = R3000Config::new(1, 4 * 1024, 4 * 1024, 4, 4, false, Backend::SoftFloat);
         let mut disabled_processor = R3000::new(config);
         disabled_processor.state.write_gpr(1, 0x8000_0101);
         disabled_processor.state.write_gpr(2, 0xaabb_ccdd);
@@ -3179,7 +3213,7 @@ mod tests {
     #[test]
     fn cp1_arithmetic_executes_through_step_with_both_backends() {
         for backend in [Backend::SoftFloat, Backend::Native] {
-            let config = R3000Config::new(4 * 1024, 4 * 1024, 4, 4, true, backend);
+            let config = R3000Config::new(1, 4 * 1024, 4 * 1024, 4, 4, true, backend);
             let mut processor = R3000::new(config);
             enable_cp1(&mut processor);
             processor

@@ -7,6 +7,7 @@ mod prom;
 use std::error::Error;
 use std::fmt;
 
+use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::{R3000, R3000Config, StepError};
 use se_device::dp8573a::Dp8573a;
 use se_device::dsp56001::Dsp56001;
@@ -21,11 +22,15 @@ use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
 use se_float::backend::Backend;
 
+use crate::output::MachineOutput;
+
 use self::bus::Ip12Bus;
 use self::prom::normalize_u56_prom;
 
 const PROM_BYTES: usize = 0x40000;
 const RAM_BYTES: usize = 8 * 1024 * 1024;
+const CPU_FREQUENCY_HZ: u64 = 33_000_000;
+const SERIAL_CLOCK_HZ: u64 = 3_686_400;
 
 /// An error encountered while constructing an Indigo IP12.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,7 +80,7 @@ impl Ip12 {
                 Hpc1::new(),
                 Int2::new(),
                 Wd33c93b::new(),
-                [Z85230::new(), Z85230::new()],
+                [Z85230::new(SERIAL_CLOCK_HZ), Z85230::new(SERIAL_CLOCK_HZ)],
                 Dp8573a::new(),
                 Mdac::new(),
                 Nmc93cs46::new(),
@@ -92,6 +97,12 @@ impl Ip12 {
         self.update_interrupt_lines();
     }
 
+    /// Returns the processor clock frequency in hertz.
+    #[must_use]
+    pub const fn cpu_frequency_hz(&self) -> u64 {
+        self.cpu.frequency_hz()
+    }
+
     /// Executes one architectural processor instruction.
     ///
     /// # Errors
@@ -104,6 +115,11 @@ impl Ip12 {
             self.reset();
         }
         Ok(())
+    }
+
+    /// Advances timed devices and appends frontend-visible output.
+    pub fn advance_time(&mut self, elapsed: VirtualDuration, output: &mut MachineOutput) {
+        self.bus.advance_time(elapsed, output);
     }
 
     fn update_interrupt_lines(&mut self) {
@@ -122,7 +138,15 @@ impl Ip12 {
 }
 
 const fn cpu_config(floating_point_backend: Backend) -> R3000Config {
-    R3000Config::new(32 * 1024, 32 * 1024, 64, 16, true, floating_point_backend)
+    R3000Config::new(
+        CPU_FREQUENCY_HZ,
+        32 * 1024,
+        32 * 1024,
+        64,
+        16,
+        true,
+        floating_point_backend,
+    )
 }
 
 #[cfg(test)]
@@ -133,7 +157,7 @@ mod tests {
     use se_core::bus::{PhysAddr, PhysicalBus};
     use se_float::backend::Backend;
 
-    use super::{Ip12, Ip12Error, PROM_BYTES, RAM_BYTES, cpu_config};
+    use super::{CPU_FREQUENCY_HZ, Ip12, Ip12Error, PROM_BYTES, RAM_BYTES, cpu_config};
 
     const MEMORY_CONFIGURATION_INSTRUCTION_BUDGET: usize = 300_000;
     const ENVIRONMENT_INITIALIZATION_INSTRUCTION_BUDGET: usize = 2_100_000;
@@ -166,6 +190,10 @@ mod tests {
             assert_eq!(config.data_refill_bytes(), 4 * 4);
             assert!(config.partial_store_enabled());
             assert_eq!(config.floating_point_backend(), backend);
+            assert_eq!(config.frequency_hz(), CPU_FREQUENCY_HZ);
+            assert_eq!(machine.cpu_frequency_hz(), CPU_FREQUENCY_HZ);
+            machine.reset();
+            assert_eq!(machine.cpu_frequency_hz(), CPU_FREQUENCY_HZ);
         }
     }
 
