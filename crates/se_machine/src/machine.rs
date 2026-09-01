@@ -7,7 +7,7 @@ use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::StepError;
 
 use crate::debug::{DebugRequest, DebugResponse};
-use crate::indigo::ip12::Ip12;
+use crate::indigo::ip12::{Ip12, Ip12NonvolatileState};
 use crate::output::MachineOutput;
 use crate::serial::SerialPort;
 
@@ -15,6 +15,13 @@ use crate::serial::SerialPort;
 pub enum Machine {
     /// An SGI Indigo IP12.
     IndigoIp12(Ip12),
+}
+
+/// State retained while a configured machine is powered off.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MachineNonvolatileState {
+    /// Battery-backed and nonvolatile state of an SGI Indigo IP12.
+    IndigoIp12(Ip12NonvolatileState),
 }
 
 /// An error encountered while executing one machine instruction.
@@ -41,6 +48,31 @@ impl Error for ExecutionError {
 }
 
 impl Machine {
+    /// Returns state that survives machine reconstruction and application
+    /// sessions.
+    #[must_use]
+    pub fn nonvolatile_state(&self) -> MachineNonvolatileState {
+        match self {
+            Self::IndigoIp12(machine) => {
+                MachineNonvolatileState::IndigoIp12(machine.nonvolatile_state())
+            }
+        }
+    }
+
+    /// Restores retained state and advances battery-backed clocks by elapsed
+    /// offline milliseconds.
+    pub fn restore_nonvolatile_state(
+        &mut self,
+        state: MachineNonvolatileState,
+        offline_milliseconds: u64,
+    ) {
+        match (self, state) {
+            (Self::IndigoIp12(machine), MachineNonvolatileState::IndigoIp12(state)) => {
+                machine.restore_nonvolatile_state(state, offline_milliseconds);
+            }
+        }
+    }
+
     /// Returns the configured processor clock frequency in hertz.
     #[must_use]
     pub const fn cpu_frequency_hz(&self) -> u64 {

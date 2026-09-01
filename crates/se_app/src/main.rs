@@ -1,6 +1,7 @@
 //! Application entry point.
 
 mod config;
+mod persistence;
 
 use std::error::Error;
 use std::fs;
@@ -39,15 +40,21 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if arguments.headless() {
         let machine = machine.ok_or_else(|| io::Error::other(startup_error))?;
-        return se_cli::headless::run(Runtime::new(Some(machine))?)
-            .map_err(|error| Box::new(error) as Box<dyn Error>);
+        let runtime = Runtime::new(Some(machine))?;
+        let frontend_result = se_cli::headless::run(&runtime);
+        if let Some(state) = runtime.shutdown()? {
+            persistence::save(&state)?;
+        }
+        return frontend_result.map_err(|error| Box::new(error) as Box<dyn Error>);
     }
 
     let startup = application_config.ui_startup_state(startup_error);
     let runtime = Runtime::new(machine)?;
     let session = UiSession::new(runtime, Box::new(build_machine));
     let exit = session.run(&startup);
-    session.shutdown()?;
+    if let Some(state) = session.shutdown()? {
+        persistence::save(&state)?;
+    }
 
     application_config.apply_ui_exit_state(exit);
     config::save(&config_path, &application_config)?;
@@ -69,9 +76,13 @@ fn build_machine(model: &str, prom_path: &str, float_backend: &str) -> Result<Ma
             };
             let raw_prom = fs::read(prom_path)
                 .map_err(|error| format!("failed to read PROM image '{prom_path}': {error}"))?;
-            Ip12::new(raw_prom, backend)
+            let mut machine = Ip12::new(raw_prom, backend)
                 .map(Machine::IndigoIp12)
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            if let Some(restored) = persistence::load(model).map_err(|error| error.to_string())? {
+                machine.restore_nonvolatile_state(restored.state, restored.offline_milliseconds);
+            }
+            Ok(machine)
         }
         _ => Err(format!("unsupported machine model: {model}")),
     }

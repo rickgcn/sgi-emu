@@ -1,5 +1,8 @@
 //! National Semiconductor DP8573A real-time clock.
 
+use std::error::Error;
+use std::fmt;
+
 use se_core::bus::{BusFault, DeviceAddr};
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
@@ -51,6 +54,136 @@ const ALARM_COMPARE_BITS: u8 = 0x3f;
 const ALARM_INTERRUPT_ENABLE: u8 = 1 << 6;
 
 const ATTOSECONDS_PER_MILLISECOND: u128 = ATTOSECONDS_PER_SECOND / 1_000;
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+const CALENDAR_CYCLE_DAYS: u64 = 700 * 365 + 175;
+
+/// An invalid persistent DP8573A state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Dp8573aStateError {
+    /// The saved prescaler phase is outside one millisecond.
+    InvalidPrescalerPhase {
+        /// Invalid phase in attoseconds.
+        phase_attoseconds: u64,
+    },
+    /// The saved millisecond position is outside one hundredth of a second.
+    InvalidMillisecondPosition {
+        /// Invalid position in milliseconds.
+        millisecond: u8,
+    },
+}
+
+impl fmt::Display for Dp8573aStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPrescalerPhase { phase_attoseconds } => write!(
+                formatter,
+                "invalid DP8573A prescaler phase: {phase_attoseconds} attoseconds"
+            ),
+            Self::InvalidMillisecondPosition { millisecond } => write!(
+                formatter,
+                "invalid DP8573A millisecond position: {millisecond}"
+            ),
+        }
+    }
+}
+
+impl Error for Dp8573aStateError {}
+
+/// State retained while an emulated DP8573A continues on battery power.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Dp8573aBatteryState {
+    registers: [u8; REGISTER_COUNT],
+    alternate_control_registers: [u8; BANKED_REGISTER_COUNT],
+    prescaler_phase_attoseconds: u64,
+    millisecond_within_hundredth: u8,
+    oscillator_failed: bool,
+    single_supply: bool,
+    alarm_match_active: bool,
+}
+
+impl Dp8573aBatteryState {
+    /// Creates a validated persistent RTC state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Dp8573aStateError`] when an internal phase is outside its
+    /// valid range.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fields mirror one fixed RTC state"
+    )]
+    pub fn new(
+        registers: [u8; REGISTER_COUNT],
+        alternate_control_registers: [u8; BANKED_REGISTER_COUNT],
+        prescaler_phase_attoseconds: u64,
+        millisecond_within_hundredth: u8,
+        oscillator_failed: bool,
+        single_supply: bool,
+        alarm_match_active: bool,
+    ) -> Result<Self, Dp8573aStateError> {
+        if u128::from(prescaler_phase_attoseconds) >= ATTOSECONDS_PER_MILLISECOND {
+            return Err(Dp8573aStateError::InvalidPrescalerPhase {
+                phase_attoseconds: prescaler_phase_attoseconds,
+            });
+        }
+        if millisecond_within_hundredth >= 10 {
+            return Err(Dp8573aStateError::InvalidMillisecondPosition {
+                millisecond: millisecond_within_hundredth,
+            });
+        }
+        Ok(Self {
+            registers,
+            alternate_control_registers,
+            prescaler_phase_attoseconds,
+            millisecond_within_hundredth,
+            oscillator_failed,
+            single_supply,
+            alarm_match_active,
+        })
+    }
+
+    /// Returns the main register storage.
+    #[must_use]
+    pub const fn registers(&self) -> &[u8; REGISTER_COUNT] {
+        &self.registers
+    }
+
+    /// Returns the alternate control register storage.
+    #[must_use]
+    pub const fn alternate_control_registers(&self) -> &[u8; BANKED_REGISTER_COUNT] {
+        &self.alternate_control_registers
+    }
+
+    /// Returns the sub-millisecond prescaler phase in attoseconds.
+    #[must_use]
+    pub const fn prescaler_phase_attoseconds(&self) -> u64 {
+        self.prescaler_phase_attoseconds
+    }
+
+    /// Returns the millisecond position within the current hundredth.
+    #[must_use]
+    pub const fn millisecond_within_hundredth(&self) -> u8 {
+        self.millisecond_within_hundredth
+    }
+
+    /// Reports whether the oscillator-failed flag is set.
+    #[must_use]
+    pub const fn oscillator_failed(&self) -> bool {
+        self.oscillator_failed
+    }
+
+    /// Reports whether single-supply operation is selected.
+    #[must_use]
+    pub const fn single_supply(&self) -> bool {
+        self.single_supply
+    }
+
+    /// Reports whether the alarm comparison is currently active.
+    #[must_use]
+    pub const fn alarm_match_active(&self) -> bool {
+        self.alarm_match_active
+    }
+}
 
 /// The software-visible state of a DP8573A under normal power.
 pub struct Dp8573a {
@@ -84,6 +217,34 @@ impl Dp8573a {
             single_supply: false,
             alarm_match_active: false,
         }
+    }
+
+    /// Returns the RTC state retained across application sessions.
+    #[must_use]
+    pub fn battery_state(&self) -> Dp8573aBatteryState {
+        Dp8573aBatteryState {
+            registers: self.registers,
+            alternate_control_registers: self.alternate_control_registers,
+            prescaler_phase_attoseconds: u64::try_from(self.prescaler_phase_attoseconds)
+                .expect("a valid DP8573A prescaler phase fits in u64"),
+            millisecond_within_hundredth: self.millisecond_within_hundredth,
+            oscillator_failed: self.oscillator_failed,
+            single_supply: self.single_supply,
+            alarm_match_active: self.alarm_match_active,
+        }
+    }
+
+    /// Restores retained RTC state and advances a running clock by elapsed
+    /// offline milliseconds.
+    pub fn restore_battery_state(&mut self, state: Dp8573aBatteryState, offline_milliseconds: u64) {
+        self.registers = state.registers;
+        self.alternate_control_registers = state.alternate_control_registers;
+        self.prescaler_phase_attoseconds = u128::from(state.prescaler_phase_attoseconds);
+        self.millisecond_within_hundredth = state.millisecond_within_hundredth;
+        self.oscillator_failed = state.oscillator_failed;
+        self.single_supply = state.single_supply;
+        self.alarm_match_active = state.alarm_match_active;
+        self.advance_offline_milliseconds(offline_milliseconds);
     }
 
     /// Reads one RTC transaction and applies read-to-clear behavior.
@@ -142,6 +303,57 @@ impl Dp8573a {
         for _ in 0..milliseconds {
             self.advance_millisecond();
         }
+    }
+
+    fn advance_offline_milliseconds(&mut self, milliseconds: u64) {
+        if milliseconds == 0 || self.alternate_control_registers[REAL_TIME_MODE] & CLOCK_START == 0
+        {
+            return;
+        }
+
+        let Some(clock) = ClockState::decode(self) else {
+            return;
+        };
+        let total_milliseconds =
+            u128::from(self.millisecond_within_hundredth) + u128::from(milliseconds);
+        let hundredth_steps = total_milliseconds / 10;
+        self.millisecond_within_hundredth = (total_milliseconds % 10) as u8;
+
+        let mut events = PERIODIC_MILLISECOND;
+        if hundredth_steps == 0 {
+            self.raise_periodic_events(events);
+            return;
+        }
+        events |= PERIODIC_TEN_MILLISECONDS;
+        if crosses_cyclic_target(u128::from(clock.hundredths), hundredth_steps, 10) {
+            events |= PERIODIC_HUNDRED_MILLISECONDS;
+        }
+
+        let total_hundredths = u128::from(clock.hundredths) + hundredth_steps;
+        let second_steps = u64::try_from(total_hundredths / 100)
+            .expect("offline milliseconds produce a u64 number of seconds");
+        self.set_bcd_counter(HUNDREDTHS, 0xff, (total_hundredths % 100) as u8);
+        if second_steps != 0 {
+            events |= PERIODIC_SECOND;
+            if crosses_cyclic_target(u128::from(clock.seconds), u128::from(second_steps), 10) {
+                events |= PERIODIC_TEN_SECONDS;
+            }
+            if crosses_cyclic_target(u128::from(clock.seconds), u128::from(second_steps), 60) {
+                events |= PERIODIC_MINUTE;
+            }
+
+            let alarm_edge = self.alarm_edge_during(&clock, second_steps);
+            self.advance_clock_seconds(&clock, second_steps);
+            if self.time_save_enabled() {
+                self.copy_all_time_save_registers();
+            }
+            let alarm_matches = self.current_alarm_matches();
+            if alarm_edge {
+                self.registers[MAIN_STATUS] |= ALARM_PENDING;
+            }
+            self.alarm_match_active = alarm_matches;
+        }
+        self.raise_periodic_events(events);
     }
 
     /// Reports whether the logical interrupt output is asserted.
@@ -436,9 +648,171 @@ impl Dp8573a {
         }
     }
 
-    fn recompute_alarm_match(&mut self) {
+    fn set_bcd_counter(&mut self, register: usize, mask: u8, value: u8) {
+        self.registers[register] = (self.registers[register] & !mask) | (encode_bcd(value) & mask);
+    }
+
+    fn advance_clock_seconds(&mut self, clock: &ClockState, seconds: u64) {
+        let total_seconds = u128::from(clock.seconds_of_day()) + u128::from(seconds);
+        let day_steps = u64::try_from(total_seconds / u128::from(SECONDS_PER_DAY))
+            .expect("offline seconds produce a u64 number of days");
+        let seconds_of_day = (total_seconds % u128::from(SECONDS_PER_DAY)) as u32;
+        let hour = (seconds_of_day / 3_600) as u8;
+        let minute = ((seconds_of_day / 60) % 60) as u8;
+        let second = (seconds_of_day % 60) as u8;
+
+        self.set_bcd_counter(SECONDS, 0x7f, second);
+        self.set_bcd_counter(MINUTES, 0x7f, minute);
+        if self.alternate_control_registers[REAL_TIME_MODE] & HOUR_MODE_12 != 0 {
+            let (hour_12, afternoon) = match hour {
+                0 => (12, false),
+                1..=11 => (hour, false),
+                12 => (12, true),
+                _ => (hour - 12, true),
+            };
+            self.registers[HOURS] = (self.registers[HOURS] & !0x9f)
+                | encode_bcd(hour_12)
+                | if afternoon { 0x80 } else { 0 };
+        } else {
+            self.set_bcd_counter(HOURS, 0x3f, hour);
+        }
+
+        for _ in 0..day_steps % CALENDAR_CYCLE_DAYS {
+            self.advance_day();
+        }
+    }
+
+    fn alarm_edge_during(&self, clock: &ClockState, seconds: u64) -> bool {
+        if seconds == 0
+            || self.alternate_control_registers[INTERRUPT_CONTROL_1] & ALARM_COMPARE_BITS == 0
+        {
+            return false;
+        }
+
+        let first = if self.alarm_match_active {
+            let first_change = self.seconds_until_selected_alarm_field_changes(clock);
+            if seconds <= first_change {
+                return false;
+            }
+            first_change + 1
+        } else {
+            1
+        };
+        self.alarm_matches_in_range(clock, first, seconds)
+    }
+
+    fn seconds_until_selected_alarm_field_changes(&self, clock: &ClockState) -> u64 {
+        let enables = self.alternate_control_registers[INTERRUPT_CONTROL_1];
+        if enables & (1 << 0) != 0 {
+            1
+        } else if enables & (1 << 1) != 0 {
+            u64::from(60 - clock.seconds)
+        } else if enables & (1 << 2) != 0 {
+            u64::from(60 - clock.minutes) * 60 - u64::from(clock.seconds)
+        } else if enables & ((1 << 3) | (1 << 5)) != 0 {
+            SECONDS_PER_DAY - u64::from(clock.seconds_of_day())
+        } else {
+            let days = u64::from(
+                days_in_month(clock.date.month, clock.date.leap_year) - clock.date.day_of_month + 1,
+            );
+            days * SECONDS_PER_DAY - u64::from(clock.seconds_of_day())
+        }
+    }
+
+    fn alarm_matches_in_range(&self, clock: &ClockState, first: u64, last: u64) -> bool {
+        let first_absolute = u64::from(clock.seconds_of_day()) + first;
+        let last_absolute = u64::from(clock.seconds_of_day()) + last;
+        let first_day = first_absolute / SECONDS_PER_DAY;
+        let last_day = last_absolute / SECONDS_PER_DAY;
+        let limited_last_day = last_day.min(first_day + CALENDAR_CYCLE_DAYS);
+        let mut date = clock.date;
+        for _ in 0..first_day % CALENDAR_CYCLE_DAYS {
+            date.advance();
+        }
+
+        for day in first_day..=limited_last_day {
+            let lower = if day == first_day {
+                (first_absolute % SECONDS_PER_DAY) as u32
+            } else {
+                0
+            };
+            let upper = if day == last_day {
+                (last_absolute % SECONDS_PER_DAY) as u32
+            } else {
+                (SECONDS_PER_DAY - 1) as u32
+            };
+            if self.alarm_date_matches(date) && self.alarm_time_matches_in_range(lower, upper) {
+                return true;
+            }
+            date.advance();
+        }
+        false
+    }
+
+    fn alarm_date_matches(&self, date: CalendarDate) -> bool {
+        let enables = self.alternate_control_registers[INTERRUPT_CONTROL_1];
+        [
+            (3, date.day_of_month, 0x3f),
+            (4, date.month, 0x1f),
+            (5, date.day_of_week, 0x07),
+        ]
+        .into_iter()
+        .all(|(bit, value, mask)| {
+            enables & (1 << bit) == 0
+                || encode_bcd(value) & mask == self.registers[SECONDS_COMPARE + bit] & mask
+        })
+    }
+
+    fn alarm_time_matches_in_range(&self, lower: u32, upper: u32) -> bool {
+        if lower > upper || !self.alarm_time_fields_valid() {
+            return false;
+        }
+        if lower == 0 && upper == (SECONDS_PER_DAY - 1) as u32 {
+            return true;
+        }
+        (lower..=upper).any(|seconds_of_day| self.alarm_time_matches(seconds_of_day))
+    }
+
+    fn alarm_time_fields_valid(&self) -> bool {
+        let enables = self.alternate_control_registers[INTERRUPT_CONTROL_1];
+        let second =
+            decode_bcd(self.registers[SECONDS_COMPARE] & 0x7f).is_some_and(|value| value <= 59);
+        let minute =
+            decode_bcd(self.registers[SECONDS_COMPARE + 1] & 0x7f).is_some_and(|value| value <= 59);
+        let hour = decode_hour(
+            self.registers[SECONDS_COMPARE + 2],
+            self.alternate_control_registers[REAL_TIME_MODE] & HOUR_MODE_12 != 0,
+        )
+        .is_some();
+        (enables & (1 << 0) == 0 || second)
+            && (enables & (1 << 1) == 0 || minute)
+            && (enables & (1 << 2) == 0 || hour)
+    }
+
+    fn alarm_time_matches(&self, seconds_of_day: u32) -> bool {
+        let enables = self.alternate_control_registers[INTERRUPT_CONTROL_1];
+        let hour = (seconds_of_day / 3_600) as u8;
+        let minute = ((seconds_of_day / 60) % 60) as u8;
+        let second = (seconds_of_day % 60) as u8;
+        let hour_raw = encode_hour(
+            hour,
+            self.alternate_control_registers[REAL_TIME_MODE] & HOUR_MODE_12 != 0,
+        );
+        [
+            (0, encode_bcd(second), 0x7f),
+            (1, encode_bcd(minute), 0x7f),
+            (2, hour_raw, self.counter_mask(HOURS)),
+        ]
+        .into_iter()
+        .all(|(bit, value, mask)| {
+            enables & (1 << bit) == 0
+                || value & mask == self.registers[SECONDS_COMPARE + bit] & mask
+        })
+    }
+
+    fn current_alarm_matches(&self) -> bool {
         let enables = self.alternate_control_registers[INTERRUPT_CONTROL_1] & ALARM_COMPARE_BITS;
-        let matches = enables != 0
+        enables != 0
             && (0..6).all(|offset| {
                 let enable = 1 << offset;
                 if enables & enable == 0 {
@@ -452,12 +826,133 @@ impl Dp8573a {
                 let compare = SECONDS_COMPARE + offset;
                 let mask = self.counter_mask(counter);
                 self.registers[counter] & mask == self.registers[compare] & mask
-            });
+            })
+    }
+
+    fn recompute_alarm_match(&mut self) {
+        let matches = self.current_alarm_matches();
         if matches && !self.alarm_match_active {
             self.registers[MAIN_STATUS] |= ALARM_PENDING;
         }
         self.alarm_match_active = matches;
     }
+}
+
+#[derive(Clone, Copy)]
+struct ClockState {
+    hundredths: u8,
+    seconds: u8,
+    minutes: u8,
+    hour: u8,
+    date: CalendarDate,
+}
+
+impl ClockState {
+    fn decode(rtc: &Dp8573a) -> Option<Self> {
+        let hundredths = decode_bcd(rtc.registers[HUNDREDTHS]).filter(|value| *value <= 99)?;
+        let seconds = decode_bcd(rtc.registers[SECONDS] & 0x7f).filter(|value| *value <= 59)?;
+        let minutes = decode_bcd(rtc.registers[MINUTES] & 0x7f).filter(|value| *value <= 59)?;
+        let hour_mode_12 = rtc.alternate_control_registers[REAL_TIME_MODE] & HOUR_MODE_12 != 0;
+        let hour = decode_hour(rtc.registers[HOURS], hour_mode_12)?;
+        let month =
+            decode_bcd(rtc.registers[MONTH] & 0x1f).filter(|value| (1..=12).contains(value))?;
+        let year = decode_bcd(rtc.registers[YEAR])?;
+        let leap_year = rtc.alternate_control_registers[REAL_TIME_MODE] & 0x03;
+        let maximum_day = days_in_month(month, leap_year);
+        let day_of_month = decode_bcd(rtc.registers[DAY_OF_MONTH] & 0x3f)
+            .filter(|value| (1..=maximum_day).contains(value))?;
+        let day_of_week = decode_bcd(rtc.registers[DAY_OF_WEEK] & 0x07)
+            .filter(|value| (1..=7).contains(value))?;
+        Some(Self {
+            hundredths,
+            seconds,
+            minutes,
+            hour,
+            date: CalendarDate {
+                day_of_month,
+                month,
+                year,
+                day_of_week,
+                leap_year,
+            },
+        })
+    }
+
+    fn seconds_of_day(self) -> u32 {
+        u32::from(self.hour) * 3_600 + u32::from(self.minutes) * 60 + u32::from(self.seconds)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CalendarDate {
+    day_of_month: u8,
+    month: u8,
+    year: u8,
+    day_of_week: u8,
+    leap_year: u8,
+}
+
+impl CalendarDate {
+    fn advance(&mut self) {
+        self.day_of_week = self.day_of_week % 7 + 1;
+        let maximum_day = days_in_month(self.month, self.leap_year);
+        if self.day_of_month < maximum_day {
+            self.day_of_month += 1;
+            return;
+        }
+
+        self.day_of_month = 1;
+        if self.month < 12 {
+            self.month += 1;
+            return;
+        }
+
+        self.month = 1;
+        self.year = (self.year + 1) % 100;
+        self.leap_year = (self.leap_year + 1) & 0x03;
+    }
+}
+
+const fn days_in_month(month: u8, leap_year: u8) -> u8 {
+    match month {
+        2 if leap_year == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn decode_hour(raw: u8, hour_mode_12: bool) -> Option<u8> {
+    if !hour_mode_12 {
+        return decode_bcd(raw & 0x3f).filter(|value| *value <= 23);
+    }
+
+    let hour = decode_bcd(raw & 0x1f).filter(|value| (1..=12).contains(value))?;
+    let afternoon = raw & 0x80 != 0;
+    Some(match (hour, afternoon) {
+        (12, false) => 0,
+        (12, true) => 12,
+        (_, false) => hour,
+        (_, true) => hour + 12,
+    })
+}
+
+fn encode_hour(hour: u8, hour_mode_12: bool) -> u8 {
+    if !hour_mode_12 {
+        return encode_bcd(hour);
+    }
+
+    let (hour_12, afternoon) = match hour {
+        0 => (12, false),
+        1..=11 => (hour, false),
+        12 => (12, true),
+        _ => (hour - 12, true),
+    };
+    encode_bcd(hour_12) | if afternoon { 0x80 } else { 0 }
+}
+
+const fn crosses_cyclic_target(current: u128, steps: u128, period: u128) -> bool {
+    steps != 0 && steps >= period - current % period
 }
 
 fn decode_bcd(value: u8) -> Option<u8> {
@@ -497,7 +992,8 @@ mod tests {
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
     use super::{
-        ALARM_PENDING, CLOCK_START, Dp8573a, HOUR_MODE_12, PERIODIC_PENDING, TIME_SAVE_ENABLE,
+        ALARM_PENDING, ATTOSECONDS_PER_MILLISECOND, CALENDAR_CYCLE_DAYS, CLOCK_START, Dp8573a,
+        Dp8573aBatteryState, Dp8573aStateError, HOUR_MODE_12, PERIODIC_PENDING, TIME_SAVE_ENABLE,
     };
 
     const HOURS_COMPARE: usize = 0x15;
@@ -764,6 +1260,106 @@ mod tests {
         assert!(!rtc.interrupt_asserted());
         select_main_bank(&mut rtc);
         assert_ne!(debug_read_register(&rtc, 0x00).unwrap() & ALARM_PENDING, 0);
+    }
+
+    #[test]
+    fn battery_state_rejects_invalid_internal_phases() {
+        assert!(matches!(
+            Dp8573aBatteryState::new(
+                [0; 32],
+                [0; 4],
+                ATTOSECONDS_PER_MILLISECOND as u64,
+                0,
+                false,
+                false,
+                false,
+            ),
+            Err(Dp8573aStateError::InvalidPrescalerPhase { .. })
+        ));
+        assert!(matches!(
+            Dp8573aBatteryState::new([0; 32], [0; 4], 0, 10, false, false, false,),
+            Err(Dp8573aStateError::InvalidMillisecondPosition { .. })
+        ));
+    }
+
+    #[test]
+    fn stopped_persistent_clock_does_not_advance_offline() {
+        let mut rtc = Dp8573a::new();
+        write_register(&mut rtc, 0x06, 0x12);
+        let state = rtc.battery_state();
+
+        let mut restored = Dp8573a::new();
+        restored.restore_battery_state(state.clone(), 86_400_000);
+
+        assert_eq!(restored.battery_state(), state);
+    }
+
+    #[test]
+    fn bulk_offline_progression_matches_millisecond_progression() {
+        let mut stepped = Dp8573a::new();
+        for (register, value) in [
+            (0x05, 0x42),
+            (0x06, 0x58),
+            (0x07, 0x59),
+            (0x08, 0x23),
+            (0x09, 0x28),
+            (0x0a, 0x02),
+            (0x0b, 0x24),
+            (0x0e, 0x03),
+            (0x13, 0x00),
+            (0x04, TIME_SAVE_ENABLE),
+        ] {
+            write_register(&mut stepped, register, value);
+        }
+        select_alternate_bank(&mut stepped);
+        write_register(&mut stepped, 0x03, 0x3f);
+        write_register(&mut stepped, 0x04, 0x41);
+        write_register(&mut stepped, 0x01, CLOCK_START);
+        select_main_bank(&mut stepped);
+        advance_milliseconds(&mut stepped, 7);
+        let initial = stepped.battery_state();
+
+        let mut bulk = Dp8573a::new();
+        bulk.restore_battery_state(initial, 65_432);
+        advance_milliseconds(&mut stepped, 65_432);
+
+        assert_eq!(bulk.battery_state(), stepped.battery_state());
+    }
+
+    #[test]
+    fn full_calendar_cycle_is_skipped_without_changing_the_date() {
+        let mut rtc = Dp8573a::new();
+        for (register, value) in [
+            (0x05, 0x12),
+            (0x06, 0x34),
+            (0x07, 0x56),
+            (0x08, 0x07),
+            (0x09, 0x17),
+            (0x0a, 0x08),
+            (0x0b, 0x24),
+            (0x0e, 0x05),
+        ] {
+            write_register(&mut rtc, register, value);
+        }
+        select_alternate_bank(&mut rtc);
+        write_register(&mut rtc, 0x01, CLOCK_START);
+        select_main_bank(&mut rtc);
+        let initial = rtc.battery_state();
+
+        rtc.restore_battery_state(initial, CALENDAR_CYCLE_DAYS * 24 * 60 * 60 * 1_000);
+
+        for (register, expected) in [
+            (0x05, 0x12),
+            (0x06, 0x34),
+            (0x07, 0x56),
+            (0x08, 0x07),
+            (0x09, 0x17),
+            (0x0a, 0x08),
+            (0x0b, 0x24),
+            (0x0e, 0x05),
+        ] {
+            assert_eq!(debug_read_register(&rtc, register), Ok(expected));
+        }
     }
 
     #[test]

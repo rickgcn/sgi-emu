@@ -11,6 +11,26 @@ const WRITE_DISABLE_COMMAND: u16 = 0x0400;
 const OPERATION_MASK: u16 = 0x07c0;
 const ADDRESS_MASK: u16 = 0b11_1111;
 
+/// Nonvolatile words stored by an NMC93CS46.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Nmc93cs46Contents {
+    words: [u16; WORD_COUNT],
+}
+
+impl Nmc93cs46Contents {
+    /// Creates EEPROM contents from all 64 stored words.
+    #[must_use]
+    pub const fn new(words: [u16; WORD_COUNT]) -> Self {
+        Self { words }
+    }
+
+    /// Returns all stored words in address order.
+    #[must_use]
+    pub const fn words(&self) -> &[u16; WORD_COUNT] {
+        &self.words
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Transfer {
     Command {
@@ -51,6 +71,19 @@ impl Nmc93cs46 {
             clock: false,
             data_out: false,
         }
+    }
+
+    /// Returns the nonvolatile EEPROM contents.
+    #[must_use]
+    pub const fn contents(&self) -> Nmc93cs46Contents {
+        Nmc93cs46Contents::new(self.words)
+    }
+
+    /// Restores the nonvolatile EEPROM contents and resets the serial
+    /// interface.
+    pub fn restore_contents(&mut self, contents: Nmc93cs46Contents) {
+        self.words = contents.words;
+        self.reset();
     }
 
     /// Resets the serial interface without erasing stored words.
@@ -333,5 +366,19 @@ mod tests {
         assert_eq!(read_word(&mut device, 63), 0x5aa5);
         write_word(&mut device, 63, 0);
         assert_eq!(read_word(&mut device, 63), 0x5aa5);
+    }
+
+    #[test]
+    fn contents_round_trip_resets_only_the_serial_interface() {
+        let mut source = Nmc93cs46::new();
+        write_command(&mut source, WRITE_ENABLE);
+        write_word(&mut source, 7, 0x1234);
+
+        let mut restored = Nmc93cs46::new();
+        restored.restore_contents(source.contents());
+
+        assert_eq!(read_word(&mut restored, 7), 0x1234);
+        write_word(&mut restored, 7, 0xabcd);
+        assert_eq!(read_word(&mut restored, 7), 0x1234);
     }
 }

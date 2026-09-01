@@ -7,7 +7,7 @@ use se_machine::debug::{DebugRequest, DebugResponse};
 use se_machine::indigo::ip12::debug::{
     DebugRequest as Ip12DebugRequest, DebugResponse as Ip12DebugResponse, MemoryAddressSpace,
 };
-use se_machine::machine::Machine;
+use se_machine::machine::{Machine, MachineNonvolatileState};
 use se_machine::output::MachineOutput;
 use se_machine::serial::SerialPort;
 use se_runtime::control::{RuntimeState, RuntimeStatus};
@@ -45,10 +45,10 @@ impl UiSession {
     }
 
     /// Stops the runtime worker and waits for it to exit.
-    pub fn shutdown(mut self) -> Result<(), ShutdownError> {
+    pub fn shutdown(mut self) -> Result<Option<MachineNonvolatileState>, ShutdownError> {
         match self.runtime.take() {
             Some(runtime) => runtime.shutdown(),
-            None => Ok(()),
+            None => Ok(None),
         }
     }
 

@@ -34,8 +34,8 @@ impl Error for HeadlessError {}
 /// # Errors
 ///
 /// Returns [`HeadlessError`] when terminal setup, host I/O, runtime control,
-/// guest execution, or runtime shutdown fails.
-pub fn run(runtime: Runtime) -> Result<(), HeadlessError> {
+/// or guest execution fails.
+pub fn run(runtime: &Runtime) -> Result<(), HeadlessError> {
     let _terminal = HostTerminalGuard::enter().map_err(headless_error)?;
     let output_error = Arc::new(Mutex::new(None));
     let handler_error = Arc::clone(&output_error);
@@ -107,7 +107,6 @@ pub fn run(runtime: Runtime) -> Result<(), HeadlessError> {
         }
     };
 
-    runtime.shutdown().map_err(headless_error)?;
     if normal_exit {
         input_thread.join().map_err(|_| HeadlessError {
             reason: String::from("headless input thread panicked"),

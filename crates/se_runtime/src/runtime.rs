@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration, VirtualInstant};
 use se_machine::debug::{DebugRequest, DebugResponse};
-use se_machine::machine::{ExecutionError, Machine};
+use se_machine::machine::{ExecutionError, Machine, MachineNonvolatileState};
 use se_machine::output::MachineOutput;
 use se_machine::serial::SerialPort;
 
@@ -48,7 +48,7 @@ enum Command {
         reply: CommandReply<RuntimeStatus>,
     },
     ClearOutputHandler(CommandReply<RuntimeStatus>),
-    Shutdown,
+    Shutdown(Sender<Option<MachineNonvolatileState>>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,6 +95,8 @@ impl Error for RuntimeError {}
 /// Error returned when the runtime worker cannot be shut down cleanly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShutdownError {
+    /// The worker stopped before returning its final machine state.
+    WorkerUnavailable,
     /// The worker thread panicked before it could exit.
     WorkerPanicked,
 }
@@ -102,6 +104,9 @@ pub enum ShutdownError {
 impl fmt::Display for ShutdownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WorkerUnavailable => {
+                formatter.write_str("runtime worker stopped before returning machine state")
+            }
             Self::WorkerPanicked => formatter.write_str("runtime worker panicked during shutdown"),
         }
     }
@@ -250,7 +255,7 @@ impl Runtime {
     }
 
     /// Requests shutdown and waits for the worker to exit.
-    pub fn shutdown(mut self) -> Result<(), ShutdownError> {
+    pub fn shutdown(mut self) -> Result<Option<MachineNonvolatileState>, ShutdownError> {
         self.shutdown_inner()
     }
 
@@ -274,14 +279,30 @@ impl Runtime {
             })
     }
 
-    fn shutdown_inner(&mut self) -> Result<(), ShutdownError> {
+    fn shutdown_inner(&mut self) -> Result<Option<MachineNonvolatileState>, ShutdownError> {
+        let mut final_state = None;
+        let mut state_unavailable = false;
         if let Some(command_sender) = self.command_sender.take() {
-            let _ = command_sender.send(Command::Shutdown);
+            let (reply_sender, reply_receiver) = mpsc::channel();
+            if command_sender
+                .send(Command::Shutdown(reply_sender))
+                .is_err()
+            {
+                state_unavailable = true;
+            } else {
+                match reply_receiver.recv() {
+                    Ok(state) => final_state = state,
+                    Err(_) => state_unavailable = true,
+                }
+            }
         }
         if let Some(worker) = self.worker.take() {
             worker.join().map_err(|_| ShutdownError::WorkerPanicked)?;
         }
-        Ok(())
+        if state_unavailable {
+            return Err(ShutdownError::WorkerUnavailable);
+        }
+        Ok(final_state)
     }
 }
 
@@ -362,8 +383,12 @@ impl Worker {
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
             Command::Configure { machine, reply } => {
+                let mut machine = *machine;
+                if let Some(state) = self.machine.as_ref().map(Machine::nonvolatile_state) {
+                    machine.restore_nonvolatile_state(state, 0);
+                }
                 self.cpu_clock = Some(CpuClock::new(machine.cpu_frequency_hz()));
-                self.machine = Some(*machine);
+                self.machine = Some(machine);
                 self.virtual_instant = VirtualInstant::ZERO;
                 self.machine_output = MachineOutput::default();
                 self.pending_serial = [VecDeque::new(), VecDeque::new()];
@@ -452,7 +477,11 @@ impl Worker {
                 self.output_handler = None;
                 send_reply(reply, Ok(self.status()));
             }
-            Command::Shutdown => return true,
+            Command::Shutdown(reply) => {
+                let state = self.machine.as_ref().map(Machine::nonvolatile_state);
+                let _ = reply.send(state);
+                return true;
+            }
         }
         false
     }
@@ -739,7 +768,16 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             runtime.send_serial(SerialPort::A, b"A"),
             Err(RuntimeError::CommandRejected { .. })
         ));
-        assert_eq!(runtime.shutdown(), Ok(()));
+        assert_eq!(runtime.shutdown(), Ok(None));
+    }
+
+    #[test]
+    fn configured_runtime_returns_final_nonvolatile_state_on_shutdown() {
+        let machine = machine_with_instructions(&[0]);
+        let expected = machine.nonvolatile_state();
+        let runtime = Runtime::new(Some(machine)).unwrap();
+
+        assert_eq!(runtime.shutdown(), Ok(Some(expected)));
     }
 
     #[test]

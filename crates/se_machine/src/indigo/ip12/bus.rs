@@ -1,11 +1,11 @@
 use se_core::bus::{BusFault, DeviceAddr, PhysAddr, PhysicalBus};
 use se_core::time::VirtualDuration;
-use se_device::dp8573a::Dp8573a;
+use se_device::dp8573a::{Dp8573a, Dp8573aBatteryState};
 use se_device::dsp56001::Dsp56001;
 use se_device::hpc1::Hpc1;
 use se_device::int2::Int2;
 use se_device::mdac::Mdac;
-use se_device::nmc93cs46::Nmc93cs46;
+use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
@@ -126,6 +126,20 @@ impl Ip12Bus {
         self.mdac.reset();
         self.nvram.reset();
         self.cpu_aux_control = 0;
+    }
+
+    pub(super) fn nonvolatile_state(&self) -> (Nmc93cs46Contents, Dp8573aBatteryState) {
+        (self.nvram.contents(), self.rtc.battery_state())
+    }
+
+    pub(super) fn restore_nonvolatile_state(
+        &mut self,
+        nvram: Nmc93cs46Contents,
+        rtc: Dp8573aBatteryState,
+        offline_milliseconds: u64,
+    ) {
+        self.nvram.restore_contents(nvram);
+        self.rtc.restore_battery_state(rtc, offline_milliseconds);
     }
 
     pub(super) fn take_system_reset_request(&mut self) -> bool {

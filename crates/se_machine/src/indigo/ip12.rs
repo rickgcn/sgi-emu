@@ -9,12 +9,12 @@ use std::fmt;
 
 use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::{R3000, R3000Config, StepError};
-use se_device::dp8573a::Dp8573a;
+use se_device::dp8573a::{Dp8573a, Dp8573aBatteryState, Dp8573aStateError};
 use se_device::dsp56001::Dsp56001;
 use se_device::hpc1::Hpc1;
 use se_device::int2::Int2;
 use se_device::mdac::Mdac;
-use se_device::nmc93cs46::Nmc93cs46;
+use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
@@ -58,6 +58,97 @@ impl fmt::Display for Ip12Error {
 
 impl Error for Ip12Error {}
 
+/// Nonvolatile state retained by an Indigo IP12.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ip12NonvolatileState {
+    nvram: Nmc93cs46Contents,
+    rtc: Dp8573aBatteryState,
+}
+
+/// Fixed-width data used to import or export Indigo IP12 nonvolatile state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ip12NonvolatileStateParts {
+    /// Serial EEPROM words in address order.
+    pub nvram_words: [u16; 64],
+    /// Main DP8573A register storage.
+    pub rtc_registers: [u8; 32],
+    /// Alternate DP8573A control register storage.
+    pub rtc_alternate_control_registers: [u8; 4],
+    /// Sub-millisecond RTC prescaler phase in attoseconds.
+    pub rtc_prescaler_phase_attoseconds: u64,
+    /// RTC millisecond position within the current hundredth.
+    pub rtc_millisecond_within_hundredth: u8,
+    /// Whether the RTC oscillator-failed flag is set.
+    pub rtc_oscillator_failed: bool,
+    /// Whether the RTC uses single-supply operation.
+    pub rtc_single_supply: bool,
+    /// Whether the RTC alarm comparison is currently active.
+    pub rtc_alarm_match_active: bool,
+}
+
+/// An invalid Indigo IP12 nonvolatile state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ip12NonvolatileStateError(Dp8573aStateError);
+
+impl fmt::Display for Ip12NonvolatileStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid Indigo IP12 nonvolatile state: {}",
+            self.0
+        )
+    }
+}
+
+impl Error for Ip12NonvolatileStateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl Ip12NonvolatileState {
+    const fn new(nvram: Nmc93cs46Contents, rtc: Dp8573aBatteryState) -> Self {
+        Self { nvram, rtc }
+    }
+
+    /// Returns a fixed-width representation without exposing device types.
+    #[must_use]
+    pub fn parts(&self) -> Ip12NonvolatileStateParts {
+        Ip12NonvolatileStateParts {
+            nvram_words: *self.nvram.words(),
+            rtc_registers: *self.rtc.registers(),
+            rtc_alternate_control_registers: *self.rtc.alternate_control_registers(),
+            rtc_prescaler_phase_attoseconds: self.rtc.prescaler_phase_attoseconds(),
+            rtc_millisecond_within_hundredth: self.rtc.millisecond_within_hundredth(),
+            rtc_oscillator_failed: self.rtc.oscillator_failed(),
+            rtc_single_supply: self.rtc.single_supply(),
+            rtc_alarm_match_active: self.rtc.alarm_match_active(),
+        }
+    }
+
+    /// Creates validated state from its fixed-width representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ip12NonvolatileStateError`] when an RTC phase is outside its
+    /// valid range.
+    pub fn try_from_parts(
+        parts: Ip12NonvolatileStateParts,
+    ) -> Result<Self, Ip12NonvolatileStateError> {
+        let rtc = Dp8573aBatteryState::new(
+            parts.rtc_registers,
+            parts.rtc_alternate_control_registers,
+            parts.rtc_prescaler_phase_attoseconds,
+            parts.rtc_millisecond_within_hundredth,
+            parts.rtc_oscillator_failed,
+            parts.rtc_single_supply,
+            parts.rtc_alarm_match_active,
+        )
+        .map_err(Ip12NonvolatileStateError)?;
+        Ok(Self::new(Nmc93cs46Contents::new(parts.nvram_words), rtc))
+    }
+}
+
 /// An SGI Indigo IP12 with an R3000A and R3010.
 pub struct Ip12 {
     cpu: R3000,
@@ -89,6 +180,26 @@ impl Ip12 {
                 prom,
             ),
         })
+    }
+
+    /// Returns the state retained across machine reconstruction and
+    /// application sessions.
+    #[must_use]
+    pub fn nonvolatile_state(&self) -> Ip12NonvolatileState {
+        let (nvram, rtc) = self.bus.nonvolatile_state();
+        Ip12NonvolatileState::new(nvram, rtc)
+    }
+
+    /// Restores retained state and advances a running RTC by elapsed offline
+    /// milliseconds.
+    pub fn restore_nonvolatile_state(
+        &mut self,
+        state: Ip12NonvolatileState,
+        offline_milliseconds: u64,
+    ) {
+        self.bus
+            .restore_nonvolatile_state(state.nvram, state.rtc, offline_milliseconds);
+        self.update_interrupt_lines();
     }
 
     /// Restores the machine reset state.
@@ -171,7 +282,10 @@ mod tests {
     use se_core::bus::{PhysAddr, PhysicalBus};
     use se_float::backend::Backend;
 
-    use super::{CPU_FREQUENCY_HZ, Ip12, Ip12Error, PROM_BYTES, RAM_BYTES, cpu_config};
+    use super::{
+        CPU_FREQUENCY_HZ, Ip12, Ip12Error, Ip12NonvolatileState, Ip12NonvolatileStateParts,
+        PROM_BYTES, RAM_BYTES, cpu_config,
+    };
 
     const MEMORY_CONFIGURATION_INSTRUCTION_BUDGET: usize = 300_000;
     const STACK_SETUP_INSTRUCTION_BUDGET: usize = 30_000;
@@ -185,6 +299,57 @@ mod tests {
                 actual
             }) if actual == PROM_BYTES - 1
         ));
+    }
+
+    #[test]
+    fn nonvolatile_state_parts_round_trip_without_device_types() {
+        let mut nvram_words = [u16::MAX; 64];
+        nvram_words[7] = 0x1234;
+        let mut rtc_registers = [0; 32];
+        rtc_registers[6] = 0x42;
+        let parts = Ip12NonvolatileStateParts {
+            nvram_words,
+            rtc_registers,
+            rtc_alternate_control_registers: [0x08, 0x11, 0x22, 0x33],
+            rtc_prescaler_phase_attoseconds: 500,
+            rtc_millisecond_within_hundredth: 7,
+            rtc_oscillator_failed: false,
+            rtc_single_supply: true,
+            rtc_alarm_match_active: false,
+        };
+
+        let state = Ip12NonvolatileState::try_from_parts(parts).unwrap();
+
+        assert_eq!(state.parts(), parts);
+    }
+
+    #[test]
+    fn nonvolatile_state_parts_validate_rtc_phases() {
+        let base = Ip12NonvolatileStateParts {
+            nvram_words: [u16::MAX; 64],
+            rtc_registers: [0; 32],
+            rtc_alternate_control_registers: [0; 4],
+            rtc_prescaler_phase_attoseconds: 0,
+            rtc_millisecond_within_hundredth: 0,
+            rtc_oscillator_failed: false,
+            rtc_single_supply: false,
+            rtc_alarm_match_active: false,
+        };
+
+        assert!(
+            Ip12NonvolatileState::try_from_parts(Ip12NonvolatileStateParts {
+                rtc_prescaler_phase_attoseconds: 1_000_000_000_000_000,
+                ..base
+            })
+            .is_err()
+        );
+        assert!(
+            Ip12NonvolatileState::try_from_parts(Ip12NonvolatileStateParts {
+                rtc_millisecond_within_hundredth: 10,
+                ..base
+            })
+            .is_err()
+        );
     }
 
     #[test]
