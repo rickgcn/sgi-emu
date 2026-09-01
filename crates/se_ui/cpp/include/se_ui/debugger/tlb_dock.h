@@ -25,6 +25,10 @@ private:
     QTabBar* tabs_;
     QCheckBox* valid_only_;
     QLabel* status_;
+    QWidget* summary_;
+    QLabel* shutdown_value_;
+    QLabel* index_value_;
+    QLabel* random_value_;
     QTableView* table_;
     std::uint64_t revision_;
 };

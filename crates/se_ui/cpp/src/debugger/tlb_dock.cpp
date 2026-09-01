@@ -67,6 +67,10 @@ TlbDock::TlbDock(const UiSession& session, QWidget* parent)
     , tabs_(new QTabBar(this))
     , valid_only_(new QCheckBox(QStringLiteral("Valid only"), this))
     , status_(new QLabel(QStringLiteral("No machine configured."), this))
+    , summary_(new QWidget(this))
+    , shutdown_value_(new QLabel(summary_))
+    , index_value_(new QLabel(summary_))
+    , random_value_(new QLabel(summary_))
     , table_(new CopyTableView(this))
     , revision_(std::numeric_limits<std::uint64_t>::max()) {
     setObjectName(QStringLiteral("TlbDock"));
@@ -78,6 +82,25 @@ TlbDock::TlbDock(const UiSession& session, QWidget* parent)
     controls->addSpacing(8);
     controls->addWidget(valid_only_);
     controls->addStretch();
+
+    const auto fixed_font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    shutdown_value_->setFont(fixed_font);
+    index_value_->setFont(fixed_font);
+    random_value_->setFont(fixed_font);
+
+    auto* summary_layout = new QHBoxLayout(summary_);
+    summary_layout->setContentsMargins(0, 0, 0, 0);
+    summary_layout->setSpacing(4);
+    summary_layout->addWidget(new QLabel(QStringLiteral("Shutdown:"), summary_));
+    summary_layout->addWidget(shutdown_value_);
+    summary_layout->addSpacing(12);
+    summary_layout->addWidget(new QLabel(QStringLiteral("Index:"), summary_));
+    summary_layout->addWidget(index_value_);
+    summary_layout->addSpacing(12);
+    summary_layout->addWidget(new QLabel(QStringLiteral("Random:"), summary_));
+    summary_layout->addWidget(random_value_);
+    summary_layout->addStretch();
+    summary_->hide();
 
     table_->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
@@ -93,6 +116,7 @@ TlbDock::TlbDock(const UiSession& session, QWidget* parent)
     layout->setContentsMargins(6, 6, 6, 6);
     layout->addLayout(controls);
     layout->addWidget(status_);
+    layout->addWidget(summary_);
     layout->addWidget(table_);
     setWidget(container);
 
@@ -117,10 +141,11 @@ void TlbDock::refresh() {
         return;
     }
     revision_ = data.revision;
-    status_->setText(QStringLiteral("Shutdown: %1    Index: %2    Random: %3")
-                         .arg(data.shutdown ? QStringLiteral("true") : QStringLiteral("false"))
-                         .arg(data.index)
-                         .arg(data.random));
+    shutdown_value_->setText(data.shutdown ? QStringLiteral("true") : QStringLiteral("false"));
+    index_value_->setText(QString::number(data.index));
+    random_value_->setText(QString::number(data.random));
+    status_->hide();
+    summary_->show();
 
     auto* model = new QStandardItemModel(table_);
     model->setHorizontalHeaderLabels({
@@ -155,6 +180,8 @@ void TlbDock::refresh() {
 void TlbDock::clear() {
     revision_ = std::numeric_limits<std::uint64_t>::max();
     status_->setText(QStringLiteral("No machine configured."));
+    summary_->hide();
+    status_->show();
     auto* previous = table_->model();
     table_->setModel(nullptr);
     delete previous;
