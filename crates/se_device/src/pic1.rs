@@ -8,6 +8,8 @@ const SYSTEM_ID: u64 = 0x0008;
 const MEMORY_CONFIGURATION_0: u64 = 0x1_0000;
 const MEMORY_CONFIGURATION_1: u64 = 0x1_0004;
 const PARITY_ERROR: u64 = 0x1_0200;
+const CPU_ERROR_ADDRESS: u64 = 0x1_0204;
+const GIO_ERROR_ADDRESS: u64 = 0x1_0208;
 const CLEAR_ERROR: u64 = 0x1_0210;
 const GIO_BURST: u64 = 0x2_0008;
 const GIO_DELAY: u64 = 0x2_000c;
@@ -28,6 +30,8 @@ pub struct Pic1 {
     cpu_control: u16,
     memory_descriptors: [u16; 4],
     parity_error: u8,
+    cpu_error_address: u32,
+    gio_error_address: u32,
     address_error_pending: bool,
     gio_burst: u8,
     gio_delay: u8,
@@ -52,6 +56,8 @@ impl Pic1 {
             cpu_control: 0,
             memory_descriptors: [0; 4],
             parity_error: 0,
+            cpu_error_address: 0,
+            gio_error_address: 0,
             address_error_pending: false,
             gio_burst: 0,
             gio_delay: 0,
@@ -65,6 +71,8 @@ impl Pic1 {
         self.cpu_control = 0;
         self.memory_descriptors = [0; 4];
         self.parity_error = 0;
+        self.cpu_error_address = 0;
+        self.gio_error_address = 0;
         self.address_error_pending = false;
         self.gio_burst = 0;
         self.gio_delay = 0;
@@ -96,6 +104,10 @@ impl Pic1 {
             read_register(u32::from(self.system_id()), offset, data);
         } else if let Some(offset) = register_offset(start, end, PARITY_ERROR) {
             read_register(u32::from(self.parity_error), offset, data);
+        } else if let Some(offset) = register_offset(start, end, CPU_ERROR_ADDRESS) {
+            read_register(self.cpu_error_address, offset, data);
+        } else if let Some(offset) = register_offset(start, end, GIO_ERROR_ADDRESS) {
+            read_register(self.gio_error_address, offset, data);
         } else if register_offset(start, end, CLEAR_ERROR).is_some() {
             return Err(BusFault::UnsupportedAccess);
         } else if let Some(offset) = register_offset(start, end, GIO_BURST) {
@@ -137,6 +149,8 @@ impl Pic1 {
         } else if register_offset(start, end, RESET_CONFIGURATION).is_some()
             || register_offset(start, end, SYSTEM_ID).is_some()
             || register_offset(start, end, PARITY_ERROR).is_some()
+            || register_offset(start, end, CPU_ERROR_ADDRESS).is_some()
+            || register_offset(start, end, GIO_ERROR_ADDRESS).is_some()
         {
             return Err(BusFault::UnsupportedAccess);
         } else if register_offset(start, end, CLEAR_ERROR).is_some() {
@@ -284,9 +298,9 @@ mod tests {
     use se_core::bus::{BusFault, DeviceAddr, PhysAddr};
 
     use super::{
-        CLEAR_ERROR, CPU_CONTROL, DESCRIPTOR_ARRAY_BASE, GIO_BURST, GIO_DELAY,
-        MEMORY_CONFIGURATION_0, MEMORY_CONFIGURATION_1, PARITY_ERROR, Pic1, RESET_CONFIGURATION,
-        SYSTEM_ID,
+        CLEAR_ERROR, CPU_CONTROL, CPU_ERROR_ADDRESS, DESCRIPTOR_ARRAY_BASE, GIO_BURST, GIO_DELAY,
+        GIO_ERROR_ADDRESS, MEMORY_CONFIGURATION_0, MEMORY_CONFIGURATION_1, PARITY_ERROR, Pic1,
+        RESET_CONFIGURATION, SYSTEM_ID,
     };
 
     fn pic1() -> Pic1 {
@@ -309,6 +323,8 @@ mod tests {
         assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_0), Ok(0));
         assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_1), Ok(0));
         assert_eq!(read_word(&pic1, PARITY_ERROR), Ok(0));
+        assert_eq!(read_word(&pic1, CPU_ERROR_ADDRESS), Ok(0));
+        assert_eq!(read_word(&pic1, GIO_ERROR_ADDRESS), Ok(0));
         assert_eq!(read_word(&pic1, GIO_BURST), Ok(0));
         assert_eq!(read_word(&pic1, GIO_DELAY), Ok(0));
         assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0));
@@ -408,6 +424,8 @@ mod tests {
     fn clear_error_is_a_write_only_strobe() {
         let mut pic1 = pic1();
         pic1.parity_error = 0xa5;
+        pic1.cpu_error_address = 0x1234_5678;
+        pic1.gio_error_address = 0x9abc_def0;
         pic1.report_cpu_write_bus_error();
 
         assert!(pic1.error_interrupt_asserted());
@@ -421,7 +439,51 @@ mod tests {
             Ok(())
         );
         assert_eq!(read_word(&pic1, PARITY_ERROR), Ok(0));
+        assert_eq!(read_word(&pic1, CPU_ERROR_ADDRESS), Ok(0x1234_5678));
+        assert_eq!(read_word(&pic1, GIO_ERROR_ADDRESS), Ok(0x9abc_def0));
         assert!(!pic1.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn error_address_registers_use_big_endian_lanes() {
+        let mut pic1 = pic1();
+        pic1.cpu_error_address = 0x1234_5678;
+        pic1.gio_error_address = 0x9abc_def0;
+
+        assert_eq!(read_word(&pic1, CPU_ERROR_ADDRESS), Ok(0x1234_5678));
+        assert_eq!(read_word(&pic1, GIO_ERROR_ADDRESS), Ok(0x9abc_def0));
+
+        let mut cpu_first = [0];
+        let mut cpu_last = [0];
+        let mut gio_middle = [0; 2];
+        assert_eq!(
+            pic1.read(DeviceAddr::new(CPU_ERROR_ADDRESS), &mut cpu_first),
+            Ok(())
+        );
+        assert_eq!(
+            pic1.read(DeviceAddr::new(CPU_ERROR_ADDRESS + 3), &mut cpu_last),
+            Ok(())
+        );
+        assert_eq!(
+            pic1.read(DeviceAddr::new(GIO_ERROR_ADDRESS + 1), &mut gio_middle),
+            Ok(())
+        );
+        assert_eq!(cpu_first, [0x12]);
+        assert_eq!(cpu_last, [0x78]);
+        assert_eq!(gio_middle, [0xbc, 0xde]);
+    }
+
+    #[test]
+    fn prom_error_register_sequence_is_mapped() {
+        let mut pic1 = pic1();
+
+        assert_eq!(read_word(&pic1, PARITY_ERROR), Ok(0));
+        assert_eq!(read_word(&pic1, CPU_ERROR_ADDRESS), Ok(0));
+        assert_eq!(read_word(&pic1, GIO_ERROR_ADDRESS), Ok(0));
+        assert_eq!(
+            pic1.write(DeviceAddr::new(CLEAR_ERROR), &0_u32.to_be_bytes()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -537,7 +599,13 @@ mod tests {
     fn read_only_registers_reject_writes() {
         let mut pic1 = pic1();
 
-        for address in [RESET_CONFIGURATION, SYSTEM_ID, PARITY_ERROR] {
+        for address in [
+            RESET_CONFIGURATION,
+            SYSTEM_ID,
+            PARITY_ERROR,
+            CPU_ERROR_ADDRESS,
+            GIO_ERROR_ADDRESS,
+        ] {
             assert_eq!(
                 pic1.write(DeviceAddr::new(address), &[0]),
                 Err(BusFault::UnsupportedAccess)
@@ -549,6 +617,8 @@ mod tests {
     fn reset_clears_mutable_state_and_pending_requests() {
         let mut pic1 = pic1();
         pic1.parity_error = 0xff;
+        pic1.cpu_error_address = 0x1234_5678;
+        pic1.gio_error_address = 0x9abc_def0;
         pic1.report_cpu_write_bus_error();
         pic1.write(DeviceAddr::new(CPU_CONTROL), &0x0000_0201_u32.to_be_bytes())
             .unwrap();
@@ -571,6 +641,8 @@ mod tests {
         assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_0), Ok(0));
         assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_1), Ok(0));
         assert_eq!(read_word(&pic1, PARITY_ERROR), Ok(0));
+        assert_eq!(read_word(&pic1, CPU_ERROR_ADDRESS), Ok(0));
+        assert_eq!(read_word(&pic1, GIO_ERROR_ADDRESS), Ok(0));
         assert_eq!(read_word(&pic1, GIO_BURST), Ok(0));
         assert_eq!(read_word(&pic1, GIO_DELAY), Ok(0));
         assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0));
@@ -595,6 +667,10 @@ mod tests {
         );
         assert_eq!(
             pic1.write(DeviceAddr::new(DESCRIPTOR_ARRAY_BASE + 3), &[1, 2]),
+            Err(BusFault::Unmapped)
+        );
+        assert_eq!(
+            pic1.read(DeviceAddr::new(CPU_ERROR_ADDRESS + 3), &mut [0; 2]),
             Err(BusFault::Unmapped)
         );
         assert_eq!(
