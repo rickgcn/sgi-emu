@@ -8,6 +8,7 @@
 class QLineEdit;
 class QPlainTextEdit;
 class QCheckBox;
+class QPushButton;
 
 namespace se_ui {
 
@@ -26,6 +27,7 @@ private:
 
     const UiSession& session_;
     QLineEdit* address_edit_;
+    QPushButton* breakpoint_button_;
     QCheckBox* follow_pc_;
     QPlainTextEdit* text_view_;
     std::uint32_t start_;

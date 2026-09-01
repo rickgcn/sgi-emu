@@ -4,10 +4,12 @@
 
 #include <QAction>
 #include <QCheckBox>
+#include <QContextMenuEvent>
 #include <QFontDatabase>
 #include <QHBoxLayout>
 #include <QKeySequence>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -58,6 +60,24 @@ public:
     }
 
 protected:
+    void contextMenuEvent(QContextMenuEvent* event) override {
+        const auto clicked = cursorForPosition(event->pos());
+        const auto current = textCursor();
+        if (!current.hasSelection() || clicked.position() < current.selectionStart()
+            || clicked.position() >= current.selectionEnd()) {
+            setTextCursor(clicked);
+        }
+        auto* menu = createStandardContextMenu();
+        menu->addSeparator();
+        auto* toggle_breakpoint = menu->addAction(QStringLiteral("Toggle Breakpoint"));
+        toggle_breakpoint->setShortcut(QKeySequence(QStringLiteral("F9")));
+        if (menu->exec(event->globalPos()) == toggle_breakpoint) {
+            setTextCursor(clicked);
+            toggle_breakpoint_();
+        }
+        delete menu;
+    }
+
     void mouseDoubleClickEvent(QMouseEvent* event) override {
         QPlainTextEdit::mouseDoubleClickEvent(event);
         toggle_breakpoint_();
@@ -96,6 +116,7 @@ DisassemblyDock::DisassemblyDock(const UiSession& session, QWidget* parent)
     : QDockWidget(QStringLiteral("Disassembly"), parent)
     , session_(session)
     , address_edit_(new QLineEdit(QStringLiteral("0xbfc00000"), this))
+    , breakpoint_button_(new QPushButton(QStringLiteral("Toggle Breakpoint"), this))
     , follow_pc_(new QCheckBox(QStringLiteral("Follow PC"), this))
     , text_view_(new DisassemblyView([this] { toggle_selected_breakpoint(); }, this))
     , start_(0xbfc0'0000)
@@ -110,7 +131,9 @@ DisassemblyDock::DisassemblyDock(const UiSession& session, QWidget* parent)
     auto* controls = new QHBoxLayout;
     controls->addWidget(address_edit_);
     controls->addWidget(go_button);
+    controls->addWidget(breakpoint_button_);
     controls->addWidget(follow_pc_);
+    breakpoint_button_->setEnabled(false);
 
     auto* container = new QWidget(this);
     auto* layout = new QVBoxLayout(container);
@@ -120,6 +143,11 @@ DisassemblyDock::DisassemblyDock(const UiSession& session, QWidget* parent)
     setWidget(container);
 
     connect(go_button, &QPushButton::clicked, this, &DisassemblyDock::apply_address);
+    connect(
+        breakpoint_button_,
+        &QPushButton::clicked,
+        this,
+        &DisassemblyDock::toggle_selected_breakpoint);
     connect(address_edit_, &QLineEdit::returnPressed, this, &DisassemblyDock::apply_address);
     connect(follow_pc_, &QCheckBox::toggled, this, [this] {
         if (!follow_pc_->isChecked()) {
@@ -129,7 +157,7 @@ DisassemblyDock::DisassemblyDock(const UiSession& session, QWidget* parent)
         refresh();
     });
 
-    auto* toggle_breakpoint = new QAction(QStringLiteral("Toggle breakpoint"), text_view_);
+    auto* toggle_breakpoint = new QAction(QStringLiteral("Toggle Breakpoint"), this);
     toggle_breakpoint->setShortcut(QKeySequence(QStringLiteral("F9")));
     toggle_breakpoint->setShortcutContext(Qt::WidgetWithChildrenShortcut);
     connect(
@@ -137,7 +165,7 @@ DisassemblyDock::DisassemblyDock(const UiSession& session, QWidget* parent)
         &QAction::triggered,
         this,
         &DisassemblyDock::toggle_selected_breakpoint);
-    text_view_->addAction(toggle_breakpoint);
+    addAction(toggle_breakpoint);
 }
 
 void DisassemblyDock::refresh() {
@@ -164,6 +192,7 @@ void DisassemblyDock::refresh() {
     revision_ = data.revision;
     line_addresses_.clear();
     line_addresses_.reserve(data.lines.size());
+    breakpoint_button_->setEnabled(!data.lines.empty());
 
     QString text;
     int current_block = -1;
@@ -172,14 +201,14 @@ void DisassemblyDock::refresh() {
             current_block = static_cast<int>(line_addresses_.size());
         }
         line_addresses_.push_back(line.address);
-        const auto marker = line.current ? QStringLiteral("=>")
-            : line.breakpoint             ? QStringLiteral(" *")
-                                          : QStringLiteral("  ");
+        const auto breakpoint_marker = line.breakpoint ? QStringLiteral("*") : QStringLiteral(" ");
+        const auto pc_marker = line.current ? QStringLiteral("=>") : QStringLiteral("  ");
         const auto word = line.readable
             ? QStringLiteral("%1").arg(line.word, 8, 16, QLatin1Char('0'))
             : QStringLiteral("????????");
-        text += QStringLiteral("%1  %2  %3  %4\n")
-                    .arg(marker)
+        text += QStringLiteral("%1 %2  %3  %4  %5\n")
+                    .arg(breakpoint_marker)
+                    .arg(pc_marker)
                     .arg(line.address, 8, 16, QLatin1Char('0'))
                     .arg(word)
                     .arg(from_rust_string(line.text));
@@ -194,6 +223,7 @@ void DisassemblyDock::refresh() {
 void DisassemblyDock::clear() {
     revision_ = std::numeric_limits<std::uint64_t>::max();
     line_addresses_.clear();
+    breakpoint_button_->setEnabled(false);
     static_cast<DisassemblyView*>(text_view_)->stop_following();
     text_view_->setPlainText(QStringLiteral("No machine configured."));
 }
