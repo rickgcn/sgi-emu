@@ -1364,6 +1364,8 @@ mod tests {
     #[test]
     fn translation_shutdown_changes_only_status_ts() {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        state.mmu.complete_write(24, 0, 0);
+        state.mmu.complete_write(25, 0, 0);
         state.pending_gpr_write = Some(PendingGprWrite {
             index: 1,
             value: 0x1111_1111,

@@ -65,8 +65,8 @@ struct TlbEntry {
 }
 
 impl TlbEntry {
-    const ZERO: Self = Self {
-        entry_hi: 0,
+    const INITIAL_INVALID: Self = Self {
+        entry_hi: KSEG0_START,
         entry_lo: 0,
     };
 
@@ -98,8 +98,8 @@ pub(super) struct Mmu {
 impl Mmu {
     pub(super) const fn new() -> Self {
         Self {
-            entries: [TlbEntry::ZERO; TLB_ENTRY_COUNT],
-            instruction_entries: [TlbEntry::ZERO; TLB_ENTRY_COUNT],
+            entries: [TlbEntry::INITIAL_INVALID; TLB_ENTRY_COUNT],
+            instruction_entries: [TlbEntry::INITIAL_INVALID; TLB_ENTRY_COUNT],
             pending_instruction_writes: [None; 2],
         }
     }
@@ -230,8 +230,8 @@ impl Mmu {
 mod tests {
     use super::{
         AccessType, Cacheability, ENTRY_HI_ASID_MASK, ENTRY_HI_VPN_MASK, ENTRY_LO_DIRTY,
-        ENTRY_LO_GLOBAL, ENTRY_LO_NONCACHEABLE, ENTRY_LO_VALID, Mmu, ProbeResult, TLB_ENTRY_COUNT,
-        Translation, TranslationFault,
+        ENTRY_LO_GLOBAL, ENTRY_LO_NONCACHEABLE, ENTRY_LO_VALID, KSEG0_START, Mmu, ProbeResult,
+        TLB_ENTRY_COUNT, Translation, TranslationFault,
     };
     use se_core::bus::PhysAddr;
 
@@ -269,17 +269,19 @@ mod tests {
     }
 
     #[test]
-    fn new_initializes_zero_entries_and_duplicate_zero_tags() {
+    fn new_initializes_safe_invalid_entries() {
         let mmu = Mmu::new();
 
         for index in 0..TLB_ENTRY_COUNT {
-            assert_eq!(mmu.read_indexed(index), (0, 0));
+            assert_eq!(mmu.read_indexed(index), (KSEG0_START, 0));
         }
-        assert_eq!(
-            mmu.translate(0, 0, true, AccessType::Load),
-            Err(TranslationFault::Shutdown)
-        );
-        assert_eq!(mmu.probe(0), ProbeResult::Shutdown);
+        for access in [AccessType::Load, AccessType::Instruction] {
+            assert_eq!(
+                mmu.translate(0, 0, true, access),
+                Err(TranslationFault::Miss)
+            );
+        }
+        assert_eq!(mmu.probe(0), ProbeResult::Miss);
     }
 
     #[test]

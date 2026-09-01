@@ -1234,7 +1234,7 @@ mod tests {
             completed((
                 None,
                 Some(InstructionEffect::DelayedTlbRead {
-                    entry_hi: 0,
+                    entry_hi: 0x8000_0000,
                     entry_lo: 0,
                 })
             ))
@@ -1263,9 +1263,12 @@ mod tests {
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Tlbp, false),
-            Err(StepError::TlbShutdown)
+            completed((
+                None,
+                Some(InstructionEffect::DelayedTlbProbe { index: 1 << 31 })
+            ))
         );
-        assert!(state.is_tlb_shutdown());
+        assert!(!state.is_tlb_shutdown());
     }
 
     #[test]

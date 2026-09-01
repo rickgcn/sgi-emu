@@ -959,7 +959,7 @@ mod tests {
 
     #[test]
     fn instruction_miss_and_invalid_select_distinct_boot_vectors() {
-        let virtual_address = 0x0040_0000;
+        let virtual_address = 0;
 
         let mut miss_processor = R3000::new(super::TEST_CONFIG);
         jump_to(&mut miss_processor, virtual_address);
@@ -2084,6 +2084,10 @@ mod tests {
     #[test]
     fn data_translation_shutdown_stalls_the_instruction() {
         let mut processor = R3000::new(super::TEST_CONFIG);
+        for index in [24, 25] {
+            install_and_sync_tlb_entry(&mut processor, index, 0, 0, 0);
+        }
+        processor.reset();
         processor.state.write_gpr(1, 0);
         processor.state.write_gpr(2, 0x1111_1111);
         let core_before = snapshot(&processor);
@@ -2561,6 +2565,10 @@ mod tests {
     #[test]
     fn translation_shutdown_sets_only_ts_and_stalls_the_processor() {
         let mut processor = R3000::new(super::TEST_CONFIG);
+        for index in [24, 25] {
+            install_and_sync_tlb_entry(&mut processor, index, 0, 0, 0);
+        }
+        processor.reset();
         processor.state.write_gpr(1, 0x1111_1111);
         processor.state.write_gpr(3, 0);
         step_with_word(&mut processor, encode_register(3, 0, 0, 0x08)).expect("JR should succeed");
@@ -2593,6 +2601,10 @@ mod tests {
     #[test]
     fn tlbp_duplicate_shutdown_does_not_complete_pending_transfer() {
         let mut processor = R3000::new(super::TEST_CONFIG);
+        for index in [24, 25] {
+            install_and_sync_tlb_entry(&mut processor, index, 0, 0, 0);
+        }
+        processor.reset();
         processor.state.write_gpr(1, 0x1111_1111);
         step_with_word(&mut processor, encode_cp0_transfer(0x00, 1, 15))
             .expect("MFC0 should succeed");
@@ -3043,6 +3055,10 @@ mod tests {
     #[test]
     fn tlb_shutdown_precedes_an_enabled_interrupt() {
         let mut processor = R3000::new(super::TEST_CONFIG);
+        for index in [24, 25] {
+            install_and_sync_tlb_entry(&mut processor, index, 0, 0, 0);
+        }
+        processor.reset();
         set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
         processor.set_hardware_interrupt_lines(1);
         assert_eq!(
