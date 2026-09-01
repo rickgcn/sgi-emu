@@ -291,6 +291,9 @@ void MainWindow::update_runtime() {
 }
 
 void MainWindow::refresh_debuggers() {
+    if (!isVisible() || isMinimized()) {
+        return;
+    }
     if (registers_dock_->isVisible()) {
         registers_dock_->refresh();
     }
