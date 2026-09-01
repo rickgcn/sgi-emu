@@ -135,6 +135,7 @@ impl Ip12Bus {
 
     pub(super) fn advance_time(&mut self, elapsed: VirtualDuration, output: &mut MachineOutput) {
         self.int2.advance_time(elapsed);
+        self.rtc.advance_time(elapsed);
         self.serial[0].advance_time(elapsed, |_, _| {});
         self.serial[1].advance_time(elapsed, |channel, value| {
             let port = match channel {
@@ -159,7 +160,7 @@ impl Ip12Bus {
             Target::Serial(index, address) => self.serial[index].debug_read(address, data),
             Target::UnpopulatedSerial(_) => Err(BusFault::Unmapped),
             Target::Mdac(address) => self.mdac.read(address, data),
-            Target::Rtc(address) => self.rtc.read(address, data),
+            Target::Rtc(address) => self.rtc.debug_read(address, data),
             Target::BoardRevision => read_board_revision(data),
             Target::Dsp56001(address) => self.dsp56001.read(address, data),
             Target::Prom(address) => self.prom.read(address, data),
@@ -779,6 +780,54 @@ mod tests {
 
         assert_eq!(output.serial(SerialPort::A), [0x22]);
         assert!(output.serial(SerialPort::B).is_empty());
+    }
+
+    #[test]
+    fn machine_time_advances_the_rtc_without_connecting_its_interrupt_to_int2() {
+        let mut bus = bus();
+        let mut output = MachineOutput::default();
+        bus.write(PhysAddr::new(RTC_BASE + 0x03), &[0x40]).unwrap();
+        bus.write(PhysAddr::new(RTC_BASE + 0x0f), &[0x20]).unwrap();
+        bus.write(PhysAddr::new(RTC_BASE + 0x07), &[0x08]).unwrap();
+        bus.write(PhysAddr::new(RTC_BASE + 0x03), &[0]).unwrap();
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND / 100),
+            &mut output,
+        );
+
+        assert_eq!(read_byte(&mut bus, RTC_BASE + 0x17), Ok(1));
+        let mut periodic_flags = [0xff];
+        bus.debug_read(PhysAddr::new(RTC_BASE + 0x0f), &mut periodic_flags)
+            .unwrap();
+        assert_eq!(periodic_flags, [0x30]);
+        assert_eq!(read_byte(&mut bus, RTC_BASE + 0x03), Ok(0x05));
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
+        assert_eq!(read_byte(&mut bus, RTC_BASE + 0x0f), Ok(0x30));
+        bus.debug_read(PhysAddr::new(RTC_BASE + 0x0f), &mut periodic_flags)
+            .unwrap();
+        assert_eq!(periodic_flags, [0]);
+    }
+
+    #[test]
+    fn reset_preserves_the_rtc_prescaler_phase() {
+        let mut bus = bus();
+        let mut output = MachineOutput::default();
+        bus.write(PhysAddr::new(RTC_BASE + 0x03), &[0x40]).unwrap();
+        bus.write(PhysAddr::new(RTC_BASE + 0x07), &[0x08]).unwrap();
+        bus.write(PhysAddr::new(RTC_BASE + 0x03), &[0]).unwrap();
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND * 9 / 1_000),
+            &mut output,
+        );
+
+        bus.reset();
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND / 1_000),
+            &mut output,
+        );
+
+        assert_eq!(read_byte(&mut bus, RTC_BASE + 0x17), Ok(1));
     }
 
     #[test]

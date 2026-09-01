@@ -581,7 +581,7 @@ mod tests {
 
     const PROM_BYTES: usize = 0x40000;
     const EXTERNAL_PROM_EXECUTION_BUDGET: usize = 125_000_000;
-    const EXPECTED_PROMPT_INSTRUCTION: usize = 119_226_807;
+    const EXPECTED_PROMPT_INSTRUCTION: usize = 108_223_056;
     const POST_PROMPT_INSTRUCTIONS: usize = 2_000_000;
     const SERIAL_RECEIVE_POLL_PC: u32 = 0xbfc2_28a0;
     const CPU_FREQUENCY_STRING_ADDRESS: u64 = 0x0038_06d8;
@@ -595,9 +595,6 @@ Keyboard/Mouse diagnostic                  *FAILED*\r\n\
 \r\nError-- cannot open console \"gfx(0)\"\r\n\
 \r\n\r\ninitializing tod clock\r\n\
 setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
-\r\ninitializing tod clock\r\n\
-setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
-can't set tod clock\r\n\
 \n\rDiagnostics failed.\n\
 \r[Press any key to continue.]";
 
@@ -822,6 +819,12 @@ can't set tod clock\r\n\
 
         assert_eq!(first, second);
         assert!(first.serial_a.is_empty());
+        assert!(
+            !first
+                .serial_b
+                .windows(b"can't set tod clock".len())
+                .any(|window| window == b"can't set tod clock")
+        );
         assert_eq!(first.serial_b, EXPECTED_SERIAL_B);
         assert_eq!(first.prompt_instruction, EXPECTED_PROMPT_INSTRUCTION);
         assert!(first.receive_poll_count != 0);
