@@ -160,7 +160,10 @@ void MainWindow::create_actions() {
 
 void MainWindow::create_docks() {
     disassembly_dock_ = new DisassemblyDock(session_, this);
-    registers_dock_ = new RegistersDock(session_, this);
+    registers_dock_ = new RegistersDock(
+        session_,
+        [this](const QString& message) { statusBar()->showMessage(message, 3000); },
+        this);
     tlb_dock_ = new TlbDock(session_, this);
     cache_dock_ = new CacheDock(session_, this);
     memory_dock_ = new MemoryDock(session_, this);
