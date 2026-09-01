@@ -638,8 +638,13 @@ mod tests {
     const EXTERNAL_PROM_EXECUTION_BUDGET: usize = 125_000_000;
     const EXPECTED_PROMPT_INSTRUCTION: usize = 108_223_056;
     const POST_PROMPT_INSTRUCTIONS: usize = 2_000_000;
+    const P5_START_PC: u32 = 0xbfc0_0fb0;
+    const P5_COMPLETE_PC: u32 = 0xbfc0_1020;
+    const HEADLESS_GRAPHICS_PROBE_PC: u32 = 0xbfc1_e69c;
     const SERIAL_RECEIVE_POLL_PC: u32 = 0xbfc2_28a0;
     const CPU_FREQUENCY_STRING_ADDRESS: u64 = 0x0038_06d8;
+    const PIC1_GIO_BURST_ADDRESS: u64 = 0x1fa2_0008;
+    const PIC1_GIO_DELAY_ADDRESS: u64 = 0x1fa2_000c;
     const EXPECTED_SERIAL_B: &[u8] =
         b"\r\nNVRAM checksum is incorrect: reinitializing the NVRAM.\r\n\
 \r\nSCSI controller diagnostic                 *FAILED*\r\n\
@@ -659,7 +664,30 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         serial_b: Vec<u8>,
         prompt_instruction: usize,
         receive_poll_count: usize,
+        p5_started: bool,
+        p5_completed: bool,
+        headless_graphics_probe_observed: bool,
+        gio_burst: Option<u32>,
+        gio_delay: Option<u32>,
         cpu_frequency_string: Vec<Option<u8>>,
+    }
+
+    fn read_physical_word(machine: &Ip12, address: u64) -> Option<u32> {
+        let DebugResponse::Memory(memory) = machine.debug(DebugRequest::Memory {
+            address_space: MemoryAddressSpace::Physical,
+            start: address,
+            length: 4,
+        }) else {
+            unreachable!();
+        };
+        let bytes: [Option<u8>; 4] = memory
+            .bytes
+            .try_into()
+            .expect("a word debug request must return four byte slots");
+        let [Some(first), Some(second), Some(third), Some(fourth)] = bytes else {
+            return None;
+        };
+        Some(u32::from_be_bytes([first, second, third, fourth]))
     }
 
     fn machine_with_instructions(instructions: &[u32]) -> Machine {
@@ -878,8 +906,20 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         let mut executed = 0;
         let mut prompt_completed_at = None;
         let mut receive_poll_count = 0;
+        let mut p5_started = false;
+        let mut p5_completed = false;
+        let mut headless_graphics_probe_observed = false;
         while executed < EXTERNAL_PROM_EXECUTION_BUDGET {
             let address = worker.machine.as_ref().unwrap().execution_address();
+            if address == P5_START_PC {
+                p5_started = true;
+            }
+            if address == P5_COMPLETE_PC {
+                p5_completed = true;
+            }
+            if address == HEADLESS_GRAPHICS_PROBE_PC {
+                headless_graphics_probe_observed = true;
+            }
             if prompt_completed_at.is_some() && address == SERIAL_RECEIVE_POLL_PC {
                 receive_poll_count += 1;
             }
@@ -922,6 +962,11 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             serial_b: serial_b.lock().unwrap().clone(),
             prompt_instruction,
             receive_poll_count,
+            p5_started,
+            p5_completed,
+            headless_graphics_probe_observed,
+            gio_burst: read_physical_word(machine, PIC1_GIO_BURST_ADDRESS),
+            gio_delay: read_physical_word(machine, PIC1_GIO_DELAY_ADDRESS),
             cpu_frequency_string: cpu_frequency.bytes,
         }
     }
@@ -947,6 +992,11 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         assert_eq!(first.serial_b, EXPECTED_SERIAL_B);
         assert_eq!(first.prompt_instruction, EXPECTED_PROMPT_INSTRUCTION);
         assert!(first.receive_poll_count != 0);
+        assert!(first.p5_started);
+        assert!(first.p5_completed);
+        assert!(first.headless_graphics_probe_observed);
+        assert_eq!(first.gio_burst, Some(1));
+        assert_eq!(first.gio_delay, Some(0xf2));
         assert_eq!(
             first.cpu_frequency_string,
             [Some(b'3'), Some(b'3'), Some(0)]
