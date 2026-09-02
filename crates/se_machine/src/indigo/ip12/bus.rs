@@ -248,6 +248,7 @@ impl Ip12Bus {
                 output.push_serial(port, value);
             }
         });
+        self.synchronize_serial_interrupt();
         self.reschedule_serial(index);
     }
 
@@ -1294,6 +1295,31 @@ mod tests {
 
         assert_eq!(read_byte(&mut bus, SERIAL_1_BASE + 0x0f), Ok(b'A'));
         assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1));
+        assert!(!bus.local_interrupt_0_asserted());
+    }
+
+    #[test]
+    fn timed_local_loopback_receive_interrupt_reaches_int2() {
+        let mut bus = bus();
+        configure_serial_a(&mut bus, SERIAL_1_BASE);
+        write_serial_register(&mut bus, SERIAL_1_BASE, 3, 1);
+        write_serial_register(&mut bus, SERIAL_1_BASE, 1, 0x10);
+        write_serial_register(&mut bus, SERIAL_1_BASE, 9, 1 << 3);
+        write_serial_register(&mut bus, SERIAL_1_BASE, 14, 0x11);
+        bus.write(PhysAddr::new(INT2_BASE + 7), &[1 << 5]).unwrap();
+        bus.write(PhysAddr::new(SERIAL_1_BASE + 0x0f), &[0xa5])
+            .unwrap();
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND / 960),
+            &mut output,
+        );
+
+        assert_eq!(output.serial(SerialPort::A), [0xa5]);
+        assert!(bus.local_interrupt_0_asserted());
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok((1 << 5) | 1));
+        assert_eq!(read_byte(&mut bus, SERIAL_1_BASE + 0x0f), Ok(0xa5));
         assert!(!bus.local_interrupt_0_asserted());
     }
 

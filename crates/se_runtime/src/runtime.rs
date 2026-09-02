@@ -556,13 +556,23 @@ impl Worker {
     }
 
     fn refill_serial_input(&mut self) {
+        if self.pending_serial[0].is_empty() && self.pending_serial[1].is_empty() {
+            return;
+        }
+
         let Some(machine) = self.machine.as_mut() else {
             return;
         };
         for (index, port) in [SerialPort::A, SerialPort::B].into_iter().enumerate() {
             let pending = &mut self.pending_serial[index];
+            if pending.is_empty() {
+                continue;
+            }
+
             let consumed = machine.receive_serial(port, pending.make_contiguous());
-            pending.drain(..consumed);
+            if consumed != 0 {
+                pending.drain(..consumed);
+            }
         }
     }
 
@@ -609,28 +619,38 @@ impl Worker {
 }
 
 struct CpuClock {
-    frequency_hz: u64,
-    remainder: u128,
+    frequency_hz: u128,
+    whole_attoseconds_per_cycle: u128,
+    remainder_per_cycle: u128,
+    accumulated_remainder: u128,
 }
 
 impl CpuClock {
     const fn new(frequency_hz: u64) -> Self {
         assert!(frequency_hz != 0);
+        let frequency_hz = frequency_hz as u128;
         Self {
             frequency_hz,
-            remainder: 0,
+            whole_attoseconds_per_cycle: ATTOSECONDS_PER_SECOND / frequency_hz,
+            remainder_per_cycle: ATTOSECONDS_PER_SECOND % frequency_hz,
+            accumulated_remainder: 0,
         }
     }
 
     fn reset(&mut self) {
-        self.remainder = 0;
+        self.accumulated_remainder = 0;
     }
 
     fn advance_cycle(&mut self) -> VirtualDuration {
-        let numerator = ATTOSECONDS_PER_SECOND + self.remainder;
-        let frequency_hz = u128::from(self.frequency_hz);
-        self.remainder = numerator % frequency_hz;
-        VirtualDuration::from_attoseconds(numerator / frequency_hz)
+        let accumulated_remainder = self.accumulated_remainder + self.remainder_per_cycle;
+        let carry = if accumulated_remainder >= self.frequency_hz {
+            self.accumulated_remainder = accumulated_remainder - self.frequency_hz;
+            1
+        } else {
+            self.accumulated_remainder = accumulated_remainder;
+            0
+        };
+        VirtualDuration::from_attoseconds(self.whole_attoseconds_per_cycle + carry)
     }
 }
 
@@ -671,7 +691,7 @@ mod tests {
 
     const PROM_BYTES: usize = 0x40000;
     const EXTERNAL_PROM_EXECUTION_BUDGET: usize = 400_000_000;
-    const EXPECTED_PROMPT_INSTRUCTION: usize = 376_277_796;
+    const EXPECTED_PROMPT_INSTRUCTION: usize = 376_277_712;
     const POST_PROMPT_INSTRUCTIONS: usize = 2_000_000;
     const P5_START_PC: u32 = 0xbfc0_0fb0;
     const P5_COMPLETE_PC: u32 = 0xbfc0_1020;
@@ -862,7 +882,25 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         }
 
         assert_eq!(elapsed, ATTOSECONDS_PER_SECOND / 1_000);
-        assert_eq!(clock.remainder, 0);
+        assert_eq!(clock.accumulated_remainder, 0);
+    }
+
+    #[test]
+    fn cpu_clock_matches_the_division_reference_for_each_cycle() {
+        for frequency_hz in [1, 3, 10, 33_000_000, 1_000_000_001, u64::MAX] {
+            let mut clock = CpuClock::new(frequency_hz);
+            let frequency_hz = u128::from(frequency_hz);
+            let mut reference_remainder = 0;
+
+            for _ in 0..1_000 {
+                let numerator = ATTOSECONDS_PER_SECOND + reference_remainder;
+                reference_remainder = numerator % frequency_hz;
+                let expected = numerator / frequency_hz;
+
+                assert_eq!(clock.advance_cycle().as_attoseconds(), expected);
+                assert_eq!(clock.accumulated_remainder, reference_remainder);
+            }
+        }
     }
 
     #[test]

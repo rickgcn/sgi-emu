@@ -49,6 +49,7 @@ impl EventSlot {
 pub(super) struct Ip12Events {
     now: VirtualInstant,
     slots: [EventSlot; EVENT_COUNT],
+    next_event: Option<(VirtualInstant, EventKind)>,
 }
 
 impl Ip12Events {
@@ -56,6 +57,7 @@ impl Ip12Events {
         Self {
             now: VirtualInstant::ZERO,
             slots: [EventSlot::EMPTY; EVENT_COUNT],
+            next_event: None,
         }
     }
 
@@ -69,17 +71,20 @@ impl Ip12Events {
             deadline.advance(after);
             deadline
         });
+        self.recompute_next_event();
     }
 
     pub(super) fn take_due(&mut self) -> Option<EventKind> {
-        for kind in EventKind::ALL {
-            let slot = &mut self.slots[kind.index()];
-            if slot.deadline.is_some_and(|deadline| deadline <= self.now) {
-                slot.deadline = None;
-                return Some(kind);
-            }
+        let (deadline, kind) = self.next_event?;
+        if deadline > self.now {
+            return None;
         }
-        None
+
+        let slot = &mut self.slots[kind.index()];
+        debug_assert_eq!(slot.deadline, Some(deadline));
+        slot.deadline = None;
+        self.recompute_next_event();
+        Some(kind)
     }
 
     pub(super) fn synchronize(&mut self, kind: EventKind) -> VirtualDuration {
@@ -92,6 +97,22 @@ impl Ip12Events {
     pub(super) fn reset(&mut self) {
         self.now = VirtualInstant::ZERO;
         self.slots = [EventSlot::EMPTY; EVENT_COUNT];
+        self.next_event = None;
+    }
+
+    fn recompute_next_event(&mut self) {
+        self.next_event = None;
+        for kind in EventKind::ALL {
+            let Some(deadline) = self.slots[kind.index()].deadline else {
+                continue;
+            };
+            if self
+                .next_event
+                .is_none_or(|(next_deadline, _)| deadline < next_deadline)
+            {
+                self.next_event = Some((deadline, kind));
+            }
+        }
     }
 }
 
@@ -147,12 +168,45 @@ mod tests {
     }
 
     #[test]
+    fn next_event_cache_tracks_earlier_rescheduled_and_cancelled_events() {
+        let mut events = Ip12Events::new();
+        events.schedule(EventKind::Scsi, Some(VirtualDuration::from_attoseconds(20)));
+        events.schedule(EventKind::Rtc, Some(VirtualDuration::from_attoseconds(10)));
+        assert_eq!(
+            events.next_event.map(|(_, kind)| kind),
+            Some(EventKind::Rtc)
+        );
+
+        events.schedule(
+            EventKind::Serial0,
+            Some(VirtualDuration::from_attoseconds(5)),
+        );
+        assert_eq!(
+            events.next_event.map(|(_, kind)| kind),
+            Some(EventKind::Serial0)
+        );
+
+        events.schedule(EventKind::Serial0, None);
+        assert_eq!(
+            events.next_event.map(|(_, kind)| kind),
+            Some(EventKind::Rtc)
+        );
+
+        events.schedule(EventKind::Rtc, Some(VirtualDuration::from_attoseconds(30)));
+        assert_eq!(
+            events.next_event.map(|(_, kind)| kind),
+            Some(EventKind::Scsi)
+        );
+    }
+
+    #[test]
     fn reset_returns_all_slots_to_the_origin() {
         let mut events = Ip12Events::new();
         events.advance(VirtualDuration::from_attoseconds(11));
         events.schedule(EventKind::Scsi, Some(VirtualDuration::ZERO));
         events.reset();
 
+        assert_eq!(events.next_event, None);
         assert_eq!(events.take_due(), None);
         assert_eq!(events.synchronize(EventKind::Scsi), VirtualDuration::ZERO);
     }
