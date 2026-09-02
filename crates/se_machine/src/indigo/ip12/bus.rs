@@ -9,7 +9,9 @@ use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
-use se_device::scsi_disk::{ScsiCommandPlan, ScsiDisk};
+use se_device::scsi::ScsiCommandPlan;
+use se_device::scsi_cdrom::ScsiCdrom;
+use se_device::scsi_disk::ScsiDisk;
 use se_device::wd33c93b::{SelectAndTransferRequest, Wd33c93b};
 use se_device::z85230::{Channel, Z85230};
 
@@ -74,15 +76,40 @@ const DSP56001_END: u64 = 0x1fc0_0000;
 const PROM_BASE: u64 = 0x1fc0_0000;
 const PROM_END: u64 = PROM_BASE + PROM_BYTES as u64;
 
+pub(super) struct StorageAttachment<T> {
+    target: T,
+    storage: Box<dyn BlockStorage>,
+}
+
+impl<T> StorageAttachment<T> {
+    pub(super) fn new(target: T, storage: Box<dyn BlockStorage>) -> Self {
+        Self { target, storage }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScsiTargetSelection {
+    Disk,
+    Cdrom,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveStorageRead {
+    selection: ScsiTargetSelection,
+    next_storage_offset: u64,
+    remaining_bytes: u32,
+}
+
 pub(super) struct Ip12Bus {
     pic1: Pic1,
     memory: [Option<Ram>; 4],
     hpc1: Hpc1,
     int2: Int2,
     scsi: Wd33c93b,
-    disk: Option<ScsiDisk>,
-    storage: Option<Box<dyn BlockStorage>>,
+    disk: Option<StorageAttachment<ScsiDisk>>,
+    cdrom: Option<StorageAttachment<ScsiCdrom>>,
     pending_scsi: Option<SelectAndTransferRequest>,
+    active_storage_read: Option<ActiveStorageRead>,
     serial: [Z85230; 2],
     rtc: Dp8573a,
     mdac: Mdac,
@@ -101,8 +128,8 @@ impl Ip12Bus {
         hpc1: Hpc1,
         int2: Int2,
         scsi: Wd33c93b,
-        disk: Option<ScsiDisk>,
-        storage: Option<Box<dyn BlockStorage>>,
+        disk: Option<StorageAttachment<ScsiDisk>>,
+        cdrom: Option<StorageAttachment<ScsiCdrom>>,
         serial: [Z85230; 2],
         rtc: Dp8573a,
         mdac: Mdac,
@@ -117,8 +144,9 @@ impl Ip12Bus {
             int2,
             scsi,
             disk,
-            storage,
+            cdrom,
             pending_scsi: None,
+            active_storage_read: None,
             serial,
             rtc,
             mdac,
@@ -139,6 +167,7 @@ impl Ip12Bus {
         self.int2.reset();
         self.scsi.reset();
         self.pending_scsi = None;
+        self.active_storage_read = None;
         for serial in &mut self.serial {
             serial.reset();
         }
@@ -274,6 +303,7 @@ impl Ip12Bus {
     fn handle_scsi_register_write(&mut self) {
         if self.scsi.take_reset_completion() {
             self.pending_scsi = None;
+            self.active_storage_read = None;
             self.events.schedule(EventKind::Scsi, None);
         }
         if let Some(request) = self.scsi.take_select_and_transfer_request() {
@@ -288,6 +318,7 @@ impl Ip12Bus {
         if self.hpc1.take_scsi_reset_request() {
             self.scsi.reset();
             self.pending_scsi = None;
+            self.active_storage_read = None;
             self.events.schedule(EventKind::Scsi, None);
         }
         self.service_scsi_descriptor_fetch();
@@ -298,18 +329,40 @@ impl Ip12Bus {
         let Some(request) = self.pending_scsi.take() else {
             return;
         };
-        if request.destination_id() != 1 || request.lun() != 0 {
-            self.scsi.finish_selection_timeout();
+        let selection = match (request.destination_id(), request.lun()) {
+            (1, 0) if self.disk.is_some() => ScsiTargetSelection::Disk,
+            (4, 0) if self.cdrom.is_some() => ScsiTargetSelection::Cdrom,
+            _ => {
+                self.scsi.finish_selection_timeout();
+                self.synchronize_scsi_interrupt();
+                return;
+            }
+        };
+
+        if let Some(active) = self.active_storage_read {
+            if active.selection == selection {
+                self.transfer_storage_read_window(&request);
+            } else {
+                self.hpc1.stop_scsi_dma();
+            }
             self.synchronize_scsi_interrupt();
             return;
         }
-        let Some(disk) = self.disk.as_mut() else {
-            self.scsi.finish_selection_timeout();
-            self.synchronize_scsi_interrupt();
-            return;
-        };
 
-        let plan = disk.execute(request.cdb());
+        let plan = match selection {
+            ScsiTargetSelection::Disk => self
+                .disk
+                .as_mut()
+                .expect("selected SCSI disk must remain attached")
+                .target
+                .execute(request.cdb()),
+            ScsiTargetSelection::Cdrom => self
+                .cdrom
+                .as_mut()
+                .expect("selected SCSI CD-ROM must remain attached")
+                .target
+                .execute(request.cdb()),
+        };
         match plan {
             ScsiCommandPlan::Complete { status, data_in } => {
                 if self.transfer_immediate_data(&request, &data_in) {
@@ -317,10 +370,60 @@ impl Ip12Bus {
                 }
             }
             ScsiCommandPlan::ReadBlocks { lba, block_count } => {
-                self.transfer_storage_blocks(&request, lba, block_count);
+                self.transfer_storage_blocks(selection, &request, lba, block_count);
             }
         }
         self.synchronize_scsi_interrupt();
+    }
+
+    fn complete_storage_read(
+        &mut self,
+        selection: ScsiTargetSelection,
+        succeeded: bool,
+    ) -> se_device::scsi::ScsiStatus {
+        match selection {
+            ScsiTargetSelection::Disk => self
+                .disk
+                .as_mut()
+                .expect("selected SCSI disk must remain attached")
+                .target
+                .complete_read(succeeded),
+            ScsiTargetSelection::Cdrom => self
+                .cdrom
+                .as_mut()
+                .expect("selected SCSI CD-ROM must remain attached")
+                .target
+                .complete_read(succeeded),
+        }
+    }
+
+    fn read_storage(
+        &mut self,
+        selection: ScsiTargetSelection,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> std::io::Result<()> {
+        match selection {
+            ScsiTargetSelection::Disk => self
+                .disk
+                .as_mut()
+                .expect("selected SCSI disk must remain attached")
+                .storage
+                .read_exact_at(offset, buffer),
+            ScsiTargetSelection::Cdrom => self
+                .cdrom
+                .as_mut()
+                .expect("selected SCSI CD-ROM must remain attached")
+                .storage
+                .read_exact_at(offset, buffer),
+        }
+    }
+
+    fn finish_storage_failure(&mut self, selection: ScsiTargetSelection) {
+        self.active_storage_read = None;
+        let status = self.complete_storage_read(selection, false);
+        self.hpc1.finish_scsi_dma();
+        self.scsi.finish_select_and_transfer(status.byte());
     }
 
     fn transfer_immediate_data(&mut self, request: &SelectAndTransferRequest, data: &[u8]) -> bool {
@@ -344,50 +447,52 @@ impl Ip12Bus {
 
     fn transfer_storage_blocks(
         &mut self,
+        selection: ScsiTargetSelection,
         request: &SelectAndTransferRequest,
         lba: u32,
         block_count: u16,
     ) {
         let total_bytes = u32::from(block_count) * 512;
-        if total_bytes > request.transfer_count() {
-            self.hpc1.stop_scsi_dma();
-            return;
-        }
+        self.active_storage_read = Some(ActiveStorageRead {
+            selection,
+            next_storage_offset: u64::from(lba) * 512,
+            remaining_bytes: total_bytes,
+        });
+        self.transfer_storage_read_window(request);
+    }
 
+    fn transfer_storage_read_window(&mut self, request: &SelectAndTransferRequest) {
+        let Some(mut active) = self.active_storage_read.take() else {
+            return;
+        };
+        let window_bytes = request.transfer_count().min(active.remaining_bytes);
         let mut transferred = 0_u32;
-        while transferred < total_bytes {
+        while transferred < window_bytes {
             let Some(window) = self.next_scsi_dma_window() else {
+                self.active_storage_read = Some(active);
                 return;
             };
             if !window.to_memory() {
                 self.hpc1.stop_scsi_dma();
+                self.active_storage_read = Some(active);
                 return;
             }
-            let remaining = total_bytes - transferred;
+            let remaining = window_bytes - transferred;
             let byte_count = usize::from(
                 window
                     .byte_count()
                     .min(u16::try_from(remaining).unwrap_or(u16::MAX)),
             );
             let mut bytes = vec![0; byte_count];
-            let storage_offset = u64::from(lba) * 512 + u64::from(transferred);
-            let read_result = self
-                .storage
-                .as_mut()
-                .expect("an attached SCSI disk must have block storage")
-                .read_exact_at(storage_offset, &mut bytes);
+            let read_result =
+                self.read_storage(active.selection, active.next_storage_offset, &mut bytes);
             if read_result.is_err() {
-                let status = self
-                    .disk
-                    .as_mut()
-                    .expect("an attached SCSI disk must have target state")
-                    .complete_read(false);
-                self.hpc1.finish_scsi_dma();
-                self.scsi.finish_select_and_transfer(status.byte());
+                self.finish_storage_failure(active.selection);
                 return;
             }
             if !self.write_dma_memory(window.buffer_address(), &bytes) {
                 self.hpc1.stop_scsi_dma();
+                self.active_storage_read = Some(active);
                 return;
             }
             let byte_count_u16 = u16::try_from(byte_count).expect("DMA window length fits u16");
@@ -396,18 +501,22 @@ impl Ip12Bus {
                 || !self.scsi.consume_transfer_bytes(byte_count_u32)
             {
                 self.hpc1.stop_scsi_dma();
+                self.active_storage_read = Some(active);
                 return;
             }
             transferred += byte_count_u32;
+            active.next_storage_offset += u64::from(byte_count_u32);
+            active.remaining_bytes -= byte_count_u32;
         }
 
         self.hpc1.finish_scsi_dma();
-        let status = self
-            .disk
-            .as_mut()
-            .expect("an attached SCSI disk must have target state")
-            .complete_read(true);
-        self.scsi.finish_select_and_transfer(status.byte());
+        if active.remaining_bytes == 0 {
+            let status = self.complete_storage_read(active.selection, true);
+            self.scsi.finish_select_and_transfer(status.byte());
+        } else {
+            self.active_storage_read = Some(active);
+            self.scsi.request_data_in_continuation();
+        }
     }
 
     fn transfer_data_to_memory(&mut self, data: &[u8]) -> bool {
@@ -893,6 +1002,8 @@ mod tests {
     use se_device::pic1::Pic1;
     use se_device::ram::Ram;
     use se_device::rom::Rom;
+    use se_device::scsi::{ScsiCommandPlan, ScsiStatus};
+    use se_device::scsi_cdrom::ScsiCdrom;
     use se_device::scsi_disk::ScsiDisk;
     use se_device::wd33c93b::Wd33c93b;
     use se_device::z85230::Z85230;
@@ -907,6 +1018,7 @@ mod tests {
         HPC1_MISCELLANEOUS_CONTROL_BASE, HPC1_SCSI_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE,
         INT2_BASE, Ip12Bus, LOCAL_MEMORY_END, MDAC_BASE, PIC1_BASE, PROM_BASE, PROM_BYTES,
         PROM_END, RTC_BASE, SCSI_BASE, SERIAL_0_BASE, SERIAL_1_BASE, SERIAL_2_BASE,
+        StorageAttachment,
     };
 
     fn bus() -> Ip12Bus {
@@ -969,8 +1081,67 @@ mod tests {
             Hpc1::new(),
             Int2::new(),
             Wd33c93b::new(),
-            Some(ScsiDisk::new(block_count)),
-            Some(Box::new(MemoryStorage { bytes, fail_reads })),
+            Some(StorageAttachment::new(
+                ScsiDisk::new(block_count),
+                Box::new(MemoryStorage { bytes, fail_reads }),
+            )),
+            None,
+            [Z85230::new(3_686_400), Z85230::new(3_686_400)],
+            Dp8573a::new(),
+            Mdac::new(),
+            Nmc93cs46::new(),
+            Dsp56001::new(),
+            Rom::new(prom),
+        )
+    }
+
+    fn bus_with_cdrom(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
+        let logical_block_count = u64::try_from(bytes.len() / 512).unwrap();
+        let prom = (0..PROM_BYTES).map(|index| index as u8).collect();
+        Ip12Bus::new(
+            Pic1::new(0xf7, 2, true),
+            [Some(Ram::new(8 * 1024 * 1024)), None, None, None],
+            Hpc1::new(),
+            Int2::new(),
+            Wd33c93b::new(),
+            None,
+            Some(StorageAttachment::new(
+                ScsiCdrom::new(logical_block_count),
+                Box::new(MemoryStorage { bytes, fail_reads }),
+            )),
+            [Z85230::new(3_686_400), Z85230::new(3_686_400)],
+            Dp8573a::new(),
+            Mdac::new(),
+            Nmc93cs46::new(),
+            Dsp56001::new(),
+            Rom::new(prom),
+        )
+    }
+
+    fn bus_with_disk_and_cdrom(disk_bytes: Vec<u8>, cdrom_bytes: Vec<u8>) -> Ip12Bus {
+        let disk_block_count = u64::try_from(disk_bytes.len() / 512).unwrap();
+        let cdrom_block_count = u64::try_from(cdrom_bytes.len() / 512).unwrap();
+        let prom = (0..PROM_BYTES).map(|index| index as u8).collect();
+        Ip12Bus::new(
+            Pic1::new(0xf7, 2, true),
+            [Some(Ram::new(8 * 1024 * 1024)), None, None, None],
+            Hpc1::new(),
+            Int2::new(),
+            Wd33c93b::new(),
+            Some(StorageAttachment::new(
+                ScsiDisk::new(disk_block_count),
+                Box::new(MemoryStorage {
+                    bytes: disk_bytes,
+                    fail_reads: false,
+                }),
+            )),
+            Some(StorageAttachment::new(
+                ScsiCdrom::new(cdrom_block_count),
+                Box::new(MemoryStorage {
+                    bytes: cdrom_bytes,
+                    fail_reads: false,
+                }),
+            )),
             [Z85230::new(3_686_400), Z85230::new(3_686_400)],
             Dp8573a::new(),
             Mdac::new(),
@@ -1027,34 +1198,67 @@ mod tests {
     }
 
     fn configure_single_scsi_descriptor(bus: &mut Ip12Bus, buffer_address: u32) {
+        configure_scsi_descriptor_chain(bus, 0x1000, buffer_address, &[512]);
+    }
+
+    fn configure_scsi_descriptor_chain(
+        bus: &mut Ip12Bus,
+        first_descriptor_address: u32,
+        first_buffer_address: u32,
+        byte_counts: &[u16],
+    ) {
         configure_memory(bus, 0x0100_023f, 0x023f_023f);
-        for (address, value) in [
-            (0x1000, 512_u32),
-            (0x1004, buffer_address | (1 << 31)),
-            (0x1008, 0_u32),
-        ] {
-            bus.write(PhysAddr::new(address), &value.to_be_bytes())
-                .unwrap();
+        let mut descriptor_address = first_descriptor_address;
+        let mut buffer_address = first_buffer_address;
+        for (index, byte_count) in byte_counts.iter().copied().enumerate() {
+            let is_last = index + 1 == byte_counts.len();
+            let buffer_word = if is_last {
+                buffer_address | (1 << 31)
+            } else {
+                buffer_address
+            };
+            for (address, value) in [
+                (descriptor_address, u32::from(byte_count)),
+                (descriptor_address + 4, buffer_word),
+                (descriptor_address + 8, descriptor_address + 12),
+            ] {
+                bus.write(PhysAddr::new(u64::from(address)), &value.to_be_bytes())
+                    .unwrap();
+            }
+            descriptor_address += 12;
+            buffer_address += u32::from(byte_count);
         }
         bus.write(
             PhysAddr::new(HPC1_SCSI_REGISTERS_BASE + 8),
-            &0x1000_u32.to_be_bytes(),
+            &first_descriptor_address.to_be_bytes(),
         )
         .unwrap();
         bus.write(PhysAddr::new(HPC1_SCSI_REGISTERS_BASE + 0x0f), &[0x90])
             .unwrap();
     }
 
-    fn issue_read_ten(bus: &mut Ip12Bus) {
-        write_scsi_register(bus, 0x15, 1);
-        write_scsi_register(bus, 0x0f, 0);
-        for (register, value) in [(0x12, 0), (0x13, 2), (0x14, 0)] {
+    fn issue_scsi_command(bus: &mut Ip12Bus, target: u8, lun: u8, transfer_count: u32, cdb: &[u8]) {
+        write_scsi_register(bus, 0x15, target);
+        write_scsi_register(bus, 0x0f, lun);
+        for (register, value) in [
+            (0x12, (transfer_count >> 16) as u8),
+            (0x13, (transfer_count >> 8) as u8),
+            (0x14, transfer_count as u8),
+        ] {
             write_scsi_register(bus, register, value);
         }
-        for (offset, value) in [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0].into_iter().enumerate() {
+        for (offset, value) in cdb.iter().copied().enumerate() {
             write_scsi_register(bus, 0x03 + offset as u8, value);
         }
         write_scsi_register(bus, 0x18, 0x09);
+    }
+
+    fn issue_read_ten(bus: &mut Ip12Bus, target: u8, lba: u32) {
+        let mut cdb = [0; 10];
+        cdb[0] = 0x28;
+        cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+        cdb[8] = 1;
+        issue_scsi_command(bus, target, 0, 512, &cdb);
     }
 
     fn nvram_clock_bit(bus: &mut Ip12Bus, bit: bool) -> bool {
@@ -1431,7 +1635,7 @@ mod tests {
         let mut bus = bus_with_disk(disk.clone(), false);
         configure_single_scsi_descriptor(&mut bus, 0x2000);
 
-        issue_read_ten(&mut bus);
+        issue_read_ten(&mut bus, 1, 0);
         assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x30));
         let mut output = MachineOutput::default();
         bus.advance_time(VirtualDuration::ZERO, &mut output);
@@ -1453,24 +1657,172 @@ mod tests {
     }
 
     #[test]
-    fn absent_target_completes_with_selection_timeout() {
-        let mut bus = bus();
-        write_scsi_register(&mut bus, 0x17, 0);
-        write_scsi_register(&mut bus, 0x15, 1);
-        write_scsi_register(&mut bus, 0x03, 0);
-        write_scsi_register(&mut bus, 0x18, 0x08);
+    fn cdrom_read_ten_uses_512_byte_guest_lbas_through_the_shared_dma_path() {
+        let cdrom: Vec<u8> = (0..4096).map(|index| (index / 512) as u8).collect();
+
+        for (lba, expected) in [(1, 1), (4, 4)] {
+            let mut bus = bus_with_cdrom(cdrom.clone(), false);
+            configure_single_scsi_descriptor(&mut bus, 0x2000);
+            issue_read_ten(&mut bus, 4, lba);
+            let mut output = MachineOutput::default();
+
+            bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+            let mut copied = vec![0; 512];
+            bus.memory[0]
+                .as_ref()
+                .unwrap()
+                .read(DeviceAddr::new(0x2000), &mut copied)
+                .unwrap();
+            assert_eq!(copied, vec![expected; 512]);
+            assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+            assert!(!bus.error_interrupt_asserted());
+        }
+    }
+
+    #[test]
+    fn cdrom_read_ten_walks_a_full_prom_descriptor_array() {
+        const BLOCK_COUNT: u16 = 512;
+        const PAGE_COUNT: u32 = 64;
+        const BYTE_COUNT: usize = BLOCK_COUNT as usize * 512;
+
+        let cdrom: Vec<u8> = (0..BYTE_COUNT).map(|index| (index / 4096) as u8).collect();
+        let mut bus = bus_with_cdrom(cdrom.clone(), false);
+        configure_scsi_descriptor_chain(&mut bus, 0x1000, 0x2000, &[4096; PAGE_COUNT as usize]);
+        let mut cdb = [0; 10];
+        cdb[0] = 0x28;
+        cdb[7..9].copy_from_slice(&BLOCK_COUNT.to_be_bytes());
+        issue_scsi_command(&mut bus, 4, 0, BYTE_COUNT as u32, &cdb);
         let mut output = MachineOutput::default();
 
         bus.advance_time(VirtualDuration::ZERO, &mut output);
 
-        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x42);
+        let mut copied = vec![0; BYTE_COUNT];
+        bus.memory[0]
+            .as_ref()
+            .unwrap()
+            .read(DeviceAddr::new(0x2000), &mut copied)
+            .unwrap();
+        assert_eq!(copied, cdrom);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn cdrom_read_ten_continues_after_the_prom_dma_map_limit() {
+        const BLOCK_COUNT: u16 = 983;
+        const BYTE_COUNT: usize = BLOCK_COUNT as usize * 512;
+        const FIRST_BUFFER_ADDRESS: u32 = 0x0002_0070;
+        const FIRST_WINDOW_BYTES: u32 = 3984 + 63 * 4096;
+        const SECOND_WINDOW_BYTES: u32 = BYTE_COUNT as u32 - FIRST_WINDOW_BYTES;
+
+        let cdrom: Vec<u8> = (0..BYTE_COUNT)
+            .map(|index| ((index * 31) ^ (index >> 8) ^ (index >> 16)) as u8)
+            .collect();
+        let mut bus = bus_with_cdrom(cdrom.clone(), false);
+        let mut first_window = vec![4096_u16; 64];
+        first_window[0] = 3984;
+        configure_scsi_descriptor_chain(&mut bus, 0x1000, FIRST_BUFFER_ADDRESS, &first_window);
+        let mut cdb = [0; 10];
+        cdb[0] = 0x28;
+        cdb[7..9].copy_from_slice(&BLOCK_COUNT.to_be_bytes());
+        issue_scsi_command(&mut bus, 4, 0, FIRST_WINDOW_BYTES, &cdb);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert_eq!(read_scsi_register(&mut bus, 0x10), 0x46);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x49);
+        assert!(bus.active_storage_read.is_some());
+
+        let mut second_window = vec![4096_u16; 59];
+        *second_window.last_mut().unwrap() = 3696;
+        configure_scsi_descriptor_chain(
+            &mut bus,
+            0x1400,
+            FIRST_BUFFER_ADDRESS + FIRST_WINDOW_BYTES,
+            &second_window,
+        );
+        for (register, value) in [
+            (0x12, (SECOND_WINDOW_BYTES >> 16) as u8),
+            (0x13, (SECOND_WINDOW_BYTES >> 8) as u8),
+            (0x14, SECOND_WINDOW_BYTES as u8),
+            (0x10, 0x45),
+            (0x15, 4),
+            (0x0f, 0),
+        ] {
+            write_scsi_register(&mut bus, register, value);
+        }
+        write_scsi_register(&mut bus, 0x18, 0x08);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        let mut copied = vec![0; BYTE_COUNT];
+        bus.memory[0]
+            .as_ref()
+            .unwrap()
+            .read(
+                DeviceAddr::new(u64::from(FIRST_BUFFER_ADDRESS)),
+                &mut copied,
+            )
+            .unwrap();
+        assert_eq!(copied, cdrom);
+        assert!(bus.active_storage_read.is_none());
+        assert_eq!(read_scsi_register(&mut bus, 0x10), 0x60);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn disk_and_cdrom_route_to_independent_targets() {
+        let mut bus = bus_with_disk_and_cdrom(vec![0x11; 512], vec![0x44; 2048]);
+        let mut output = MachineOutput::default();
+
+        configure_single_scsi_descriptor(&mut bus, 0x2000);
+        issue_read_ten(&mut bus, 1, 0);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+
+        configure_single_scsi_descriptor(&mut bus, 0x2200);
+        issue_read_ten(&mut bus, 4, 0);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        let mut disk_copy = vec![0; 512];
+        let mut cdrom_copy = vec![0; 512];
+        let memory = bus.memory[0].as_ref().unwrap();
+        memory
+            .read(DeviceAddr::new(0x2000), &mut disk_copy)
+            .unwrap();
+        memory
+            .read(DeviceAddr::new(0x2200), &mut cdrom_copy)
+            .unwrap();
+        assert_eq!(disk_copy, vec![0x11; 512]);
+        assert_eq!(cdrom_copy, vec![0x44; 512]);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+    }
+
+    #[test]
+    fn absent_targets_and_wrong_luns_complete_with_selection_timeout() {
+        for (target, lun) in [(1, 0), (4, 0), (4, 1)] {
+            let mut bus = if lun == 0 {
+                bus()
+            } else {
+                bus_with_cdrom(vec![0; 2048], false)
+            };
+            write_scsi_register(&mut bus, 0x17, 0);
+            issue_scsi_command(&mut bus, target, lun, 0, &[0, 0, 0, 0, 0, 0]);
+            let mut output = MachineOutput::default();
+
+            bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+            assert_eq!(read_scsi_register(&mut bus, 0x17), 0x42);
+        }
     }
 
     #[test]
     fn storage_failure_becomes_target_check_condition_without_pic1_error() {
         let mut bus = bus_with_disk(vec![0; 512], true);
         configure_single_scsi_descriptor(&mut bus, 0x2000);
-        issue_read_ten(&mut bus);
+        issue_read_ten(&mut bus, 1, 0);
         let mut output = MachineOutput::default();
 
         bus.advance_time(VirtualDuration::ZERO, &mut output);
@@ -1481,10 +1833,76 @@ mod tests {
     }
 
     #[test]
+    fn cdrom_storage_failure_becomes_target_check_condition_without_pic1_error() {
+        let mut bus = bus_with_cdrom(vec![0; 2048], true);
+        configure_single_scsi_descriptor(&mut bus, 0x2000);
+        issue_read_ten(&mut bus, 4, 0);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert_eq!(read_scsi_register(&mut bus, 0x0f), 2);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn reset_preserves_cdrom_readiness_and_target_state_is_isolated() {
+        let mut bus = bus_with_disk_and_cdrom(vec![0; 512], vec![0; 2048]);
+        let cdrom = &mut bus.cdrom.as_mut().unwrap().target;
+        assert!(matches!(
+            cdrom.execute(&[0x1b, 0, 0, 0, 0, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                ..
+            }
+        ));
+
+        bus.reset();
+
+        assert!(matches!(
+            bus.cdrom
+                .as_mut()
+                .unwrap()
+                .target
+                .execute(&[0, 0, 0, 0, 0, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::CheckCondition,
+                ..
+            }
+        ));
+        assert!(matches!(
+            bus.disk
+                .as_mut()
+                .unwrap()
+                .target
+                .execute(&[0, 0, 0, 0, 0, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                ..
+            }
+        ));
+
+        let mut rebuilt = bus_with_cdrom(vec![0; 2048], false);
+        assert!(matches!(
+            rebuilt
+                .cdrom
+                .as_mut()
+                .unwrap()
+                .target
+                .execute(&[0, 0, 0, 0, 0, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn scsi_dma_memory_hole_raises_pic1_address_error_without_finishing_wd() {
         let mut bus = bus_with_disk(vec![0; 512], false);
         configure_single_scsi_descriptor(&mut bus, 0x00c0_0000);
-        issue_read_ten(&mut bus);
+        issue_read_ten(&mut bus, 1, 0);
         let mut output = MachineOutput::default();
 
         bus.advance_time(VirtualDuration::ZERO, &mut output);
@@ -1497,7 +1915,7 @@ mod tests {
     fn reset_cancels_a_scheduled_scsi_command() {
         let mut bus = bus_with_disk(vec![0; 512], false);
         configure_single_scsi_descriptor(&mut bus, 0x2000);
-        issue_read_ten(&mut bus);
+        issue_read_ten(&mut bus, 1, 0);
         assert!(bus.pending_scsi.is_some());
 
         bus.reset();

@@ -757,7 +757,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             let [first, second, third, fourth] = instruction.to_be_bytes();
             destination.copy_from_slice(&[second, first, fourth, third]);
         }
-        Machine::IndigoIp12(Ip12::new(raw_prom, Backend::SoftFloat, None).unwrap())
+        Machine::IndigoIp12(Ip12::new(raw_prom, Backend::SoftFloat, None, None).unwrap())
     }
 
     fn machine_that_transmits_serial_a(values: &[u8]) -> Machine {
@@ -1031,7 +1031,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
     ) -> ExternalPromRun {
         let continue_after_diagnostics = storage.is_some();
         let machine = Machine::IndigoIp12(
-            Ip12::new(raw_prom, Backend::SoftFloat, storage)
+            Ip12::new(raw_prom, Backend::SoftFloat, storage, None)
                 .expect("the PROM dump and storage should be valid"),
         );
         let serial_a = Arc::new(Mutex::new(Vec::new()));

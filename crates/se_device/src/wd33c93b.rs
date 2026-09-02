@@ -32,7 +32,9 @@ const SELECT_AND_TRANSFER_WITH_ATN: u8 = 0x09;
 const RESET_COMPLETION_STATUS: u8 = 0x00;
 const ADVANCED_RESET_COMPLETION_STATUS: u8 = 0x01;
 const SELECT_AND_TRANSFER_COMPLETION_STATUS: u8 = 0x16;
+const UNEXPECTED_SEND_DATA_STATUS: u8 = 0x49;
 const SELECTION_TIMEOUT_STATUS: u8 = 0x42;
+const DATA_TRANSFER_PHASE: u8 = 0x46;
 const SELECT_AND_TRANSFER_PHASE: u8 = 0x60;
 const ADVANCED_FEATURES: u8 = 1 << 3;
 const SOURCE_ID_PRESERVED_BITS: u8 = 0x0f;
@@ -224,6 +226,16 @@ impl Wd33c93b {
         self.pending_request = None;
     }
 
+    /// Signals that a Data In target has more bytes after the programmed
+    /// transfer count reaches zero.
+    pub fn request_data_in_continuation(&mut self) {
+        self.command_phase = DATA_TRANSFER_PHASE;
+        self.scsi_status = UNEXPECTED_SEND_DATA_STATUS;
+        self.command_in_progress = false;
+        self.interrupt_pending = true;
+        self.pending_request = None;
+    }
+
     /// Completes selection without finding the requested target.
     pub fn finish_selection_timeout(&mut self) {
         self.command_phase = 0;
@@ -385,9 +397,10 @@ mod tests {
     use se_core::bus::{BusFault, DeviceAddr};
 
     use super::{
-        ADDRESS_PORT, AUXILIARY_STATUS, BUSY, CDB_START, COMMAND, COMMAND_IN_PROGRESS, CONTROL,
-        DATA_PORT, DESTINATION_ID, INTERRUPT_PENDING, OWN_ID, SCSI_STATUS, SELECT_AND_TRANSFER,
-        SOURCE_ID, TARGET_LUN, TIMEOUT_PERIOD, TRANSFER_COUNT_MSB, Wd33c93b,
+        ADDRESS_PORT, AUXILIARY_STATUS, BUSY, CDB_START, COMMAND, COMMAND_IN_PROGRESS,
+        COMMAND_PHASE, CONTROL, DATA_PORT, DATA_TRANSFER_PHASE, DESTINATION_ID, INTERRUPT_PENDING,
+        OWN_ID, SCSI_STATUS, SELECT_AND_TRANSFER, SOURCE_ID, TARGET_LUN, TIMEOUT_PERIOD,
+        TRANSFER_COUNT_MSB, UNEXPECTED_SEND_DATA_STATUS, Wd33c93b,
     };
 
     fn read_port(scsi: &mut Wd33c93b, port: u64) -> Result<u8, BusFault> {
@@ -458,6 +471,30 @@ mod tests {
         assert_eq!(read_register(&mut scsi, SCSI_STATUS), 0x16);
         assert!(!scsi.interrupt_asserted());
         assert_eq!(scsi.selected_register, COMMAND);
+    }
+
+    #[test]
+    fn exhausted_data_in_count_requests_another_transfer_window() {
+        let mut scsi = Wd33c93b::new();
+        write_register(&mut scsi, TRANSFER_COUNT_MSB + 2, 8);
+        write_register(&mut scsi, COMMAND, SELECT_AND_TRANSFER);
+        assert!(scsi.consume_transfer_bytes(8));
+
+        scsi.request_data_in_continuation();
+
+        assert_eq!(read_register(&mut scsi, COMMAND_PHASE), DATA_TRANSFER_PHASE);
+        assert_eq!(
+            read_register(&mut scsi, SCSI_STATUS),
+            UNEXPECTED_SEND_DATA_STATUS
+        );
+        write_register(&mut scsi, TRANSFER_COUNT_MSB + 2, 4);
+        write_register(&mut scsi, COMMAND, SELECT_AND_TRANSFER);
+        let request = scsi.take_select_and_transfer_request().unwrap();
+        assert_eq!(request.transfer_count(), 4);
+        assert_eq!(
+            read_port(&mut scsi, ADDRESS_PORT),
+            Ok(BUSY | COMMAND_IN_PROGRESS)
+        );
     }
 
     #[test]

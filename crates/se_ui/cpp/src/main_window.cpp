@@ -49,16 +49,31 @@ QByteArray decoded_bytes(const rust::String& value) {
         QByteArray(value.data(), static_cast<qsizetype>(value.size())));
 }
 
+MachineSettings from_machine_configuration(const MachineConfiguration& configuration) {
+    return {
+        from_rust_string(configuration.machine_model),
+        from_rust_string(configuration.prom_path),
+        from_rust_string(configuration.disk_path),
+        from_rust_string(configuration.cdrom_path),
+        from_rust_string(configuration.float_backend),
+    };
+}
+
+MachineConfiguration to_machine_configuration(const MachineSettings& settings) {
+    return {
+        to_rust_string(settings.machine_model),
+        to_rust_string(settings.prom_path),
+        to_rust_string(settings.disk_path),
+        to_rust_string(settings.cdrom_path),
+        to_rust_string(settings.float_backend),
+    };
+}
+
 } // namespace
 
 MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     : session_(session)
-    , settings_ {
-          from_rust_string(startup.machine_model),
-          from_rust_string(startup.prom_path),
-          from_rust_string(startup.disk_path),
-          from_rust_string(startup.float_backend),
-      }
+    , settings_(from_machine_configuration(startup.machine))
     , run_action_(nullptr)
     , reset_action_(nullptr)
     , pause_action_(nullptr)
@@ -113,10 +128,7 @@ MainWindow::~MainWindow() {
 
 UiExitState MainWindow::exit_state() const {
     return {
-        to_rust_string(settings_.machine_model),
-        to_rust_string(settings_.prom_path),
-        to_rust_string(settings_.disk_path),
-        to_rust_string(settings_.float_backend),
+        to_machine_configuration(settings_),
         encoded_bytes(saveGeometry()),
         encoded_bytes(saveState()),
     };
@@ -259,6 +271,7 @@ void MainWindow::show_settings() {
     if (selected.machine_model == settings_.machine_model
         && selected.prom_path == settings_.prom_path
         && selected.disk_path == settings_.disk_path
+        && selected.cdrom_path == settings_.cdrom_path
         && selected.float_backend == settings_.float_backend) {
         return;
     }
@@ -270,11 +283,8 @@ void MainWindow::show_settings() {
         return;
     }
 
-    const auto model = to_rust_string(selected.machine_model);
-    const auto prom = to_rust_string(selected.prom_path);
-    const auto disk = to_rust_string(selected.disk_path);
-    const auto backend = to_rust_string(selected.float_backend);
-    const auto status = session_.configure_machine(model, prom, disk, backend);
+    const auto configuration = to_machine_configuration(selected);
+    const auto status = session_.configure_machine(configuration);
     if (!status.success) {
         QMessageBox::critical(
             this,

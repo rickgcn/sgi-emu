@@ -13,6 +13,7 @@ use se_float::backend::Backend;
 use se_machine::indigo::ip12::Ip12;
 use se_machine::machine::Machine;
 use se_runtime::runtime::Runtime;
+use se_ui::bridge::ffi::MachineConfiguration;
 use se_ui::session::UiSession;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -22,18 +23,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     application_config.apply_environment();
     application_config.apply_arguments(&arguments);
 
-    let (model, prom_path, disk_path, float_backend) = application_config.machine_configuration();
-    if arguments.headless() && prom_path.is_empty() {
+    let machine_configuration = application_config.machine_configuration();
+    if arguments.headless() && machine_configuration.prom_path.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "headless mode requires an Indigo IP12 PROM; use --prom or SE_INDIGO_IP12_PROM",
         )
         .into());
     }
-    let (machine, startup_error) = if prom_path.is_empty() {
+    let (machine, startup_error) = if machine_configuration.prom_path.is_empty() {
         (None, String::new())
     } else {
-        match build_machine(model, prom_path, disk_path, float_backend) {
+        match build_machine(&machine_configuration) {
             Ok(machine) => (Some(machine), String::new()),
             Err(error) => (None, error),
         }
@@ -63,44 +64,66 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn build_machine(
-    model: &str,
-    prom_path: &str,
-    disk_path: &str,
-    float_backend: &str,
-) -> Result<Machine, String> {
-    match model {
+fn build_machine(configuration: &MachineConfiguration) -> Result<Machine, String> {
+    match configuration.machine_model.as_str() {
         "indigo-ip12" => {
-            let backend = match float_backend {
+            let backend = match configuration.float_backend.as_str() {
                 "softfloat" => Backend::SoftFloat,
                 "native" => Backend::Native,
                 _ => {
                     return Err(format!(
-                        "unsupported floating-point backend: {float_backend}"
+                        "unsupported floating-point backend: {}",
+                        configuration.float_backend
                     ));
                 }
             };
-            let raw_prom = fs::read(prom_path)
-                .map_err(|error| format!("failed to read PROM image '{prom_path}': {error}"))?;
-            let storage = if disk_path.is_empty() {
+            let raw_prom = fs::read(&configuration.prom_path).map_err(|error| {
+                format!(
+                    "failed to read PROM image '{}': {error}",
+                    configuration.prom_path
+                )
+            })?;
+            let disk_storage = if configuration.disk_path.is_empty() {
                 None
             } else {
                 Some(
-                    storage::FileBlockStorage::open(disk_path)
+                    storage::FileBlockStorage::open(&configuration.disk_path)
                         .map_err(|error| {
-                            format!("failed to open disk image '{disk_path}': {error}")
+                            format!(
+                                "failed to open disk image '{}': {error}",
+                                configuration.disk_path
+                            )
                         })?
                         .boxed(),
                 )
             };
-            let mut machine = Ip12::new(raw_prom, backend, storage)
+            let cdrom_storage = if configuration.cdrom_path.is_empty() {
+                None
+            } else {
+                Some(
+                    storage::FileBlockStorage::open(&configuration.cdrom_path)
+                        .map_err(|error| {
+                            format!(
+                                "failed to open CD-ROM image '{}': {error}",
+                                configuration.cdrom_path
+                            )
+                        })?
+                        .boxed(),
+                )
+            };
+            let mut machine = Ip12::new(raw_prom, backend, disk_storage, cdrom_storage)
                 .map(Machine::IndigoIp12)
                 .map_err(|error| error.to_string())?;
-            if let Some(restored) = persistence::load(model).map_err(|error| error.to_string())? {
+            if let Some(restored) = persistence::load(&configuration.machine_model)
+                .map_err(|error| error.to_string())?
+            {
                 machine.restore_nonvolatile_state(restored.state, restored.offline_milliseconds);
             }
             Ok(machine)
         }
-        _ => Err(format!("unsupported machine model: {model}")),
+        _ => Err(format!(
+            "unsupported machine model: {}",
+            configuration.machine_model
+        )),
     }
 }

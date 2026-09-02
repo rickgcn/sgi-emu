@@ -17,6 +17,7 @@ SettingsDialog::SettingsDialog(const MachineSettings& settings, QWidget* parent)
     , machine_combo_(new QComboBox(this))
     , prom_edit_(new QLineEdit(this))
     , disk_edit_(new QLineEdit(this))
+    , cdrom_edit_(new QLineEdit(this))
     , float_backend_combo_(new QComboBox(this)) {
     setWindowTitle(QStringLiteral("Settings"));
     setModal(true);
@@ -27,6 +28,7 @@ SettingsDialog::SettingsDialog(const MachineSettings& settings, QWidget* parent)
 
     prom_edit_->setText(settings.prom_path);
     disk_edit_->setText(settings.disk_path);
+    cdrom_edit_->setText(settings.cdrom_path);
 
     float_backend_combo_->addItem(QStringLiteral("SoftFloat"), QStringLiteral("softfloat"));
     float_backend_combo_->addItem(QStringLiteral("Native"), QStringLiteral("native"));
@@ -41,6 +43,10 @@ SettingsDialog::SettingsDialog(const MachineSettings& settings, QWidget* parent)
     disk_browse_button->setText(QStringLiteral("..."));
     connect(disk_browse_button, &QToolButton::clicked, this, &SettingsDialog::select_disk);
 
+    auto* cdrom_browse_button = new QToolButton(this);
+    cdrom_browse_button->setText(QStringLiteral("..."));
+    connect(cdrom_browse_button, &QToolButton::clicked, this, &SettingsDialog::select_cdrom);
+
     auto* prom_widget = new QWidget(this);
     auto* prom_layout = new QHBoxLayout(prom_widget);
     prom_layout->setContentsMargins(0, 0, 0, 0);
@@ -53,6 +59,12 @@ SettingsDialog::SettingsDialog(const MachineSettings& settings, QWidget* parent)
     disk_layout->addWidget(disk_edit_);
     disk_layout->addWidget(disk_browse_button);
 
+    auto* cdrom_widget = new QWidget(this);
+    auto* cdrom_layout = new QHBoxLayout(cdrom_widget);
+    cdrom_layout->setContentsMargins(0, 0, 0, 0);
+    cdrom_layout->addWidget(cdrom_edit_);
+    cdrom_layout->addWidget(cdrom_browse_button);
+
     auto* button_box = new QDialogButtonBox(
         QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     connect(button_box, &QDialogButtonBox::accepted, this, &QDialog::accept);
@@ -62,6 +74,7 @@ SettingsDialog::SettingsDialog(const MachineSettings& settings, QWidget* parent)
     layout->addRow(QStringLiteral("Machine"), machine_combo_);
     layout->addRow(QStringLiteral("PROM"), prom_widget);
     layout->addRow(QStringLiteral("Disk image"), disk_widget);
+    layout->addRow(QStringLiteral("CD-ROM image"), cdrom_widget);
     layout->addRow(QStringLiteral("Float backend"), float_backend_combo_);
     layout->addRow(button_box);
     setLayout(layout);
@@ -72,6 +85,7 @@ MachineSettings SettingsDialog::settings() const {
         machine_combo_->currentData().toString(),
         prom_edit_->text(),
         disk_edit_->text(),
+        cdrom_edit_->text(),
         float_backend_combo_->currentData().toString(),
     };
 }
@@ -89,6 +103,14 @@ void SettingsDialog::select_disk() {
         this, QStringLiteral("Select disk image"), disk_edit_->text());
     if (!selected_path.isEmpty()) {
         disk_edit_->setText(selected_path);
+    }
+}
+
+void SettingsDialog::select_cdrom() {
+    const auto selected_path = QFileDialog::getOpenFileName(
+        this, QStringLiteral("Select CD-ROM image"), cdrom_edit_->text());
+    if (!selected_path.isEmpty()) {
+        cdrom_edit_->setText(selected_path);
     }
 }
 

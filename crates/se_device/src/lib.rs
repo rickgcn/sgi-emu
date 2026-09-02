@@ -9,6 +9,8 @@ pub mod nmc93cs46;
 pub mod pic1;
 pub mod ram;
 pub mod rom;
+pub mod scsi;
+pub mod scsi_cdrom;
 pub mod scsi_disk;
 pub mod wd33c93b;
 pub mod z85230;

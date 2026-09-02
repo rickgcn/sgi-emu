@@ -62,17 +62,26 @@ pub mod ffi {
         pub scrollback_offset: u32,
     }
 
-    /// Values used to initialize the Qt user interface.
+    /// Machine settings shared by the application and Qt frontend.
     #[derive(Debug)]
-    pub struct UiStartupState {
+    pub struct MachineConfiguration {
         /// Stable machine identifier.
         pub machine_model: String,
         /// Path to the selected PROM image.
         pub prom_path: String,
         /// Path to the optional disk image.
         pub disk_path: String,
+        /// Path to the optional CD-ROM image.
+        pub cdrom_path: String,
         /// Stable floating-point backend identifier.
         pub float_backend: String,
+    }
+
+    /// Values used to initialize the Qt user interface.
+    #[derive(Debug)]
+    pub struct UiStartupState {
+        /// Machine settings displayed by the frontend.
+        pub machine: MachineConfiguration,
         /// Base64-encoded `QWidget::saveGeometry()` bytes.
         pub window_geometry: String,
         /// Base64-encoded `QMainWindow::saveState()` bytes.
@@ -84,14 +93,8 @@ pub mod ffi {
     /// Values returned after the Qt event loop exits normally.
     #[derive(Debug)]
     pub struct UiExitState {
-        /// Stable machine identifier.
-        pub machine_model: String,
-        /// Path to the selected PROM image.
-        pub prom_path: String,
-        /// Path to the optional disk image.
-        pub disk_path: String,
-        /// Stable floating-point backend identifier.
-        pub float_backend: String,
+        /// Machine settings selected by the frontend.
+        pub machine: MachineConfiguration,
         /// Base64-encoded `QWidget::saveGeometry()` bytes.
         pub window_geometry: String,
         /// Base64-encoded `QMainWindow::saveState()` bytes.
@@ -264,10 +267,7 @@ pub mod ffi {
         fn runtime_status(self: &UiSession) -> RuntimeStatusDto;
         fn configure_machine(
             self: &UiSession,
-            model: &str,
-            prom_path: &str,
-            disk_path: &str,
-            float_backend: &str,
+            configuration: &MachineConfiguration,
         ) -> RuntimeStatusDto;
         fn run_machine(self: &UiSession) -> RuntimeStatusDto;
         fn reset_machine(self: &UiSession) -> RuntimeStatusDto;

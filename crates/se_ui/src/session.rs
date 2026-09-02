@@ -14,14 +14,14 @@ use se_runtime::control::{RuntimeState, RuntimeStatus};
 use se_runtime::runtime::{DebugReply, Runtime, RuntimeError, ShutdownError};
 
 use crate::bridge::ffi::{
-    CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineOutputSink, MemoryDto,
-    RegistersDto, RuntimeStatusDto, SerialPortDto, TlbDto, TlbEntryDto, UiExitState,
-    UiStartupState, run_gui,
+    CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineConfiguration,
+    MachineOutputSink, MemoryDto, RegistersDto, RuntimeStatusDto, SerialPortDto, TlbDto,
+    TlbEntryDto, UiExitState, UiStartupState, run_gui,
 };
 
 /// Constructs a machine from settings selected by a frontend.
 pub type MachineBuilder =
-    Box<dyn Fn(&str, &str, &str, &str) -> Result<Machine, String> + Send + Sync + 'static>;
+    Box<dyn Fn(&MachineConfiguration) -> Result<Machine, String> + Send + Sync + 'static>;
 
 /// Owns the emulator runtime for the lifetime of one Qt event loop.
 pub struct UiSession {
@@ -58,14 +58,8 @@ impl UiSession {
     }
 
     /// Builds and installs a machine selected in the settings dialog.
-    pub fn configure_machine(
-        &self,
-        model: &str,
-        prom_path: &str,
-        disk_path: &str,
-        float_backend: &str,
-    ) -> RuntimeStatusDto {
-        let machine = match (self.machine_builder)(model, prom_path, disk_path, float_backend) {
+    pub fn configure_machine(&self, configuration: &MachineConfiguration) -> RuntimeStatusDto {
+        let machine = match (self.machine_builder)(configuration) {
             Ok(machine) => machine,
             Err(error) => return failed_status(error),
         };

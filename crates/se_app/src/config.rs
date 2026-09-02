@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
 use se_cli::Arguments;
-use se_ui::bridge::ffi::{UiExitState, UiStartupState};
+use se_ui::bridge::ffi::{MachineConfiguration, UiExitState, UiStartupState};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -25,6 +25,7 @@ struct MachineConfig {
     model: String,
     prom_path: String,
     disk_path: String,
+    cdrom_path: String,
     float_backend: FloatBackend,
 }
 
@@ -34,6 +35,7 @@ impl Default for MachineConfig {
             model: String::from("indigo-ip12"),
             prom_path: String::new(),
             disk_path: String::new(),
+            cdrom_path: String::new(),
             float_backend: FloatBackend::SoftFloat,
         }
     }
@@ -94,21 +96,19 @@ impl ApplicationConfig {
         }
     }
 
-    pub fn machine_configuration(&self) -> (&str, &str, &str, &str) {
-        (
-            &self.machine.model,
-            &self.machine.prom_path,
-            &self.machine.disk_path,
-            self.machine.float_backend.identifier(),
-        )
+    pub fn machine_configuration(&self) -> MachineConfiguration {
+        MachineConfiguration {
+            machine_model: self.machine.model.clone(),
+            prom_path: self.machine.prom_path.clone(),
+            disk_path: self.machine.disk_path.clone(),
+            cdrom_path: self.machine.cdrom_path.clone(),
+            float_backend: String::from(self.machine.float_backend.identifier()),
+        }
     }
 
     pub fn ui_startup_state(&self, startup_error: String) -> UiStartupState {
         UiStartupState {
-            machine_model: self.machine.model.clone(),
-            prom_path: self.machine.prom_path.clone(),
-            disk_path: self.machine.disk_path.clone(),
-            float_backend: String::from(self.machine.float_backend.identifier()),
+            machine: self.machine_configuration(),
             window_geometry: self.ui.window_geometry.clone(),
             window_state: self.ui.window_state.clone(),
             startup_error,
@@ -116,10 +116,11 @@ impl ApplicationConfig {
     }
 
     pub fn apply_ui_exit_state(&mut self, exit: UiExitState) {
-        self.machine.model = exit.machine_model;
-        self.machine.prom_path = exit.prom_path;
-        self.machine.disk_path = exit.disk_path;
-        self.machine.float_backend = FloatBackend::from_identifier(&exit.float_backend);
+        self.machine.model = exit.machine.machine_model;
+        self.machine.prom_path = exit.machine.prom_path;
+        self.machine.disk_path = exit.machine.disk_path;
+        self.machine.cdrom_path = exit.machine.cdrom_path;
+        self.machine.float_backend = FloatBackend::from_identifier(&exit.machine.float_backend);
         self.ui.window_geometry = exit.window_geometry;
         self.ui.window_state = exit.window_state;
     }
@@ -180,6 +181,7 @@ mod tests {
         assert_eq!(config.machine.model, "indigo-ip12");
         assert!(config.machine.prom_path.is_empty());
         assert!(config.machine.disk_path.is_empty());
+        assert!(config.machine.cdrom_path.is_empty());
         assert!(matches!(
             config.machine.float_backend,
             FloatBackend::SoftFloat
@@ -196,6 +198,7 @@ mod tests {
                 model = "indigo-ip12"
                 prom_path = "prom.bin"
                 disk_path = "disk.img"
+                cdrom_path = "disc.iso"
                 float_backend = "native"
                 another_future_value = 7
             "#,
@@ -204,7 +207,25 @@ mod tests {
 
         assert_eq!(config.machine.prom_path, "prom.bin");
         assert_eq!(config.machine.disk_path, "disk.img");
+        assert_eq!(config.machine.cdrom_path, "disc.iso");
         assert!(matches!(config.machine.float_backend, FloatBackend::Native));
+    }
+
+    #[test]
+    fn older_configuration_without_cdrom_path_uses_an_empty_path() {
+        let config: ApplicationConfig = toml::from_str(
+            r#"
+                [machine]
+                model = "indigo-ip12"
+                prom_path = "prom.bin"
+                disk_path = "disk.img"
+                float_backend = "native"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.machine.cdrom_path.is_empty());
+        assert!(config.machine_configuration().cdrom_path.is_empty());
     }
 
     #[test]
@@ -246,11 +267,13 @@ mod tests {
         save(&path, &config).unwrap();
         config.machine.prom_path = String::from("replacement.bin");
         config.machine.disk_path = String::from("disk.img");
+        config.machine.cdrom_path = String::from("disc.iso");
         save(&path, &config).unwrap();
 
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.machine.prom_path, "replacement.bin");
         assert_eq!(loaded.machine.disk_path, "disk.img");
+        assert_eq!(loaded.machine.cdrom_path, "disc.iso");
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
