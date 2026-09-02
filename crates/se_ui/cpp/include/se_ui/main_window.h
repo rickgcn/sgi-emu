@@ -11,6 +11,7 @@
 class QAction;
 class QDockWidget;
 class QLabel;
+class QString;
 class QTimer;
 
 namespace se_ui {
@@ -43,6 +44,7 @@ private:
     void create_toolbar();
     void restore_window_state(const UiStartupState& startup);
     void set_default_dock_layout();
+    void show_notification(const QString& message, int timeout);
     void show_settings();
     void update_runtime();
     void refresh_debuggers();
@@ -67,10 +69,12 @@ private:
     SerialConsoleDock* serial_console_dock_;
     std::shared_ptr<MachineOutputSink> machine_output_sink_;
     QTimer* update_timer_;
+    QTimer* notification_timer_;
     QElapsedTimer performance_timer_;
     std::uint64_t performance_instruction_baseline_;
     QLabel* machine_status_;
     QLabel* execution_error_status_;
+    QLabel* notification_status_;
     QLabel* performance_status_;
     QLabel* runtime_status_;
 };

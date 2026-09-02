@@ -87,10 +87,12 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , serial_console_dock_(nullptr)
     , machine_output_sink_()
     , update_timer_(new QTimer(this))
+    , notification_timer_(new QTimer(this))
     , performance_timer_()
     , performance_instruction_baseline_(0)
     , machine_status_(new QLabel(this))
     , execution_error_status_(new QLabel(this))
+    , notification_status_(new QLabel(this))
     , performance_status_(new QLabel(this))
     , runtime_status_(new QLabel(this)) {
     setObjectName(QStringLiteral("MainWindow"));
@@ -179,7 +181,7 @@ void MainWindow::create_docks() {
     disassembly_dock_ = new DisassemblyDock(session_, this);
     registers_dock_ = new RegistersDock(
         session_,
-        [this](const QString& message) { statusBar()->showMessage(message, 3000); },
+        [this](const QString& message) { show_notification(message, 3000); },
         this);
     tlb_dock_ = new TlbDock(session_, this);
     cache_dock_ = new CacheDock(session_, this);
@@ -222,15 +224,32 @@ void MainWindow::create_toolbar() {
 }
 
 void MainWindow::create_status_bar() {
+    notification_timer_->setSingleShot(true);
+    connect(notification_timer_, &QTimer::timeout, this, [this] {
+        notification_status_->clear();
+        notification_status_->hide();
+    });
     execution_error_status_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     statusBar()->addWidget(machine_status_);
     statusBar()->addWidget(execution_error_status_, 1);
+    statusBar()->addPermanentWidget(notification_status_);
     statusBar()->addPermanentWidget(performance_status_);
     statusBar()->addPermanentWidget(runtime_status_);
     execution_error_status_->hide();
+    notification_status_->hide();
     performance_status_->setText(QStringLiteral("IPS: \u2014"));
     runtime_status_->setText(QStringLiteral("State: Unconfigured"));
     update_machine_status();
+}
+
+void MainWindow::show_notification(const QString& message, int timeout) {
+    notification_timer_->stop();
+    notification_status_->setText(message);
+    notification_status_->setToolTip(message);
+    notification_status_->setVisible(!message.isEmpty());
+    if (!message.isEmpty() && timeout > 0) {
+        notification_timer_->start(timeout);
+    }
 }
 
 void MainWindow::restore_window_state(const UiStartupState& startup) {
@@ -331,7 +350,7 @@ void MainWindow::refresh_debuggers() {
 void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool report_error) {
     if (!status.success) {
         const auto command_error = from_rust_string(status.command_error);
-        statusBar()->showMessage(QStringLiteral("Error: %1").arg(command_error), 5000);
+        show_notification(QStringLiteral("Error: %1").arg(command_error), 5000);
         if (report_error) {
             QMessageBox::warning(
                 this, QStringLiteral("Machine command"), command_error);
