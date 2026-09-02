@@ -328,7 +328,7 @@ impl State {
             Cacheability::Uncached => {
                 let mut staged = [0; 4];
                 bus.read(translation.address, &mut staged[..data.len()])?;
-                data.copy_from_slice(&staged[..data.len()]);
+                commit_load_data(data, staged);
                 Ok(())
             }
         }
@@ -582,6 +582,30 @@ impl State {
                 unreachable!("TLB shutdown is handled before exception mapping")
             }
         }
+    }
+}
+
+fn commit_load_data(data: &mut [u8], staged: [u8; 4]) {
+    match data {
+        [byte0] => {
+            *byte0 = staged[0];
+        }
+        [byte0, byte1] => {
+            *byte0 = staged[0];
+            *byte1 = staged[1];
+        }
+        [byte0, byte1, byte2] => {
+            *byte0 = staged[0];
+            *byte1 = staged[1];
+            *byte2 = staged[2];
+        }
+        [byte0, byte1, byte2, byte3] => {
+            *byte0 = staged[0];
+            *byte1 = staged[1];
+            *byte2 = staged[2];
+            *byte3 = staged[3];
+        }
+        _ => unreachable!("R3000 memory transactions contain one through four bytes"),
     }
 }
 

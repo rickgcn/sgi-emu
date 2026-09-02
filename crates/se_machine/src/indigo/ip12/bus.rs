@@ -702,6 +702,13 @@ fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault> {
     let length = u64::try_from(length).map_err(|_| BusFault::UnsupportedAccess)?;
     let end = start.checked_add(length).ok_or(BusFault::Unmapped)?;
 
+    if contains(start, end, PROM_BASE, PROM_END) {
+        return Ok(Target::Prom(DeviceAddr::new(start - PROM_BASE)));
+    }
+    if overlaps(start, end, PROM_BASE, PROM_END) {
+        return Err(BusFault::Unmapped);
+    }
+
     if contains(start, end, GIO_BASE, GIO_END) {
         return Ok(Target::UnpopulatedGio);
     }
@@ -800,9 +807,6 @@ fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault> {
 
     if contains(start, end, PIC1_BASE, PIC1_END) {
         return Ok(Target::Pic1(DeviceAddr::new(start - PIC1_BASE)));
-    }
-    if contains(start, end, PROM_BASE, PROM_END) {
-        return Ok(Target::Prom(DeviceAddr::new(start - PROM_BASE)));
     }
 
     Err(BusFault::Unmapped)

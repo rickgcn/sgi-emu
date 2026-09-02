@@ -25,7 +25,7 @@ impl Rom {
     /// transaction is not backed by this ROM.
     pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
         let range = self.transaction_range(address, data.len())?;
-        data.copy_from_slice(&self.bytes[range]);
+        copy_read_transaction(&self.bytes[range], data);
         Ok(())
     }
 
@@ -57,6 +57,30 @@ impl Rom {
         }
 
         Ok(start..end)
+    }
+}
+
+fn copy_read_transaction(source: &[u8], data: &mut [u8]) {
+    match data {
+        [byte0] => {
+            *byte0 = source[0];
+        }
+        [byte0, byte1] => {
+            *byte0 = source[0];
+            *byte1 = source[1];
+        }
+        [byte0, byte1, byte2] => {
+            *byte0 = source[0];
+            *byte1 = source[1];
+            *byte2 = source[2];
+        }
+        [byte0, byte1, byte2, byte3] => {
+            *byte0 = source[0];
+            *byte1 = source[1];
+            *byte2 = source[2];
+            *byte3 = source[3];
+        }
+        _ => unreachable!("ROM transactions contain one through four bytes"),
     }
 }
 
@@ -102,15 +126,19 @@ mod tests {
     #[test]
     fn rejects_out_of_range_and_crossing_transactions() {
         let rom = Rom::new(vec![0; 4]);
+        let mut outside = [0xaa];
+        let mut crossing = [0xbb; 3];
 
         assert_eq!(
-            rom.read(DeviceAddr::new(4), &mut [0; 1]),
+            rom.read(DeviceAddr::new(4), &mut outside),
             Err(BusFault::Unmapped)
         );
         assert_eq!(
-            rom.read(DeviceAddr::new(2), &mut [0; 3]),
+            rom.read(DeviceAddr::new(2), &mut crossing),
             Err(BusFault::Unmapped)
         );
+        assert_eq!(outside, [0xaa]);
+        assert_eq!(crossing, [0xbb; 3]);
         assert_eq!(
             rom.read(DeviceAddr::new(u64::MAX), &mut [0; 1]),
             Err(BusFault::Unmapped)
