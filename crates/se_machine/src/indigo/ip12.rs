@@ -307,6 +307,12 @@ impl Ip12 {
         if self.bus.local_interrupt_0_asserted() {
             interrupt_lines |= 1 << 1;
         }
+        if self.bus.timer_0_interrupt_asserted() {
+            interrupt_lines |= 1 << 2;
+        }
+        if self.bus.timer_1_interrupt_asserted() {
+            interrupt_lines |= 1 << 4;
+        }
         if self.bus.error_interrupt_asserted() {
             interrupt_lines |= 1 << 5;
         }
@@ -338,8 +344,10 @@ mod tests {
     use std::fs;
     use std::io;
 
+    use crate::output::MachineOutput;
     use crate::serial::SerialPort;
     use se_core::bus::{PhysAddr, PhysicalBus};
+    use se_core::time::VirtualDuration;
     use se_device::storage::BlockStorage;
     use se_float::backend::Backend;
 
@@ -679,6 +687,49 @@ mod tests {
         assert_eq!(machine.receive_serial(SerialPort::A, b"A"), 1);
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 11),
+            0
+        );
+    }
+
+    #[test]
+    fn int2_timers_drive_cpu_interrupt_inputs_two_and_four() {
+        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        for (control, address) in [
+            (0xb4, 0x1fb8_01fb),
+            (0x34, 0x1fb8_01f3),
+            (0x74, 0x1fb8_01f7),
+        ] {
+            machine
+                .bus
+                .write(PhysAddr::new(0x1fb8_01ff), &[control])
+                .unwrap();
+            for value in 2_u16.to_le_bytes() {
+                machine.bus.write(PhysAddr::new(address), &[value]).unwrap();
+            }
+        }
+        let mut output = MachineOutput::default();
+
+        machine.advance_time(
+            VirtualDuration::from_attoseconds(4_000_000_000_000),
+            &mut output,
+        );
+        machine.update_interrupt_lines();
+        assert_eq!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_5000,
+            0x0000_5000
+        );
+
+        machine.bus.write(PhysAddr::new(0x1fb8_01e3), &[1]).unwrap();
+        machine.update_interrupt_lines();
+        assert_eq!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_5000,
+            0x0000_4000
+        );
+
+        machine.bus.write(PhysAddr::new(0x1fb8_01e3), &[2]).unwrap();
+        machine.update_interrupt_lines();
+        assert_eq!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_5000,
             0
         );
     }

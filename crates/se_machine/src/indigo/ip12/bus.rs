@@ -129,6 +129,14 @@ impl Ip12Bus {
         self.int2.local_interrupt_0_asserted()
     }
 
+    pub(super) fn timer_0_interrupt_asserted(&self) -> bool {
+        self.int2.timer_0_interrupt_asserted()
+    }
+
+    pub(super) fn timer_1_interrupt_asserted(&self) -> bool {
+        self.int2.timer_1_interrupt_asserted()
+    }
+
     pub(super) fn receive_serial(&mut self, port: SerialPort, bytes: &[u8]) -> usize {
         let channel = match port {
             SerialPort::A => Channel::A,
@@ -179,7 +187,9 @@ impl PhysicalBus for Ip12Bus {
             Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),
             Target::Int2(address) => {
                 self.synchronize_int2_time();
-                self.int2.read(address, data)
+                let result = self.int2.read(address, data);
+                self.reschedule_int2();
+                result
             }
             Target::Serial(index, address) => {
                 self.synchronize_serial_for_mmio(index);
@@ -226,7 +236,9 @@ impl PhysicalBus for Ip12Bus {
             }
             Target::Int2(address) => {
                 self.synchronize_int2_time();
-                self.int2.write(address, data)
+                let result = self.int2.write(address, data);
+                self.reschedule_int2();
+                result
             }
             Target::Serial(index, address) => {
                 self.synchronize_serial_for_mmio(index);

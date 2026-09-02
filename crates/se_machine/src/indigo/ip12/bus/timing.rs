@@ -16,7 +16,10 @@ impl Ip12Bus {
         self.events.advance(elapsed);
         while let Some(kind) = self.events.take_due() {
             match kind {
-                EventKind::Int2 => self.synchronize_int2_time(),
+                EventKind::Int2 => {
+                    self.synchronize_int2_time();
+                    self.reschedule_int2();
+                }
                 EventKind::Rtc => self.synchronize_rtc_time(),
                 EventKind::Serial0 => self.synchronize_serial_time(0, output),
                 EventKind::Serial1 => self.synchronize_serial_time(1, output),
@@ -29,7 +32,7 @@ impl Ip12Bus {
     }
 
     pub(super) fn schedule_timed_devices(&mut self) {
-        self.events.schedule(EventKind::Int2, None);
+        self.reschedule_int2();
         self.events
             .schedule(EventKind::Rtc, self.rtc.time_until_event());
         self.reschedule_serial(0);
@@ -40,7 +43,11 @@ impl Ip12Bus {
     pub(super) fn synchronize_int2_time(&mut self) {
         let elapsed = self.events.synchronize(EventKind::Int2);
         self.int2.advance_time(elapsed);
-        self.events.schedule(EventKind::Int2, None);
+    }
+
+    pub(super) fn reschedule_int2(&mut self) {
+        self.events
+            .schedule(EventKind::Int2, self.int2.time_until_event());
     }
 
     pub(super) fn synchronize_rtc_time(&mut self) {
@@ -96,7 +103,7 @@ const fn serial_event_kind(index: usize) -> EventKind {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{PhysAddr, PhysicalBus};
+    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
     use crate::output::MachineOutput;
@@ -104,6 +111,20 @@ mod tests {
 
     use super::super::address::{INT2_BASE, RTC_BASE, SERIAL_0_BASE, SERIAL_1_BASE};
     use super::super::test_support::{bus, configure_serial_a, read_byte, read_word};
+
+    const ATTOSECONDS_PER_MICROSECOND: u128 = ATTOSECONDS_PER_SECOND / 1_000_000;
+    const TIMER_ACKNOWLEDGE: u64 = INT2_BASE + 0x23;
+    const TIMER_COUNTER_0: u64 = INT2_BASE + 0x33;
+    const TIMER_COUNTER_1: u64 = INT2_BASE + 0x37;
+    const TIMER_COUNTER_2: u64 = INT2_BASE + 0x3b;
+    const TIMER_CONTROL: u64 = INT2_BASE + 0x3f;
+
+    fn configure_timer(bus: &mut super::Ip12Bus, control: u8, address: u64, reload: u16) {
+        bus.write(PhysAddr::new(TIMER_CONTROL), &[control]).unwrap();
+        for value in reload.to_le_bytes() {
+            bus.write(PhysAddr::new(address), &[value]).unwrap();
+        }
+    }
 
     #[test]
     fn only_the_second_serial_controller_reaches_external_machine_output() {
@@ -173,5 +194,150 @@ mod tests {
         );
 
         assert_eq!(read_byte(&mut bus, RTC_BASE + 0x17), Ok(1));
+    }
+
+    #[test]
+    fn ide_counter_1_sequence_uses_the_physical_ports_and_event_scheduler() {
+        let mut bus = bus();
+        let mut output = MachineOutput::default();
+        configure_timer(&mut bus, 0xb4, TIMER_COUNTER_2, 1_000);
+        configure_timer(&mut bus, 0x74, TIMER_COUNTER_1, 2_000);
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(2 * ATTOSECONDS_PER_SECOND - 1),
+            &mut output,
+        );
+        assert!(!bus.timer_1_interrupt_asserted());
+        bus.advance_time(VirtualDuration::from_attoseconds(1), &mut output);
+        assert!(bus.timer_1_interrupt_asserted());
+
+        bus.write(PhysAddr::new(TIMER_ACKNOWLEDGE), &[2]).unwrap();
+        assert!(!bus.timer_1_interrupt_asserted());
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(2 * ATTOSECONDS_PER_SECOND),
+            &mut output,
+        );
+        assert!(bus.timer_1_interrupt_asserted());
+    }
+
+    #[test]
+    fn failed_timer_mmio_preserves_the_rescheduled_deadline() {
+        let mut bus = bus();
+        let mut output = MachineOutput::default();
+        configure_timer(&mut bus, 0xb4, TIMER_COUNTER_2, 3);
+        configure_timer(&mut bus, 0x74, TIMER_COUNTER_1, 2);
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(2 * ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+
+        assert_eq!(
+            bus.write(PhysAddr::new(TIMER_CONTROL), &[0x76]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(4 * ATTOSECONDS_PER_MICROSECOND - 1),
+            &mut output,
+        );
+        assert!(!bus.timer_1_interrupt_asserted());
+        bus.advance_time(VirtualDuration::from_attoseconds(1), &mut output);
+        assert!(bus.timer_1_interrupt_asserted());
+    }
+
+    #[test]
+    fn reprogramming_replaces_the_old_timer_deadline() {
+        let mut bus = bus();
+        let mut output = MachineOutput::default();
+        configure_timer(&mut bus, 0xb4, TIMER_COUNTER_2, 3);
+        configure_timer(&mut bus, 0x74, TIMER_COUNTER_1, 2);
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(2 * ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        configure_timer(&mut bus, 0x74, TIMER_COUNTER_1, 4);
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(4 * ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        assert!(!bus.timer_1_interrupt_asserted());
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(6 * ATTOSECONDS_PER_MICROSECOND - 1),
+            &mut output,
+        );
+        assert!(!bus.timer_1_interrupt_asserted());
+        bus.advance_time(VirtualDuration::from_attoseconds(1), &mut output);
+        assert!(bus.timer_1_interrupt_asserted());
+    }
+
+    #[test]
+    fn acknowledgement_and_control_follow_due_event_ordering() {
+        let mut acknowledged = bus();
+        let mut output = MachineOutput::default();
+        configure_timer(&mut acknowledged, 0xb4, TIMER_COUNTER_2, 3);
+        configure_timer(&mut acknowledged, 0x74, TIMER_COUNTER_1, 2);
+        acknowledged.advance_time(
+            VirtualDuration::from_attoseconds(6 * ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        acknowledged
+            .write(PhysAddr::new(TIMER_ACKNOWLEDGE), &[2])
+            .unwrap();
+        assert!(!acknowledged.timer_1_interrupt_asserted());
+        acknowledged.advance_time(
+            VirtualDuration::from_attoseconds(6 * ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        assert!(acknowledged.timer_1_interrupt_asserted());
+
+        let mut quiesced = bus();
+        configure_timer(&mut quiesced, 0xb4, TIMER_COUNTER_2, 3);
+        configure_timer(&mut quiesced, 0x74, TIMER_COUNTER_1, 2);
+        quiesced.advance_time(
+            VirtualDuration::from_attoseconds(6 * ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        quiesced
+            .write(PhysAddr::new(TIMER_CONTROL), &[0x78])
+            .unwrap();
+        assert!(quiesced.timer_1_interrupt_asserted());
+    }
+
+    #[test]
+    fn timer_debug_reads_do_not_synchronize_a_due_event() {
+        let mut bus = bus();
+        let mut output = MachineOutput::default();
+        configure_timer(&mut bus, 0xb4, TIMER_COUNTER_2, 3);
+        configure_timer(&mut bus, 0x74, TIMER_COUNTER_1, 2);
+        bus.events.advance(VirtualDuration::from_attoseconds(
+            6 * ATTOSECONDS_PER_MICROSECOND,
+        ));
+
+        assert_eq!(
+            bus.debug_read(PhysAddr::new(TIMER_ACKNOWLEDGE), &mut [0]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert!(!bus.timer_1_interrupt_asserted());
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        assert!(bus.timer_1_interrupt_asserted());
+    }
+
+    #[test]
+    fn reset_cancels_the_timer_event_and_clears_pending_outputs() {
+        let mut bus = bus();
+        let mut output = MachineOutput::default();
+        configure_timer(&mut bus, 0xb4, TIMER_COUNTER_2, 3);
+        configure_timer(&mut bus, 0x34, TIMER_COUNTER_0, 2);
+        configure_timer(&mut bus, 0x74, TIMER_COUNTER_1, 2);
+
+        bus.reset();
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(100 * ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+
+        assert!(!bus.timer_0_interrupt_asserted());
+        assert!(!bus.timer_1_interrupt_asserted());
     }
 }

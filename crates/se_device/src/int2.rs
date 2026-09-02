@@ -1,7 +1,11 @@
 //! Silicon Graphics INT2 interrupt and timer register front end.
 
+mod timer;
+
 use se_core::bus::{BusFault, DeviceAddr};
 use se_core::time::VirtualDuration;
+
+use self::timer::{CounterId, ProgrammableTimer};
 
 const LOCAL_INTERRUPT_0_STATUS: u64 = 0x00;
 const LOCAL_INTERRUPT_0_MASK: u64 = 0x04;
@@ -13,11 +17,12 @@ const VME_INTERRUPT_1_MASK: u64 = 0x18;
 const OUTPUT_PORT: u64 = 0x1c;
 const TIMER_ACKNOWLEDGE: u64 = 0x23;
 const PROGRAMMABLE_TIMER_CLOCK: u64 = 0x30;
+const SYSTEM_TIMER_COUNTER_0: u64 = 0x33;
+const SYSTEM_TIMER_COUNTER_1: u64 = 0x37;
 const SYSTEM_TIMER_COUNTER_2: u64 = 0x3b;
 const SYSTEM_TIMER_CONTROL: u64 = 0x3f;
 const REGISTER_BYTES: u64 = 4;
 const OUTPUT_BITS: u8 = 0x1f;
-const ATTOSECONDS_PER_COUNTER_TICK: u128 = 1_000_000_000_000;
 
 /// The software-visible INT2 state used by the IP12 machine.
 pub struct Int2 {
@@ -26,17 +31,7 @@ pub struct Int2 {
     vme_interrupt_masks: [u8; 2],
     output_port: u8,
     timer_pending: [bool; 2],
-    timer_programming: [u8; 3],
-    timer_programming_length: usize,
-    system_timer_counter_2_programming: [u8; 2],
-    system_timer_counter_2_programming_length: usize,
-    system_timer_control: u8,
-    system_timer_phase: u128,
-    system_timer_counter_2_reload: u32,
-    system_timer_counter_2_value: u32,
-    system_timer_counter_2_mode_2: bool,
-    system_timer_counter_2_latch: Option<u16>,
-    system_timer_counter_2_read_high: bool,
+    timer: ProgrammableTimer,
 }
 
 impl Int2 {
@@ -53,17 +48,7 @@ impl Int2 {
             vme_interrupt_masks: [0; 2],
             output_port: 0,
             timer_pending: [false; 2],
-            timer_programming: [0; 3],
-            timer_programming_length: 0,
-            system_timer_counter_2_programming: [0; 2],
-            system_timer_counter_2_programming_length: 0,
-            system_timer_control: 0,
-            system_timer_phase: 0,
-            system_timer_counter_2_reload: 0,
-            system_timer_counter_2_value: 0,
-            system_timer_counter_2_mode_2: false,
-            system_timer_counter_2_latch: None,
-            system_timer_counter_2_read_high: false,
+            timer: ProgrammableTimer::new(),
         }
     }
 
@@ -74,17 +59,7 @@ impl Int2 {
         self.vme_interrupt_masks = [0; 2];
         self.output_port = 0;
         self.timer_pending = [false; 2];
-        self.timer_programming = [0; 3];
-        self.timer_programming_length = 0;
-        self.system_timer_counter_2_programming = [0; 2];
-        self.system_timer_counter_2_programming_length = 0;
-        self.system_timer_control = 0;
-        self.system_timer_phase = 0;
-        self.system_timer_counter_2_reload = 0;
-        self.system_timer_counter_2_value = 0;
-        self.system_timer_counter_2_mode_2 = false;
-        self.system_timer_counter_2_latch = None;
-        self.system_timer_counter_2_read_high = false;
+        self.timer.reset();
     }
 
     /// Drives selected local-interrupt-zero input lines.
@@ -102,24 +77,44 @@ impl Int2 {
         self.local_interrupt_status[0] & self.local_interrupt_masks[0] != 0
     }
 
+    /// Reports whether the timer-zero interrupt output is asserted.
+    #[must_use]
+    pub const fn timer_0_interrupt_asserted(&self) -> bool {
+        self.timer_pending[0]
+    }
+
+    /// Reports whether the timer-one interrupt output is asserted.
+    #[must_use]
+    pub const fn timer_1_interrupt_asserted(&self) -> bool {
+        self.timer_pending[1]
+    }
+
     /// Advances the one-megahertz system timer by guest virtual time.
     pub fn advance_time(&mut self, elapsed: VirtualDuration) {
-        let total = self.system_timer_phase + elapsed.as_attoseconds();
-        let ticks = total / ATTOSECONDS_PER_COUNTER_TICK;
-        self.system_timer_phase = total % ATTOSECONDS_PER_COUNTER_TICK;
+        let outputs = self.timer.advance_time(elapsed);
+        self.timer_pending[0] |= outputs.counter_0;
+        self.timer_pending[1] |= outputs.counter_1;
+    }
 
-        if !self.system_timer_counter_2_mode_2
-            || self.system_timer_counter_2_reload == 0
-            || ticks == 0
-        {
-            return;
+    /// Returns the virtual duration until the next timer output that can set a
+    /// pending interrupt latch.
+    #[must_use]
+    pub fn time_until_event(&self) -> Option<VirtualDuration> {
+        let timer_0 = if self.timer_pending[0] {
+            None
+        } else {
+            self.timer.time_until_output(CounterId::Zero)
+        };
+        let timer_1 = if self.timer_pending[1] {
+            None
+        } else {
+            self.timer.time_until_output(CounterId::One)
+        };
+        match (timer_0, timer_1) {
+            (Some(timer_0), Some(timer_1)) => Some(timer_0.min(timer_1)),
+            (Some(timer), None) | (None, Some(timer)) => Some(timer),
+            (None, None) => None,
         }
-
-        let reload = u128::from(self.system_timer_counter_2_reload);
-        let current = u128::from(self.system_timer_counter_2_value);
-        let offset = (current - 1 + reload - ticks % reload) % reload;
-        self.system_timer_counter_2_value = u32::try_from(offset + 1)
-            .expect("counter 2 value must remain within its 16-bit period");
     }
 
     /// Reads one fixed-width device-local transaction.
@@ -146,17 +141,19 @@ impl Int2 {
             return Ok(());
         }
 
-        if start == TIMER_ACKNOWLEDGE || start == PROGRAMMABLE_TIMER_CLOCK {
+        if start == TIMER_ACKNOWLEDGE
+            || start == PROGRAMMABLE_TIMER_CLOCK
+            || start == SYSTEM_TIMER_CONTROL
+        {
             return Err(BusFault::UnsupportedAccess);
         }
 
-        if start == SYSTEM_TIMER_COUNTER_2 && end == start + 1 {
-            data[0] = self.read_system_timer_counter_2();
+        if let Some(counter) = decode_timer_counter(start) {
+            if end != start + 1 {
+                return Err(BusFault::UnsupportedAccess);
+            }
+            data[0] = self.timer.read_counter(counter)?;
             return Ok(());
-        }
-
-        if start == SYSTEM_TIMER_CONTROL {
-            return Err(BusFault::UnsupportedAccess);
         }
 
         Err(BusFault::Unmapped)
@@ -186,17 +183,19 @@ impl Int2 {
             return Ok(());
         }
 
-        if start == TIMER_ACKNOWLEDGE || start == PROGRAMMABLE_TIMER_CLOCK {
+        if start == TIMER_ACKNOWLEDGE
+            || start == PROGRAMMABLE_TIMER_CLOCK
+            || start == SYSTEM_TIMER_CONTROL
+        {
             return Err(BusFault::UnsupportedAccess);
         }
 
-        if start == SYSTEM_TIMER_COUNTER_2 && end == start + 1 {
-            data[0] = self.peek_system_timer_counter_2();
+        if let Some(counter) = decode_timer_counter(start) {
+            if end != start + 1 {
+                return Err(BusFault::UnsupportedAccess);
+            }
+            data[0] = self.timer.debug_read_counter(counter)?;
             return Ok(());
-        }
-
-        if start == SYSTEM_TIMER_CONTROL {
-            return Err(BusFault::UnsupportedAccess);
         }
 
         Err(BusFault::Unmapped)
@@ -247,54 +246,23 @@ impl Int2 {
         }
 
         if start == PROGRAMMABLE_TIMER_CLOCK && end == start + 1 {
-            self.timer_programming.rotate_left(1);
-            self.timer_programming[2] = data[0];
-            self.timer_programming_length = (self.timer_programming_length + 1).min(3);
             return Ok(());
         }
 
-        if start == SYSTEM_TIMER_COUNTER_2 && end == start + 1 {
-            if self.system_timer_counter_2_programming_length == 1 {
-                self.system_timer_counter_2_programming[1] = data[0];
-                self.system_timer_counter_2_programming_length = 2;
-                let programmed = u16::from_le_bytes(self.system_timer_counter_2_programming);
-                self.system_timer_counter_2_reload = if programmed == 0 {
-                    1 << 16
-                } else {
-                    u32::from(programmed)
-                };
-                self.system_timer_counter_2_value = self.system_timer_counter_2_reload;
-                self.system_timer_counter_2_latch = None;
-                self.system_timer_counter_2_read_high = false;
-            } else {
-                self.system_timer_counter_2_programming[0] = data[0];
-                self.system_timer_counter_2_programming_length = 1;
+        if let Some(counter) = decode_timer_counter(start) {
+            if end != start + 1 {
+                return Err(BusFault::UnsupportedAccess);
             }
-            return Ok(());
+            return self.timer.write_counter(counter, data[0]);
         }
 
         if start == SYSTEM_TIMER_CONTROL && end == start + 1 {
-            self.system_timer_control = data[0];
-            match data[0] {
-                0xb4 => {
-                    self.system_timer_counter_2_programming_length = 0;
-                    self.system_timer_counter_2_mode_2 = true;
-                    self.system_timer_counter_2_latch = None;
-                    self.system_timer_counter_2_read_high = false;
-                }
-                0x80 => {
-                    self.system_timer_counter_2_latch =
-                        Some((self.system_timer_counter_2_value & u32::from(u16::MAX)) as u16);
-                    self.system_timer_counter_2_read_high = false;
-                }
-                _ => {}
-            }
-            return Ok(());
+            return self.timer.write_control(data[0]);
         }
 
         if start == TIMER_ACKNOWLEDGE
             || start == PROGRAMMABLE_TIMER_CLOCK
-            || start == SYSTEM_TIMER_COUNTER_2
+            || decode_timer_counter(start).is_some()
             || start == SYSTEM_TIMER_CONTROL
         {
             return Err(BusFault::UnsupportedAccess);
@@ -302,26 +270,14 @@ impl Int2 {
 
         Err(BusFault::Unmapped)
     }
+}
 
-    fn read_system_timer_counter_2(&mut self) -> u8 {
-        let value = self.peek_system_timer_counter_2();
-        if self.system_timer_counter_2_latch.is_some() {
-            if self.system_timer_counter_2_read_high {
-                self.system_timer_counter_2_latch = None;
-                self.system_timer_counter_2_read_high = false;
-            } else {
-                self.system_timer_counter_2_read_high = true;
-            }
-        }
-        value
-    }
-
-    fn peek_system_timer_counter_2(&self) -> u8 {
-        let Some(latch) = self.system_timer_counter_2_latch else {
-            return 0;
-        };
-        let bytes = latch.to_le_bytes();
-        bytes[usize::from(self.system_timer_counter_2_read_high)]
+const fn decode_timer_counter(address: u64) -> Option<CounterId> {
+    match address {
+        SYSTEM_TIMER_COUNTER_0 => Some(CounterId::Zero),
+        SYSTEM_TIMER_COUNTER_1 => Some(CounterId::One),
+        SYSTEM_TIMER_COUNTER_2 => Some(CounterId::Two),
+        _ => None,
     }
 }
 
@@ -384,11 +340,13 @@ mod tests {
     use se_core::time::VirtualDuration;
 
     use super::{
-        ATTOSECONDS_PER_COUNTER_TICK, Int2, LOCAL_INTERRUPT_0_MASK, LOCAL_INTERRUPT_0_STATUS,
-        LOCAL_INTERRUPT_1_MASK, LOCAL_INTERRUPT_1_STATUS, OUTPUT_PORT, PROGRAMMABLE_TIMER_CLOCK,
-        SYSTEM_TIMER_CONTROL, SYSTEM_TIMER_COUNTER_2, TIMER_ACKNOWLEDGE, VME_INTERRUPT_0_MASK,
-        VME_INTERRUPT_1_MASK, VME_INTERRUPT_STATUS,
+        Int2, LOCAL_INTERRUPT_0_MASK, LOCAL_INTERRUPT_0_STATUS, LOCAL_INTERRUPT_1_MASK,
+        LOCAL_INTERRUPT_1_STATUS, OUTPUT_PORT, PROGRAMMABLE_TIMER_CLOCK, SYSTEM_TIMER_CONTROL,
+        SYSTEM_TIMER_COUNTER_0, SYSTEM_TIMER_COUNTER_1, SYSTEM_TIMER_COUNTER_2, TIMER_ACKNOWLEDGE,
+        VME_INTERRUPT_0_MASK, VME_INTERRUPT_1_MASK, VME_INTERRUPT_STATUS,
     };
+
+    const ATTOSECONDS_PER_MICROSECOND: u128 = 1_000_000_000_000;
 
     fn read_word(int2: &mut Int2, address: u64) -> Result<u32, BusFault> {
         let mut bytes = [0; 4];
@@ -479,10 +437,17 @@ mod tests {
         let mut int2 = Int2::new();
         int2.timer_pending = [true; 2];
 
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[0])
+            .unwrap();
+        assert_eq!(int2.timer_pending, [true, true]);
         int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[1])
             .unwrap();
         assert_eq!(int2.timer_pending, [false, true]);
-        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[2])
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[0xfe])
+            .unwrap();
+        assert_eq!(int2.timer_pending, [false, false]);
+        int2.timer_pending = [true; 2];
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[3])
             .unwrap();
         assert_eq!(int2.timer_pending, [false, false]);
         assert_eq!(
@@ -494,15 +459,17 @@ mod tests {
     #[test]
     fn programmable_clock_accepts_the_prom_sequence() {
         let mut int2 = Int2::new();
+        int2.timer_pending = [true, false];
+        let timer_before = int2.timer.clone();
 
         for value in [0x02, 0x42, 0x42] {
             int2.write(DeviceAddr::new(PROGRAMMABLE_TIMER_CLOCK), &[value])
                 .unwrap();
         }
 
-        assert_eq!(int2.timer_programming, [0x02, 0x42, 0x42]);
-        assert_eq!(int2.timer_programming_length, 3);
-        assert_eq!(int2.timer_pending, [false; 2]);
+        assert_eq!(int2.timer, timer_before);
+        assert_eq!(int2.timer_pending, [true, false]);
+        assert_eq!(int2.time_until_event(), None);
     }
 
     #[test]
@@ -516,14 +483,13 @@ mod tests {
         int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[0x27])
             .unwrap();
         int2.advance_time(VirtualDuration::from_attoseconds(123_456_789));
-        assert_eq!(int2.system_timer_phase, 123_456_789);
         int2.advance_time(VirtualDuration::from_attoseconds(
-            2_345 * ATTOSECONDS_PER_COUNTER_TICK - 123_456_789,
+            2_345 * ATTOSECONDS_PER_MICROSECOND - 123_456_789,
         ));
         int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0x80])
             .unwrap();
         int2.advance_time(VirtualDuration::from_attoseconds(
-            10 * ATTOSECONDS_PER_COUNTER_TICK,
+            10 * ATTOSECONDS_PER_MICROSECOND,
         ));
 
         let mut low = [0xff];
@@ -537,11 +503,14 @@ mod tests {
             Ok(())
         );
         assert_eq!(u16::from_le_bytes([low[0], high[0]]), 7_655);
-        assert_eq!(int2.system_timer_counter_2_programming, [0x10, 0x27]);
-        assert_eq!(int2.system_timer_counter_2_programming_length, 2);
-        assert_eq!(int2.system_timer_control, 0x80);
-        assert_eq!(int2.system_timer_counter_2_latch, None);
-        assert_eq!(int2.system_timer_counter_2_value, 7_645);
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0x80])
+            .unwrap();
+        let mut next = [0; 2];
+        int2.read(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &mut next[..1])
+            .unwrap();
+        int2.read(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &mut next[1..])
+            .unwrap();
+        assert_eq!(u16::from_le_bytes(next), 7_645);
     }
 
     #[test]
@@ -568,6 +537,131 @@ mod tests {
     }
 
     #[test]
+    fn all_counter_ports_cascade_to_independent_pending_outputs() {
+        let mut int2 = Int2::new();
+        for (control, address, reload) in [
+            (0xb4, SYSTEM_TIMER_COUNTER_2, 3_u16),
+            (0x34, SYSTEM_TIMER_COUNTER_0, 2),
+            (0x74, SYSTEM_TIMER_COUNTER_1, 2),
+        ] {
+            int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[control])
+                .unwrap();
+            for value in reload.to_le_bytes() {
+                int2.write(DeviceAddr::new(address), &[value]).unwrap();
+            }
+        }
+
+        assert_eq!(
+            int2.time_until_event(),
+            Some(VirtualDuration::from_attoseconds(
+                6 * ATTOSECONDS_PER_MICROSECOND
+            ))
+        );
+        int2.advance_time(VirtualDuration::from_attoseconds(
+            6 * ATTOSECONDS_PER_MICROSECOND,
+        ));
+
+        assert!(int2.timer_0_interrupt_asserted());
+        assert!(int2.timer_1_interrupt_asserted());
+        assert_eq!(int2.time_until_event(), None);
+    }
+
+    #[test]
+    fn pending_timers_are_excluded_until_acknowledged() {
+        let mut int2 = Int2::new();
+        for (control, address, reload) in [
+            (0xb4, SYSTEM_TIMER_COUNTER_2, 3_u16),
+            (0x34, SYSTEM_TIMER_COUNTER_0, 2),
+            (0x74, SYSTEM_TIMER_COUNTER_1, 3),
+        ] {
+            int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[control])
+                .unwrap();
+            for value in reload.to_le_bytes() {
+                int2.write(DeviceAddr::new(address), &[value]).unwrap();
+            }
+        }
+
+        int2.advance_time(VirtualDuration::from_attoseconds(
+            6 * ATTOSECONDS_PER_MICROSECOND,
+        ));
+        assert_eq!(int2.timer_pending, [true, false]);
+        assert_eq!(
+            int2.time_until_event(),
+            Some(VirtualDuration::from_attoseconds(
+                3 * ATTOSECONDS_PER_MICROSECOND
+            ))
+        );
+        int2.advance_time(VirtualDuration::from_attoseconds(
+            3 * ATTOSECONDS_PER_MICROSECOND,
+        ));
+        assert_eq!(int2.timer_pending, [true, true]);
+        assert_eq!(int2.time_until_event(), None);
+
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[1])
+            .unwrap();
+        assert_eq!(
+            int2.time_until_event(),
+            Some(VirtualDuration::from_attoseconds(
+                3 * ATTOSECONDS_PER_MICROSECOND
+            ))
+        );
+    }
+
+    #[test]
+    fn timer_ports_require_exact_byte_transactions_and_latched_reads() {
+        let mut int2 = Int2::new();
+
+        for address in [
+            SYSTEM_TIMER_COUNTER_0,
+            SYSTEM_TIMER_COUNTER_1,
+            SYSTEM_TIMER_COUNTER_2,
+        ] {
+            assert_eq!(
+                int2.read(DeviceAddr::new(address), &mut [0]),
+                Err(BusFault::UnsupportedAccess)
+            );
+            assert_eq!(
+                int2.write(DeviceAddr::new(address), &[0, 0]),
+                Err(BusFault::UnsupportedAccess)
+            );
+        }
+        assert_eq!(
+            int2.read(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &mut [0]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert_eq!(
+            int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0, 0]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert_eq!(
+            int2.read(DeviceAddr::new(PROGRAMMABLE_TIMER_CLOCK), &mut [0]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert_eq!(
+            int2.read(DeviceAddr::new(SYSTEM_TIMER_COUNTER_0 + 1), &mut [0]),
+            Err(BusFault::Unmapped)
+        );
+    }
+
+    #[test]
+    fn running_counter_rejects_data_only_reload_without_losing_state() {
+        let mut int2 = Int2::new();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0xb4])
+            .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[3])
+            .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[0])
+            .unwrap();
+        let timer_before = int2.timer.clone();
+
+        assert_eq!(
+            int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[4]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert_eq!(int2.timer, timer_before);
+    }
+
+    #[test]
     fn reset_clears_mutable_state() {
         let mut int2 = Int2::new();
         int2.write(DeviceAddr::new(LOCAL_INTERRUPT_0_MASK + 3), &[0xa5])
@@ -579,10 +673,11 @@ mod tests {
         int2.timer_pending = [true; 2];
         int2.write(DeviceAddr::new(PROGRAMMABLE_TIMER_CLOCK), &[0x42])
             .unwrap();
-        int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[0x27])
-            .unwrap();
         int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0xb4])
             .unwrap();
+        int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[0x27])
+            .unwrap();
+        int2.advance_time(VirtualDuration::from_attoseconds(123));
         int2.set_local_interrupt_0_input(1 << 5, true);
 
         int2.reset();
@@ -592,10 +687,7 @@ mod tests {
         assert_eq!(read_word(&mut int2, VME_INTERRUPT_1_MASK), Ok(0));
         assert_eq!(read_word(&mut int2, OUTPUT_PORT), Ok(0));
         assert_eq!(int2.timer_pending, [false; 2]);
-        assert_eq!(int2.timer_programming_length, 0);
-        assert_eq!(int2.system_timer_counter_2_programming_length, 0);
-        assert_eq!(int2.system_timer_control, 0);
-        assert_eq!(int2.system_timer_phase, 0);
+        assert_eq!(int2.timer, super::timer::ProgrammableTimer::new());
     }
 
     #[test]
