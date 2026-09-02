@@ -5,3 +5,4 @@ pub mod indigo;
 pub mod machine;
 pub mod output;
 pub mod serial;
+pub mod storage;

@@ -56,6 +56,7 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , settings_ {
           from_rust_string(startup.machine_model),
           from_rust_string(startup.prom_path),
+          from_rust_string(startup.disk_path),
           from_rust_string(startup.float_backend),
       }
     , run_action_(nullptr)
@@ -114,6 +115,7 @@ UiExitState MainWindow::exit_state() const {
     return {
         to_rust_string(settings_.machine_model),
         to_rust_string(settings_.prom_path),
+        to_rust_string(settings_.disk_path),
         to_rust_string(settings_.float_backend),
         encoded_bytes(saveGeometry()),
         encoded_bytes(saveState()),
@@ -256,6 +258,7 @@ void MainWindow::show_settings() {
     const auto selected = dialog.settings();
     if (selected.machine_model == settings_.machine_model
         && selected.prom_path == settings_.prom_path
+        && selected.disk_path == settings_.disk_path
         && selected.float_backend == settings_.float_backend) {
         return;
     }
@@ -269,8 +272,9 @@ void MainWindow::show_settings() {
 
     const auto model = to_rust_string(selected.machine_model);
     const auto prom = to_rust_string(selected.prom_path);
+    const auto disk = to_rust_string(selected.disk_path);
     const auto backend = to_rust_string(selected.float_backend);
-    const auto status = session_.configure_machine(model, prom, backend);
+    const auto status = session_.configure_machine(model, prom, disk, backend);
     if (!status.success) {
         QMessageBox::critical(
             this,

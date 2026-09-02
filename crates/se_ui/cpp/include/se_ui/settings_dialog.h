@@ -11,6 +11,7 @@ namespace se_ui {
 struct MachineSettings {
     QString machine_model;
     QString prom_path;
+    QString disk_path;
     QString float_backend;
 };
 
@@ -22,9 +23,11 @@ public:
 
 private:
     void select_prom();
+    void select_disk();
 
     QComboBox* machine_combo_;
     QLineEdit* prom_edit_;
+    QLineEdit* disk_edit_;
     QComboBox* float_backend_combo_;
 };
 

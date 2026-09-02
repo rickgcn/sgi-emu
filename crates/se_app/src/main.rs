@@ -2,6 +2,7 @@
 
 mod config;
 mod persistence;
+mod storage;
 
 use std::error::Error;
 use std::fs;
@@ -21,7 +22,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     application_config.apply_environment();
     application_config.apply_arguments(&arguments);
 
-    let (model, prom_path, float_backend) = application_config.machine_configuration();
+    let (model, prom_path, disk_path, float_backend) = application_config.machine_configuration();
     if arguments.headless() && prom_path.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -32,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (machine, startup_error) = if prom_path.is_empty() {
         (None, String::new())
     } else {
-        match build_machine(model, prom_path, float_backend) {
+        match build_machine(model, prom_path, disk_path, float_backend) {
             Ok(machine) => (Some(machine), String::new()),
             Err(error) => (None, error),
         }
@@ -62,7 +63,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn build_machine(model: &str, prom_path: &str, float_backend: &str) -> Result<Machine, String> {
+fn build_machine(
+    model: &str,
+    prom_path: &str,
+    disk_path: &str,
+    float_backend: &str,
+) -> Result<Machine, String> {
     match model {
         "indigo-ip12" => {
             let backend = match float_backend {
@@ -76,7 +82,18 @@ fn build_machine(model: &str, prom_path: &str, float_backend: &str) -> Result<Ma
             };
             let raw_prom = fs::read(prom_path)
                 .map_err(|error| format!("failed to read PROM image '{prom_path}': {error}"))?;
-            let mut machine = Ip12::new(raw_prom, backend)
+            let storage = if disk_path.is_empty() {
+                None
+            } else {
+                Some(
+                    storage::FileBlockStorage::open(disk_path)
+                        .map_err(|error| {
+                            format!("failed to open disk image '{disk_path}': {error}")
+                        })?
+                        .boxed(),
+                )
+            };
+            let mut machine = Ip12::new(raw_prom, backend, storage)
                 .map(Machine::IndigoIp12)
                 .map_err(|error| error.to_string())?;
             if let Some(restored) = persistence::load(model).map_err(|error| error.to_string())? {

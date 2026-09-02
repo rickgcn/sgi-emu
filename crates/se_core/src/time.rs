@@ -4,7 +4,7 @@
 pub const ATTOSECONDS_PER_SECOND: u128 = 1_000_000_000_000_000_000;
 
 /// A duration measured in guest virtual time.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct VirtualDuration {
     attoseconds: u128,
 }
@@ -33,7 +33,7 @@ impl VirtualDuration {
 }
 
 /// A point on the guest virtual timeline.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct VirtualInstant {
     attoseconds: u128,
 }
@@ -51,6 +51,20 @@ impl VirtualInstant {
     /// Advances the instant by one virtual duration.
     pub fn advance(&mut self, elapsed: VirtualDuration) {
         self.attoseconds += elapsed.as_attoseconds();
+    }
+
+    /// Returns the duration elapsed since an earlier instant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `earlier` is later than this instant.
+    #[must_use]
+    pub const fn duration_since(self, earlier: Self) -> VirtualDuration {
+        assert!(
+            self.attoseconds >= earlier.attoseconds,
+            "earlier virtual instant must not be later"
+        );
+        VirtualDuration::from_attoseconds(self.attoseconds - earlier.attoseconds)
     }
 }
 
@@ -75,5 +89,15 @@ mod tests {
         instant.advance(VirtualDuration::from_attoseconds(29));
 
         assert_eq!(instant.as_attoseconds(), 46);
+        assert_eq!(
+            instant.duration_since(VirtualInstant::ZERO),
+            VirtualDuration::from_attoseconds(46)
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn duration_since_rejects_reversed_instants() {
+        let _ = VirtualInstant::ZERO.duration_since(VirtualInstant { attoseconds: 1 });
     }
 }

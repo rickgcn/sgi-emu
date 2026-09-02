@@ -655,6 +655,7 @@ fn send_reply<T>(reply: CommandReply<T>, result: Result<T, CommandRejection>) {
 mod tests {
     use std::env;
     use std::fs;
+    use std::io;
     use std::sync::{Arc, Mutex, mpsc};
 
     use se_core::time::ATTOSECONDS_PER_SECOND;
@@ -663,31 +664,33 @@ mod tests {
     use se_machine::indigo::ip12::debug::{DebugRequest, DebugResponse, MemoryAddressSpace};
     use se_machine::machine::Machine;
     use se_machine::serial::SerialPort;
+    use se_machine::storage::BlockStorage;
 
-    use super::{CpuClock, Runtime, RuntimeError};
+    use super::{CpuClock, Runtime, RuntimeError, serial_port_index};
     use crate::control::RuntimeState;
 
     const PROM_BYTES: usize = 0x40000;
-    const EXTERNAL_PROM_EXECUTION_BUDGET: usize = 125_000_000;
-    const EXPECTED_PROMPT_INSTRUCTION: usize = 108_223_056;
+    const EXTERNAL_PROM_EXECUTION_BUDGET: usize = 400_000_000;
+    const EXPECTED_PROMPT_INSTRUCTION: usize = 376_277_796;
     const POST_PROMPT_INSTRUCTIONS: usize = 2_000_000;
     const P5_START_PC: u32 = 0xbfc0_0fb0;
     const P5_COMPLETE_PC: u32 = 0xbfc0_1020;
     const HEADLESS_GRAPHICS_PROBE_PC: u32 = 0xbfc1_e69c;
     const SERIAL_RECEIVE_POLL_PC: u32 = 0xbfc2_28a0;
+    const VOLUME_HEADER_MAGIC_CHECK_PC: u32 = 0xbfc2_b3fc;
+    const VOLUME_HEADER_CHECKSUM_PC: u32 = 0xbfc2_b45c;
     const CPU_FREQUENCY_STRING_ADDRESS: u64 = 0x0038_06d8;
     const PIC1_GIO_BURST_ADDRESS: u64 = 0x1fa2_0008;
     const PIC1_GIO_DELAY_ADDRESS: u64 = 0x1fa2_000c;
     const EXPECTED_SERIAL_B: &[u8] =
         b"\r\nNVRAM checksum is incorrect: reinitializing the NVRAM.\r\n\
-\r\nSCSI controller diagnostic                 *FAILED*\r\n\
-\r\n        Check or replace:  CPU board\r\n\
-Keyboard/Mouse diagnostic                  *FAILED*\r\n\
-\r\n        Check or replace:  CPU board\r\n\
+\r\ninitializing tod clock\r\n\
+setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
+\r\nSCSI device/cable diagnostic               *FAILED*\r\n\
+\r\n        Check or replace:  Disk, Floppy, CDROM, or SCSI Cable\r\n\
 \r\n\r\nError-- gfx(0) keyboard not responding\r\n\
 \r\nError-- cannot open console \"gfx(0)\"\r\n\
-\r\n\r\ninitializing tod clock\r\n\
-setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
+\r\n\
 \n\rDiagnostics failed.\n\
 \r[Press any key to continue.]";
 
@@ -695,11 +698,13 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
     struct ExternalPromRun {
         serial_a: Vec<u8>,
         serial_b: Vec<u8>,
-        prompt_instruction: usize,
+        prompt_instruction: Option<usize>,
         receive_poll_count: usize,
         p5_started: bool,
         p5_completed: bool,
         headless_graphics_probe_observed: bool,
+        volume_header_magic_checked: bool,
+        volume_header_checksum_checked: bool,
         gio_burst: Option<u32>,
         gio_delay: Option<u32>,
         cpu_frequency_string: Vec<Option<u8>>,
@@ -732,7 +737,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             let [first, second, third, fourth] = instruction.to_be_bytes();
             destination.copy_from_slice(&[second, first, fourth, third]);
         }
-        Machine::IndigoIp12(Ip12::new(raw_prom, Backend::SoftFloat).unwrap())
+        Machine::IndigoIp12(Ip12::new(raw_prom, Backend::SoftFloat, None).unwrap())
     }
 
     fn machine_that_transmits_serial_a(values: &[u8]) -> Machine {
@@ -941,9 +946,55 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         worker.execute_timed_instruction().unwrap();
     }
 
-    fn run_external_ip12_prom(raw_prom: Vec<u8>) -> ExternalPromRun {
+    struct RecordingStorage {
+        bytes: Vec<u8>,
+        reads: Arc<Mutex<Vec<(u64, usize)>>>,
+    }
+
+    impl BlockStorage for RecordingStorage {
+        fn size_bytes(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_exact_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+            let start = usize::try_from(offset)
+                .map_err(|_| io::Error::other("storage offset does not fit usize"))?;
+            let end = start
+                .checked_add(buffer.len())
+                .ok_or_else(|| io::Error::other("storage range overflow"))?;
+            let source = self
+                .bytes
+                .get(start..end)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short storage"))?;
+            buffer.copy_from_slice(source);
+            self.reads.lock().unwrap().push((offset, buffer.len()));
+            Ok(())
+        }
+    }
+
+    fn dynamic_sgi_volume_header() -> Vec<u8> {
+        const BLOCK_COUNT: usize = 16;
+        const VOLUME_HEADER_MAGIC: u32 = 0x0be5_a941;
+
+        let mut bytes = vec![0; BLOCK_COUNT * 512];
+        bytes[..4].copy_from_slice(&VOLUME_HEADER_MAGIC.to_be_bytes());
+        bytes[508..512].copy_from_slice(&VOLUME_HEADER_MAGIC.wrapping_neg().to_be_bytes());
+        let checksum = bytes[..512]
+            .chunks_exact(4)
+            .map(|word| u32::from_be_bytes(word.try_into().unwrap()))
+            .fold(0_u32, u32::wrapping_add);
+        assert_eq!(checksum, 0);
+        bytes
+    }
+
+    fn run_external_ip12_prom(
+        raw_prom: Vec<u8>,
+        storage: Option<Box<dyn BlockStorage>>,
+    ) -> ExternalPromRun {
+        let continue_after_diagnostics = storage.is_some();
         let machine = Machine::IndigoIp12(
-            Ip12::new(raw_prom, Backend::SoftFloat).expect("the PROM dump should be valid"),
+            Ip12::new(raw_prom, Backend::SoftFloat, storage)
+                .expect("the PROM dump and storage should be valid"),
         );
         let serial_a = Arc::new(Mutex::new(Vec::new()));
         let serial_b = Arc::new(Mutex::new(Vec::new()));
@@ -967,6 +1018,9 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         let mut p5_started = false;
         let mut p5_completed = false;
         let mut headless_graphics_probe_observed = false;
+        let mut volume_header_magic_checked = false;
+        let mut volume_header_checksum_checked = false;
+        let mut system_start_requested = false;
         while executed < EXTERNAL_PROM_EXECUTION_BUDGET {
             let address = worker.machine.as_ref().unwrap().execution_address();
             if address == P5_START_PC {
@@ -977,6 +1031,12 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             }
             if address == HEADLESS_GRAPHICS_PROBE_PC {
                 headless_graphics_probe_observed = true;
+            }
+            if address == VOLUME_HEADER_MAGIC_CHECK_PC {
+                volume_header_magic_checked = true;
+            }
+            if address == VOLUME_HEADER_CHECKSUM_PC {
+                volume_header_checksum_checked = true;
             }
             if prompt_completed_at.is_some() && address == SERIAL_RECEIVE_POLL_PC {
                 receive_poll_count += 1;
@@ -995,16 +1055,63 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
                     .ends_with(b"[Press any key to continue.]")
             {
                 prompt_completed_at = Some(executed);
+                if continue_after_diagnostics {
+                    worker.pending_serial[serial_port_index(SerialPort::B)].push_back(b'\r');
+                }
             }
-            if let Some(prompt_instruction) = prompt_completed_at
+            if continue_after_diagnostics
+                && !system_start_requested
+                && serial_b.lock().unwrap().ends_with(b"Option? ")
+            {
+                worker.pending_serial[serial_port_index(SerialPort::B)].extend(b"1\r");
+                system_start_requested = true;
+            }
+            if continue_after_diagnostics {
+                if volume_header_magic_checked && volume_header_checksum_checked {
+                    break;
+                }
+            } else if let Some(prompt_instruction) = prompt_completed_at
                 && executed - prompt_instruction == POST_PROMPT_INSTRUCTIONS
             {
                 break;
             }
         }
 
-        let prompt_instruction = prompt_completed_at.unwrap_or_else(|| {
-            panic!("PROM did not reach its input prompt within {EXTERNAL_PROM_EXECUTION_BUDGET} instructions")
+        let prompt_instruction = prompt_completed_at.or_else(|| {
+            if continue_after_diagnostics {
+                return None;
+            }
+            let machine = worker.machine.as_ref().unwrap();
+            let address = machine.execution_address();
+            let Machine::IndigoIp12(machine) = machine;
+            let DebugResponse::Registers(registers) = machine.debug(DebugRequest::Registers) else {
+                unreachable!();
+            };
+            let cpu = &registers.cpu;
+            let DebugResponse::Memory(saved_return_address) = machine.debug(DebugRequest::Memory {
+                address_space: MemoryAddressSpace::Virtual,
+                start: u64::from(cpu.gpr[29].wrapping_add(28)),
+                length: 4,
+            }) else {
+                unreachable!();
+            };
+            let caller = saved_return_address
+                .bytes
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_be_bytes);
+            let serial_b = serial_b.lock().unwrap();
+            let tail_start = serial_b.len().saturating_sub(512);
+            let serial_tail = String::from_utf8_lossy(&serial_b[tail_start..]);
+            panic!(
+                "PROM did not reach its input prompt within {EXTERNAL_PROM_EXECUTION_BUDGET} \
+                 instructions; PC=0x{address:08x}; a0=0x{:08x}; ra=0x{:08x}; sp=0x{:08x}; \
+                 caller={caller:?}; \
+                 serial B tail:\n{serial_tail}",
+                cpu.gpr[4], cpu.gpr[31], cpu.gpr[29]
+            )
         });
         let Machine::IndigoIp12(machine) = worker.machine.as_ref().unwrap();
         let DebugResponse::Memory(cpu_frequency) = machine.debug(DebugRequest::Memory {
@@ -1023,6 +1130,8 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             p5_started,
             p5_completed,
             headless_graphics_probe_observed,
+            volume_header_magic_checked,
+            volume_header_checksum_checked,
             gio_burst: read_physical_word(machine, PIC1_GIO_BURST_ADDRESS),
             gio_delay: read_physical_word(machine, PIC1_GIO_DELAY_ADDRESS),
             cpu_frequency_string: cpu_frequency.bytes,
@@ -1036,8 +1145,8 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
 
-        let first = run_external_ip12_prom(raw_prom.clone());
-        let second = run_external_ip12_prom(raw_prom);
+        let first = run_external_ip12_prom(raw_prom.clone(), None);
+        let second = run_external_ip12_prom(raw_prom, None);
 
         assert_eq!(first, second);
         assert!(first.serial_a.is_empty());
@@ -1048,16 +1157,54 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
                 .any(|window| window == b"can't set tod clock")
         );
         assert_eq!(first.serial_b, EXPECTED_SERIAL_B);
-        assert_eq!(first.prompt_instruction, EXPECTED_PROMPT_INSTRUCTION);
+        assert_eq!(first.prompt_instruction, Some(EXPECTED_PROMPT_INSTRUCTION));
         assert!(first.receive_poll_count != 0);
         assert!(first.p5_started);
         assert!(first.p5_completed);
         assert!(first.headless_graphics_probe_observed);
+        assert!(!first.volume_header_magic_checked);
+        assert!(!first.volume_header_checksum_checked);
         assert_eq!(first.gio_burst, Some(1));
         assert_eq!(first.gio_delay, Some(0xf2));
         assert_eq!(
             first.cpu_frequency_string,
             [Some(b'3'), Some(b'3'), Some(0)]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an external 070-8088-002 IP12 PROM dump"]
+    fn ip12_prom_validates_dynamic_volume_header_through_scsi_dma() {
+        let path = env::var_os("SE_INDIGO_IP12_PROM")
+            .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
+        let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let storage = RecordingStorage {
+            bytes: dynamic_sgi_volume_header(),
+            reads: Arc::clone(&reads),
+        };
+
+        let run = run_external_ip12_prom(raw_prom, Some(Box::new(storage)));
+
+        let storage_reads = reads.lock().unwrap().clone();
+        let serial_b = String::from_utf8_lossy(&run.serial_b);
+        assert!(
+            run.volume_header_magic_checked,
+            "PROM did not check the volume-header magic; storage reads: {storage_reads:?}; serial B:\n{serial_b}"
+        );
+        assert!(
+            run.volume_header_checksum_checked,
+            "PROM did not check the volume-header checksum; storage reads: {storage_reads:?}; serial B:\n{serial_b}"
+        );
+        assert!(
+            storage_reads
+                .iter()
+                .any(|&(offset, length)| offset == 0 && length >= 512)
+        );
+        assert!(
+            !run.serial_b
+                .windows(b"SCSI device/cable diagnostic".len())
+                .any(|window| window == b"SCSI device/cable diagnostic")
         );
     }
 }

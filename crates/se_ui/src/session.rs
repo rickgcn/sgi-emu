@@ -21,7 +21,7 @@ use crate::bridge::ffi::{
 
 /// Constructs a machine from settings selected by a frontend.
 pub type MachineBuilder =
-    Box<dyn Fn(&str, &str, &str) -> Result<Machine, String> + Send + Sync + 'static>;
+    Box<dyn Fn(&str, &str, &str, &str) -> Result<Machine, String> + Send + Sync + 'static>;
 
 /// Owns the emulator runtime for the lifetime of one Qt event loop.
 pub struct UiSession {
@@ -62,9 +62,10 @@ impl UiSession {
         &self,
         model: &str,
         prom_path: &str,
+        disk_path: &str,
         float_backend: &str,
     ) -> RuntimeStatusDto {
-        let machine = match (self.machine_builder)(model, prom_path, float_backend) {
+        let machine = match (self.machine_builder)(model, prom_path, disk_path, float_backend) {
             Ok(machine) => machine,
             Err(error) => return failed_status(error),
         };

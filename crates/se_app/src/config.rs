@@ -24,6 +24,7 @@ pub struct ApplicationConfig {
 struct MachineConfig {
     model: String,
     prom_path: String,
+    disk_path: String,
     float_backend: FloatBackend,
 }
 
@@ -32,6 +33,7 @@ impl Default for MachineConfig {
         Self {
             model: String::from("indigo-ip12"),
             prom_path: String::new(),
+            disk_path: String::new(),
             float_backend: FloatBackend::SoftFloat,
         }
     }
@@ -92,10 +94,11 @@ impl ApplicationConfig {
         }
     }
 
-    pub fn machine_configuration(&self) -> (&str, &str, &str) {
+    pub fn machine_configuration(&self) -> (&str, &str, &str, &str) {
         (
             &self.machine.model,
             &self.machine.prom_path,
+            &self.machine.disk_path,
             self.machine.float_backend.identifier(),
         )
     }
@@ -104,6 +107,7 @@ impl ApplicationConfig {
         UiStartupState {
             machine_model: self.machine.model.clone(),
             prom_path: self.machine.prom_path.clone(),
+            disk_path: self.machine.disk_path.clone(),
             float_backend: String::from(self.machine.float_backend.identifier()),
             window_geometry: self.ui.window_geometry.clone(),
             window_state: self.ui.window_state.clone(),
@@ -114,6 +118,7 @@ impl ApplicationConfig {
     pub fn apply_ui_exit_state(&mut self, exit: UiExitState) {
         self.machine.model = exit.machine_model;
         self.machine.prom_path = exit.prom_path;
+        self.machine.disk_path = exit.disk_path;
         self.machine.float_backend = FloatBackend::from_identifier(&exit.float_backend);
         self.ui.window_geometry = exit.window_geometry;
         self.ui.window_state = exit.window_state;
@@ -174,6 +179,7 @@ mod tests {
 
         assert_eq!(config.machine.model, "indigo-ip12");
         assert!(config.machine.prom_path.is_empty());
+        assert!(config.machine.disk_path.is_empty());
         assert!(matches!(
             config.machine.float_backend,
             FloatBackend::SoftFloat
@@ -189,6 +195,7 @@ mod tests {
                 [machine]
                 model = "indigo-ip12"
                 prom_path = "prom.bin"
+                disk_path = "disk.img"
                 float_backend = "native"
                 another_future_value = 7
             "#,
@@ -196,6 +203,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.machine.prom_path, "prom.bin");
+        assert_eq!(config.machine.disk_path, "disk.img");
         assert!(matches!(config.machine.float_backend, FloatBackend::Native));
     }
 
@@ -237,10 +245,12 @@ mod tests {
         let mut config = ApplicationConfig::default();
         save(&path, &config).unwrap();
         config.machine.prom_path = String::from("replacement.bin");
+        config.machine.disk_path = String::from("disk.img");
         save(&path, &config).unwrap();
 
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.machine.prom_path, "replacement.bin");
+        assert_eq!(loaded.machine.disk_path, "disk.img");
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();

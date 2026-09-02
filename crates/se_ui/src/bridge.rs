@@ -69,6 +69,8 @@ pub mod ffi {
         pub machine_model: String,
         /// Path to the selected PROM image.
         pub prom_path: String,
+        /// Path to the optional disk image.
+        pub disk_path: String,
         /// Stable floating-point backend identifier.
         pub float_backend: String,
         /// Base64-encoded `QWidget::saveGeometry()` bytes.
@@ -86,6 +88,8 @@ pub mod ffi {
         pub machine_model: String,
         /// Path to the selected PROM image.
         pub prom_path: String,
+        /// Path to the optional disk image.
+        pub disk_path: String,
         /// Stable floating-point backend identifier.
         pub float_backend: String,
         /// Base64-encoded `QWidget::saveGeometry()` bytes.
@@ -262,6 +266,7 @@ pub mod ffi {
             self: &UiSession,
             model: &str,
             prom_path: &str,
+            disk_path: &str,
             float_backend: &str,
         ) -> RuntimeStatusDto;
         fn run_machine(self: &UiSession) -> RuntimeStatusDto;

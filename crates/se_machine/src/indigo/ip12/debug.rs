@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn debug_queries_do_not_advance_the_machine() {
-        let machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat).unwrap();
+        let machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None).unwrap();
         let pc = machine.execution_address();
 
         assert!(matches!(
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn physical_memory_reports_mapped_and_unmapped_bytes() {
-        let machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat).unwrap();
+        let machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None).unwrap();
         let response = machine.debug(DebugRequest::Memory {
             address_space: MemoryAddressSpace::Physical,
             start: 0x1fbf_ffff,

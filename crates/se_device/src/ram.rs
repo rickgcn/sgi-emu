@@ -22,26 +22,25 @@ impl Ram {
         self.bytes.len()
     }
 
-    /// Reads one fixed-width transaction in ascending address order.
+    /// Reads one nonempty contiguous byte range in ascending address order.
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] unless `data` contains one
-    /// through four bytes. Returns [`BusFault::Unmapped`] when the complete
-    /// transaction is outside the storage.
+    /// Returns [`BusFault::UnsupportedAccess`] when `data` is empty. Returns
+    /// [`BusFault::Unmapped`] when the complete range is outside the storage.
     pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
         let range = self.transaction_range(address, data.len())?;
         data.copy_from_slice(&self.bytes[range]);
         Ok(())
     }
 
-    /// Writes one fixed-width transaction in ascending address order.
+    /// Writes one nonempty contiguous byte range in ascending address order.
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] unless `data` contains one
-    /// through four bytes. Returns [`BusFault::Unmapped`] without changing
-    /// storage when the complete transaction is outside the storage.
+    /// Returns [`BusFault::UnsupportedAccess`] when `data` is empty. Returns
+    /// [`BusFault::Unmapped`] without changing storage when the complete range
+    /// is outside the storage.
     pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
         let range = self.transaction_range(address, data.len())?;
         self.bytes[range].copy_from_slice(data);
@@ -53,7 +52,7 @@ impl Ram {
         address: DeviceAddr,
         length: usize,
     ) -> Result<std::ops::Range<usize>, BusFault> {
-        if !(1..=4).contains(&length) {
+        if length == 0 {
             return Err(BusFault::UnsupportedAccess);
         }
 
@@ -84,19 +83,14 @@ mod tests {
     }
 
     #[test]
-    fn transactions_preserve_address_order_for_every_supported_width() {
-        for length in 1..=4 {
-            let mut ram = Ram::new(8);
-            let source = [0x10, 0x21, 0x32, 0x43];
-            let mut destination = [0; 4];
+    fn transactions_preserve_address_order_for_arbitrary_nonempty_ranges() {
+        let mut ram = Ram::new(16);
+        let source = [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87];
+        let mut destination = [0; 8];
 
-            assert_eq!(ram.write(DeviceAddr::new(2), &source[..length]), Ok(()));
-            assert_eq!(
-                ram.read(DeviceAddr::new(2), &mut destination[..length]),
-                Ok(())
-            );
-            assert_eq!(destination[..length], source[..length]);
-        }
+        assert_eq!(ram.write(DeviceAddr::new(3), &source), Ok(()));
+        assert_eq!(ram.read(DeviceAddr::new(3), &mut destination), Ok(()));
+        assert_eq!(destination, source);
     }
 
     #[test]
@@ -115,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_widths_are_rejected() {
+    fn empty_transactions_are_rejected() {
         let mut ram = Ram::new(8);
 
         assert_eq!(
@@ -123,7 +117,7 @@ mod tests {
             Err(BusFault::UnsupportedAccess)
         );
         assert_eq!(
-            ram.write(DeviceAddr::new(0), &[0; 5]),
+            ram.write(DeviceAddr::new(0), &[]),
             Err(BusFault::UnsupportedAccess)
         );
     }

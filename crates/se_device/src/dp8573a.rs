@@ -305,6 +305,18 @@ impl Dp8573a {
         }
     }
 
+    /// Returns the virtual duration until the next millisecond event.
+    #[must_use]
+    pub fn time_until_event(&self) -> Option<VirtualDuration> {
+        if self.alternate_control_registers[REAL_TIME_MODE] & CLOCK_START == 0 {
+            return None;
+        }
+
+        Some(VirtualDuration::from_attoseconds(
+            ATTOSECONDS_PER_MILLISECOND - self.prescaler_phase_attoseconds,
+        ))
+    }
+
     fn advance_offline_milliseconds(&mut self, milliseconds: u64) {
         if milliseconds == 0 || self.alternate_control_registers[REAL_TIME_MODE] & CLOCK_START == 0
         {

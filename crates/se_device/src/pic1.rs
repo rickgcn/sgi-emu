@@ -178,14 +178,13 @@ impl Pic1 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] unless `byte_len` is from one
-    /// through four bytes.
+    /// Returns [`BusFault::UnsupportedAccess`] when `byte_len` is zero.
     pub fn decode_memory(
         &self,
         address: PhysAddr,
         byte_len: usize,
     ) -> Result<Option<(usize, DeviceAddr)>, BusFault> {
-        if !(1..=4).contains(&byte_len) {
+        if byte_len == 0 {
             return Err(BusFault::UnsupportedAccess);
         }
 
@@ -208,8 +207,8 @@ impl Pic1 {
         Ok(None)
     }
 
-    /// Records an asynchronous CPU write-bus error.
-    pub fn report_cpu_write_bus_error(&mut self) {
+    /// Records an asynchronous address error.
+    pub fn report_address_error(&mut self) {
         self.address_error_pending = true;
     }
 
@@ -426,7 +425,7 @@ mod tests {
         pic1.parity_error = 0xa5;
         pic1.cpu_error_address = 0x1234_5678;
         pic1.gio_error_address = 0x9abc_def0;
-        pic1.report_cpu_write_bus_error();
+        pic1.report_address_error();
 
         assert!(pic1.error_interrupt_asserted());
 
@@ -579,7 +578,7 @@ mod tests {
         );
         assert_eq!(
             pic1.decode_memory(PhysAddr::new(base), 5),
-            Err(BusFault::UnsupportedAccess)
+            Ok(Some((0, DeviceAddr::new(0))))
         );
     }
 
@@ -588,7 +587,7 @@ mod tests {
         let mut pic1 = pic1();
 
         assert!(!pic1.error_interrupt_asserted());
-        pic1.report_cpu_write_bus_error();
+        pic1.report_address_error();
         assert!(pic1.error_interrupt_asserted());
 
         pic1.reset();
@@ -619,7 +618,7 @@ mod tests {
         pic1.parity_error = 0xff;
         pic1.cpu_error_address = 0x1234_5678;
         pic1.gio_error_address = 0x9abc_def0;
-        pic1.report_cpu_write_bus_error();
+        pic1.report_address_error();
         pic1.write(DeviceAddr::new(CPU_CONTROL), &0x0000_0201_u32.to_be_bytes())
             .unwrap();
         pic1.write(

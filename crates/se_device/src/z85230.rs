@@ -15,13 +15,18 @@ const ASYNC_EIGHT_BIT_RESIDUE: u8 = 0x06;
 const RECEIVER_ENABLE: u8 = 1;
 const AUTO_ENABLE: u8 = 1 << 5;
 const TRANSMITTER_ENABLE: u8 = 1 << 3;
+const LOCAL_LOOPBACK: u8 = 1 << 4;
 const MASTER_INTERRUPT_ENABLE: u8 = 1 << 3;
 const SOFTWARE_INTERRUPT_ACKNOWLEDGE: u8 = 1 << 5;
+const SDLC_STATUS_FIFO_ENABLE: u8 = 1 << 2;
+const EXTENDED_READ_ENABLE: u8 = 1 << 6;
 const CHANNEL_B_RESET: u8 = 0x40;
 const CHANNEL_A_RESET: u8 = 0x80;
 const WHOLE_CHIP_RESET: u8 = 0xc0;
 const RECEIVE_FIFO_BYTES: usize = 8;
 const TRANSMIT_FIFO_BYTES: usize = 4;
+const RESET_WRITE_REGISTERS: [u8; 16] = [0, 0, 0, 0, 0x04, 0, 0, 0, 0, 0, 0, 0x08, 0, 0, 0, 0xf8];
+const RESET_WRITE_REGISTER_PRIME_SEVEN: u8 = 0x20;
 
 /// A channel within one Z85230 controller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +98,16 @@ impl Z85230 {
         });
     }
 
+    /// Returns the virtual duration until the next transmitted character.
+    #[must_use]
+    pub fn time_until_event(&self) -> Option<VirtualDuration> {
+        self.channels
+            .iter()
+            .filter_map(|channel| channel.active_character)
+            .map(|character| VirtualDuration::from_attoseconds(character.remaining_attoseconds))
+            .min()
+    }
+
     /// Reads one byte from a channel control or data port.
     ///
     /// # Errors
@@ -140,35 +155,51 @@ impl Z85230 {
 
     fn read_control(&mut self, channel: usize) -> u8 {
         let register = self.channels[channel].take_selected_register();
-        match register {
-            0 => self.channels[channel].read_register_zero(),
-            1 => self.channels[channel].read_register_one(),
-            2 => {
-                let value = self.read_interrupt_vector(channel);
-                if self.master_interrupt_control & SOFTWARE_INTERRUPT_ACKNOWLEDGE != 0
-                    && let Some(source) = self.highest_pending_receive_interrupt()
-                {
-                    self.receive_interrupt_under_service[source] = true;
-                }
-                value
-            }
-            3 if channel == 0 => self.interrupt_pending_register(),
+        let value = match register {
             8 => self.channels[channel].read_data(),
-            12 | 13 | 15 => self.channels[channel].write_register(register),
-            _ => 0,
+            _ => self.register_value(channel, register),
+        };
+        if register == 2
+            && self.master_interrupt_control & SOFTWARE_INTERRUPT_ACKNOWLEDGE != 0
+            && let Some(source) = self.highest_pending_receive_interrupt()
+        {
+            self.receive_interrupt_under_service[source] = true;
         }
+        value
     }
 
     fn peek_control(&self, channel: usize) -> u8 {
-        match self.channels[channel].selected_register {
-            0 => self.channels[channel].read_register_zero(),
-            1 => self.channels[channel].read_register_one(),
+        self.register_value(channel, self.channels[channel].selected_register)
+    }
+
+    fn register_value(&self, channel: usize, register: u8) -> u8 {
+        let state = &self.channels[channel];
+        let extended_read = state.write_register_prime_seven & EXTENDED_READ_ENABLE != 0;
+        match register {
+            0 => state.read_register_zero(),
+            1 => state.read_register_one(),
             2 => self.read_interrupt_vector(channel),
             3 if channel == 0 => self.interrupt_pending_register(),
-            8 => self.channels[channel].peek_data(),
-            12 | 13 | 15 => {
-                self.channels[channel].write_register(self.channels[channel].selected_register)
+            4 if extended_read => state.write_register(4),
+            4 => state.read_register_zero(),
+            5 if extended_read => state.write_register(5),
+            5 => state.read_register_one(),
+            6 if state.write_register(15) & SDLC_STATUS_FIFO_ENABLE == 0 => {
+                self.read_interrupt_vector(channel)
             }
+            7 if state.write_register(15) & SDLC_STATUS_FIFO_ENABLE == 0 && channel == 0 => {
+                self.interrupt_pending_register()
+            }
+            8 => state.peek_data(),
+            9 if extended_read => state.write_register(3),
+            9 => state.write_register(13),
+            10 => 0,
+            11 if extended_read => state.write_register(10),
+            11 => state.read_register_fifteen(),
+            12 | 13 => state.write_register(register),
+            14 if extended_read => state.write_register_prime_seven,
+            14 => state.write_register(10),
+            15 => state.read_register_fifteen(),
             _ => 0,
         }
     }
@@ -267,6 +298,7 @@ impl Z85230 {
 struct ActiveCharacter {
     value: u8,
     remaining_attoseconds: u128,
+    local_loopback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -304,8 +336,8 @@ impl ChannelState {
     const fn new() -> Self {
         Self {
             selected_register: 0,
-            write_registers: [0; 16],
-            write_register_prime_seven: 0,
+            write_registers: RESET_WRITE_REGISTERS,
+            write_register_prime_seven: RESET_WRITE_REGISTER_PRIME_SEVEN,
             receive_fifo: [ReceiveCharacter::EMPTY; RECEIVE_FIFO_BYTES],
             receive_fifo_head: 0,
             receive_fifo_length: 0,
@@ -362,6 +394,10 @@ impl ChannelState {
         self.write_registers[register as usize]
     }
 
+    const fn read_register_fifteen(&self) -> u8 {
+        self.write_register(15) & 0xfa
+    }
+
     fn set_write_register(&mut self, register: u8, value: u8) {
         self.write_registers[register as usize] = value;
         if register == 1 {
@@ -378,6 +414,10 @@ impl ChannelState {
             return bytes.len();
         }
 
+        self.enqueue_receive(bytes)
+    }
+
+    fn enqueue_receive(&mut self, bytes: &[u8]) -> usize {
         let consumed = bytes
             .len()
             .min(RECEIVE_FIFO_BYTES - self.receive_fifo_length);
@@ -390,6 +430,12 @@ impl ChannelState {
             self.receive_fifo_length += 1;
         }
         consumed
+    }
+
+    fn receive_local_loopback(&mut self, value: u8) {
+        if self.write_register(3) & RECEIVER_ENABLE != 0 {
+            let _ = self.enqueue_receive(&[value]);
+        }
     }
 
     fn read_data(&mut self) -> u8 {
@@ -501,6 +547,7 @@ impl ChannelState {
         self.active_character = Some(ActiveCharacter {
             value,
             remaining_attoseconds,
+            local_loopback: self.write_register(14) & LOCAL_LOOPBACK != 0,
         });
     }
 
@@ -523,8 +570,12 @@ impl ChannelState {
 
             remaining -= active.remaining_attoseconds;
             let value = active.value;
+            let local_loopback = active.local_loopback;
             self.active_character = None;
             output(value);
+            if local_loopback {
+                self.receive_local_loopback(value);
+            }
         }
     }
 
@@ -613,7 +664,8 @@ mod tests {
 
     use super::{
         ALL_SENT, ASYNC_EIGHT_BIT_RESIDUE, CHANNEL_A_CONTROL, CHANNEL_A_DATA, CHANNEL_B_CONTROL,
-        CHANNEL_B_DATA, Channel, RECEIVE_CHARACTER_AVAILABLE, TRANSMIT_BUFFER_EMPTY, Z85230,
+        CHANNEL_B_DATA, Channel, RECEIVE_CHARACTER_AVAILABLE, RESET_WRITE_REGISTER_PRIME_SEVEN,
+        RESET_WRITE_REGISTERS, TRANSMIT_BUFFER_EMPTY, Z85230,
     };
 
     const CLOCK_HZ: u64 = 3_686_400;
@@ -628,6 +680,11 @@ mod tests {
     fn write_register(serial: &mut Z85230, control: u64, register: u8, value: u8) {
         serial.write(DeviceAddr::new(control), &[register]).unwrap();
         serial.write(DeviceAddr::new(control), &[value]).unwrap();
+    }
+
+    fn read_register(serial: &mut Z85230, control: u64, register: u8) -> u8 {
+        serial.write(DeviceAddr::new(control), &[register]).unwrap();
+        read_port(serial, control).unwrap()
     }
 
     fn configure_9600_8n1(serial: &mut Z85230, control: u64) {
@@ -715,7 +772,59 @@ mod tests {
     }
 
     #[test]
-    fn whole_chip_reset_clears_timing_and_both_channels() {
+    fn prom_enhanced_scc_detection_reads_wr7_prime_through_rr14() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+
+        write_register(&mut serial, CHANNEL_A_CONTROL, 15, 0x01);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 7, 0x40);
+
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 14), 0x40);
+    }
+
+    #[test]
+    fn extended_read_maps_write_registers_to_the_documented_read_registers() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 3, 0xa3);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 4, 0xa4);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 5, 0xa5);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 10, 0xaa);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 15, 0x01);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 7, 0x40);
+
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 4), 0xa4);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 5), 0xa5);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 9), 0xa3);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 11), 0xaa);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 14), 0x40);
+    }
+
+    #[test]
+    fn ordinary_read_aliases_follow_the_base_register_map() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 2, 0xa2);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 10, 0xaa);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 13, 0xad);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 15, 0xfb);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 7, 0x00);
+
+        assert_eq!(
+            read_register(&mut serial, CHANNEL_A_CONTROL, 4),
+            TRANSMIT_BUFFER_EMPTY
+        );
+        assert_eq!(
+            read_register(&mut serial, CHANNEL_A_CONTROL, 5),
+            ASYNC_EIGHT_BIT_RESIDUE | ALL_SENT
+        );
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 6), 0xa2);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 7), 0);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 9), 0xad);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 11), 0xfa);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 14), 0xaa);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 15), 0xfa);
+    }
+
+    #[test]
+    fn whole_chip_reset_restores_timing_and_both_channels() {
         let mut serial = Z85230::new(CLOCK_HZ);
         configure_9600_8n1(&mut serial, CHANNEL_A_CONTROL);
         serial
@@ -727,7 +836,11 @@ mod tests {
 
         for channel in &serial.channels {
             assert_eq!(channel.selected_register, 0);
-            assert_eq!(channel.write_registers, [0; 16]);
+            assert_eq!(channel.write_registers, RESET_WRITE_REGISTERS);
+            assert_eq!(
+                channel.write_register_prime_seven,
+                RESET_WRITE_REGISTER_PRIME_SEVEN
+            );
             assert_eq!(channel.receive_fifo_length, 0);
             assert_eq!(channel.transmit_fifo_length, 0);
             assert!(channel.active_character.is_none());
@@ -739,7 +852,7 @@ mod tests {
     fn debug_read_preserves_the_selected_register() {
         let mut serial = Z85230::new(CLOCK_HZ);
         serial
-            .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[5])
+            .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[12])
             .unwrap();
         let mut value = [0xff];
 
@@ -748,7 +861,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(value, [0]);
-        assert_eq!(serial.channels[0].selected_register, 5);
+        assert_eq!(serial.channels[0].selected_register, 12);
     }
 
     #[test]
@@ -782,6 +895,62 @@ mod tests {
         });
 
         assert_eq!(output, [(Channel::A, 0xa5)]);
+    }
+
+    #[test]
+    fn local_loopback_delivers_a_completed_character_to_output_and_receive_fifo() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        configure_9600_8n1(&mut serial, CHANNEL_A_CONTROL);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 3, 1);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 14, 0x11);
+        serial
+            .write(DeviceAddr::new(CHANNEL_A_DATA), &[0xa5])
+            .unwrap();
+        let mut output = Vec::new();
+
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS - 1),
+            |channel, value| output.push((channel, value)),
+        );
+        assert!(output.is_empty());
+        assert_eq!(
+            read_port(&mut serial, CHANNEL_A_CONTROL),
+            Ok(TRANSMIT_BUFFER_EMPTY)
+        );
+
+        serial.advance_time(VirtualDuration::from_attoseconds(1), |channel, value| {
+            output.push((channel, value));
+        });
+
+        assert_eq!(output, [(Channel::A, 0xa5)]);
+        assert_eq!(
+            read_port(&mut serial, CHANNEL_A_CONTROL),
+            Ok(RECEIVE_CHARACTER_AVAILABLE | TRANSMIT_BUFFER_EMPTY)
+        );
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(0xa5));
+    }
+
+    #[test]
+    fn local_loopback_does_not_deliver_to_a_disabled_receiver() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        configure_9600_8n1(&mut serial, CHANNEL_A_CONTROL);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 14, 0x11);
+        serial
+            .write(DeviceAddr::new(CHANNEL_A_DATA), &[0xa5])
+            .unwrap();
+        let mut output = Vec::new();
+
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |channel, value| output.push((channel, value)),
+        );
+
+        assert_eq!(output, [(Channel::A, 0xa5)]);
+        assert_eq!(
+            read_port(&mut serial, CHANNEL_A_CONTROL),
+            Ok(TRANSMIT_BUFFER_EMPTY)
+        );
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(0));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 mod bus;
 pub mod debug;
+mod events;
 mod prom;
 
 use std::error::Error;
@@ -18,12 +19,14 @@ use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
+use se_device::scsi_disk::ScsiDisk;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
 use se_float::backend::Backend;
 
 use crate::output::MachineOutput;
 use crate::serial::SerialPort;
+use crate::storage::BlockStorage;
 
 use self::bus::Ip12Bus;
 use self::prom::normalize_u56_prom;
@@ -43,6 +46,11 @@ pub enum Ip12Error {
         /// Supplied raw image size in bytes.
         actual: usize,
     },
+    /// The optional disk cannot be represented by the fixed SCSI target.
+    InvalidDiskSize {
+        /// Supplied storage size in bytes.
+        bytes: u64,
+    },
 }
 
 impl fmt::Display for Ip12Error {
@@ -51,6 +59,10 @@ impl fmt::Display for Ip12Error {
             Self::InvalidPromSize { expected, actual } => write!(
                 formatter,
                 "invalid IP12 PROM size: expected {expected} bytes, got {actual}"
+            ),
+            Self::InvalidDiskSize { bytes } => write!(
+                formatter,
+                "invalid IP12 disk size: expected a nonzero multiple of 512 bytes representable by READ CAPACITY(10), got {bytes}"
             ),
         }
     }
@@ -162,8 +174,22 @@ impl Ip12 {
     ///
     /// Returns [`Ip12Error`] when the PROM image does not satisfy the IP12
     /// image contract.
-    pub fn new(raw_prom: Vec<u8>, floating_point_backend: Backend) -> Result<Self, Ip12Error> {
+    pub fn new(
+        raw_prom: Vec<u8>,
+        floating_point_backend: Backend,
+        storage: Option<Box<dyn BlockStorage>>,
+    ) -> Result<Self, Ip12Error> {
         let prom = Rom::new(normalize_u56_prom(raw_prom)?);
+        let disk = storage
+            .as_ref()
+            .map(|storage| {
+                let bytes = storage.size_bytes();
+                if bytes == 0 || bytes % 512 != 0 || bytes / 512 > u64::from(u32::MAX) + 1 {
+                    return Err(Ip12Error::InvalidDiskSize { bytes });
+                }
+                Ok(ScsiDisk::new(bytes / 512))
+            })
+            .transpose()?;
         Ok(Self {
             cpu: R3000::new(cpu_config(floating_point_backend)),
             bus: Ip12Bus::new(
@@ -172,6 +198,8 @@ impl Ip12 {
                 Hpc1::new(),
                 Int2::new(),
                 Wd33c93b::new(),
+                disk,
+                storage,
                 [Z85230::new(SERIAL_CLOCK_HZ), Z85230::new(SERIAL_CLOCK_HZ)],
                 Dp8573a::new(),
                 Mdac::new(),
@@ -277,8 +305,10 @@ const fn cpu_config(floating_point_backend: Backend) -> R3000Config {
 mod tests {
     use std::env;
     use std::fs;
+    use std::io;
 
     use crate::serial::SerialPort;
+    use crate::storage::BlockStorage;
     use se_core::bus::{PhysAddr, PhysicalBus};
     use se_float::backend::Backend;
 
@@ -290,15 +320,51 @@ mod tests {
     const MEMORY_CONFIGURATION_INSTRUCTION_BUDGET: usize = 300_000;
     const STACK_SETUP_INSTRUCTION_BUDGET: usize = 30_000;
 
+    struct SizedStorage(u64);
+
+    impl BlockStorage for SizedStorage {
+        fn size_bytes(&self) -> u64 {
+            self.0
+        }
+
+        fn read_exact_at(&mut self, _offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+            buffer.fill(0);
+            Ok(())
+        }
+    }
+
     #[test]
     fn constructor_reports_invalid_prom_size() {
         assert!(matches!(
-            Ip12::new(vec![0; PROM_BYTES - 1], Backend::SoftFloat),
+            Ip12::new(vec![0; PROM_BYTES - 1], Backend::SoftFloat, None),
             Err(Ip12Error::InvalidPromSize {
                 expected: PROM_BYTES,
                 actual
             }) if actual == PROM_BYTES - 1
         ));
+    }
+
+    #[test]
+    fn constructor_validates_optional_disk_capacity() {
+        for bytes in [0, 513, (u64::from(u32::MAX) + 2) * 512] {
+            assert!(matches!(
+                Ip12::new(
+                    vec![0; PROM_BYTES],
+                    Backend::SoftFloat,
+                    Some(Box::new(SizedStorage(bytes)))
+                ),
+                Err(Ip12Error::InvalidDiskSize { bytes: actual }) if actual == bytes
+            ));
+        }
+
+        assert!(
+            Ip12::new(
+                vec![0; PROM_BYTES],
+                Backend::SoftFloat,
+                Some(Box::new(SizedStorage(512)))
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -356,7 +422,7 @@ mod tests {
     fn cpu_configuration_matches_the_ip12_board() {
         for backend in [Backend::SoftFloat, Backend::Native] {
             let config = cpu_config(backend);
-            let mut machine = Ip12::new(vec![0; PROM_BYTES], backend).unwrap();
+            let mut machine = Ip12::new(vec![0; PROM_BYTES], backend, None).unwrap();
             let reset_configuration = read_word(&mut machine, 0x1fa0_0004) as u8;
 
             assert_eq!(reset_configuration & 0xf0, 0xf0);
@@ -377,7 +443,7 @@ mod tests {
 
     #[test]
     fn production_topology_contains_one_eight_megabyte_ram_module() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat).unwrap();
+        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None).unwrap();
         machine
             .bus
             .write(PhysAddr::new(0x1fa1_0000), &0x0f00_023f_u32.to_be_bytes())
@@ -398,7 +464,7 @@ mod tests {
     fn reset_restores_the_cpu_and_asic_front_end_without_changing_ram_or_prom() {
         let mut raw_prom = vec![0; PROM_BYTES];
         raw_prom[0x100..0x104].copy_from_slice(&[0x34, 0x12, 0x78, 0x56]);
-        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat).unwrap();
+        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat, None).unwrap();
 
         machine.execute_instruction().unwrap();
         assert_eq!(machine.execution_address(), 0xbfc0_0004);
@@ -464,7 +530,7 @@ mod tests {
 
     #[test]
     fn pic1_error_output_drives_and_releases_cpu_interrupt_input_five() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat).unwrap();
+        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None).unwrap();
         machine
             .bus
             .write(
@@ -536,7 +602,7 @@ mod tests {
 
     #[test]
     fn serial_receive_interrupt_drives_cpu_interrupt_input_one() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat).unwrap();
+        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None).unwrap();
         for (register, value) in [(3, 1), (1, 0x10), (9, 1 << 3)] {
             machine
                 .bus
@@ -561,7 +627,7 @@ mod tests {
 
     #[test]
     fn guest_system_initialize_uses_the_machine_reset_path() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat).unwrap();
+        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None).unwrap();
         machine
             .bus
             .write(PhysAddr::new(0x1fb8_00c3), &[0x1f])
@@ -603,7 +669,7 @@ mod tests {
             let [first, second, third, fourth] = instruction.to_be_bytes();
             destination.copy_from_slice(&[second, first, fourth, third]);
         }
-        Ip12::new(raw_prom, Backend::SoftFloat).unwrap()
+        Ip12::new(raw_prom, Backend::SoftFloat, None).unwrap()
     }
 
     #[test]
@@ -613,7 +679,7 @@ mod tests {
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
         let mut machine =
-            Ip12::new(raw_prom, Backend::SoftFloat).expect("the PROM dump should be valid");
+            Ip12::new(raw_prom, Backend::SoftFloat, None).expect("the PROM dump should be valid");
 
         assert_eq!(machine.cpu.program_counter(), 0xbfc0_0000);
         machine
@@ -632,7 +698,7 @@ mod tests {
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
         let mut machine =
-            Ip12::new(raw_prom, Backend::SoftFloat).expect("the PROM dump should be valid");
+            Ip12::new(raw_prom, Backend::SoftFloat, None).expect("the PROM dump should be valid");
 
         for _ in 0..256 {
             if machine.execution_address() == 0xbfc0_02f0 {
@@ -653,7 +719,7 @@ mod tests {
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
         let mut machine =
-            Ip12::new(raw_prom, Backend::SoftFloat).expect("the PROM dump should be valid");
+            Ip12::new(raw_prom, Backend::SoftFloat, None).expect("the PROM dump should be valid");
 
         for _ in 0..20_000 {
             if machine.execution_address() == 0xbfc0_0320 {
@@ -674,7 +740,7 @@ mod tests {
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
         let mut machine =
-            Ip12::new(raw_prom, Backend::SoftFloat).expect("the PROM dump should be valid");
+            Ip12::new(raw_prom, Backend::SoftFloat, None).expect("the PROM dump should be valid");
 
         machine
             .bus

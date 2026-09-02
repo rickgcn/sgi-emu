@@ -9,13 +9,16 @@ use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
-use se_device::wd33c93b::Wd33c93b;
+use se_device::scsi_disk::{ScsiCommandPlan, ScsiDisk};
+use se_device::wd33c93b::{SelectAndTransferRequest, Wd33c93b};
 use se_device::z85230::{Channel, Z85230};
 
 use crate::output::MachineOutput;
 use crate::serial::SerialPort;
+use crate::storage::BlockStorage;
 
 use super::PROM_BYTES;
+use super::events::{EventKind, Ip12Events};
 
 const LOCAL_MEMORY_END: u64 = 0x1000_0000;
 
@@ -32,8 +35,10 @@ const HPC1_ETHERNET_POINTER_BASE: u64 = 0x1fb8_0058;
 const HPC1_ETHERNET_POINTER_END: u64 = 0x1fb8_005c;
 const HPC1_ETHERNET_FIFO_BASE: u64 = 0x1fb8_005c;
 const HPC1_ETHERNET_FIFO_END: u64 = 0x1fb8_0060;
+const HPC1_SCSI_REGISTERS_BASE: u64 = 0x1fb8_0088;
+const HPC1_SCSI_REGISTERS_END: u64 = 0x1fb8_009c;
+#[cfg(test)]
 const HPC1_SCSI_CONTROL_BASE: u64 = 0x1fb8_0094;
-const HPC1_SCSI_CONTROL_END: u64 = 0x1fb8_0098;
 const HPC1_ENDIAN_CONTROL_BASE: u64 = 0x1fb8_00c0;
 const HPC1_ENDIAN_CONTROL_END: u64 = 0x1fb8_00c4;
 const HPC1_MISCELLANEOUS_CONTROL_BASE: u64 = 0x1fb8_01b0;
@@ -45,6 +50,7 @@ const CPU_AUX_CONTROL: u64 = 0x1fb8_01bf;
 const CPU_AUX_OUTPUT_BITS: u8 = 0x0f;
 const INT2_BASE: u64 = 0x1fb8_01c0;
 const INT2_END: u64 = 0x1fb8_0200;
+const SCSI_INTERRUPT: u8 = 1;
 const SERIAL_INTERRUPT: u8 = 1 << 5;
 
 const SERIAL_0_BASE: u64 = 0x1fb8_0d00;
@@ -74,6 +80,9 @@ pub(super) struct Ip12Bus {
     hpc1: Hpc1,
     int2: Int2,
     scsi: Wd33c93b,
+    disk: Option<ScsiDisk>,
+    storage: Option<Box<dyn BlockStorage>>,
+    pending_scsi: Option<SelectAndTransferRequest>,
     serial: [Z85230; 2],
     rtc: Dp8573a,
     mdac: Mdac,
@@ -81,16 +90,19 @@ pub(super) struct Ip12Bus {
     dsp56001: Dsp56001,
     prom: Rom,
     cpu_aux_control: u8,
+    events: Ip12Events,
 }
 
 impl Ip12Bus {
     #[allow(clippy::too_many_arguments, reason = "the IP12 topology is fixed")]
-    pub(super) const fn new(
+    pub(super) fn new(
         pic1: Pic1,
         memory: [Option<Ram>; 4],
         hpc1: Hpc1,
         int2: Int2,
         scsi: Wd33c93b,
+        disk: Option<ScsiDisk>,
+        storage: Option<Box<dyn BlockStorage>>,
         serial: [Z85230; 2],
         rtc: Dp8573a,
         mdac: Mdac,
@@ -98,12 +110,15 @@ impl Ip12Bus {
         dsp56001: Dsp56001,
         prom: Rom,
     ) -> Self {
-        Self {
+        let mut bus = Self {
             pic1,
             memory,
             hpc1,
             int2,
             scsi,
+            disk,
+            storage,
+            pending_scsi: None,
             serial,
             rtc,
             mdac,
@@ -111,7 +126,11 @@ impl Ip12Bus {
             dsp56001,
             prom,
             cpu_aux_control: 0,
-        }
+            events: Ip12Events::new(),
+        };
+        bus.schedule_timed_devices();
+        bus.synchronize_scsi_interrupt();
+        bus
     }
 
     pub(super) fn reset(&mut self) {
@@ -119,10 +138,14 @@ impl Ip12Bus {
         self.hpc1.reset();
         self.int2.reset();
         self.scsi.reset();
+        self.pending_scsi = None;
         for serial in &mut self.serial {
             serial.reset();
         }
+        self.events.reset();
+        self.schedule_timed_devices();
         self.synchronize_serial_interrupt();
+        self.synchronize_scsi_interrupt();
         self.mdac.reset();
         self.nvram.reset();
         self.cpu_aux_control = 0;
@@ -165,22 +188,320 @@ impl Ip12Bus {
     }
 
     pub(super) fn advance_time(&mut self, elapsed: VirtualDuration, output: &mut MachineOutput) {
-        self.int2.advance_time(elapsed);
-        self.rtc.advance_time(elapsed);
-        self.serial[0].advance_time(elapsed, |_, _| {});
-        self.serial[1].advance_time(elapsed, |channel, value| {
-            let port = match channel {
-                Channel::A => SerialPort::A,
-                Channel::B => SerialPort::B,
-            };
-            output.push_serial(port, value);
-        });
+        self.events.advance(elapsed);
+        while let Some(kind) = self.events.take_due() {
+            match kind {
+                EventKind::Int2 => self.synchronize_int2_time(),
+                EventKind::Rtc => self.synchronize_rtc_time(),
+                EventKind::Serial0 => self.synchronize_serial_time(0, output),
+                EventKind::Serial1 => self.synchronize_serial_time(1, output),
+                EventKind::Scsi => {
+                    let _ = self.events.synchronize(EventKind::Scsi);
+                    self.process_scsi_event();
+                }
+            }
+        }
     }
 
     fn synchronize_serial_interrupt(&mut self) {
         let asserted = self.serial.iter().any(Z85230::interrupt_asserted);
         self.int2
             .set_local_interrupt_0_input(SERIAL_INTERRUPT, asserted);
+    }
+
+    fn synchronize_scsi_interrupt(&mut self) {
+        self.int2
+            .set_local_interrupt_0_input(SCSI_INTERRUPT, self.scsi.interrupt_asserted());
+    }
+
+    fn schedule_timed_devices(&mut self) {
+        self.events.schedule(EventKind::Int2, None);
+        self.events
+            .schedule(EventKind::Rtc, self.rtc.time_until_event());
+        self.reschedule_serial(0);
+        self.reschedule_serial(1);
+        self.events.schedule(EventKind::Scsi, None);
+    }
+
+    fn synchronize_int2_time(&mut self) {
+        let elapsed = self.events.synchronize(EventKind::Int2);
+        self.int2.advance_time(elapsed);
+        self.events.schedule(EventKind::Int2, None);
+    }
+
+    fn synchronize_rtc_time(&mut self) {
+        let elapsed = self.events.synchronize(EventKind::Rtc);
+        self.rtc.advance_time(elapsed);
+        self.events
+            .schedule(EventKind::Rtc, self.rtc.time_until_event());
+    }
+
+    fn synchronize_serial_time(&mut self, index: usize, output: &mut MachineOutput) {
+        let kind = serial_event_kind(index);
+        let elapsed = self.events.synchronize(kind);
+        self.serial[index].advance_time(elapsed, |channel, value| {
+            if index == 1 {
+                let port = match channel {
+                    Channel::A => SerialPort::A,
+                    Channel::B => SerialPort::B,
+                };
+                output.push_serial(port, value);
+            }
+        });
+        self.reschedule_serial(index);
+    }
+
+    fn synchronize_serial_for_mmio(&mut self, index: usize) {
+        let kind = serial_event_kind(index);
+        let elapsed = self.events.synchronize(kind);
+        let mut produced_output = false;
+        self.serial[index].advance_time(elapsed, |_, _| produced_output = true);
+        debug_assert!(
+            !produced_output,
+            "serial deadline must be dispatched before a later MMIO access"
+        );
+        self.reschedule_serial(index);
+    }
+
+    fn reschedule_serial(&mut self, index: usize) {
+        self.events.schedule(
+            serial_event_kind(index),
+            self.serial[index].time_until_event(),
+        );
+    }
+
+    fn handle_scsi_register_write(&mut self) {
+        if self.scsi.take_reset_completion() {
+            self.pending_scsi = None;
+            self.events.schedule(EventKind::Scsi, None);
+        }
+        if let Some(request) = self.scsi.take_select_and_transfer_request() {
+            self.pending_scsi = Some(request);
+            self.events
+                .schedule(EventKind::Scsi, Some(VirtualDuration::ZERO));
+        }
+        self.synchronize_scsi_interrupt();
+    }
+
+    fn handle_hpc_scsi_state(&mut self) {
+        if self.hpc1.take_scsi_reset_request() {
+            self.scsi.reset();
+            self.pending_scsi = None;
+            self.events.schedule(EventKind::Scsi, None);
+        }
+        self.service_scsi_descriptor_fetch();
+        self.synchronize_scsi_interrupt();
+    }
+
+    fn process_scsi_event(&mut self) {
+        let Some(request) = self.pending_scsi.take() else {
+            return;
+        };
+        if request.destination_id() != 1 || request.lun() != 0 {
+            self.scsi.finish_selection_timeout();
+            self.synchronize_scsi_interrupt();
+            return;
+        }
+        let Some(disk) = self.disk.as_mut() else {
+            self.scsi.finish_selection_timeout();
+            self.synchronize_scsi_interrupt();
+            return;
+        };
+
+        let plan = disk.execute(request.cdb());
+        match plan {
+            ScsiCommandPlan::Complete { status, data_in } => {
+                if self.transfer_immediate_data(&request, &data_in) {
+                    self.scsi.finish_select_and_transfer(status.byte());
+                }
+            }
+            ScsiCommandPlan::ReadBlocks { lba, block_count } => {
+                self.transfer_storage_blocks(&request, lba, block_count);
+            }
+        }
+        self.synchronize_scsi_interrupt();
+    }
+
+    fn transfer_immediate_data(&mut self, request: &SelectAndTransferRequest, data: &[u8]) -> bool {
+        let Ok(byte_count) = u32::try_from(data.len()) else {
+            self.hpc1.stop_scsi_dma();
+            return false;
+        };
+        if byte_count > request.transfer_count() {
+            self.hpc1.stop_scsi_dma();
+            return false;
+        }
+        if data.is_empty() {
+            return true;
+        }
+        if !self.transfer_data_to_memory(data) {
+            return false;
+        }
+        self.hpc1.finish_scsi_dma();
+        true
+    }
+
+    fn transfer_storage_blocks(
+        &mut self,
+        request: &SelectAndTransferRequest,
+        lba: u32,
+        block_count: u16,
+    ) {
+        let total_bytes = u32::from(block_count) * 512;
+        if total_bytes > request.transfer_count() {
+            self.hpc1.stop_scsi_dma();
+            return;
+        }
+
+        let mut transferred = 0_u32;
+        while transferred < total_bytes {
+            let Some(window) = self.next_scsi_dma_window() else {
+                return;
+            };
+            if !window.to_memory() {
+                self.hpc1.stop_scsi_dma();
+                return;
+            }
+            let remaining = total_bytes - transferred;
+            let byte_count = usize::from(
+                window
+                    .byte_count()
+                    .min(u16::try_from(remaining).unwrap_or(u16::MAX)),
+            );
+            let mut bytes = vec![0; byte_count];
+            let storage_offset = u64::from(lba) * 512 + u64::from(transferred);
+            let read_result = self
+                .storage
+                .as_mut()
+                .expect("an attached SCSI disk must have block storage")
+                .read_exact_at(storage_offset, &mut bytes);
+            if read_result.is_err() {
+                let status = self
+                    .disk
+                    .as_mut()
+                    .expect("an attached SCSI disk must have target state")
+                    .complete_read(false);
+                self.hpc1.finish_scsi_dma();
+                self.scsi.finish_select_and_transfer(status.byte());
+                return;
+            }
+            if !self.write_dma_memory(window.buffer_address(), &bytes) {
+                self.hpc1.stop_scsi_dma();
+                return;
+            }
+            let byte_count_u16 = u16::try_from(byte_count).expect("DMA window length fits u16");
+            let byte_count_u32 = u32::from(byte_count_u16);
+            if !self.hpc1.consume_scsi_dma_bytes(byte_count_u16)
+                || !self.scsi.consume_transfer_bytes(byte_count_u32)
+            {
+                self.hpc1.stop_scsi_dma();
+                return;
+            }
+            transferred += byte_count_u32;
+        }
+
+        self.hpc1.finish_scsi_dma();
+        let status = self
+            .disk
+            .as_mut()
+            .expect("an attached SCSI disk must have target state")
+            .complete_read(true);
+        self.scsi.finish_select_and_transfer(status.byte());
+    }
+
+    fn transfer_data_to_memory(&mut self, data: &[u8]) -> bool {
+        let mut transferred = 0_usize;
+        while transferred < data.len() {
+            let Some(window) = self.next_scsi_dma_window() else {
+                return false;
+            };
+            if !window.to_memory() {
+                self.hpc1.stop_scsi_dma();
+                return false;
+            }
+            let byte_count = usize::from(window.byte_count()).min(data.len() - transferred);
+            if !self.write_dma_memory(
+                window.buffer_address(),
+                &data[transferred..transferred + byte_count],
+            ) {
+                self.hpc1.stop_scsi_dma();
+                return false;
+            }
+            let byte_count_u16 = u16::try_from(byte_count).expect("DMA window length fits u16");
+            if !self.hpc1.consume_scsi_dma_bytes(byte_count_u16)
+                || !self.scsi.consume_transfer_bytes(u32::from(byte_count_u16))
+            {
+                self.hpc1.stop_scsi_dma();
+                return false;
+            }
+            transferred += byte_count;
+        }
+        true
+    }
+
+    fn next_scsi_dma_window(&mut self) -> Option<se_device::hpc1::ScsiDmaWindow> {
+        loop {
+            if let Some(window) = self.hpc1.scsi_dma_window() {
+                return Some(window);
+            }
+            let descriptor_address = self.hpc1.take_scsi_descriptor_fetch()?;
+            let mut descriptor = [0; 12];
+            if !self.read_dma_memory(descriptor_address, &mut descriptor) {
+                self.hpc1.stop_scsi_dma();
+                return None;
+            }
+            self.hpc1.load_scsi_descriptor(descriptor);
+            if self.hpc1.scsi_dma_window().is_none() {
+                self.hpc1.stop_scsi_dma();
+                return None;
+            }
+        }
+    }
+
+    fn service_scsi_descriptor_fetch(&mut self) {
+        let Some(descriptor_address) = self.hpc1.take_scsi_descriptor_fetch() else {
+            return;
+        };
+        let mut descriptor = [0; 12];
+        if self.read_dma_memory(descriptor_address, &mut descriptor) {
+            self.hpc1.load_scsi_descriptor(descriptor);
+        } else {
+            self.hpc1.stop_scsi_dma();
+        }
+    }
+
+    fn read_dma_memory(&mut self, address: u32, data: &mut [u8]) -> bool {
+        let address = PhysAddr::new(u64::from(address));
+        let Ok(Some((index, offset))) = self.pic1.decode_memory(address, data.len()) else {
+            self.pic1.report_address_error();
+            return false;
+        };
+        let Some(ram) = &self.memory[index] else {
+            self.pic1.report_address_error();
+            return false;
+        };
+        if ram.read(offset, data).is_err() {
+            self.pic1.report_address_error();
+            return false;
+        }
+        true
+    }
+
+    fn write_dma_memory(&mut self, address: u32, data: &[u8]) -> bool {
+        let address = PhysAddr::new(u64::from(address));
+        let Ok(Some((index, offset))) = self.pic1.decode_memory(address, data.len()) else {
+            self.pic1.report_address_error();
+            return false;
+        };
+        let Some(ram) = &mut self.memory[index] else {
+            self.pic1.report_address_error();
+            return false;
+        };
+        if ram.write(offset, data).is_err() {
+            self.pic1.report_address_error();
+            return false;
+        }
+        true
     }
 
     pub(super) fn debug_read(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
@@ -231,12 +552,12 @@ impl Ip12Bus {
 
     fn write_memory(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
         if !local_memory_transaction_is_contained(address, data.len())? {
-            self.pic1.report_cpu_write_bus_error();
+            self.pic1.report_address_error();
             return Ok(());
         }
 
         let Some((index, offset)) = self.pic1.decode_memory(address, data.len())? else {
-            self.pic1.report_cpu_write_bus_error();
+            self.pic1.report_address_error();
             return Ok(());
         };
 
@@ -260,17 +581,32 @@ impl PhysicalBus for Ip12Bus {
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.read(address, data),
             Target::Hpc1(address) => self.hpc1.read(address, data),
-            Target::Scsi(address) => self.scsi.read(address, data),
+            Target::Scsi(address) => {
+                let result = self.scsi.read(address, data);
+                self.synchronize_scsi_interrupt();
+                result
+            }
             Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),
-            Target::Int2(address) => self.int2.read(address, data),
+            Target::Int2(address) => {
+                self.synchronize_int2_time();
+                self.int2.read(address, data)
+            }
             Target::Serial(index, address) => {
+                self.synchronize_serial_for_mmio(index);
                 let result = self.serial[index].read(address, data);
                 self.synchronize_serial_interrupt();
+                self.reschedule_serial(index);
                 result
             }
             Target::UnpopulatedSerial(_) => Err(BusFault::Unmapped),
             Target::Mdac(address) => self.mdac.read(address, data),
-            Target::Rtc(address) => self.rtc.read(address, data),
+            Target::Rtc(address) => {
+                self.synchronize_rtc_time();
+                let result = self.rtc.read(address, data);
+                self.events
+                    .schedule(EventKind::Rtc, self.rtc.time_until_event());
+                result
+            }
             Target::BoardRevision => read_board_revision(data),
             Target::Dsp56001(address) => self.dsp56001.read(address, data),
             Target::Prom(address) => self.prom.read(address, data),
@@ -287,24 +623,37 @@ impl PhysicalBus for Ip12Bus {
             Target::Pic1(address) => self.pic1.write(address, data),
             Target::Hpc1(address) => {
                 self.hpc1.write(address, data)?;
-                if self.hpc1.take_scsi_reset_request() {
-                    self.scsi.reset();
-                }
+                self.handle_hpc_scsi_state();
                 Ok(())
             }
-            Target::Scsi(address) => self.scsi.write(address, data),
+            Target::Scsi(address) => {
+                self.scsi.write(address, data)?;
+                self.handle_scsi_register_write();
+                Ok(())
+            }
             Target::CpuAuxControl => {
                 write_cpu_aux_control(&mut self.cpu_aux_control, &mut self.nvram, data)
             }
-            Target::Int2(address) => self.int2.write(address, data),
+            Target::Int2(address) => {
+                self.synchronize_int2_time();
+                self.int2.write(address, data)
+            }
             Target::Serial(index, address) => {
+                self.synchronize_serial_for_mmio(index);
                 let result = self.serial[index].write(address, data);
                 self.synchronize_serial_interrupt();
+                self.reschedule_serial(index);
                 result
             }
             Target::UnpopulatedSerial(address) => write_unpopulated_serial(address, data),
             Target::Mdac(address) => self.mdac.write(address, data),
-            Target::Rtc(address) => self.rtc.write(address, data),
+            Target::Rtc(address) => {
+                self.synchronize_rtc_time();
+                let result = self.rtc.write(address, data);
+                self.events
+                    .schedule(EventKind::Rtc, self.rtc.time_until_event());
+                result
+            }
             Target::BoardRevision => Err(BusFault::UnsupportedAccess),
             Target::Dsp56001(address) => self.dsp56001.write(address, data),
             Target::Prom(_) => Ok(()),
@@ -363,7 +712,7 @@ fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault> {
         (HPC1_ETHERNET_STATUS_BASE, HPC1_ETHERNET_STATUS_END),
         (HPC1_ETHERNET_POINTER_BASE, HPC1_ETHERNET_POINTER_END),
         (HPC1_ETHERNET_FIFO_BASE, HPC1_ETHERNET_FIFO_END),
-        (HPC1_SCSI_CONTROL_BASE, HPC1_SCSI_CONTROL_END),
+        (HPC1_SCSI_REGISTERS_BASE, HPC1_SCSI_REGISTERS_END),
         (HPC1_ENDIAN_CONTROL_BASE, HPC1_ENDIAN_CONTROL_END),
         (
             HPC1_MISCELLANEOUS_CONTROL_BASE,
@@ -516,9 +865,19 @@ const fn overlaps(start: u64, end: u64, range_start: u64, range_end: u64) -> boo
     start < range_end && end > range_start
 }
 
+const fn serial_event_kind(index: usize) -> EventKind {
+    match index {
+        0 => EventKind::Serial0,
+        1 => EventKind::Serial1,
+        _ => panic!("IP12 has exactly two serial controllers"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use std::io;
+
+    use se_core::bus::{BusFault, DeviceAddr, PhysAddr, PhysicalBus};
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
     use se_device::dp8573a::Dp8573a;
     use se_device::dsp56001::Dsp56001;
@@ -529,18 +888,20 @@ mod tests {
     use se_device::pic1::Pic1;
     use se_device::ram::Ram;
     use se_device::rom::Rom;
+    use se_device::scsi_disk::ScsiDisk;
     use se_device::wd33c93b::Wd33c93b;
     use se_device::z85230::Z85230;
 
     use crate::output::MachineOutput;
     use crate::serial::SerialPort;
+    use crate::storage::BlockStorage;
 
     use super::{
         BOARD_REVISION_BASE, CPU_AUX_CONTROL, DSP56001_BASE, DSP56001_END, GIO_BASE, GIO_END,
         HPC1_ENDIAN_CONTROL_BASE, HPC1_ETHERNET_FIFO_BASE, HPC1_ETHERNET_POINTER_BASE,
-        HPC1_MISCELLANEOUS_CONTROL_BASE, HPC1_SCSI_CONTROL_BASE, INT2_BASE, Ip12Bus,
-        LOCAL_MEMORY_END, MDAC_BASE, PIC1_BASE, PROM_BASE, PROM_BYTES, PROM_END, RTC_BASE,
-        SCSI_BASE, SERIAL_0_BASE, SERIAL_1_BASE, SERIAL_2_BASE,
+        HPC1_MISCELLANEOUS_CONTROL_BASE, HPC1_SCSI_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE,
+        INT2_BASE, Ip12Bus, LOCAL_MEMORY_END, MDAC_BASE, PIC1_BASE, PROM_BASE, PROM_BYTES,
+        PROM_END, RTC_BASE, SCSI_BASE, SERIAL_0_BASE, SERIAL_1_BASE, SERIAL_2_BASE,
     };
 
     fn bus() -> Ip12Bus {
@@ -555,12 +916,62 @@ mod tests {
             Hpc1::new(),
             Int2::new(),
             Wd33c93b::new(),
+            None,
+            None,
             [Z85230::new(3_686_400), Z85230::new(3_686_400)],
             Dp8573a::new(),
             Mdac::new(),
             Nmc93cs46::new(),
             Dsp56001::new(),
             Rom::new(bytes),
+        )
+    }
+
+    struct MemoryStorage {
+        bytes: Vec<u8>,
+        fail_reads: bool,
+    }
+
+    impl BlockStorage for MemoryStorage {
+        fn size_bytes(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_exact_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+            if self.fail_reads {
+                return Err(io::Error::other("injected storage failure"));
+            }
+            let start = usize::try_from(offset)
+                .map_err(|_| io::Error::other("storage offset does not fit usize"))?;
+            let end = start
+                .checked_add(buffer.len())
+                .ok_or_else(|| io::Error::other("storage range overflow"))?;
+            let source = self
+                .bytes
+                .get(start..end)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short storage"))?;
+            buffer.copy_from_slice(source);
+            Ok(())
+        }
+    }
+
+    fn bus_with_disk(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
+        let block_count = u64::try_from(bytes.len() / 512).unwrap();
+        let prom = (0..PROM_BYTES).map(|index| index as u8).collect();
+        Ip12Bus::new(
+            Pic1::new(0xf7, 2, true),
+            [Some(Ram::new(8 * 1024 * 1024)), None, None, None],
+            Hpc1::new(),
+            Int2::new(),
+            Wd33c93b::new(),
+            Some(ScsiDisk::new(block_count)),
+            Some(Box::new(MemoryStorage { bytes, fail_reads })),
+            [Z85230::new(3_686_400), Z85230::new(3_686_400)],
+            Dp8573a::new(),
+            Mdac::new(),
+            Nmc93cs46::new(),
+            Dsp56001::new(),
+            Rom::new(prom),
         )
     }
 
@@ -598,6 +1009,47 @@ mod tests {
         for (register, value) in [(4, 0x44), (11, 0x10), (12, 10), (13, 0), (14, 1), (5, 0x68)] {
             write_serial_register(bus, base, register, value);
         }
+    }
+
+    fn write_scsi_register(bus: &mut Ip12Bus, register: u8, value: u8) {
+        bus.write(PhysAddr::new(SCSI_BASE), &[register]).unwrap();
+        bus.write(PhysAddr::new(SCSI_BASE + 4), &[value]).unwrap();
+    }
+
+    fn read_scsi_register(bus: &mut Ip12Bus, register: u8) -> u8 {
+        bus.write(PhysAddr::new(SCSI_BASE), &[register]).unwrap();
+        read_byte(bus, SCSI_BASE + 4).unwrap()
+    }
+
+    fn configure_single_scsi_descriptor(bus: &mut Ip12Bus, buffer_address: u32) {
+        configure_memory(bus, 0x0100_023f, 0x023f_023f);
+        for (address, value) in [
+            (0x1000, 512_u32),
+            (0x1004, buffer_address | (1 << 31)),
+            (0x1008, 0_u32),
+        ] {
+            bus.write(PhysAddr::new(address), &value.to_be_bytes())
+                .unwrap();
+        }
+        bus.write(
+            PhysAddr::new(HPC1_SCSI_REGISTERS_BASE + 8),
+            &0x1000_u32.to_be_bytes(),
+        )
+        .unwrap();
+        bus.write(PhysAddr::new(HPC1_SCSI_REGISTERS_BASE + 0x0f), &[0x90])
+            .unwrap();
+    }
+
+    fn issue_read_ten(bus: &mut Ip12Bus) {
+        write_scsi_register(bus, 0x15, 1);
+        write_scsi_register(bus, 0x0f, 0);
+        for (register, value) in [(0x12, 0), (0x13, 2), (0x14, 0)] {
+            write_scsi_register(bus, register, value);
+        }
+        for (offset, value) in [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0].into_iter().enumerate() {
+            write_scsi_register(bus, 0x03 + offset as u8, value);
+        }
+        write_scsi_register(bus, 0x18, 0x09);
     }
 
     fn nvram_clock_bit(bus: &mut Ip12Bus, bit: bool) -> bool {
@@ -837,11 +1289,11 @@ mod tests {
         bus.write(PhysAddr::new(INT2_BASE + 7), &[1 << 5]).unwrap();
 
         assert_eq!(bus.receive_serial(SerialPort::A, b"A"), 1);
-        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1 << 5));
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok((1 << 5) | 1));
         assert!(bus.local_interrupt_0_asserted());
 
         assert_eq!(read_byte(&mut bus, SERIAL_1_BASE + 0x0f), Ok(b'A'));
-        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1));
         assert!(!bus.local_interrupt_0_asserted());
     }
 
@@ -865,7 +1317,7 @@ mod tests {
             .unwrap();
         assert_eq!(periodic_flags, [0x30]);
         assert_eq!(read_byte(&mut bus, RTC_BASE + 0x03), Ok(0x05));
-        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1));
         assert_eq!(read_byte(&mut bus, RTC_BASE + 0x0f), Ok(0x30));
         bus.debug_read(PhysAddr::new(RTC_BASE + 0x0f), &mut periodic_flags)
             .unwrap();
@@ -911,6 +1363,7 @@ mod tests {
             Ok(0x5a)
         );
         assert_eq!(read_byte(&mut bus, HPC1_ETHERNET_FIFO_BASE + 3), Ok(0));
+        assert_eq!(read_word(&mut bus, 0x1fb8_0098), Ok(0));
         assert_eq!(read_byte(&mut bus, 0x1fb8_0100), Err(BusFault::Unmapped));
     }
 
@@ -923,7 +1376,7 @@ mod tests {
             .unwrap();
         bus.write(PhysAddr::new(SCSI_BASE), &[2]).unwrap();
 
-        assert_eq!(read_byte(&mut bus, SCSI_BASE + 4), Ok(0));
+        assert_eq!(read_byte(&mut bus, SCSI_BASE + 4), Ok(0xa5));
         assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x80));
     }
 
@@ -940,6 +1393,95 @@ mod tests {
         assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x80));
         assert_eq!(read_byte(&mut bus, SCSI_BASE + 4), Ok(0));
         assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0));
+    }
+
+    #[test]
+    fn scsi_read_ten_moves_storage_through_hpc_dma_and_interrupts_int2() {
+        let disk: Vec<u8> = (0..512).map(|index| index as u8).collect();
+        let mut bus = bus_with_disk(disk.clone(), false);
+        configure_single_scsi_descriptor(&mut bus, 0x2000);
+
+        issue_read_ten(&mut bus);
+        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x30));
+        let mut output = MachineOutput::default();
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        let mut copied = vec![0; 512];
+        bus.memory[0]
+            .as_ref()
+            .unwrap()
+            .read(DeviceAddr::new(0x2000), &mut copied)
+            .unwrap();
+        assert_eq!(copied, disk);
+        assert_eq!(read_scsi_register(&mut bus, 0x12), 0);
+        assert_eq!(read_scsi_register(&mut bus, 0x13), 0);
+        assert_eq!(read_scsi_register(&mut bus, 0x14), 0);
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1));
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn absent_target_completes_with_selection_timeout() {
+        let mut bus = bus();
+        write_scsi_register(&mut bus, 0x17, 0);
+        write_scsi_register(&mut bus, 0x15, 1);
+        write_scsi_register(&mut bus, 0x03, 0);
+        write_scsi_register(&mut bus, 0x18, 0x08);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x42);
+    }
+
+    #[test]
+    fn storage_failure_becomes_target_check_condition_without_pic1_error() {
+        let mut bus = bus_with_disk(vec![0; 512], true);
+        configure_single_scsi_descriptor(&mut bus, 0x2000);
+        issue_read_ten(&mut bus);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert_eq!(read_scsi_register(&mut bus, 0x0f), 2);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn scsi_dma_memory_hole_raises_pic1_address_error_without_finishing_wd() {
+        let mut bus = bus_with_disk(vec![0; 512], false);
+        configure_single_scsi_descriptor(&mut bus, 0x00c0_0000);
+        issue_read_ten(&mut bus);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert!(bus.error_interrupt_asserted());
+        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x30));
+    }
+
+    #[test]
+    fn reset_cancels_a_scheduled_scsi_command() {
+        let mut bus = bus_with_disk(vec![0; 512], false);
+        configure_single_scsi_descriptor(&mut bus, 0x2000);
+        issue_read_ten(&mut bus);
+        assert!(bus.pending_scsi.is_some());
+
+        bus.reset();
+
+        assert!(bus.pending_scsi.is_none());
+        let mut output = MachineOutput::default();
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        let mut copied = vec![0; 512];
+        bus.memory[0]
+            .as_ref()
+            .unwrap()
+            .read(DeviceAddr::new(0x2000), &mut copied)
+            .unwrap();
+        assert_eq!(copied, vec![0; 512]);
     }
 
     #[test]
