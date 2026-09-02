@@ -21,7 +21,7 @@ use self::{
     cp0::Exception,
     decode::{DecodeResult, Instruction, decode},
     mmu::{AccessType, Translation},
-    state::{InstructionEffect, LoadKind, State, TranslationError},
+    state::{InstructionEffect, State, TranslationError},
 };
 
 const MINIMUM_CACHE_BYTES: usize = 4 * 1024;
@@ -373,9 +373,7 @@ fn fetch_instruction(
     translation: Translation,
     bus: &mut dyn PhysicalBus,
 ) -> Result<u32, BusFault> {
-    let mut bytes = [0; 4];
-    state.load_memory(LoadKind::Instruction, translation, &mut bytes, bus)?;
-
+    let bytes = state.read_instruction(translation, bus)?;
     Ok(u32::from_be_bytes(bytes))
 }
 

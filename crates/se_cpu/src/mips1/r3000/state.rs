@@ -83,8 +83,8 @@ pub(super) enum TranslationError {
     TlbShutdown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum LoadKind {
+#[derive(Clone, Copy)]
+enum LoadKind {
     Instruction,
     Data,
 }
@@ -304,17 +304,36 @@ impl State {
         }
     }
 
-    pub(super) fn load_memory(
+    pub(super) fn read_instruction(
         &mut self,
-        kind: LoadKind,
+        translation: Translation,
+        bus: &mut dyn PhysicalBus,
+    ) -> Result<[u8; 4], BusFault> {
+        validate_memory_access(translation, 4);
+
+        let mut data = [0; 4];
+        match translation.cacheability {
+            Cacheability::Cached => {
+                let bank = self.cache_bank(LoadKind::Instruction);
+                self.caches
+                    .read(bank, translation.address, &mut data, bus)?;
+            }
+            Cacheability::Uncached => bus.read(translation.address, &mut data)?,
+        }
+
+        Ok(data)
+    }
+
+    pub(super) fn load_data(
+        &mut self,
         translation: Translation,
         data: &mut [u8],
         bus: &mut dyn PhysicalBus,
     ) -> Result<(), BusFault> {
         validate_memory_access(translation, data.len());
 
-        if kind == LoadKind::Data && self.cp0.is_cache_isolated() {
-            let bank = self.cache_bank(kind);
+        if self.cp0.is_cache_isolated() {
+            let bank = self.cache_bank(LoadKind::Data);
             let miss = self.caches.read_isolated(bank, translation.address, data);
             self.cp0.set_cache_miss(miss);
             return Ok(());
@@ -322,7 +341,7 @@ impl State {
 
         match translation.cacheability {
             Cacheability::Cached => {
-                let bank = self.cache_bank(kind);
+                let bank = self.cache_bank(LoadKind::Data);
                 self.caches.read(bank, translation.address, data, bus)
             }
             Cacheability::Uncached => {
@@ -620,9 +639,9 @@ mod tests {
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 
     use super::{
-        AccessType, Cacheability, Cp0, DelaySlot, Exception, InstructionEffect, LoadKind,
-        PendingCp0Write, PendingCp1Write, PendingGprWrite, RESET_PC, State, StepError,
-        TlbFaultKind, Translation, TranslationError, TranslationFault,
+        AccessType, Cacheability, Cp0, DelaySlot, Exception, InstructionEffect, PendingCp0Write,
+        PendingCp1Write, PendingGprWrite, RESET_PC, State, StepError, TlbFaultKind, Translation,
+        TranslationError, TranslationFault,
     };
 
     const ENTRY_LO_DIRTY: u32 = 1 << 10;
@@ -1692,7 +1711,7 @@ mod tests {
 
         state.cp0.set_cache_miss(true);
         state
-            .load_memory(LoadKind::Data, cached, &mut data, &mut bus)
+            .load_data(cached, &mut data, &mut bus)
             .expect("cached load should refill");
         assert_eq!(data, [1, 2, 3, 4]);
         assert_eq!(bus.reads.len(), 1);
@@ -1700,13 +1719,13 @@ mod tests {
 
         bus.read_data = [5, 6, 7, 8];
         state
-            .load_memory(LoadKind::Data, cached, &mut data, &mut bus)
+            .load_data(cached, &mut data, &mut bus)
             .expect("cached load should hit");
         assert_eq!(data, [1, 2, 3, 4]);
         assert_eq!(bus.reads.len(), 1);
 
         state
-            .load_memory(LoadKind::Data, uncached, &mut data, &mut bus)
+            .load_data(uncached, &mut data, &mut bus)
             .expect("uncached load should reach the bus");
         assert_eq!(data, [5, 6, 7, 8]);
         assert_eq!(bus.reads.len(), 2);
@@ -1718,7 +1737,7 @@ mod tests {
         let status = state.read_cp0(12);
         let random = state.read_cp0(1);
         assert_eq!(
-            state.load_memory(LoadKind::Data, uncached, &mut data, &mut bus),
+            state.load_data(uncached, &mut data, &mut bus),
             Err(BusFault::Unmapped)
         );
         assert_eq!(data, [0xaa; 4]);
@@ -1728,7 +1747,7 @@ mod tests {
 
         bus.read_fault = None;
         state
-            .load_memory(LoadKind::Data, cached, &mut data, &mut bus)
+            .load_data(cached, &mut data, &mut bus)
             .expect("uncached alias should not modify the resident cache entry");
         assert_eq!(data, [1, 2, 3, 4]);
         assert_eq!(bus.reads.len(), 3);
@@ -1777,23 +1796,22 @@ mod tests {
         assert!(bus.writes.is_empty());
 
         state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
-        let mut data = [0; 4];
         state.cp0.set_cache_miss(true);
-        state
-            .load_memory(LoadKind::Instruction, address, &mut data, &mut bus)
+        let mut data = state
+            .read_instruction(address, &mut bus)
             .expect("unswapped instruction load should select the instruction cache");
         assert_eq!(data, [5, 6, 7, 8]);
         assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
 
         state
-            .load_memory(LoadKind::Data, address, &mut data, &mut bus)
+            .load_data(address, &mut data, &mut bus)
             .expect("isolated data-cache read should succeed");
         assert_eq!(data, [1, 2, 3, 4]);
         assert_eq!(state.read_cp0(12) & STATUS_CM, 0);
 
         let alias = translation(0x1100, Cacheability::Uncached);
         state
-            .load_memory(LoadKind::Data, alias, &mut data, &mut bus)
+            .load_data(alias, &mut data, &mut bus)
             .expect("isolated miss should still return indexed data");
         assert_eq!(data, [1, 2, 3, 4]);
         assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
@@ -1802,20 +1820,15 @@ mod tests {
             .cp0
             .write_register(12, STATUS_BEV | STATUS_ISC | STATUS_SWC);
         state
-            .load_memory(LoadKind::Data, address, &mut data, &mut bus)
+            .load_data(address, &mut data, &mut bus)
             .expect("swapped isolated read should succeed");
         assert_eq!(data, [5, 6, 7, 8]);
         assert_eq!(state.read_cp0(12) & STATUS_CM, 0);
 
         state.cp0.set_cache_miss(true);
         let instruction_address = translation(0x204, Cacheability::Cached);
-        state
-            .load_memory(
-                LoadKind::Instruction,
-                instruction_address,
-                &mut data,
-                &mut bus,
-            )
+        data = state
+            .read_instruction(instruction_address, &mut bus)
             .expect("instruction load should ignore cache isolation");
         assert_eq!(data, [9, 8, 7, 6]);
         assert_eq!(bus.reads, vec![(PhysAddr::new(0x204), 4)]);
@@ -1823,7 +1836,7 @@ mod tests {
 
         state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
         state
-            .load_memory(LoadKind::Data, instruction_address, &mut data, &mut bus)
+            .load_data(instruction_address, &mut data, &mut bus)
             .expect("swapped instruction refill should reside in the data cache");
         assert_eq!(data, [9, 8, 7, 6]);
         assert_eq!(state.read_cp0(12) & STATUS_CM, 0);
@@ -1875,8 +1888,7 @@ mod tests {
         state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
         let mut data = [0; 4];
         state
-            .load_memory(
-                LoadKind::Data,
+            .load_data(
                 translation(0x400, Cacheability::Uncached),
                 &mut data,
                 &mut bus,
@@ -1908,8 +1920,7 @@ mod tests {
         state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
         let mut data = [0; 4];
         state
-            .load_memory(
-                LoadKind::Data,
+            .load_data(
                 translation(0x300, Cacheability::Uncached),
                 &mut data,
                 &mut bus,
@@ -1932,18 +1943,18 @@ mod tests {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let translation = translation(0x500, Cacheability::Cached);
         let mut bus = TestBus::new([1, 2, 3, 4]);
-        let mut data = [0; 4];
-        state
-            .load_memory(LoadKind::Instruction, translation, &mut data, &mut bus)
+        let data = state
+            .read_instruction(translation, &mut bus)
             .expect("initial fetch should refill");
 
         state.reset();
         bus.read_data = [5, 6, 7, 8];
-        state
-            .load_memory(LoadKind::Instruction, translation, &mut data, &mut bus)
+        let reset_data = state
+            .read_instruction(translation, &mut bus)
             .expect("reset cache entry should remain readable");
 
         assert_eq!(data, [1, 2, 3, 4]);
+        assert_eq!(reset_data, [1, 2, 3, 4]);
         assert_eq!(bus.reads.len(), 1);
     }
 }

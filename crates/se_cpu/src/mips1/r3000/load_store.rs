@@ -5,7 +5,7 @@ use super::{
     cp0::Exception,
     decode::MemoryInstruction,
     mmu::{AccessType, Translation},
-    state::{InstructionEffect, LoadKind, State, TranslationError},
+    state::{InstructionEffect, State, TranslationError},
 };
 
 pub(super) fn execute(
@@ -82,7 +82,7 @@ pub(super) fn execute(
             let length = 4 - byte;
             let mut memory = [0; 4];
             if state
-                .load_memory(LoadKind::Data, translation, &mut memory[..length], bus)
+                .load_data(translation, &mut memory[..length], bus)
                 .is_err()
             {
                 return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
@@ -124,7 +124,7 @@ pub(super) fn execute(
             let length = byte + 1;
             let mut memory = [0; 4];
             if state
-                .load_memory(LoadKind::Data, translation, &mut memory[..length], bus)
+                .load_data(translation, &mut memory[..length], bus)
                 .is_err()
             {
                 return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
@@ -240,10 +240,7 @@ pub(super) fn load(
         }
     };
 
-    if state
-        .load_memory(LoadKind::Data, translation, data, bus)
-        .is_err()
-    {
+    if state.load_data(translation, data, bus).is_err() {
         return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
     }
 
