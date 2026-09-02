@@ -19,18 +19,18 @@ use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
+use se_device::scsi::{ScsiAttachError, ScsiBus};
 use se_device::scsi_cdrom::ScsiCdrom;
 use se_device::scsi_disk::ScsiDisk;
+use se_device::storage::BlockStorage;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
 use se_float::backend::Backend;
 
+use self::bus::Ip12Bus;
+use self::prom::normalize_u56_prom;
 use crate::output::MachineOutput;
 use crate::serial::SerialPort;
-use crate::storage::BlockStorage;
-
-use self::bus::{Ip12Bus, StorageAttachment};
-use self::prom::normalize_u56_prom;
 
 const PROM_BYTES: usize = 0x40000;
 const RAM_BYTES: usize = 8 * 1024 * 1024;
@@ -57,6 +57,8 @@ pub enum Ip12Error {
         /// Supplied storage size in bytes.
         bytes: u64,
     },
+    /// The fixed IP12 SCSI topology could not be assembled.
+    ScsiAttachment(ScsiAttachError),
 }
 
 impl fmt::Display for Ip12Error {
@@ -74,11 +76,23 @@ impl fmt::Display for Ip12Error {
                 formatter,
                 "invalid IP12 CD-ROM size: expected a nonzero multiple of 2048 bytes representable as 512-byte logical blocks by READ CAPACITY(10), got {bytes}"
             ),
+            Self::ScsiAttachment(error) => {
+                write!(formatter, "invalid IP12 SCSI attachment: {error}")
+            }
         }
     }
 }
 
-impl Error for Ip12Error {}
+impl Error for Ip12Error {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ScsiAttachment(error) => Some(error),
+            Self::InvalidPromSize { .. }
+            | Self::InvalidDiskSize { .. }
+            | Self::InvalidCdromSize { .. } => None,
+        }
+    }
+}
 
 /// Nonvolatile state retained by an Indigo IP12.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,24 +205,23 @@ impl Ip12 {
         cdrom_storage: Option<Box<dyn BlockStorage>>,
     ) -> Result<Self, Ip12Error> {
         let prom = Rom::new(normalize_u56_prom(raw_prom)?);
-        let disk = disk_storage
-            .map(|storage| {
-                let bytes = storage.size_bytes();
-                if bytes == 0 || bytes % 512 != 0 || bytes / 512 > u64::from(u32::MAX) + 1 {
-                    return Err(Ip12Error::InvalidDiskSize { bytes });
-                }
-                Ok(StorageAttachment::new(ScsiDisk::new(bytes / 512), storage))
-            })
-            .transpose()?;
-        let cdrom = cdrom_storage
-            .map(|storage| {
-                let bytes = storage.size_bytes();
-                if bytes == 0 || bytes % 2048 != 0 || bytes / 512 > u64::from(u32::MAX) + 1 {
-                    return Err(Ip12Error::InvalidCdromSize { bytes });
-                }
-                Ok(StorageAttachment::new(ScsiCdrom::new(bytes / 512), storage))
-            })
-            .transpose()?;
+        let mut scsi_bus = ScsiBus::new();
+        if let Some(storage) = disk_storage {
+            let bytes = storage.size_bytes();
+            let target =
+                ScsiDisk::try_new(bytes).map_err(|_| Ip12Error::InvalidDiskSize { bytes })?;
+            scsi_bus
+                .attach(1, 0, Box::new(target), storage)
+                .map_err(Ip12Error::ScsiAttachment)?;
+        }
+        if let Some(storage) = cdrom_storage {
+            let bytes = storage.size_bytes();
+            let target =
+                ScsiCdrom::try_new(bytes).map_err(|_| Ip12Error::InvalidCdromSize { bytes })?;
+            scsi_bus
+                .attach(4, 0, Box::new(target), storage)
+                .map_err(Ip12Error::ScsiAttachment)?;
+        }
         Ok(Self {
             cpu: R3000::new(cpu_config(floating_point_backend)),
             bus: Ip12Bus::new(
@@ -217,8 +230,7 @@ impl Ip12 {
                 Hpc1::new(),
                 Int2::new(),
                 Wd33c93b::new(),
-                disk,
-                cdrom,
+                scsi_bus,
                 [Z85230::new(SERIAL_CLOCK_HZ), Z85230::new(SERIAL_CLOCK_HZ)],
                 Dp8573a::new(),
                 Mdac::new(),
@@ -327,8 +339,8 @@ mod tests {
     use std::io;
 
     use crate::serial::SerialPort;
-    use crate::storage::BlockStorage;
     use se_core::bus::{PhysAddr, PhysicalBus};
+    use se_device::storage::BlockStorage;
     use se_float::backend::Backend;
 
     use super::{

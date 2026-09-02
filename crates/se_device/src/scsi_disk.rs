@@ -1,6 +1,6 @@
 //! Functional read-only SCSI direct-access disk target.
 
-use crate::scsi::{ScsiCommandPlan, ScsiStatus, SenseData};
+use crate::scsi::{ScsiCommandPlan, ScsiStatus, ScsiStorageSizeError, ScsiTarget, SenseData};
 
 const BLOCK_BYTES: u32 = 512;
 
@@ -21,66 +21,25 @@ pub struct ScsiDisk {
 }
 
 impl ScsiDisk {
-    /// Creates a ready target with the supplied nonzero block count.
+    /// Creates a ready target for a validated storage capacity.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when `block_count` is zero or cannot be represented by
+    /// Returns [`ScsiStorageSizeError`] when `storage_bytes` is zero, is not
+    /// a multiple of 512 bytes, or cannot be represented by
     /// `READ CAPACITY(10)`.
-    #[must_use]
-    pub const fn new(block_count: u64) -> Self {
-        assert!(block_count != 0);
-        assert!(block_count <= u32::MAX as u64 + 1);
-        Self {
-            block_count,
+    pub fn try_new(storage_bytes: u64) -> Result<Self, ScsiStorageSizeError> {
+        if storage_bytes == 0
+            || !storage_bytes.is_multiple_of(u64::from(BLOCK_BYTES))
+            || storage_bytes / u64::from(BLOCK_BYTES) > u64::from(u32::MAX) + 1
+        {
+            return Err(ScsiStorageSizeError::new(storage_bytes));
+        }
+        Ok(Self {
+            block_count: storage_bytes / u64::from(BLOCK_BYTES),
             ready: true,
             sense: SenseData::NONE,
-        }
-    }
-
-    /// Decodes one command descriptor block.
-    #[must_use]
-    pub fn execute(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
-        let Some(opcode) = cdb.first().copied() else {
-            return self.check_condition(SenseData::INVALID_CDB_FIELD);
-        };
-
-        match opcode {
-            TEST_UNIT_READY if cdb.len() >= 6 => {
-                if self.ready {
-                    complete_good(Vec::new())
-                } else {
-                    self.check_condition(SenseData::NOT_READY)
-                }
-            }
-            REQUEST_SENSE if cdb.len() >= 6 => self.request_sense(cdb[4]),
-            INQUIRY if cdb.len() >= 6 => self.inquiry(cdb[4]),
-            MODE_SENSE_6 if cdb.len() >= 6 => self.mode_sense(cdb[4]),
-            START_STOP_UNIT if cdb.len() >= 6 => {
-                self.ready = cdb[4] & 1 != 0;
-                complete_good(Vec::new())
-            }
-            READ_CAPACITY_10 if cdb.len() >= 10 => self.read_capacity(),
-            READ_10 if cdb.len() >= 10 => self.read_10(cdb),
-            WRITE_10 if cdb.len() >= 10 => self.check_condition(SenseData::WRITE_PROTECTED),
-            TEST_UNIT_READY | REQUEST_SENSE | INQUIRY | MODE_SENSE_6 | START_STOP_UNIT
-            | READ_CAPACITY_10 | READ_10 | WRITE_10 => {
-                self.check_condition(SenseData::INVALID_CDB_FIELD)
-            }
-            _ => self.check_condition(SenseData::UNSUPPORTED_OPCODE),
-        }
-    }
-
-    /// Completes a storage-backed read and records a host read failure as
-    /// target sense data.
-    #[must_use]
-    pub fn complete_read(&mut self, succeeded: bool) -> ScsiStatus {
-        if succeeded {
-            ScsiStatus::Good
-        } else {
-            self.sense = SenseData::HOST_READ_ERROR;
-            ScsiStatus::CheckCondition
-        }
+        })
     }
 
     fn request_sense(&mut self, allocation_length: u8) -> ScsiCommandPlan {
@@ -117,8 +76,7 @@ impl ScsiDisk {
         if !self.ready {
             return self.check_condition(SenseData::NOT_READY);
         }
-        let last_lba = u32::try_from(self.block_count - 1)
-            .expect("validated SCSI disk capacity must fit READ CAPACITY(10)");
+        let last_lba = (self.block_count - 1) as u32;
         let mut data = Vec::with_capacity(8);
         data.extend_from_slice(&last_lba.to_be_bytes());
         data.extend_from_slice(&BLOCK_BYTES.to_be_bytes());
@@ -129,9 +87,8 @@ impl ScsiDisk {
         if !self.ready {
             return self.check_condition(SenseData::NOT_READY);
         }
-        let lba = u32::from_be_bytes(cdb[2..6].try_into().expect("READ(10) CDB was validated"));
-        let block_count =
-            u16::from_be_bytes(cdb[7..9].try_into().expect("READ(10) CDB was validated"));
+        let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+        let block_count = u16::from_be_bytes([cdb[7], cdb[8]]);
         if block_count == 0 {
             return complete_good(Vec::new());
         }
@@ -139,7 +96,10 @@ impl ScsiDisk {
         if end > self.block_count {
             return self.check_condition(SenseData::LBA_OUT_OF_RANGE);
         }
-        ScsiCommandPlan::ReadBlocks { lba, block_count }
+        ScsiCommandPlan::ReadStorage {
+            offset: u64::from(lba) * u64::from(BLOCK_BYTES),
+            byte_count: u64::from(block_count) * u64::from(BLOCK_BYTES),
+        }
     }
 
     fn check_condition(&mut self, sense: SenseData) -> ScsiCommandPlan {
@@ -147,6 +107,55 @@ impl ScsiDisk {
         ScsiCommandPlan::Complete {
             status: ScsiStatus::CheckCondition,
             data_in: Vec::new(),
+        }
+    }
+}
+
+impl ScsiTarget for ScsiDisk {
+    fn storage_size_bytes(&self) -> u64 {
+        self.block_count * u64::from(BLOCK_BYTES)
+    }
+
+    /// Decodes one command descriptor block.
+    fn execute(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
+        let Some(opcode) = cdb.first().copied() else {
+            return self.check_condition(SenseData::INVALID_CDB_FIELD);
+        };
+
+        match opcode {
+            TEST_UNIT_READY if cdb.len() >= 6 => {
+                if self.ready {
+                    complete_good(Vec::new())
+                } else {
+                    self.check_condition(SenseData::NOT_READY)
+                }
+            }
+            REQUEST_SENSE if cdb.len() >= 6 => self.request_sense(cdb[4]),
+            INQUIRY if cdb.len() >= 6 => self.inquiry(cdb[4]),
+            MODE_SENSE_6 if cdb.len() >= 6 => self.mode_sense(cdb[4]),
+            START_STOP_UNIT if cdb.len() >= 6 => {
+                self.ready = cdb[4] & 1 != 0;
+                complete_good(Vec::new())
+            }
+            READ_CAPACITY_10 if cdb.len() >= 10 => self.read_capacity(),
+            READ_10 if cdb.len() >= 10 => self.read_10(cdb),
+            WRITE_10 if cdb.len() >= 10 => self.check_condition(SenseData::WRITE_PROTECTED),
+            TEST_UNIT_READY | REQUEST_SENSE | INQUIRY | MODE_SENSE_6 | START_STOP_UNIT
+            | READ_CAPACITY_10 | READ_10 | WRITE_10 => {
+                self.check_condition(SenseData::INVALID_CDB_FIELD)
+            }
+            _ => self.check_condition(SenseData::UNSUPPORTED_OPCODE),
+        }
+    }
+
+    /// Completes a storage-backed read and records a host read failure as
+    /// target sense data.
+    fn complete_read(&mut self, succeeded: bool) -> ScsiStatus {
+        if succeeded {
+            ScsiStatus::Good
+        } else {
+            self.sense = SenseData::HOST_READ_ERROR;
+            ScsiStatus::CheckCondition
         }
     }
 }
@@ -160,13 +169,17 @@ fn complete_good(data_in: Vec<u8>) -> ScsiCommandPlan {
 
 #[cfg(test)]
 mod tests {
-    use crate::scsi::{ScsiCommandPlan, ScsiStatus};
+    use crate::scsi::{ScsiCommandPlan, ScsiStatus, ScsiTarget};
 
-    use super::ScsiDisk;
+    use super::{BLOCK_BYTES, ScsiDisk};
+
+    fn disk(block_count: u64) -> ScsiDisk {
+        ScsiDisk::try_new(block_count * u64::from(BLOCK_BYTES)).unwrap()
+    }
 
     #[test]
     fn inquiry_and_capacity_report_the_fixed_target_identity() {
-        let mut disk = ScsiDisk::new(0x1235);
+        let mut disk = disk(0x1235);
         let ScsiCommandPlan::Complete { status, data_in } = disk.execute(&[0x12, 0, 0, 0, 36, 0])
         else {
             panic!("INQUIRY should complete immediately");
@@ -186,16 +199,16 @@ mod tests {
 
     #[test]
     fn read_ten_validates_the_requested_range() {
-        let mut disk = ScsiDisk::new(16);
+        let mut disk = disk(16);
         let mut cdb = [0; 10];
         cdb[0] = 0x28;
         cdb[5] = 4;
         cdb[8] = 2;
         assert_eq!(
             disk.execute(&cdb),
-            ScsiCommandPlan::ReadBlocks {
-                lba: 4,
-                block_count: 2
+            ScsiCommandPlan::ReadStorage {
+                offset: 4 * u64::from(BLOCK_BYTES),
+                byte_count: 2 * u64::from(BLOCK_BYTES),
             }
         );
 
@@ -211,7 +224,7 @@ mod tests {
 
     #[test]
     fn request_sense_reports_and_clears_the_latest_failure() {
-        let mut disk = ScsiDisk::new(1);
+        let mut disk = disk(1);
         assert!(matches!(
             disk.execute(&[0xff]),
             ScsiCommandPlan::Complete {
@@ -235,7 +248,7 @@ mod tests {
 
     #[test]
     fn stopped_and_read_only_states_report_distinct_sense() {
-        let mut disk = ScsiDisk::new(1);
+        let mut disk = disk(1);
         let _ = disk.execute(&[0x1b, 0, 0, 0, 0, 0]);
         assert!(matches!(
             disk.execute(&[0x00, 0, 0, 0, 0, 0]),
@@ -266,7 +279,7 @@ mod tests {
 
     #[test]
     fn host_read_failure_becomes_hardware_error_sense() {
-        let mut disk = ScsiDisk::new(1);
+        let mut disk = disk(1);
         assert_eq!(disk.complete_read(false), ScsiStatus::CheckCondition);
         let ScsiCommandPlan::Complete { data_in, .. } = disk.execute(&[0x03, 0, 0, 0, 18, 0])
         else {

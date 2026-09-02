@@ -679,12 +679,12 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
 
     use se_core::time::ATTOSECONDS_PER_SECOND;
+    use se_device::storage::BlockStorage;
     use se_float::backend::Backend;
     use se_machine::indigo::ip12::Ip12;
     use se_machine::indigo::ip12::debug::{DebugRequest, DebugResponse, MemoryAddressSpace};
     use se_machine::machine::Machine;
     use se_machine::serial::SerialPort;
-    use se_machine::storage::BlockStorage;
 
     use super::{CpuClock, Runtime, RuntimeError, serial_port_index};
     use crate::control::RuntimeState;

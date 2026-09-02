@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use se_machine::storage::BlockStorage;
+use se_device::storage::BlockStorage;
 
 pub(crate) struct FileBlockStorage {
     file: File,

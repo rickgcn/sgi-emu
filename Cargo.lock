@@ -444,6 +444,7 @@ dependencies = [
  "clap",
  "directories",
  "se_cli",
+ "se_device",
  "se_float",
  "se_machine",
  "se_runtime",
@@ -505,6 +506,7 @@ name = "se_runtime"
 version = "0.1.0"
 dependencies = [
  "se_core",
+ "se_device",
  "se_float",
  "se_machine",
 ]

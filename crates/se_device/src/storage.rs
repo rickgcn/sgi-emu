@@ -1,4 +1,4 @@
-//! Host-backed block storage used by concrete machine compositions.
+//! Host-backed storage ports consumed by device models.
 
 use std::io;
 
