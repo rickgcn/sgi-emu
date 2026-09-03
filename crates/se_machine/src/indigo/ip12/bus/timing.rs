@@ -120,7 +120,9 @@ mod tests {
         HPC1_COUNTER_BASE, HPC1_ETHERNET_TIMER_BASE, INT2_BASE, RTC_BASE, SERIAL_0_BASE,
         SERIAL_1_BASE,
     };
-    use super::super::test_support::{bus, configure_serial_a, read_byte, read_word};
+    use super::super::test_support::{
+        bus, configure_serial_a, read_byte, read_scsi_register, read_word,
+    };
 
     const ATTOSECONDS_PER_MICROSECOND: u128 = ATTOSECONDS_PER_SECOND / 1_000_000;
     const TIMER_ACKNOWLEDGE: u64 = INT2_BASE + 0x23;
@@ -162,6 +164,8 @@ mod tests {
     fn machine_time_advances_the_rtc_without_connecting_its_interrupt_to_int2() {
         let mut bus = bus();
         let mut output = MachineOutput::default();
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0);
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
         bus.write(PhysAddr::new(RTC_BASE + 0x03), &[0x40]).unwrap();
         bus.write(PhysAddr::new(RTC_BASE + 0x0f), &[0x20]).unwrap();
         bus.write(PhysAddr::new(RTC_BASE + 0x07), &[0x08]).unwrap();
@@ -178,7 +182,7 @@ mod tests {
             .unwrap();
         assert_eq!(periodic_flags, [0x30]);
         assert_eq!(read_byte(&mut bus, RTC_BASE + 0x03), Ok(0x05));
-        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1));
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
         assert_eq!(read_byte(&mut bus, RTC_BASE + 0x0f), Ok(0x30));
         bus.debug_read(PhysAddr::new(RTC_BASE + 0x0f), &mut periodic_flags)
             .unwrap();

@@ -9,7 +9,7 @@ use super::super::events::EventKind;
 use super::Ip12Bus;
 
 const CPU_AUX_OUTPUT_BITS: u8 = 0x0f;
-const SCSI_INTERRUPT: u8 = 1;
+const SCSI_INTERRUPT: u8 = 1 << 2;
 const PARALLEL_INTERRUPT: u8 = 1 << 1;
 const SERIAL_INTERRUPT: u8 = 1 << 5;
 const DSP_INTERRUPT: u8 = 1 << 4;
@@ -323,7 +323,7 @@ mod tests {
     use crate::output::MachineOutput;
     use crate::serial::SerialPort;
 
-    use super::{Ip12Bus, drive_hpc1_interrupt_inputs};
+    use super::{Ip12Bus, SCSI_INTERRUPT, drive_hpc1_interrupt_inputs};
 
     use super::super::address::{
         HPC1_SCSI_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE, INT2_BASE, SCSI_BASE, SERIAL_1_BASE,
@@ -365,11 +365,17 @@ mod tests {
         bus.write(PhysAddr::new(INT2_BASE + 7), &[1 << 5]).unwrap();
 
         assert_eq!(bus.receive_serial(SerialPort::A, b"A"), 1);
-        assert_eq!(read_word(&mut bus, INT2_BASE), Ok((1 << 5) | 1));
+        assert_eq!(
+            read_word(&mut bus, INT2_BASE),
+            Ok(u32::from((1 << 5) | SCSI_INTERRUPT))
+        );
         assert!(bus.local_interrupt_0_asserted());
 
         assert_eq!(read_byte(&mut bus, SERIAL_1_BASE + 0x0f), Ok(b'A'));
-        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1));
+        assert_eq!(
+            read_word(&mut bus, INT2_BASE),
+            Ok(u32::from(SCSI_INTERRUPT))
+        );
         assert!(!bus.local_interrupt_0_asserted());
     }
 
@@ -382,13 +388,19 @@ mod tests {
 
         drive_hpc1_interrupt_inputs(&mut bus.int2, true, true);
 
-        assert_eq!(read_word(&mut bus, INT2_BASE), Ok((1 << 1) | 1));
+        assert_eq!(
+            read_word(&mut bus, INT2_BASE),
+            Ok(u32::from((1 << 1) | SCSI_INTERRUPT))
+        );
         assert_eq!(read_word(&mut bus, INT2_BASE + 8), Ok(1 << 4));
         assert!(bus.local_interrupt_0_asserted());
         assert!(bus.local_interrupt_1_asserted());
 
         drive_hpc1_interrupt_inputs(&mut bus.int2, false, false);
-        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1));
+        assert_eq!(
+            read_word(&mut bus, INT2_BASE),
+            Ok(u32::from(SCSI_INTERRUPT))
+        );
         assert_eq!(read_word(&mut bus, INT2_BASE + 8), Ok(0));
         assert!(!bus.local_interrupt_0_asserted());
         assert!(!bus.local_interrupt_1_asserted());
@@ -414,7 +426,10 @@ mod tests {
 
         assert_eq!(output.serial(SerialPort::A), [0xa5]);
         assert!(bus.local_interrupt_0_asserted());
-        assert_eq!(read_word(&mut bus, INT2_BASE), Ok((1 << 5) | 1));
+        assert_eq!(
+            read_word(&mut bus, INT2_BASE),
+            Ok(u32::from((1 << 5) | SCSI_INTERRUPT))
+        );
         assert_eq!(read_byte(&mut bus, SERIAL_1_BASE + 0x0f), Ok(0xa5));
         assert!(!bus.local_interrupt_0_asserted());
     }
@@ -469,6 +484,8 @@ mod tests {
         let disk: Vec<u8> = (0..512).map(|index| index as u8).collect();
         let mut bus = bus_with_disk(disk.clone(), false);
         configure_single_scsi_descriptor(&mut bus, 0x2000);
+        bus.write(PhysAddr::new(INT2_BASE + 7), &[SCSI_INTERRUPT])
+            .unwrap();
 
         issue_read_ten(&mut bus, 1, 0);
         assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x30));
@@ -485,9 +502,14 @@ mod tests {
         assert_eq!(read_scsi_register(&mut bus, 0x12), 0);
         assert_eq!(read_scsi_register(&mut bus, 0x13), 0);
         assert_eq!(read_scsi_register(&mut bus, 0x14), 0);
-        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1));
+        assert_eq!(
+            read_word(&mut bus, INT2_BASE),
+            Ok(u32::from(SCSI_INTERRUPT))
+        );
+        assert!(bus.local_interrupt_0_asserted());
         assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
         assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
+        assert!(!bus.local_interrupt_0_asserted());
         assert!(!bus.error_interrupt_asserted());
     }
 
@@ -869,12 +891,21 @@ mod tests {
                 bus_with_cdrom(vec![0; 2048], false)
             };
             write_scsi_register(&mut bus, 0x17, 0);
+            bus.write(PhysAddr::new(INT2_BASE + 7), &[SCSI_INTERRUPT])
+                .unwrap();
             issue_scsi_command(&mut bus, target, lun, 0, &[0, 0, 0, 0, 0, 0]);
             let mut output = MachineOutput::default();
 
             bus.advance_time(VirtualDuration::ZERO, &mut output);
 
+            assert_eq!(
+                read_word(&mut bus, INT2_BASE),
+                Ok(u32::from(SCSI_INTERRUPT))
+            );
+            assert!(bus.local_interrupt_0_asserted());
             assert_eq!(read_scsi_register(&mut bus, 0x17), 0x42);
+            assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
+            assert!(!bus.local_interrupt_0_asserted());
         }
     }
 
