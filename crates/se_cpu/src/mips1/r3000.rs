@@ -261,8 +261,9 @@ impl R3000 {
     /// Unsupported instructions leave architectural registers unchanged,
     /// although a successful cached fetch remains visible in the instruction
     /// cache. A newly detected translation buffer shutdown changes only the
-    /// CP0 shutdown state. Enabled interrupts are sampled after the shutdown
-    /// guard and before instruction fetch.
+    /// CP0 shutdown state. Instruction-address alignment is resolved after the
+    /// shutdown guard. For aligned addresses, enabled interrupts are sampled
+    /// before address translation and instruction fetch.
     ///
     /// # Errors
     ///
@@ -274,16 +275,16 @@ impl R3000 {
             return Err(StepError::TlbShutdown);
         }
 
-        if self.state.interrupt_requested() {
-            self.state.take_exception(Exception::Interrupt);
-            self.state.synchronize_cp1_interrupt();
-            return Ok(());
-        }
-
         let pc = self.state.pc();
         if pc & 3 != 0 {
             self.state
                 .take_exception(Exception::InstructionAddressError { address: pc });
+            self.state.synchronize_cp1_interrupt();
+            return Ok(());
+        }
+
+        if self.state.interrupt_requested() {
+            self.state.take_exception(Exception::Interrupt);
             self.state.synchronize_cp1_interrupt();
             return Ok(());
         }
@@ -422,6 +423,7 @@ mod tests {
     const STATUS_IM0: u32 = 1 << 8;
     const STATUS_IM2: u32 = 1 << 10;
     const STATUS_IM3: u32 = 1 << 11;
+    const STATUS_IM6: u32 = 1 << 14;
     const UNSUPPORTED_CP2_INSTRUCTION: u32 = 0x4a00_0000;
 
     fn translation(address: u64, cacheability: Cacheability) -> Translation {
@@ -2941,6 +2943,30 @@ mod tests {
             STATUS_IM3
         );
         assert_eq!(processor.state.read_cp0(1), previous_random - (1 << 8));
+    }
+
+    #[test]
+    fn instruction_address_error_precedes_an_enabled_interrupt() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM6 | STATUS_IEC);
+        let fault_address = 0x001f_7247;
+        jump_to(&mut processor, fault_address);
+        processor.set_hardware_interrupt_lines(1 << 4);
+        let mut bus = RejectingBus;
+
+        processor
+            .step(&mut bus)
+            .expect("the address error should enter a guest exception");
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), fault_address);
+        assert_eq!(processor.state.read_cp0(8), fault_address);
+        assert_eq!(processor.state.read_cp0(13) & CAUSE_BD, 0);
+        assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 4);
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            STATUS_IM6
+        );
     }
 
     #[test]
