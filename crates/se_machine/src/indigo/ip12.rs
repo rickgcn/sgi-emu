@@ -22,6 +22,7 @@ use se_device::rom::Rom;
 use se_device::scsi::{ScsiAttachError, ScsiBus};
 use se_device::scsi_cdrom::ScsiCdrom;
 use se_device::scsi_disk::ScsiDisk;
+use se_device::seeq8003::Seeq8003;
 use se_device::storage::BlockStorage;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
@@ -228,6 +229,7 @@ impl Ip12 {
                 Pic1::new(0xf7, 2, true),
                 [Some(Ram::new(RAM_BYTES)), None, None, None],
                 Hpc1::new(),
+                Seeq8003::new(),
                 Int2::new(),
                 Wd33c93b::new(),
                 scsi_bus,

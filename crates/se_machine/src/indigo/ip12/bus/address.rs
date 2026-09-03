@@ -8,22 +8,29 @@ pub(super) const GIO_END: u64 = 0x1f40_0000;
 pub(super) const PIC1_BASE: u64 = 0x1fa0_0000;
 const PIC1_END: u64 = 0x1fab_0000;
 const HPC1_BASE: u64 = 0x1fb8_0000;
-pub(super) const HPC1_ETHERNET_STATUS_BASE: u64 = 0x1fb8_0034;
+const HPC1_INTERNAL_END: u64 = 0x1fb8_00c0;
+#[cfg(test)]
+pub(super) const HPC1_ETHERNET_TIMER_BASE: u64 = 0x1fb8_002c;
+#[cfg(test)]
 pub(super) const HPC1_ETHERNET_POINTER_BASE: u64 = 0x1fb8_0058;
+#[cfg(test)]
 pub(super) const HPC1_ETHERNET_FIFO_BASE: u64 = 0x1fb8_005c;
+#[cfg(test)]
 pub(super) const HPC1_SCSI_REGISTERS_BASE: u64 = 0x1fb8_0088;
 #[cfg(test)]
 pub(super) const HPC1_SCSI_CONTROL_BASE: u64 = 0x1fb8_0094;
 pub(super) const HPC1_ENDIAN_CONTROL_BASE: u64 = 0x1fb8_00c0;
 pub(super) const HPC1_COUNTER_BASE: u64 = 0x1fb8_0194;
 pub(super) const HPC1_MISCELLANEOUS_CONTROL_BASE: u64 = 0x1fb8_01b0;
-const HPC1_ETHERNET_STATUS_END: u64 = 0x1fb8_0040;
-const HPC1_ETHERNET_POINTER_END: u64 = 0x1fb8_005c;
-const HPC1_ETHERNET_FIFO_END: u64 = 0x1fb8_0060;
-const HPC1_SCSI_REGISTERS_END: u64 = 0x1fb8_009c;
 const HPC1_ENDIAN_CONTROL_END: u64 = 0x1fb8_00c4;
 const HPC1_COUNTER_END: u64 = 0x1fb8_0198;
 const HPC1_MISCELLANEOUS_CONTROL_END: u64 = 0x1fb8_01b4;
+pub(super) const SEEQ8003_EXTERNAL_BASE: u64 = 0x1fb8_0100;
+const SEEQ8003_EXTERNAL_END: u64 = 0x1fb8_0120;
+const SEEQ8003_RECEIVE_ALIAS: u64 = 0x1fb8_005b;
+const SEEQ8003_TRANSMIT_ALIAS: u64 = 0x1fb8_005f;
+const SEEQ8003_RECEIVE_COMMAND: u64 = 0x1b;
+const SEEQ8003_TRANSMIT_COMMAND: u64 = 0x1f;
 pub(super) const SCSI_BASE: u64 = 0x1fb8_0122;
 const SCSI_END: u64 = 0x1fb8_0127;
 pub(super) const CPU_AUX_CONTROL: u64 = 0x1fb8_01bf;
@@ -49,6 +56,7 @@ pub(super) const PROM_END: u64 = PROM_BASE + PROM_BYTES as u64;
 pub(super) enum Target {
     Pic1(DeviceAddr),
     Hpc1(DeviceAddr),
+    Seeq8003(DeviceAddr),
     Scsi(DeviceAddr),
     CpuAuxControl,
     Int2(DeviceAddr),
@@ -84,11 +92,15 @@ pub(super) fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault
         return Err(BusFault::Unmapped);
     }
 
+    if start == SEEQ8003_RECEIVE_ALIAS && end == start + 1 {
+        return Ok(Target::Seeq8003(DeviceAddr::new(SEEQ8003_RECEIVE_COMMAND)));
+    }
+    if start == SEEQ8003_TRANSMIT_ALIAS && end == start + 1 {
+        return Ok(Target::Seeq8003(DeviceAddr::new(SEEQ8003_TRANSMIT_COMMAND)));
+    }
+
     for (range_start, range_end) in [
-        (HPC1_ETHERNET_STATUS_BASE, HPC1_ETHERNET_STATUS_END),
-        (HPC1_ETHERNET_POINTER_BASE, HPC1_ETHERNET_POINTER_END),
-        (HPC1_ETHERNET_FIFO_BASE, HPC1_ETHERNET_FIFO_END),
-        (HPC1_SCSI_REGISTERS_BASE, HPC1_SCSI_REGISTERS_END),
+        (HPC1_BASE, HPC1_INTERNAL_END),
         (HPC1_ENDIAN_CONTROL_BASE, HPC1_ENDIAN_CONTROL_END),
         (HPC1_COUNTER_BASE, HPC1_COUNTER_END),
         (
@@ -102,6 +114,15 @@ pub(super) fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault
         if overlaps(start, end, range_start, range_end) {
             return Err(BusFault::Unmapped);
         }
+    }
+
+    if contains(start, end, SEEQ8003_EXTERNAL_BASE, SEEQ8003_EXTERNAL_END) {
+        return Ok(Target::Seeq8003(DeviceAddr::new(
+            start - SEEQ8003_EXTERNAL_BASE,
+        )));
+    }
+    if overlaps(start, end, SEEQ8003_EXTERNAL_BASE, SEEQ8003_EXTERNAL_END) {
+        return Err(BusFault::Unmapped);
     }
 
     if contains(start, end, SCSI_BASE, SCSI_END) {
@@ -201,12 +222,12 @@ mod tests {
     use super::super::test_support::{bus, read_byte, read_word};
     use super::{
         CPU_AUX_CONTROL, DSP56001_END, HPC1_COUNTER_BASE, HPC1_ETHERNET_FIFO_BASE,
-        HPC1_ETHERNET_POINTER_BASE, HPC1_MISCELLANEOUS_CONTROL_BASE, PROM_BASE, PROM_END,
-        SERIAL_2_BASE,
+        HPC1_ETHERNET_POINTER_BASE, HPC1_MISCELLANEOUS_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE,
+        PROM_BASE, PROM_END, SEEQ8003_EXTERNAL_BASE, SERIAL_2_BASE,
     };
 
     #[test]
-    fn hpc1_routes_only_implemented_register_windows() {
+    fn routes_hpc1_internal_registers_and_seeq_external_registers() {
         let mut bus = bus();
 
         bus.write(
@@ -214,22 +235,38 @@ mod tests {
             &9_u32.to_be_bytes(),
         )
         .unwrap();
-        bus.write(PhysAddr::new(HPC1_ETHERNET_POINTER_BASE + 3), &[0x5a])
+        bus.write(
+            PhysAddr::new(HPC1_ETHERNET_POINTER_BASE),
+            &0_u32.to_be_bytes(),
+        )
+        .unwrap();
+        bus.write(PhysAddr::new(HPC1_ETHERNET_POINTER_BASE + 3), &[0])
+            .unwrap();
+        bus.write(PhysAddr::new(HPC1_ETHERNET_FIFO_BASE + 3), &[0])
             .unwrap();
 
+        assert_eq!(read_word(&mut bus, 0x1fb8_0000), Ok(0));
         assert_eq!(read_word(&mut bus, HPC1_MISCELLANEOUS_CONTROL_BASE), Ok(9));
+        assert_eq!(read_word(&mut bus, HPC1_ETHERNET_POINTER_BASE), Ok(0));
         assert_eq!(
             read_byte(&mut bus, HPC1_ETHERNET_POINTER_BASE + 3),
-            Ok(0x5a)
+            Ok(0x80)
         );
         assert_eq!(read_byte(&mut bus, HPC1_ETHERNET_FIFO_BASE + 3), Ok(0));
         assert_eq!(read_word(&mut bus, 0x1fb8_0098), Ok(0));
+        let mut scsi_channel_pointer = [0xff; 2];
+        bus.read(
+            PhysAddr::new(HPC1_SCSI_REGISTERS_BASE + 0x10),
+            &mut scsi_channel_pointer,
+        )
+        .unwrap();
+        assert_eq!(scsi_channel_pointer, [0; 2]);
         assert_eq!(read_word(&mut bus, HPC1_COUNTER_BASE), Ok(0));
+        assert_eq!(read_word(&mut bus, SEEQ8003_EXTERNAL_BASE), Ok(0x80));
         assert_eq!(
             read_byte(&mut bus, HPC1_COUNTER_BASE + 3),
             Err(BusFault::UnsupportedAccess)
         );
-        assert_eq!(read_byte(&mut bus, 0x1fb8_0100), Err(BusFault::Unmapped));
     }
 
     #[test]
@@ -288,7 +325,11 @@ mod tests {
         );
         assert_eq!(
             bus.write(PhysAddr::new(HPC1_ETHERNET_POINTER_BASE + 3), &[0xaa, 0xbb]),
-            Err(BusFault::Unmapped)
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert_eq!(
+            bus.read(PhysAddr::new(SEEQ8003_EXTERNAL_BASE + 3), &mut [0; 2]),
+            Err(BusFault::UnsupportedAccess)
         );
         assert_eq!(
             bus.write(PhysAddr::new(DSP56001_END - 2), &[0xaa; 4]),

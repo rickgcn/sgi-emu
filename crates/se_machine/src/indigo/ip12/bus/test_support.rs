@@ -13,6 +13,7 @@ use se_device::rom::Rom;
 use se_device::scsi::ScsiBus;
 use se_device::scsi_cdrom::ScsiCdrom;
 use se_device::scsi_disk::ScsiDisk;
+use se_device::seeq8003::Seeq8003;
 use se_device::storage::BlockStorage;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
@@ -31,6 +32,7 @@ pub(super) fn bus_with_memory(memory: [Option<Ram>; 4]) -> Ip12Bus {
         Pic1::new(0xf7, 2, true),
         memory,
         Hpc1::new(),
+        Seeq8003::new(),
         Int2::new(),
         Wd33c93b::new(),
         ScsiBus::new(),
@@ -87,6 +89,7 @@ pub(super) fn bus_with_disk(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
         Pic1::new(0xf7, 2, true),
         [Some(Ram::new(8 * 1024 * 1024)), None, None, None],
         Hpc1::new(),
+        Seeq8003::new(),
         Int2::new(),
         Wd33c93b::new(),
         scsi_bus,
@@ -115,6 +118,7 @@ pub(super) fn bus_with_cdrom(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
         Pic1::new(0xf7, 2, true),
         [Some(Ram::new(8 * 1024 * 1024)), None, None, None],
         Hpc1::new(),
+        Seeq8003::new(),
         Int2::new(),
         Wd33c93b::new(),
         scsi_bus,
@@ -158,6 +162,7 @@ pub(super) fn bus_with_disk_and_cdrom(disk_bytes: Vec<u8>, cdrom_bytes: Vec<u8>)
         Pic1::new(0xf7, 2, true),
         [Some(Ram::new(8 * 1024 * 1024)), None, None, None],
         Hpc1::new(),
+        Seeq8003::new(),
         Int2::new(),
         Wd33c93b::new(),
         scsi_bus,

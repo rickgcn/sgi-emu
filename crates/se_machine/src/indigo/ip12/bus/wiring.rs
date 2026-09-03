@@ -37,7 +37,10 @@ impl Ip12Bus {
         self.synchronize_scsi_interrupt();
     }
 
-    pub(super) fn handle_hpc_scsi_state(&mut self) {
+    pub(super) fn handle_hpc1_outputs(&mut self) {
+        if self.hpc1.take_ethernet_reset_request() {
+            self.seeq8003.reset();
+        }
         if self.hpc1.take_scsi_reset_request() {
             self.wd33c93b.reset();
             self.pending_scsi = None;
@@ -220,7 +223,9 @@ mod tests {
     use crate::output::MachineOutput;
     use crate::serial::SerialPort;
 
-    use super::super::address::{HPC1_SCSI_CONTROL_BASE, INT2_BASE, SCSI_BASE, SERIAL_1_BASE};
+    use super::super::address::{
+        HPC1_SCSI_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE, INT2_BASE, SCSI_BASE, SERIAL_1_BASE,
+    };
     use super::super::test_support::{
         bus, bus_with_cdrom, bus_with_disk, bus_with_disk_and_cdrom,
         configure_scsi_descriptor_chain, configure_serial_a, configure_single_scsi_descriptor,
@@ -281,6 +286,23 @@ mod tests {
 
         assert_eq!(read_byte(&mut bus, SCSI_BASE + 4), Ok(0xa5));
         assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x80));
+    }
+
+    #[test]
+    fn inactive_scsi_descriptor_write_does_not_fetch_guest_memory() {
+        let mut bus = bus();
+
+        bus.write(
+            PhysAddr::new(HPC1_SCSI_REGISTERS_BASE + 8),
+            &0x0c00_0000_u32.to_be_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE + 8),
+            Ok(0x0c00_0000)
+        );
+        assert!(!bus.error_interrupt_asserted());
     }
 
     #[test]

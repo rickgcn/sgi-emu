@@ -9,6 +9,7 @@ use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
 use se_device::scsi::ScsiBus;
+use se_device::seeq8003::Seeq8003;
 use se_device::wd33c93b::{SelectAndTransferRequest, Wd33c93b};
 use se_device::z85230::{Channel, Z85230};
 
@@ -32,6 +33,7 @@ pub(super) struct Ip12Bus {
     pic1: Pic1,
     memory: LocalMemory,
     hpc1: Hpc1,
+    seeq8003: Seeq8003,
     int2: Int2,
     wd33c93b: Wd33c93b,
     scsi_bus: ScsiBus,
@@ -52,6 +54,7 @@ impl Ip12Bus {
         pic1: Pic1,
         memory: [Option<Ram>; 4],
         hpc1: Hpc1,
+        seeq8003: Seeq8003,
         int2: Int2,
         wd33c93b: Wd33c93b,
         scsi_bus: ScsiBus,
@@ -66,6 +69,7 @@ impl Ip12Bus {
             pic1,
             memory: LocalMemory::new(memory),
             hpc1,
+            seeq8003,
             int2,
             wd33c93b,
             scsi_bus,
@@ -87,6 +91,7 @@ impl Ip12Bus {
     pub(super) fn reset(&mut self) {
         self.pic1.reset();
         self.hpc1.reset();
+        self.seeq8003.reset();
         self.int2.reset();
         self.wd33c93b.reset();
         self.pending_scsi = None;
@@ -155,6 +160,7 @@ impl Ip12Bus {
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.read(address, data),
             Target::Hpc1(address) => self.hpc1.read(address, data),
+            Target::Seeq8003(address) => self.seeq8003.read(address, data),
             Target::Scsi(address) => self.wd33c93b.debug_read(address, data),
             Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),
             Target::Int2(address) => self.int2.debug_read(address, data),
@@ -179,9 +185,10 @@ impl PhysicalBus for Ip12Bus {
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.read(address, data),
             Target::Hpc1(address) => {
-                self.synchronize_hpc1_counter_time();
+                self.synchronize_hpc1_time();
                 self.hpc1.read(address, data)
             }
+            Target::Seeq8003(address) => self.seeq8003.read(address, data),
             Target::Scsi(address) => {
                 let result = self.wd33c93b.read(address, data);
                 self.synchronize_scsi_interrupt();
@@ -225,11 +232,12 @@ impl PhysicalBus for Ip12Bus {
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.write(address, data),
             Target::Hpc1(address) => {
-                self.synchronize_hpc1_counter_time();
+                self.synchronize_hpc1_time();
                 self.hpc1.write(address, data)?;
-                self.handle_hpc_scsi_state();
+                self.handle_hpc1_outputs();
                 Ok(())
             }
+            Target::Seeq8003(address) => self.seeq8003.write(address, data),
             Target::Scsi(address) => {
                 self.wd33c93b.write(address, data)?;
                 self.handle_scsi_register_write();

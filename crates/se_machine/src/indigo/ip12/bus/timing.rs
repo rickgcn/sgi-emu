@@ -21,7 +21,7 @@ impl Ip12Bus {
                     self.reschedule_int2();
                 }
                 EventKind::Rtc => self.synchronize_rtc_time(),
-                EventKind::Hpc1Counter => self.synchronize_hpc1_counter_time(),
+                EventKind::Hpc1Time => self.synchronize_hpc1_time(),
                 EventKind::Serial0 => self.synchronize_serial_time(0, output),
                 EventKind::Serial1 => self.synchronize_serial_time(1, output),
                 EventKind::Scsi => {
@@ -36,7 +36,7 @@ impl Ip12Bus {
         self.reschedule_int2();
         self.events
             .schedule(EventKind::Rtc, self.rtc.time_until_event());
-        self.events.schedule(EventKind::Hpc1Counter, None);
+        self.events.schedule(EventKind::Hpc1Time, None);
         self.reschedule_serial(0);
         self.reschedule_serial(1);
         self.events.schedule(EventKind::Scsi, None);
@@ -59,8 +59,8 @@ impl Ip12Bus {
             .schedule(EventKind::Rtc, self.rtc.time_until_event());
     }
 
-    pub(super) fn synchronize_hpc1_counter_time(&mut self) {
-        let elapsed = self.events.synchronize(EventKind::Hpc1Counter);
+    pub(super) fn synchronize_hpc1_time(&mut self) {
+        let elapsed = self.events.synchronize(EventKind::Hpc1Time);
         self.hpc1.advance_time(elapsed);
     }
 
@@ -117,7 +117,8 @@ mod tests {
     use crate::serial::SerialPort;
 
     use super::super::address::{
-        HPC1_COUNTER_BASE, INT2_BASE, RTC_BASE, SERIAL_0_BASE, SERIAL_1_BASE,
+        HPC1_COUNTER_BASE, HPC1_ETHERNET_TIMER_BASE, INT2_BASE, RTC_BASE, SERIAL_0_BASE,
+        SERIAL_1_BASE,
     };
     use super::super::test_support::{bus, configure_serial_a, read_byte, read_word};
 
@@ -185,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn hpc1_counter_synchronizes_lazily_on_normal_mmio() {
+    fn hpc1_time_synchronizes_lazily_on_normal_mmio() {
         let mut bus = bus();
         let mut output = MachineOutput::default();
         let mut counter = [0; 4];
@@ -207,6 +208,28 @@ mod tests {
             .unwrap();
         assert_eq!(u32::from_be_bytes(counter), 33);
         assert_eq!(read_word(&mut bus, HPC1_COUNTER_BASE), Ok(66));
+    }
+
+    #[test]
+    fn hpc1_time_advances_the_ethernet_timer_with_the_reference_counter() {
+        let mut bus = bus();
+        let mut output = MachineOutput::default();
+        bus.write(
+            PhysAddr::new(HPC1_ETHERNET_TIMER_BASE),
+            &(100_u32 << 4).to_be_bytes(),
+        )
+        .unwrap();
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        let mut timer = [0; 4];
+        bus.debug_read(PhysAddr::new(HPC1_ETHERNET_TIMER_BASE), &mut timer)
+            .unwrap();
+        assert_eq!(u32::from_be_bytes(timer), 100 << 4);
+        assert_eq!(read_word(&mut bus, HPC1_ETHERNET_TIMER_BASE), Ok(67 << 4));
+        assert_eq!(read_word(&mut bus, HPC1_COUNTER_BASE), Ok(33));
     }
 
     #[test]
