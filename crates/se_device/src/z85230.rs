@@ -11,6 +11,8 @@ const CHANNEL_A_DATA: u64 = 0x0f;
 const RECEIVE_CHARACTER_AVAILABLE: u8 = 1;
 const TRANSMIT_BUFFER_EMPTY: u8 = 1 << 2;
 const ALL_SENT: u8 = 1;
+const TRANSMIT_INTERRUPT_ENABLE: u8 = 1 << 1;
+const TRANSMIT_INTERRUPT_FIFO_EMPTY: u8 = 1 << 5;
 const ASYNC_EIGHT_BIT_RESIDUE: u8 = 0x06;
 const RECEIVER_ENABLE: u8 = 1;
 const AUTO_ENABLE: u8 = 1 << 5;
@@ -37,13 +39,64 @@ pub enum Channel {
     B,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterruptSource {
+    AReceive,
+    ATransmit,
+    BReceive,
+    BTransmit,
+}
+
+impl InterruptSource {
+    const PRIORITY_ORDER: [Self; 4] = [
+        Self::AReceive,
+        Self::ATransmit,
+        Self::BReceive,
+        Self::BTransmit,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::AReceive => 0,
+            Self::ATransmit => 1,
+            Self::BReceive => 2,
+            Self::BTransmit => 3,
+        }
+    }
+
+    const fn channel(self) -> usize {
+        match self {
+            Self::AReceive | Self::ATransmit => 0,
+            Self::BReceive | Self::BTransmit => 1,
+        }
+    }
+
+    const fn pending_mask(self) -> u8 {
+        match self {
+            Self::AReceive => 1 << 5,
+            Self::ATransmit => 1 << 4,
+            Self::BReceive => 1 << 2,
+            Self::BTransmit => 1 << 1,
+        }
+    }
+
+    const fn vector_status(self) -> u8 {
+        match self {
+            Self::AReceive => 0b110,
+            Self::ATransmit => 0b100,
+            Self::BReceive => 0b010,
+            Self::BTransmit => 0b000,
+        }
+    }
+}
+
 /// The two-channel state needed by the IP12 serial path.
 pub struct Z85230 {
     clock_hz: u64,
     channels: [ChannelState; 2],
     interrupt_vector: u8,
     master_interrupt_control: u8,
-    receive_interrupt_under_service: [bool; 2],
+    interrupt_under_service: [bool; 4],
 }
 
 impl Z85230 {
@@ -60,16 +113,20 @@ impl Z85230 {
             channels: [ChannelState::new(), ChannelState::new()],
             interrupt_vector: 0,
             master_interrupt_control: 0,
-            receive_interrupt_under_service: [false; 2],
+            interrupt_under_service: [false; 4],
         }
     }
 
     /// Restores both channels to their reset state.
     pub fn reset(&mut self) {
+        self.reset_except_master_interrupt_control();
+        self.master_interrupt_control = 0;
+    }
+
+    fn reset_except_master_interrupt_control(&mut self) {
         self.channels = [ChannelState::new(), ChannelState::new()];
         self.interrupt_vector = 0;
-        self.master_interrupt_control = 0;
-        self.receive_interrupt_under_service = [false; 2];
+        self.interrupt_under_service = [false; 4];
     }
 
     /// Supplies host bytes to one receiver.
@@ -85,7 +142,7 @@ impl Z85230 {
     #[must_use]
     pub fn interrupt_asserted(&self) -> bool {
         self.master_interrupt_control & MASTER_INTERRUPT_ENABLE != 0
-            && self.highest_pending_receive_interrupt().is_some()
+            && self.highest_pending_interrupt().is_some()
     }
 
     /// Advances both transmitters and reports completed characters.
@@ -146,8 +203,9 @@ impl Z85230 {
         match decode_port(address, data.len())? {
             Port::Control(channel) => self.write_control(channel, data[0]),
             Port::Data(channel) => {
-                self.channels[channel].write_data(data[0]);
-                self.channels[channel].start_transmitter(self.clock_hz);
+                if self.channels[channel].write_data(data[0]) {
+                    self.channels[channel].start_transmitter(self.clock_hz);
+                }
             }
         }
         Ok(())
@@ -159,11 +217,12 @@ impl Z85230 {
             8 => self.channels[channel].read_data(),
             _ => self.register_value(channel, register),
         };
-        if register == 2
+        if channel == 1
+            && register == 2
             && self.master_interrupt_control & SOFTWARE_INTERRUPT_ACKNOWLEDGE != 0
-            && let Some(source) = self.highest_pending_receive_interrupt()
+            && let Some(source) = self.highest_pending_interrupt()
         {
-            self.receive_interrupt_under_service[source] = true;
+            self.interrupt_under_service[source.index()] = true;
         }
         value
     }
@@ -227,6 +286,7 @@ impl Z85230 {
     fn execute_command(&mut self, channel: usize, value: u8) {
         match (value >> 3) & 0x07 {
             4 => self.channels[channel].enable_interrupt_on_next_receive_character(),
+            5 => self.channels[channel].reset_transmit_interrupt_pending(),
             6 => self.channels[channel].reset_receive_errors(),
             7 => self.reset_highest_interrupt_under_service(),
             _ => {}
@@ -234,45 +294,75 @@ impl Z85230 {
     }
 
     fn write_master_interrupt_control(&mut self, value: u8) {
-        self.master_interrupt_control = value & 0x3f;
         match value & 0xc0 {
             CHANNEL_B_RESET => {
                 self.channels[1] = ChannelState::new();
-                self.receive_interrupt_under_service[1] = false;
+                self.reset_channel_interrupts_under_service(1);
             }
             CHANNEL_A_RESET => {
                 self.channels[0] = ChannelState::new();
-                self.receive_interrupt_under_service[0] = false;
+                self.reset_channel_interrupts_under_service(0);
             }
-            WHOLE_CHIP_RESET => self.reset(),
+            WHOLE_CHIP_RESET => self.reset_except_master_interrupt_control(),
             _ => {}
         }
+        self.master_interrupt_control = value & 0x3f;
     }
 
-    fn highest_pending_receive_interrupt(&self) -> Option<usize> {
-        if self.receive_interrupt_under_service[0] {
-            return None;
+    fn highest_pending_interrupt(&self) -> Option<InterruptSource> {
+        for source in InterruptSource::PRIORITY_ORDER {
+            if self.interrupt_under_service[source.index()] {
+                return None;
+            }
+            if self.interrupt_requested(source) {
+                return Some(source);
+            }
         }
-        if self.channels[0].receive_interrupt_pending() {
-            return Some(0);
+        None
+    }
+
+    fn interrupt_requested(&self, source: InterruptSource) -> bool {
+        let channel = &self.channels[source.channel()];
+        match source {
+            InterruptSource::AReceive | InterruptSource::BReceive => {
+                channel.receive_interrupt_pending()
+            }
+            InterruptSource::ATransmit | InterruptSource::BTransmit => {
+                channel.transmit_interrupt_pending && channel.transmit_interrupt_enabled()
+            }
         }
-        if self.receive_interrupt_under_service[1] {
-            return None;
-        }
-        self.channels[1].receive_interrupt_pending().then_some(1)
     }
 
     fn reset_highest_interrupt_under_service(&mut self) {
-        if self.receive_interrupt_under_service[0] {
-            self.receive_interrupt_under_service[0] = false;
-        } else {
-            self.receive_interrupt_under_service[1] = false;
+        for source in InterruptSource::PRIORITY_ORDER {
+            let under_service = &mut self.interrupt_under_service[source.index()];
+            if *under_service {
+                *under_service = false;
+                return;
+            }
+        }
+    }
+
+    fn reset_channel_interrupts_under_service(&mut self, channel: usize) {
+        for source in InterruptSource::PRIORITY_ORDER {
+            if source.channel() == channel {
+                self.interrupt_under_service[source.index()] = false;
+            }
         }
     }
 
     fn interrupt_pending_register(&self) -> u8 {
-        u8::from(self.channels[0].receive_interrupt_pending()) << 5
-            | u8::from(self.channels[1].receive_interrupt_pending()) << 2
+        InterruptSource::PRIORITY_ORDER
+            .into_iter()
+            .filter(|source| match source {
+                InterruptSource::AReceive | InterruptSource::BReceive => {
+                    self.channels[source.channel()].receive_interrupt_pending()
+                }
+                InterruptSource::ATransmit | InterruptSource::BTransmit => {
+                    self.channels[source.channel()].transmit_interrupt_pending
+                }
+            })
+            .fold(0, |value, source| value | source.pending_mask())
     }
 
     fn read_interrupt_vector(&self, channel: usize) -> u8 {
@@ -280,12 +370,9 @@ impl Z85230 {
             return self.interrupt_vector;
         }
 
-        let status = match self.highest_pending_receive_interrupt() {
-            Some(0) => 0b110,
-            Some(1) => 0b010,
-            None => 0b011,
-            _ => unreachable!(),
-        };
+        let status = self
+            .highest_pending_interrupt()
+            .map_or(0b011, InterruptSource::vector_status);
         if self.master_interrupt_control & 0x10 != 0 {
             self.interrupt_vector & 0x8f | status << 4
         } else {
@@ -328,6 +415,7 @@ struct ChannelState {
     transmit_fifo: [u8; TRANSMIT_FIFO_BYTES],
     transmit_fifo_head: usize,
     transmit_fifo_length: usize,
+    transmit_interrupt_pending: bool,
     active_character: Option<ActiveCharacter>,
     timing_remainder: u64,
 }
@@ -347,6 +435,7 @@ impl ChannelState {
             transmit_fifo: [0; TRANSMIT_FIFO_BYTES],
             transmit_fifo_head: 0,
             transmit_fifo_length: 0,
+            transmit_interrupt_pending: false,
             active_character: None,
             timing_remainder: 0,
         }
@@ -517,22 +606,24 @@ impl ChannelState {
         self.receive_fifo_locked = false;
     }
 
-    fn write_data(&mut self, value: u8) {
+    fn write_data(&mut self, value: u8) -> bool {
         if self.transmit_fifo_length == TRANSMIT_FIFO_BYTES {
-            return;
+            return false;
         }
 
+        self.transmit_interrupt_pending = false;
         let tail = (self.transmit_fifo_head + self.transmit_fifo_length) % TRANSMIT_FIFO_BYTES;
         self.transmit_fifo[tail] = value;
         self.transmit_fifo_length += 1;
+        true
     }
 
-    fn start_transmitter(&mut self, clock_hz: u64) {
+    fn start_transmitter(&mut self, clock_hz: u64) -> bool {
         if self.active_character.is_some() || self.transmit_fifo_length == 0 {
-            return;
+            return false;
         }
         let Some(frame_units) = self.frame_units() else {
-            return;
+            return false;
         };
 
         let value = self.transmit_fifo[self.transmit_fifo_head];
@@ -549,6 +640,27 @@ impl ChannelState {
             remaining_attoseconds,
             local_loopback: self.write_register(14) & LOCAL_LOOPBACK != 0,
         });
+        true
+    }
+
+    fn transmit_interrupt_enabled(&self) -> bool {
+        self.write_register(1) & TRANSMIT_INTERRUPT_ENABLE != 0
+    }
+
+    fn latch_transmit_interrupt_if_ready(&mut self) {
+        if !self.transmit_interrupt_enabled() {
+            return;
+        }
+        let fifo_ready = if self.write_register_prime_seven & TRANSMIT_INTERRUPT_FIFO_EMPTY != 0 {
+            self.transmit_fifo_length == 0
+        } else {
+            self.transmit_fifo_length < TRANSMIT_FIFO_BYTES
+        };
+        self.transmit_interrupt_pending |= fifo_ready;
+    }
+
+    fn reset_transmit_interrupt_pending(&mut self) {
+        self.transmit_interrupt_pending = false;
     }
 
     fn advance_time(
@@ -559,7 +671,9 @@ impl ChannelState {
     ) {
         let mut remaining = elapsed.as_attoseconds();
         loop {
-            self.start_transmitter(clock_hz);
+            if self.start_transmitter(clock_hz) {
+                self.latch_transmit_interrupt_if_ready();
+            }
             let Some(active) = self.active_character.as_mut() else {
                 return;
             };
@@ -573,6 +687,7 @@ impl ChannelState {
             let local_loopback = active.local_loopback;
             self.active_character = None;
             output(value);
+            self.latch_transmit_interrupt_if_ready();
             if local_loopback {
                 self.receive_local_loopback(value);
             }
@@ -664,8 +779,9 @@ mod tests {
 
     use super::{
         ALL_SENT, ASYNC_EIGHT_BIT_RESIDUE, CHANNEL_A_CONTROL, CHANNEL_A_DATA, CHANNEL_B_CONTROL,
-        CHANNEL_B_DATA, Channel, RECEIVE_CHARACTER_AVAILABLE, RESET_WRITE_REGISTER_PRIME_SEVEN,
-        RESET_WRITE_REGISTERS, TRANSMIT_BUFFER_EMPTY, Z85230,
+        CHANNEL_B_DATA, Channel, InterruptSource, MASTER_INTERRUPT_ENABLE,
+        RECEIVE_CHARACTER_AVAILABLE, RESET_WRITE_REGISTER_PRIME_SEVEN, RESET_WRITE_REGISTERS,
+        TRANSMIT_BUFFER_EMPTY, TRANSMIT_INTERRUPT_ENABLE, WHOLE_CHIP_RESET, Z85230,
     };
 
     const CLOCK_HZ: u64 = 3_686_400;
@@ -694,6 +810,11 @@ mod tests {
         write_register(serial, control, 13, 0);
         write_register(serial, control, 14, 1);
         write_register(serial, control, 5, 0x68);
+    }
+
+    fn configure_transmit_interrupt(serial: &mut Z85230, control: u64) {
+        configure_9600_8n1(serial, control);
+        write_register(serial, control, 1, TRANSMIT_INTERRUPT_ENABLE);
     }
 
     #[test]
@@ -843,9 +964,34 @@ mod tests {
             );
             assert_eq!(channel.receive_fifo_length, 0);
             assert_eq!(channel.transmit_fifo_length, 0);
+            assert!(!channel.transmit_interrupt_pending);
             assert!(channel.active_character.is_none());
             assert_eq!(channel.timing_remainder, 0);
         }
+        assert_eq!(serial.master_interrupt_control, 0);
+        assert_eq!(serial.interrupt_under_service, [false; 4]);
+    }
+
+    #[test]
+    fn whole_chip_reset_programs_wr9_control_bits_from_the_same_write() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+
+        write_register(
+            &mut serial,
+            CHANNEL_A_CONTROL,
+            9,
+            WHOLE_CHIP_RESET | MASTER_INTERRUPT_ENABLE,
+        );
+
+        assert_eq!(serial.master_interrupt_control, MASTER_INTERRUPT_ENABLE);
+        configure_transmit_interrupt(&mut serial, CHANNEL_B_CONTROL);
+        serial.write(DeviceAddr::new(CHANNEL_B_DATA), b"A").unwrap();
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        assert!(serial.interrupt_asserted());
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 1 << 1);
     }
 
     #[test]
@@ -992,6 +1138,263 @@ mod tests {
             read_port(&mut serial, CHANNEL_A_CONTROL),
             Ok(TRANSMIT_BUFFER_EMPTY)
         );
+    }
+
+    #[test]
+    fn default_transmit_interrupt_waits_for_the_fifo_to_empty() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        configure_transmit_interrupt(&mut serial, CHANNEL_A_CONTROL);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+        let mut output = Vec::new();
+
+        for value in b"The " {
+            serial
+                .write(DeviceAddr::new(CHANNEL_A_DATA), &[*value])
+                .unwrap();
+            assert!(!serial.interrupt_asserted());
+            assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 0);
+        }
+
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(2 * ATTOSECONDS_PER_SECOND / 960),
+            |_, value| output.push(value),
+        );
+        assert_eq!(output, b"Th");
+        assert!(!serial.interrupt_asserted());
+
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(
+                3 * ATTOSECONDS_PER_SECOND / 960 - 2 * ATTOSECONDS_PER_SECOND / 960,
+            ),
+            |_, value| output.push(value),
+        );
+        assert_eq!(output, b"The");
+        assert!(serial.interrupt_asserted());
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 1 << 4);
+
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"s").unwrap();
+        assert!(!serial.interrupt_asserted());
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 0);
+    }
+
+    #[test]
+    fn reset_transmit_interrupt_pending_waits_for_new_transmit_progression() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        configure_transmit_interrupt(&mut serial, CHANNEL_A_CONTROL);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"A").unwrap();
+        assert!(!serial.interrupt_asserted());
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        assert!(serial.interrupt_asserted());
+
+        serial
+            .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[5 << 3])
+            .unwrap();
+        assert!(!serial.interrupt_asserted());
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 0);
+
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        assert!(!serial.interrupt_asserted());
+
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"B").unwrap();
+        assert!(!serial.interrupt_asserted());
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(2 * CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        assert!(serial.interrupt_asserted());
+    }
+
+    #[test]
+    fn disabled_transmit_interrupt_does_not_accumulate_pending() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        configure_9600_8n1(&mut serial, CHANNEL_A_CONTROL);
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"A").unwrap();
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 0);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 1, TRANSMIT_INTERRUPT_ENABLE);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+        assert!(!serial.interrupt_asserted());
+
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"B").unwrap();
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(2 * CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        assert!(serial.interrupt_asserted());
+    }
+
+    #[test]
+    fn non_fifo_empty_mode_interrupts_when_the_fifo_is_not_full() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        configure_transmit_interrupt(&mut serial, CHANNEL_A_CONTROL);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 15, 1);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 7, 0);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+
+        for value in 0..5 {
+            serial
+                .write(DeviceAddr::new(CHANNEL_A_DATA), &[value])
+                .unwrap();
+        }
+        assert!(!serial.interrupt_asserted());
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), &[5]).unwrap();
+        assert!(!serial.interrupt_asserted());
+
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        assert!(serial.interrupt_asserted());
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 1 << 4);
+    }
+
+    #[test]
+    fn rr3_reports_raw_transmit_pending_while_wr1_and_mie_gate_the_output() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        configure_transmit_interrupt(&mut serial, CHANNEL_A_CONTROL);
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"A").unwrap();
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 0x10);
+        assert!(!serial.interrupt_asserted());
+
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+        assert!(serial.interrupt_asserted());
+
+        write_register(&mut serial, CHANNEL_A_CONTROL, 1, 0);
+        assert!(!serial.interrupt_asserted());
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 0x10);
+
+        write_register(&mut serial, CHANNEL_A_CONTROL, 1, TRANSMIT_INTERRUPT_ENABLE);
+        assert!(serial.interrupt_asserted());
+    }
+
+    #[test]
+    fn rr2_reports_receive_and_transmit_sources_in_priority_order() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        for control in [CHANNEL_A_CONTROL, CHANNEL_B_CONTROL] {
+            configure_9600_8n1(&mut serial, control);
+            write_register(&mut serial, control, 3, 1);
+            write_register(
+                &mut serial,
+                control,
+                1,
+                (2 << 3) | TRANSMIT_INTERRUPT_ENABLE,
+            );
+        }
+        write_register(&mut serial, CHANNEL_A_CONTROL, 2, 1);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"A").unwrap();
+        serial.write(DeviceAddr::new(CHANNEL_B_DATA), b"B").unwrap();
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        assert_eq!(serial.receive(Channel::A, b"a"), 1);
+        assert_eq!(serial.receive(Channel::B, b"b"), 1);
+
+        assert_eq!(read_register(&mut serial, CHANNEL_B_CONTROL, 2), 0x0d);
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(b'a'));
+        assert_eq!(read_register(&mut serial, CHANNEL_B_CONTROL, 2), 0x09);
+
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, (1 << 4) | (1 << 3));
+        assert_eq!(read_register(&mut serial, CHANNEL_B_CONTROL, 2), 0x41);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 1 << 3);
+
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"C").unwrap();
+        assert_eq!(read_register(&mut serial, CHANNEL_B_CONTROL, 2), 0x05);
+        assert_eq!(read_port(&mut serial, CHANNEL_B_DATA), Ok(b'b'));
+        assert_eq!(read_register(&mut serial, CHANNEL_B_CONTROL, 2), 0x01);
+    }
+
+    #[test]
+    fn higher_priority_transmit_interrupt_preempts_a_lower_ius() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        configure_transmit_interrupt(&mut serial, CHANNEL_A_CONTROL);
+        configure_transmit_interrupt(&mut serial, CHANNEL_B_CONTROL);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, (1 << 5) | (1 << 3));
+        serial.write(DeviceAddr::new(CHANNEL_B_DATA), b"B").unwrap();
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 2), 0);
+        assert_eq!(serial.interrupt_under_service, [false; 4]);
+        assert!(serial.interrupt_asserted());
+        assert_eq!(read_register(&mut serial, CHANNEL_B_CONTROL, 2), 0);
+        assert_eq!(serial.interrupt_under_service, [false, false, false, true]);
+        assert!(!serial.interrupt_asserted());
+
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"A").unwrap();
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        assert!(serial.interrupt_asserted());
+        assert_eq!(read_register(&mut serial, CHANNEL_B_CONTROL, 2), 0x08);
+        assert_eq!(serial.interrupt_under_service, [false, true, false, true]);
+        assert!(!serial.interrupt_asserted());
+
+        serial
+            .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[7 << 3])
+            .unwrap();
+        assert_eq!(serial.interrupt_under_service, [false, false, false, true]);
+        assert!(serial.interrupt_asserted());
+
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"C").unwrap();
+        assert!(!serial.interrupt_asserted());
+        serial
+            .write(DeviceAddr::new(CHANNEL_A_CONTROL), &[7 << 3])
+            .unwrap();
+        assert_eq!(serial.interrupt_under_service, [false; 4]);
+        assert!(serial.interrupt_asserted());
+        assert_eq!(
+            serial.highest_pending_interrupt(),
+            Some(InterruptSource::BTransmit)
+        );
+    }
+
+    #[test]
+    fn channel_reset_clears_receive_and_transmit_ius_for_only_that_channel() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        configure_transmit_interrupt(&mut serial, CHANNEL_A_CONTROL);
+        configure_transmit_interrupt(&mut serial, CHANNEL_B_CONTROL);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, (1 << 5) | (1 << 3));
+        serial.write(DeviceAddr::new(CHANNEL_B_DATA), b"B").unwrap();
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        let _ = read_register(&mut serial, CHANNEL_B_CONTROL, 2);
+        serial.write(DeviceAddr::new(CHANNEL_A_DATA), b"A").unwrap();
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        let _ = read_register(&mut serial, CHANNEL_B_CONTROL, 2);
+        assert_eq!(serial.interrupt_under_service, [false, true, false, true]);
+
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, 0x80);
+        assert_eq!(serial.interrupt_under_service, [false, false, false, true]);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 1 << 1);
+
+        write_register(&mut serial, CHANNEL_B_CONTROL, 9, 0x40);
+        assert_eq!(serial.interrupt_under_service, [false; 4]);
+        assert_eq!(read_register(&mut serial, CHANNEL_A_CONTROL, 3), 0);
     }
 
     #[test]

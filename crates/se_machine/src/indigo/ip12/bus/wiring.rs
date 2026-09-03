@@ -435,6 +435,50 @@ mod tests {
     }
 
     #[test]
+    fn transmit_fifo_empty_interrupt_reaches_int2_and_clears_on_refill() {
+        let mut bus = bus();
+        write_serial_register(&mut bus, SERIAL_1_BASE, 9, 0xc8);
+        configure_serial_a(&mut bus, SERIAL_1_BASE);
+        write_serial_register(&mut bus, SERIAL_1_BASE, 1, 1 << 1);
+        bus.write(PhysAddr::new(INT2_BASE + 7), &[1 << 5]).unwrap();
+        for value in b"The " {
+            bus.write(PhysAddr::new(SERIAL_1_BASE + 0x0f), &[*value])
+                .unwrap();
+            assert!(!bus.local_interrupt_0_asserted());
+        }
+        let mut output = MachineOutput::default();
+
+        assert!(!bus.local_interrupt_0_asserted());
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(2 * ATTOSECONDS_PER_SECOND / 960),
+            &mut output,
+        );
+        assert_eq!(output.serial(SerialPort::A), b"Th");
+        assert!(!bus.local_interrupt_0_asserted());
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(
+                3 * ATTOSECONDS_PER_SECOND / 960 - 2 * ATTOSECONDS_PER_SECOND / 960,
+            ),
+            &mut output,
+        );
+        assert_eq!(output.serial(SerialPort::A), b"The");
+        assert!(bus.local_interrupt_0_asserted());
+        assert_eq!(
+            read_word(&mut bus, INT2_BASE),
+            Ok(u32::from((1 << 5) | SCSI_INTERRUPT))
+        );
+
+        bus.write(PhysAddr::new(SERIAL_1_BASE + 0x0f), b"s")
+            .unwrap();
+        assert!(!bus.local_interrupt_0_asserted());
+        assert_eq!(
+            read_word(&mut bus, INT2_BASE),
+            Ok(u32::from(SCSI_INTERRUPT))
+        );
+    }
+
+    #[test]
     fn hpc1_scsi_reset_reaches_the_wd33c93b() {
         let mut bus = bus();
         bus.write(PhysAddr::new(SCSI_BASE), &[2]).unwrap();
