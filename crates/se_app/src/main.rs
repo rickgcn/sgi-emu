@@ -87,7 +87,7 @@ fn build_machine(configuration: &MachineConfiguration) -> Result<Machine, String
                 None
             } else {
                 Some(
-                    storage::FileBlockStorage::open(&configuration.disk_path)
+                    storage::FileBlockStorage::open_read_write(&configuration.disk_path)
                         .map_err(|error| {
                             format!(
                                 "failed to open disk image '{}': {error}",
@@ -101,7 +101,7 @@ fn build_machine(configuration: &MachineConfiguration) -> Result<Machine, String
                 None
             } else {
                 Some(
-                    storage::FileBlockStorage::open(&configuration.cdrom_path)
+                    storage::FileBlockStorage::open_read_only(&configuration.cdrom_path)
                         .map_err(|error| {
                             format!(
                                 "failed to open CD-ROM image '{}': {error}",

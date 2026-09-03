@@ -1,7 +1,7 @@
 use se_core::bus::BusFault;
 use se_core::time::VirtualDuration;
 use se_device::nmc93cs46::Nmc93cs46;
-use se_device::scsi::{ScsiCommandStart, ScsiDataInResult};
+use se_device::scsi::{ScsiCommandStart, ScsiDataDirection, ScsiTransferResult};
 use se_device::z85230::Z85230;
 
 use super::super::events::EventKind;
@@ -58,7 +58,7 @@ impl Ip12Bus {
         let address = (request.destination_id(), request.lun());
         match self.scsi_bus.active_address() {
             Some(active_address) if active_address == address => {
-                self.transfer_scsi_data_in(request.transfer_count());
+                self.transfer_active_scsi_data(request.transfer_count());
             }
             Some(_) => self.hpc1.stop_scsi_dma(),
             None => match self.scsi_bus.start_command(
@@ -75,10 +75,21 @@ impl Ip12Bus {
                 Ok(ScsiCommandStart::DataIn { .. }) => {
                     self.transfer_scsi_data_in(request.transfer_count());
                 }
+                Ok(ScsiCommandStart::DataOut { .. }) => {
+                    self.transfer_scsi_data_out(request.transfer_count());
+                }
                 Err(_) => self.hpc1.stop_scsi_dma(),
             },
         }
         self.synchronize_scsi_interrupt();
+    }
+
+    fn transfer_active_scsi_data(&mut self, wd_bytes_remaining: u32) {
+        match self.scsi_bus.active_data_direction() {
+            Some(ScsiDataDirection::In) => self.transfer_scsi_data_in(wd_bytes_remaining),
+            Some(ScsiDataDirection::Out) => self.transfer_scsi_data_out(wd_bytes_remaining),
+            None => self.hpc1.stop_scsi_dma(),
+        }
     }
 
     fn transfer_scsi_data_in(&mut self, mut wd_bytes_remaining: u32) {
@@ -124,11 +135,11 @@ impl Ip12Bus {
             };
 
             match result {
-                Ok(ScsiDataInResult::NotAccepted) | Err(_) => {
+                Ok(ScsiTransferResult::Rejected) | Err(_) => {
                     self.hpc1.stop_scsi_dma();
                     return;
                 }
-                Ok(ScsiDataInResult::More { transferred, .. }) => {
+                Ok(ScsiTransferResult::More { transferred, .. }) => {
                     let Ok(transferred) = u32::try_from(transferred) else {
                         self.hpc1.stop_scsi_dma();
                         return;
@@ -140,13 +151,85 @@ impl Ip12Bus {
                         return;
                     }
                 }
-                Ok(ScsiDataInResult::Complete { status, .. }) => {
+                Ok(ScsiTransferResult::Complete { status, .. }) => {
                     self.hpc1.finish_scsi_dma();
                     self.wd33c93b.finish_select_and_transfer(status.byte());
                     return;
                 }
             }
         }
+    }
+
+    fn transfer_scsi_data_out(&mut self, mut wd_bytes_remaining: u32) {
+        if wd_bytes_remaining == 0 {
+            self.hpc1.finish_scsi_dma();
+            self.wd33c93b.request_data_out_continuation();
+            return;
+        }
+
+        loop {
+            let Some(window) = self.next_scsi_dma_window() else {
+                return;
+            };
+            if window.to_memory() {
+                self.hpc1.stop_scsi_dma();
+                return;
+            }
+            let maximum_bytes = usize::from(
+                window
+                    .byte_count()
+                    .min(u16::try_from(wd_bytes_remaining).unwrap_or(u16::MAX)),
+            );
+            let buffer_address = window.buffer_address();
+            let result = {
+                let Self {
+                    pic1,
+                    memory,
+                    scsi_bus,
+                    ..
+                } = self;
+                scsi_bus.transfer_data_out(maximum_bytes, |bytes| {
+                    memory.read_dma(pic1, buffer_address, bytes)
+                })
+            };
+
+            match result {
+                Ok(ScsiTransferResult::Rejected) | Err(_) => {
+                    self.hpc1.stop_scsi_dma();
+                    return;
+                }
+                Ok(ScsiTransferResult::More { transferred, .. }) => {
+                    let transferred = self.advance_scsi_data_out(transferred);
+                    wd_bytes_remaining = wd_bytes_remaining
+                        .checked_sub(transferred)
+                        .expect("SCSI bus cannot exceed the WD transfer window");
+                    if wd_bytes_remaining == 0 {
+                        self.hpc1.finish_scsi_dma();
+                        self.wd33c93b.request_data_out_continuation();
+                        return;
+                    }
+                }
+                Ok(ScsiTransferResult::Complete {
+                    transferred,
+                    status,
+                }) => {
+                    if transferred != 0 {
+                        self.advance_scsi_data_out(transferred);
+                    }
+                    self.hpc1.finish_scsi_dma();
+                    self.wd33c93b.finish_select_and_transfer(status.byte());
+                    return;
+                }
+            }
+        }
+    }
+
+    fn advance_scsi_data_out(&mut self, transferred: usize) -> u32 {
+        let byte_count = u16::try_from(transferred)
+            .expect("SCSI transfer chunk must fit the HPC1 byte-count field");
+        assert!(self.hpc1.consume_scsi_dma_bytes(byte_count));
+        assert!(self.wd33c93b.consume_transfer_bytes(u32::from(byte_count)));
+        u32::from(byte_count)
     }
 
     fn next_scsi_dma_window(&mut self) -> Option<se_device::hpc1::ScsiDmaWindow> {
@@ -223,15 +306,38 @@ mod tests {
     use crate::output::MachineOutput;
     use crate::serial::SerialPort;
 
+    use super::Ip12Bus;
+
     use super::super::address::{
         HPC1_SCSI_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE, INT2_BASE, SCSI_BASE, SERIAL_1_BASE,
     };
     use super::super::test_support::{
-        bus, bus_with_cdrom, bus_with_disk, bus_with_disk_and_cdrom,
-        configure_scsi_descriptor_chain, configure_serial_a, configure_single_scsi_descriptor,
-        issue_read_ten, issue_scsi_command, nvram_command, nvram_read_word, nvram_write_word,
+        bus, bus_with_cdrom, bus_with_disk, bus_with_disk_and_cdrom, bus_with_disk_failures,
+        configure_scsi_descriptor_chain, configure_scsi_write_descriptor_chain, configure_serial_a,
+        configure_single_scsi_descriptor, configure_single_scsi_write_descriptor, issue_read_ten,
+        issue_scsi_command, issue_write_ten, nvram_command, nvram_read_word, nvram_write_word,
         read_byte, read_scsi_register, read_word, write_scsi_register, write_serial_register,
     };
+
+    fn write_memory(bus: &mut Ip12Bus, address: u32, bytes: &[u8]) {
+        for (offset, chunk) in bytes.chunks(4).enumerate() {
+            bus.write(
+                PhysAddr::new(u64::from(address) + (offset * 4) as u64),
+                chunk,
+            )
+            .unwrap();
+        }
+    }
+
+    fn read_memory(bus: &Ip12Bus, address: u32, byte_count: usize) -> Vec<u8> {
+        let mut bytes = vec![0; byte_count];
+        bus.memory
+            .module(0)
+            .unwrap()
+            .read(DeviceAddr::new(u64::from(address)), &mut bytes)
+            .unwrap();
+        bytes
+    }
 
     #[test]
     fn external_serial_input_drives_the_masked_int2_local_interrupt() {
@@ -345,6 +451,210 @@ mod tests {
         assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
         assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
         assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn scsi_write_ten_uses_multiple_hpc_descriptors_and_reads_back() {
+        const BYTE_COUNT: usize = 1024;
+
+        let payload: Vec<u8> = (0..BYTE_COUNT)
+            .map(|index| ((index * 29) ^ (index >> 3)) as u8)
+            .collect();
+        let mut bus = bus_with_disk(vec![0; BYTE_COUNT], false);
+        configure_scsi_write_descriptor_chain(&mut bus, 0x1000, 0x2000, &[256, 768]);
+        write_memory(&mut bus, 0x2000, &payload);
+        let mut cdb = [0; 10];
+        cdb[0] = 0x2a;
+        cdb[8] = 2;
+        issue_scsi_command(&mut bus, 1, 0, BYTE_COUNT as u32, &cdb);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+        assert_eq!(bus.scsi_bus.active_address(), None);
+        configure_scsi_descriptor_chain(&mut bus, 0x1800, 0x3000, &[400, 624]);
+        cdb[0] = 0x28;
+        issue_scsi_command(&mut bus, 1, 0, BYTE_COUNT as u32, &cdb);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert_eq!(read_memory(&bus, 0x3000, BYTE_COUNT), payload);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn scsi_write_ten_continues_after_the_wd_transfer_window() {
+        const BYTE_COUNT: usize = 1024;
+
+        let payload: Vec<u8> = (0..BYTE_COUNT)
+            .map(|index| ((index * 17) ^ (index >> 2)) as u8)
+            .collect();
+        let mut bus = bus_with_disk(vec![0; BYTE_COUNT], false);
+        configure_single_scsi_write_descriptor(&mut bus, 0x2000);
+        write_memory(&mut bus, 0x2000, &payload);
+        let mut cdb = [0; 10];
+        cdb[0] = 0x2a;
+        cdb[8] = 2;
+        issue_scsi_command(&mut bus, 1, 0, 512, &cdb);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert_eq!(read_scsi_register(&mut bus, 0x10), 0x46);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x48);
+        assert_eq!(bus.scsi_bus.active_address(), Some((1, 0)));
+
+        configure_single_scsi_write_descriptor(&mut bus, 0x2200);
+        for (register, value) in [
+            (0x12, 0),
+            (0x13, 2),
+            (0x14, 0),
+            (0x10, 0x45),
+            (0x15, 1),
+            (0x0f, 0),
+        ] {
+            write_scsi_register(&mut bus, register, value);
+        }
+        write_scsi_register(&mut bus, 0x18, 0x08);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+        assert_eq!(bus.scsi_bus.active_address(), None);
+        configure_scsi_descriptor_chain(&mut bus, 0x1800, 0x3000, &[512, 512]);
+        cdb[0] = 0x28;
+        issue_scsi_command(&mut bus, 1, 0, BYTE_COUNT as u32, &cdb);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        assert_eq!(read_memory(&bus, 0x3000, BYTE_COUNT), payload);
+    }
+
+    #[test]
+    fn reset_cancels_data_out_continuation_without_rolling_back_committed_data() {
+        let payload = vec![0xa5; 1024];
+        let mut bus = bus_with_disk(vec![0; 1024], false);
+        configure_single_scsi_write_descriptor(&mut bus, 0x2000);
+        write_memory(&mut bus, 0x2000, &payload);
+        let mut cdb = [0; 10];
+        cdb[0] = 0x2a;
+        cdb[8] = 2;
+        issue_scsi_command(&mut bus, 1, 0, 512, &cdb);
+        let mut output = MachineOutput::default();
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        assert_eq!(bus.scsi_bus.active_address(), Some((1, 0)));
+
+        bus.reset();
+
+        assert_eq!(bus.scsi_bus.active_address(), None);
+        configure_single_scsi_descriptor(&mut bus, 0x3000);
+        issue_read_ten(&mut bus, 1, 0);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        configure_single_scsi_descriptor(&mut bus, 0x3200);
+        issue_read_ten(&mut bus, 1, 1);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        assert_eq!(read_memory(&bus, 0x3000, 512), vec![0xa5; 512]);
+        assert_eq!(read_memory(&bus, 0x3200, 512), vec![0; 512]);
+    }
+
+    #[test]
+    fn wrong_hpc_direction_stops_data_out_without_writing_storage() {
+        let mut bus = bus_with_disk(vec![0; 512], false);
+        configure_single_scsi_descriptor(&mut bus, 0x2000);
+        write_memory(&mut bus, 0x2000, &vec![0x5a; 512]);
+        issue_write_ten(&mut bus, 1, 0);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert_eq!(bus.scsi_bus.active_address(), Some((1, 0)));
+        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x30));
+        assert_eq!(
+            read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE + 0x0c),
+            Ok(0x10)
+        );
+        assert!(!bus.error_interrupt_asserted());
+
+        bus.reset();
+        configure_single_scsi_descriptor(&mut bus, 0x3000);
+        issue_read_ten(&mut bus, 1, 0);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        assert_eq!(read_memory(&bus, 0x3000, 512), vec![0; 512]);
+    }
+
+    #[test]
+    fn data_out_ram_fault_preserves_target_and_controller_residuals() {
+        let mut bus = bus_with_disk(vec![0; 512], false);
+        configure_single_scsi_write_descriptor(&mut bus, 0x00c0_0000);
+        issue_write_ten(&mut bus, 1, 0);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert!(bus.error_interrupt_asserted());
+        assert_eq!(bus.scsi_bus.active_address(), Some((1, 0)));
+        assert_eq!(read_scsi_register(&mut bus, 0x13), 2);
+        assert_eq!(read_scsi_register(&mut bus, 0x14), 0);
+        assert_eq!(read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE), Ok(512));
+        assert_eq!(
+            read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE + 4),
+            Ok(0x80c0_0000)
+        );
+    }
+
+    #[test]
+    fn data_out_storage_failure_returns_check_condition_with_unchanged_residuals() {
+        let mut bus = bus_with_disk_failures(vec![0; 512], false, true);
+        configure_single_scsi_write_descriptor(&mut bus, 0x2000);
+        write_memory(&mut bus, 0x2000, &vec![0x5a; 512]);
+        issue_write_ten(&mut bus, 1, 0);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+        assert_eq!(bus.scsi_bus.active_address(), None);
+        assert_eq!(read_scsi_register(&mut bus, 0x0f), 2);
+        assert_eq!(read_scsi_register(&mut bus, 0x13), 2);
+        assert_eq!(read_scsi_register(&mut bus, 0x14), 0);
+        assert_eq!(read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE), Ok(512));
+        assert_eq!(
+            read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE + 4),
+            Ok(0x8000_2000)
+        );
+        assert_eq!(read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE + 0x0c), Ok(0));
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+        assert!(!bus.error_interrupt_asserted());
+
+        configure_single_scsi_descriptor(&mut bus, 0x2400);
+        issue_scsi_command(&mut bus, 1, 0, 18, &[0x03, 0, 0, 0, 18, 0]);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        let sense = read_memory(&bus, 0x2400, 18);
+        assert_eq!((sense[2], sense[12], sense[13]), (4, 0x44, 0));
+    }
+
+    #[test]
+    fn disk_write_and_cdrom_write_protection_remain_target_local() {
+        let mut bus = bus_with_disk_and_cdrom(vec![0; 512], vec![0x44; 2048]);
+        configure_single_scsi_write_descriptor(&mut bus, 0x2000);
+        write_memory(&mut bus, 0x2000, &vec![0x77; 512]);
+        issue_write_ten(&mut bus, 1, 0);
+        let mut output = MachineOutput::default();
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+
+        configure_single_scsi_write_descriptor(&mut bus, 0x2200);
+        issue_write_ten(&mut bus, 4, 0);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        assert_eq!(read_scsi_register(&mut bus, 0x0f), 2);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+
+        bus.reset();
+        configure_single_scsi_descriptor(&mut bus, 0x3000);
+        issue_read_ten(&mut bus, 1, 0);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        configure_single_scsi_descriptor(&mut bus, 0x3200);
+        issue_read_ten(&mut bus, 4, 0);
+        bus.advance_time(VirtualDuration::ZERO, &mut output);
+        assert_eq!(read_memory(&bus, 0x3000, 512), vec![0x77; 512]);
+        assert_eq!(read_memory(&bus, 0x3200, 512), vec![0x44; 512]);
     }
 
     #[test]

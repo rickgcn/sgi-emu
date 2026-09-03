@@ -47,6 +47,13 @@ pub enum ScsiCommandPlan {
         /// Number of bytes to return to the initiator.
         byte_count: u64,
     },
+    /// The bus must write one byte range to the attached storage.
+    WriteStorage {
+        /// First byte offset in the attached storage.
+        offset: u64,
+        /// Number of bytes to receive from the initiator.
+        byte_count: u64,
+    },
 }
 
 /// A functional SCSI target attached to [`ScsiBus`].
@@ -57,8 +64,8 @@ pub trait ScsiTarget: Send {
     /// Decodes one command descriptor block.
     fn execute(&mut self, cdb: &[u8]) -> ScsiCommandPlan;
 
-    /// Completes a storage-backed read and returns its target status.
-    fn complete_read(&mut self, succeeded: bool) -> ScsiStatus;
+    /// Completes storage-backed I/O and returns its target status.
+    fn complete_storage(&mut self, succeeded: bool) -> ScsiStatus;
 }
 
 /// An invalid storage capacity supplied to a SCSI target constructor.
@@ -164,6 +171,8 @@ pub enum ScsiBusError {
     },
     /// No Data In transaction is active.
     NoDataInTransaction,
+    /// No Data Out transaction is active.
+    NoDataOutTransaction,
     /// The caller supplied a zero-byte transfer limit.
     EmptyDataBuffer,
 }
@@ -184,7 +193,10 @@ impl fmt::Display for ScsiBusError {
             Self::NoDataInTransaction => {
                 formatter.write_str("no SCSI Data In transaction is active")
             }
-            Self::EmptyDataBuffer => formatter.write_str("SCSI Data In transfer limit is zero"),
+            Self::NoDataOutTransaction => {
+                formatter.write_str("no SCSI Data Out transaction is active")
+            }
+            Self::EmptyDataBuffer => formatter.write_str("SCSI transfer limit is zero"),
         }
     }
 }
@@ -196,7 +208,7 @@ impl Error for ScsiBusError {}
 pub enum ScsiCommandStart {
     /// No target is attached at the selected address.
     SelectionTimeout,
-    /// The target completed without a Data In transaction.
+    /// The target completed without a data transaction.
     Complete {
         /// Final target status.
         status: ScsiStatus,
@@ -206,13 +218,27 @@ pub enum ScsiCommandStart {
         /// Total bytes in the new Data In transaction.
         byte_count: u64,
     },
+    /// The target expects bytes through [`ScsiBus::transfer_data_out`].
+    DataOut {
+        /// Total bytes in the new Data Out transaction.
+        byte_count: u64,
+    },
 }
 
-/// The result of one accepted or rejected Data In chunk.
+/// The data direction of an active SCSI transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScsiDataInResult {
-    /// The consumer rejected the chunk and the transaction did not advance.
-    NotAccepted,
+pub enum ScsiDataDirection {
+    /// Bytes move from the target to the initiator.
+    In,
+    /// Bytes move from the initiator to the target.
+    Out,
+}
+
+/// The result of one accepted or rejected data-transfer chunk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScsiTransferResult {
+    /// The callback rejected the chunk and the transaction did not advance.
+    Rejected,
     /// The chunk was accepted and more bytes remain.
     More {
         /// Bytes accepted in this call.
@@ -238,16 +264,20 @@ type TargetRegistry = [Option<TargetAttachment>; TARGET_SLOT_COUNT];
 
 struct ScsiTransaction {
     target_slot: usize,
-    data_in: ScsiDataIn,
+    transfer: ScsiTransfer,
 }
 
-enum ScsiDataIn {
-    Immediate {
+enum ScsiTransfer {
+    ImmediateDataIn {
         data: Vec<u8>,
         next_offset: usize,
         final_status: ScsiStatus,
     },
-    Storage {
+    StorageDataIn {
+        next_offset: u64,
+        remaining: u64,
+    },
+    StorageDataOut {
         next_offset: u64,
         remaining: u64,
     },
@@ -319,8 +349,9 @@ impl ScsiBus {
         let Some(attachment) = self.targets[slot].as_mut() else {
             return Ok(ScsiCommandStart::SelectionTimeout);
         };
+        let plan = attachment.target.execute(cdb);
 
-        match attachment.target.execute(cdb) {
+        match plan {
             ScsiCommandPlan::Complete { status, data_in } if data_in.is_empty() => {
                 Ok(ScsiCommandStart::Complete { status })
             }
@@ -328,7 +359,7 @@ impl ScsiBus {
                 let byte_count = data_in.len() as u64;
                 self.active_transaction = Some(ScsiTransaction {
                     target_slot: slot,
-                    data_in: ScsiDataIn::Immediate {
+                    transfer: ScsiTransfer::ImmediateDataIn {
                         data: data_in,
                         next_offset: 0,
                         final_status: status,
@@ -337,26 +368,51 @@ impl ScsiBus {
                 Ok(ScsiCommandStart::DataIn { byte_count })
             }
             ScsiCommandPlan::ReadStorage { offset, byte_count } => {
-                if byte_count == 0 {
-                    let status = attachment.target.complete_read(true);
-                    return Ok(ScsiCommandStart::Complete { status });
-                }
-                let range_is_valid = offset
-                    .checked_add(byte_count)
-                    .is_some_and(|end| end <= attachment.storage.size_bytes());
-                if !range_is_valid {
-                    let status = attachment.target.complete_read(false);
-                    return Ok(ScsiCommandStart::Complete { status });
-                }
-                self.active_transaction = Some(ScsiTransaction {
-                    target_slot: slot,
-                    data_in: ScsiDataIn::Storage {
-                        next_offset: offset,
-                        remaining: byte_count,
-                    },
-                });
-                Ok(ScsiCommandStart::DataIn { byte_count })
+                Ok(self.start_storage_transfer(slot, offset, byte_count, ScsiDataDirection::In))
             }
+            ScsiCommandPlan::WriteStorage { offset, byte_count } => {
+                Ok(self.start_storage_transfer(slot, offset, byte_count, ScsiDataDirection::Out))
+            }
+        }
+    }
+
+    fn start_storage_transfer(
+        &mut self,
+        target_slot: usize,
+        offset: u64,
+        byte_count: u64,
+        direction: ScsiDataDirection,
+    ) -> ScsiCommandStart {
+        if byte_count == 0 {
+            let status = self.complete_target_storage(target_slot, true);
+            return ScsiCommandStart::Complete { status };
+        }
+        let range_is_valid = offset.checked_add(byte_count).is_some_and(|end| {
+            self.targets[target_slot]
+                .as_ref()
+                .is_some_and(|attachment| end <= attachment.storage.size_bytes())
+        });
+        if !range_is_valid {
+            let status = self.complete_target_storage(target_slot, false);
+            return ScsiCommandStart::Complete { status };
+        }
+        let transfer = match direction {
+            ScsiDataDirection::In => ScsiTransfer::StorageDataIn {
+                next_offset: offset,
+                remaining: byte_count,
+            },
+            ScsiDataDirection::Out => ScsiTransfer::StorageDataOut {
+                next_offset: offset,
+                remaining: byte_count,
+            },
+        };
+        self.active_transaction = Some(ScsiTransaction {
+            target_slot,
+            transfer,
+        });
+        match direction {
+            ScsiDataDirection::In => ScsiCommandStart::DataIn { byte_count },
+            ScsiDataDirection::Out => ScsiCommandStart::DataOut { byte_count },
         }
     }
 
@@ -368,6 +424,19 @@ impl ScsiBus {
             .map(|transaction| address_for_slot(transaction.target_slot))
     }
 
+    /// Returns the direction of the active data transaction.
+    #[must_use]
+    pub fn active_data_direction(&self) -> Option<ScsiDataDirection> {
+        self.active_transaction
+            .as_ref()
+            .map(|transaction| match &transaction.transfer {
+                ScsiTransfer::ImmediateDataIn { .. } | ScsiTransfer::StorageDataIn { .. } => {
+                    ScsiDataDirection::In
+                }
+                ScsiTransfer::StorageDataOut { .. } => ScsiDataDirection::Out,
+            })
+    }
+
     /// Offers at most `maximum_bytes` from the active Data In transaction.
     ///
     /// The transaction advances only when `accept` returns `true`. The
@@ -375,13 +444,13 @@ impl ScsiBus {
     ///
     /// # Errors
     ///
-    /// Returns [`ScsiBusError`] when the limit is zero or no transaction is
-    /// active.
+    /// Returns [`ScsiBusError`] when the limit is zero or no Data In
+    /// transaction is active.
     pub fn transfer_data_in(
         &mut self,
         maximum_bytes: usize,
         accept: impl FnOnce(&[u8]) -> bool,
-    ) -> Result<ScsiDataInResult, ScsiBusError> {
+    ) -> Result<ScsiTransferResult, ScsiBusError> {
         if maximum_bytes == 0 {
             return Err(ScsiBusError::EmptyDataBuffer);
         }
@@ -389,10 +458,95 @@ impl ScsiBus {
             return Err(ScsiBusError::NoDataInTransaction);
         };
 
-        match &transaction.data_in {
-            ScsiDataIn::Immediate { .. } => self.transfer_immediate(maximum_bytes, accept),
-            ScsiDataIn::Storage { .. } => self.transfer_storage(maximum_bytes, accept),
+        match &transaction.transfer {
+            ScsiTransfer::ImmediateDataIn { .. } => {
+                self.transfer_immediate_data_in(maximum_bytes, accept)
+            }
+            ScsiTransfer::StorageDataIn { .. } => {
+                self.transfer_storage_data_in(maximum_bytes, accept)
+            }
+            ScsiTransfer::StorageDataOut { .. } => Err(ScsiBusError::NoDataInTransaction),
         }
+    }
+
+    /// Requests at most `maximum_bytes` for the active Data Out transaction.
+    ///
+    /// The callback receives the exact chunk buffer and must fill it before
+    /// returning `true`. A rejected callback leaves the transaction and
+    /// storage unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScsiBusError`] when the limit is zero or no Data Out
+    /// transaction is active.
+    pub fn transfer_data_out(
+        &mut self,
+        maximum_bytes: usize,
+        provide: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<ScsiTransferResult, ScsiBusError> {
+        if maximum_bytes == 0 {
+            return Err(ScsiBusError::EmptyDataBuffer);
+        }
+        let Some(ScsiTransaction {
+            target_slot,
+            transfer:
+                ScsiTransfer::StorageDataOut {
+                    next_offset,
+                    remaining,
+                },
+        }) = self.active_transaction.as_ref()
+        else {
+            return Err(ScsiBusError::NoDataOutTransaction);
+        };
+        let target_slot = *target_slot;
+        let next_offset = *next_offset;
+        let active_remaining = *remaining;
+        let byte_count = maximum_bytes.min(usize::try_from(active_remaining).unwrap_or(usize::MAX));
+        let mut bytes = vec![0; byte_count];
+        if !provide(&mut bytes) {
+            return Ok(ScsiTransferResult::Rejected);
+        }
+
+        let write_succeeded = self.targets[target_slot]
+            .as_mut()
+            .is_some_and(|attachment| attachment.storage.write_all_at(next_offset, &bytes).is_ok());
+        if !write_succeeded {
+            self.active_transaction = None;
+            let status = self.complete_target_storage(target_slot, false);
+            return Ok(ScsiTransferResult::Complete {
+                transferred: 0,
+                status,
+            });
+        }
+
+        let byte_count_u64 = byte_count as u64;
+        let remaining = active_remaining - byte_count_u64;
+        if remaining == 0 {
+            self.active_transaction = None;
+            let status = self.complete_target_storage(target_slot, true);
+            return Ok(ScsiTransferResult::Complete {
+                transferred: byte_count,
+                status,
+            });
+        }
+        if let Some(ScsiTransaction {
+            transfer:
+                ScsiTransfer::StorageDataOut {
+                    next_offset,
+                    remaining: active_remaining,
+                },
+            ..
+        }) = self.active_transaction.as_mut()
+        {
+            *next_offset = (*next_offset)
+                .checked_add(byte_count_u64)
+                .expect("validated SCSI storage range cannot overflow");
+            *active_remaining = remaining;
+        }
+        Ok(ScsiTransferResult::More {
+            transferred: byte_count,
+            remaining,
+        })
     }
 
     /// Cancels the active transaction without changing target state.
@@ -400,14 +554,14 @@ impl ScsiBus {
         self.active_transaction = None;
     }
 
-    fn transfer_immediate(
+    fn transfer_immediate_data_in(
         &mut self,
         maximum_bytes: usize,
         accept: impl FnOnce(&[u8]) -> bool,
-    ) -> Result<ScsiDataInResult, ScsiBusError> {
+    ) -> Result<ScsiTransferResult, ScsiBusError> {
         let Some(ScsiTransaction {
-            data_in:
-                ScsiDataIn::Immediate {
+            transfer:
+                ScsiTransfer::ImmediateDataIn {
                     data,
                     next_offset,
                     final_status,
@@ -421,39 +575,39 @@ impl ScsiBus {
         let transferred = end - *next_offset;
         let status = *final_status;
         if !accept(&data[*next_offset..end]) {
-            return Ok(ScsiDataInResult::NotAccepted);
+            return Ok(ScsiTransferResult::Rejected);
         }
 
         if end == data.len() {
             self.active_transaction = None;
-            return Ok(ScsiDataInResult::Complete {
+            return Ok(ScsiTransferResult::Complete {
                 transferred,
                 status,
             });
         }
         let remaining = (data.len() - end) as u64;
         if let Some(ScsiTransaction {
-            data_in: ScsiDataIn::Immediate { next_offset, .. },
+            transfer: ScsiTransfer::ImmediateDataIn { next_offset, .. },
             ..
         }) = self.active_transaction.as_mut()
         {
             *next_offset = end;
         }
-        Ok(ScsiDataInResult::More {
+        Ok(ScsiTransferResult::More {
             transferred,
             remaining,
         })
     }
 
-    fn transfer_storage(
+    fn transfer_storage_data_in(
         &mut self,
         maximum_bytes: usize,
         accept: impl FnOnce(&[u8]) -> bool,
-    ) -> Result<ScsiDataInResult, ScsiBusError> {
+    ) -> Result<ScsiTransferResult, ScsiBusError> {
         let Some(ScsiTransaction {
             target_slot,
-            data_in:
-                ScsiDataIn::Storage {
+            transfer:
+                ScsiTransfer::StorageDataIn {
                     next_offset,
                     remaining,
                 },
@@ -476,29 +630,29 @@ impl ScsiBus {
             });
         if !read_succeeded {
             self.active_transaction = None;
-            let status = self.complete_target_read(target_slot, false);
-            return Ok(ScsiDataInResult::Complete {
+            let status = self.complete_target_storage(target_slot, false);
+            return Ok(ScsiTransferResult::Complete {
                 transferred: 0,
                 status,
             });
         }
         if !accept(&bytes) {
-            return Ok(ScsiDataInResult::NotAccepted);
+            return Ok(ScsiTransferResult::Rejected);
         }
 
         let byte_count_u64 = byte_count as u64;
         let remaining = active_remaining - byte_count_u64;
         if remaining == 0 {
             self.active_transaction = None;
-            let status = self.complete_target_read(target_slot, true);
-            return Ok(ScsiDataInResult::Complete {
+            let status = self.complete_target_storage(target_slot, true);
+            return Ok(ScsiTransferResult::Complete {
                 transferred: byte_count,
                 status,
             });
         }
         if let Some(ScsiTransaction {
-            data_in:
-                ScsiDataIn::Storage {
+            transfer:
+                ScsiTransfer::StorageDataIn {
                     next_offset,
                     remaining: active_remaining,
                 },
@@ -508,17 +662,17 @@ impl ScsiBus {
             *next_offset += byte_count_u64;
             *active_remaining = remaining;
         }
-        Ok(ScsiDataInResult::More {
+        Ok(ScsiTransferResult::More {
             transferred: byte_count,
             remaining,
         })
     }
 
-    fn complete_target_read(&mut self, slot: usize, succeeded: bool) -> ScsiStatus {
+    fn complete_target_storage(&mut self, slot: usize, succeeded: bool) -> ScsiStatus {
         self.targets[slot]
             .as_mut()
             .map_or(ScsiStatus::CheckCondition, |attachment| {
-                attachment.target.complete_read(succeeded)
+                attachment.target.complete_storage(succeeded)
             })
     }
 }
@@ -554,7 +708,7 @@ impl SenseData {
     pub(crate) const INVALID_CDB_FIELD: Self = Self::new(5, 0x24, 0);
     pub(crate) const LBA_OUT_OF_RANGE: Self = Self::new(5, 0x21, 0);
     pub(crate) const WRITE_PROTECTED: Self = Self::new(7, 0x27, 0);
-    pub(crate) const HOST_READ_ERROR: Self = Self::new(4, 0x44, 0);
+    pub(crate) const HOST_IO_ERROR: Self = Self::new(4, 0x44, 0);
     pub(crate) const NOT_READY: Self = Self::new(2, 0x04, 0x02);
 
     const fn new(key: u8, asc: u8, ascq: u8) -> Self {
@@ -576,12 +730,13 @@ impl SenseData {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::sync::{Arc, Mutex};
 
     use crate::storage::BlockStorage;
 
     use super::{
         ScsiAttachError, ScsiBus, ScsiBusError, ScsiCommandPlan, ScsiCommandStart,
-        ScsiDataInResult, ScsiStatus, ScsiTarget,
+        ScsiDataDirection, ScsiStatus, ScsiTarget, ScsiTransferResult,
     };
 
     struct TestTarget {
@@ -607,6 +762,22 @@ mod tests {
                     offset: self.storage_bytes,
                     byte_count: 1,
                 },
+                Some(4) => ScsiCommandPlan::WriteStorage {
+                    offset: 2,
+                    byte_count: 4,
+                },
+                Some(5) => ScsiCommandPlan::WriteStorage {
+                    offset: self.storage_bytes,
+                    byte_count: 1,
+                },
+                Some(6) => ScsiCommandPlan::WriteStorage {
+                    offset: 0,
+                    byte_count: 0,
+                },
+                Some(7) => ScsiCommandPlan::WriteStorage {
+                    offset: u64::MAX,
+                    byte_count: 2,
+                },
                 _ => ScsiCommandPlan::Complete {
                     status: ScsiStatus::Good,
                     data_in: Vec::new(),
@@ -614,7 +785,7 @@ mod tests {
             }
         }
 
-        fn complete_read(&mut self, succeeded: bool) -> ScsiStatus {
+        fn complete_storage(&mut self, succeeded: bool) -> ScsiStatus {
             if succeeded {
                 ScsiStatus::Good
             } else {
@@ -624,13 +795,14 @@ mod tests {
     }
 
     struct TestStorage {
-        bytes: Vec<u8>,
+        bytes: Arc<Mutex<Vec<u8>>>,
         fail_reads: bool,
+        fail_writes: bool,
     }
 
     impl BlockStorage for TestStorage {
         fn size_bytes(&self) -> u64 {
-            self.bytes.len() as u64
+            self.bytes.lock().unwrap().len() as u64
         }
 
         fn read_exact_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
@@ -642,26 +814,50 @@ mod tests {
             let end = offset
                 .checked_add(buffer.len())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "range overflow"))?;
-            let source = self
-                .bytes
+            let bytes = self.bytes.lock().unwrap();
+            let source = bytes
                 .get(offset..end)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short storage"))?;
             buffer.copy_from_slice(source);
             Ok(())
         }
+
+        fn write_all_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+            if self.fail_writes {
+                return Err(io::Error::other("injected storage failure"));
+            }
+            let offset = usize::try_from(offset)
+                .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "offset overflow"))?;
+            let end = offset
+                .checked_add(data.len())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "range overflow"))?;
+            let mut bytes = self.bytes.lock().unwrap();
+            let destination = bytes
+                .get_mut(offset..end)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short storage"))?;
+            destination.copy_from_slice(data);
+            Ok(())
+        }
     }
 
-    fn attach_test_target(bus: &mut ScsiBus, fail_reads: bool) {
+    fn attach_test_target(
+        bus: &mut ScsiBus,
+        fail_reads: bool,
+        fail_writes: bool,
+    ) -> Arc<Mutex<Vec<u8>>> {
+        let bytes = Arc::new(Mutex::new((0..8).collect()));
         bus.attach(
             1,
             0,
             Box::new(TestTarget { storage_bytes: 8 }),
             Box::new(TestStorage {
-                bytes: (0..8).collect(),
+                bytes: Arc::clone(&bytes),
                 fail_reads,
+                fail_writes,
             }),
         )
         .unwrap();
+        bytes
     }
 
     #[test]
@@ -670,8 +866,9 @@ mod tests {
         let target = || Box::new(TestTarget { storage_bytes: 8 });
         let storage = |len| {
             Box::new(TestStorage {
-                bytes: vec![0; len],
+                bytes: Arc::new(Mutex::new(vec![0; len])),
                 fail_reads: false,
+                fail_writes: false,
             }) as Box<dyn BlockStorage>
         };
 
@@ -710,7 +907,7 @@ mod tests {
     #[test]
     fn rejected_immediate_data_does_not_advance() {
         let mut bus = ScsiBus::new();
-        attach_test_target(&mut bus, false);
+        attach_test_target(&mut bus, false, false);
         assert_eq!(
             bus.start_command(1, 0, &[1]),
             Ok(ScsiCommandStart::DataIn { byte_count: 4 })
@@ -720,14 +917,14 @@ mod tests {
                 assert_eq!(bytes, [1, 2]);
                 false
             }),
-            Ok(ScsiDataInResult::NotAccepted)
+            Ok(ScsiTransferResult::Rejected)
         );
         assert_eq!(
             bus.transfer_data_in(3, |bytes| {
                 assert_eq!(bytes, [1, 2, 3]);
                 true
             }),
-            Ok(ScsiDataInResult::More {
+            Ok(ScsiTransferResult::More {
                 transferred: 3,
                 remaining: 1,
             })
@@ -737,7 +934,7 @@ mod tests {
                 assert_eq!(bytes, [4]);
                 true
             }),
-            Ok(ScsiDataInResult::Complete {
+            Ok(ScsiTransferResult::Complete {
                 transferred: 1,
                 status: ScsiStatus::Good,
             })
@@ -747,7 +944,7 @@ mod tests {
     #[test]
     fn storage_data_is_chunked_and_completed_by_the_target() {
         let mut bus = ScsiBus::new();
-        attach_test_target(&mut bus, false);
+        attach_test_target(&mut bus, false, false);
         assert_eq!(
             bus.start_command(1, 0, &[2]),
             Ok(ScsiCommandStart::DataIn { byte_count: 4 })
@@ -758,7 +955,7 @@ mod tests {
                 assert_eq!(bytes, [1, 2]);
                 true
             }),
-            Ok(ScsiDataInResult::More {
+            Ok(ScsiTransferResult::More {
                 transferred: 2,
                 remaining: 2,
             })
@@ -768,7 +965,7 @@ mod tests {
                 assert_eq!(bytes, [3, 4]);
                 true
             }),
-            Ok(ScsiDataInResult::Complete {
+            Ok(ScsiTransferResult::Complete {
                 transferred: 2,
                 status: ScsiStatus::Good,
             })
@@ -779,13 +976,13 @@ mod tests {
     #[test]
     fn storage_failure_completes_without_calling_the_consumer() {
         let mut bus = ScsiBus::new();
-        attach_test_target(&mut bus, true);
+        attach_test_target(&mut bus, true, false);
         bus.start_command(1, 0, &[2]).unwrap();
         assert_eq!(
             bus.transfer_data_in(4, |_| panic!(
                 "consumer must not run after a storage failure"
             )),
-            Ok(ScsiDataInResult::Complete {
+            Ok(ScsiTransferResult::Complete {
                 transferred: 0,
                 status: ScsiStatus::CheckCondition,
             })
@@ -794,13 +991,106 @@ mod tests {
     }
 
     #[test]
+    fn storage_data_out_uses_exact_chunks_and_advances_after_writes() {
+        let mut bus = ScsiBus::new();
+        let bytes = attach_test_target(&mut bus, false, false);
+        assert_eq!(
+            bus.start_command(1, 0, &[4]),
+            Ok(ScsiCommandStart::DataOut { byte_count: 4 })
+        );
+        assert_eq!(bus.active_data_direction(), Some(ScsiDataDirection::Out));
+
+        assert_eq!(
+            bus.transfer_data_out(2, |buffer| {
+                assert_eq!(buffer.len(), 2);
+                buffer.copy_from_slice(&[9, 8]);
+                true
+            }),
+            Ok(ScsiTransferResult::More {
+                transferred: 2,
+                remaining: 2,
+            })
+        );
+        assert_eq!(
+            bus.transfer_data_out(8, |buffer| {
+                assert_eq!(buffer.len(), 2);
+                buffer.copy_from_slice(&[7, 6]);
+                true
+            }),
+            Ok(ScsiTransferResult::Complete {
+                transferred: 2,
+                status: ScsiStatus::Good,
+            })
+        );
+        assert_eq!(*bytes.lock().unwrap(), [0, 1, 9, 8, 7, 6, 6, 7]);
+        assert_eq!(bus.active_data_direction(), None);
+    }
+
+    #[test]
+    fn rejected_data_out_does_not_write_or_advance() {
+        let mut bus = ScsiBus::new();
+        let bytes = attach_test_target(&mut bus, false, false);
+        bus.start_command(1, 0, &[4]).unwrap();
+
+        assert_eq!(
+            bus.transfer_data_out(3, |buffer| {
+                buffer.fill(0xff);
+                false
+            }),
+            Ok(ScsiTransferResult::Rejected)
+        );
+        assert_eq!(*bytes.lock().unwrap(), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(bus.active_address(), Some((1, 0)));
+
+        assert_eq!(
+            bus.transfer_data_out(4, |buffer| {
+                buffer.copy_from_slice(&[4, 3, 2, 1]);
+                true
+            }),
+            Ok(ScsiTransferResult::Complete {
+                transferred: 4,
+                status: ScsiStatus::Good,
+            })
+        );
+        assert_eq!(*bytes.lock().unwrap(), [0, 1, 4, 3, 2, 1, 6, 7]);
+    }
+
+    #[test]
+    fn data_out_storage_failure_reports_zero_and_clears_the_transaction() {
+        let mut bus = ScsiBus::new();
+        let bytes = attach_test_target(&mut bus, false, true);
+        bus.start_command(1, 0, &[4]).unwrap();
+
+        assert_eq!(
+            bus.transfer_data_out(4, |buffer| {
+                buffer.fill(0xff);
+                true
+            }),
+            Ok(ScsiTransferResult::Complete {
+                transferred: 0,
+                status: ScsiStatus::CheckCondition,
+            })
+        );
+        assert_eq!(*bytes.lock().unwrap(), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(bus.active_address(), None);
+    }
+
+    #[test]
     fn invalid_storage_range_becomes_target_check_condition() {
         let mut bus = ScsiBus::new();
-        attach_test_target(&mut bus, false);
+        attach_test_target(&mut bus, false, false);
+        for cdb in [3, 5, 7] {
+            assert_eq!(
+                bus.start_command(1, 0, &[cdb]),
+                Ok(ScsiCommandStart::Complete {
+                    status: ScsiStatus::CheckCondition,
+                })
+            );
+        }
         assert_eq!(
-            bus.start_command(1, 0, &[3]),
+            bus.start_command(1, 0, &[6]),
             Ok(ScsiCommandStart::Complete {
-                status: ScsiStatus::CheckCondition,
+                status: ScsiStatus::Good,
             })
         );
     }
@@ -808,7 +1098,7 @@ mod tests {
     #[test]
     fn active_transaction_blocks_new_commands_and_can_be_cancelled() {
         let mut bus = ScsiBus::new();
-        attach_test_target(&mut bus, false);
+        attach_test_target(&mut bus, false, false);
         bus.start_command(1, 0, &[1]).unwrap();
         assert_eq!(
             bus.transfer_data_in(0, |_| true),
@@ -826,6 +1116,40 @@ mod tests {
         assert_eq!(
             bus.transfer_data_in(1, |_| true),
             Err(ScsiBusError::NoDataInTransaction)
+        );
+    }
+
+    #[test]
+    fn transfer_direction_is_enforced_and_cancel_preserves_committed_chunks() {
+        let mut bus = ScsiBus::new();
+        let bytes = attach_test_target(&mut bus, false, false);
+        bus.start_command(1, 0, &[4]).unwrap();
+        assert_eq!(
+            bus.transfer_data_in(1, |_| true),
+            Err(ScsiBusError::NoDataInTransaction)
+        );
+        assert_eq!(
+            bus.transfer_data_out(2, |buffer| {
+                buffer.copy_from_slice(&[0xaa, 0xbb]);
+                true
+            }),
+            Ok(ScsiTransferResult::More {
+                transferred: 2,
+                remaining: 2,
+            })
+        );
+        bus.cancel_transaction();
+        assert_eq!(*bytes.lock().unwrap(), [0, 1, 0xaa, 0xbb, 4, 5, 6, 7]);
+        assert_eq!(
+            bus.transfer_data_out(1, |_| true),
+            Err(ScsiBusError::NoDataOutTransaction)
+        );
+
+        bus.start_command(1, 0, &[2]).unwrap();
+        assert_eq!(bus.active_data_direction(), Some(ScsiDataDirection::In));
+        assert_eq!(
+            bus.transfer_data_out(1, |_| true),
+            Err(ScsiBusError::NoDataOutTransaction)
         );
     }
 }

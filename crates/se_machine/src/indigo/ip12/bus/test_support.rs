@@ -48,6 +48,8 @@ pub(super) fn bus_with_memory(memory: [Option<Ram>; 4]) -> Ip12Bus {
 struct MemoryStorage {
     bytes: Vec<u8>,
     fail_reads: bool,
+    fail_writes: bool,
+    writable: bool,
 }
 
 impl BlockStorage for MemoryStorage {
@@ -71,9 +73,40 @@ impl BlockStorage for MemoryStorage {
         buffer.copy_from_slice(source);
         Ok(())
     }
+
+    fn write_all_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+        if !self.writable {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "storage is read-only",
+            ));
+        }
+        if self.fail_writes {
+            return Err(io::Error::other("injected storage failure"));
+        }
+        let start = usize::try_from(offset)
+            .map_err(|_| io::Error::other("storage offset does not fit usize"))?;
+        let end = start
+            .checked_add(data.len())
+            .ok_or_else(|| io::Error::other("storage range overflow"))?;
+        let destination = self
+            .bytes
+            .get_mut(start..end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short storage"))?;
+        destination.copy_from_slice(data);
+        Ok(())
+    }
 }
 
 pub(super) fn bus_with_disk(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
+    bus_with_disk_failures(bytes, fail_reads, false)
+}
+
+pub(super) fn bus_with_disk_failures(
+    bytes: Vec<u8>,
+    fail_reads: bool,
+    fail_writes: bool,
+) -> Ip12Bus {
     let storage_bytes = bytes.len() as u64;
     let mut scsi_bus = ScsiBus::new();
     scsi_bus
@@ -81,7 +114,12 @@ pub(super) fn bus_with_disk(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
             1,
             0,
             Box::new(ScsiDisk::try_new(storage_bytes).unwrap()),
-            Box::new(MemoryStorage { bytes, fail_reads }),
+            Box::new(MemoryStorage {
+                bytes,
+                fail_reads,
+                fail_writes,
+                writable: true,
+            }),
         )
         .unwrap();
     let prom = (0..PROM_BYTES).map(|index| index as u8).collect();
@@ -110,7 +148,12 @@ pub(super) fn bus_with_cdrom(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
             4,
             0,
             Box::new(ScsiCdrom::try_new(storage_bytes).unwrap()),
-            Box::new(MemoryStorage { bytes, fail_reads }),
+            Box::new(MemoryStorage {
+                bytes,
+                fail_reads,
+                fail_writes: false,
+                writable: false,
+            }),
         )
         .unwrap();
     let prom = (0..PROM_BYTES).map(|index| index as u8).collect();
@@ -143,6 +186,8 @@ pub(super) fn bus_with_disk_and_cdrom(disk_bytes: Vec<u8>, cdrom_bytes: Vec<u8>)
             Box::new(MemoryStorage {
                 bytes: disk_bytes,
                 fail_reads: false,
+                fail_writes: false,
+                writable: true,
             }),
         )
         .unwrap();
@@ -154,6 +199,8 @@ pub(super) fn bus_with_disk_and_cdrom(disk_bytes: Vec<u8>, cdrom_bytes: Vec<u8>)
             Box::new(MemoryStorage {
                 bytes: cdrom_bytes,
                 fail_reads: false,
+                fail_writes: false,
+                writable: false,
             }),
         )
         .unwrap();
@@ -225,11 +272,46 @@ pub(super) fn configure_single_scsi_descriptor(bus: &mut Ip12Bus, buffer_address
     configure_scsi_descriptor_chain(bus, 0x1000, buffer_address, &[512]);
 }
 
+pub(super) fn configure_single_scsi_write_descriptor(bus: &mut Ip12Bus, buffer_address: u32) {
+    configure_scsi_write_descriptor_chain(bus, 0x1000, buffer_address, &[512]);
+}
+
 pub(super) fn configure_scsi_descriptor_chain(
     bus: &mut Ip12Bus,
     first_descriptor_address: u32,
     first_buffer_address: u32,
     byte_counts: &[u16],
+) {
+    configure_scsi_descriptor_chain_direction(
+        bus,
+        first_descriptor_address,
+        first_buffer_address,
+        byte_counts,
+        true,
+    );
+}
+
+pub(super) fn configure_scsi_write_descriptor_chain(
+    bus: &mut Ip12Bus,
+    first_descriptor_address: u32,
+    first_buffer_address: u32,
+    byte_counts: &[u16],
+) {
+    configure_scsi_descriptor_chain_direction(
+        bus,
+        first_descriptor_address,
+        first_buffer_address,
+        byte_counts,
+        false,
+    );
+}
+
+fn configure_scsi_descriptor_chain_direction(
+    bus: &mut Ip12Bus,
+    first_descriptor_address: u32,
+    first_buffer_address: u32,
+    byte_counts: &[u16],
+    to_memory: bool,
 ) {
     configure_memory(bus, 0x0100_023f, 0x023f_023f);
     let mut descriptor_address = first_descriptor_address;
@@ -257,7 +339,8 @@ pub(super) fn configure_scsi_descriptor_chain(
         &first_descriptor_address.to_be_bytes(),
     )
     .unwrap();
-    bus.write(PhysAddr::new(HPC1_SCSI_REGISTERS_BASE + 0x0f), &[0x90])
+    let control = 0x80 | if to_memory { 0x10 } else { 0 };
+    bus.write(PhysAddr::new(HPC1_SCSI_REGISTERS_BASE + 0x0f), &[control])
         .unwrap();
 }
 
@@ -286,6 +369,14 @@ pub(super) fn issue_scsi_command(
 pub(super) fn issue_read_ten(bus: &mut Ip12Bus, target: u8, lba: u32) {
     let mut cdb = [0; 10];
     cdb[0] = 0x28;
+    cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+    cdb[8] = 1;
+    issue_scsi_command(bus, target, 0, 512, &cdb);
+}
+
+pub(super) fn issue_write_ten(bus: &mut Ip12Bus, target: u8, lba: u32) {
+    let mut cdb = [0; 10];
+    cdb[0] = 0x2a;
     cdb[2..6].copy_from_slice(&lba.to_be_bytes());
     cdb[8] = 1;
     issue_scsi_command(bus, target, 0, 512, &cdb);

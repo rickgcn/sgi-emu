@@ -153,13 +153,13 @@ impl ScsiTarget for ScsiCdrom {
         }
     }
 
-    /// Completes a storage-backed read and records a host read failure as
-    /// target sense data.
-    fn complete_read(&mut self, succeeded: bool) -> ScsiStatus {
+    /// Completes storage-backed I/O and records a host failure as target sense
+    /// data.
+    fn complete_storage(&mut self, succeeded: bool) -> ScsiStatus {
         if succeeded {
             ScsiStatus::Good
         } else {
-            self.sense = SenseData::HOST_READ_ERROR;
+            self.sense = SenseData::HOST_IO_ERROR;
             ScsiStatus::CheckCondition
         }
     }
@@ -339,9 +339,9 @@ mod tests {
     }
 
     #[test]
-    fn host_read_failure_becomes_hardware_error_sense() {
+    fn host_storage_failure_becomes_hardware_error_sense() {
         let mut cdrom = cdrom(4);
-        assert_eq!(cdrom.complete_read(false), ScsiStatus::CheckCondition);
+        assert_eq!(cdrom.complete_storage(false), ScsiStatus::CheckCondition);
         let data = sense(&mut cdrom, 18);
         assert_eq!((data[2], data[12], data[13]), (4, 0x44, 0));
     }

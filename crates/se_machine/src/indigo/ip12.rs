@@ -372,6 +372,10 @@ mod tests {
             buffer.fill(0);
             Ok(())
         }
+
+        fn write_all_at(&mut self, _offset: u64, _data: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]

@@ -1008,6 +1008,13 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             self.reads.lock().unwrap().push((offset, buffer.len()));
             Ok(())
         }
+
+        fn write_all_at(&mut self, _offset: u64, _data: &[u8]) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recording storage is read-only",
+            ))
+        }
     }
 
     fn dynamic_sgi_volume_header() -> Vec<u8> {
