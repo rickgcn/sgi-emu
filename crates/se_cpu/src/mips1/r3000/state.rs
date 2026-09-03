@@ -3,7 +3,7 @@ use se_core::bus::{BusFault, PhysicalBus};
 use super::{
     R3000Config, StepError,
     cache::{CacheBank, Caches},
-    cp0::{Cp0, Cp0FunctionalState, Exception, TlbFaultKind},
+    cp0::{CacheControl, Cp0, Cp0FunctionalState, Exception, TlbFaultKind},
     cp1::Cp1,
     mmu::{AccessType, Cacheability, Mmu, ProbeResult, Translation, TranslationFault},
 };
@@ -28,10 +28,9 @@ pub(super) struct PendingGprWrite {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PendingCp0Write {
-    Register { index: usize, value: u32 },
-    TlbRead { entry_hi: u32, entry_lo: u32 },
-    TlbProbe { index: u32 },
+pub(super) struct PendingCp0Write {
+    pub(super) index: usize,
+    pub(super) value: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,11 +62,11 @@ pub(super) enum InstructionEffect {
     DelayedCp1ConditionWrite {
         value: bool,
     },
-    DelayedTlbRead {
+    TlbRead {
         entry_hi: u32,
         entry_lo: u32,
     },
-    DelayedTlbProbe {
+    TlbProbe {
         index: u32,
     },
     TlbWrite {
@@ -327,7 +326,7 @@ impl State {
         let mut data = [0; 4];
         match translation.cacheability {
             Cacheability::Cached => {
-                let bank = self.cache_bank(LoadKind::Instruction);
+                let bank = Self::cache_bank(LoadKind::Instruction, self.cp0.cache_control());
                 self.caches
                     .read(bank, translation.address, &mut data, bus)?;
             }
@@ -345,8 +344,9 @@ impl State {
     ) -> Result<(), BusFault> {
         validate_memory_access(translation, data.len());
 
-        if self.cp0.is_cache_isolated() {
-            let bank = self.cache_bank(LoadKind::Data);
+        let cache_control = self.data_cache_control();
+        if cache_control.is_isolated() {
+            let bank = Self::cache_bank(LoadKind::Data, cache_control);
             let miss = self.caches.read_isolated(bank, translation.address, data);
             self.cp0.set_cache_miss(miss);
             return Ok(());
@@ -354,7 +354,7 @@ impl State {
 
         match translation.cacheability {
             Cacheability::Cached => {
-                let bank = self.cache_bank(LoadKind::Data);
+                let bank = Self::cache_bank(LoadKind::Data, cache_control);
                 self.caches.read(bank, translation.address, data, bus)
             }
             Cacheability::Uncached => {
@@ -374,23 +374,30 @@ impl State {
     ) -> Result<(), BusFault> {
         validate_memory_access(translation, data.len());
 
-        if self.cp0.is_cache_isolated() {
-            let bank = self.cache_bank(LoadKind::Data);
+        let cache_control = self.data_cache_control();
+        if cache_control.is_isolated() {
+            let bank = Self::cache_bank(LoadKind::Data, cache_control);
             self.caches.write_isolated(bank, translation.address, data);
             return Ok(());
         }
 
         match translation.cacheability {
             Cacheability::Cached => {
-                let bank = self.cache_bank(LoadKind::Data);
+                let bank = Self::cache_bank(LoadKind::Data, cache_control);
                 self.caches.write(bank, translation.address, data, bus)
             }
             Cacheability::Uncached => bus.write(translation.address, data),
         }
     }
 
-    fn cache_bank(&self, kind: LoadKind) -> CacheBank {
-        match (kind, self.cp0.caches_swapped()) {
+    fn data_cache_control(&self) -> CacheControl {
+        self.pending_cp0_write
+            .and_then(|write| self.cp0.cache_control_after_write(write.index, write.value))
+            .unwrap_or_else(|| self.cp0.cache_control())
+    }
+
+    fn cache_bank(kind: LoadKind, control: CacheControl) -> CacheBank {
+        match (kind, control.is_swapped()) {
             (LoadKind::Instruction, false) | (LoadKind::Data, true) => CacheBank::Instruction,
             (LoadKind::Instruction, true) | (LoadKind::Data, false) => CacheBank::Data,
         }
@@ -398,7 +405,7 @@ impl State {
 
     pub(super) fn tlbr_effect(&self) -> InstructionEffect {
         let (entry_hi, entry_lo) = self.mmu.read_indexed(self.cp0.tlb_index());
-        InstructionEffect::DelayedTlbRead { entry_hi, entry_lo }
+        InstructionEffect::TlbRead { entry_hi, entry_lo }
     }
 
     pub(super) fn tlbwi_effect(&self) -> InstructionEffect {
@@ -430,7 +437,7 @@ impl State {
             }
         };
 
-        Ok(InstructionEffect::DelayedTlbProbe { index })
+        Ok(InstructionEffect::TlbProbe { index })
     }
 
     pub(super) fn complete_instruction(
@@ -457,7 +464,7 @@ impl State {
                 None
             }
             Some(InstructionEffect::DelayedCp0Write { index, value }) => {
-                self.pending_cp0_write = Some(PendingCp0Write::Register { index, value });
+                self.pending_cp0_write = Some(PendingCp0Write { index, value });
                 None
             }
             Some(InstructionEffect::DelayedCp1GeneralWrite { index, value }) => {
@@ -472,12 +479,12 @@ impl State {
                 self.pending_cp1_write = Some(PendingCp1Write::Condition { value });
                 None
             }
-            Some(InstructionEffect::DelayedTlbRead { entry_hi, entry_lo }) => {
-                self.pending_cp0_write = Some(PendingCp0Write::TlbRead { entry_hi, entry_lo });
+            Some(InstructionEffect::TlbRead { entry_hi, entry_lo }) => {
+                self.cp0.write_tlb_read_result(entry_hi, entry_lo);
                 None
             }
-            Some(InstructionEffect::DelayedTlbProbe { index }) => {
-                self.pending_cp0_write = Some(PendingCp0Write::TlbProbe { index });
+            Some(InstructionEffect::TlbProbe { index }) => {
+                self.cp0.write_tlb_probe_result(index);
                 None
             }
             Some(InstructionEffect::TlbWrite {
@@ -537,17 +544,7 @@ impl State {
 
     fn commit_pending_cp0_write(&mut self) {
         if let Some(write) = self.pending_cp0_write.take() {
-            match write {
-                PendingCp0Write::Register { index, value } => {
-                    self.cp0.write_register(index, value);
-                }
-                PendingCp0Write::TlbRead { entry_hi, entry_lo } => {
-                    self.cp0.write_tlb_read_result(entry_hi, entry_lo)
-                }
-                PendingCp0Write::TlbProbe { index } => {
-                    self.cp0.write_tlb_probe_result(index);
-                }
-            }
+            self.cp0.write_register(write.index, write.value);
         }
     }
 
@@ -751,7 +748,7 @@ mod tests {
             value: 0xaaaa_aaaa,
             load_merge_bypass: false,
         });
-        state.pending_cp0_write = Some(PendingCp0Write::Register {
+        state.pending_cp0_write = Some(PendingCp0Write {
             index: 14,
             value: 0xbbbb_bbbb,
         });
@@ -1427,7 +1424,7 @@ mod tests {
             value: 0x1111_1111,
             load_merge_bypass: false,
         });
-        state.pending_cp0_write = Some(PendingCp0Write::Register {
+        state.pending_cp0_write = Some(PendingCp0Write {
             index: 14,
             value: 0x2222_2222,
         });
@@ -1453,7 +1450,7 @@ mod tests {
         );
         assert_eq!(
             state.pending_cp0_write,
-            Some(PendingCp0Write::Register {
+            Some(PendingCp0Write {
                 index: 14,
                 value: 0x2222_2222,
             })
@@ -1470,7 +1467,7 @@ mod tests {
 
         assert_eq!(
             state.tlbr_effect(),
-            InstructionEffect::DelayedTlbRead {
+            InstructionEffect::TlbRead {
                 entry_hi: 0x4567_8b40,
                 entry_lo: 0x3456_7e00,
             }
@@ -1494,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn tlb_probe_produces_delayed_index_results_and_shutdown() {
+    fn tlb_probe_produces_index_results_and_shutdown() {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let entry_hi = 0x2345_6a80;
         state.cp0.write_register(10, entry_hi);
@@ -1502,19 +1499,19 @@ mod tests {
 
         assert_eq!(
             state.tlbp_effect(),
-            Ok(InstructionEffect::DelayedTlbProbe { index: 23 << 8 })
+            Ok(InstructionEffect::TlbProbe { index: 23 << 8 })
         );
 
         state.cp0.write_register(10, 0x3456_7a80);
         assert_eq!(
             state.tlbp_effect(),
-            Ok(InstructionEffect::DelayedTlbProbe { index: 0x8000_0000 })
+            Ok(InstructionEffect::TlbProbe { index: 0x8000_0000 })
         );
 
         state.mmu.complete_write(24, entry_hi, 0);
         state.mmu.complete_write(25, entry_hi, 0);
         state.cp0.write_register(10, entry_hi);
-        state.pending_cp0_write = Some(PendingCp0Write::Register {
+        state.pending_cp0_write = Some(PendingCp0Write {
             index: 14,
             value: 0x1234_5678,
         });
@@ -1527,7 +1524,7 @@ mod tests {
         assert_eq!(state.read_cp0(1), random);
         assert_eq!(
             state.pending_cp0_write,
-            Some(PendingCp0Write::Register {
+            Some(PendingCp0Write {
                 index: 14,
                 value: 0x1234_5678,
             })
@@ -1535,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn tlb_read_and_probe_results_observe_cp0_delay() {
+    fn tlb_read_and_probe_results_are_immediately_visible() {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.cp0.write_register(10, 0x1111_1a80);
         state.cp0.write_register(2, 0x2222_2f00);
@@ -1543,7 +1540,7 @@ mod tests {
 
         state.complete_instruction(
             None,
-            Some(InstructionEffect::DelayedTlbRead {
+            Some(InstructionEffect::TlbRead {
                 entry_hi: 0x3333_3b40,
                 entry_lo: 0x4444_4e00,
             }),
@@ -1552,21 +1549,17 @@ mod tests {
             state.tlbwi_effect(),
             InstructionEffect::TlbWrite {
                 index: 4,
-                entry_hi: 0x1111_1a80,
-                entry_lo: 0x2222_2f00,
+                entry_hi: 0x3333_3b40,
+                entry_lo: 0x4444_4e00,
             }
         );
-
-        state.complete_instruction(None, None);
         assert_eq!(state.read_cp0(10), 0x3333_3b40);
         assert_eq!(state.read_cp0(2), 0x4444_4e00);
 
         state.complete_instruction(
             None,
-            Some(InstructionEffect::DelayedTlbProbe { index: 0x8000_0000 }),
+            Some(InstructionEffect::TlbProbe { index: 0x8000_0000 }),
         );
-        assert_eq!(state.read_cp0(0), 4 << 8);
-        state.complete_instruction(None, None);
         assert_eq!(state.read_cp0(0), 0x8000_0000);
     }
 
@@ -1589,7 +1582,7 @@ mod tests {
         let immediate_tlbr = state.tlbr_effect();
         assert_eq!(
             immediate_tlbr,
-            InstructionEffect::DelayedTlbRead {
+            InstructionEffect::TlbRead {
                 entry_hi: 0x3333_3b40,
                 entry_lo: 0x4444_4e00,
             }
@@ -1597,7 +1590,7 @@ mod tests {
         state.complete_instruction(None, Some(immediate_tlbr));
         assert_eq!(
             state.tlbr_effect(),
-            InstructionEffect::DelayedTlbRead {
+            InstructionEffect::TlbRead {
                 entry_hi: 0x5555_5c00,
                 entry_lo: 0x6666_6d00,
             }
@@ -1662,14 +1655,14 @@ mod tests {
     }
 
     #[test]
-    fn tlb_exception_overrides_pending_tlbr_vpn_and_preserves_asid() {
+    fn tlb_exception_overrides_tlbr_vpn_and_preserves_asid() {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let fault_address = 0xf234_5678;
         let asid = 0x0000_0a80;
 
         state.complete_instruction(
             None,
-            Some(InstructionEffect::DelayedTlbRead {
+            Some(InstructionEffect::TlbRead {
                 entry_hi: 0x1234_5000 | asid,
                 entry_lo: 0x3456_7e00,
             }),
@@ -1684,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_preserves_main_tlb_and_clears_translation_pending_state() {
+    fn reset_preserves_main_tlb_and_clears_cp0_pending_state() {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let virtual_address = 0x5678_9000;
         let entry_lo = 0x3000_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY;
@@ -1697,9 +1690,13 @@ mod tests {
                 entry_lo,
             }),
         );
+        state.complete_instruction(None, Some(InstructionEffect::TlbProbe { index: 9 << 8 }));
         state.complete_instruction(
             None,
-            Some(InstructionEffect::DelayedTlbProbe { index: 9 << 8 }),
+            Some(InstructionEffect::DelayedCp0Write {
+                index: 0,
+                value: 7 << 8,
+            }),
         );
         state.cp0.enter_tlb_shutdown();
 
@@ -1767,8 +1764,24 @@ mod tests {
     }
 
     #[test]
-    fn cache_controls_follow_the_cp0_write_hazard() {
+    fn pending_status_forwards_cache_control_to_data_access_only() {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        let cached = translation(0x100, Cacheability::Cached);
+        let uncached = translation(0x100, Cacheability::Uncached);
+        let mut bus = TestBus::new([9, 8, 7, 6]);
+
+        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        state
+            .store_memory(uncached, &[1, 2, 3, 4], &mut bus)
+            .expect("isolated data-cache setup should succeed");
+        state
+            .cp0
+            .write_register(12, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        state
+            .store_memory(uncached, &[5, 6, 7, 8], &mut bus)
+            .expect("isolated instruction-cache setup should succeed");
+        state.cp0.write_register(12, STATUS_BEV);
+
         state.complete_instruction(
             None,
             Some(InstructionEffect::DelayedCp0Write {
@@ -1777,13 +1790,50 @@ mod tests {
             }),
         );
 
-        assert!(!state.cp0.is_cache_isolated());
-        assert!(!state.cp0.caches_swapped());
+        assert!(!state.cp0.cache_control().is_isolated());
+        assert!(!state.cp0.cache_control().is_swapped());
+        assert_eq!(
+            state
+                .read_instruction(cached, &mut bus)
+                .expect("instruction fetch should use committed cache control"),
+            [5, 6, 7, 8]
+        );
+        let mut data = [0; 4];
+        state
+            .load_data(uncached, &mut data, &mut bus)
+            .expect("data load should use forwarded cache control");
+        assert_eq!(data, [5, 6, 7, 8]);
+        assert!(bus.reads.is_empty());
 
         state.complete_instruction(None, None);
+        assert!(state.cp0.cache_control().is_isolated());
+        assert!(state.cp0.cache_control().is_swapped());
 
-        assert!(state.cp0.is_cache_isolated());
-        assert!(state.cp0.caches_swapped());
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp0Write {
+                index: 12,
+                value: STATUS_BEV,
+            }),
+        );
+
+        assert_eq!(
+            state
+                .read_instruction(cached, &mut bus)
+                .expect("instruction fetch should still use committed swapped control"),
+            [1, 2, 3, 4]
+        );
+        state
+            .load_data(uncached, &mut data, &mut bus)
+            .expect("data load should observe forwarded isolation clear");
+        assert_eq!(data, [9, 8, 7, 6]);
+        assert_eq!(bus.reads, vec![(PhysAddr::new(0x100), 4)]);
+        assert!(state.cp0.cache_control().is_isolated());
+        assert!(state.cp0.cache_control().is_swapped());
+
+        state.complete_instruction(None, None);
+        assert!(!state.cp0.cache_control().is_isolated());
+        assert!(!state.cp0.cache_control().is_swapped());
     }
 
     #[test]

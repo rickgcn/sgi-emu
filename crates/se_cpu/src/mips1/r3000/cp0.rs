@@ -76,6 +76,29 @@ struct FunctionalState {
     software_interrupts: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CacheControl {
+    isolated: bool,
+    swapped: bool,
+}
+
+impl CacheControl {
+    const fn from_status(status: u32) -> Self {
+        Self {
+            isolated: status & STATUS_ISC != 0,
+            swapped: status & STATUS_SWC != 0,
+        }
+    }
+
+    pub(super) const fn is_isolated(self) -> bool {
+        self.isolated
+    }
+
+    pub(super) const fn is_swapped(self) -> bool {
+        self.swapped
+    }
+}
+
 pub(super) type Cp0FunctionalState = (u32, u32, u32);
 
 impl FunctionalState {
@@ -212,12 +235,16 @@ impl Cp0 {
         self.status & STATUS_TS != 0
     }
 
-    pub(super) fn is_cache_isolated(&self) -> bool {
-        self.status & STATUS_ISC != 0
+    pub(super) fn cache_control(&self) -> CacheControl {
+        CacheControl::from_status(self.status)
     }
 
-    pub(super) fn caches_swapped(&self) -> bool {
-        self.status & STATUS_SWC != 0
+    pub(super) fn cache_control_after_write(
+        &self,
+        index: usize,
+        value: u32,
+    ) -> Option<CacheControl> {
+        (index == 12).then(|| CacheControl::from_status(self.status_after_write(value)))
     }
 
     pub(super) fn set_cache_miss(&mut self, miss: bool) {
@@ -359,18 +386,22 @@ impl Cp0 {
     }
 
     fn write_status(&mut self, value: u32) {
+        self.status = self.status_after_write(value);
+
+        let mut functional = self.effective;
+        functional.coprocessor_usable = self.status & STATUS_CU_MASK;
+        functional.interrupt_control = self.status & STATUS_INTERRUPT_CONTROL_MASK;
+        self.pending_functional = Some(functional);
+    }
+
+    fn status_after_write(&self, value: u32) -> u32 {
         let preserved = self.status & !(STATUS_WRITABLE_MASK | STATUS_PE);
         let parity_error = if value & STATUS_PE == 0 {
             self.status & STATUS_PE
         } else {
             0
         };
-        self.status = preserved | (value & STATUS_WRITABLE_MASK) | parity_error;
-
-        let mut functional = self.effective;
-        functional.coprocessor_usable = self.status & STATUS_CU_MASK;
-        functional.interrupt_control = self.status & STATUS_INTERRUPT_CONTROL_MASK;
-        self.pending_functional = Some(functional);
+        preserved | (value & STATUS_WRITABLE_MASK) | parity_error
     }
 
     fn write_cause(&mut self, value: u32) {
@@ -437,13 +468,13 @@ mod tests {
     use super::{
         BOOT_GENERAL_EXCEPTION_VECTOR, BOOT_TLB_REFILL_EXCEPTION_VECTOR, CAUSE_BD, CAUSE_CE_SHIFT,
         CAUSE_HARDWARE_IP_MASK, CAUSE_IP_MASK, CAUSE_SOFTWARE_IP_MASK, CAUSE_VISIBLE_MASK,
-        CONTEXT_BAD_VPN_MASK, CONTEXT_PTE_BASE_MASK, Cp0, Cp0Instruction, ENTRY_HI_VISIBLE_MASK,
-        ENTRY_HI_VPN_MASK, ENTRY_LO_VISIBLE_MASK, Exception, ExecutionOutcome, FunctionalState,
-        GENERAL_EXCEPTION_VECTOR, INDEX_INDEX_MASK, INDEX_PROBE_FAILURE, InstructionEffect, PRID,
-        RANDOM_RESET, STATUS_BEV, STATUS_CM, STATUS_CU_MASK, STATUS_CU0, STATUS_IEC,
-        STATUS_INTERRUPT_CONTROL_MASK, STATUS_ISC, STATUS_KUC, STATUS_MODE_STACK_MASK, STATUS_PE,
-        STATUS_SWC, STATUS_TS, STATUS_VISIBLE_MASK, STATUS_WRITABLE_MASK, State,
-        TLB_REFILL_EXCEPTION_VECTOR, TlbFaultKind, execute,
+        CONTEXT_BAD_VPN_MASK, CONTEXT_PTE_BASE_MASK, CacheControl, Cp0, Cp0Instruction,
+        ENTRY_HI_VISIBLE_MASK, ENTRY_HI_VPN_MASK, ENTRY_LO_VISIBLE_MASK, Exception,
+        ExecutionOutcome, FunctionalState, GENERAL_EXCEPTION_VECTOR, INDEX_INDEX_MASK,
+        INDEX_PROBE_FAILURE, InstructionEffect, PRID, RANDOM_RESET, STATUS_BEV, STATUS_CM,
+        STATUS_CU_MASK, STATUS_CU0, STATUS_IEC, STATUS_INTERRUPT_CONTROL_MASK, STATUS_ISC,
+        STATUS_KUC, STATUS_MODE_STACK_MASK, STATUS_PE, STATUS_SWC, STATUS_TS, STATUS_VISIBLE_MASK,
+        STATUS_WRITABLE_MASK, State, TLB_REFILL_EXCEPTION_VECTOR, TlbFaultKind, execute,
     };
     use crate::mips1::r3000::StepError;
 
@@ -975,14 +1006,22 @@ mod tests {
     }
 
     #[test]
-    fn cache_status_helpers_use_raw_status_and_preserve_hardware_miss() {
+    fn cache_control_uses_raw_and_projected_status_and_preserves_hardware_miss() {
         const STATUS_PZ: u32 = 1 << 18;
 
         let mut cp0 = Cp0::new();
         cp0.write_register(12, STATUS_BEV | STATUS_PZ | STATUS_ISC | STATUS_SWC);
 
-        assert!(cp0.is_cache_isolated());
-        assert!(cp0.caches_swapped());
+        assert!(cp0.cache_control().is_isolated());
+        assert!(cp0.cache_control().is_swapped());
+        assert_eq!(
+            cp0.cache_control_after_write(12, 0),
+            Some(CacheControl {
+                isolated: false,
+                swapped: false,
+            })
+        );
+        assert_eq!(cp0.cache_control_after_write(14, 0), None);
         assert_eq!(cp0.read_register(12) & STATUS_PZ, STATUS_PZ);
         assert_eq!(cp0.read_register(12) & STATUS_CM, 0);
 
@@ -991,8 +1030,8 @@ mod tests {
         assert_eq!(cp0.read_register(12) & STATUS_CM, STATUS_CM);
 
         cp0.write_register(12, 0);
-        assert!(!cp0.is_cache_isolated());
-        assert!(!cp0.caches_swapped());
+        assert!(!cp0.cache_control().is_isolated());
+        assert!(!cp0.cache_control().is_swapped());
         assert_eq!(cp0.read_register(12) & STATUS_CM, STATUS_CM);
 
         cp0.set_cache_miss(false);
@@ -1240,7 +1279,7 @@ mod tests {
             execute(&mut state, Cp0Instruction::Tlbr, false),
             completed((
                 None,
-                Some(InstructionEffect::DelayedTlbRead {
+                Some(InstructionEffect::TlbRead {
                     entry_hi: 0x8000_0000,
                     entry_lo: 0,
                 })
@@ -1270,10 +1309,7 @@ mod tests {
         );
         assert_eq!(
             execute(&mut state, Cp0Instruction::Tlbp, false),
-            completed((
-                None,
-                Some(InstructionEffect::DelayedTlbProbe { index: 1 << 31 })
-            ))
+            completed((None, Some(InstructionEffect::TlbProbe { index: 1 << 31 })))
         );
         assert!(!state.is_tlb_shutdown());
     }

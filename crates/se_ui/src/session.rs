@@ -464,14 +464,8 @@ fn failed_memory(error: String, virtual_address_space: bool, start: u64) -> Memo
 fn format_pending_cp0(pending: Option<PendingCp0DebugSnapshot>) -> String {
     match pending {
         None => String::from("none"),
-        Some(PendingCp0DebugSnapshot::Register { index, value }) => {
+        Some(PendingCp0DebugSnapshot { index, value }) => {
             format!("${index} = 0x{value:08x}")
-        }
-        Some(PendingCp0DebugSnapshot::TlbRead { entry_hi, entry_lo }) => {
-            format!("TLBR: EntryHi=0x{entry_hi:08x}, EntryLo=0x{entry_lo:08x}")
-        }
-        Some(PendingCp0DebugSnapshot::TlbProbe { index }) => {
-            format!("TLBP: Index=0x{index:08x}")
         }
     }
 }

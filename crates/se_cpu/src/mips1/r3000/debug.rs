@@ -11,7 +11,7 @@ use super::decode::{
     MemoryInstruction, decode,
 };
 use super::mmu::AccessType;
-use super::state::{PendingCp0Write, PendingCp1Write};
+use super::state::PendingCp1Write;
 
 const GPR_NAMES: [&str; 32] = [
     "$zero", "$at", "$v0", "$v1", "$a0", "$a1", "$a2", "$a3", "$t0", "$t1", "$t2", "$t3", "$t4",
@@ -39,28 +39,13 @@ pub struct PendingGprDebugSnapshot {
     pub load_merge_bypass: bool,
 }
 
-/// A pending CP0-visible transfer.
+/// A pending general CP0-register transfer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PendingCp0DebugSnapshot {
-    /// A general CP0 register write.
-    Register {
-        /// Destination register index.
-        index: usize,
-        /// Value awaiting visibility.
-        value: u32,
-    },
-    /// A paired TLB read result.
-    TlbRead {
-        /// EntryHi value awaiting visibility.
-        entry_hi: u32,
-        /// EntryLo value awaiting visibility.
-        entry_lo: u32,
-    },
-    /// A TLB probe result.
-    TlbProbe {
-        /// Index value awaiting visibility.
-        index: u32,
-    },
+pub struct PendingCp0DebugSnapshot {
+    /// Destination register index.
+    pub index: usize,
+    /// Value awaiting visibility.
+    pub value: u32,
 }
 
 /// A pending CP1-visible transfer.
@@ -267,18 +252,13 @@ impl R3000 {
                     value: write.value,
                     load_merge_bypass: write.load_merge_bypass,
                 });
-        let pending_cp0 = self
-            .state
-            .debug_pending_cp0_write()
-            .map(|write| match write {
-                PendingCp0Write::Register { index, value } => {
-                    PendingCp0DebugSnapshot::Register { index, value }
-                }
-                PendingCp0Write::TlbRead { entry_hi, entry_lo } => {
-                    PendingCp0DebugSnapshot::TlbRead { entry_hi, entry_lo }
-                }
-                PendingCp0Write::TlbProbe { index } => PendingCp0DebugSnapshot::TlbProbe { index },
-            });
+        let pending_cp0 =
+            self.state
+                .debug_pending_cp0_write()
+                .map(|write| PendingCp0DebugSnapshot {
+                    index: write.index,
+                    value: write.value,
+                });
         let pending_cp1 = self
             .state
             .debug_pending_cp1_write()

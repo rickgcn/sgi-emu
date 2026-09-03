@@ -2506,6 +2506,71 @@ mod tests {
     }
 
     #[test]
+    fn tlbr_result_is_available_to_the_immediate_mfc0() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        let entry_hi = 0x1234_5000;
+        let entry_lo = 0x3456_7000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY;
+        install_and_sync_tlb_entry(
+            &mut processor,
+            5,
+            entry_hi,
+            entry_lo & 0xffff_f000,
+            entry_lo & 0x0000_0f00,
+        );
+        set_cp0_register(&mut processor, 0, 5 << 8);
+        processor.state.write_gpr(10, 0xaaaa_aaaa);
+
+        step_with_word(&mut processor, 0x4200_0001).expect("TLBR should succeed");
+        step_with_word(&mut processor, encode_cp0_transfer(0x00, 10, 10))
+            .expect("MFC0 EntryHi should succeed");
+        assert_eq!(processor.state.read_gpr(10), 0xaaaa_aaaa);
+
+        step_with_word(&mut processor, 0).expect("MFC0 delay instruction should succeed");
+        assert_eq!(processor.state.read_gpr(10), entry_hi);
+        assert_eq!(processor.state.read_cp0(2), entry_lo);
+    }
+
+    #[test]
+    fn immediate_mfc0_observes_tlbp_miss_and_preserves_the_wired_entry() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        let wired_entry_hi = 0xffff_b000;
+        let wired_entry_lo = 0x0017_2700;
+        install_and_sync_tlb_entry(
+            &mut processor,
+            0,
+            wired_entry_hi,
+            wired_entry_lo & 0xffff_f000,
+            wired_entry_lo & 0x0000_0f00,
+        );
+        set_cp0_register(&mut processor, 0, 0);
+        set_cp0_register(&mut processor, 10, 0x1000_0040);
+        set_cp0_register(&mut processor, 2, 0);
+
+        step_with_word(&mut processor, 0x4200_0008).expect("TLBP should succeed");
+        step_with_word(&mut processor, encode_cp0_transfer(0x00, 11, 0))
+            .expect("MFC0 Index should succeed");
+        step_with_word(&mut processor, encode_register(0, 0, 2, 0x21))
+            .expect("MFC0 delay instruction should succeed");
+        assert_eq!(processor.state.read_gpr(11), 0x8000_0000);
+
+        let branch_pc = processor.state.pc();
+        step_with_word(&mut processor, encode_immediate(0x01, 11, 0, 2))
+            .expect("BLTZ should succeed");
+        step_with_word(&mut processor, 0).expect("branch delay slot should succeed");
+        assert_eq!(processor.state.pc(), branch_pc + 12);
+        step_with_word(&mut processor, 0x4200_0006).expect("TLBWR should succeed");
+
+        set_cp0_register(&mut processor, 0, 0);
+        assert_eq!(
+            processor.state.tlbr_effect(),
+            InstructionEffect::TlbRead {
+                entry_hi: wired_entry_hi,
+                entry_lo: wired_entry_lo,
+            }
+        );
+    }
+
+    #[test]
     fn tlb_write_changes_instruction_fetch_after_two_completed_instructions() {
         const VIRTUAL_ADDRESS: u32 = 0x0040_0000;
         const OLD_PHYSICAL_ADDRESS: u32 = 0x0010_0000;
@@ -2567,7 +2632,7 @@ mod tests {
 
         assert_eq!(
             processor.state.tlbr_effect(),
-            InstructionEffect::DelayedTlbRead { entry_hi, entry_lo }
+            InstructionEffect::TlbRead { entry_hi, entry_lo }
         );
     }
 
