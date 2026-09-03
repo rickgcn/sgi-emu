@@ -39,6 +39,8 @@ const PARALLEL_FIFO: u64 = 0x00bc;
 const INTERNAL_REGISTERS_END: u64 = 0x00c0;
 const ENDIAN_CONTROL: u64 = 0x00c0;
 const FREE_RUNNING_COUNTER: u64 = 0x0194;
+const DSP_INTERRUPT_STATUS: u64 = 0x01a0;
+const DSP_INTERRUPT_MASK: u64 = 0x01a4;
 const MISCELLANEOUS_CONTROL: u64 = 0x01b0;
 const REGISTER_BYTES: u64 = 4;
 
@@ -71,8 +73,11 @@ const PARALLEL_BYTE_COUNT_MASK: u32 = 0x0000_01ff;
 const PARALLEL_CURRENT_BUFFER_POINTER_MASK: u32 = 0x8fff_ffff;
 const PARALLEL_DESCRIPTOR_POINTER_MASK: u32 = 0x0fff_ffff;
 const PARALLEL_RESET: u8 = 0x01;
+const PARALLEL_CLEAR_INTERRUPT: u8 = 0x02;
 const PARALLEL_TO_MEMORY: u8 = 0x10;
 const WRITABLE_PARALLEL_BITS: u8 = 0xfd;
+
+const DSP_INTERRUPT_BITS: u8 = 0x07;
 
 const FREE_RUNNING_COUNTER_FREQUENCY: u128 = 33_000_000;
 const FREE_RUNNING_COUNTER_MODULUS: u128 = 1 << 24;
@@ -149,6 +154,7 @@ struct EthernetChannel {
     transmit_fifo_write_flag: u8,
     receive_fifo: DiagnosticFifo,
     receive_fifo_write_direction: bool,
+    reset_output_pending: bool,
 }
 
 impl EthernetChannel {
@@ -173,6 +179,7 @@ impl EthernetChannel {
             transmit_fifo_write_flag: 0,
             receive_fifo: DiagnosticFifo::new(),
             receive_fifo_write_direction: false,
+            reset_output_pending: false,
         }
     }
 
@@ -248,6 +255,7 @@ struct ScsiChannel {
     descriptor_fetch_pending: bool,
     control: u8,
     fifo: DiagnosticFifo,
+    reset_output_pending: bool,
 }
 
 impl ScsiChannel {
@@ -261,6 +269,7 @@ impl ScsiChannel {
             descriptor_fetch_pending: false,
             control: 0,
             fifo: DiagnosticFifo::new(),
+            reset_output_pending: false,
         }
     }
 
@@ -308,11 +317,30 @@ impl ScsiChannel {
     }
 }
 
+struct DspChannel {
+    interrupt_status: u8,
+    interrupt_mask: u8,
+}
+
+impl DspChannel {
+    const fn new() -> Self {
+        Self {
+            interrupt_status: 0,
+            interrupt_mask: 0,
+        }
+    }
+
+    const fn interrupt_asserted(&self) -> bool {
+        self.interrupt_status & self.interrupt_mask != 0
+    }
+}
+
 struct ParallelChannel {
     byte_count: u32,
     current_buffer_pointer: u32,
     next_descriptor_pointer: u32,
     control: u8,
+    interrupt_pending: bool,
     fifo: DiagnosticFifo,
 }
 
@@ -323,14 +351,26 @@ impl ParallelChannel {
             current_buffer_pointer: 0,
             next_descriptor_pointer: 0,
             control: 0,
+            interrupt_pending: false,
             fifo: DiagnosticFifo::new(),
         }
     }
 
     fn reset_data_path(&mut self) {
         let control = self.control;
+        let interrupt_pending = self.interrupt_pending;
         *self = Self::new();
         self.control = control;
+        self.interrupt_pending = interrupt_pending;
+    }
+
+    const fn control_value(&self) -> u8 {
+        self.control
+            | if self.interrupt_pending {
+                PARALLEL_CLEAR_INTERRUPT
+            } else {
+                0
+            }
     }
 
     fn fifo_pointer(&self) -> u32 {
@@ -347,17 +387,16 @@ impl ParallelChannel {
     }
 }
 
-/// The software-visible HPC1.5 state used by the IP12 machine.
+/// The complete functional state of the IP12 HPC1.5 device.
 pub struct Hpc1 {
     ethernet: EthernetChannel,
     scsi: ScsiChannel,
     parallel: ParallelChannel,
+    dsp: DspChannel,
     endian_control: u8,
     free_running_counter: u32,
-    clock_phase: u128,
     miscellaneous_control: u32,
-    ethernet_reset_requested: bool,
-    scsi_reset_requested: bool,
+    clock_phase: u128,
 }
 
 impl Hpc1 {
@@ -372,18 +411,29 @@ impl Hpc1 {
             ethernet: EthernetChannel::new(),
             scsi: ScsiChannel::new(),
             parallel: ParallelChannel::new(),
+            dsp: DspChannel::new(),
             endian_control: REVISION,
             free_running_counter: 0,
-            clock_phase: 0,
             miscellaneous_control: 0,
-            ethernet_reset_requested: false,
-            scsi_reset_requested: false,
+            clock_phase: 0,
         }
     }
 
     /// Restores the mutable HPC1.5 reset state.
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Reports the masked CPU-side DSP interrupt output level.
+    #[must_use]
+    pub const fn dsp_interrupt_asserted(&self) -> bool {
+        self.dsp.interrupt_asserted()
+    }
+
+    /// Reports the HPC1 parallel-channel interrupt output level.
+    #[must_use]
+    pub const fn parallel_interrupt_asserted(&self) -> bool {
+        self.parallel.interrupt_pending
     }
 
     /// Reads one fixed-width device-local transaction.
@@ -493,7 +543,7 @@ impl Hpc1 {
         } else if let Some(offset) = register_offset(start, end, PARALLEL_NEXT_DESCRIPTOR_POINTER) {
             read_register(self.parallel.next_descriptor_pointer, offset, data);
         } else if let Some(offset) = register_offset(start, end, PARALLEL_CONTROL) {
-            read_register(u32::from(self.parallel.control), offset, data);
+            read_register(u32::from(self.parallel.control_value()), offset, data);
         } else if is_word(start, end, PARALLEL_FIFO_POINTER) {
             data.copy_from_slice(&self.parallel.fifo_pointer().to_be_bytes());
         } else if is_word(start, end, PARALLEL_FIFO) {
@@ -508,9 +558,15 @@ impl Hpc1 {
             read_register(u32::from(self.endian_control), offset, data);
         } else if is_word(start, end, FREE_RUNNING_COUNTER) {
             data.copy_from_slice(&self.free_running_counter.to_be_bytes());
+        } else if is_word(start, end, DSP_INTERRUPT_STATUS) {
+            data.copy_from_slice(&u32::from(self.dsp.interrupt_status).to_be_bytes());
+        } else if is_word(start, end, DSP_INTERRUPT_MASK) {
+            data.copy_from_slice(&u32::from(self.dsp.interrupt_mask).to_be_bytes());
         } else if is_word(start, end, MISCELLANEOUS_CONTROL) {
             data.copy_from_slice(&self.miscellaneous_control.to_be_bytes());
         } else if overlaps_register(start, end, FREE_RUNNING_COUNTER)
+            || overlaps_register(start, end, DSP_INTERRUPT_STATUS)
+            || overlaps_register(start, end, DSP_INTERRUPT_MASK)
             || overlaps_register(start, end, MISCELLANEOUS_CONTROL)
         {
             return Err(BusFault::UnsupportedAccess);
@@ -621,7 +677,7 @@ impl Hpc1 {
                 && self.ethernet.control & ETHERNET_RESET_CHANNEL != 0
             {
                 self.ethernet.reset_data_path();
-                self.ethernet_reset_requested = true;
+                self.ethernet.reset_output_pending = true;
             }
         } else if let Some(offset) = register_offset(start, end, ETHERNET_RECEIVE_BYTE_COUNT) {
             self.ethernet.receive_byte_count = masked_write(
@@ -682,9 +738,9 @@ impl Hpc1 {
             let value = write_register(u32::from(old_value), offset, data) as u8;
             self.scsi.control = value & WRITABLE_SCSI_BITS;
             let reset_rising = old_value & SCSI_RESET == 0 && self.scsi.control & SCSI_RESET != 0;
-            self.scsi_reset_requested |= reset_rising;
             if reset_rising {
                 self.scsi.reset_data_path();
+                self.scsi.reset_output_pending = true;
             }
 
             if self.scsi.control & SCSI_RESET != 0 {
@@ -736,6 +792,9 @@ impl Hpc1 {
             if old_control & PARALLEL_RESET == 0 && self.parallel.control & PARALLEL_RESET != 0 {
                 self.parallel.reset_data_path();
             }
+            if writes_low_byte_bit(offset, data, PARALLEL_CLEAR_INTERRUPT) {
+                self.parallel.interrupt_pending = false;
+            }
         } else if is_word(start, end, PARALLEL_FIFO_POINTER) {
             self.parallel
                 .write_fifo_pointer(u32::from_be_bytes(data.try_into().unwrap()));
@@ -749,6 +808,16 @@ impl Hpc1 {
             let value = write_register(u32::from(self.endian_control), offset, data) as u8;
             self.endian_control = REVISION | (value & WRITABLE_ENDIAN_BITS);
         } else if overlaps_register(start, end, FREE_RUNNING_COUNTER) {
+            return Err(BusFault::UnsupportedAccess);
+        } else if is_word(start, end, DSP_INTERRUPT_STATUS) {
+            self.dsp.interrupt_status &=
+                u32::from_be_bytes(data.try_into().unwrap()) as u8 & DSP_INTERRUPT_BITS;
+        } else if is_word(start, end, DSP_INTERRUPT_MASK) {
+            self.dsp.interrupt_mask =
+                u32::from_be_bytes(data.try_into().unwrap()) as u8 & DSP_INTERRUPT_BITS;
+        } else if overlaps_register(start, end, DSP_INTERRUPT_STATUS)
+            || overlaps_register(start, end, DSP_INTERRUPT_MASK)
+        {
             return Err(BusFault::UnsupportedAccess);
         } else if is_word(start, end, MISCELLANEOUS_CONTROL) {
             self.miscellaneous_control = u32::from_be_bytes(data.try_into().unwrap());
@@ -788,15 +857,15 @@ impl Hpc1 {
 
     /// Returns and clears a pending reset request for the attached Ethernet controller.
     pub fn take_ethernet_reset_request(&mut self) -> bool {
-        let requested = self.ethernet_reset_requested;
-        self.ethernet_reset_requested = false;
+        let requested = self.ethernet.reset_output_pending;
+        self.ethernet.reset_output_pending = false;
         requested
     }
 
     /// Returns and clears a pending reset request for the attached SCSI controller.
     pub fn take_scsi_reset_request(&mut self) -> bool {
-        let requested = self.scsi_reset_requested;
-        self.scsi_reset_requested = false;
+        let requested = self.scsi.reset_output_pending;
+        self.scsi.reset_output_pending = false;
         requested
     }
 
@@ -875,6 +944,16 @@ impl Hpc1 {
         self.scsi.control &= !SCSI_START_DMA;
         self.scsi.descriptor_fetch_pending = false;
     }
+
+    #[cfg(test)]
+    fn set_dsp_interrupt_status_for_test(&mut self, status: u8) {
+        self.dsp.interrupt_status = status & DSP_INTERRUPT_BITS;
+    }
+
+    #[cfg(test)]
+    fn set_parallel_interrupt_pending_for_test(&mut self, pending: bool) {
+        self.parallel.interrupt_pending = pending;
+    }
 }
 
 fn transaction_bounds(address: DeviceAddr, length: usize) -> Result<(u64, u64), BusFault> {
@@ -944,6 +1023,14 @@ fn masked_write(value: u32, offset: usize, data: &[u8], mask: u32) -> u32 {
     write_register(value, offset, data) & mask
 }
 
+fn writes_low_byte_bit(offset: usize, data: &[u8], bit: u8) -> bool {
+    const LOW_BYTE_OFFSET: usize = 3;
+
+    offset <= LOW_BYTE_OFFSET
+        && LOW_BYTE_OFFSET < offset + data.len()
+        && data[LOW_BYTE_OFFSET - offset] & bit != 0
+}
+
 fn fifo_index(value: u32, shift: u32) -> usize {
     ((value >> shift) & (FIFO_ENTRIES as u32 - 1)) as usize
 }
@@ -954,7 +1041,8 @@ mod tests {
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
     use super::{
-        ENDIAN_CONTROL, ETHERNET_CURRENT_PACKET_FIRST_TRANSMIT_DESCRIPTOR_POINTER,
+        DSP_INTERRUPT_MASK, DSP_INTERRUPT_STATUS, ENDIAN_CONTROL,
+        ETHERNET_CURRENT_PACKET_FIRST_TRANSMIT_DESCRIPTOR_POINTER,
         ETHERNET_CURRENT_RECEIVE_BUFFER_POINTER, ETHERNET_CURRENT_RECEIVE_DESCRIPTOR_POINTER,
         ETHERNET_CURRENT_TRANSMIT_BUFFER_POINTER, ETHERNET_CURRENT_TRANSMIT_DESCRIPTOR_POINTER,
         ETHERNET_NEXT_RECEIVE_DESCRIPTOR_POINTER, ETHERNET_NEXT_TRANSMIT_DESCRIPTOR_POINTER,
@@ -1024,6 +1112,71 @@ mod tests {
             hpc1.write(DeviceAddr::new(FREE_RUNNING_COUNTER), &0_u32.to_be_bytes()),
             Err(BusFault::UnsupportedAccess)
         );
+    }
+
+    #[test]
+    fn dsp_interrupt_status_is_write_zero_to_clear_and_masked_to_three_bits() {
+        let mut hpc1 = Hpc1::new();
+        hpc1.set_dsp_interrupt_status_for_test(u8::MAX);
+
+        write_word(&mut hpc1, DSP_INTERRUPT_MASK, u32::MAX);
+        assert_eq!(read_word(&hpc1, DSP_INTERRUPT_STATUS), Ok(7));
+        assert_eq!(read_word(&hpc1, DSP_INTERRUPT_MASK), Ok(7));
+        assert!(hpc1.dsp_interrupt_asserted());
+
+        write_word(&mut hpc1, DSP_INTERRUPT_STATUS, 0xffff_fffd);
+        assert_eq!(read_word(&hpc1, DSP_INTERRUPT_STATUS), Ok(5));
+        write_word(&mut hpc1, DSP_INTERRUPT_STATUS, 0xffff_fffb);
+        assert_eq!(read_word(&hpc1, DSP_INTERRUPT_STATUS), Ok(1));
+
+        write_word(&mut hpc1, DSP_INTERRUPT_MASK, 2);
+        assert!(!hpc1.dsp_interrupt_asserted());
+        write_word(&mut hpc1, DSP_INTERRUPT_STATUS, 0);
+        assert_eq!(read_word(&hpc1, DSP_INTERRUPT_STATUS), Ok(0));
+    }
+
+    #[test]
+    fn dsp_interrupt_registers_require_complete_aligned_words() {
+        let mut hpc1 = Hpc1::new();
+
+        for address in [DSP_INTERRUPT_STATUS, DSP_INTERRUPT_MASK] {
+            assert_eq!(
+                hpc1.read(DeviceAddr::new(address + 3), &mut [0]),
+                Err(BusFault::UnsupportedAccess)
+            );
+            assert_eq!(
+                hpc1.write(DeviceAddr::new(address), &[0; 2]),
+                Err(BusFault::UnsupportedAccess)
+            );
+        }
+        assert_eq!(
+            hpc1.write(DeviceAddr::new(DSP_INTERRUPT_STATUS + 3), &[0; 2]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert_eq!(read_word(&hpc1, DSP_INTERRUPT_STATUS), Ok(0));
+        assert_eq!(read_word(&hpc1, DSP_INTERRUPT_MASK), Ok(0));
+    }
+
+    #[test]
+    fn parallel_control_keeps_pending_separate_and_clears_it_with_one() {
+        let mut hpc1 = Hpc1::new();
+        hpc1.set_parallel_interrupt_pending_for_test(true);
+
+        assert_eq!(read_word(&hpc1, PARALLEL_CONTROL), Ok(2));
+        assert!(hpc1.parallel_interrupt_asserted());
+        write_word(&mut hpc1, PARALLEL_CONTROL, 0x10);
+        assert_eq!(read_word(&hpc1, PARALLEL_CONTROL), Ok(0x12));
+        assert!(hpc1.parallel_interrupt_asserted());
+
+        hpc1.write(DeviceAddr::new(PARALLEL_CONTROL), &[0xff])
+            .unwrap();
+        assert_eq!(read_word(&hpc1, PARALLEL_CONTROL), Ok(0x12));
+        assert!(hpc1.parallel_interrupt_asserted());
+
+        hpc1.write(DeviceAddr::new(PARALLEL_CONTROL + 3), &[0x12])
+            .unwrap();
+        assert_eq!(read_word(&hpc1, PARALLEL_CONTROL), Ok(0x10));
+        assert!(!hpc1.parallel_interrupt_asserted());
     }
 
     #[test]
@@ -1478,6 +1631,9 @@ mod tests {
         write_word(&mut hpc1, SCSI_NEXT_DESCRIPTOR_POINTER, 0x0012_3400);
         hpc1.write(DeviceAddr::new(ENDIAN_CONTROL + 3), &[0x1f])
             .unwrap();
+        hpc1.set_dsp_interrupt_status_for_test(7);
+        write_word(&mut hpc1, DSP_INTERRUPT_MASK, 7);
+        hpc1.set_parallel_interrupt_pending_for_test(true);
         write_word(&mut hpc1, MISCELLANEOUS_CONTROL, 9);
         hpc1.advance_time(VirtualDuration::from_attoseconds(
             ATTOSECONDS_PER_SECOND / FREE_RUNNING_COUNTER_FREQUENCY,
@@ -1488,6 +1644,10 @@ mod tests {
         assert_eq!(read_word(&hpc1, SCSI_CONTROL), Ok(0));
         assert_eq!(read_word(&hpc1, ENDIAN_CONTROL), Ok(0x40));
         assert_eq!(read_word(&hpc1, FREE_RUNNING_COUNTER), Ok(0));
+        assert_eq!(read_word(&hpc1, DSP_INTERRUPT_STATUS), Ok(0));
+        assert_eq!(read_word(&hpc1, DSP_INTERRUPT_MASK), Ok(0));
+        assert!(!hpc1.dsp_interrupt_asserted());
+        assert!(!hpc1.parallel_interrupt_asserted());
         assert_eq!(read_word(&hpc1, MISCELLANEOUS_CONTROL), Ok(0));
         assert!(!hpc1.take_ethernet_reset_request());
         assert!(!hpc1.take_scsi_reset_request());

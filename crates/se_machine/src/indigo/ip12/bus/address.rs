@@ -21,9 +21,12 @@ pub(super) const HPC1_SCSI_REGISTERS_BASE: u64 = 0x1fb8_0088;
 pub(super) const HPC1_SCSI_CONTROL_BASE: u64 = 0x1fb8_0094;
 pub(super) const HPC1_ENDIAN_CONTROL_BASE: u64 = 0x1fb8_00c0;
 pub(super) const HPC1_COUNTER_BASE: u64 = 0x1fb8_0194;
+pub(super) const HPC1_DSP_INTERRUPT_STATUS_BASE: u64 = 0x1fb8_01a0;
+pub(super) const HPC1_DSP_INTERRUPT_MASK_BASE: u64 = 0x1fb8_01a4;
 pub(super) const HPC1_MISCELLANEOUS_CONTROL_BASE: u64 = 0x1fb8_01b0;
 const HPC1_ENDIAN_CONTROL_END: u64 = 0x1fb8_00c4;
 const HPC1_COUNTER_END: u64 = 0x1fb8_0198;
+const HPC1_DSP_INTERRUPT_END: u64 = HPC1_DSP_INTERRUPT_MASK_BASE + 4;
 const HPC1_MISCELLANEOUS_CONTROL_END: u64 = 0x1fb8_01b4;
 pub(super) const SEEQ8003_EXTERNAL_BASE: u64 = 0x1fb8_0100;
 const SEEQ8003_EXTERNAL_END: u64 = 0x1fb8_0120;
@@ -33,6 +36,8 @@ const SEEQ8003_RECEIVE_COMMAND: u64 = 0x1b;
 const SEEQ8003_TRANSMIT_COMMAND: u64 = 0x1f;
 pub(super) const SCSI_BASE: u64 = 0x1fb8_0122;
 const SCSI_END: u64 = 0x1fb8_0127;
+pub(super) const CENTRONICS_EXTERNAL_BASE: u64 = 0x1fb8_0134;
+const CENTRONICS_EXTERNAL_END: u64 = 0x1fb8_0138;
 pub(super) const CPU_AUX_CONTROL: u64 = 0x1fb8_01bf;
 pub(super) const INT2_BASE: u64 = 0x1fb8_01c0;
 const INT2_END: u64 = 0x1fb8_0200;
@@ -56,6 +61,7 @@ pub(super) const PROM_END: u64 = PROM_BASE + PROM_BYTES as u64;
 pub(super) enum Target {
     Pic1(DeviceAddr),
     Hpc1(DeviceAddr),
+    Centronics(DeviceAddr),
     Seeq8003(DeviceAddr),
     Scsi(DeviceAddr),
     CpuAuxControl,
@@ -103,6 +109,7 @@ pub(super) fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault
         (HPC1_BASE, HPC1_INTERNAL_END),
         (HPC1_ENDIAN_CONTROL_BASE, HPC1_ENDIAN_CONTROL_END),
         (HPC1_COUNTER_BASE, HPC1_COUNTER_END),
+        (HPC1_DSP_INTERRUPT_STATUS_BASE, HPC1_DSP_INTERRUPT_END),
         (
             HPC1_MISCELLANEOUS_CONTROL_BASE,
             HPC1_MISCELLANEOUS_CONTROL_END,
@@ -130,6 +137,24 @@ pub(super) fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault
     }
     if overlaps(start, end, SCSI_BASE, SCSI_END) {
         return Err(BusFault::Unmapped);
+    }
+    if contains(
+        start,
+        end,
+        CENTRONICS_EXTERNAL_BASE,
+        CENTRONICS_EXTERNAL_END,
+    ) {
+        return Ok(Target::Centronics(DeviceAddr::new(
+            start - CENTRONICS_EXTERNAL_BASE,
+        )));
+    }
+    if overlaps(
+        start,
+        end,
+        CENTRONICS_EXTERNAL_BASE,
+        CENTRONICS_EXTERNAL_END,
+    ) {
+        return Err(BusFault::UnsupportedAccess);
     }
     if contains(start, end, CPU_AUX_CONTROL, CPU_AUX_CONTROL + 1) {
         return Ok(Target::CpuAuxControl);
@@ -221,13 +246,14 @@ mod tests {
 
     use super::super::test_support::{bus, read_byte, read_word};
     use super::{
-        CPU_AUX_CONTROL, DSP56001_END, HPC1_COUNTER_BASE, HPC1_ETHERNET_FIFO_BASE,
+        CENTRONICS_EXTERNAL_BASE, CPU_AUX_CONTROL, DSP56001_END, HPC1_COUNTER_BASE,
+        HPC1_DSP_INTERRUPT_MASK_BASE, HPC1_DSP_INTERRUPT_STATUS_BASE, HPC1_ETHERNET_FIFO_BASE,
         HPC1_ETHERNET_POINTER_BASE, HPC1_MISCELLANEOUS_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE,
         PROM_BASE, PROM_END, SEEQ8003_EXTERNAL_BASE, SERIAL_2_BASE,
     };
 
     #[test]
-    fn routes_hpc1_internal_registers_and_seeq_external_registers() {
+    fn routes_hpc1_and_external_peripheral_registers() {
         let mut bus = bus();
 
         bus.write(
@@ -262,6 +288,24 @@ mod tests {
         .unwrap();
         assert_eq!(scsi_channel_pointer, [0; 2]);
         assert_eq!(read_word(&mut bus, HPC1_COUNTER_BASE), Ok(0));
+        bus.write(
+            PhysAddr::new(HPC1_DSP_INTERRUPT_MASK_BASE),
+            &u32::MAX.to_be_bytes(),
+        )
+        .unwrap();
+        bus.write(
+            PhysAddr::new(HPC1_DSP_INTERRUPT_STATUS_BASE),
+            &0_u32.to_be_bytes(),
+        )
+        .unwrap();
+        assert_eq!(read_word(&mut bus, HPC1_DSP_INTERRUPT_MASK_BASE), Ok(7));
+        assert_eq!(read_word(&mut bus, HPC1_DSP_INTERRUPT_STATUS_BASE), Ok(0));
+        bus.write(PhysAddr::new(CENTRONICS_EXTERNAL_BASE + 1), &[0])
+            .unwrap();
+        bus.write(PhysAddr::new(CENTRONICS_EXTERNAL_BASE + 1), &[3])
+            .unwrap();
+        assert_eq!(read_byte(&mut bus, CENTRONICS_EXTERNAL_BASE + 1), Ok(0));
+        assert_eq!(read_word(&mut bus, CENTRONICS_EXTERNAL_BASE), Ok(0));
         assert_eq!(read_word(&mut bus, SEEQ8003_EXTERNAL_BASE), Ok(0x80));
         assert_eq!(
             read_byte(&mut bus, HPC1_COUNTER_BASE + 3),
@@ -329,6 +373,10 @@ mod tests {
         );
         assert_eq!(
             bus.read(PhysAddr::new(SEEQ8003_EXTERNAL_BASE + 3), &mut [0; 2]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert_eq!(
+            bus.write(PhysAddr::new(CENTRONICS_EXTERNAL_BASE + 3), &[0; 2]),
             Err(BusFault::UnsupportedAccess)
         );
         assert_eq!(

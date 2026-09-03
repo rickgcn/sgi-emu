@@ -1,5 +1,6 @@
 //! Device models for emulated systems.
 
+pub mod centronics;
 pub mod dp8573a;
 pub mod dsp56001;
 pub mod hpc1;

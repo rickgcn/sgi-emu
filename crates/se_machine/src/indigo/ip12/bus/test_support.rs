@@ -1,6 +1,7 @@
 use std::io;
 
 use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+use se_device::centronics::CentronicsPort;
 use se_device::dp8573a::Dp8573a;
 use se_device::dsp56001::Dsp56001;
 use se_device::hpc1::Hpc1;
@@ -32,6 +33,7 @@ pub(super) fn bus_with_memory(memory: [Option<Ram>; 4]) -> Ip12Bus {
         Pic1::new(0xf7, 2, true),
         memory,
         Hpc1::new(),
+        CentronicsPort::new(),
         Seeq8003::new(),
         Int2::new(),
         Wd33c93b::new(),
@@ -127,6 +129,7 @@ pub(super) fn bus_with_disk_failures(
         Pic1::new(0xf7, 2, true),
         [Some(Ram::new(8 * 1024 * 1024)), None, None, None],
         Hpc1::new(),
+        CentronicsPort::new(),
         Seeq8003::new(),
         Int2::new(),
         Wd33c93b::new(),
@@ -161,6 +164,7 @@ pub(super) fn bus_with_cdrom(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
         Pic1::new(0xf7, 2, true),
         [Some(Ram::new(8 * 1024 * 1024)), None, None, None],
         Hpc1::new(),
+        CentronicsPort::new(),
         Seeq8003::new(),
         Int2::new(),
         Wd33c93b::new(),
@@ -209,6 +213,7 @@ pub(super) fn bus_with_disk_and_cdrom(disk_bytes: Vec<u8>, cdrom_bytes: Vec<u8>)
         Pic1::new(0xf7, 2, true),
         [Some(Ram::new(8 * 1024 * 1024)), None, None, None],
         Hpc1::new(),
+        CentronicsPort::new(),
         Seeq8003::new(),
         Int2::new(),
         Wd33c93b::new(),

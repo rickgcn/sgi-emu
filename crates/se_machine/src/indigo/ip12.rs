@@ -10,6 +10,7 @@ use std::fmt;
 
 use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::{R3000, R3000Config, StepError};
+use se_device::centronics::CentronicsPort;
 use se_device::dp8573a::{Dp8573a, Dp8573aBatteryState, Dp8573aStateError};
 use se_device::dsp56001::Dsp56001;
 use se_device::hpc1::Hpc1;
@@ -229,6 +230,7 @@ impl Ip12 {
                 Pic1::new(0xf7, 2, true),
                 [Some(Ram::new(RAM_BYTES)), None, None, None],
                 Hpc1::new(),
+                CentronicsPort::new(),
                 Seeq8003::new(),
                 Int2::new(),
                 Wd33c93b::new(),
@@ -308,6 +310,9 @@ impl Ip12 {
         let mut interrupt_lines = 0;
         if self.bus.local_interrupt_0_asserted() {
             interrupt_lines |= 1 << 1;
+        }
+        if self.bus.local_interrupt_1_asserted() {
+            interrupt_lines |= 1 << 2;
         }
         if self.bus.timer_0_interrupt_asserted() {
             interrupt_lines |= 1 << 3;
@@ -686,6 +691,33 @@ mod tests {
         assert_eq!(machine.receive_serial(SerialPort::A, b"A"), 1);
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 11),
+            0
+        );
+    }
+
+    #[test]
+    fn hpc1_interrupt_outputs_drive_cpu_inputs_one_and_two() {
+        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fb8_01c7), &[1 << 1])
+            .unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fb8_01cf), &[1 << 4])
+            .unwrap();
+
+        machine.bus.set_hpc1_interrupt_levels_for_test(true, true);
+        machine.update_interrupt_lines();
+        assert_eq!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_1800,
+            0x0000_1800
+        );
+
+        machine.bus.set_hpc1_interrupt_levels_for_test(false, false);
+        machine.update_interrupt_lines();
+        assert_eq!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_1800,
             0
         );
     }

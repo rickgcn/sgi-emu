@@ -1,5 +1,6 @@
 use se_core::bus::BusFault;
 use se_core::time::VirtualDuration;
+use se_device::int2::Int2;
 use se_device::nmc93cs46::Nmc93cs46;
 use se_device::scsi::{ScsiCommandStart, ScsiDataDirection, ScsiTransferResult};
 use se_device::z85230::Z85230;
@@ -9,7 +10,9 @@ use super::Ip12Bus;
 
 const CPU_AUX_OUTPUT_BITS: u8 = 0x0f;
 const SCSI_INTERRUPT: u8 = 1;
+const PARALLEL_INTERRUPT: u8 = 1 << 1;
 const SERIAL_INTERRUPT: u8 = 1 << 5;
+const DSP_INTERRUPT: u8 = 1 << 4;
 
 impl Ip12Bus {
     pub(super) fn synchronize_serial_interrupt(&mut self) {
@@ -21,6 +24,14 @@ impl Ip12Bus {
     pub(super) fn synchronize_scsi_interrupt(&mut self) {
         self.int2
             .set_local_interrupt_0_input(SCSI_INTERRUPT, self.wd33c93b.interrupt_asserted());
+    }
+
+    pub(super) fn synchronize_hpc1_interrupts(&mut self) {
+        drive_hpc1_interrupt_inputs(
+            &mut self.int2,
+            self.hpc1.parallel_interrupt_asserted(),
+            self.hpc1.dsp_interrupt_asserted(),
+        );
     }
 
     pub(super) fn handle_scsi_register_write(&mut self) {
@@ -49,6 +60,7 @@ impl Ip12Bus {
         }
         self.service_scsi_descriptor_fetch();
         self.synchronize_scsi_interrupt();
+        self.synchronize_hpc1_interrupts();
     }
 
     pub(super) fn process_scsi_event(&mut self) {
@@ -268,6 +280,11 @@ impl Ip12Bus {
     }
 }
 
+pub(super) fn drive_hpc1_interrupt_inputs(int2: &mut Int2, parallel: bool, dsp: bool) {
+    int2.set_local_interrupt_0_input(PARALLEL_INTERRUPT, parallel);
+    int2.set_local_interrupt_1_input(DSP_INTERRUPT, dsp);
+}
+
 pub(super) fn read_cpu_aux_control(
     value: u8,
     nvram: &Nmc93cs46,
@@ -306,7 +323,7 @@ mod tests {
     use crate::output::MachineOutput;
     use crate::serial::SerialPort;
 
-    use super::Ip12Bus;
+    use super::{Ip12Bus, drive_hpc1_interrupt_inputs};
 
     use super::super::address::{
         HPC1_SCSI_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE, INT2_BASE, SCSI_BASE, SERIAL_1_BASE,
@@ -354,6 +371,27 @@ mod tests {
         assert_eq!(read_byte(&mut bus, SERIAL_1_BASE + 0x0f), Ok(b'A'));
         assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1));
         assert!(!bus.local_interrupt_0_asserted());
+    }
+
+    #[test]
+    fn hpc1_interrupt_levels_drive_distinct_int2_local_banks() {
+        let mut bus = bus();
+        bus.write(PhysAddr::new(INT2_BASE + 7), &[1 << 1]).unwrap();
+        bus.write(PhysAddr::new(INT2_BASE + 0x0f), &[1 << 4])
+            .unwrap();
+
+        drive_hpc1_interrupt_inputs(&mut bus.int2, true, true);
+
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok((1 << 1) | 1));
+        assert_eq!(read_word(&mut bus, INT2_BASE + 8), Ok(1 << 4));
+        assert!(bus.local_interrupt_0_asserted());
+        assert!(bus.local_interrupt_1_asserted());
+
+        drive_hpc1_interrupt_inputs(&mut bus.int2, false, false);
+        assert_eq!(read_word(&mut bus, INT2_BASE), Ok(1));
+        assert_eq!(read_word(&mut bus, INT2_BASE + 8), Ok(0));
+        assert!(!bus.local_interrupt_0_asserted());
+        assert!(!bus.local_interrupt_1_asserted());
     }
 
     #[test]

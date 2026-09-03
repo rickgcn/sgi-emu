@@ -71,10 +71,25 @@ impl Int2 {
         }
     }
 
+    /// Drives selected local-interrupt-one input lines.
+    pub fn set_local_interrupt_1_input(&mut self, lines: u8, asserted: bool) {
+        if asserted {
+            self.local_interrupt_status[1] |= lines;
+        } else {
+            self.local_interrupt_status[1] &= !lines;
+        }
+    }
+
     /// Reports the masked local-interrupt-zero output level.
     #[must_use]
     pub const fn local_interrupt_0_asserted(&self) -> bool {
         self.local_interrupt_status[0] & self.local_interrupt_masks[0] != 0
+    }
+
+    /// Reports the masked local-interrupt-one output level.
+    #[must_use]
+    pub const fn local_interrupt_1_asserted(&self) -> bool {
+        self.local_interrupt_status[1] & self.local_interrupt_masks[1] != 0
     }
 
     /// Reports whether the timer-zero interrupt output is asserted.
@@ -423,6 +438,28 @@ mod tests {
     }
 
     #[test]
+    fn local_interrupt_one_is_masked_and_independent_from_local_interrupt_zero() {
+        let mut int2 = Int2::new();
+        int2.set_local_interrupt_0_input(1 << 5, true);
+        int2.set_local_interrupt_1_input(1 << 4, true);
+
+        int2.write(DeviceAddr::new(LOCAL_INTERRUPT_1_MASK + 3), &[1 << 4])
+            .unwrap();
+        assert!(!int2.local_interrupt_0_asserted());
+        assert!(int2.local_interrupt_1_asserted());
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_1_STATUS), Ok(1 << 4));
+
+        int2.write(DeviceAddr::new(LOCAL_INTERRUPT_0_MASK + 3), &[1 << 5])
+            .unwrap();
+        assert!(int2.local_interrupt_0_asserted());
+        assert!(int2.local_interrupt_1_asserted());
+
+        int2.set_local_interrupt_1_input(1 << 4, false);
+        assert!(int2.local_interrupt_0_asserted());
+        assert!(!int2.local_interrupt_1_asserted());
+    }
+
+    #[test]
     fn output_port_keeps_only_the_low_five_bits() {
         let mut int2 = Int2::new();
 
@@ -679,11 +716,13 @@ mod tests {
             .unwrap();
         int2.advance_time(VirtualDuration::from_attoseconds(123));
         int2.set_local_interrupt_0_input(1 << 5, true);
+        int2.set_local_interrupt_1_input(1 << 4, true);
 
         int2.reset();
 
         assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_MASK), Ok(0));
         assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_STATUS), Ok(0));
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_1_STATUS), Ok(0));
         assert_eq!(read_word(&mut int2, VME_INTERRUPT_1_MASK), Ok(0));
         assert_eq!(read_word(&mut int2, OUTPUT_PORT), Ok(0));
         assert_eq!(int2.timer_pending, [false; 2]);

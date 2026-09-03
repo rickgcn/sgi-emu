@@ -1,4 +1,5 @@
 use se_core::bus::{BusFault, DeviceAddr, PhysAddr, PhysicalBus};
+use se_device::centronics::CentronicsPort;
 use se_device::dp8573a::{Dp8573a, Dp8573aBatteryState};
 use se_device::dsp56001::Dsp56001;
 use se_device::hpc1::Hpc1;
@@ -33,6 +34,7 @@ pub(super) struct Ip12Bus {
     pic1: Pic1,
     memory: LocalMemory,
     hpc1: Hpc1,
+    centronics: CentronicsPort,
     seeq8003: Seeq8003,
     int2: Int2,
     wd33c93b: Wd33c93b,
@@ -54,6 +56,7 @@ impl Ip12Bus {
         pic1: Pic1,
         memory: [Option<Ram>; 4],
         hpc1: Hpc1,
+        centronics: CentronicsPort,
         seeq8003: Seeq8003,
         int2: Int2,
         wd33c93b: Wd33c93b,
@@ -69,6 +72,7 @@ impl Ip12Bus {
             pic1,
             memory: LocalMemory::new(memory),
             hpc1,
+            centronics,
             seeq8003,
             int2,
             wd33c93b,
@@ -85,24 +89,27 @@ impl Ip12Bus {
         };
         bus.schedule_timed_devices();
         bus.synchronize_scsi_interrupt();
+        bus.synchronize_hpc1_interrupts();
         bus
     }
 
     pub(super) fn reset(&mut self) {
         self.pic1.reset();
         self.hpc1.reset();
+        self.centronics.reset();
         self.seeq8003.reset();
-        self.int2.reset();
         self.wd33c93b.reset();
         self.pending_scsi = None;
         self.scsi_bus.cancel_transaction();
         for serial in &mut self.serial {
             serial.reset();
         }
+        self.int2.reset();
         self.events.reset();
         self.schedule_timed_devices();
         self.synchronize_serial_interrupt();
         self.synchronize_scsi_interrupt();
+        self.synchronize_hpc1_interrupts();
         self.mdac.reset();
         self.nvram.reset();
         self.cpu_aux_control = 0;
@@ -134,6 +141,15 @@ impl Ip12Bus {
         self.int2.local_interrupt_0_asserted()
     }
 
+    pub(super) fn local_interrupt_1_asserted(&self) -> bool {
+        self.int2.local_interrupt_1_asserted()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_hpc1_interrupt_levels_for_test(&mut self, parallel: bool, dsp: bool) {
+        self::wiring::drive_hpc1_interrupt_inputs(&mut self.int2, parallel, dsp);
+    }
+
     pub(super) fn timer_0_interrupt_asserted(&self) -> bool {
         self.int2.timer_0_interrupt_asserted()
     }
@@ -160,6 +176,7 @@ impl Ip12Bus {
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.read(address, data),
             Target::Hpc1(address) => self.hpc1.read(address, data),
+            Target::Centronics(address) => self.centronics.read(address, data),
             Target::Seeq8003(address) => self.seeq8003.read(address, data),
             Target::Scsi(address) => self.wd33c93b.debug_read(address, data),
             Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),
@@ -188,6 +205,7 @@ impl PhysicalBus for Ip12Bus {
                 self.synchronize_hpc1_time();
                 self.hpc1.read(address, data)
             }
+            Target::Centronics(address) => self.centronics.read(address, data),
             Target::Seeq8003(address) => self.seeq8003.read(address, data),
             Target::Scsi(address) => {
                 let result = self.wd33c93b.read(address, data);
@@ -237,6 +255,7 @@ impl PhysicalBus for Ip12Bus {
                 self.handle_hpc1_outputs();
                 Ok(())
             }
+            Target::Centronics(address) => self.centronics.write(address, data),
             Target::Seeq8003(address) => self.seeq8003.write(address, data),
             Target::Scsi(address) => {
                 self.wd33c93b.write(address, data)?;
@@ -305,9 +324,10 @@ mod tests {
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 
     use super::address::{
-        BOARD_REVISION_BASE, CPU_AUX_CONTROL, DSP56001_BASE, DSP56001_END, GIO_BASE, GIO_END,
-        HPC1_ENDIAN_CONTROL_BASE, INT2_BASE, MDAC_BASE, PIC1_BASE, PROM_BASE, RTC_BASE, SCSI_BASE,
-        SERIAL_0_BASE, SERIAL_1_BASE,
+        BOARD_REVISION_BASE, CENTRONICS_EXTERNAL_BASE, CPU_AUX_CONTROL, DSP56001_BASE,
+        DSP56001_END, GIO_BASE, GIO_END, HPC1_DSP_INTERRUPT_MASK_BASE,
+        HPC1_DSP_INTERRUPT_STATUS_BASE, HPC1_ENDIAN_CONTROL_BASE, INT2_BASE, MDAC_BASE, PIC1_BASE,
+        PROM_BASE, RTC_BASE, SCSI_BASE, SERIAL_0_BASE, SERIAL_1_BASE,
     };
     use super::test_support::{
         bus, configure_memory, nvram_command, nvram_read_word, nvram_write_word, read_byte,
@@ -406,7 +426,16 @@ mod tests {
         .unwrap();
         bus.write(PhysAddr::new(HPC1_ENDIAN_CONTROL_BASE + 3), &[0x1f])
             .unwrap();
+        bus.write(
+            PhysAddr::new(HPC1_DSP_INTERRUPT_MASK_BASE),
+            &7_u32.to_be_bytes(),
+        )
+        .unwrap();
+        bus.write(PhysAddr::new(CENTRONICS_EXTERNAL_BASE + 1), &[3])
+            .unwrap();
         bus.write(PhysAddr::new(INT2_BASE + 7), &[0xa5]).unwrap();
+        bus.write(PhysAddr::new(INT2_BASE + 0x0f), &[1 << 4])
+            .unwrap();
         bus.write(PhysAddr::new(CPU_AUX_CONTROL), &[0x0f]).unwrap();
         bus.write(PhysAddr::new(RTC_BASE + 0x57), &[0xa5]).unwrap();
         nvram_command(&mut bus, 0x04c0);
@@ -429,7 +458,11 @@ mod tests {
         assert_eq!(read_word(&mut bus, 6 * 1024 * 1024), Ok(0x0123_4567));
         assert_eq!(read_word(&mut bus, PIC1_BASE + 0xa_0000), Ok(0));
         assert_eq!(read_word(&mut bus, HPC1_ENDIAN_CONTROL_BASE), Ok(0x40));
+        assert_eq!(read_word(&mut bus, HPC1_DSP_INTERRUPT_STATUS_BASE), Ok(0));
+        assert_eq!(read_word(&mut bus, HPC1_DSP_INTERRUPT_MASK_BASE), Ok(0));
+        assert_eq!(read_byte(&mut bus, CENTRONICS_EXTERNAL_BASE + 1), Ok(0));
         assert_eq!(read_word(&mut bus, INT2_BASE + 4), Ok(0));
+        assert_eq!(read_word(&mut bus, INT2_BASE + 0x0c), Ok(0));
         assert_eq!(read_byte(&mut bus, CPU_AUX_CONTROL), Ok(0));
         assert_eq!(read_byte(&mut bus, RTC_BASE + 0x57), Ok(0xa5));
         assert_eq!(nvram_read_word(&mut bus, 7), 0x5aa5);
