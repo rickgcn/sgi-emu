@@ -1,6 +1,7 @@
 //! Silicon Graphics HPC1.5 register front end.
 
 use se_core::bus::{BusFault, DeviceAddr};
+use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
 const ETHERNET_TRANSMIT_STATUS: u64 = 0x0034;
 const ETHERNET_RECEIVE_STATUS: u64 = 0x0038;
@@ -13,6 +14,7 @@ const SCSI_NEXT_DESCRIPTOR_POINTER: u64 = 0x0090;
 const SCSI_CONTROL: u64 = 0x0094;
 const SCSI_FIFO_POINTER: u64 = 0x0098;
 const ENDIAN_CONTROL: u64 = 0x00c0;
+const FREE_RUNNING_COUNTER: u64 = 0x0194;
 const MISCELLANEOUS_CONTROL: u64 = 0x01b0;
 const REGISTER_BYTES: u64 = 4;
 
@@ -29,6 +31,8 @@ const ETHERNET_RESET_CHANNEL: u32 = 0x01;
 const ETHERNET_TRANSMIT_STATUS_BITS: u32 = 0x00ff_0000;
 const ETHERNET_RECEIVE_STATUS_BITS: u32 = 0x0000_ff00;
 const ETHERNET_CONTROL_BITS: u32 = 0x0f;
+const FREE_RUNNING_COUNTER_FREQUENCY: u128 = 33_000_000;
+const FREE_RUNNING_COUNTER_MODULUS: u128 = 1 << 24;
 
 /// One currently available HPC1 SCSI DMA window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +76,8 @@ pub struct Hpc1 {
     scsi_descriptor_fetch_pending: bool,
     scsi_control: u8,
     endian_control: u8,
+    free_running_counter: u32,
+    free_running_counter_phase: u128,
     miscellaneous_control: u32,
     scsi_reset_requested: bool,
 }
@@ -97,6 +103,8 @@ impl Hpc1 {
             scsi_descriptor_fetch_pending: false,
             scsi_control: 0,
             endian_control: REVISION,
+            free_running_counter: 0,
+            free_running_counter_phase: 0,
             miscellaneous_control: 0,
             scsi_reset_requested: false,
         }
@@ -116,6 +124,8 @@ impl Hpc1 {
         self.scsi_descriptor_fetch_pending = false;
         self.scsi_control = 0;
         self.endian_control = REVISION;
+        self.free_running_counter = 0;
+        self.free_running_counter_phase = 0;
         self.miscellaneous_control = 0;
         self.scsi_reset_requested = false;
     }
@@ -151,10 +161,13 @@ impl Hpc1 {
             read_register(0, offset, data);
         } else if let Some(offset) = register_offset(start, end, ENDIAN_CONTROL) {
             read_register(u32::from(self.endian_control), offset, data);
+        } else if start == FREE_RUNNING_COUNTER && end == start + REGISTER_BYTES {
+            data.copy_from_slice(&self.free_running_counter.to_be_bytes());
         } else if start == MISCELLANEOUS_CONTROL && end == start + REGISTER_BYTES {
             data.copy_from_slice(&self.miscellaneous_control.to_be_bytes());
         } else if contains_register(start, end, ETHERNET_RECEIVE_POINTER)
             || contains_register(start, end, ETHERNET_RECEIVE_FIFO)
+            || contains_register(start, end, FREE_RUNNING_COUNTER)
             || contains_register(start, end, MISCELLANEOUS_CONTROL)
         {
             return Err(BusFault::UnsupportedAccess);
@@ -219,6 +232,8 @@ impl Hpc1 {
         } else if let Some(offset) = register_offset(start, end, ENDIAN_CONTROL) {
             let value = write_register(u32::from(self.endian_control), offset, data) as u8;
             self.endian_control = REVISION | (value & WRITABLE_ENDIAN_BITS);
+        } else if contains_register(start, end, FREE_RUNNING_COUNTER) {
+            return Err(BusFault::UnsupportedAccess);
         } else if start == MISCELLANEOUS_CONTROL && end == start + REGISTER_BYTES {
             self.miscellaneous_control =
                 u32::from_be_bytes(data.try_into().map_err(|_| BusFault::UnsupportedAccess)?);
@@ -231,6 +246,24 @@ impl Hpc1 {
         }
 
         Ok(())
+    }
+
+    /// Advances the 33 MHz free-running counter by guest virtual time.
+    pub fn advance_time(&mut self, elapsed: VirtualDuration) {
+        let attoseconds = elapsed.as_attoseconds();
+        let whole_seconds = attoseconds / ATTOSECONDS_PER_SECOND;
+        let partial_attoseconds = attoseconds % ATTOSECONDS_PER_SECOND;
+        let scaled_partial =
+            partial_attoseconds * FREE_RUNNING_COUNTER_FREQUENCY + self.free_running_counter_phase;
+        let partial_ticks = scaled_partial / ATTOSECONDS_PER_SECOND;
+        self.free_running_counter_phase = scaled_partial % ATTOSECONDS_PER_SECOND;
+
+        let whole_ticks = (whole_seconds % FREE_RUNNING_COUNTER_MODULUS)
+            * (FREE_RUNNING_COUNTER_FREQUENCY % FREE_RUNNING_COUNTER_MODULUS);
+        let elapsed_ticks = (whole_ticks + partial_ticks % FREE_RUNNING_COUNTER_MODULUS)
+            % FREE_RUNNING_COUNTER_MODULUS;
+        self.free_running_counter = ((u128::from(self.free_running_counter) + elapsed_ticks)
+            % FREE_RUNNING_COUNTER_MODULUS) as u32;
     }
 
     /// Returns and clears a pending reset request for the attached SCSI controller.
@@ -352,11 +385,14 @@ fn write_register(value: u32, offset: usize, data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
     use super::{
         ENDIAN_CONTROL, ETHERNET_RECEIVE_FIFO, ETHERNET_RECEIVE_POINTER, ETHERNET_RECEIVE_STATUS,
-        ETHERNET_RESET, ETHERNET_TRANSMIT_STATUS, Hpc1, MISCELLANEOUS_CONTROL, SCSI_BYTE_COUNT,
-        SCSI_CONTROL, SCSI_CURRENT_BUFFER_POINTER, SCSI_FIFO_POINTER, SCSI_NEXT_DESCRIPTOR_POINTER,
+        ETHERNET_RESET, ETHERNET_TRANSMIT_STATUS, FREE_RUNNING_COUNTER,
+        FREE_RUNNING_COUNTER_FREQUENCY, FREE_RUNNING_COUNTER_MODULUS, Hpc1, MISCELLANEOUS_CONTROL,
+        SCSI_BYTE_COUNT, SCSI_CONTROL, SCSI_CURRENT_BUFFER_POINTER, SCSI_FIFO_POINTER,
+        SCSI_NEXT_DESCRIPTOR_POINTER,
     };
 
     fn read_word(hpc1: &Hpc1, address: u64) -> Result<u32, BusFault> {
@@ -371,6 +407,7 @@ mod tests {
 
         assert_eq!(read_word(&hpc1, SCSI_CONTROL), Ok(0));
         assert_eq!(read_word(&hpc1, ENDIAN_CONTROL), Ok(0x40));
+        assert_eq!(read_word(&hpc1, FREE_RUNNING_COUNTER), Ok(0));
         assert_eq!(read_word(&hpc1, MISCELLANEOUS_CONTROL), Ok(0));
         let mut byte = [0xff];
         assert_eq!(
@@ -378,6 +415,40 @@ mod tests {
             Ok(())
         );
         assert_eq!(byte, [0]);
+    }
+
+    #[test]
+    fn free_running_counter_accumulates_exact_fractional_ticks_and_wraps() {
+        let mut hpc1 = Hpc1::new();
+        let almost_one_tick = ATTOSECONDS_PER_SECOND / FREE_RUNNING_COUNTER_FREQUENCY;
+
+        hpc1.advance_time(VirtualDuration::from_attoseconds(almost_one_tick));
+        assert_eq!(read_word(&hpc1, FREE_RUNNING_COUNTER), Ok(0));
+        hpc1.advance_time(VirtualDuration::from_attoseconds(1));
+        assert_eq!(read_word(&hpc1, FREE_RUNNING_COUNTER), Ok(1));
+
+        hpc1.reset();
+        hpc1.advance_time(VirtualDuration::from_attoseconds(
+            2 * ATTOSECONDS_PER_SECOND,
+        ));
+        assert_eq!(
+            read_word(&hpc1, FREE_RUNNING_COUNTER),
+            Ok((2 * FREE_RUNNING_COUNTER_FREQUENCY % FREE_RUNNING_COUNTER_MODULUS) as u32)
+        );
+    }
+
+    #[test]
+    fn free_running_counter_is_a_read_only_word() {
+        let mut hpc1 = Hpc1::new();
+
+        assert_eq!(
+            hpc1.read(DeviceAddr::new(FREE_RUNNING_COUNTER + 3), &mut [0]),
+            Err(BusFault::UnsupportedAccess)
+        );
+        assert_eq!(
+            hpc1.write(DeviceAddr::new(FREE_RUNNING_COUNTER), &0_u32.to_be_bytes()),
+            Err(BusFault::UnsupportedAccess)
+        );
     }
 
     #[test]
@@ -568,11 +639,15 @@ mod tests {
             .unwrap();
         hpc1.write(DeviceAddr::new(MISCELLANEOUS_CONTROL), &9_u32.to_be_bytes())
             .unwrap();
+        hpc1.advance_time(VirtualDuration::from_attoseconds(
+            ATTOSECONDS_PER_SECOND / FREE_RUNNING_COUNTER_FREQUENCY,
+        ));
 
         hpc1.reset();
 
         assert_eq!(read_word(&hpc1, SCSI_CONTROL), Ok(0));
         assert_eq!(read_word(&hpc1, ENDIAN_CONTROL), Ok(0x40));
+        assert_eq!(read_word(&hpc1, FREE_RUNNING_COUNTER), Ok(0));
         assert_eq!(read_word(&hpc1, MISCELLANEOUS_CONTROL), Ok(0));
         assert!(!hpc1.take_scsi_reset_request());
         assert!(hpc1.take_scsi_descriptor_fetch().is_none());

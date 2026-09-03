@@ -178,7 +178,10 @@ impl PhysicalBus for Ip12Bus {
 
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.read(address, data),
-            Target::Hpc1(address) => self.hpc1.read(address, data),
+            Target::Hpc1(address) => {
+                self.synchronize_hpc1_counter_time();
+                self.hpc1.read(address, data)
+            }
             Target::Scsi(address) => {
                 let result = self.wd33c93b.read(address, data);
                 self.synchronize_scsi_interrupt();
@@ -222,6 +225,7 @@ impl PhysicalBus for Ip12Bus {
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.write(address, data),
             Target::Hpc1(address) => {
+                self.synchronize_hpc1_counter_time();
                 self.hpc1.write(address, data)?;
                 self.handle_hpc_scsi_state();
                 Ok(())

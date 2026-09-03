@@ -2,12 +2,13 @@
 
 use se_core::time::{VirtualDuration, VirtualInstant};
 
-const EVENT_COUNT: usize = 5;
+const EVENT_COUNT: usize = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum EventKind {
     Int2,
     Rtc,
+    Hpc1Counter,
     Serial0,
     Serial1,
     Scsi,
@@ -17,6 +18,7 @@ impl EventKind {
     const ALL: [Self; EVENT_COUNT] = [
         Self::Int2,
         Self::Rtc,
+        Self::Hpc1Counter,
         Self::Serial0,
         Self::Serial1,
         Self::Scsi,
@@ -26,9 +28,10 @@ impl EventKind {
         match self {
             Self::Int2 => 0,
             Self::Rtc => 1,
-            Self::Serial0 => 2,
-            Self::Serial1 => 3,
-            Self::Scsi => 4,
+            Self::Hpc1Counter => 2,
+            Self::Serial0 => 3,
+            Self::Serial1 => 4,
+            Self::Scsi => 5,
         }
     }
 }
@@ -153,6 +156,10 @@ mod tests {
             events.synchronize(EventKind::Int2),
             VirtualDuration::from_attoseconds(12)
         );
+        assert_eq!(
+            events.synchronize(EventKind::Hpc1Counter),
+            VirtualDuration::from_attoseconds(12)
+        );
     }
 
     #[test]
@@ -209,5 +216,9 @@ mod tests {
         assert_eq!(events.next_event, None);
         assert_eq!(events.take_due(), None);
         assert_eq!(events.synchronize(EventKind::Scsi), VirtualDuration::ZERO);
+        assert_eq!(
+            events.synchronize(EventKind::Hpc1Counter),
+            VirtualDuration::ZERO
+        );
     }
 }

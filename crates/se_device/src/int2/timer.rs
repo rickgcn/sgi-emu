@@ -19,6 +19,14 @@ impl CounterId {
             Self::Two => 2,
         }
     }
+
+    const fn interrupt_index(self) -> Option<usize> {
+        match self {
+            Self::Zero => Some(0),
+            Self::One => Some(1),
+            Self::Two => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -30,6 +38,7 @@ pub(super) struct TimerOutputs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ProgrammableTimer {
     counters: [Counter; 3],
+    deferred_outputs: [bool; 2],
     oscillator_phase: u128,
 }
 
@@ -37,6 +46,7 @@ impl ProgrammableTimer {
     pub(super) const fn new() -> Self {
         Self {
             counters: [Counter::new(), Counter::new(), Counter::new()],
+            deferred_outputs: [false; 2],
             oscillator_phase: 0,
         }
     }
@@ -51,10 +61,12 @@ impl ProgrammableTimer {
             ControlCommand::Latch(counter) => self.counters[counter.index()].latch(),
             ControlCommand::Configure { counter, mode } => {
                 self.counters[counter.index()].configure(mode);
+                self.clear_deferred_output(counter);
                 Ok(())
             }
             ControlCommand::Quiesce(counter) => {
                 self.counters[counter.index()].quiesce();
+                self.clear_deferred_output(counter);
                 Ok(())
             }
         }
@@ -81,12 +93,14 @@ impl ProgrammableTimer {
         self.oscillator_phase = combined_phase % ATTOSECONDS_PER_TICK;
 
         let counter_2_outputs = self.counters[CounterId::Two.index()].advance(ticks);
-        let counter_0_outputs = self.counters[CounterId::Zero.index()].advance(counter_2_outputs);
-        let counter_1_outputs = self.counters[CounterId::One.index()].advance(counter_2_outputs);
+        let counter_0_output = self.counters[CounterId::Zero.index()]
+            .advance_with_deferred_output(counter_2_outputs, &mut self.deferred_outputs[0]);
+        let counter_1_output = self.counters[CounterId::One.index()]
+            .advance_with_deferred_output(counter_2_outputs, &mut self.deferred_outputs[1]);
 
         TimerOutputs {
-            counter_0: counter_0_outputs != 0,
-            counter_1: counter_1_outputs != 0,
+            counter_0: counter_0_output,
+            counter_1: counter_1_output,
         }
     }
 
@@ -97,11 +111,25 @@ impl ProgrammableTimer {
 
         let (counter_2_reload, counter_2_remaining) =
             self.counters[CounterId::Two.index()].rate_generator_state()?;
-        let (_, downstream_remaining) = self.counters[counter.index()].rate_generator_state()?;
-        let ticks = u128::from(counter_2_remaining)
-            + u128::from(downstream_remaining - 1) * u128::from(counter_2_reload);
+        let interrupt_index = counter
+            .interrupt_index()
+            .expect("counter two does not produce an INT2 timer interrupt");
+        let ticks = if self.deferred_outputs[interrupt_index] {
+            u128::from(counter_2_remaining)
+        } else {
+            let (_, downstream_remaining) =
+                self.counters[counter.index()].rate_generator_state()?;
+            u128::from(counter_2_remaining)
+                + u128::from(downstream_remaining) * u128::from(counter_2_reload)
+        };
         let attoseconds = ticks * ATTOSECONDS_PER_TICK - self.oscillator_phase;
         Some(VirtualDuration::from_attoseconds(attoseconds))
+    }
+
+    fn clear_deferred_output(&mut self, counter: CounterId) {
+        if let Some(index) = counter.interrupt_index() {
+            self.deferred_outputs[index] = false;
+        }
     }
 }
 
@@ -233,6 +261,24 @@ impl Counter {
             remaining: next_remaining,
         };
         output_count
+    }
+
+    fn advance_with_deferred_output(&mut self, input_pulses: u128, output_due: &mut bool) -> bool {
+        if input_pulses == 0 {
+            return false;
+        }
+
+        let mut output = *output_due;
+        *output_due = false;
+        if let Some((reload, remaining)) = self.rate_generator_state()
+            && input_pulses >= u128::from(remaining)
+        {
+            let after_first_terminal = input_pulses - u128::from(remaining);
+            output |= after_first_terminal != 0;
+            *output_due = after_first_terminal.is_multiple_of(u128::from(reload));
+        }
+        let _ = self.advance(input_pulses);
+        output
     }
 
     const fn rate_generator_state(&self) -> Option<(u32, u32)> {
@@ -466,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn counter_2_cascades_boundary_outputs_in_the_same_advance() {
+    fn downstream_terminal_counts_emit_on_the_next_counter_2_output() {
         let mut timer = ProgrammableTimer::new();
         configure(&mut timer, 0xb4, CounterId::Two, 3);
         configure(&mut timer, 0x34, CounterId::Zero, 2);
@@ -478,6 +524,14 @@ mod tests {
         );
         assert_eq!(
             timer.advance_time(VirtualDuration::from_attoseconds(ATTOSECONDS_PER_TICK)),
+            TimerOutputs::default()
+        );
+        assert_eq!(
+            timer.time_until_output(CounterId::One),
+            Some(VirtualDuration::from_attoseconds(3 * ATTOSECONDS_PER_TICK))
+        );
+        assert_eq!(
+            timer.advance_time(VirtualDuration::from_attoseconds(3 * ATTOSECONDS_PER_TICK)),
             TimerOutputs {
                 counter_0: true,
                 counter_1: true,
@@ -495,7 +549,7 @@ mod tests {
         assert_eq!(
             timer.time_until_output(CounterId::One),
             Some(VirtualDuration::from_attoseconds(
-                3 * ATTOSECONDS_PER_TICK + 1
+                5 * ATTOSECONDS_PER_TICK + 1
             ))
         );
         assert_eq!(
@@ -529,18 +583,24 @@ mod tests {
     }
 
     #[test]
-    fn ide_counter_1_sequence_expires_at_two_seconds() {
+    fn ide_counter_1_sequence_emits_one_counter_2_period_after_terminal_count() {
         let mut timer = ProgrammableTimer::new();
         configure(&mut timer, 0xb4, CounterId::Two, 1_000);
         configure(&mut timer, 0x74, CounterId::One, 2_000);
         let two_seconds = 2_000_000 * ATTOSECONDS_PER_TICK;
+        let counter_2_period = 1_000 * ATTOSECONDS_PER_TICK;
+        let first_interrupt = two_seconds + counter_2_period;
 
         assert_eq!(
             timer.time_until_output(CounterId::One),
-            Some(VirtualDuration::from_attoseconds(two_seconds))
+            Some(VirtualDuration::from_attoseconds(first_interrupt))
         );
         assert_eq!(
-            timer.advance_time(VirtualDuration::from_attoseconds(two_seconds - 1)),
+            timer.advance_time(VirtualDuration::from_attoseconds(two_seconds)),
+            TimerOutputs::default()
+        );
+        assert_eq!(
+            timer.advance_time(VirtualDuration::from_attoseconds(counter_2_period - 1)),
             TimerOutputs::default()
         );
         assert_eq!(
@@ -563,8 +623,27 @@ mod tests {
         assert_eq!(
             timer.time_until_output(CounterId::One),
             Some(VirtualDuration::from_attoseconds(
-                6 * ATTOSECONDS_PER_TICK - ATTOSECONDS_PER_TICK / 2
+                9 * ATTOSECONDS_PER_TICK - ATTOSECONDS_PER_TICK / 2
             ))
         );
+    }
+
+    #[test]
+    fn configure_and_quiesce_clear_a_deferred_output() {
+        for control in [0x74, 0x78] {
+            let mut timer = ProgrammableTimer::new();
+            configure(&mut timer, 0xb4, CounterId::Two, 3);
+            configure(&mut timer, 0x74, CounterId::One, 2);
+            assert_eq!(
+                timer.advance_time(VirtualDuration::from_attoseconds(6 * ATTOSECONDS_PER_TICK)),
+                TimerOutputs::default()
+            );
+
+            timer.write_control(control).unwrap();
+            assert_eq!(
+                timer.advance_time(VirtualDuration::from_attoseconds(3 * ATTOSECONDS_PER_TICK)),
+                TimerOutputs::default()
+            );
+        }
     }
 }

@@ -554,11 +554,11 @@ mod tests {
         assert_eq!(
             int2.time_until_event(),
             Some(VirtualDuration::from_attoseconds(
-                6 * ATTOSECONDS_PER_MICROSECOND
+                9 * ATTOSECONDS_PER_MICROSECOND
             ))
         );
         int2.advance_time(VirtualDuration::from_attoseconds(
-            6 * ATTOSECONDS_PER_MICROSECOND,
+            9 * ATTOSECONDS_PER_MICROSECOND,
         ));
 
         assert!(int2.timer_0_interrupt_asserted());
@@ -582,7 +582,7 @@ mod tests {
         }
 
         int2.advance_time(VirtualDuration::from_attoseconds(
-            6 * ATTOSECONDS_PER_MICROSECOND,
+            9 * ATTOSECONDS_PER_MICROSECOND,
         ));
         assert_eq!(int2.timer_pending, [true, false]);
         assert_eq!(

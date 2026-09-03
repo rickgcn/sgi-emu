@@ -21,6 +21,7 @@ impl Ip12Bus {
                     self.reschedule_int2();
                 }
                 EventKind::Rtc => self.synchronize_rtc_time(),
+                EventKind::Hpc1Counter => self.synchronize_hpc1_counter_time(),
                 EventKind::Serial0 => self.synchronize_serial_time(0, output),
                 EventKind::Serial1 => self.synchronize_serial_time(1, output),
                 EventKind::Scsi => {
@@ -35,6 +36,7 @@ impl Ip12Bus {
         self.reschedule_int2();
         self.events
             .schedule(EventKind::Rtc, self.rtc.time_until_event());
+        self.events.schedule(EventKind::Hpc1Counter, None);
         self.reschedule_serial(0);
         self.reschedule_serial(1);
         self.events.schedule(EventKind::Scsi, None);
@@ -55,6 +57,11 @@ impl Ip12Bus {
         self.rtc.advance_time(elapsed);
         self.events
             .schedule(EventKind::Rtc, self.rtc.time_until_event());
+    }
+
+    pub(super) fn synchronize_hpc1_counter_time(&mut self) {
+        let elapsed = self.events.synchronize(EventKind::Hpc1Counter);
+        self.hpc1.advance_time(elapsed);
     }
 
     fn synchronize_serial_time(&mut self, index: usize, output: &mut MachineOutput) {
@@ -109,7 +116,9 @@ mod tests {
     use crate::output::MachineOutput;
     use crate::serial::SerialPort;
 
-    use super::super::address::{INT2_BASE, RTC_BASE, SERIAL_0_BASE, SERIAL_1_BASE};
+    use super::super::address::{
+        HPC1_COUNTER_BASE, INT2_BASE, RTC_BASE, SERIAL_0_BASE, SERIAL_1_BASE,
+    };
     use super::super::test_support::{bus, configure_serial_a, read_byte, read_word};
 
     const ATTOSECONDS_PER_MICROSECOND: u128 = ATTOSECONDS_PER_SECOND / 1_000_000;
@@ -176,6 +185,51 @@ mod tests {
     }
 
     #[test]
+    fn hpc1_counter_synchronizes_lazily_on_normal_mmio() {
+        let mut bus = bus();
+        let mut output = MachineOutput::default();
+        let mut counter = [0; 4];
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        bus.debug_read(PhysAddr::new(HPC1_COUNTER_BASE), &mut counter)
+            .unwrap();
+        assert_eq!(u32::from_be_bytes(counter), 0);
+        assert_eq!(read_word(&mut bus, HPC1_COUNTER_BASE), Ok(33));
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        bus.debug_read(PhysAddr::new(HPC1_COUNTER_BASE), &mut counter)
+            .unwrap();
+        assert_eq!(u32::from_be_bytes(counter), 33);
+        assert_eq!(read_word(&mut bus, HPC1_COUNTER_BASE), Ok(66));
+    }
+
+    #[test]
+    fn reset_clears_the_hpc1_counter_and_its_synchronization_origin() {
+        let mut bus = bus();
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        assert_eq!(read_word(&mut bus, HPC1_COUNTER_BASE), Ok(33));
+        bus.reset();
+        assert_eq!(read_word(&mut bus, HPC1_COUNTER_BASE), Ok(0));
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        assert_eq!(read_word(&mut bus, HPC1_COUNTER_BASE), Ok(33));
+    }
+
+    #[test]
     fn reset_preserves_the_rtc_prescaler_phase() {
         let mut bus = bus();
         let mut output = MachineOutput::default();
@@ -209,6 +263,13 @@ mod tests {
         );
         assert!(!bus.timer_1_interrupt_asserted());
         bus.advance_time(VirtualDuration::from_attoseconds(1), &mut output);
+        assert!(!bus.timer_1_interrupt_asserted());
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND / 1_000 - 1),
+            &mut output,
+        );
+        assert!(!bus.timer_1_interrupt_asserted());
+        bus.advance_time(VirtualDuration::from_attoseconds(1), &mut output);
         assert!(bus.timer_1_interrupt_asserted());
 
         bus.write(PhysAddr::new(TIMER_ACKNOWLEDGE), &[2]).unwrap();
@@ -236,7 +297,7 @@ mod tests {
             Err(BusFault::UnsupportedAccess)
         );
         bus.advance_time(
-            VirtualDuration::from_attoseconds(4 * ATTOSECONDS_PER_MICROSECOND - 1),
+            VirtualDuration::from_attoseconds(7 * ATTOSECONDS_PER_MICROSECOND - 1),
             &mut output,
         );
         assert!(!bus.timer_1_interrupt_asserted());
@@ -262,7 +323,7 @@ mod tests {
         );
         assert!(!bus.timer_1_interrupt_asserted());
         bus.advance_time(
-            VirtualDuration::from_attoseconds(6 * ATTOSECONDS_PER_MICROSECOND - 1),
+            VirtualDuration::from_attoseconds(9 * ATTOSECONDS_PER_MICROSECOND - 1),
             &mut output,
         );
         assert!(!bus.timer_1_interrupt_asserted());
@@ -277,7 +338,7 @@ mod tests {
         configure_timer(&mut acknowledged, 0xb4, TIMER_COUNTER_2, 3);
         configure_timer(&mut acknowledged, 0x74, TIMER_COUNTER_1, 2);
         acknowledged.advance_time(
-            VirtualDuration::from_attoseconds(6 * ATTOSECONDS_PER_MICROSECOND),
+            VirtualDuration::from_attoseconds(9 * ATTOSECONDS_PER_MICROSECOND),
             &mut output,
         );
         acknowledged
@@ -300,7 +361,11 @@ mod tests {
         quiesced
             .write(PhysAddr::new(TIMER_CONTROL), &[0x78])
             .unwrap();
-        assert!(quiesced.timer_1_interrupt_asserted());
+        quiesced.advance_time(
+            VirtualDuration::from_attoseconds(3 * ATTOSECONDS_PER_MICROSECOND),
+            &mut output,
+        );
+        assert!(!quiesced.timer_1_interrupt_asserted());
     }
 
     #[test]
@@ -310,7 +375,7 @@ mod tests {
         configure_timer(&mut bus, 0xb4, TIMER_COUNTER_2, 3);
         configure_timer(&mut bus, 0x74, TIMER_COUNTER_1, 2);
         bus.events.advance(VirtualDuration::from_attoseconds(
-            6 * ATTOSECONDS_PER_MICROSECOND,
+            9 * ATTOSECONDS_PER_MICROSECOND,
         ));
 
         assert_eq!(

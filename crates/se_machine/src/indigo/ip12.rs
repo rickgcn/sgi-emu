@@ -308,7 +308,7 @@ impl Ip12 {
             interrupt_lines |= 1 << 1;
         }
         if self.bus.timer_0_interrupt_asserted() {
-            interrupt_lines |= 1 << 2;
+            interrupt_lines |= 1 << 3;
         }
         if self.bus.timer_1_interrupt_asserted() {
             interrupt_lines |= 1 << 4;
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn int2_timers_drive_cpu_interrupt_inputs_two_and_four() {
+    fn int2_timers_drive_cpu_interrupt_inputs_three_and_four() {
         let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
         for (control, address) in [
             (0xb4, 0x1fb8_01fb),
@@ -710,26 +710,26 @@ mod tests {
         let mut output = MachineOutput::default();
 
         machine.advance_time(
-            VirtualDuration::from_attoseconds(4_000_000_000_000),
+            VirtualDuration::from_attoseconds(6_000_000_000_000),
             &mut output,
         );
         machine.update_interrupt_lines();
         assert_eq!(
-            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_5000,
-            0x0000_5000
+            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_6000,
+            0x0000_6000
         );
 
         machine.bus.write(PhysAddr::new(0x1fb8_01e3), &[1]).unwrap();
         machine.update_interrupt_lines();
         assert_eq!(
-            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_5000,
+            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_6000,
             0x0000_4000
         );
 
         machine.bus.write(PhysAddr::new(0x1fb8_01e3), &[2]).unwrap();
         machine.update_interrupt_lines();
         assert_eq!(
-            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_5000,
+            machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_6000,
             0
         );
     }

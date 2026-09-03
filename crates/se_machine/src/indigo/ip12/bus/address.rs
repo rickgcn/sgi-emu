@@ -15,12 +15,14 @@ pub(super) const HPC1_SCSI_REGISTERS_BASE: u64 = 0x1fb8_0088;
 #[cfg(test)]
 pub(super) const HPC1_SCSI_CONTROL_BASE: u64 = 0x1fb8_0094;
 pub(super) const HPC1_ENDIAN_CONTROL_BASE: u64 = 0x1fb8_00c0;
+pub(super) const HPC1_COUNTER_BASE: u64 = 0x1fb8_0194;
 pub(super) const HPC1_MISCELLANEOUS_CONTROL_BASE: u64 = 0x1fb8_01b0;
 const HPC1_ETHERNET_STATUS_END: u64 = 0x1fb8_0040;
 const HPC1_ETHERNET_POINTER_END: u64 = 0x1fb8_005c;
 const HPC1_ETHERNET_FIFO_END: u64 = 0x1fb8_0060;
 const HPC1_SCSI_REGISTERS_END: u64 = 0x1fb8_009c;
 const HPC1_ENDIAN_CONTROL_END: u64 = 0x1fb8_00c4;
+const HPC1_COUNTER_END: u64 = 0x1fb8_0198;
 const HPC1_MISCELLANEOUS_CONTROL_END: u64 = 0x1fb8_01b4;
 pub(super) const SCSI_BASE: u64 = 0x1fb8_0122;
 const SCSI_END: u64 = 0x1fb8_0127;
@@ -88,6 +90,7 @@ pub(super) fn route(address: PhysAddr, length: usize) -> Result<Target, BusFault
         (HPC1_ETHERNET_FIFO_BASE, HPC1_ETHERNET_FIFO_END),
         (HPC1_SCSI_REGISTERS_BASE, HPC1_SCSI_REGISTERS_END),
         (HPC1_ENDIAN_CONTROL_BASE, HPC1_ENDIAN_CONTROL_END),
+        (HPC1_COUNTER_BASE, HPC1_COUNTER_END),
         (
             HPC1_MISCELLANEOUS_CONTROL_BASE,
             HPC1_MISCELLANEOUS_CONTROL_END,
@@ -197,8 +200,9 @@ mod tests {
 
     use super::super::test_support::{bus, read_byte, read_word};
     use super::{
-        CPU_AUX_CONTROL, DSP56001_END, HPC1_ETHERNET_FIFO_BASE, HPC1_ETHERNET_POINTER_BASE,
-        HPC1_MISCELLANEOUS_CONTROL_BASE, PROM_BASE, PROM_END, SERIAL_2_BASE,
+        CPU_AUX_CONTROL, DSP56001_END, HPC1_COUNTER_BASE, HPC1_ETHERNET_FIFO_BASE,
+        HPC1_ETHERNET_POINTER_BASE, HPC1_MISCELLANEOUS_CONTROL_BASE, PROM_BASE, PROM_END,
+        SERIAL_2_BASE,
     };
 
     #[test]
@@ -220,6 +224,11 @@ mod tests {
         );
         assert_eq!(read_byte(&mut bus, HPC1_ETHERNET_FIFO_BASE + 3), Ok(0));
         assert_eq!(read_word(&mut bus, 0x1fb8_0098), Ok(0));
+        assert_eq!(read_word(&mut bus, HPC1_COUNTER_BASE), Ok(0));
+        assert_eq!(
+            read_byte(&mut bus, HPC1_COUNTER_BASE + 3),
+            Err(BusFault::UnsupportedAccess)
+        );
         assert_eq!(read_byte(&mut bus, 0x1fb8_0100), Err(BusFault::Unmapped));
     }
 
