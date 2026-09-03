@@ -263,7 +263,7 @@ impl R3000 {
     /// cache. A newly detected translation buffer shutdown changes only the
     /// CP0 shutdown state. Instruction-address alignment is resolved after the
     /// shutdown guard. For aligned addresses, enabled interrupts are sampled
-    /// before address translation and instruction fetch.
+    /// after a successful instruction fetch and before decoding or execution.
     ///
     /// # Errors
     ///
@@ -279,12 +279,6 @@ impl R3000 {
         if pc & 3 != 0 {
             self.state
                 .take_exception(Exception::InstructionAddressError { address: pc });
-            self.state.synchronize_cp1_interrupt();
-            return Ok(());
-        }
-
-        if self.state.interrupt_requested() {
-            self.state.take_exception(Exception::Interrupt);
             self.state.synchronize_cp1_interrupt();
             return Ok(());
         }
@@ -306,6 +300,13 @@ impl R3000 {
                 return Ok(());
             }
         };
+
+        if self.state.interrupt_requested() {
+            self.state.take_exception(Exception::Interrupt);
+            self.state.synchronize_cp1_interrupt();
+            return Ok(());
+        }
+
         let instruction = match decode(word) {
             DecodeResult::Implemented(instruction) => instruction,
             DecodeResult::UnsupportedCoprocessor { unit } => {
@@ -479,11 +480,11 @@ mod tests {
 
     impl PhysicalBus for RejectingBus {
         fn read(&mut self, _address: PhysAddr, _data: &mut [u8]) -> Result<(), BusFault> {
-            panic!("an interrupt step must not read the physical bus")
+            panic!("this processor step must not read the physical bus")
         }
 
         fn write(&mut self, _address: PhysAddr, _data: &[u8]) -> Result<(), BusFault> {
-            panic!("an interrupt step must not write the physical bus")
+            panic!("this processor step must not write the physical bus")
         }
     }
 
@@ -2922,18 +2923,26 @@ mod tests {
     }
 
     #[test]
-    fn enabled_hardware_interrupt_enters_before_instruction_fetch() {
+    fn enabled_hardware_interrupt_enters_after_successful_instruction_fetch() {
         let mut processor = R3000::new(super::TEST_CONFIG);
         set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
         processor.set_hardware_interrupt_lines(1 << 1);
+        processor.state.write_gpr(2, 7);
         let expected_epc = processor.state.pc();
         let previous_random = processor.state.read_cp0(1);
-        let mut bus = RejectingBus;
+        let instruction = encode_immediate(0x09, 2, 2, 1);
+        let mut bus = TestBus::new(instruction.to_be_bytes());
 
         processor
             .step(&mut bus)
             .expect("the interrupt should enter a guest exception");
 
+        assert_eq!(
+            bus.read_address,
+            Some(PhysAddr::new(u64::from(expected_epc & 0x1fff_ffff)))
+        );
+        assert_eq!(bus.read_length, Some(4));
+        assert_eq!(processor.state.read_gpr(2), 7);
         assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
         assert_eq!(processor.state.read_cp0(14), expected_epc);
         assert_eq!(processor.state.read_cp0(13) & CAUSE_BD, 0);
@@ -2966,6 +2975,87 @@ mod tests {
         assert_eq!(
             processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
             STATUS_IM6
+        );
+    }
+
+    #[test]
+    fn instruction_tlb_miss_precedes_an_enabled_interrupt() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        let fault_address = 0x0040_0000;
+        jump_to(&mut processor, fault_address);
+        processor.set_hardware_interrupt_lines(1 << 1);
+        let mut bus = TestBus::new([0; 4]);
+
+        processor
+            .step(&mut bus)
+            .expect("the instruction TLB miss should enter a guest exception");
+
+        assert_eq!(bus.read_address, None);
+        assert_eq!(processor.state.pc(), BOOT_TLB_REFILL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), fault_address);
+        assert_eq!(processor.state.read_cp0(8), fault_address);
+        assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 2);
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            STATUS_IM3
+        );
+    }
+
+    #[test]
+    fn invalid_instruction_tlb_entry_precedes_an_enabled_interrupt() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        let fault_address = 0x0040_0000;
+        install_and_sync_tlb_entry(
+            &mut processor,
+            5,
+            fault_address,
+            0x0010_0000,
+            ENTRY_LO_DIRTY,
+        );
+        jump_to(&mut processor, fault_address);
+        processor.set_hardware_interrupt_lines(1 << 1);
+        let mut bus = TestBus::new([0; 4]);
+
+        processor
+            .step(&mut bus)
+            .expect("the invalid instruction TLB entry should enter a guest exception");
+
+        assert_eq!(bus.read_address, None);
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), fault_address);
+        assert_eq!(processor.state.read_cp0(8), fault_address);
+        assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 2);
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            STATUS_IM3
+        );
+    }
+
+    #[test]
+    fn instruction_bus_error_precedes_an_enabled_interrupt() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(1 << 1);
+        let fault_pc = processor.state.pc();
+        let mut bus = TestBus::new([0; 4]);
+        bus.fault = Some(BusFault::Unmapped);
+
+        processor
+            .step(&mut bus)
+            .expect("the instruction bus error should enter a guest exception");
+
+        assert_eq!(
+            bus.read_address,
+            Some(PhysAddr::new(u64::from(fault_pc & 0x1fff_ffff)))
+        );
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), fault_pc);
+        assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 6);
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            STATUS_IM3
         );
     }
 
@@ -3007,7 +3097,12 @@ mod tests {
             .step(&mut bus)
             .expect("the interrupt should enter a guest exception");
 
-        assert_eq!(bus.read_address, None);
+        assert_eq!(
+            bus.read_address,
+            Some(PhysAddr::new(u64::from(
+                branch_pc.wrapping_add(4) & 0x1fff_ffff,
+            )))
+        );
         assert_eq!(processor.state.read_gpr(1), 7);
         assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
         assert_eq!(processor.state.read_cp0(14), branch_pc);
@@ -3022,11 +3117,8 @@ mod tests {
         set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IEC | PENDING);
         set_cp0_register_and_sync(&mut processor, 13, (1 << 9) | (1 << 8));
         processor.set_hardware_interrupt_lines(0b10_0010);
-        let mut bus = RejectingBus;
 
-        processor
-            .step(&mut bus)
-            .expect("the pending bitmap should request one interrupt");
+        step_with_word(&mut processor, 0).expect("the pending bitmap should request one interrupt");
 
         assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
         assert_eq!(processor.state.read_cp0(13) & CAUSE_IP_MASK, PENDING);
@@ -3054,10 +3146,8 @@ mod tests {
 
         step_with_word(&mut processor, 0).expect("the second hazard instruction should execute");
         let expected_epc = processor.state.pc();
-        let mut bus = RejectingBus;
 
-        processor
-            .step(&mut bus)
+        step_with_word(&mut processor, 0)
             .expect("the synchronized enable should request an interrupt");
         assert_eq!(processor.state.read_cp0(14), expected_epc);
     }
@@ -3075,10 +3165,8 @@ mod tests {
 
         processor.set_hardware_interrupt_lines(1 << 1);
         let expected_epc = processor.state.pc();
-        let mut bus = RejectingBus;
 
-        processor
-            .step(&mut bus)
+        step_with_word(&mut processor, 0)
             .expect("the old effective enable should request an interrupt");
         assert_eq!(processor.state.read_cp0(14), expected_epc);
     }
@@ -3096,10 +3184,8 @@ mod tests {
 
         step_with_word(&mut processor, 0).expect("the functional write should become visible");
         let expected_epc = processor.state.pc();
-        let mut bus = RejectingBus;
 
-        processor
-            .step(&mut bus)
+        step_with_word(&mut processor, 0)
             .expect("the synchronized software pending bit should interrupt");
         assert_eq!(processor.state.read_cp0(14), expected_epc);
         assert_eq!(processor.state.read_cp0(13) & STATUS_IM0, STATUS_IM0);
@@ -3111,21 +3197,15 @@ mod tests {
         set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
         processor.set_hardware_interrupt_lines(1 << 1);
         let return_pc = processor.state.pc();
-        let mut bus = RejectingBus;
 
-        processor
-            .step(&mut bus)
-            .expect("the first interrupt should enter its handler");
+        step_with_word(&mut processor, 0).expect("the first interrupt should enter its handler");
         processor.state.write_gpr(3, return_pc);
         step_with_word(&mut processor, encode_register(3, 0, 0, 0x08)).expect("JR should succeed");
         step_with_word(&mut processor, 0x4200_0010).expect("RFE should succeed");
         assert_eq!(processor.state.pc(), return_pc);
         assert_eq!(processor.state.read_cp0(12) & STATUS_IEC, STATUS_IEC);
 
-        let mut bus = RejectingBus;
-        processor
-            .step(&mut bus)
-            .expect("the held line should interrupt again");
+        step_with_word(&mut processor, 0).expect("the held line should interrupt again");
 
         assert_eq!(processor.state.read_cp0(14), return_pc);
         assert_eq!(processor.state.read_cp0(13) & CAUSE_BD, 0);
@@ -3137,11 +3217,8 @@ mod tests {
         set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
         processor.set_hardware_interrupt_lines(1 << 1);
         let return_pc = processor.state.pc();
-        let mut bus = RejectingBus;
 
-        processor
-            .step(&mut bus)
-            .expect("the interrupt should enter its handler");
+        step_with_word(&mut processor, 0).expect("the interrupt should enter its handler");
         processor.set_hardware_interrupt_lines(0);
         assert_eq!(processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, 0);
         processor.state.write_gpr(3, return_pc);
@@ -3364,8 +3441,7 @@ mod tests {
             STATUS_BEV | STATUS_CU1 | STATUS_IM2 | STATUS_IEC,
         );
         let interrupted_pc = processor.state.pc();
-        processor
-            .step(&mut RejectingBus)
+        step_with_word(&mut processor, 0)
             .expect("the pending CP1 level should enter the guest handler");
 
         assert_eq!(processor.state.read_cp0(14), interrupted_pc);
