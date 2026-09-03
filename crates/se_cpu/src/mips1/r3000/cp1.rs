@@ -6,7 +6,7 @@ use se_float::{
 };
 
 use super::{
-    ExecutionOutcome, InstructionResult,
+    ExecutionOutcome, InstructionCompletion, StepError,
     control::branch_resume_pc,
     cp0::Exception,
     decode::{
@@ -25,6 +25,7 @@ const CONTROL_STATUS_CONDITION: u32 = 1 << 23;
 const CONTROL_STATUS_FLAG_SHIFT: u32 = 2;
 const CONTROL_STATUS_ENABLE_SHIFT: u32 = 7;
 const CONTROL_STATUS_CAUSE_SHIFT: u32 = 12;
+const UNDEFINED_COMPANION_WORD: u32 = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Fcr31Update {
@@ -117,6 +118,9 @@ impl Cp1 {
     }
 
     fn write_float32(&mut self, register: usize, value: Float32) {
+        if register & 1 == 0 {
+            self.registers[register | 1] = UNDEFINED_COMPANION_WORD;
+        }
         self.registers[register] = value.to_bits();
     }
 
@@ -128,6 +132,9 @@ impl Cp1 {
     }
 
     fn write_word(&mut self, register: usize, value: u32) {
+        if register & 1 == 0 {
+            self.registers[register | 1] = UNDEFINED_COMPANION_WORD;
+        }
         self.registers[register] = value;
     }
 
@@ -258,14 +265,15 @@ pub(super) fn execute(
     state: &mut State,
     instruction: Cp1Instruction,
     bus: &mut dyn PhysicalBus,
-) -> InstructionResult {
+) -> Result<(ExecutionOutcome<InstructionCompletion>, bool), StepError> {
     if !state.coprocessor_usable(1) {
-        return Ok(ExecutionOutcome::Exception(
-            Exception::CoprocessorUnusable { unit: 1 },
+        return Ok((
+            ExecutionOutcome::Exception(Exception::CoprocessorUnusable { unit: 1 }),
+            false,
         ));
     }
 
-    let completion = match instruction {
+    let (delayed_resume_pc, effect, exception_raised) = match instruction {
         Cp1Instruction::Mfc1 { rt, rd } => (
             None,
             Some(InstructionEffect::DelayedGprWrite {
@@ -273,6 +281,7 @@ pub(super) fn execute(
                 value: state.read_cp1_general(rd),
                 load_merge_bypass: false,
             }),
+            false,
         ),
         Cp1Instruction::Cfc1 { rt, rd } => (
             None,
@@ -281,6 +290,7 @@ pub(super) fn execute(
                 value: state.read_cp1_control(rd),
                 load_merge_bypass: false,
             }),
+            false,
         ),
         Cp1Instruction::Mtc1 { rt, rd } => (
             None,
@@ -288,6 +298,7 @@ pub(super) fn execute(
                 index: rd,
                 value: state.read_gpr(rt),
             }),
+            false,
         ),
         Cp1Instruction::Ctc1 { rt, rd } => (
             None,
@@ -295,21 +306,24 @@ pub(super) fn execute(
                 index: rd,
                 value: state.read_gpr(rt),
             }),
+            false,
         ),
         Cp1Instruction::Bc1f { offset } => (
             Some(branch_resume_pc(state.pc(), offset, !state.cp1_condition())),
             None,
+            false,
         ),
         Cp1Instruction::Bc1t { offset } => (
             Some(branch_resume_pc(state.pc(), offset, state.cp1_condition())),
             None,
+            false,
         ),
         Cp1Instruction::Lwc1 { base, ft, offset } => {
             let mut bytes = [0; 4];
             match load_store::load(state, base, offset, &mut bytes, bus)? {
                 ExecutionOutcome::Completed(()) => {}
                 ExecutionOutcome::Exception(exception) => {
-                    return Ok(ExecutionOutcome::Exception(exception));
+                    return Ok((ExecutionOutcome::Exception(exception), false));
                 }
             }
 
@@ -319,6 +333,7 @@ pub(super) fn execute(
                     index: ft,
                     value: u32::from_be_bytes(bytes),
                 }),
+                false,
             )
         }
         Cp1Instruction::Swc1 { base, ft, offset } => {
@@ -326,11 +341,11 @@ pub(super) fn execute(
             match load_store::store(state, base, offset, &bytes, bus)? {
                 ExecutionOutcome::Completed(()) => {}
                 ExecutionOutcome::Exception(exception) => {
-                    return Ok(ExecutionOutcome::Exception(exception));
+                    return Ok((ExecutionOutcome::Exception(exception), false));
                 }
             }
 
-            (None, None)
+            (None, None, false)
         }
         Cp1Instruction::Binary {
             operation,
@@ -338,38 +353,41 @@ pub(super) fn execute(
             ft,
             fs,
             fd,
-        } => {
-            execute_binary(state, operation, format, ft, fs, fd);
-            (None, None)
-        }
+        } => (
+            None,
+            None,
+            execute_binary(state, operation, format, ft, fs, fd),
+        ),
         Cp1Instruction::Unary {
             operation,
             format,
             fs,
             fd,
-        } => {
-            execute_unary(state, operation, format, fs, fd);
-            (None, None)
-        }
+        } => (None, None, execute_unary(state, operation, format, fs, fd)),
         Cp1Instruction::Convert { operation, fs, fd } => {
-            execute_conversion(state, operation, fs, fd);
-            (None, None)
+            (None, None, execute_conversion(state, operation, fs, fd))
         }
         Cp1Instruction::Compare {
             format,
             condition,
             fs,
             ft,
-        } => (None, execute_compare(state, format, condition, fs, ft)),
+        } => {
+            let (effect, exception_raised) = execute_compare(state, format, condition, fs, ft);
+            (None, effect, exception_raised)
+        }
         Cp1Instruction::UnimplementedOperation => {
             let update = Cp1::unimplemented_update();
             state.commit_pending_cp1_write();
             state.cp1_mut().apply_fcr31_update(update);
-            (None, None)
+            (None, None, true)
         }
     };
 
-    Ok(ExecutionOutcome::Completed(completion))
+    Ok((
+        ExecutionOutcome::Completed((delayed_resume_pc, effect)),
+        exception_raised,
+    ))
 }
 
 fn execute_binary(
@@ -379,7 +397,7 @@ fn execute_binary(
     ft: usize,
     fs: usize,
     fd: usize,
-) {
+) -> bool {
     match format {
         Cp1FloatFormat::Single => {
             let (update, value) = {
@@ -411,7 +429,7 @@ fn execute_binary(
                     }
                 }
             };
-            finish_float32(state, fd, update, value);
+            finish_float32(state, fd, update, value)
         }
         Cp1FloatFormat::Double => {
             let (update, value) = {
@@ -443,7 +461,7 @@ fn execute_binary(
                     }
                 }
             };
-            finish_float64(state, fd, update, value);
+            finish_float64(state, fd, update, value)
         }
     }
 }
@@ -454,7 +472,7 @@ fn execute_unary(
     format: Cp1FloatFormat,
     fs: usize,
     fd: usize,
-) {
+) -> bool {
     if operation == Cp1UnaryOperation::Move {
         match format {
             Cp1FloatFormat::Single => {
@@ -468,7 +486,7 @@ fn execute_unary(
                 state.cp1_mut().write_float64(fd, value);
             }
         }
-        return;
+        return false;
     }
 
     match format {
@@ -493,7 +511,7 @@ fn execute_unary(
                     }
                 }
             };
-            finish_float32(state, fd, update, value);
+            finish_float32(state, fd, update, value)
         }
         Cp1FloatFormat::Double => {
             let (update, value) = {
@@ -516,12 +534,12 @@ fn execute_unary(
                     }
                 }
             };
-            finish_float64(state, fd, update, value);
+            finish_float64(state, fd, update, value)
         }
     }
 }
 
-fn execute_conversion(state: &mut State, operation: Cp1Conversion, fs: usize, fd: usize) {
+fn execute_conversion(state: &mut State, operation: Cp1Conversion, fs: usize, fd: usize) -> bool {
     match operation {
         Cp1Conversion::SingleToDouble => {
             let (update, value) = {
@@ -538,7 +556,7 @@ fn execute_conversion(state: &mut State, operation: Cp1Conversion, fs: usize, fd
                     }
                 }
             };
-            finish_float64(state, fd, update, value);
+            finish_float64(state, fd, update, value)
         }
         Cp1Conversion::WordToDouble => {
             let (update, value) = {
@@ -549,7 +567,7 @@ fn execute_conversion(state: &mut State, operation: Cp1Conversion, fs: usize, fd
                     Some(outcome.value),
                 )
             };
-            finish_float64(state, fd, update, value);
+            finish_float64(state, fd, update, value)
         }
         Cp1Conversion::DoubleToSingle => {
             let (update, value) = {
@@ -568,7 +586,7 @@ fn execute_conversion(state: &mut State, operation: Cp1Conversion, fs: usize, fd
                     }
                 }
             };
-            finish_float32(state, fd, update, value);
+            finish_float32(state, fd, update, value)
         }
         Cp1Conversion::WordToSingle => {
             let (update, value) = {
@@ -581,7 +599,7 @@ fn execute_conversion(state: &mut State, operation: Cp1Conversion, fs: usize, fd
                     Some(outcome.value),
                 )
             };
-            finish_float32(state, fd, update, value);
+            finish_float32(state, fd, update, value)
         }
         Cp1Conversion::SingleToWord => {
             let (update, value) = {
@@ -600,7 +618,7 @@ fn execute_conversion(state: &mut State, operation: Cp1Conversion, fs: usize, fd
                     }
                 }
             };
-            finish_word(state, fd, update, value);
+            finish_word(state, fd, update, value)
         }
         Cp1Conversion::DoubleToWord => {
             let (update, value) = {
@@ -619,7 +637,7 @@ fn execute_conversion(state: &mut State, operation: Cp1Conversion, fs: usize, fd
                     }
                 }
             };
-            finish_word(state, fd, update, value);
+            finish_word(state, fd, update, value)
         }
     }
 }
@@ -630,7 +648,7 @@ fn execute_compare(
     condition: u8,
     fs: usize,
     ft: usize,
-) -> Option<InstructionEffect> {
+) -> (Option<InstructionEffect>, bool) {
     let mode = if condition & 0x8 == 0 {
         ComparisonMode::Quiet
     } else {
@@ -674,13 +692,16 @@ fn execute_compare(
     state.commit_pending_cp1_write();
     state.cp1_mut().apply_fcr31_update(update);
     if !update.writeback {
-        return None;
+        return (None, true);
     }
 
     let relation = relation.expect("successful comparison must produce a relation");
-    Some(InstructionEffect::DelayedCp1ConditionWrite {
-        value: comparison_condition(condition, relation),
-    })
+    (
+        Some(InstructionEffect::DelayedCp1ConditionWrite {
+            value: comparison_condition(condition, relation),
+        }),
+        false,
+    )
 }
 
 fn finish_float32(
@@ -688,7 +709,7 @@ fn finish_float32(
     destination: usize,
     update: Fcr31Update,
     value: Option<Float32>,
-) {
+) -> bool {
     state.commit_pending_cp1_write();
     let cp1 = state.cp1_mut();
     cp1.apply_fcr31_update(update);
@@ -698,6 +719,7 @@ fn finish_float32(
             value.expect("enabled floating-point writeback must have a result"),
         );
     }
+    !update.writeback
 }
 
 fn finish_float64(
@@ -705,7 +727,7 @@ fn finish_float64(
     destination: usize,
     update: Fcr31Update,
     value: Option<Float64>,
-) {
+) -> bool {
     state.commit_pending_cp1_write();
     let cp1 = state.cp1_mut();
     cp1.apply_fcr31_update(update);
@@ -715,9 +737,15 @@ fn finish_float64(
             value.expect("enabled floating-point writeback must have a result"),
         );
     }
+    !update.writeback
 }
 
-fn finish_word(state: &mut State, destination: usize, update: Fcr31Update, value: Option<u32>) {
+fn finish_word(
+    state: &mut State,
+    destination: usize,
+    update: Fcr31Update,
+    value: Option<u32>,
+) -> bool {
     state.commit_pending_cp1_write();
     let cp1 = state.cp1_mut();
     cp1.apply_fcr31_update(update);
@@ -727,6 +755,7 @@ fn finish_word(state: &mut State, destination: usize, update: Fcr31Update, value
             value.expect("enabled floating-point writeback must have a result"),
         );
     }
+    !update.writeback
 }
 
 fn comparison_condition(condition: u8, relation: Relation) -> bool {
@@ -751,7 +780,8 @@ mod tests {
         CONTROL_STATUS_CAUSE_MASK, CONTROL_STATUS_CONDITION, CONTROL_STATUS_ENABLE_MASK,
         CONTROL_STATUS_UNIMPLEMENTED, CONTROL_STATUS_WRITABLE_MASK, Cp1, Cp1BinaryOperation,
         Cp1Conversion, Cp1FloatFormat, Cp1Instruction, Cp1UnaryOperation, Exception,
-        ExecutionOutcome, IMPLEMENTATION_REVISION, InstructionEffect, RoundingMode, State, execute,
+        ExecutionOutcome, IMPLEMENTATION_REVISION, InstructionEffect, RoundingMode, State,
+        UNDEFINED_COMPANION_WORD, execute,
     };
     use crate::mips1::r3000::{R3000Config, TEST_CONFIG};
 
@@ -806,7 +836,8 @@ mod tests {
 
     fn run(state: &mut State, instruction: Cp1Instruction) {
         let mut bus = TestBus::new([0; 4]);
-        let result = execute(state, instruction, &mut bus).expect("CP1 execution should succeed");
+        let (result, _) =
+            execute(state, instruction, &mut bus).expect("CP1 execution should succeed");
         let ExecutionOutcome::Completed((resume_pc, effect)) = result else {
             panic!("CP1 computation should not enter a CPU exception");
         };
@@ -884,6 +915,21 @@ mod tests {
     }
 
     #[test]
+    fn single_and_word_results_zero_the_undefined_companion_word() {
+        let mut cp1 = Cp1::new(Backend::SoftFloat);
+
+        cp1.write_general_register(3, 0xaaaa_aaaa);
+        cp1.write_float32(2, Float32::from_bits(1.0_f32.to_bits()));
+        assert_eq!(cp1.read_general_register(2), 1.0_f32.to_bits());
+        assert_eq!(cp1.read_general_register(3), UNDEFINED_COMPANION_WORD);
+
+        cp1.write_general_register(5, 0xbbbb_bbbb);
+        cp1.write_word(4, 0x1234_5678);
+        assert_eq!(cp1.read_general_register(4), 0x1234_5678);
+        assert_eq!(cp1.read_general_register(5), UNDEFINED_COMPANION_WORD);
+    }
+
+    #[test]
     fn control_registers_apply_their_access_rules() {
         let mut cp1 = Cp1::new(Backend::SoftFloat);
 
@@ -942,17 +988,17 @@ mod tests {
 
         assert_eq!(
             execute(&mut state, Cp1Instruction::Bc1f { offset: 2 }, &mut bus,),
-            Ok(ExecutionOutcome::Completed((
-                Some(pc.wrapping_add(12)),
-                None
-            )))
+            Ok((
+                ExecutionOutcome::Completed((Some(pc.wrapping_add(12)), None)),
+                false,
+            ))
         );
         assert_eq!(
             execute(&mut state, Cp1Instruction::Bc1t { offset: 2 }, &mut bus,),
-            Ok(ExecutionOutcome::Completed((
-                Some(pc.wrapping_add(8)),
-                None
-            )))
+            Ok((
+                ExecutionOutcome::Completed((Some(pc.wrapping_add(8)), None)),
+                false,
+            ))
         );
 
         state.complete_instruction(
@@ -967,17 +1013,17 @@ mod tests {
 
         assert_eq!(
             execute(&mut state, Cp1Instruction::Bc1f { offset: 2 }, &mut bus,),
-            Ok(ExecutionOutcome::Completed((
-                Some(pc.wrapping_add(8)),
-                None
-            )))
+            Ok((
+                ExecutionOutcome::Completed((Some(pc.wrapping_add(8)), None)),
+                false,
+            ))
         );
         assert_eq!(
             execute(&mut state, Cp1Instruction::Bc1t { offset: 2 }, &mut bus,),
-            Ok(ExecutionOutcome::Completed((
-                Some(pc.wrapping_add(12)),
-                None
-            )))
+            Ok((
+                ExecutionOutcome::Completed((Some(pc.wrapping_add(12)), None)),
+                false,
+            ))
         );
     }
 
@@ -1001,7 +1047,7 @@ mod tests {
                 },
                 &mut bus,
             ),
-            Ok(ExecutionOutcome::Completed((None, Some(effect))))
+            Ok((ExecutionOutcome::Completed((None, Some(effect))), false,))
         );
         assert_eq!(bus.reads, [(PhysAddr::new(0x100), 4)]);
         assert_eq!(state.read_cp1_general(5), 0);
@@ -1021,7 +1067,7 @@ mod tests {
                 },
                 &mut bus,
             ),
-            Ok(ExecutionOutcome::Completed((None, None)))
+            Ok((ExecutionOutcome::Completed((None, None)), false))
         );
         assert_eq!(
             bus.writes,
@@ -1045,9 +1091,12 @@ mod tests {
                 },
                 &mut bus,
             ),
-            Ok(ExecutionOutcome::Exception(Exception::LoadAddressError {
-                address: 0xa000_0101,
-            }))
+            Ok((
+                ExecutionOutcome::Exception(Exception::LoadAddressError {
+                    address: 0xa000_0101,
+                }),
+                false,
+            ))
         );
         assert_eq!(
             execute(
@@ -1059,9 +1108,12 @@ mod tests {
                 },
                 &mut bus,
             ),
-            Ok(ExecutionOutcome::Exception(Exception::StoreAddressError {
-                address: 0xa000_0101,
-            }))
+            Ok((
+                ExecutionOutcome::Exception(Exception::StoreAddressError {
+                    address: 0xa000_0101,
+                }),
+                false,
+            ))
         );
         assert!(bus.reads.is_empty());
         assert!(bus.writes.is_empty());
@@ -1083,8 +1135,9 @@ mod tests {
                 },
                 &mut bus,
             ),
-            Ok(ExecutionOutcome::Exception(
-                Exception::CoprocessorUnusable { unit: 1 }
+            Ok((
+                ExecutionOutcome::Exception(Exception::CoprocessorUnusable { unit: 1 }),
+                false,
             ))
         );
         assert!(bus.reads.is_empty());

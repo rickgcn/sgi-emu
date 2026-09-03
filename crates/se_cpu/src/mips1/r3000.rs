@@ -222,6 +222,7 @@ impl R3000 {
     /// preserved.
     pub fn reset(&mut self) {
         self.state.reset();
+        self.state.synchronize_cp1_interrupt();
     }
 
     /// Returns the processor clock frequency in hertz.
@@ -235,25 +236,18 @@ impl R3000 {
         self.cp0_condition = condition;
     }
 
-    /// Reports whether the CP1 external interrupt output is asserted.
+    /// Sets the asserted state of the five machine-driven interrupt inputs.
     ///
-    /// The containing machine is responsible for routing this output to an
-    /// R3000 hardware interrupt input.
-    #[must_use]
-    pub fn cp1_interrupt_asserted(&self) -> bool {
-        self.state.cp1_interrupt_asserted()
-    }
-
-    /// Sets the asserted state of the six hardware interrupt inputs.
-    ///
-    /// Bits zero through five replace the complete current input snapshot and
-    /// map to `Cause.IP2` through `Cause.IP7`, respectively. A set bit means
-    /// that the corresponding logical interrupt input is asserted. Inputs are
-    /// level-sensitive and remain unchanged across processor reset.
+    /// Bits one through five map to `Cause.IP3` through `Cause.IP7`,
+    /// respectively. A set bit means that the corresponding logical interrupt
+    /// input is asserted. Bit zero must remain clear because the attached R3010
+    /// exclusively drives `Cause.IP2`. Each call replaces the current state of
+    /// the five machine-driven inputs without changing the R3010 input. Inputs
+    /// are level-sensitive and remain unchanged across processor reset.
     ///
     /// # Panics
     ///
-    /// Panics if either of the two unused high bits is set.
+    /// Panics if bit zero or either of the two unused high bits is set.
     pub fn set_hardware_interrupt_lines(&mut self, lines: u8) {
         self.state.set_hardware_interrupt_lines(lines);
     }
@@ -282,6 +276,7 @@ impl R3000 {
 
         if self.state.interrupt_requested() {
             self.state.take_exception(Exception::Interrupt);
+            self.state.synchronize_cp1_interrupt();
             return Ok(());
         }
 
@@ -289,6 +284,7 @@ impl R3000 {
         if pc & 3 != 0 {
             self.state
                 .take_exception(Exception::InstructionAddressError { address: pc });
+            self.state.synchronize_cp1_interrupt();
             return Ok(());
         }
 
@@ -296,6 +292,7 @@ impl R3000 {
             Ok(translation) => translation,
             Err(TranslationError::Exception(exception)) => {
                 self.state.take_exception(exception);
+                self.state.synchronize_cp1_interrupt();
                 return Ok(());
             }
             Err(TranslationError::TlbShutdown) => return Err(StepError::TlbShutdown),
@@ -304,6 +301,7 @@ impl R3000 {
             Ok(word) => word,
             Err(_) => {
                 self.state.take_exception(Exception::InstructionBusError);
+                self.state.synchronize_cp1_interrupt();
                 return Ok(());
             }
         };
@@ -319,10 +317,12 @@ impl R3000 {
 
                 self.state
                     .take_exception(Exception::CoprocessorUnusable { unit });
+                self.state.synchronize_cp1_interrupt();
                 return Ok(());
             }
             DecodeResult::Reserved => {
                 self.state.take_exception(Exception::ReservedInstruction);
+                self.state.synchronize_cp1_interrupt();
                 return Ok(());
             }
         };
@@ -339,7 +339,16 @@ impl R3000 {
             Instruction::Cp0(instruction) => {
                 cp0::execute(&mut self.state, instruction, self.cp0_condition)
             }
-            Instruction::Cp1(instruction) => cp1::execute(&mut self.state, instruction, bus),
+            Instruction::Cp1(instruction) => {
+                let (outcome, exception_raised) = cp1::execute(&mut self.state, instruction, bus)?;
+                self.state.synchronize_cp1_interrupt();
+                if exception_raised && self.state.interrupt_requested() {
+                    self.state.take_exception(Exception::Interrupt);
+                    self.state.synchronize_cp1_interrupt();
+                    return Ok(());
+                }
+                Ok(outcome)
+            }
             Instruction::Memory(instruction) => {
                 match load_store::execute(&mut self.state, instruction, bus)? {
                     ExecutionOutcome::Completed(effect) => {
@@ -363,6 +372,7 @@ impl R3000 {
             }
             Err(error) => return Err(error),
         }
+        self.state.synchronize_cp1_interrupt();
 
         Ok(())
     }
@@ -411,6 +421,7 @@ mod tests {
     const STATUS_CU3: u32 = 1 << 31;
     const STATUS_IM0: u32 = 1 << 8;
     const STATUS_IM2: u32 = 1 << 10;
+    const STATUS_IM3: u32 = 1 << 11;
     const UNSUPPORTED_CP2_INSTRUCTION: u32 = 0x4a00_0000;
 
     fn translation(address: u64, cacheability: Cacheability) -> Translation {
@@ -2846,8 +2857,8 @@ mod tests {
     #[test]
     fn enabled_hardware_interrupt_enters_before_instruction_fetch() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
-        processor.set_hardware_interrupt_lines(1);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(1 << 1);
         let expected_epc = processor.state.pc();
         let previous_random = processor.state.read_cp0(1);
         let mut bus = RejectingBus;
@@ -2862,7 +2873,7 @@ mod tests {
         assert_eq!((processor.state.read_cp0(13) >> 2) & 0x1f, 0);
         assert_eq!(
             processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
-            STATUS_IM2
+            STATUS_IM3
         );
         assert_eq!(processor.state.read_cp0(1), previous_random - (1 << 8));
     }
@@ -2870,13 +2881,13 @@ mod tests {
     #[test]
     fn disabled_and_masked_hardware_interrupts_allow_execution() {
         for status in [
-            STATUS_BEV | STATUS_IM2,
+            STATUS_BEV | STATUS_IM3,
             STATUS_BEV | STATUS_IEC,
-            STATUS_BEV | STATUS_IEC | (1 << 11),
+            STATUS_BEV | STATUS_IEC | STATUS_IM2,
         ] {
             let mut processor = R3000::new(super::TEST_CONFIG);
             set_cp0_register_and_sync(&mut processor, 12, status);
-            processor.set_hardware_interrupt_lines(1);
+            processor.set_hardware_interrupt_lines(1 << 1);
             let instruction_pc = processor.state.pc();
 
             step_with_word(&mut processor, 0).expect("the NOP should execute");
@@ -2884,7 +2895,7 @@ mod tests {
             assert_eq!(processor.state.pc(), instruction_pc.wrapping_add(4));
             assert_eq!(
                 processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
-                STATUS_IM2
+                STATUS_IM3
             );
         }
     }
@@ -2892,13 +2903,13 @@ mod tests {
     #[test]
     fn interrupt_before_a_delay_slot_restarts_the_branch() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
         processor.state.write_gpr(1, 7);
         let branch_pc = processor.state.pc();
 
         step_with_word(&mut processor, encode_immediate(0x04, 0, 0, 2))
             .expect("BEQ should succeed");
-        processor.set_hardware_interrupt_lines(1);
+        processor.set_hardware_interrupt_lines(1 << 1);
         let mut bus = TestBus::new(encode_immediate(0x09, 1, 1, 1).to_be_bytes());
 
         processor
@@ -2914,12 +2925,12 @@ mod tests {
 
     #[test]
     fn multiple_interrupt_sources_preserve_the_complete_pending_bitmap() {
-        const PENDING: u32 = (1 << 15) | (1 << 10) | (1 << 9) | (1 << 8);
+        const PENDING: u32 = (1 << 15) | (1 << 11) | (1 << 9) | (1 << 8);
 
         let mut processor = R3000::new(super::TEST_CONFIG);
         set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IEC | PENDING);
         set_cp0_register_and_sync(&mut processor, 13, (1 << 9) | (1 << 8));
-        processor.set_hardware_interrupt_lines(0b10_0001);
+        processor.set_hardware_interrupt_lines(0b10_0010);
         let mut bus = RejectingBus;
 
         processor
@@ -2934,10 +2945,10 @@ mod tests {
     #[test]
     fn status_enable_hazard_delays_interrupt_recognition() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        processor.set_hardware_interrupt_lines(1);
+        processor.set_hardware_interrupt_lines(1 << 1);
         processor
             .state
-            .write_gpr(1, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+            .write_gpr(1, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
         let first_pc = processor.state.pc();
 
         step_with_word(&mut processor, encode_cp0_transfer(0x04, 1, 12))
@@ -2946,8 +2957,8 @@ mod tests {
 
         step_with_word(&mut processor, 0).expect("the first hazard instruction should execute");
         assert_eq!(
-            processor.state.read_cp0(12) & (STATUS_IM2 | STATUS_IEC),
-            STATUS_IM2 | STATUS_IEC
+            processor.state.read_cp0(12) & (STATUS_IM3 | STATUS_IEC),
+            STATUS_IM3 | STATUS_IEC
         );
 
         step_with_word(&mut processor, 0).expect("the second hazard instruction should execute");
@@ -2963,15 +2974,15 @@ mod tests {
     #[test]
     fn status_disable_hazard_cannot_cancel_an_effective_interrupt() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
-        processor.state.write_gpr(1, STATUS_BEV | STATUS_IM2);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor.state.write_gpr(1, STATUS_BEV | STATUS_IM3);
 
         step_with_word(&mut processor, encode_cp0_transfer(0x04, 1, 12))
             .expect("MTC0 Status should succeed");
         step_with_word(&mut processor, 0).expect("the raw write should become visible");
         assert_eq!(processor.state.read_cp0(12) & STATUS_IEC, 0);
 
-        processor.set_hardware_interrupt_lines(1);
+        processor.set_hardware_interrupt_lines(1 << 1);
         let expected_epc = processor.state.pc();
         let mut bus = RejectingBus;
 
@@ -3006,8 +3017,8 @@ mod tests {
     #[test]
     fn rfe_reenables_a_held_interrupt_at_the_return_boundary() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
-        processor.set_hardware_interrupt_lines(1);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(1 << 1);
         let return_pc = processor.state.pc();
         let mut bus = RejectingBus;
 
@@ -3032,8 +3043,8 @@ mod tests {
     #[test]
     fn deasserted_hardware_interrupt_does_not_retrigger_after_rfe() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
-        processor.set_hardware_interrupt_lines(1);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(1 << 1);
         let return_pc = processor.state.pc();
         let mut bus = RejectingBus;
 
@@ -3057,8 +3068,8 @@ mod tests {
             install_and_sync_tlb_entry(&mut processor, index, 0, 0, 0);
         }
         processor.reset();
-        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
-        processor.set_hardware_interrupt_lines(1);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(1 << 1);
         assert_eq!(
             processor
                 .state
@@ -3074,21 +3085,21 @@ mod tests {
         assert_eq!(processor.state.read_cp0(1), random);
         assert_eq!(
             processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
-            STATUS_IM2
+            STATUS_IM3
         );
     }
 
     #[test]
     fn reset_preserves_hardware_interrupt_inputs_but_disables_them() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
-        processor.set_hardware_interrupt_lines(0b10_0001);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor.set_hardware_interrupt_lines(0b10_0010);
 
         processor.reset();
 
         assert_eq!(
             processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
-            u32::from(0b10_0001_u8) << 10
+            u32::from(0b10_0010_u8) << 10
         );
         assert_eq!(processor.state.read_cp0(12) & STATUS_IEC, 0);
         step_with_word(&mut processor, 0).expect("reset should leave interrupts disabled");
@@ -3100,6 +3111,14 @@ mod tests {
         let mut processor = R3000::new(super::TEST_CONFIG);
 
         processor.set_hardware_interrupt_lines(0x40);
+    }
+
+    #[test]
+    #[should_panic]
+    fn hardware_interrupt_input_rejects_the_r3010_line() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+
+        processor.set_hardware_interrupt_lines(1);
     }
 
     #[test]
@@ -3132,7 +3151,7 @@ mod tests {
         set_cp0_register_and_sync(&mut enabled_cp1, 12, STATUS_BEV | STATUS_CU1);
         step_with_word(&mut enabled_cp1, cp1_word)
             .expect("an unsupported R3010 operation should complete with U");
-        assert!(enabled_cp1.cp1_interrupt_asserted());
+        assert!(enabled_cp1.state.cp1_interrupt_asserted());
 
         let cases = [
             (encode_coprocessor_operation(2, 0x00, 0), 2, STATUS_CU2),
@@ -3164,6 +3183,137 @@ mod tests {
     }
 
     #[test]
+    fn cp1_exception_enters_interrupt_at_the_faulting_instruction() {
+        const CONTROL_STATUS_UNIMPLEMENTED: u32 = 1 << 17;
+        const DESTINATION: u32 = 0x89ab_cdef;
+
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(
+            &mut processor,
+            12,
+            STATUS_BEV | STATUS_CU1 | STATUS_IM2 | STATUS_IEC,
+        );
+        processor
+            .state
+            .cp1_mut()
+            .write_general_register(2, 0x0000_0001);
+        processor
+            .state
+            .cp1_mut()
+            .write_general_register(20, DESTINATION);
+        let faulting_pc = processor.state.pc();
+        let convert_single_to_word =
+            encode_coprocessor_operation(1, 0x10, (2 << 11) | (20 << 6) | 0x24);
+
+        step_with_word(&mut processor, convert_single_to_word)
+            .expect("the CP1 exception should enter the guest interrupt handler");
+
+        let cause = processor.state.read_cp0(13);
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), faulting_pc);
+        assert_eq!(cause & CAUSE_BD, 0);
+        assert_eq!((cause >> 2) & 0x1f, 0);
+        assert_ne!(cause & STATUS_IM2, 0);
+        assert_ne!(
+            processor.state.read_cp1_control(31) & CONTROL_STATUS_UNIMPLEMENTED,
+            0
+        );
+        assert_eq!(processor.state.read_cp1_general(20), DESTINATION);
+    }
+
+    #[test]
+    fn cp1_exception_in_a_delay_slot_uses_the_branch_epc() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(
+            &mut processor,
+            12,
+            STATUS_BEV | STATUS_CU1 | STATUS_IM2 | STATUS_IEC,
+        );
+        processor
+            .state
+            .cp1_mut()
+            .write_general_register(2, 0x0000_0001);
+        let branch_pc = processor.state.pc();
+
+        step_with_word(&mut processor, encode_immediate(0x04, 0, 0, 2))
+            .expect("BEQ should establish a delay slot");
+        step_with_word(
+            &mut processor,
+            encode_coprocessor_operation(1, 0x10, (2 << 11) | (20 << 6) | 0x24),
+        )
+        .expect("the delay-slot CP1 exception should enter the guest handler");
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), branch_pc);
+        assert_ne!(processor.state.read_cp0(13) & CAUSE_BD, 0);
+    }
+
+    #[test]
+    fn masked_cp1_exception_remains_pending_without_backdating_epc() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_CU1);
+        processor
+            .state
+            .cp1_mut()
+            .write_general_register(2, 0x0000_0001);
+        let faulting_pc = processor.state.pc();
+
+        step_with_word(
+            &mut processor,
+            encode_coprocessor_operation(1, 0x10, (2 << 11) | (20 << 6) | 0x24),
+        )
+        .expect("a masked CP1 exception should complete the processor step");
+
+        assert_eq!(processor.state.pc(), faulting_pc.wrapping_add(4));
+        assert_ne!(processor.state.read_cp0(13) & STATUS_IM2, 0);
+
+        set_cp0_register_and_sync(
+            &mut processor,
+            12,
+            STATUS_BEV | STATUS_CU1 | STATUS_IM2 | STATUS_IEC,
+        );
+        let interrupted_pc = processor.state.pc();
+        processor
+            .step(&mut RejectingBus)
+            .expect("the pending CP1 level should enter the guest handler");
+
+        assert_eq!(processor.state.read_cp0(14), interrupted_pc);
+        assert_ne!(processor.state.read_cp0(14), faulting_pc);
+    }
+
+    #[test]
+    fn cp1_interrupt_owns_input_zero_without_disturbing_external_lines() {
+        const CONTROL_STATUS_UNIMPLEMENTED: u32 = 1 << 17;
+
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.set_hardware_interrupt_lines(1 << 1);
+        processor
+            .state
+            .cp1_mut()
+            .write_control_register(31, CONTROL_STATUS_UNIMPLEMENTED);
+        processor.state.synchronize_cp1_interrupt();
+
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            u32::from(0b000011_u8) << 10
+        );
+
+        processor.set_hardware_interrupt_lines(0b100010);
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            u32::from(0b100011_u8) << 10
+        );
+
+        processor.state.cp1_mut().write_control_register(31, 0);
+        processor.state.synchronize_cp1_interrupt();
+
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            u32::from(0b100010_u8) << 10
+        );
+    }
+
+    #[test]
     fn cp1_transfers_and_branches_observe_their_delays() {
         const CONTROL_STATUS_CONDITION: u32 = 1 << 23;
         const CONTROL_STATUS_UNIMPLEMENTED: u32 = 1 << 17;
@@ -3191,11 +3341,11 @@ mod tests {
         processor.state.write_gpr(2, control_status);
         step_with_word(&mut processor, encode_cp1_transfer(0x06, 2, 31))
             .expect("CTC1 should succeed");
-        assert!(!processor.cp1_interrupt_asserted());
+        assert!(!processor.state.cp1_interrupt_asserted());
 
         let old_condition_branch_pc = processor.state.pc();
         step_with_word(&mut processor, encode_cp1_branch(1, 2)).expect("BC1T should succeed");
-        assert!(processor.cp1_interrupt_asserted());
+        assert!(processor.state.cp1_interrupt_asserted());
         step_with_word(&mut processor, 0).expect("the branch delay slot should succeed");
         assert_eq!(
             processor.state.pc(),
@@ -3221,7 +3371,7 @@ mod tests {
             .expect("the pending CTC1 should succeed");
         processor.reset();
 
-        assert!(processor.cp1_interrupt_asserted());
+        assert!(processor.state.cp1_interrupt_asserted());
     }
 
     #[test]

@@ -303,7 +303,7 @@ impl Ip12 {
     }
 
     fn update_interrupt_lines(&mut self) {
-        let mut interrupt_lines = u8::from(self.cpu.cp1_interrupt_asserted());
+        let mut interrupt_lines = 0;
         if self.bus.local_interrupt_0_asserted() {
             interrupt_lines |= 1 << 1;
         }
@@ -653,13 +653,6 @@ mod tests {
         for _ in 0..6 {
             machine.execute_instruction().unwrap();
         }
-        assert!(machine.cpu.cp1_interrupt_asserted());
-        assert_eq!(
-            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 10),
-            0
-        );
-
-        machine.execute_instruction().unwrap();
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 10),
             0

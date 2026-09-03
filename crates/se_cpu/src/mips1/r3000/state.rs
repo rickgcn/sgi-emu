@@ -9,6 +9,9 @@ use super::{
 };
 
 const RESET_PC: u32 = 0xbfc0_0000;
+const CP1_INTERRUPT_INPUT: usize = 0;
+const MACHINE_INTERRUPT_INPUTS: std::ops::Range<usize> = 1..6;
+const MACHINE_INTERRUPT_MASK: u8 = 0x3e;
 const TLB_PROBE_FAILURE: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -267,7 +270,17 @@ impl State {
     }
 
     pub(super) fn set_hardware_interrupt_lines(&mut self, lines: u8) {
-        self.cp0.set_hardware_interrupt_lines(lines);
+        assert!(lines & !MACHINE_INTERRUPT_MASK == 0);
+        for input in MACHINE_INTERRUPT_INPUTS {
+            self.cp0
+                .set_hardware_interrupt_line(input, lines & (1 << input) != 0);
+        }
+    }
+
+    pub(super) fn synchronize_cp1_interrupt(&mut self) {
+        let asserted = self.cp1_interrupt_asserted();
+        self.cp0
+            .set_hardware_interrupt_line(CP1_INTERRUPT_INPUT, asserted);
     }
 
     pub(super) fn interrupt_requested(&self) -> bool {
@@ -944,17 +957,17 @@ mod tests {
     fn interrupt_input_reuses_exception_boundaries_and_survives_reset() {
         const CAUSE_BD: u32 = 1 << 31;
         const CAUSE_HARDWARE_IP_MASK: u32 = 0x0000_fc00;
-        const STATUS_IM2: u32 = 1 << 10;
+        const STATUS_IM3: u32 = 1 << 11;
 
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
-        state.set_hardware_interrupt_lines(1);
+        state.set_hardware_interrupt_lines(1 << 1);
 
-        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM2);
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM3);
         assert!(!state.interrupt_requested());
 
         state
             .cp0
-            .write_register(12, STATUS_BEV | STATUS_IM2 | STATUS_IEC);
+            .write_register(12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
         state.cp0.commit_pending_functional();
         assert!(state.interrupt_requested());
 
@@ -965,12 +978,12 @@ mod tests {
         assert_eq!(state.read_cp0(14), branch_pc);
         assert_eq!(state.read_cp0(13) & CAUSE_BD, CAUSE_BD);
         assert_eq!((state.read_cp0(13) >> 2) & 0x1f, 0);
-        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM2);
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM3);
         assert!(!state.interrupt_requested());
 
         state.reset();
 
-        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM2);
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM3);
         assert!(!state.interrupt_requested());
     }
 
