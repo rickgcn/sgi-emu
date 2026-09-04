@@ -233,14 +233,9 @@ void MainWindow::create_docks() {
 void MainWindow::create_menus() {
     auto* machine_menu = menuBar()->addMenu(QStringLiteral("Machine"));
     machine_menu->addAction(run_action_);
-    machine_menu->addAction(run_with_record_action_);
     machine_menu->addAction(reset_action_);
     machine_menu->addAction(pause_action_);
     machine_menu->addAction(step_action_);
-    machine_menu->addAction(stop_recording_action_);
-    machine_menu->addSeparator();
-    machine_menu->addAction(open_replay_action_);
-    machine_menu->addAction(stop_replay_action_);
     machine_menu->addSeparator();
     machine_menu->addAction(settings_action_);
 
@@ -252,6 +247,13 @@ void MainWindow::create_menus() {
     view_menu->addAction(tlb_dock_->toggleViewAction());
     view_menu->addAction(cache_dock_->toggleViewAction());
     view_menu->addAction(memory_dock_->toggleViewAction());
+
+    auto* debug_menu = menuBar()->addMenu(QStringLiteral("Debug"));
+    debug_menu->addAction(run_with_record_action_);
+    debug_menu->addAction(stop_recording_action_);
+    debug_menu->addSeparator();
+    debug_menu->addAction(open_replay_action_);
+    debug_menu->addAction(stop_replay_action_);
 }
 
 void MainWindow::create_toolbar() {
@@ -402,9 +404,9 @@ void MainWindow::set_default_dock_layout() {
 void MainWindow::run_with_record() {
     auto path = QFileDialog::getSaveFileName(
         this,
-        QStringLiteral("Run with Record"),
+        QStringLiteral("Run with record"),
         QString(),
-        QStringLiteral("sgi-emu Record (*.serec)"));
+        QStringLiteral("Record file (*.serec)"));
     if (path.isEmpty()) {
         return;
     }
