@@ -29,6 +29,7 @@ public:
     void append_serial(
         const std::vector<std::uint8_t>& serial_a,
         const std::vector<std::uint8_t>& serial_b);
+    void set_input_enabled(bool enabled);
 
 private:
     void send_serial(SerialPortDto port, const std::vector<std::uint8_t>& bytes) const;
@@ -37,13 +38,14 @@ private:
     StatusHandler status_handler_;
     Vt100Widget* serial_a_;
     Vt100Widget* serial_b_;
+    bool input_enabled_;
 };
 
 class MachineOutputSink final : public std::enable_shared_from_this<MachineOutputSink> {
 public:
     explicit MachineOutputSink(SerialConsoleDock* console);
 
-    void publish_serial(
+    void publish_output(
         rust::Slice<const std::uint8_t> serial_a,
         rust::Slice<const std::uint8_t> serial_b) const;
 

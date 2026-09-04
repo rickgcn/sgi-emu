@@ -1,4 +1,9 @@
 //! Lifetime management and commands for the host runtime worker.
+//!
+//! Record and Replay modes are fixed by [`RuntimeConfiguration`] when a new
+//! machine is installed. They cannot be attached to a machine that has
+//! already executed. All modes continue to use the same worker command queue,
+//! instruction batching, and timed-instruction path.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
@@ -14,21 +19,32 @@ use se_machine::machine::{ExecutionError, Machine, MachineNonvolatileState};
 use se_machine::output::MachineOutput;
 use se_machine::serial::SerialPort;
 
-use crate::control::{RuntimeState, RuntimeStatus};
-
-const EXECUTION_BATCH_SIZE: usize = 1024;
+use crate::control::{RuntimeMode, RuntimeState, RuntimeStatus};
+use crate::record::{
+    ExecutionPosition, RecordOutcome, Recorder, ReplaySession, Replayer, TimelineAction,
+};
 
 type CommandReply<T> = Sender<Result<T, CommandRejection>>;
 
+fn checkpoint_digest(machine: &Machine) -> [u8; 32] {
+    let DebugResponse::MachineStateFingerprint(digest) =
+        machine.debug(DebugRequest::MachineStateFingerprint)
+    else {
+        unreachable!("machine state fingerprint request returned the wrong response")
+    };
+    digest
+}
+
 enum Command {
     Configure {
-        machine: Box<Machine>,
+        configuration: Box<RuntimeConfiguration>,
         reply: CommandReply<RuntimeStatus>,
     },
     Run(CommandReply<RuntimeStatus>),
     Reset(CommandReply<RuntimeStatus>),
     Pause(CommandReply<RuntimeStatus>),
     Step(CommandReply<RuntimeStatus>),
+    StopRecording(CommandReply<RuntimeStatus>),
     Status(CommandReply<RuntimeStatus>),
     ToggleBreakpoint {
         address: u32,
@@ -49,6 +65,47 @@ enum Command {
     },
     ClearOutputHandler(CommandReply<RuntimeStatus>),
     Shutdown(Sender<Option<MachineNonvolatileState>>),
+}
+
+/// Complete cold-constructed machine and deterministic session mode.
+pub struct RuntimeConfiguration {
+    machine: Machine,
+    mode: RuntimeConfigurationMode,
+}
+
+enum RuntimeConfigurationMode {
+    Normal,
+    Recording(Recorder),
+    Replaying(Box<Replayer>),
+}
+
+impl RuntimeConfiguration {
+    /// Creates an ordinary machine configuration.
+    #[must_use]
+    pub fn normal(machine: Machine) -> Self {
+        Self {
+            machine,
+            mode: RuntimeConfigurationMode::Normal,
+        }
+    }
+
+    /// Creates a cold-start recording configuration.
+    #[must_use]
+    pub fn recording(machine: Machine, recorder: Recorder) -> Self {
+        Self {
+            machine,
+            mode: RuntimeConfigurationMode::Recording(recorder),
+        }
+    }
+
+    /// Creates a cold-start replay configuration.
+    #[must_use]
+    pub fn replaying(machine: Machine, replayer: Replayer) -> Self {
+        Self {
+            machine,
+            mode: RuntimeConfigurationMode::Replaying(Box::new(replayer)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,8 +202,21 @@ impl Runtime {
     ///
     /// Returns [`RuntimeError`] when the worker is unavailable.
     pub fn configure(&self, machine: Machine) -> Result<RuntimeStatus, RuntimeError> {
+        self.configure_with(RuntimeConfiguration::normal(machine))
+    }
+
+    /// Replaces the current machine with a complete cold-start configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] when Record/Replay initialization fails or the
+    /// worker is unavailable.
+    pub fn configure_with(
+        &self,
+        configuration: RuntimeConfiguration,
+    ) -> Result<RuntimeStatus, RuntimeError> {
         self.request(|reply| Command::Configure {
-            machine: Box::new(machine),
+            configuration: Box::new(configuration),
             reply,
         })
     }
@@ -185,6 +255,19 @@ impl Runtime {
     /// Returns [`RuntimeError`] when the runtime is not paused or the worker is unavailable.
     pub fn step(&self) -> Result<RuntimeStatus, RuntimeError> {
         self.request(Command::Step)
+    }
+
+    /// Finalizes the active Record and keeps the current execution state.
+    ///
+    /// This method flushes and synchronizes the Record file before returning
+    /// and may therefore block on host file I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] when the runtime is not recording, finalizing
+    /// the file fails, or the worker is unavailable.
+    pub fn stop_recording(&self) -> Result<RuntimeStatus, RuntimeError> {
+        self.request(Command::StopRecording)
     }
 
     /// Samples runtime status.
@@ -312,19 +395,84 @@ impl Drop for Runtime {
     }
 }
 
+const EXECUTION_BATCH_SIZE: usize = 1024;
+const CHECKPOINT_INTERVAL: u64 = 1_000_000;
+
 struct Worker {
     machine: Option<Machine>,
     cpu_clock: Option<CpuClock>,
     virtual_instant: VirtualInstant,
-    machine_output: MachineOutput,
+    frontend_output: MachineOutput,
     output_handler: Option<Box<dyn FnMut(MachineOutput) + Send + 'static>>,
     pending_serial: [VecDeque<u8>; 2],
     state: RuntimeState,
+    mode: ActiveMode,
+    position: ExecutionPosition,
+    preserved_nonvolatile_state: Option<MachineNonvolatileState>,
     revision: u64,
     completed_instructions: u64,
     last_error: Option<String>,
+    session_error: Option<String>,
     breakpoints: BTreeSet<u32>,
     ignore_breakpoint_once: Option<u32>,
+}
+
+enum ActiveMode {
+    Normal,
+    Recording(RecordingSession),
+    Replaying(ReplaySession),
+    ReplayCompleted(ReplaySession),
+    ReplayDiverged {
+        session: ReplaySession,
+        reason: String,
+    },
+}
+
+struct RecordingSession {
+    recorder: Recorder,
+    next_checkpoint_instruction: Option<u64>,
+}
+
+impl RecordingSession {
+    const fn new(recorder: Recorder) -> Self {
+        Self {
+            recorder,
+            next_checkpoint_instruction: Some(CHECKPOINT_INTERVAL),
+        }
+    }
+
+    fn checkpoint_due(&self, position: ExecutionPosition) -> bool {
+        self.next_checkpoint_instruction == Some(position.completed_instructions)
+    }
+
+    fn advance_checkpoint_deadline(&mut self) {
+        self.next_checkpoint_instruction = self
+            .next_checkpoint_instruction
+            .and_then(|deadline| deadline.checked_add(CHECKPOINT_INTERVAL));
+    }
+
+    const fn reset_checkpoint_deadline(&mut self) {
+        self.next_checkpoint_instruction = Some(CHECKPOINT_INTERVAL);
+    }
+}
+
+impl ActiveMode {
+    const fn public_mode(&self) -> RuntimeMode {
+        match self {
+            Self::Normal => RuntimeMode::Normal,
+            Self::Recording(_) => RuntimeMode::Recording,
+            Self::Replaying(_) => RuntimeMode::Replaying,
+            Self::ReplayCompleted(_) => RuntimeMode::ReplayCompleted,
+            Self::ReplayDiverged { .. } => RuntimeMode::ReplayDiverged,
+        }
+    }
+
+    const fn is_replay(&self) -> bool {
+        matches!(
+            self,
+            Self::Replaying(_) | Self::ReplayCompleted(_) | Self::ReplayDiverged { .. }
+        )
+    }
 }
 
 impl Worker {
@@ -341,13 +489,17 @@ impl Worker {
             machine,
             cpu_clock,
             virtual_instant: VirtualInstant::ZERO,
-            machine_output: MachineOutput::default(),
+            frontend_output: MachineOutput::default(),
             output_handler: None,
             pending_serial: [VecDeque::new(), VecDeque::new()],
             state,
+            mode: ActiveMode::Normal,
+            position: ExecutionPosition::default(),
+            preserved_nonvolatile_state: None,
             revision: 0,
             completed_instructions: 0,
             last_error: None,
+            session_error: None,
             breakpoints: BTreeSet::new(),
             ignore_breakpoint_once: None,
         }
@@ -384,25 +536,12 @@ impl Worker {
 
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
-            Command::Configure { machine, reply } => {
-                let mut machine = *machine;
-                if let Some(state) = self.machine.as_ref().map(Machine::nonvolatile_state) {
-                    machine.restore_nonvolatile_state(state, 0);
-                }
-                self.cpu_clock = Some(CpuClock::new(machine.cpu_frequency_hz()));
-                self.machine = Some(machine);
-                self.virtual_instant = VirtualInstant::ZERO;
-                self.machine_output = MachineOutput::default();
-                self.pending_serial = [VecDeque::new(), VecDeque::new()];
-                self.state = RuntimeState::Paused;
-                self.last_error = None;
-                self.breakpoints.clear();
-                self.ignore_breakpoint_once = None;
-                self.advance_revision();
-                send_reply(reply, Ok(self.status()));
-            }
+            Command::Configure {
+                configuration,
+                reply,
+            } => send_reply(reply, self.configure(*configuration)),
             Command::Run(reply) => {
-                let result = self.require_machine().map(|()| {
+                let result = self.require_runnable().map(|()| {
                     let address = self.machine.as_ref().map(Machine::execution_address);
                     self.ignore_breakpoint_once =
                         address.filter(|current| self.breakpoints.contains(current));
@@ -413,22 +552,39 @@ impl Worker {
                 send_reply(reply, result);
             }
             Command::Reset(reply) => {
-                let result = self.require_machine().map(|()| {
-                    if let Some(machine) = self.machine.as_mut() {
-                        machine.reset();
+                let result = self.require_manual_reset().and_then(|()| {
+                    let next_epoch = if matches!(self.mode, ActiveMode::Recording(_)) {
+                        Some(
+                            self.position
+                                .epoch
+                                .checked_add(1)
+                                .ok_or_else(|| rejection("Record epoch counter overflow"))?,
+                        )
+                    } else {
+                        None
+                    };
+                    if let ActiveMode::Recording(session) = &self.mode {
+                        session
+                            .recorder
+                            .record_reset(self.position)
+                            .map_err(|error| rejection_owned(error.to_string()))?;
                     }
-                    if let Some(clock) = self.cpu_clock.as_mut() {
-                        clock.reset();
+                    self.reset_machine();
+                    if let Some(next_epoch) = next_epoch {
+                        self.position = ExecutionPosition {
+                            epoch: next_epoch,
+                            completed_instructions: 0,
+                        };
                     }
-                    self.virtual_instant = VirtualInstant::ZERO;
-                    self.machine_output = MachineOutput::default();
-                    self.pending_serial = [VecDeque::new(), VecDeque::new()];
                     self.state = RuntimeState::Paused;
-                    self.last_error = None;
-                    self.ignore_breakpoint_once = None;
+                    self.record_checkpoint()?;
+                    if let ActiveMode::Recording(session) = &mut self.mode {
+                        session.reset_checkpoint_deadline();
+                    }
                     self.advance_revision();
-                    self.status()
+                    Ok(self.status())
                 });
+                self.check_record_failure();
                 send_reply(reply, result);
             }
             Command::Pause(reply) => {
@@ -442,6 +598,11 @@ impl Worker {
             }
             Command::Step(reply) => {
                 let result = self.step_once();
+                send_reply(reply, result);
+            }
+            Command::StopRecording(reply) => {
+                let result = self.stop_recording(RecordOutcome::UserStopped);
+                self.check_record_failure();
                 send_reply(reply, result);
             }
             Command::Status(reply) => send_reply(reply, Ok(self.status())),
@@ -463,12 +624,13 @@ impl Worker {
                 send_reply(reply, result);
             }
             Command::SendSerial { port, bytes, reply } => {
-                let result = self.require_machine().map(|()| {
+                let result = self.require_live_serial().and_then(|()| {
                     self.pending_serial[serial_port_index(port)].extend(bytes);
-                    self.refill_serial_input();
+                    self.refill_serial_input()?;
                     self.advance_revision();
-                    self.status()
+                    Ok(self.status())
                 });
+                self.check_record_failure();
                 send_reply(reply, result);
             }
             Command::SetOutputHandler { handler, reply } => {
@@ -480,7 +642,14 @@ impl Worker {
                 send_reply(reply, Ok(self.status()));
             }
             Command::Shutdown(reply) => {
-                let state = self.machine.as_ref().map(Machine::nonvolatile_state);
+                if matches!(self.mode, ActiveMode::Recording(_)) {
+                    let _ = self.stop_recording(RecordOutcome::Shutdown);
+                }
+                let state = if self.mode.is_replay() {
+                    self.preserved_nonvolatile_state.clone()
+                } else {
+                    self.machine.as_ref().map(Machine::nonvolatile_state)
+                };
                 let _ = reply.send(state);
                 return true;
             }
@@ -488,15 +657,350 @@ impl Worker {
         false
     }
 
+    fn configure(
+        &mut self,
+        configuration: RuntimeConfiguration,
+    ) -> Result<RuntimeStatus, CommandRejection> {
+        if matches!(self.mode, ActiveMode::Recording(_)) {
+            return Err(rejection(
+                "the current recording must be stopped before configuring another machine",
+            ));
+        }
+        if self.mode.is_replay() && !matches!(&configuration.mode, RuntimeConfigurationMode::Normal)
+        {
+            return Err(rejection(
+                "the current Replay must be stopped before starting another session",
+            ));
+        }
+        let RuntimeConfiguration { mut machine, mode } = configuration;
+        let retained_state = if self.mode.is_replay() {
+            self.preserved_nonvolatile_state.clone()
+        } else {
+            self.machine.as_ref().map(Machine::nonvolatile_state)
+        };
+        let mut next_preserved_state = None;
+        let next_mode = match mode {
+            RuntimeConfigurationMode::Normal => {
+                if let Some(state) = retained_state {
+                    machine.restore_nonvolatile_state(state, 0);
+                }
+                ActiveMode::Normal
+            }
+            RuntimeConfigurationMode::Recording(recorder) => {
+                let digest = checkpoint_digest(&machine);
+                recorder
+                    .record_checkpoint(ExecutionPosition::default(), digest)
+                    .map_err(|error| rejection_owned(error.to_string()))?;
+                ActiveMode::Recording(RecordingSession::new(recorder))
+            }
+            RuntimeConfigurationMode::Replaying(replayer) => {
+                next_preserved_state = retained_state;
+                ActiveMode::Replaying((*replayer).into_session())
+            }
+        };
+        self.cpu_clock = Some(CpuClock::new(machine.cpu_frequency_hz()));
+        self.machine = Some(machine);
+        self.virtual_instant = VirtualInstant::ZERO;
+        self.frontend_output = MachineOutput::default();
+        self.pending_serial = [VecDeque::new(), VecDeque::new()];
+        self.state = RuntimeState::Paused;
+        self.mode = next_mode;
+        self.position = ExecutionPosition::default();
+        self.preserved_nonvolatile_state = next_preserved_state;
+        self.last_error = None;
+        self.session_error = None;
+        self.breakpoints.clear();
+        self.ignore_breakpoint_once = None;
+        if matches!(self.mode, ActiveMode::Replaying(_))
+            && let Err(reason) = self.process_replay_boundary()
+        {
+            self.set_replay_divergence(reason);
+        }
+        self.advance_revision();
+        Ok(self.status())
+    }
+
+    fn stop_recording(
+        &mut self,
+        outcome: RecordOutcome,
+    ) -> Result<RuntimeStatus, CommandRejection> {
+        let recorder = match &self.mode {
+            ActiveMode::Recording(session) => session.recorder.clone(),
+            _ => return Err(rejection("no recording is active")),
+        };
+        self.record_checkpoint()?;
+        if let Err(error) = recorder.finalize(self.position, &outcome) {
+            let reason = error.to_string();
+            self.set_record_failure(recorder, reason.clone());
+            return Err(rejection_owned(reason));
+        }
+        self.mode = ActiveMode::Normal;
+        self.session_error = None;
+        self.advance_revision();
+        Ok(self.status())
+    }
+
+    fn process_replay_boundary(&mut self) -> Result<(), String> {
+        loop {
+            let action = match &self.mode {
+                ActiveMode::Replaying(session) => match session.next_entry() {
+                    Some(entry) if entry.position < self.position => {
+                        return Err(format!(
+                            "Replay passed Timeline entry at epoch {}, instruction {}",
+                            entry.position.epoch, entry.position.completed_instructions
+                        ));
+                    }
+                    Some(entry) if entry.position == self.position => Some(entry.action.clone()),
+                    _ => None,
+                },
+                _ => return Ok(()),
+            };
+            let Some(action) = action else {
+                break;
+            };
+            let ActiveMode::Replaying(session) = &mut self.mode else {
+                return Ok(());
+            };
+            session.advance();
+            match action {
+                TimelineAction::SerialByte { port, value } => {
+                    let consumed = self
+                        .machine
+                        .as_mut()
+                        .expect("Replay requires a configured machine")
+                        .receive_serial(port, &[value]);
+                    if consumed != 1 {
+                        return Err(format!(
+                            "Replay serial byte was not accepted at epoch {}, instruction {}",
+                            self.position.epoch, self.position.completed_instructions
+                        ));
+                    }
+                }
+                TimelineAction::Reset => {
+                    let next_epoch = self
+                        .position
+                        .epoch
+                        .checked_add(1)
+                        .ok_or_else(|| String::from("Replay epoch counter overflow"))?;
+                    self.reset_machine();
+                    self.position = ExecutionPosition {
+                        epoch: next_epoch,
+                        completed_instructions: 0,
+                    };
+                }
+                TimelineAction::Checkpoint { digest } => {
+                    let actual = checkpoint_digest(
+                        self.machine
+                            .as_ref()
+                            .expect("Replay requires a configured machine"),
+                    );
+                    if actual != digest {
+                        return Err(format!(
+                            "Replay checkpoint mismatch at epoch {}, instruction {}",
+                            self.position.epoch, self.position.completed_instructions
+                        ));
+                    }
+                }
+            }
+        }
+
+        let complete = match &self.mode {
+            ActiveMode::Replaying(session) => {
+                if self.position > session.final_position() {
+                    return Err(String::from("Replay passed its final position"));
+                }
+                if self.position != session.final_position() {
+                    false
+                } else {
+                    if !session.timeline_consumed() {
+                        return Err(String::from(
+                            "Replay reached its footer before consuming the Timeline",
+                        ));
+                    }
+                    matches!(
+                        session.outcome(),
+                        RecordOutcome::UserStopped | RecordOutcome::Shutdown
+                    )
+                }
+            }
+            _ => return Ok(()),
+        };
+        if complete {
+            self.complete_replay();
+        }
+        Ok(())
+    }
+
+    fn replay_boundary_due(&self) -> bool {
+        match &self.mode {
+            ActiveMode::Replaying(session) => self.position >= session.next_boundary_position(),
+            _ => false,
+        }
+    }
+
+    fn record_checkpoint(&self) -> Result<(), CommandRejection> {
+        let ActiveMode::Recording(session) = &self.mode else {
+            return Ok(());
+        };
+        let digest = checkpoint_digest(
+            self.machine
+                .as_ref()
+                .expect("a deterministic session requires a machine"),
+        );
+        session
+            .recorder
+            .record_checkpoint(self.position, digest)
+            .map_err(|error| rejection_owned(error.to_string()))
+    }
+
+    fn record_checkpoint_if_due(&mut self) -> Result<(), CommandRejection> {
+        let due = match &self.mode {
+            ActiveMode::Recording(session) => session.checkpoint_due(self.position),
+            _ => false,
+        };
+        if !due {
+            return Ok(());
+        }
+        self.record_checkpoint()?;
+        let ActiveMode::Recording(session) = &mut self.mode else {
+            unreachable!("a successful Recording checkpoint preserves the session mode");
+        };
+        session.advance_checkpoint_deadline();
+        Ok(())
+    }
+
+    fn handle_execution_error(&mut self, error: ExecutionError) {
+        let error_text = error.to_string();
+        let address = self.machine.as_ref().map_or(0, Machine::execution_address);
+        self.last_error = Some(error_text.clone());
+        self.check_record_failure();
+        self.check_replay_storage_failure();
+
+        if matches!(self.mode, ActiveMode::Replaying(_)) {
+            let expected = match &self.mode {
+                ActiveMode::Replaying(session) => {
+                    self.position == session.final_position()
+                        && session.timeline_consumed()
+                        && matches!(
+                            session.outcome(),
+                            RecordOutcome::ExecutionError {
+                                address: expected_address,
+                                description,
+                            } if *expected_address == address && description == &error_text
+                        )
+                }
+                _ => false,
+            };
+            if expected {
+                self.complete_replay();
+            } else {
+                self.set_replay_divergence(format!(
+                    "unexpected execution error at 0x{address:08x}: {error_text}"
+                ));
+            }
+            return;
+        }
+
+        if matches!(self.mode, ActiveMode::Recording(_)) {
+            let outcome = RecordOutcome::ExecutionError {
+                address,
+                description: error_text,
+            };
+            if let Err(rejection) = self.stop_recording(outcome) {
+                self.session_error = Some(rejection.reason);
+            }
+        }
+    }
+
+    fn check_record_failure(&mut self) {
+        let failure = match &self.mode {
+            ActiveMode::Recording(session) => session
+                .recorder
+                .failure()
+                .map(|reason| (session.recorder.clone(), reason)),
+            _ => None,
+        };
+        if let Some((recorder, reason)) = failure {
+            self.set_record_failure(recorder, reason);
+        }
+    }
+
+    fn check_replay_storage_failure(&mut self) {
+        let failure = match &self.mode {
+            ActiveMode::Replaying(session) => session.storage_failure(),
+            _ => None,
+        };
+        if let Some(reason) = failure {
+            self.set_replay_divergence(reason);
+        }
+    }
+
+    fn set_record_failure(&mut self, recorder: Recorder, reason: String) {
+        recorder.disable();
+        self.state = RuntimeState::Paused;
+        self.mode = ActiveMode::Normal;
+        self.session_error = Some(reason);
+        self.advance_revision();
+    }
+
+    fn set_replay_divergence(&mut self, reason: String) {
+        if let ActiveMode::Replaying(session) = mem::replace(&mut self.mode, ActiveMode::Normal) {
+            self.state = RuntimeState::Paused;
+            self.session_error = Some(reason.clone());
+            self.mode = ActiveMode::ReplayDiverged { session, reason };
+            self.advance_revision();
+        }
+    }
+
+    fn complete_replay(&mut self) {
+        if let ActiveMode::Replaying(session) = mem::replace(&mut self.mode, ActiveMode::Normal) {
+            self.state = RuntimeState::Paused;
+            self.session_error = None;
+            self.mode = ActiveMode::ReplayCompleted(session);
+            self.advance_revision();
+        }
+    }
+
+    fn fail_session(&mut self, reason: String) {
+        match mem::replace(&mut self.mode, ActiveMode::Normal) {
+            ActiveMode::Recording(session) => {
+                self.set_record_failure(session.recorder, reason);
+            }
+            ActiveMode::Replaying(session) => {
+                self.state = RuntimeState::Paused;
+                self.session_error = Some(reason.clone());
+                self.mode = ActiveMode::ReplayDiverged { session, reason };
+                self.advance_revision();
+            }
+            mode => self.mode = mode,
+        }
+    }
+
+    fn reset_machine(&mut self) {
+        self.machine
+            .as_mut()
+            .expect("reset requires a configured machine")
+            .reset();
+        self.cpu_clock
+            .as_mut()
+            .expect("reset requires a CPU clock")
+            .reset();
+        self.virtual_instant = VirtualInstant::ZERO;
+        self.frontend_output = MachineOutput::default();
+        self.pending_serial = [VecDeque::new(), VecDeque::new()];
+        self.last_error = None;
+        self.ignore_breakpoint_once = None;
+    }
+
     fn step_once(&mut self) -> Result<RuntimeStatus, CommandRejection> {
-        self.require_machine()?;
+        self.require_runnable()?;
         if self.state == RuntimeState::Running {
             return Err(rejection("single-step requires a paused machine"));
         }
 
         match self.execute_timed_instruction() {
             Ok(()) => self.last_error = None,
-            Err(error) => self.last_error = Some(error.to_string()),
+            Err(error) => self.handle_execution_error(error),
         }
         self.state = RuntimeState::Paused;
         self.ignore_breakpoint_once = None;
@@ -505,27 +1009,72 @@ impl Worker {
     }
 
     fn execute_batch(&mut self) {
+        match self.mode.public_mode() {
+            RuntimeMode::Normal => self.execute_normal_batch(),
+            RuntimeMode::Recording => self.execute_recording_batch(),
+            RuntimeMode::Replaying => self.execute_replay_batch(),
+            RuntimeMode::ReplayCompleted | RuntimeMode::ReplayDiverged => {}
+        }
+    }
+
+    fn execute_normal_batch(&mut self) {
         for _ in 0..EXECUTION_BATCH_SIZE {
-            let Some(machine) = self.machine.as_mut() else {
-                self.state = RuntimeState::Unconfigured;
-                return;
-            };
-            let address = machine.execution_address();
-            if self.ignore_breakpoint_once == Some(address) {
-                self.ignore_breakpoint_once = None;
-            } else if self.breakpoints.contains(&address) {
-                self.state = RuntimeState::Paused;
-                self.advance_revision();
+            if self.pause_for_breakpoint() {
                 return;
             }
-
-            match self.execute_timed_instruction() {
+            match self.execute_normal_instruction() {
                 Ok(()) => {
                     self.last_error = None;
                     self.advance_revision();
                 }
                 Err(error) => {
-                    self.last_error = Some(error.to_string());
+                    self.handle_execution_error(error);
+                    self.state = RuntimeState::Paused;
+                    self.advance_revision();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn execute_recording_batch(&mut self) {
+        for _ in 0..EXECUTION_BATCH_SIZE {
+            if self.pause_for_breakpoint() {
+                return;
+            }
+            match self.execute_recording_instruction() {
+                Ok(()) => {
+                    self.last_error = None;
+                    self.advance_revision();
+                    if self.state != RuntimeState::Running {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    self.handle_execution_error(error);
+                    self.state = RuntimeState::Paused;
+                    self.advance_revision();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn execute_replay_batch(&mut self) {
+        for _ in 0..EXECUTION_BATCH_SIZE {
+            if self.pause_for_breakpoint() {
+                return;
+            }
+            match self.execute_replay_instruction() {
+                Ok(()) => {
+                    self.last_error = None;
+                    self.advance_revision();
+                    if self.state != RuntimeState::Running {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    self.handle_execution_error(error);
                     self.state = RuntimeState::Paused;
                     self.advance_revision();
                     return;
@@ -535,11 +1084,89 @@ impl Worker {
     }
 
     fn execute_timed_instruction(&mut self) -> Result<(), ExecutionError> {
+        match self.mode.public_mode() {
+            RuntimeMode::Normal => self.execute_normal_instruction(),
+            RuntimeMode::Recording => self.execute_recording_instruction(),
+            RuntimeMode::Replaying => self.execute_replay_instruction(),
+            RuntimeMode::ReplayCompleted | RuntimeMode::ReplayDiverged => Ok(()),
+        }
+    }
+
+    fn execute_normal_instruction(&mut self) -> Result<(), ExecutionError> {
+        self.execute_machine_instruction()?;
+        if let Err(error) = self.refill_serial_input() {
+            unreachable!(
+                "Normal serial input cannot write a Record: {}",
+                error.reason
+            );
+        }
+        self.deliver_output();
+        Ok(())
+    }
+
+    fn execute_recording_instruction(&mut self) -> Result<(), ExecutionError> {
+        self.execute_machine_instruction()?;
+        if !self.advance_session_position() {
+            return Ok(());
+        }
+        if let Err(error) = self.refill_serial_input() {
+            self.fail_session(error.reason);
+            self.deliver_output();
+            return Ok(());
+        }
+        self.check_record_failure();
+        if let Err(error) = self.record_checkpoint_if_due() {
+            self.fail_session(error.reason);
+        }
+        self.deliver_output();
+        Ok(())
+    }
+
+    fn execute_replay_instruction(&mut self) -> Result<(), ExecutionError> {
+        let expected_execution_error = match &self.mode {
+            ActiveMode::Replaying(session) => {
+                self.position == session.final_position()
+                    && session.timeline_consumed()
+                    && matches!(session.outcome(), RecordOutcome::ExecutionError { .. })
+            }
+            _ => false,
+        };
+        let instruction_result = self
+            .machine
+            .as_mut()
+            .expect("Replay requires a configured machine")
+            .execute_instruction();
+        if instruction_result.is_ok() && expected_execution_error {
+            self.set_replay_divergence(String::from(
+                "Replay expected the recorded execution error, but the instruction succeeded",
+            ));
+            return Ok(());
+        }
+        instruction_result?;
+        self.finish_machine_instruction();
+        if !self.advance_session_position() {
+            return Ok(());
+        }
+        self.check_replay_storage_failure();
+        if self.replay_boundary_due()
+            && let Err(reason) = self.process_replay_boundary()
+        {
+            self.set_replay_divergence(reason);
+        }
+        self.deliver_output();
+        Ok(())
+    }
+
+    fn execute_machine_instruction(&mut self) -> Result<(), ExecutionError> {
         self.machine
             .as_mut()
             .expect("a timed instruction requires a configured machine")
             .execute_instruction()?;
-        self.refill_serial_input();
+        self.finish_machine_instruction();
+        Ok(())
+    }
+
+    fn finish_machine_instruction(&mut self) {
         let elapsed = self
             .cpu_clock
             .as_mut()
@@ -549,19 +1176,45 @@ impl Worker {
         self.machine
             .as_mut()
             .expect("a timed instruction requires a configured machine")
-            .advance_time(elapsed, &mut self.machine_output);
-        self.deliver_output();
+            .advance_time(elapsed, &mut self.frontend_output);
         self.completed_instructions = self.completed_instructions.wrapping_add(1);
-        Ok(())
     }
 
-    fn refill_serial_input(&mut self) {
+    fn advance_session_position(&mut self) -> bool {
+        let Some(next) = self.position.completed_instructions.checked_add(1) else {
+            self.fail_session(String::from("Record/Replay instruction counter overflow"));
+            return false;
+        };
+        self.position.completed_instructions = next;
+        true
+    }
+
+    fn pause_for_breakpoint(&mut self) -> bool {
+        let Some(machine) = self.machine.as_ref() else {
+            self.state = RuntimeState::Unconfigured;
+            return true;
+        };
+        let address = machine.execution_address();
+        if self.ignore_breakpoint_once == Some(address) {
+            self.ignore_breakpoint_once = None;
+            false
+        } else if self.breakpoints.contains(&address) {
+            self.state = RuntimeState::Paused;
+            self.advance_revision();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn refill_serial_input(&mut self) -> Result<(), CommandRejection> {
         if self.pending_serial[0].is_empty() && self.pending_serial[1].is_empty() {
-            return;
+            return Ok(());
         }
 
-        let Some(machine) = self.machine.as_mut() else {
-            return;
+        let recorder = match &self.mode {
+            ActiveMode::Recording(session) => Some(session.recorder.clone()),
+            _ => None,
         };
         for (index, port) in [SerialPort::A, SerialPort::B].into_iter().enumerate() {
             let pending = &mut self.pending_serial[index];
@@ -569,19 +1222,31 @@ impl Worker {
                 continue;
             }
 
-            let consumed = machine.receive_serial(port, pending.make_contiguous());
+            let consumed = self
+                .machine
+                .as_mut()
+                .expect("serial input requires a configured machine")
+                .receive_serial(port, pending.make_contiguous());
             if consumed != 0 {
+                if let Some(recorder) = &recorder {
+                    for value in pending.iter().take(consumed).copied() {
+                        recorder
+                            .record_serial_byte(self.position, port, value)
+                            .map_err(|error| rejection_owned(error.to_string()))?;
+                    }
+                }
                 pending.drain(..consumed);
             }
         }
+        Ok(())
     }
 
     fn deliver_output(&mut self) {
-        if self.machine_output.is_empty() {
+        if self.frontend_output.is_empty() {
             return;
         }
 
-        let output = mem::take(&mut self.machine_output);
+        let output = mem::take(&mut self.frontend_output);
         if let Some(handler) = self.output_handler.as_mut() {
             handler(output);
         }
@@ -595,11 +1260,52 @@ impl Worker {
         }
     }
 
+    fn require_runnable(&self) -> Result<(), CommandRejection> {
+        self.require_machine()?;
+        match self.mode {
+            ActiveMode::ReplayCompleted(_) => Err(rejection("replay is complete")),
+            ActiveMode::ReplayDiverged { .. } => Err(rejection("replay has diverged")),
+            _ => Ok(()),
+        }
+    }
+
+    fn require_manual_reset(&self) -> Result<(), CommandRejection> {
+        self.require_machine()?;
+        if self.mode.is_replay() {
+            Err(rejection("manual reset is disabled during replay"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn require_live_serial(&self) -> Result<(), CommandRejection> {
+        self.require_machine()?;
+        if self.mode.is_replay() {
+            Err(rejection("live serial input is disabled during replay"))
+        } else {
+            Ok(())
+        }
+    }
+
     fn status(&self) -> RuntimeStatus {
+        let session_error = match &self.mode {
+            ActiveMode::ReplayDiverged { reason, .. } => Some(reason.clone()),
+            _ => self.session_error.clone(),
+        };
+        let replay_final_position = match &self.mode {
+            ActiveMode::Replaying(session)
+            | ActiveMode::ReplayCompleted(session)
+            | ActiveMode::ReplayDiverged { session, .. } => Some(session.final_position()),
+            _ => None,
+        };
         RuntimeStatus {
             state: self.state,
             revision: self.revision,
             completed_instructions: self.completed_instructions,
+            mode: self.mode.public_mode(),
+            position: self.position,
+            replay_final_position,
+            session_error,
             last_error: self.last_error.clone(),
         }
     }
@@ -660,6 +1366,10 @@ fn rejection(reason: &str) -> CommandRejection {
     }
 }
 
+fn rejection_owned(reason: String) -> CommandRejection {
+    CommandRejection { reason }
+}
+
 const fn serial_port_index(port: SerialPort) -> usize {
     match port {
         SerialPort::A => 0,
@@ -676,18 +1386,23 @@ mod tests {
     use std::env;
     use std::fs;
     use std::io;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, mpsc};
 
     use se_core::time::ATTOSECONDS_PER_SECOND;
     use se_device::storage::BlockStorage;
     use se_float::backend::Backend;
-    use se_machine::indigo::ip12::Ip12;
     use se_machine::indigo::ip12::debug::{DebugRequest, DebugResponse, MemoryAddressSpace};
+    use se_machine::indigo::ip12::{Ip12, Ip12NonvolatileState, Ip12NonvolatileStateParts};
     use se_machine::machine::Machine;
+    use se_machine::machine::MachineNonvolatileState;
     use se_machine::serial::SerialPort;
 
-    use super::{CpuClock, Runtime, RuntimeError, serial_port_index};
-    use crate::control::RuntimeState;
+    use super::{
+        CpuClock, Runtime, RuntimeConfiguration, RuntimeError, checkpoint_digest, serial_port_index,
+    };
+    use crate::control::{RuntimeMode, RuntimeState};
+    use crate::record::{ExecutionPosition, MediaIdentity, RecordManifest, Recorder, Replayer};
 
     const PROM_BYTES: usize = 0x40000;
     const EXTERNAL_PROM_EXECUTION_BUDGET: usize = 400_000_000;
@@ -778,35 +1493,52 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         machine_with_instructions(&instructions)
     }
 
+    fn record_manifest() -> RecordManifest {
+        RecordManifest::new(
+            String::from("indigo-ip12"),
+            String::from("softfloat"),
+            MediaIdentity::from_bytes(Path::new("prom.bin"), &[0; PROM_BYTES]),
+            None,
+            None,
+            vec![0x12, 0x34, 0x56],
+        )
+    }
+
+    fn started_recorder(path: &Path) -> Recorder {
+        let recorder = Recorder::create(path).unwrap();
+        recorder.start(&record_manifest()).unwrap();
+        recorder
+    }
+
+    fn record_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sgi-emu-runtime-{name}-{}.serec",
+            std::process::id()
+        ))
+    }
+
+    fn distinct_nonvolatile_state() -> MachineNonvolatileState {
+        let mut words = [u16::MAX; 64];
+        words[5] = 0x1234;
+        MachineNonvolatileState::IndigoIp12(
+            Ip12NonvolatileState::try_from_parts(Ip12NonvolatileStateParts {
+                nvram_words: words,
+                rtc_registers: [0; 32],
+                rtc_alternate_control_registers: [0; 4],
+                rtc_prescaler_phase_attoseconds: 0,
+                rtc_millisecond_within_hundredth: 0,
+                rtc_oscillator_failed: false,
+                rtc_single_supply: false,
+                rtc_alarm_match_active: false,
+            })
+            .unwrap(),
+        )
+    }
+
     fn execute_instructions(worker: &mut super::Worker, count: usize) {
         for _ in 0..count {
             worker.execute_timed_instruction().unwrap();
         }
-    }
-
-    #[test]
-    fn unconfigured_runtime_rejects_execution_and_shuts_down_cleanly() {
-        let runtime = Runtime::new_unconfigured().unwrap();
-
-        assert_eq!(runtime.status().unwrap().state, RuntimeState::Unconfigured);
-        assert!(matches!(
-            runtime.step(),
-            Err(RuntimeError::CommandRejected { .. })
-        ));
-        assert!(matches!(
-            runtime.send_serial(SerialPort::A, b"A"),
-            Err(RuntimeError::CommandRejected { .. })
-        ));
-        assert_eq!(runtime.shutdown(), Ok(None));
-    }
-
-    #[test]
-    fn configured_runtime_returns_final_nonvolatile_state_on_shutdown() {
-        let machine = machine_with_instructions(&[0]);
-        let expected = machine.nonvolatile_state();
-        let runtime = Runtime::new(Some(machine)).unwrap();
-
-        assert_eq!(runtime.shutdown(), Ok(Some(expected)));
     }
 
     #[test]
@@ -826,7 +1558,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         execute_instructions(&mut worker, 6);
 
         let (reply, response) = mpsc::channel();
-        assert!(!worker.handle_command(super::Command::SendSerial {
+        assert!(!worker.handle_command(crate::runtime::Command::SendSerial {
             port: SerialPort::A,
             bytes: (0..9).collect(),
             reply,
@@ -846,7 +1578,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         worker.pending_serial[1].extend(b"second");
 
         let (reset_reply, reset_response) = mpsc::channel();
-        assert!(!worker.handle_command(super::Command::Reset(reset_reply)));
+        assert!(!worker.handle_command(crate::runtime::Command::Reset(reset_reply)));
         let reset_status = reset_response.recv().unwrap().unwrap();
         assert!(
             worker
@@ -858,8 +1590,10 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
 
         worker.pending_serial[0].extend(b"third");
         let (configure_reply, configure_response) = mpsc::channel();
-        assert!(!worker.handle_command(super::Command::Configure {
-            machine: Box::new(machine_with_instructions(&[0])),
+        assert!(!worker.handle_command(crate::runtime::Command::Configure {
+            configuration: Box::new(super::RuntimeConfiguration::normal(
+                machine_with_instructions(&[0]),
+            )),
             reply: configure_reply,
         }));
         let configure_status = configure_response.recv().unwrap().unwrap();
@@ -959,6 +1693,37 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
     }
 
     #[test]
+    fn recording_checkpoint_deadline_advances_and_resets() {
+        let path = record_path("checkpoint-deadline");
+        let partial = PathBuf::from(format!("{}.partial", path.display()));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&partial);
+        let mut session = super::RecordingSession::new(started_recorder(&path));
+
+        assert!(!session.checkpoint_due(ExecutionPosition {
+            epoch: 0,
+            completed_instructions: super::CHECKPOINT_INTERVAL - 1,
+        }));
+        assert!(session.checkpoint_due(ExecutionPosition {
+            epoch: 0,
+            completed_instructions: super::CHECKPOINT_INTERVAL,
+        }));
+        session.advance_checkpoint_deadline();
+        assert!(session.checkpoint_due(ExecutionPosition {
+            epoch: 0,
+            completed_instructions: super::CHECKPOINT_INTERVAL * 2,
+        }));
+        session.reset_checkpoint_deadline();
+        assert!(session.checkpoint_due(ExecutionPosition {
+            epoch: 1,
+            completed_instructions: super::CHECKPOINT_INTERVAL,
+        }));
+
+        drop(session);
+        fs::remove_file(partial).unwrap();
+    }
+
+    #[test]
     fn machine_output_handler_has_no_backlog_and_can_be_cleared() {
         const INSTRUCTIONS_PER_CHARACTER_INTERVAL: usize = 35_000;
 
@@ -982,6 +1747,230 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             panic!("discarded output must not be retained for a later handler")
         }));
         worker.execute_timed_instruction().unwrap();
+    }
+
+    #[test]
+    fn record_and_replay_preserve_event_positions_across_reset_epochs() {
+        let path = record_path("event-positions");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}.partial", path.display()));
+        let recorder = started_recorder(&path);
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let status = runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&[0, 0, 0, 0]),
+                recorder,
+            ))
+            .unwrap();
+        assert_eq!(status.mode, RuntimeMode::Recording);
+        runtime.send_serial(SerialPort::A, b"before reset").unwrap();
+        runtime.step().unwrap();
+        runtime.step().unwrap();
+        let reset = runtime.reset().unwrap();
+        assert_eq!(reset.position.epoch, 1);
+        assert_eq!(reset.position.completed_instructions, 0);
+        runtime.send_serial(SerialPort::B, b"after reset").unwrap();
+        runtime.step().unwrap();
+        let stopped = runtime.stop_recording().unwrap();
+        assert_eq!(stopped.mode, RuntimeMode::Normal);
+        runtime.shutdown().unwrap();
+
+        let replayer = Replayer::open(&path).unwrap();
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let opened = runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_instructions(&[0, 0, 0, 0]),
+                replayer,
+            ))
+            .unwrap();
+        assert_eq!(opened.mode, RuntimeMode::Replaying);
+        assert!(runtime.send_serial(SerialPort::A, b"live").is_err());
+        assert!(runtime.reset().is_err());
+        runtime.step().unwrap();
+        runtime.step().unwrap();
+        let completed = runtime.step().unwrap();
+        assert_eq!(completed.mode, RuntimeMode::ReplayCompleted);
+        assert_eq!(completed.position.epoch, 1);
+        assert_eq!(completed.position.completed_instructions, 1);
+        assert!(runtime.step().is_err());
+        runtime.shutdown().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn replay_processes_position_zero_input_before_completing() {
+        let path = record_path("position-zero-input");
+        let _ = fs::remove_file(&path);
+        let recorder = started_recorder(&path);
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&[0]),
+                recorder,
+            ))
+            .unwrap();
+        runtime.send_serial(SerialPort::A, b"").unwrap();
+        runtime.send_serial(SerialPort::A, b"input").unwrap();
+        runtime.stop_recording().unwrap();
+        runtime.shutdown().unwrap();
+
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let opened = runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_instructions(&[0]),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(opened.mode, RuntimeMode::ReplayCompleted);
+        assert_eq!(opened.position, Default::default());
+        assert!(runtime.step().is_err());
+        runtime.shutdown().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stopping_a_running_record_preserves_running_execution_state() {
+        let path = record_path("running-stop");
+        let _ = fs::remove_file(&path);
+        let recorder = started_recorder(&path);
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&[0, 0x1000_fffe, 0]),
+                recorder,
+            ))
+            .unwrap();
+        runtime.run().unwrap();
+        let stopped = runtime.stop_recording().unwrap();
+        assert_eq!(stopped.state, RuntimeState::Running);
+        assert_eq!(stopped.mode, RuntimeMode::Normal);
+        runtime.shutdown().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recording_storage_failure_pauses_and_returns_to_normal_mode() {
+        let path = record_path("storage-failure");
+        let _ = fs::remove_file(&path);
+        let partial = PathBuf::from(format!("{}.partial", path.display()));
+        let _ = fs::remove_file(&partial);
+        let recorder = started_recorder(&path);
+        let disk = recorder.disk();
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&[0]),
+                recorder,
+            ))
+            .unwrap();
+        disk.report_storage_error(&io::Error::other("test failure"));
+        let status = runtime.step().unwrap();
+
+        assert_eq!(status.state, RuntimeState::Paused);
+        assert_eq!(status.mode, RuntimeMode::Normal);
+        assert_eq!(
+            status.session_error.as_deref(),
+            Some("host storage error: test failure")
+        );
+        runtime.shutdown().unwrap();
+        fs::remove_file(partial).unwrap();
+    }
+
+    #[test]
+    fn replay_shutdown_returns_the_pre_replay_nonvolatile_state() {
+        let path = record_path("nonvolatile-isolation");
+        let _ = fs::remove_file(&path);
+        let recorder = started_recorder(&path);
+        let record_runtime = Runtime::new_unconfigured().unwrap();
+        record_runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&[0]),
+                recorder,
+            ))
+            .unwrap();
+        record_runtime.stop_recording().unwrap();
+        record_runtime.shutdown().unwrap();
+
+        let mut normal_machine = machine_with_instructions(&[0]);
+        let expected = distinct_nonvolatile_state();
+        normal_machine.restore_nonvolatile_state(expected.clone(), 0);
+        let runtime = Runtime::new(Some(normal_machine)).unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_instructions(&[0]),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(runtime.shutdown().unwrap(), Some(expected));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn final_checkpoint_detects_replay_cpu_divergence() {
+        let path = record_path("checkpoint-divergence");
+        let _ = fs::remove_file(&path);
+        let recorder = started_recorder(&path);
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&[0]),
+                recorder,
+            ))
+            .unwrap();
+        runtime.step().unwrap();
+        runtime.stop_recording().unwrap();
+        runtime.shutdown().unwrap();
+
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_instructions(&[0x2408_0001]),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        let status = runtime.step().unwrap();
+        assert_eq!(status.mode, RuntimeMode::ReplayDiverged);
+        assert!(status.session_error.is_some());
+        runtime.shutdown().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recorded_execution_error_finalizes_and_replays_at_the_same_boundary() {
+        let path = record_path("execution-error");
+        let _ = fs::remove_file(&path);
+        let instructions = [0x3c08_4040, 0x4088_6000, 0, 0, 0x4a00_0000];
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&instructions),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        for _ in 0..4 {
+            runtime.step().unwrap();
+        }
+        let recorded = runtime.step().unwrap();
+        assert_eq!(recorded.mode, RuntimeMode::Normal);
+        assert_eq!(recorded.state, RuntimeState::Paused);
+        assert!(recorded.last_error.is_some());
+        runtime.shutdown().unwrap();
+
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_instructions(&instructions),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        for _ in 0..4 {
+            runtime.step().unwrap();
+        }
+        let replayed = runtime.step().unwrap();
+        assert_eq!(replayed.mode, RuntimeMode::ReplayCompleted);
+        assert!(replayed.last_error.is_some());
+        runtime.shutdown().unwrap();
+        fs::remove_file(path).unwrap();
     }
 
     struct RecordingStorage {
@@ -1251,5 +2240,44 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
                 .windows(b"SCSI device/cable diagnostic".len())
                 .any(|window| window == b"SCSI device/cable diagnostic")
         );
+    }
+
+    fn reset_machine() -> Machine {
+        Machine::IndigoIp12(Ip12::new(vec![0; 0x40000], Backend::SoftFloat, None, None).unwrap())
+    }
+
+    #[test]
+    fn unconfigured_runtime_rejects_machine_commands() {
+        let runtime = Runtime::new_unconfigured().unwrap();
+
+        assert_eq!(runtime.status().unwrap().state, RuntimeState::Unconfigured);
+        assert!(matches!(
+            runtime.step(),
+            Err(RuntimeError::CommandRejected { .. })
+        ));
+        assert!(matches!(
+            runtime.send_serial(SerialPort::A, b"A"),
+            Err(RuntimeError::CommandRejected { .. })
+        ));
+        assert_eq!(runtime.shutdown(), Ok(None));
+    }
+
+    #[test]
+    fn configured_runtime_returns_final_nonvolatile_state_on_shutdown() {
+        let machine = reset_machine();
+        let expected = machine.nonvolatile_state();
+        let runtime = Runtime::new(Some(machine)).unwrap();
+
+        assert_eq!(runtime.shutdown(), Ok(Some(expected)));
+    }
+
+    #[test]
+    fn checkpoint_uses_the_machine_state_fingerprint() {
+        let mut machine = reset_machine();
+        let baseline = checkpoint_digest(&machine);
+
+        assert_eq!(baseline, checkpoint_digest(&machine));
+        machine.execute_instruction().unwrap();
+        assert_ne!(baseline, checkpoint_digest(&machine));
     }
 }

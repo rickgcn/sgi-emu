@@ -4,6 +4,7 @@
 #include "se_ui/vt100_widget.h"
 
 #include <QMetaObject>
+#include <QString>
 #include <QTabWidget>
 
 #include <cstddef>
@@ -19,7 +20,8 @@ SerialConsoleDock::SerialConsoleDock(
     , session_(session)
     , status_handler_(std::move(status_handler))
     , serial_a_(new Vt100Widget(this))
-    , serial_b_(new Vt100Widget(this)) {
+    , serial_b_(new Vt100Widget(this))
+    , input_enabled_(true) {
     setObjectName(QStringLiteral("SerialConsoleDock"));
     serial_a_->set_input_handler(
         [this](const auto& bytes) { send_serial(SerialPortDto::A, bytes); });
@@ -32,6 +34,10 @@ SerialConsoleDock::SerialConsoleDock(
     setWidget(tabs);
 }
 
+void SerialConsoleDock::set_input_enabled(bool enabled) {
+    input_enabled_ = enabled;
+}
+
 void SerialConsoleDock::append_serial(
     const std::vector<std::uint8_t>& serial_a,
     const std::vector<std::uint8_t>& serial_b) {
@@ -42,7 +48,7 @@ void SerialConsoleDock::append_serial(
 void SerialConsoleDock::send_serial(
     SerialPortDto port,
     const std::vector<std::uint8_t>& bytes) const {
-    if (bytes.empty()) {
+    if (bytes.empty() || !input_enabled_) {
         return;
     }
     const auto status = session_.send_serial(
@@ -57,7 +63,7 @@ MachineOutputSink::MachineOutputSink(SerialConsoleDock* console)
     , delivery_scheduled_(false) {
 }
 
-void MachineOutputSink::publish_serial(
+void MachineOutputSink::publish_output(
     rust::Slice<const std::uint8_t> serial_a,
     rust::Slice<const std::uint8_t> serial_b) const {
     if (serial_a.empty() && serial_b.empty()) {
