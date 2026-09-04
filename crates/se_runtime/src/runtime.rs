@@ -1406,7 +1406,7 @@ mod tests {
 
     const PROM_BYTES: usize = 0x40000;
     const EXTERNAL_PROM_EXECUTION_BUDGET: usize = 400_000_000;
-    const EXPECTED_PROMPT_INSTRUCTION: usize = 376_277_712;
+    const EXPECTED_PROMPT_INSTRUCTION: usize = 376_277_796;
     const POST_PROMPT_INSTRUCTIONS: usize = 2_000_000;
     const P5_START_PC: u32 = 0xbfc0_0fb0;
     const P5_COMPLETE_PC: u32 = 0xbfc0_1020;

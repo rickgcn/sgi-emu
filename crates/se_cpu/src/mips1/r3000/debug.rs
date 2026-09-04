@@ -111,6 +111,15 @@ pub struct Cp1DebugSnapshot {
     pub interrupt_asserted: bool,
 }
 
+/// Machine-driven interrupt input synchronization state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MachineInterruptInputDebugSnapshot {
+    /// Current external levels driven on inputs one through five.
+    pub asserted: u8,
+    /// Levels captured at the first processor-step sampling boundary.
+    pub sampled: u8,
+}
+
 /// Small R3000/R3010 state sampled at one instruction boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct R3000DebugSnapshot {
@@ -130,6 +139,8 @@ pub struct R3000DebugSnapshot {
     pub pending_cp0: Option<PendingCp0DebugSnapshot>,
     /// Pending CP1 transfer, when present.
     pub pending_cp1: Option<PendingCp1DebugSnapshot>,
+    /// Machine-driven interrupt input synchronization state.
+    pub interrupt_inputs: MachineInterruptInputDebugSnapshot,
     /// CP0 state.
     pub cp0: Cp0DebugSnapshot,
     /// CP1 state.
@@ -274,6 +285,7 @@ impl R3000 {
                 }
             });
         let (effective, pending_functional) = self.state.debug_cp0_functional_state();
+        let (interrupt_asserted, interrupt_sampled) = self.state.debug_machine_interrupt_inputs();
         let cp1 = self.state.cp1();
 
         R3000DebugSnapshot {
@@ -285,6 +297,10 @@ impl R3000 {
             pending_gpr,
             pending_cp0,
             pending_cp1,
+            interrupt_inputs: MachineInterruptInputDebugSnapshot {
+                asserted: interrupt_asserted,
+                sampled: interrupt_sampled,
+            },
             cp0: Cp0DebugSnapshot {
                 registers: std::array::from_fn(|index| self.state.read_cp0(index)),
                 effective: functional_snapshot(effective),
@@ -679,6 +695,23 @@ mod tests {
         assert_eq!(snapshot.gpr, [0; 32]);
         assert_eq!(snapshot.cp0.registers[1], 63 << 8);
         assert_eq!(snapshot.cp1.fcr0, 0x0000_0300);
+        assert_eq!(snapshot.interrupt_inputs.asserted, 0);
+        assert_eq!(snapshot.interrupt_inputs.sampled, 0);
+    }
+
+    #[test]
+    fn snapshot_reports_machine_interrupt_synchronization_state() {
+        let mut cpu = R3000::new(CONFIG);
+        cpu.set_hardware_interrupt_lines(1 << 3);
+
+        let asserted = cpu.debug_snapshot();
+        assert_eq!(asserted.interrupt_inputs.asserted, 1 << 3);
+        assert_eq!(asserted.interrupt_inputs.sampled, 0);
+
+        cpu.state.advance_machine_interrupt_inputs();
+        let sampled = cpu.debug_snapshot();
+        assert_eq!(sampled.interrupt_inputs.asserted, 1 << 3);
+        assert_eq!(sampled.interrupt_inputs.sampled, 1 << 3);
     }
 
     #[test]
