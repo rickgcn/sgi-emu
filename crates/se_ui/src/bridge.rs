@@ -112,6 +112,20 @@ pub mod ffi {
         pub revision: u64,
         /// Instructions completed during the runtime's lifetime.
         pub completed_instructions: u64,
+        /// Deterministic session mode identifier.
+        pub mode: u8,
+        /// Current Record/Replay epoch.
+        pub epoch: u64,
+        /// Instructions completed within the current epoch.
+        pub epoch_instructions: u64,
+        /// Whether a Replay footer position is available.
+        pub has_replay_final_position: bool,
+        /// Final Replay epoch.
+        pub replay_final_epoch: u64,
+        /// Final Replay instruction count within its epoch.
+        pub replay_final_instructions: u64,
+        /// Record failure or Replay divergence detail.
+        pub session_error: String,
         /// Most recent execution error.
         pub execution_error: String,
         /// Command error when `success` is false.
@@ -273,6 +287,18 @@ pub mod ffi {
         fn reset_machine(self: &UiSession) -> RuntimeStatusDto;
         fn pause_machine(self: &UiSession) -> RuntimeStatusDto;
         fn step_machine(self: &UiSession) -> RuntimeStatusDto;
+        fn run_with_record(
+            self: &UiSession,
+            configuration: &MachineConfiguration,
+            path: &str,
+        ) -> RuntimeStatusDto;
+        fn stop_recording(self: &UiSession) -> RuntimeStatusDto;
+        fn open_replay(
+            self: &UiSession,
+            configuration: &MachineConfiguration,
+            path: &str,
+        ) -> RuntimeStatusDto;
+        fn stop_replay(self: &UiSession, configuration: &MachineConfiguration) -> RuntimeStatusDto;
         fn registers(self: &UiSession) -> RegistersDto;
         fn tlb(self: &UiSession, instruction_view: bool) -> TlbDto;
         fn cache(self: &UiSession, instruction_cache: bool) -> CacheDto;
@@ -298,14 +324,14 @@ pub mod ffi {
 
         type MachineOutputSink;
 
-        fn publish_serial(self: &MachineOutputSink, serial_a: &[u8], serial_b: &[u8]);
+        fn publish_output(self: &MachineOutputSink, serial_a: &[u8], serial_b: &[u8]);
 
         /// Runs the Qt event loop and returns the final user-interface state.
         fn run_gui(session: &UiSession, startup: &UiStartupState) -> UiExitState;
     }
 }
 
-// SAFETY: `MachineOutputSink::publish_serial` only mutates mutex-protected
+// SAFETY: `MachineOutputSink::publish_output` only mutates mutex-protected
 // buffers and schedules GUI work through a queued Qt invocation.
 unsafe impl Send for ffi::MachineOutputSink {}
 

@@ -1,5 +1,7 @@
 //! Top-level ownership of the runtime during a graphical session.
 
+use std::path::PathBuf;
+
 use se_cpu::mips1::r3000::debug::{
     CacheView, PendingCp0DebugSnapshot, PendingCp1DebugSnapshot, TlbView,
 };
@@ -7,11 +9,10 @@ use se_machine::debug::{DebugRequest, DebugResponse};
 use se_machine::indigo::ip12::debug::{
     DebugRequest as Ip12DebugRequest, DebugResponse as Ip12DebugResponse, MemoryAddressSpace,
 };
-use se_machine::machine::{Machine, MachineNonvolatileState};
-use se_machine::output::MachineOutput;
+use se_machine::machine::MachineNonvolatileState;
 use se_machine::serial::SerialPort;
-use se_runtime::control::{RuntimeState, RuntimeStatus};
-use se_runtime::runtime::{DebugReply, Runtime, RuntimeError, ShutdownError};
+use se_runtime::control::{RuntimeMode, RuntimeState, RuntimeStatus};
+use se_runtime::runtime::{DebugReply, Runtime, RuntimeConfiguration, RuntimeError, ShutdownError};
 
 use crate::bridge::ffi::{
     CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineConfiguration,
@@ -20,8 +21,22 @@ use crate::bridge::ffi::{
 };
 
 /// Constructs a machine from settings selected by a frontend.
-pub type MachineBuilder =
-    Box<dyn Fn(&MachineConfiguration) -> Result<Machine, String> + Send + Sync + 'static>;
+pub type MachineBuilder = Box<
+    dyn Fn(&MachineConfiguration, MachineBuildRequest) -> Result<RuntimeConfiguration, String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Cold machine mode requested by the Qt session.
+pub enum MachineBuildRequest {
+    /// Ordinary execution using current settings.
+    Normal,
+    /// Cold-start recording to the selected Record path.
+    Recording(PathBuf),
+    /// Cold-start replay from the selected Record path.
+    Replaying(PathBuf),
+}
 
 /// Owns the emulator runtime for the lifetime of one Qt event loop.
 pub struct UiSession {
@@ -59,11 +74,12 @@ impl UiSession {
 
     /// Builds and installs a machine selected in the settings dialog.
     pub fn configure_machine(&self, configuration: &MachineConfiguration) -> RuntimeStatusDto {
-        let machine = match (self.machine_builder)(configuration) {
-            Ok(machine) => machine,
+        let configuration = match (self.machine_builder)(configuration, MachineBuildRequest::Normal)
+        {
+            Ok(configuration) => configuration,
             Err(error) => return failed_status(error),
         };
-        self.runtime_command(|runtime| runtime.configure(machine))
+        self.runtime_command(|runtime| runtime.configure_with(configuration))
     }
 
     /// Starts continuous machine execution.
@@ -86,6 +102,54 @@ impl UiSession {
         self.runtime_command(Runtime::step)
     }
 
+    /// Cold-constructs a Recording machine and starts it from the first PROM
+    /// instruction.
+    pub fn run_with_record(
+        &self,
+        configuration: &MachineConfiguration,
+        path: &str,
+    ) -> RuntimeStatusDto {
+        let configuration = match (self.machine_builder)(
+            configuration,
+            MachineBuildRequest::Recording(PathBuf::from(path)),
+        ) {
+            Ok(configuration) => configuration,
+            Err(error) => return failed_status(error),
+        };
+        let status = self.runtime_command(|runtime| runtime.configure_with(configuration));
+        if !status.success {
+            return status;
+        }
+        self.runtime_command(Runtime::run)
+    }
+
+    /// Finalizes the active Record without changing Running or Paused state.
+    pub fn stop_recording(&self) -> RuntimeStatusDto {
+        self.runtime_command(Runtime::stop_recording)
+    }
+
+    /// Cold-constructs and installs a paused Replay machine.
+    pub fn open_replay(
+        &self,
+        configuration: &MachineConfiguration,
+        path: &str,
+    ) -> RuntimeStatusDto {
+        let configuration = match (self.machine_builder)(
+            configuration,
+            MachineBuildRequest::Replaying(PathBuf::from(path)),
+        ) {
+            Ok(configuration) => configuration,
+            Err(error) => return failed_status(error),
+        };
+        self.runtime_command(|runtime| runtime.configure_with(configuration))
+    }
+
+    /// Discards the Replay machine and cold-constructs a paused Normal machine
+    /// from current settings.
+    pub fn stop_replay(&self, configuration: &MachineConfiguration) -> RuntimeStatusDto {
+        self.configure_machine(configuration)
+    }
+
     /// Connects runtime machine output to the Qt delivery sink.
     pub fn attach_machine_output(
         &self,
@@ -96,8 +160,8 @@ impl UiSession {
         }
 
         self.runtime_command(|runtime| {
-            runtime.set_output_handler(Box::new(move |output: MachineOutput| {
-                sink.publish_serial(output.serial(SerialPort::A), output.serial(SerialPort::B));
+            runtime.set_output_handler(Box::new(move |output| {
+                sink.publish_output(output.serial(SerialPort::A), output.serial(SerialPort::B));
             }))
         })
     }
@@ -362,13 +426,31 @@ impl UiSession {
 }
 
 fn status_dto(status: RuntimeStatus) -> RuntimeStatusDto {
+    let replay_final_position = status.replay_final_position.unwrap_or_default();
     RuntimeStatusDto {
         success: true,
         state: state_identifier(status.state),
         revision: status.revision,
         completed_instructions: status.completed_instructions,
+        mode: mode_identifier(status.mode),
+        epoch: status.position.epoch,
+        epoch_instructions: status.position.completed_instructions,
+        has_replay_final_position: status.replay_final_position.is_some(),
+        replay_final_epoch: replay_final_position.epoch,
+        replay_final_instructions: replay_final_position.completed_instructions,
+        session_error: status.session_error.unwrap_or_default(),
         execution_error: status.last_error.unwrap_or_default(),
         command_error: String::new(),
+    }
+}
+
+const fn mode_identifier(mode: RuntimeMode) -> u8 {
+    match mode {
+        RuntimeMode::Normal => 0,
+        RuntimeMode::Recording => 1,
+        RuntimeMode::Replaying => 2,
+        RuntimeMode::ReplayCompleted => 3,
+        RuntimeMode::ReplayDiverged => 4,
     }
 }
 
@@ -386,6 +468,13 @@ fn failed_status(error: String) -> RuntimeStatusDto {
         state: 0,
         revision: 0,
         completed_instructions: 0,
+        mode: 0,
+        epoch: 0,
+        epoch_instructions: 0,
+        has_replay_final_position: false,
+        replay_final_epoch: 0,
+        replay_final_instructions: 0,
+        session_error: String::new(),
         execution_error: String::new(),
         command_error: error,
     }

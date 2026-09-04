@@ -130,6 +130,9 @@ impl Machine {
     #[must_use]
     pub fn debug(&self, request: DebugRequest) -> DebugResponse {
         match (self, request) {
+            (Self::IndigoIp12(machine), DebugRequest::MachineStateFingerprint) => {
+                DebugResponse::MachineStateFingerprint(machine.machine_state_fingerprint())
+            }
             (Self::IndigoIp12(machine), DebugRequest::IndigoIp12(request)) => {
                 DebugResponse::IndigoIp12(machine.debug(request))
             }

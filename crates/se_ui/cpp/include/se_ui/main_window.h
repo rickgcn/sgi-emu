@@ -6,7 +6,9 @@
 #include <QMainWindow>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
 
 class QAction;
 class QDockWidget;
@@ -24,10 +26,17 @@ struct UiSession;
 class CacheDock;
 class DisassemblyDock;
 class MemoryDock;
+class PreparationTask;
 class RegistersDock;
 class MachineOutputSink;
 class SerialConsoleDock;
 class TlbDock;
+
+enum class PreparationState {
+    None,
+    Recording,
+    Replay,
+};
 
 class MainWindow final : public QMainWindow {
 public:
@@ -45,6 +54,16 @@ private:
     void restore_window_state(const UiStartupState& startup);
     void set_default_dock_layout();
     void show_notification(const QString& message, int timeout);
+    void begin_preparation(
+        PreparationState state,
+        bool stops_replay,
+        std::function<RuntimeStatusDto()> command);
+    void poll_preparation();
+    void apply_preparation_state();
+    void run_with_record();
+    void stop_recording();
+    void open_replay();
+    void stop_replay();
     void show_settings();
     void update_runtime();
     void refresh_debuggers();
@@ -56,9 +75,13 @@ private:
     MachineSettings settings_;
 
     QAction* run_action_;
+    QAction* run_with_record_action_;
     QAction* reset_action_;
     QAction* pause_action_;
     QAction* step_action_;
+    QAction* stop_recording_action_;
+    QAction* open_replay_action_;
+    QAction* stop_replay_action_;
     QAction* settings_action_;
 
     DisassemblyDock* disassembly_dock_;
@@ -71,11 +94,17 @@ private:
     QTimer* update_timer_;
     QTimer* notification_timer_;
     QElapsedTimer performance_timer_;
+    std::unique_ptr<PreparationTask> preparation_task_;
+    PreparationState preparation_state_;
+    bool preparation_resume_running_;
+    bool preparation_stops_replay_;
+    std::string last_session_error_;
     std::uint64_t performance_instruction_baseline_;
     QLabel* machine_status_;
     QLabel* execution_error_status_;
     QLabel* notification_status_;
     QLabel* performance_status_;
+    QLabel* session_status_;
     QLabel* runtime_status_;
 };
 

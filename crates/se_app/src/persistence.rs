@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 
 const FORMAT_VERSION: u32 = 1;
 const IP12_STATE_FILE: &str = "indigo-ip12.toml";
+const IP12_RECORD_STATE_BYTES: usize = 176;
+const IP12_RECORD_NVRAM_END: usize = 128;
+const IP12_RECORD_RTC_END: usize = 160;
+const IP12_RECORD_RTC_ALTERNATE_END: usize = 164;
+const IP12_RECORD_PRESCALER_END: usize = 172;
 
 /// A restored machine state and the host time elapsed since it was saved.
 pub struct RestoredMachineState {
@@ -141,6 +146,94 @@ pub fn save(state: &MachineNonvolatileState) -> Result<(), Box<dyn Error>> {
     save_at(&path, state, SystemTime::now())
 }
 
+/// Encodes the exact nonvolatile state stored in a cold-start Record manifest.
+#[must_use]
+pub(crate) fn encode_record_nonvolatile_state(state: &MachineNonvolatileState) -> Vec<u8> {
+    let MachineNonvolatileState::IndigoIp12(state) = state;
+    let parts = state.parts();
+    let mut bytes = Vec::with_capacity(IP12_RECORD_STATE_BYTES);
+    for word in parts.nvram_words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes.extend_from_slice(&parts.rtc_registers);
+    bytes.extend_from_slice(&parts.rtc_alternate_control_registers);
+    bytes.extend_from_slice(&parts.rtc_prescaler_phase_attoseconds.to_le_bytes());
+    bytes.push(parts.rtc_millisecond_within_hundredth);
+    bytes.push(u8::from(parts.rtc_oscillator_failed));
+    bytes.push(u8::from(parts.rtc_single_supply));
+    bytes.push(u8::from(parts.rtc_alarm_match_active));
+    bytes
+}
+
+/// Decodes the machine-specific nonvolatile state stored in a Record manifest.
+///
+/// # Errors
+///
+/// Returns an error when the machine model is unsupported or the payload has
+/// an invalid size, boolean value, or RTC state.
+pub(crate) fn decode_record_nonvolatile_state(
+    machine_model: &str,
+    bytes: &[u8],
+) -> Result<MachineNonvolatileState, Box<dyn Error>> {
+    if machine_model != "indigo-ip12" {
+        return Err(invalid_data(format!(
+            "unsupported Record machine state model: {machine_model}"
+        ))
+        .into());
+    }
+    if bytes.len() != IP12_RECORD_STATE_BYTES {
+        return Err(invalid_data(format!(
+            "invalid Indigo IP12 Record state length: expected {IP12_RECORD_STATE_BYTES}, got {}",
+            bytes.len()
+        ))
+        .into());
+    }
+
+    let mut nvram_words = [0; 64];
+    for (word, encoded) in nvram_words
+        .iter_mut()
+        .zip(bytes[..IP12_RECORD_NVRAM_END].chunks_exact(2))
+    {
+        *word = u16::from_le_bytes(encoded.try_into().expect("NVRAM word has two bytes"));
+    }
+    let mut rtc_registers = [0; 32];
+    rtc_registers.copy_from_slice(&bytes[IP12_RECORD_NVRAM_END..IP12_RECORD_RTC_END]);
+    let mut rtc_alternate_control_registers = [0; 4];
+    rtc_alternate_control_registers
+        .copy_from_slice(&bytes[IP12_RECORD_RTC_END..IP12_RECORD_RTC_ALTERNATE_END]);
+    let rtc_prescaler_phase_attoseconds = u64::from_le_bytes(
+        bytes[IP12_RECORD_RTC_ALTERNATE_END..IP12_RECORD_PRESCALER_END]
+            .try_into()
+            .expect("RTC prescaler has eight bytes"),
+    );
+    let rtc_oscillator_failed = decode_record_boolean(bytes[173], "oscillator failed")?;
+    let rtc_single_supply = decode_record_boolean(bytes[174], "single supply")?;
+    let rtc_alarm_match_active = decode_record_boolean(bytes[175], "alarm match active")?;
+
+    Ip12NonvolatileState::try_from_parts(Ip12NonvolatileStateParts {
+        nvram_words,
+        rtc_registers,
+        rtc_alternate_control_registers,
+        rtc_prescaler_phase_attoseconds,
+        rtc_millisecond_within_hundredth: bytes[172],
+        rtc_oscillator_failed,
+        rtc_single_supply,
+        rtc_alarm_match_active,
+    })
+    .map(MachineNonvolatileState::IndigoIp12)
+    .map_err(|error| Box::new(error) as Box<dyn Error>)
+}
+
+fn decode_record_boolean(value: u8, name: &str) -> io::Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid_data(format!(
+            "invalid Indigo IP12 Record state {name} boolean"
+        ))),
+    }
+}
+
 fn state_path(model: &str) -> io::Result<PathBuf> {
     let file_name = match model {
         "indigo-ip12" => IP12_STATE_FILE,
@@ -220,7 +313,10 @@ mod tests {
     use se_machine::indigo::ip12::{Ip12NonvolatileState, Ip12NonvolatileStateParts};
     use se_machine::machine::MachineNonvolatileState;
 
-    use super::{FORMAT_VERSION, load_at, save_at};
+    use super::{
+        FORMAT_VERSION, IP12_RECORD_STATE_BYTES, decode_record_nonvolatile_state,
+        encode_record_nonvolatile_state, load_at, save_at,
+    };
 
     fn sample_state() -> MachineNonvolatileState {
         let mut words = [u16::MAX; 64];
@@ -286,6 +382,32 @@ mod tests {
 
         assert_eq!(restored.offline_milliseconds, 0);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn record_state_round_trip_preserves_exact_values() {
+        let state = sample_state();
+        let bytes = encode_record_nonvolatile_state(&state);
+
+        assert_eq!(bytes.len(), IP12_RECORD_STATE_BYTES);
+        assert_eq!(
+            decode_record_nonvolatile_state("indigo-ip12", &bytes).unwrap(),
+            state
+        );
+    }
+
+    #[test]
+    fn record_state_rejects_invalid_length_boolean_and_rtc_phase() {
+        let mut bytes = encode_record_nonvolatile_state(&sample_state());
+        assert!(decode_record_nonvolatile_state("indigo-ip12", &bytes[..175]).is_err());
+
+        bytes[173] = 2;
+        assert!(decode_record_nonvolatile_state("indigo-ip12", &bytes).is_err());
+
+        bytes = encode_record_nonvolatile_state(&sample_state());
+        bytes[172] = 10;
+        assert!(decode_record_nonvolatile_state("indigo-ip12", &bytes).is_err());
+        assert!(decode_record_nonvolatile_state("other-machine", &bytes).is_err());
     }
 
     #[test]

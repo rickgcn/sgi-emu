@@ -7,8 +7,13 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+crc32fast.workspace = true
 se_core.workspace = true
 se_machine.workspace = true
+sha2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 se_device.workspace = true
