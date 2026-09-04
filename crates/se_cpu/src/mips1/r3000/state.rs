@@ -15,6 +15,21 @@ const MACHINE_INTERRUPT_MASK: u8 = 0x3e;
 const TLB_PROBE_FAILURE: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MachineInterruptInputs {
+    asserted: u8,
+    sampled: u8,
+}
+
+impl MachineInterruptInputs {
+    const fn new() -> Self {
+        Self {
+            asserted: 0,
+            sampled: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DelaySlot {
     pub(super) origin_pc: u32,
     pub(super) resume_pc: u32,
@@ -104,6 +119,7 @@ pub(super) struct State {
     pending_gpr_write: Option<PendingGprWrite>,
     pending_cp0_write: Option<PendingCp0Write>,
     pending_cp1_write: Option<PendingCp1Write>,
+    machine_interrupt_inputs: MachineInterruptInputs,
 }
 
 impl State {
@@ -121,6 +137,7 @@ impl State {
             pending_gpr_write: None,
             pending_cp0_write: None,
             pending_cp1_write: None,
+            machine_interrupt_inputs: MachineInterruptInputs::new(),
         }
     }
 
@@ -160,6 +177,13 @@ impl State {
         &self,
     ) -> (Cp0FunctionalState, Option<Cp0FunctionalState>) {
         self.cp0.debug_functional_state()
+    }
+
+    pub(super) fn debug_machine_interrupt_inputs(&self) -> (u8, u8) {
+        (
+            self.machine_interrupt_inputs.asserted,
+            self.machine_interrupt_inputs.sampled,
+        )
     }
 
     pub(super) fn debug_tlb_entries(&self, instruction: bool) -> [(u32, u32); 64] {
@@ -270,10 +294,16 @@ impl State {
 
     pub(super) fn set_hardware_interrupt_lines(&mut self, lines: u8) {
         assert!(lines & !MACHINE_INTERRUPT_MASK == 0);
+        self.machine_interrupt_inputs.asserted = lines;
+    }
+
+    pub(super) fn advance_machine_interrupt_inputs(&mut self) {
+        let lines = self.machine_interrupt_inputs.sampled;
         for input in MACHINE_INTERRUPT_INPUTS {
             self.cp0
                 .set_hardware_interrupt_line(input, lines & (1 << input) != 0);
         }
+        self.machine_interrupt_inputs.sampled = self.machine_interrupt_inputs.asserted;
     }
 
     pub(super) fn synchronize_cp1_interrupt(&mut self) {
@@ -649,9 +679,9 @@ mod tests {
     use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 
     use super::{
-        AccessType, Cacheability, Cp0, DelaySlot, Exception, InstructionEffect, PendingCp0Write,
-        PendingCp1Write, PendingGprWrite, RESET_PC, State, StepError, TlbFaultKind, Translation,
-        TranslationError, TranslationFault,
+        AccessType, Cacheability, Cp0, DelaySlot, Exception, InstructionEffect,
+        MachineInterruptInputs, PendingCp0Write, PendingCp1Write, PendingGprWrite, RESET_PC, State,
+        StepError, TlbFaultKind, Translation, TranslationError, TranslationFault,
     };
 
     const ENTRY_LO_DIRTY: u32 = 1 << 10;
@@ -728,6 +758,10 @@ mod tests {
         assert_eq!(state.pending_gpr_write, None);
         assert_eq!(state.pending_cp0_write, None);
         assert_eq!(state.pending_cp1_write, None);
+        assert_eq!(
+            state.machine_interrupt_inputs,
+            MachineInterruptInputs::new()
+        );
     }
 
     #[test]
@@ -959,6 +993,12 @@ mod tests {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.set_hardware_interrupt_lines(1 << 1);
 
+        assert_eq!(state.debug_machine_interrupt_inputs(), (1 << 1, 0));
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, 0);
+        state.advance_machine_interrupt_inputs();
+        assert_eq!(state.debug_machine_interrupt_inputs(), (1 << 1, 1 << 1));
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, 0);
+        state.advance_machine_interrupt_inputs();
         assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM3);
         assert!(!state.interrupt_requested());
 
@@ -980,8 +1020,29 @@ mod tests {
 
         state.reset();
 
+        assert_eq!(state.debug_machine_interrupt_inputs(), (1 << 1, 1 << 1));
         assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM3);
         assert!(!state.interrupt_requested());
+    }
+
+    #[test]
+    fn interrupt_input_deassertion_uses_the_same_sampling_boundaries() {
+        const CAUSE_HARDWARE_IP_MASK: u32 = 0x0000_fc00;
+        const STATUS_IM3: u32 = 1 << 11;
+
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        state.set_hardware_interrupt_lines(1 << 1);
+        state.advance_machine_interrupt_inputs();
+        state.advance_machine_interrupt_inputs();
+        state.set_hardware_interrupt_lines(0);
+
+        assert_eq!(state.debug_machine_interrupt_inputs(), (0, 1 << 1));
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM3);
+        state.advance_machine_interrupt_inputs();
+        assert_eq!(state.debug_machine_interrupt_inputs(), (0, 0));
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, STATUS_IM3);
+        state.advance_machine_interrupt_inputs();
+        assert_eq!(state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK, 0);
     }
 
     #[test]

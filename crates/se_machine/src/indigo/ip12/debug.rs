@@ -144,6 +144,8 @@ impl Ip12 {
                 hash_bool(&mut hasher, value);
             }
         }
+        hasher.update([cpu.interrupt_inputs.asserted]);
+        hasher.update([cpu.interrupt_inputs.sampled]);
         for value in cpu.cp0.registers {
             hash_u32(&mut hasher, value);
         }
@@ -298,6 +300,20 @@ mod tests {
         assert_eq!(baseline, machine.machine_state_fingerprint());
         machine.execute_instruction().unwrap();
         assert_ne!(baseline, machine.machine_state_fingerprint());
+    }
+
+    #[test]
+    fn machine_state_fingerprint_tracks_uncommitted_interrupt_input() {
+        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let baseline = machine.machine_state_fingerprint();
+
+        machine.cpu.set_hardware_interrupt_lines(1 << 3);
+
+        assert_ne!(baseline, machine.machine_state_fingerprint());
+        let snapshot = machine.cpu.debug_snapshot();
+        assert_eq!(snapshot.interrupt_inputs.asserted, 1 << 3);
+        assert_eq!(snapshot.interrupt_inputs.sampled, 0);
+        assert_eq!(snapshot.cp0.registers[13] & 0x0000_fc00, 0);
     }
 
     #[test]

@@ -575,7 +575,7 @@ mod tests {
             .unwrap();
         machine.bus.write(PhysAddr::new(0x00c0_0000), &[0]).unwrap();
         assert!(machine.bus.error_interrupt_asserted());
-        machine.execute_instruction().unwrap();
+        advance_machine_interrupt_inputs(&mut machine);
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
             0
@@ -593,6 +593,11 @@ mod tests {
         assert_eq!(read_word(&mut machine, 0x1fa0_0008), 0x88);
         assert_eq!(read_word(&mut machine, 0x1fa1_0000), 0);
         assert!(!machine.bus.error_interrupt_asserted());
+        assert_ne!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
+            0
+        );
+        advance_machine_interrupt_inputs(&mut machine);
         assert_eq!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
             0
@@ -616,14 +621,14 @@ mod tests {
             )
             .unwrap();
 
-        machine.execute_instruction().unwrap();
+        advance_machine_interrupt_inputs(&mut machine);
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
             0
         );
 
         machine.bus.write(PhysAddr::new(0x1fa1_0210), &[0]).unwrap();
-        machine.execute_instruction().unwrap();
+        advance_machine_interrupt_inputs(&mut machine);
         assert_eq!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
             0
@@ -631,12 +636,18 @@ mod tests {
     }
 
     #[test]
-    fn guest_store_error_is_sampled_at_the_next_instruction_boundary() {
+    fn guest_store_error_crosses_two_interrupt_input_boundaries() {
         let mut machine = machine_with_instructions(&[0x3c08_a040, 0xad00_0000, 0]);
 
         machine.execute_instruction().unwrap();
         machine.execute_instruction().unwrap();
         assert!(machine.bus.error_interrupt_asserted());
+        assert_eq!(
+            machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
+            0
+        );
+
+        machine.execute_instruction().unwrap();
         assert_eq!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
             0
@@ -689,6 +700,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(machine.receive_serial(SerialPort::A, b"A"), 1);
+        advance_machine_interrupt_inputs(&mut machine);
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 11),
             0
@@ -709,6 +721,7 @@ mod tests {
 
         machine.bus.set_hpc1_interrupt_levels_for_test(true, true);
         machine.update_interrupt_lines();
+        advance_machine_interrupt_inputs(&mut machine);
         assert_eq!(
             machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_1800,
             0x0000_1800
@@ -716,6 +729,7 @@ mod tests {
 
         machine.bus.set_hpc1_interrupt_levels_for_test(false, false);
         machine.update_interrupt_lines();
+        advance_machine_interrupt_inputs(&mut machine);
         assert_eq!(
             machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_1800,
             0
@@ -745,6 +759,7 @@ mod tests {
             &mut output,
         );
         machine.update_interrupt_lines();
+        advance_machine_interrupt_inputs(&mut machine);
         assert_eq!(
             machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_6000,
             0x0000_6000
@@ -752,6 +767,7 @@ mod tests {
 
         machine.bus.write(PhysAddr::new(0x1fb8_01e3), &[1]).unwrap();
         machine.update_interrupt_lines();
+        advance_machine_interrupt_inputs(&mut machine);
         assert_eq!(
             machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_6000,
             0x0000_4000
@@ -759,6 +775,7 @@ mod tests {
 
         machine.bus.write(PhysAddr::new(0x1fb8_01e3), &[2]).unwrap();
         machine.update_interrupt_lines();
+        advance_machine_interrupt_inputs(&mut machine);
         assert_eq!(
             machine.cpu.debug_snapshot().cp0.registers[13] & 0x0000_6000,
             0
@@ -798,6 +815,11 @@ mod tests {
         let mut byte = [0];
         machine.bus.read(PhysAddr::new(address), &mut byte).unwrap();
         byte[0]
+    }
+
+    fn advance_machine_interrupt_inputs(machine: &mut Ip12) {
+        machine.execute_instruction().unwrap();
+        machine.execute_instruction().unwrap();
     }
 
     fn machine_with_instructions(instructions: &[u32]) -> Ip12 {
