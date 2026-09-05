@@ -5,6 +5,7 @@ use std::fmt;
 
 use se_core::bus::{BusFault, DeviceAddr};
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
+use serde::{Deserialize, Serialize};
 
 const REGISTER_COUNT: usize = 32;
 const BANKED_REGISTER_COUNT: usize = 4;
@@ -90,7 +91,7 @@ impl fmt::Display for Dp8573aStateError {
 impl Error for Dp8573aStateError {}
 
 /// State retained while an emulated DP8573A continues on battery power.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Dp8573aBatteryState {
     registers: [u8; REGISTER_COUNT],
     alternate_control_registers: [u8; BANKED_REGISTER_COUNT],
@@ -186,6 +187,7 @@ impl Dp8573aBatteryState {
 }
 
 /// The software-visible state of a DP8573A under normal power.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Dp8573a {
     registers: [u8; REGISTER_COUNT],
     alternate_control_registers: [u8; BANKED_REGISTER_COUNT],

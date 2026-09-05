@@ -2,6 +2,7 @@
 
 use se_core::bus::{BusFault, DeviceAddr};
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
+use serde::{Deserialize, Serialize};
 
 const CHANNEL_B_CONTROL: u64 = 0x03;
 const CHANNEL_B_DATA: u64 = 0x07;
@@ -91,6 +92,7 @@ impl InterruptSource {
 }
 
 /// The two-channel state needed by the IP12 serial path.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Z85230 {
     clock_hz: u64,
     channels: [ChannelState; 2],
@@ -381,14 +383,14 @@ impl Z85230 {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 struct ActiveCharacter {
     value: u8,
     remaining_attoseconds: u128,
     local_loopback: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 struct ReceiveCharacter {
     value: u8,
     status: u8,
@@ -401,7 +403,7 @@ impl ReceiveCharacter {
     };
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 struct ChannelState {
     selected_register: u8,
     write_registers: [u8; 16],

@@ -16,6 +16,7 @@ mod state;
 
 use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
 use se_float::backend::Backend;
+use serde::{Deserialize, Serialize};
 
 use self::{
     cp0::Exception,
@@ -190,6 +191,17 @@ pub struct R3000 {
     frequency_hz: u64,
 }
 
+/// Complete restorable execution state of an R3000 and its attached R3010.
+///
+/// Construction-time frequency and floating-point backend selection are not
+/// restored from this value. The containing machine must provide the same
+/// processor configuration before applying a snapshot.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct R3000Snapshot {
+    state: State,
+    cp0_condition: bool,
+}
+
 impl R3000 {
     /// Creates a processor at the reset vector.
     ///
@@ -205,6 +217,26 @@ impl R3000 {
             cp0_condition: false,
             frequency_hz: config.frequency_hz(),
         }
+    }
+
+    /// Captures complete processor execution state without construction-time
+    /// configuration.
+    #[must_use]
+    pub fn snapshot(&self) -> R3000Snapshot {
+        R3000Snapshot {
+            state: self.state.clone(),
+            cp0_condition: self.cp0_condition,
+        }
+    }
+
+    /// Restores processor execution state while preserving the configured
+    /// floating-point backend and clock frequency.
+    pub fn restore_snapshot(&mut self, mut snapshot: R3000Snapshot) {
+        snapshot
+            .state
+            .restore_floating_point_backend(self.state.floating_point_backend());
+        self.state = snapshot.state;
+        self.cp0_condition = snapshot.cp0_condition;
     }
 
     /// Restores the architecturally defined core reset state.
@@ -710,6 +742,41 @@ mod tests {
         let mut processor = R3000::new(super::TEST_CONFIG);
 
         processor.reset();
+    }
+
+    #[test]
+    fn snapshot_restores_pending_execution_and_interrupt_input_state() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(3, 0x8000_0100);
+        step_with_word(&mut processor, encode_register(3, 0, 0, 0x08)).unwrap();
+        processor.set_hardware_interrupt_lines(1 << 3);
+        let expected = processor.debug_snapshot();
+        let snapshot = processor.snapshot();
+
+        processor.reset();
+        assert_ne!(processor.debug_snapshot(), expected);
+        processor.restore_snapshot(snapshot);
+
+        assert_eq!(processor.debug_snapshot(), expected);
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_the_cold_configured_float_backend() {
+        let snapshot = R3000::new(super::TEST_CONFIG).snapshot();
+        let native_config = R3000Config::new(
+            33_000_000,
+            32 * 1024,
+            32 * 1024,
+            64,
+            4,
+            true,
+            Backend::Native,
+        );
+        let mut processor = R3000::new(native_config);
+
+        processor.restore_snapshot(snapshot);
+
+        assert_eq!(processor.debug_snapshot().cp1.backend, Backend::Native);
     }
 
     #[test]

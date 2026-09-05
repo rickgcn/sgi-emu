@@ -27,6 +27,7 @@ class CacheDock;
 class DisassemblyDock;
 class MemoryDock;
 class PreparationTask;
+class ReplayCatalogTask;
 class RegistersDock;
 class MachineOutputSink;
 class SerialConsoleDock;
@@ -36,6 +37,8 @@ enum class PreparationState {
     None,
     Recording,
     Replay,
+    ReplayCatalog,
+    ReplaySnapshot,
 };
 
 class MainWindow final : public QMainWindow {
@@ -63,6 +66,7 @@ private:
     void run_with_record();
     void stop_recording();
     void open_replay();
+    void create_replay_snapshot();
     void stop_replay();
     void show_settings();
     void update_runtime();
@@ -81,6 +85,7 @@ private:
     QAction* step_action_;
     QAction* stop_recording_action_;
     QAction* open_replay_action_;
+    QAction* create_replay_snapshot_action_;
     QAction* stop_replay_action_;
     QAction* settings_action_;
 
@@ -95,9 +100,11 @@ private:
     QTimer* notification_timer_;
     QElapsedTimer performance_timer_;
     std::unique_ptr<PreparationTask> preparation_task_;
+    std::unique_ptr<ReplayCatalogTask> replay_catalog_task_;
     PreparationState preparation_state_;
     bool preparation_resume_running_;
     bool preparation_stops_replay_;
+    std::string pending_replay_path_;
     std::string last_session_error_;
     std::uint64_t performance_instruction_baseline_;
     QLabel* machine_status_;

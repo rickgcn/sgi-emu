@@ -20,6 +20,7 @@ license = "GPL-3.0-or-later"
 authors = ["rickgcn"]
 
 [workspace.dependencies]
+bincode = { version = "2", features = ["serde"] }
 bitflags = "2"
 cc = "1"
 clap = { version = "4", features = ["derive"] }
@@ -30,6 +31,7 @@ directories = "6"
 qt-build-utils = "=0.10.0"
 rustix = { version = "1", features = ["stdio", "termios"] }
 serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"
 sha2 = "0.10"
 se_cli = { path = "crates/se_cli" }
 se_core = { path = "crates/se_core" }

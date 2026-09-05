@@ -1,11 +1,13 @@
 //! Write-only attenuation latches for the IP12 headphone output.
 
 use se_core::bus::{BusFault, DeviceAddr};
+use serde::{Deserialize, Serialize};
 
 const LEFT_ATTENUATION: u64 = 0;
 const RIGHT_ATTENUATION: u64 = 4;
 
 /// The two software-visible MDAC attenuation latches.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Mdac {
     attenuation: [u8; 2],
 }

@@ -1,9 +1,11 @@
 use se_core::bus::{BusFault, PhysAddr};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
+use serde::{Deserialize, Serialize};
 
 use super::address::local_memory_transaction_is_contained;
 
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct LocalMemory {
     modules: [Option<Ram>; 4],
 }

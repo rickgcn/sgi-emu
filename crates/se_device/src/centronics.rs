@@ -1,6 +1,7 @@
 //! SGI Centronics external status and remote-control latch.
 
 use se_core::bus::{BusFault, DeviceAddr};
+use serde::{Deserialize, Serialize};
 
 const REGISTER_BYTES: u64 = 4;
 const STATUS_LANE: usize = 1;
@@ -8,6 +9,7 @@ const STATUS_BITS: u8 = 0x0f;
 const REMOTE_BITS: u8 = 0x03;
 
 /// The board-level Centronics state visible through the HPC1 external slot.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct CentronicsPort {
     status_input: u8,
     remote_output: u8,

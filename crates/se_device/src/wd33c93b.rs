@@ -1,6 +1,7 @@
 //! Western Digital WD33C93B indirect-register and command model.
 
 use se_core::bus::{BusFault, DeviceAddr};
+use serde::{Deserialize, Serialize};
 
 const ADDRESS_PORT: u64 = 0;
 const DATA_PORT: u64 = 4;
@@ -42,7 +43,7 @@ const SOURCE_ID_PRESERVED_BITS: u8 = 0x0f;
 const TRANSFER_COUNT_MASK: u32 = 0x00ff_ffff;
 
 /// A stable Select-And-Transfer request produced by the WD33C93B.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SelectAndTransferRequest {
     destination_id: u8,
     lun: u8,
@@ -78,6 +79,7 @@ impl SelectAndTransferRequest {
 }
 
 /// The software-visible WD33C93B state used by the IP12 machine.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Wd33c93b {
     selected_register: u8,
     own_id: u8,

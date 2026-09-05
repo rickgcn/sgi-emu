@@ -1,6 +1,10 @@
 //! Functional read-only SCSI CD-ROM target backed by a raw ISO image.
 
-use crate::scsi::{ScsiCommandPlan, ScsiStatus, ScsiStorageSizeError, ScsiTarget, SenseData};
+use serde::{Deserialize, Serialize};
+
+use crate::scsi::{
+    ScsiCommandPlan, ScsiStatus, ScsiStorageSizeError, ScsiTarget, ScsiTargetSnapshot, SenseData,
+};
 
 const BLOCK_BYTES: u32 = 512;
 
@@ -14,6 +18,7 @@ const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2a;
 
 /// Software-visible state of one read-only SCSI CD-ROM target.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ScsiCdrom {
     logical_block_count: u64,
     ready: bool,
@@ -122,6 +127,25 @@ impl ScsiCdrom {
 impl ScsiTarget for ScsiCdrom {
     fn storage_size_bytes(&self) -> u64 {
         self.logical_block_count * u64::from(BLOCK_BYTES)
+    }
+
+    fn snapshot(&self) -> Option<ScsiTargetSnapshot> {
+        Some(ScsiTargetSnapshot::Cdrom(self.clone()))
+    }
+
+    fn accepts_snapshot(&self, snapshot: &ScsiTargetSnapshot) -> bool {
+        matches!(snapshot, ScsiTargetSnapshot::Cdrom(state) if state.logical_block_count == self.logical_block_count)
+    }
+
+    fn restore_snapshot(&mut self, snapshot: ScsiTargetSnapshot) -> bool {
+        let ScsiTargetSnapshot::Cdrom(state) = snapshot else {
+            return false;
+        };
+        if state.logical_block_count != self.logical_block_count {
+            return false;
+        }
+        *self = state;
+        true
     }
 
     /// Decodes one command descriptor block.

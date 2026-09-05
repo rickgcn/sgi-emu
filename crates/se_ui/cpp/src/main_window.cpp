@@ -16,6 +16,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QIcon>
+#include <QInputDialog>
 #include <QKeySequence>
 #include <QLabel>
 #include <QMenu>
@@ -85,6 +86,15 @@ public:
     std::future<RuntimeStatusDto> future;
 };
 
+class ReplayCatalogTask final {
+public:
+    explicit ReplayCatalogTask(std::function<ReplaySnapshotCatalogDto()> command)
+        : future(std::async(std::launch::async, std::move(command))) {
+    }
+
+    std::future<ReplaySnapshotCatalogDto> future;
+};
+
 MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     : session_(session)
     , settings_(from_machine_configuration(startup.machine))
@@ -95,6 +105,7 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , step_action_(nullptr)
     , stop_recording_action_(nullptr)
     , open_replay_action_(nullptr)
+    , create_replay_snapshot_action_(nullptr)
     , stop_replay_action_(nullptr)
     , settings_action_(nullptr)
     , disassembly_dock_(nullptr)
@@ -108,9 +119,11 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , notification_timer_(new QTimer(this))
     , performance_timer_()
     , preparation_task_()
+    , replay_catalog_task_()
     , preparation_state_(PreparationState::None)
     , preparation_resume_running_(false)
     , preparation_stops_replay_(false)
+    , pending_replay_path_()
     , last_session_error_()
     , performance_instruction_baseline_(0)
     , machine_status_(new QLabel(this))
@@ -204,6 +217,14 @@ void MainWindow::create_actions() {
     open_replay_action_ = new QAction(QStringLiteral("Open Replay"), this);
     connect(open_replay_action_, &QAction::triggered, this, &MainWindow::open_replay);
 
+    create_replay_snapshot_action_ =
+        new QAction(QStringLiteral("Create Replay Snapshot"), this);
+    connect(
+        create_replay_snapshot_action_,
+        &QAction::triggered,
+        this,
+        &MainWindow::create_replay_snapshot);
+
     stop_replay_action_ = new QAction(QStringLiteral("Stop Replay"), this);
     connect(stop_replay_action_, &QAction::triggered, this, &MainWindow::stop_replay);
 
@@ -253,6 +274,7 @@ void MainWindow::create_menus() {
     debug_menu->addAction(stop_recording_action_);
     debug_menu->addSeparator();
     debug_menu->addAction(open_replay_action_);
+    debug_menu->addAction(create_replay_snapshot_action_);
     debug_menu->addAction(stop_replay_action_);
 }
 
@@ -318,6 +340,84 @@ void MainWindow::begin_preparation(
 }
 
 void MainWindow::poll_preparation() {
+    if (preparation_state_ == PreparationState::ReplayCatalog) {
+        if (replay_catalog_task_ == nullptr
+            || replay_catalog_task_->future.wait_for(std::chrono::seconds(0))
+                != std::future_status::ready) {
+            return;
+        }
+
+        const bool resume_running = preparation_resume_running_;
+        auto catalog = replay_catalog_task_->future.get();
+        replay_catalog_task_.reset();
+        preparation_state_ = PreparationState::None;
+        preparation_resume_running_ = false;
+        const auto replay_path = QString::fromUtf8(
+            pending_replay_path_.data(), static_cast<qsizetype>(pending_replay_path_.size()));
+        pending_replay_path_.clear();
+
+        if (!catalog.success) {
+            show_notification(
+                QStringLiteral("Error: %1").arg(from_rust_string(catalog.error)), 5000);
+            if (resume_running) {
+                apply_runtime_status(session_.run_machine(), false);
+            } else {
+                apply_runtime_status(session_.runtime_status(), false);
+            }
+            return;
+        }
+
+        QString selected_snapshot_id;
+        if (!catalog.snapshots.empty()) {
+            QStringList choices;
+            choices.append(QStringLiteral("Replay from start"));
+            for (const auto& snapshot : catalog.snapshots) {
+                choices.append(
+                    QStringLiteral("Epoch %1, instruction %2, PC 0x%3")
+                        .arg(snapshot.epoch)
+                        .arg(snapshot.instructions)
+                        .arg(snapshot.pc, 8, 16, QLatin1Char('0')));
+            }
+            bool accepted = false;
+            const auto selected = QInputDialog::getItem(
+                this,
+                QStringLiteral("Open Replay"),
+                QStringLiteral("Starting point:"),
+                choices,
+                0,
+                false,
+                &accepted);
+            if (!accepted) {
+                if (resume_running) {
+                    apply_runtime_status(session_.run_machine(), false);
+                } else {
+                    apply_runtime_status(session_.runtime_status(), false);
+                }
+                return;
+            }
+            const auto selected_index = choices.indexOf(selected);
+            if (selected_index > 0) {
+                selected_snapshot_id = from_rust_string(
+                    catalog.snapshots[static_cast<std::size_t>(selected_index - 1)].id);
+            }
+        }
+
+        auto configuration =
+            std::make_shared<MachineConfiguration>(to_machine_configuration(settings_));
+        auto path = std::make_shared<rust::String>(to_rust_string(replay_path));
+        auto snapshot_id =
+            std::make_shared<rust::String>(to_rust_string(selected_snapshot_id));
+        begin_preparation(
+            PreparationState::Replay,
+            false,
+            [this, configuration, path, snapshot_id] {
+                return session_.open_replay(
+                    *configuration, rust::Str(*path), rust::Str(*snapshot_id));
+            });
+        preparation_resume_running_ = resume_running;
+        return;
+    }
+
     if (preparation_state_ == PreparationState::None || preparation_task_ == nullptr
         || preparation_task_->future.wait_for(std::chrono::seconds(0))
             != std::future_status::ready) {
@@ -342,8 +442,13 @@ void MainWindow::poll_preparation() {
 
     if (completed_state == PreparationState::Recording) {
         show_notification(QStringLiteral("Recording started"), 3000);
+    } else if (completed_state == PreparationState::ReplaySnapshot) {
+        show_notification(QStringLiteral("Replay snapshot created"), 3000);
     } else if (stopped_replay) {
         show_notification(QStringLiteral("Replay stopped"), 3000);
+    }
+    if (completed_state == PreparationState::ReplaySnapshot) {
+        return;
     }
     registers_dock_->clear();
     tlb_dock_->clear();
@@ -364,13 +469,17 @@ void MainWindow::apply_preparation_state() {
     step_action_->setEnabled(false);
     stop_recording_action_->setEnabled(false);
     open_replay_action_->setEnabled(false);
+    create_replay_snapshot_action_->setEnabled(false);
     stop_replay_action_->setEnabled(false);
     settings_action_->setEnabled(false);
     serial_console_dock_->set_input_enabled(false);
-    session_status_->setText(
-        preparation_state_ == PreparationState::Recording
-            ? QStringLiteral("Preparing recording...")
-            : QStringLiteral("Preparing replay..."));
+    if (preparation_state_ == PreparationState::Recording) {
+        session_status_->setText(QStringLiteral("Preparing recording..."));
+    } else if (preparation_state_ == PreparationState::ReplaySnapshot) {
+        session_status_->setText(QStringLiteral("Creating replay snapshot..."));
+    } else {
+        session_status_->setText(QStringLiteral("Preparing replay..."));
+    }
 }
 
 void MainWindow::restore_window_state(const UiStartupState& startup) {
@@ -447,19 +556,33 @@ void MainWindow::open_replay() {
         this,
         QStringLiteral("Open Replay"),
         QString(),
-        QStringLiteral("sgi-emu Record (*.serec)"));
+        QStringLiteral("Record file (*.serec)"));
     if (path.isEmpty()) {
         return;
     }
-    auto configuration =
-        std::make_shared<MachineConfiguration>(to_machine_configuration(settings_));
+    if (preparation_state_ != PreparationState::None) {
+        return;
+    }
+    const auto current = session_.runtime_status();
+    preparation_resume_running_ = current.success && current.state == 2;
+    if (preparation_resume_running_) {
+        session_.pause_machine();
+    }
+    const auto path_utf8 = path.toUtf8();
+    pending_replay_path_.assign(
+        path_utf8.constData(), static_cast<std::size_t>(path_utf8.size()));
     auto replay_path = std::make_shared<rust::String>(to_rust_string(path));
-    begin_preparation(
-        PreparationState::Replay,
-        false,
-        [this, configuration, replay_path] {
-            return session_.open_replay(*configuration, rust::Str(*replay_path));
-        });
+    preparation_state_ = PreparationState::ReplayCatalog;
+    replay_catalog_task_ = std::make_unique<ReplayCatalogTask>([this, replay_path] {
+        return session_.replay_snapshot_catalog(rust::Str(*replay_path));
+    });
+    apply_preparation_state();
+}
+
+void MainWindow::create_replay_snapshot() {
+    begin_preparation(PreparationState::ReplaySnapshot, false, [this] {
+        return session_.create_replay_snapshot();
+    });
 }
 
 void MainWindow::stop_replay() {
@@ -567,6 +690,7 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
     step_action_->setEnabled(paused && !session_stopped);
     stop_recording_action_->setEnabled(recording);
     open_replay_action_->setEnabled(normal);
+    create_replay_snapshot_action_->setEnabled(paused && replaying);
     stop_replay_action_->setEnabled(replay_session);
     settings_action_->setEnabled(normal);
     serial_console_dock_->set_input_enabled(!replay_session);

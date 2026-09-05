@@ -4,6 +4,7 @@ mod bus;
 pub mod debug;
 mod events;
 mod prom;
+pub(crate) mod snapshot;
 
 use std::error::Error;
 use std::fmt;
@@ -28,6 +29,7 @@ use se_device::storage::BlockStorage;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
 use se_float::backend::Backend;
+use serde::{Deserialize, Serialize};
 
 use self::bus::Ip12Bus;
 use self::prom::normalize_u56_prom;
@@ -97,7 +99,7 @@ impl Error for Ip12Error {
 }
 
 /// Nonvolatile state retained by an Indigo IP12.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Ip12NonvolatileState {
     nvram: Nmc93cs46Contents,
     rtc: Dp8573aBatteryState,
@@ -535,6 +537,61 @@ mod tests {
             .unwrap();
         assert_eq!(read_word(&mut machine, RAM_BYTES as u64 - 4), 0x0123_4567);
         assert_eq!(read_word(&mut machine, RAM_BYTES as u64), 0);
+    }
+
+    #[test]
+    fn snapshot_restore_repeats_machine_execution_and_output() {
+        let mut machine = machine_with_instructions(&[0x2408_0001, 0x2508_0001, 0]);
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fa1_0000), &0x0f00_023f_u32.to_be_bytes())
+            .unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x1000), &0x1234_5678_u32.to_be_bytes())
+            .unwrap();
+        machine.execute_instruction().unwrap();
+        let mut initial_output = MachineOutput::default();
+        machine.advance_time(
+            VirtualDuration::from_attoseconds(123_456),
+            &mut initial_output,
+        );
+        let snapshot = machine.snapshot().unwrap();
+        let expected_fingerprint = machine.machine_state_fingerprint();
+        let expected_address = machine.execution_address();
+        let expected_ram = read_word(&mut machine, 0x1000);
+
+        machine.execute_instruction().unwrap();
+        let mut first_output = MachineOutput::default();
+        machine.advance_time(
+            VirtualDuration::from_attoseconds(987_654),
+            &mut first_output,
+        );
+        let first_result = (
+            machine.machine_state_fingerprint(),
+            machine.execution_address(),
+            read_word(&mut machine, 0x1000),
+            first_output,
+        );
+
+        machine.restore_snapshot(snapshot).unwrap();
+        assert_eq!(machine.machine_state_fingerprint(), expected_fingerprint);
+        assert_eq!(machine.execution_address(), expected_address);
+        assert_eq!(read_word(&mut machine, 0x1000), expected_ram);
+        machine.execute_instruction().unwrap();
+        let mut second_output = MachineOutput::default();
+        machine.advance_time(
+            VirtualDuration::from_attoseconds(987_654),
+            &mut second_output,
+        );
+        let second_result = (
+            machine.machine_state_fingerprint(),
+            machine.execution_address(),
+            read_word(&mut machine, 0x1000),
+            second_output,
+        );
+
+        assert_eq!(second_result, first_result);
     }
 
     #[test]

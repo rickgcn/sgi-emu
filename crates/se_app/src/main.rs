@@ -86,7 +86,9 @@ fn build_runtime_configuration(
             build_normal_machine(configuration).map(RuntimeConfiguration::normal)
         }
         MachineBuildRequest::Recording(path) => build_recording_configuration(configuration, path),
-        MachineBuildRequest::Replaying(path) => build_replay_configuration(configuration, path),
+        MachineBuildRequest::Replaying { path, snapshot_id } => {
+            build_replay_configuration(configuration, path, snapshot_id.as_deref())
+        }
     }
 }
 
@@ -114,8 +116,7 @@ fn build_recording_configuration(
         cdrom,
     )?;
     restore_persisted_state(&mut machine, &configuration.machine_model)?;
-    let nonvolatile_state =
-        persistence::encode_record_nonvolatile_state(&machine.nonvolatile_state());
+    let nonvolatile_state = machine.nonvolatile_state();
     let manifest = RecordManifest::new(
         configuration.machine_model.clone(),
         configuration.float_backend.clone(),
@@ -133,15 +134,17 @@ fn build_recording_configuration(
 fn build_replay_configuration(
     configuration: &MachineConfiguration,
     path: PathBuf,
+    snapshot_id: Option<&str>,
 ) -> Result<RuntimeConfiguration, String> {
-    let replayer = Replayer::open(path).map_err(|error| error.to_string())?;
+    let replayer = match snapshot_id {
+        Some(snapshot_id) => {
+            Replayer::open_snapshot(path, snapshot_id).map_err(|error| error.to_string())?
+        }
+        None => Replayer::open(path).map_err(|error| error.to_string())?,
+    };
     let manifest = replayer.manifest().clone();
     validate_machine_and_backend(manifest.machine_model(), manifest.float_backend())?;
-    let nonvolatile_state = persistence::decode_record_nonvolatile_state(
-        manifest.machine_model(),
-        manifest.nonvolatile_state_bytes(),
-    )
-    .map_err(|error| error.to_string())?;
+    let nonvolatile_state = manifest.nonvolatile_state().clone();
     let prom_path = selected_or_hint(&configuration.prom_path, &manifest.prom().path_hint);
     let raw_prom = read_prom(&prom_path)?;
     ensure_identity(

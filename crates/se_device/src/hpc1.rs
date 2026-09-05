@@ -2,6 +2,7 @@
 
 use se_core::bus::{BusFault, DeviceAddr};
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
+use serde::{Deserialize, Serialize};
 
 const ETHERNET_CURRENT_TRANSMIT_BUFFER_POINTER: u64 = 0x000c;
 const ETHERNET_NEXT_TRANSMIT_DESCRIPTOR_POINTER: u64 = 0x0010;
@@ -111,6 +112,7 @@ impl ScsiDmaWindow {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct DiagnosticFifo {
     data: [u32; FIFO_ENTRIES],
     flags: [u8; FIFO_ENTRIES],
@@ -134,6 +136,7 @@ impl DiagnosticFifo {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct EthernetChannel {
     current_transmit_buffer_pointer: u32,
     next_transmit_descriptor_pointer: u32,
@@ -246,6 +249,7 @@ impl EthernetChannel {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct ScsiChannel {
     byte_count: u16,
     current_buffer_address: u32,
@@ -317,6 +321,7 @@ impl ScsiChannel {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct DspChannel {
     interrupt_status: u8,
     interrupt_mask: u8,
@@ -335,6 +340,7 @@ impl DspChannel {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct ParallelChannel {
     byte_count: u32,
     current_buffer_pointer: u32,
@@ -388,6 +394,7 @@ impl ParallelChannel {
 }
 
 /// The complete functional state of the IP12 HPC1.5 device.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Hpc1 {
     ethernet: EthernetChannel,
     scsi: ScsiChannel,

@@ -1,11 +1,12 @@
 use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+use serde::{Deserialize, Serialize};
 
 use super::R3000Config;
 
 const WORD_BYTES: usize = 4;
 const PAGE_FRAME_MASK: u32 = 0xffff_f000;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct CacheEntry {
     page_frame: u32,
     data: [u8; WORD_BYTES],
@@ -20,6 +21,7 @@ impl CacheEntry {
     };
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct Cache {
     entries: Box<[CacheEntry]>,
     refill_bytes: usize,
@@ -164,6 +166,7 @@ pub(super) enum CacheBank {
     Data,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Caches {
     instruction: Cache,
     data: Cache,

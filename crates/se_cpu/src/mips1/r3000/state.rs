@@ -1,4 +1,6 @@
 use se_core::bus::{BusFault, PhysicalBus};
+use se_float::backend::Backend;
+use serde::{Deserialize, Serialize};
 
 use super::{
     R3000Config, StepError,
@@ -14,7 +16,7 @@ const MACHINE_INTERRUPT_INPUTS: std::ops::Range<usize> = 1..6;
 const MACHINE_INTERRUPT_MASK: u8 = 0x3e;
 const TLB_PROBE_FAILURE: u32 = 1 << 31;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct MachineInterruptInputs {
     asserted: u8,
     sampled: u8,
@@ -29,26 +31,26 @@ impl MachineInterruptInputs {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct DelaySlot {
     pub(super) origin_pc: u32,
     pub(super) resume_pc: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct PendingGprWrite {
     pub(super) index: usize,
     pub(super) value: u32,
     pub(super) load_merge_bypass: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct PendingCp0Write {
     pub(super) index: usize,
     pub(super) value: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) enum PendingCp1Write {
     General { index: usize, value: u32 },
     Control { index: usize, value: u32 },
@@ -106,6 +108,7 @@ enum LoadKind {
     Data,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct State {
     gpr: [u32; 32],
     hi: u32,
@@ -151,6 +154,14 @@ impl State {
         self.pending_gpr_write = None;
         self.pending_cp0_write = None;
         self.pending_cp1_write = None;
+    }
+
+    pub(super) const fn floating_point_backend(&self) -> Backend {
+        self.cp1.backend()
+    }
+
+    pub(super) fn restore_floating_point_backend(&mut self, backend: Backend) {
+        self.cp1.restore_backend(backend);
     }
 
     pub(super) fn pc(&self) -> u32 {

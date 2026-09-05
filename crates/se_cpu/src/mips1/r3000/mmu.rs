@@ -1,4 +1,6 @@
 use se_core::bus::PhysAddr;
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 
 const TLB_ENTRY_COUNT: usize = 64;
 
@@ -58,7 +60,7 @@ pub(super) enum ProbeResult {
     Shutdown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct TlbEntry {
     entry_hi: u32,
     entry_lo: u32,
@@ -83,14 +85,17 @@ impl TlbEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct PendingTlbWrite {
     index: usize,
     entry: TlbEntry,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Mmu {
+    #[serde(with = "BigArray")]
     entries: [TlbEntry; TLB_ENTRY_COUNT],
+    #[serde(with = "BigArray")]
     instruction_entries: [TlbEntry; TLB_ENTRY_COUNT],
     pending_instruction_writes: [Option<PendingTlbWrite>; 2],
 }

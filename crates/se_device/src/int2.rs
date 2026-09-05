@@ -4,6 +4,7 @@ mod timer;
 
 use se_core::bus::{BusFault, DeviceAddr};
 use se_core::time::VirtualDuration;
+use serde::{Deserialize, Serialize};
 
 use self::timer::{CounterId, ProgrammableTimer};
 
@@ -25,6 +26,7 @@ const REGISTER_BYTES: u64 = 4;
 const OUTPUT_BITS: u8 = 0x1f;
 
 /// The software-visible INT2 state used by the IP12 machine.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Int2 {
     local_interrupt_status: [u8; 2],
     local_interrupt_masks: [u8; 2],

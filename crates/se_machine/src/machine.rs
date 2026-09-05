@@ -5,8 +5,11 @@ use std::fmt;
 
 use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::StepError;
+use se_device::scsi::ScsiSnapshotError;
+use serde::{Deserialize, Serialize};
 
 use crate::debug::{DebugRequest, DebugResponse};
+use crate::indigo::ip12::snapshot::Ip12Snapshot;
 use crate::indigo::ip12::{Ip12, Ip12NonvolatileState};
 use crate::output::MachineOutput;
 use crate::serial::SerialPort;
@@ -18,10 +21,60 @@ pub enum Machine {
 }
 
 /// State retained while a configured machine is powered off.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum MachineNonvolatileState {
     /// Battery-backed and nonvolatile state of an SGI Indigo IP12.
     IndigoIp12(Ip12NonvolatileState),
+}
+
+/// Complete restorable execution state of one configured machine.
+///
+/// The value intentionally excludes construction-time configuration and host
+/// storage objects. It can only be restored into a matching cold-constructed
+/// machine.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct MachineSnapshot {
+    state: MachineSnapshotState,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+enum MachineSnapshotState {
+    IndigoIp12(Ip12Snapshot),
+}
+
+/// A machine snapshot that cannot be captured or restored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineSnapshotError {
+    /// Snapshot and cold-constructed machine models differ.
+    IncompatibleMachineModel,
+    /// The SCSI topology cannot preserve its attached storage objects.
+    Scsi(ScsiSnapshotError),
+}
+
+impl fmt::Display for MachineSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IncompatibleMachineModel => {
+                formatter.write_str("machine snapshot model does not match the configured machine")
+            }
+            Self::Scsi(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for MachineSnapshotError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::IncompatibleMachineModel => None,
+            Self::Scsi(error) => Some(error),
+        }
+    }
+}
+
+impl From<ScsiSnapshotError> for MachineSnapshotError {
+    fn from(error: ScsiSnapshotError) -> Self {
+        Self::Scsi(error)
+    }
 }
 
 /// An error encountered while executing one machine instruction.
@@ -48,6 +101,37 @@ impl Error for ExecutionError {
 }
 
 impl Machine {
+    /// Captures complete execution state without construction-time resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineSnapshotError`] when an attached device cannot expose
+    /// restorable state.
+    pub fn snapshot(&self) -> Result<MachineSnapshot, MachineSnapshotError> {
+        let state = match self {
+            Self::IndigoIp12(machine) => MachineSnapshotState::IndigoIp12(machine.snapshot()?),
+        };
+        Ok(MachineSnapshot { state })
+    }
+
+    /// Restores execution state into a matching cold-constructed machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineSnapshotError`] when the machine model or attached
+    /// storage topology differs.
+    pub fn restore_snapshot(
+        &mut self,
+        snapshot: MachineSnapshot,
+    ) -> Result<(), MachineSnapshotError> {
+        match (self, snapshot.state) {
+            (Self::IndigoIp12(machine), MachineSnapshotState::IndigoIp12(snapshot)) => {
+                machine.restore_snapshot(snapshot)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns state that survives machine reconstruction and application
     /// sessions.
     #[must_use]

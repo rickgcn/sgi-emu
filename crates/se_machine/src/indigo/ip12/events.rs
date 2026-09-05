@@ -1,10 +1,11 @@
 //! Private event bookkeeping for the Indigo IP12.
 
 use se_core::time::{VirtualDuration, VirtualInstant};
+use serde::{Deserialize, Serialize};
 
 const EVENT_COUNT: usize = 6;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) enum EventKind {
     Int2,
     Rtc,
@@ -36,7 +37,7 @@ impl EventKind {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 struct EventSlot {
     synchronized_at: VirtualInstant,
     deadline: Option<VirtualInstant>,
@@ -49,6 +50,7 @@ impl EventSlot {
     };
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Ip12Events {
     now: VirtualInstant,
     slots: [EventSlot; EVENT_COUNT],
