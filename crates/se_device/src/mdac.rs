@@ -1,6 +1,6 @@
 //! Write-only attenuation latches for the IP12 headphone output.
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 use serde::{Deserialize, Serialize};
 
 const LEFT_ATTENUATION: u64 = 0;
@@ -34,41 +34,46 @@ impl Mdac {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] for a decoded byte latch and
-    /// [`BusFault::Unmapped`] for other addresses.
-    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length.
+    /// Other reads return [`BusError::UnimplementedAccess`]; latch readback
+    /// is not modeled.
+    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         decode_latch(address, data.len())?;
-        Err(BusFault::UnsupportedAccess)
+        Err(BusError::UnimplementedAccess)
     }
 
     /// Writes one attenuation latch.
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the address or width does not select exactly
+    /// Returns [`BusError`] when the address or width does not select exactly
     /// one latch.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         let latch = decode_latch(address, data.len())?;
         self.attenuation[latch] = data[0];
         Ok(())
     }
 }
 
-fn decode_latch(address: DeviceAddr, length: usize) -> Result<usize, BusFault> {
+fn decode_latch(address: DeviceAddr, length: usize) -> Result<usize, BusError> {
+    if !(1..=4).contains(&length) {
+        return Err(BusError::InvalidTransaction);
+    }
+
     if length != 1 {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::UnimplementedAccess);
     }
 
     match address.get() {
         LEFT_ATTENUATION => Ok(0),
         RIGHT_ATTENUATION => Ok(1),
-        _ => Err(BusFault::Unmapped),
+        _ => Err(BusError::UnimplementedAccess),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
 
     use super::{LEFT_ATTENUATION, Mdac, RIGHT_ATTENUATION};
 
@@ -103,15 +108,15 @@ mod tests {
 
         assert_eq!(
             mdac.read(DeviceAddr::new(LEFT_ATTENUATION), &mut [0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             mdac.write(DeviceAddr::new(LEFT_ATTENUATION), &[0, 1]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             mdac.write(DeviceAddr::new(2), &[0]),
-            Err(BusFault::Unmapped)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(mdac.attenuation, [0, 0]);
     }

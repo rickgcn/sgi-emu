@@ -718,6 +718,59 @@ mod tests {
     }
 
     #[test]
+    fn guest_can_poll_and_clear_optional_controller_errors_with_interrupts_disabled() {
+        for physical_address in [0x1fb0_0010_u32, 0x1fb0_0050, 0x1f98_0010, 0x1f98_0050] {
+            let virtual_address = physical_address | 0xa000_0000;
+            let mut instructions = vec![
+                0x3c08_bfa1,                              // lui t0, 0xbfa1
+                0x3c09_0000 | (virtual_address >> 16),    // lui t1, target high
+                0x3529_0000 | (virtual_address & 0xffff), // ori t1, t1, target low
+                0x3c0a_bfa0,                              // lui t2, 0xbfa0
+                0x340b_aaaa,                              // ori t3, zero, 0xaaaa
+                0x4080_6000,                              // mtc0 zero, Status
+                0,
+                0,
+            ];
+            let probe = [
+                0xad00_0210, // sw zero, CLERERR(t0)
+                0xad2b_0000, // sw t3, 0(t1)
+                0x8d40_0000, // lw zero, CPUCTRL(t2)
+                0x8d40_0000, // lw zero, CPUCTRL(t2)
+                0x400c_6800, // mfc0 t4, Cause
+                0,
+                0x318c_8000, // andi t4, t4, 0x8000
+                0xad00_0210, // sw zero, CLERERR(t0)
+                0,
+                0,
+                0x400d_6800, // mfc0 t5, Cause
+                0,
+                0x31ad_8000, // andi t5, t5, 0x8000
+            ];
+            instructions.extend(probe);
+            instructions.extend(probe);
+            let mut machine = machine_with_instructions(&instructions);
+
+            for _ in 0..8 {
+                machine.execute_instruction().unwrap();
+            }
+            for _ in 0..2 {
+                for _ in &probe {
+                    machine.execute_instruction().unwrap();
+                }
+                let state = machine.cpu.debug_snapshot();
+                assert_eq!(state.gpr[12], 0x8000);
+                assert_eq!(state.gpr[13], 0);
+                assert_eq!(state.cp0.registers[12] & 1, 0);
+                assert!(!machine.bus.error_interrupt_asserted());
+            }
+            assert_eq!(
+                machine.execution_address(),
+                0xbfc0_0000 + u32::try_from(instructions.len() * 4).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn cp1_error_output_drives_cpu_interrupt_input_zero() {
         let mut machine = machine_with_instructions(&[
             0x3c08_2040,

@@ -1,6 +1,6 @@
 //! SEEQ 8003 Ethernet controller register front end.
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 use serde::{Deserialize, Serialize};
 
 const REGISTER_BYTES: u64 = 4;
@@ -56,9 +56,9 @@ impl Seeq8003 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the complete transaction does not fit one
+    /// Returns [`BusError`] when the complete transaction does not fit one
     /// external register or the width is unsupported.
-    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let (slot, offset) = register_transaction(address, data.len())?;
         let value = match slot {
             0 => OLD_DEVICE_STATUS,
@@ -76,9 +76,9 @@ impl Seeq8003 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the complete transaction does not fit one
+    /// Returns [`BusError`] when the complete transaction does not fit one
     /// external register or the width is unsupported.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         let (slot, offset) = register_transaction(address, data.len())?;
         let low_lane = 3;
         if offset > low_lane || offset + data.len() <= low_lane {
@@ -111,31 +111,34 @@ impl Seeq8003 {
     }
 }
 
-fn register_transaction(address: DeviceAddr, length: usize) -> Result<(usize, usize), BusFault> {
+fn register_transaction(address: DeviceAddr, length: usize) -> Result<(usize, usize), BusError> {
     if !(1..=4).contains(&length) {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::InvalidTransaction);
     }
 
     let start = address.get();
-    let length = u64::try_from(length).map_err(|_| BusFault::UnsupportedAccess)?;
-    let end = start.checked_add(length).ok_or(BusFault::Unmapped)?;
+    let length = u64::try_from(length).map_err(|_| BusError::InvalidTransaction)?;
+    let end = start
+        .checked_add(length)
+        .ok_or(BusError::InvalidTransaction)?;
     let register_end = REGISTER_COUNT * REGISTER_BYTES;
     if start >= register_end || end > register_end {
-        return Err(BusFault::Unmapped);
+        return Err(BusError::HardwareFault);
     }
     if start / REGISTER_BYTES != (end - 1) / REGISTER_BYTES {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::UnimplementedAccess);
     }
 
-    let slot = usize::try_from(start / REGISTER_BYTES).map_err(|_| BusFault::UnsupportedAccess)?;
+    let slot =
+        usize::try_from(start / REGISTER_BYTES).map_err(|_| BusError::UnimplementedAccess)?;
     let offset =
-        usize::try_from(start % REGISTER_BYTES).map_err(|_| BusFault::UnsupportedAccess)?;
+        usize::try_from(start % REGISTER_BYTES).map_err(|_| BusError::UnimplementedAccess)?;
     Ok((slot, offset))
 }
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
 
     use super::{OLD_DEVICE_STATUS, Seeq8003};
 
@@ -144,7 +147,7 @@ mod tests {
             .unwrap();
     }
 
-    fn read_word(seeq: &Seeq8003, slot: u64) -> Result<u32, BusFault> {
+    fn read_word(seeq: &Seeq8003, slot: u64) -> Result<u32, BusError> {
         let mut data = [0; 4];
         seeq.read(DeviceAddr::new(slot * 4), &mut data)?;
         Ok(u32::from_be_bytes(data))
@@ -224,19 +227,19 @@ mod tests {
 
         assert_eq!(
             seeq.read(DeviceAddr::new(3), &mut [0; 2]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             seeq.read(DeviceAddr::new(0x20), &mut [0]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(
             seeq.write(DeviceAddr::new(0), &[]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert_eq!(
             seeq.write(DeviceAddr::new(0x20), &[0]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
     }
 }

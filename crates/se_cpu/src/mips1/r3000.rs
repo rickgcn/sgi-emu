@@ -14,7 +14,7 @@ mod load_store;
 mod mmu;
 mod state;
 
-use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 use se_float::backend::Backend;
 use serde::{Deserialize, Serialize};
 
@@ -145,13 +145,14 @@ pub enum StepError {
     /// match.
     TlbShutdown,
 
-    /// The physical bus rejected a processor write.
-    BusFault {
-        /// The translated physical address used for the write.
+    /// The physical bus reported an invalid or unimplemented access, or a
+    /// hardware write failure that the machine did not complete.
+    BusError {
+        /// The physical address of the processor access.
         address: PhysAddr,
 
         /// The fault reported by the physical bus.
-        fault: BusFault,
+        fault: BusError,
     },
 
     /// The instruction is valid for the R3000 but is not implemented by this
@@ -169,9 +170,9 @@ impl fmt::Display for StepError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TlbShutdown => formatter.write_str("R3000 TLB is in shutdown state"),
-            Self::BusFault { address, fault } => write!(
+            Self::BusError { address, fault } => write!(
                 formatter,
-                "physical bus fault at 0x{:08x}: {fault:?}",
+                "physical bus error at 0x{:08x}: {fault:?}",
                 address.get()
             ),
             Self::UnsupportedInstruction { pc, instruction } => write!(
@@ -291,8 +292,10 @@ impl R3000 {
     ///
     /// A successful step either completes one instruction or enters a guest
     /// exception. Guest exceptions are architectural state transitions and do
-    /// not produce [`StepError`]. Instruction and data read bus faults enter
-    /// the guest instruction- and data-bus-error exceptions, respectively.
+    /// not produce [`StepError`]. Hardware failures during instruction and
+    /// data reads enter the guest instruction- and data-bus-error exceptions,
+    /// respectively. Invalid and unimplemented bus accesses remain host
+    /// errors. The machine completes asynchronous hardware write errors.
     /// Unsupported instructions leave architectural registers unchanged,
     /// although a successful cached fetch remains visible in the instruction
     /// cache. A newly detected translation buffer shutdown changes only the
@@ -302,9 +305,10 @@ impl R3000 {
     ///
     /// # Errors
     ///
-    /// Returns [`StepError`] when the translation buffer is shut down, a
-    /// processor write is rejected by the physical bus, or a valid R3000
-    /// instruction is not implemented by this processor model.
+    /// Returns [`StepError`] when the translation buffer is shut down, a bus
+    /// access is invalid or unimplemented, a hardware write failure was not
+    /// completed by the machine, or a valid R3000 instruction is not
+    /// implemented by this processor model.
     pub fn step(&mut self, bus: &mut dyn PhysicalBus) -> Result<(), StepError> {
         if self.state.is_tlb_shutdown() {
             return Err(StepError::TlbShutdown);
@@ -330,10 +334,16 @@ impl R3000 {
         };
         let word = match fetch_instruction(&mut self.state, translation, bus) {
             Ok(word) => word,
-            Err(_) => {
+            Err(BusError::HardwareFault) => {
                 self.state.take_exception(Exception::InstructionBusError);
                 self.state.synchronize_cp1_interrupt();
                 return Ok(());
+            }
+            Err(fault) => {
+                return Err(StepError::BusError {
+                    address: translation.address,
+                    fault,
+                });
             }
         };
 
@@ -420,7 +430,7 @@ fn fetch_instruction(
     state: &mut State,
     translation: Translation,
     bus: &mut dyn PhysicalBus,
-) -> Result<u32, BusFault> {
+) -> Result<u32, BusError> {
     let bytes = state.read_instruction(translation, bus)?;
     Ok(u32::from_be_bytes(bytes))
 }
@@ -429,7 +439,7 @@ fn fetch_instruction(
 mod tests {
     use std::collections::BTreeMap;
 
-    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_core::bus::{BusError, PhysAddr, PhysicalBus};
     use se_float::backend::Backend;
 
     use super::{R3000, R3000Config, StepError, fetch_instruction};
@@ -472,7 +482,7 @@ mod tests {
 
     struct TestBus {
         bytes: [u8; 4],
-        fault: Option<BusFault>,
+        fault: Option<BusError>,
         read_address: Option<PhysAddr>,
         read_addresses: Vec<PhysAddr>,
         read_length: Option<usize>,
@@ -491,7 +501,7 @@ mod tests {
     }
 
     impl PhysicalBus for TestBus {
-        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
             self.read_address = Some(address);
             self.read_addresses.push(address);
             self.read_length = Some(data.len());
@@ -500,26 +510,26 @@ mod tests {
                 return Err(fault);
             }
             if data.len() != self.bytes.len() {
-                return Err(BusFault::UnsupportedAccess);
+                return Err(BusError::UnimplementedAccess);
             }
 
             data.copy_from_slice(&self.bytes);
             Ok(())
         }
 
-        fn write(&mut self, _address: PhysAddr, _data: &[u8]) -> Result<(), BusFault> {
-            Err(BusFault::UnsupportedAccess)
+        fn write(&mut self, _address: PhysAddr, _data: &[u8]) -> Result<(), BusError> {
+            Err(BusError::UnimplementedAccess)
         }
     }
 
     struct RejectingBus;
 
     impl PhysicalBus for RejectingBus {
-        fn read(&mut self, _address: PhysAddr, _data: &mut [u8]) -> Result<(), BusFault> {
+        fn read(&mut self, _address: PhysAddr, _data: &mut [u8]) -> Result<(), BusError> {
             panic!("this processor step must not read the physical bus")
         }
 
-        fn write(&mut self, _address: PhysAddr, _data: &[u8]) -> Result<(), BusFault> {
+        fn write(&mut self, _address: PhysAddr, _data: &[u8]) -> Result<(), BusError> {
             panic!("this processor step must not write the physical bus")
         }
     }
@@ -542,23 +552,23 @@ mod tests {
     }
 
     impl PhysicalBus for AddressBus {
-        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
             if data.len() != 4 {
-                return Err(BusFault::UnsupportedAccess);
+                return Err(BusError::UnimplementedAccess);
             }
 
             let word = self
                 .words
                 .iter()
                 .find_map(|&(candidate, word)| (candidate == address).then_some(word))
-                .ok_or(BusFault::Unmapped)?;
+                .ok_or(BusError::HardwareFault)?;
             self.read_addresses.push(address);
             data.copy_from_slice(&word.to_be_bytes());
             Ok(())
         }
 
-        fn write(&mut self, _address: PhysAddr, _data: &[u8]) -> Result<(), BusFault> {
-            Err(BusFault::UnsupportedAccess)
+        fn write(&mut self, _address: PhysAddr, _data: &[u8]) -> Result<(), BusError> {
+            Err(BusError::UnimplementedAccess)
         }
     }
 
@@ -567,8 +577,8 @@ mod tests {
         memory: BTreeMap<u64, u8>,
         reads: Vec<(PhysAddr, usize)>,
         writes: Vec<(PhysAddr, Vec<u8>)>,
-        read_fault: Option<(PhysAddr, BusFault)>,
-        write_fault: Option<(PhysAddr, BusFault)>,
+        read_fault: Option<(PhysAddr, BusError)>,
+        write_fault: Option<(PhysAddr, BusError)>,
     }
 
     impl ByteBus {
@@ -595,7 +605,7 @@ mod tests {
     }
 
     impl PhysicalBus for ByteBus {
-        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
             self.reads.push((address, data.len()));
             if let Some((fault_address, fault)) = self.read_fault
                 && address == fault_address
@@ -610,14 +620,14 @@ mod tests {
                     self.memory
                         .get(&address)
                         .copied()
-                        .ok_or(BusFault::Unmapped)?,
+                        .ok_or(BusError::HardwareFault)?,
                 );
             }
             data.copy_from_slice(&staged);
             Ok(())
         }
 
-        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusError> {
             self.writes.push((address, data.to_vec()));
             if let Some((fault_address, fault)) = self.write_fault
                 && address == fault_address
@@ -900,7 +910,7 @@ mod tests {
         assert_eq!(first_bus.read_addresses, vec![PhysAddr::new(0x100)]);
 
         let mut hit_bus = TestBus::new([0; 4]);
-        hit_bus.fault = Some(BusFault::Unmapped);
+        hit_bus.fault = Some(BusError::HardwareFault);
         assert_eq!(
             kseg0_processor.step(&mut hit_bus),
             Err(StepError::UnsupportedInstruction {
@@ -998,7 +1008,7 @@ mod tests {
         assert_eq!(refill_bus.read_addresses, vec![PhysAddr::new(0x300)]);
 
         let mut data_cache_hit_bus = TestBus::new([0; 4]);
-        data_cache_hit_bus.fault = Some(BusFault::Unmapped);
+        data_cache_hit_bus.fault = Some(BusError::HardwareFault);
         assert!(matches!(
             processor.step(&mut data_cache_hit_bus),
             Err(StepError::UnsupportedInstruction { .. })
@@ -1086,7 +1096,7 @@ mod tests {
         processor.state.write_hi(0x1357_9bdf);
         processor.state.write_lo(0x2468_ace0);
         let mut bus = TestBus::new([0; 4]);
-        bus.fault = Some(BusFault::Unmapped);
+        bus.fault = Some(BusError::HardwareFault);
 
         processor
             .step(&mut bus)
@@ -1119,7 +1129,7 @@ mod tests {
 
         jump_to(&mut processor, 0x8000_0700);
         let mut fault_bus = TestBus::new([0; 4]);
-        fault_bus.fault = Some(BusFault::Unmapped);
+        fault_bus.fault = Some(BusError::HardwareFault);
         processor
             .step(&mut fault_bus)
             .expect("cached fetch fault should enter IBE");
@@ -1152,7 +1162,7 @@ mod tests {
 
         jump_to(&mut processor, target);
         let mut hit_bus = TestBus::new([0; 4]);
-        hit_bus.fault = Some(BusFault::Unmapped);
+        hit_bus.fault = Some(BusError::HardwareFault);
         processor
             .step(&mut hit_bus)
             .expect("resident reserved instruction should enter RI");
@@ -1563,13 +1573,13 @@ mod tests {
         let cp0_before = cp0_snapshot(&processor);
         let mut bus = ByteBus::default();
         bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x2e, 1, 2, 0));
-        bus.write_fault = Some((PhysAddr::new(0x100), BusFault::UnsupportedAccess));
+        bus.write_fault = Some((PhysAddr::new(0x100), BusError::UnimplementedAccess));
 
         assert_eq!(
             processor.step(&mut bus),
-            Err(StepError::BusFault {
+            Err(StepError::BusError {
                 address: PhysAddr::new(0x100),
-                fault: BusFault::UnsupportedAccess,
+                fault: BusError::UnimplementedAccess,
             })
         );
         assert_eq!(snapshot(&processor), core_before);
@@ -1592,7 +1602,7 @@ mod tests {
             .expect("BEQ should succeed");
         let mut bus = ByteBus::default();
         bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, encode_immediate(0x26, 1, 2, 0));
-        bus.read_fault = Some((PhysAddr::new(0x100), BusFault::Unmapped));
+        bus.read_fault = Some((PhysAddr::new(0x100), BusError::HardwareFault));
 
         processor
             .step(&mut bus)
@@ -1717,7 +1727,7 @@ mod tests {
             .step(&mut bus)
             .expect("first LWL should refill the data cache");
         processor.step(&mut bus).expect("first NOP should succeed");
-        bus.read_fault = Some((PhysAddr::new(0x100), BusFault::Unmapped));
+        bus.read_fault = Some((PhysAddr::new(0x100), BusError::HardwareFault));
         processor
             .step(&mut bus)
             .expect("resident LWL should avoid the bus fault");
@@ -2014,13 +2024,13 @@ mod tests {
         processor.step(&mut bus).expect("LW should succeed");
         let core_before = snapshot(&processor);
         let cp0_before = cp0_snapshot(&processor);
-        bus.write_fault = Some((PhysAddr::new(0x200), BusFault::Unmapped));
+        bus.write_fault = Some((PhysAddr::new(0x200), BusError::HardwareFault));
 
         assert_eq!(
             processor.step(&mut bus),
-            Err(StepError::BusFault {
+            Err(StepError::BusError {
                 address: PhysAddr::new(0x200),
-                fault: BusFault::Unmapped,
+                fault: BusError::HardwareFault,
             })
         );
         assert_eq!(snapshot(&processor), core_before);
@@ -2031,6 +2041,142 @@ mod tests {
         processor.step(&mut bus).expect("retry should succeed");
         assert_eq!(processor.state.read_gpr(2), 0x2222_2222);
         assert_eq!(bus.bytes(0x200, 4), 0x3333_3333_u32.to_be_bytes());
+    }
+
+    #[test]
+    fn model_fetch_errors_stall_without_publishing_a_partial_refill() {
+        let config = R3000Config::new(1, 4 * 1024, 4 * 1024, 16, 16, true, Backend::SoftFloat);
+        for fault in [BusError::InvalidTransaction, BusError::UnimplementedAccess] {
+            for cached in [false, true] {
+                let mut processor = R3000::new(config);
+                jump_to(
+                    &mut processor,
+                    if cached { 0x8000_0100 } else { 0xa000_0100 },
+                );
+                let before = processor.debug_snapshot();
+                let mut bus = ByteBus::default();
+                bus.insert_bytes(0x100, &[0; 16]);
+                bus.read_fault = Some((PhysAddr::new(if cached { 0x104 } else { 0x100 }), fault));
+
+                assert_eq!(
+                    processor.step(&mut bus),
+                    Err(StepError::BusError {
+                        address: PhysAddr::new(0x100),
+                        fault
+                    })
+                );
+                assert_eq!(processor.debug_snapshot(), before);
+
+                bus.read_fault = None;
+                bus.reads.clear();
+                bus.insert_word(0x100, encode_immediate(0x09, 0, 2, 7));
+                processor
+                    .step(&mut bus)
+                    .expect("retry should fetch the replacement instruction");
+                assert_eq!(processor.state.read_gpr(2), 7);
+                assert_eq!(bus.reads.len(), if cached { 4 } else { 1 });
+                assert_eq!(bus.reads[0], (PhysAddr::new(0x100), 4));
+            }
+        }
+    }
+
+    #[test]
+    fn model_load_errors_preserve_pending_transfers_and_allow_retry() {
+        let config = R3000Config::new(1, 4 * 1024, 4 * 1024, 16, 16, true, Backend::SoftFloat);
+        for fault in [BusError::InvalidTransaction, BusError::UnimplementedAccess] {
+            for cached in [false, true] {
+                for (opcode, offset, request_address) in [
+                    (0x23, 0, 0x100), // LW
+                    (0x22, 1, 0x101), // LWL: three bytes
+                    (0x26, 2, 0x100), // LWR: three bytes
+                    (0x31, 0, 0x100), // LWC1
+                ] {
+                    let mut processor = R3000::new(config);
+                    enable_cp1(&mut processor);
+                    processor
+                        .state
+                        .write_gpr(1, if cached { 0x8000_0100 } else { 0xa000_0100 });
+                    processor.state.write_gpr(4, 0xa000_0200);
+                    let mut bus = ByteBus::default();
+                    bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 4, 5, 0));
+                    bus.insert_word(
+                        BOOT_PHYSICAL_ADDRESS + 4,
+                        encode_immediate(opcode, 1, 2, offset),
+                    );
+                    bus.insert_word(0x200, 0x1234_5678);
+                    bus.insert_bytes(0x100, &[0x11; 16]);
+                    processor
+                        .step(&mut bus)
+                        .expect("the preceding load should succeed");
+                    let before = processor.debug_snapshot();
+                    bus.read_fault = Some((
+                        PhysAddr::new(if cached { 0x104 } else { request_address }),
+                        fault,
+                    ));
+
+                    assert_eq!(
+                        processor.step(&mut bus),
+                        Err(StepError::BusError {
+                            address: PhysAddr::new(request_address),
+                            fault
+                        })
+                    );
+                    assert_eq!(processor.debug_snapshot(), before);
+
+                    bus.read_fault = None;
+                    bus.reads.clear();
+                    processor
+                        .step(&mut bus)
+                        .expect("the failed load should be retryable");
+                    assert_eq!(processor.state.read_gpr(5), 0x1234_5678);
+                    assert_eq!(bus.reads.len(), if cached { 5 } else { 2 });
+                    assert_eq!(
+                        bus.reads[1].0,
+                        PhysAddr::new(if cached { 0x100 } else { request_address })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uncompleted_store_errors_remain_host_errors() {
+        for fault in [
+            BusError::HardwareFault,
+            BusError::InvalidTransaction,
+            BusError::UnimplementedAccess,
+        ] {
+            for (opcode, offset, request_address) in [
+                (0x2b, 0, 0x100), // SW
+                (0x2a, 1, 0x101), // SWL: three bytes
+                (0x2e, 2, 0x100), // SWR: three bytes
+                (0x39, 0, 0x100), // SWC1
+            ] {
+                let mut processor = R3000::new(super::TEST_CONFIG);
+                enable_cp1(&mut processor);
+                processor.state.write_gpr(1, 0xa000_0100);
+                let before = processor.debug_snapshot();
+                let mut bus = ByteBus::default();
+                bus.insert_word(
+                    BOOT_PHYSICAL_ADDRESS,
+                    encode_immediate(opcode, 1, 2, offset),
+                );
+                bus.insert_bytes(0x100, &[0xaa; 4]);
+                bus.write_fault = Some((PhysAddr::new(request_address), fault));
+
+                assert_eq!(
+                    processor.step(&mut bus),
+                    Err(StepError::BusError {
+                        address: PhysAddr::new(request_address),
+                        fault
+                    })
+                );
+                assert_eq!(processor.debug_snapshot(), before);
+                assert_eq!(bus.bytes(0x100, 4), [0xaa; 4]);
+                assert_eq!(bus.writes.len(), 1);
+                assert_eq!(bus.writes[0].1.len(), if offset == 0 { 4 } else { 3 });
+            }
+        }
     }
 
     #[test]
@@ -2130,7 +2276,7 @@ mod tests {
             ];
             let mut bus = ByteBus::default();
             bus.insert_word(BOOT_PHYSICAL_ADDRESS, encode_immediate(0x23, 1, 2, 0));
-            bus.read_fault = Some((PhysAddr::new(0x100), BusFault::Unmapped));
+            bus.read_fault = Some((PhysAddr::new(0x100), BusError::HardwareFault));
 
             processor
                 .step(&mut bus)
@@ -2158,7 +2304,7 @@ mod tests {
             .expect("BEQ should succeed");
         let mut bus = ByteBus::default();
         bus.insert_word(BOOT_PHYSICAL_ADDRESS + 4, encode_immediate(0x23, 1, 2, 0));
-        bus.read_fault = Some((PhysAddr::new(0x100), BusFault::Unmapped));
+        bus.read_fault = Some((PhysAddr::new(0x100), BusError::HardwareFault));
 
         processor
             .step(&mut bus)
@@ -2213,7 +2359,7 @@ mod tests {
 
         processor.step(&mut bus).expect("first LW should succeed");
         processor.step(&mut bus).expect("first NOP should succeed");
-        bus.read_fault = Some((PhysAddr::new(0x100), BusFault::Unmapped));
+        bus.read_fault = Some((PhysAddr::new(0x100), BusError::HardwareFault));
         processor
             .step(&mut bus)
             .expect("resident LW should avoid the bus fault");
@@ -2241,7 +2387,7 @@ mod tests {
         bus.insert_word(BOOT_PHYSICAL_ADDRESS + 8, 0);
 
         processor.step(&mut bus).expect("cached SW should succeed");
-        bus.read_fault = Some((PhysAddr::new(0x100), BusFault::Unmapped));
+        bus.read_fault = Some((PhysAddr::new(0x100), BusError::HardwareFault));
         processor
             .step(&mut bus)
             .expect("resident LW should avoid the bus fault");
@@ -2427,7 +2573,7 @@ mod tests {
         let mut processor = R3000::new(super::TEST_CONFIG);
         step_with_word(&mut processor, 0x0ff0_0010).expect("JAL should succeed");
         let mut bus = TestBus::new([0; 4]);
-        bus.fault = Some(BusFault::Unmapped);
+        bus.fault = Some(BusError::HardwareFault);
 
         processor
             .step(&mut bus)
@@ -2909,7 +3055,7 @@ mod tests {
         let exception_epc = processor.state.pc();
         let stalled_random = processor.state.read_cp0(1);
         let mut bus = TestBus::new([0; 4]);
-        bus.fault = Some(BusFault::Unmapped);
+        bus.fault = Some(BusError::HardwareFault);
 
         processor
             .step(&mut bus)
@@ -3122,7 +3268,7 @@ mod tests {
         set_hardware_interrupt_lines_and_sync(&mut processor, 1 << 1);
         let fault_pc = processor.state.pc();
         let mut bus = TestBus::new([0; 4]);
-        bus.fault = Some(BusFault::Unmapped);
+        bus.fault = Some(BusError::HardwareFault);
 
         processor
             .step(&mut bus)

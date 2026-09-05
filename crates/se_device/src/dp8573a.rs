@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 use serde::{Deserialize, Serialize};
 
@@ -253,9 +253,10 @@ impl Dp8573a {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] unless the transaction is a
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction is a
     /// byte on the low byte lane or a complete aligned word.
-    pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let register = decode_register(address, data.len())?;
         let value = self.read_register(register);
         write_transaction_value(value, data);
@@ -269,9 +270,10 @@ impl Dp8573a {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] unless the transaction is a
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction is a
     /// byte on the low byte lane or a complete aligned word.
-    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let register = decode_register(address, data.len())?;
         write_transaction_value(self.read_register(register), data);
         Ok(())
@@ -281,9 +283,10 @@ impl Dp8573a {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] unless the transaction is a
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction is a
     /// byte on the low byte lane or a complete aligned word.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         let register = decode_register(address, data.len())?;
         self.write_register(register, data[data.len() - 1]);
         Ok(())
@@ -987,22 +990,26 @@ fn write_transaction_value(value: u8, data: &mut [u8]) {
     }
 }
 
-fn decode_register(address: DeviceAddr, length: usize) -> Result<usize, BusFault> {
+fn decode_register(address: DeviceAddr, length: usize) -> Result<usize, BusError> {
+    if !(1..=4).contains(&length) {
+        return Err(BusError::InvalidTransaction);
+    }
+
     let address = address.get();
     let register = match length {
         1 if address & 3 == 3 => address >> 2,
         4 if address & 3 == 0 => address >> 2,
-        _ => return Err(BusFault::UnsupportedAccess),
+        _ => return Err(BusError::UnimplementedAccess),
     };
     usize::try_from(register)
         .ok()
         .filter(|register| *register < REGISTER_COUNT)
-        .ok_or(BusFault::UnsupportedAccess)
+        .ok_or(BusError::UnimplementedAccess)
 }
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
     use super::{
@@ -1017,13 +1024,13 @@ mod tests {
         DeviceAddr::new((register as u64) * 4 + 3)
     }
 
-    fn read_register(rtc: &mut Dp8573a, register: usize) -> Result<u8, BusFault> {
+    fn read_register(rtc: &mut Dp8573a, register: usize) -> Result<u8, BusError> {
         let mut value = [0xff];
         rtc.read(address(register), &mut value)?;
         Ok(value[0])
     }
 
-    fn debug_read_register(rtc: &Dp8573a, register: usize) -> Result<u8, BusFault> {
+    fn debug_read_register(rtc: &Dp8573a, register: usize) -> Result<u8, BusError> {
         let mut value = [0xff];
         rtc.debug_read(address(register), &mut value)?;
         Ok(value[0])
@@ -1383,15 +1390,15 @@ mod tests {
 
         assert_eq!(
             rtc.write(DeviceAddr::new(0x54), &[0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             rtc.write(address(HOURS_COMPARE), &[1, 2]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             rtc.write(DeviceAddr::new(0x80), &0_u32.to_be_bytes()),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(read_register(&mut rtc, HOURS_COMPARE), Ok(0xa5));
     }

@@ -1,4 +1,4 @@
-use se_core::bus::{BusFault, PhysAddr};
+use se_core::bus::{BusError, PhysAddr};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use serde::{Deserialize, Serialize};
@@ -20,12 +20,12 @@ impl LocalMemory {
         pic1: &Pic1,
         address: PhysAddr,
         data: &mut [u8],
-    ) -> Result<(), BusFault> {
+    ) -> Result<(), BusError> {
         if !local_memory_transaction_is_contained(address, data.len())? {
-            return Err(BusFault::Unmapped);
+            return Err(BusError::HardwareFault);
         }
         let Some((index, offset)) = pic1.decode_memory(address, data.len())? else {
-            return Err(BusFault::Unmapped);
+            return Err(BusError::HardwareFault);
         };
         let Some(ram) = &self.modules[index] else {
             data.fill(0);
@@ -33,7 +33,7 @@ impl LocalMemory {
         };
         match ram.read(offset, data) {
             Ok(()) => Ok(()),
-            Err(BusFault::Unmapped) => {
+            Err(BusError::HardwareFault) => {
                 data.fill(0);
                 Ok(())
             }
@@ -43,23 +43,21 @@ impl LocalMemory {
 
     pub(super) fn write(
         &mut self,
-        pic1: &mut Pic1,
+        pic1: &Pic1,
         address: PhysAddr,
         data: &[u8],
-    ) -> Result<(), BusFault> {
+    ) -> Result<(), BusError> {
         if !local_memory_transaction_is_contained(address, data.len())? {
-            pic1.report_address_error();
-            return Ok(());
+            return Err(BusError::HardwareFault);
         }
         let Some((index, offset)) = pic1.decode_memory(address, data.len())? else {
-            pic1.report_address_error();
-            return Ok(());
+            return Err(BusError::HardwareFault);
         };
         let Some(ram) = &mut self.modules[index] else {
             return Ok(());
         };
         match ram.write(offset, data) {
-            Ok(()) | Err(BusFault::Unmapped) => Ok(()),
+            Ok(()) | Err(BusError::HardwareFault) => Ok(()),
             Err(fault) => Err(fault),
         }
     }
@@ -106,7 +104,7 @@ impl LocalMemory {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_core::bus::{BusError, PhysAddr, PhysicalBus};
     use se_device::ram::Ram;
 
     use super::super::address::{LOCAL_MEMORY_END, PIC1_BASE};
@@ -191,11 +189,11 @@ mod tests {
 
         assert_eq!(
             bus.read(PhysAddr::new(0), &mut [0; 4]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(
             bus.debug_read(PhysAddr::new(0), &mut [0; 4]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(
             bus.write(PhysAddr::new(0), &0x0123_4567_u32.to_be_bytes()),
@@ -250,7 +248,7 @@ mod tests {
         assert!(bus.error_interrupt_asserted());
         assert_eq!(
             bus.read(PhysAddr::new(LOCAL_MEMORY_END - 2), &mut [0; 4]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
     }
 }

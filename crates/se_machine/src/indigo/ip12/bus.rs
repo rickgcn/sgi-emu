@@ -1,4 +1,4 @@
-use se_core::bus::{BusFault, DeviceAddr, PhysAddr, PhysicalBus};
+use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 use se_device::centronics::CentronicsPort;
 use se_device::dp8573a::{Dp8573a, Dp8573aBatteryState};
 use se_device::dsp56001::Dsp56001;
@@ -233,7 +233,7 @@ impl Ip12Bus {
         consumed
     }
 
-    pub(super) fn debug_read(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    pub(super) fn debug_read(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
         if address.get() < LOCAL_MEMORY_END {
             return self.memory.read(&self.pic1, address, data);
         }
@@ -246,20 +246,26 @@ impl Ip12Bus {
             Target::Scsi(address) => self.wd33c93b.debug_read(address, data),
             Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),
             Target::Int2(address) => self.int2.debug_read(address, data),
-            Target::Serial(index, address) => self.serial[index].debug_read(address, data),
-            Target::UnpopulatedSerial(_) => Err(BusFault::Unmapped),
+            Target::Serial(index, address) => self
+                .serial
+                .get(index)
+                .ok_or(BusError::HardwareFault)?
+                .debug_read(address, data),
             Target::Mdac(address) => self.mdac.read(address, data),
             Target::Rtc(address) => self.rtc.debug_read(address, data),
             Target::BoardRevision => read_board_revision(data),
             Target::Dsp56001(address) => self.dsp56001.read(address, data),
             Target::Prom(address) => self.prom.read(address, data),
-            Target::UnpopulatedGio => read_unpopulated_gio(data),
+            Target::Gio(_address) => {
+                data.fill(0);
+                Ok(())
+            }
         }
     }
 }
 
 impl PhysicalBus for Ip12Bus {
-    fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
         if address.get() < LOCAL_MEMORY_END {
             return self.memory.read(&self.pic1, address, data);
         }
@@ -284,14 +290,14 @@ impl PhysicalBus for Ip12Bus {
                 self.reschedule_int2();
                 result
             }
-            Target::Serial(index, address) => {
+            Target::Serial(index, address) if index < self.serial.len() => {
                 self.synchronize_serial_for_mmio(index);
                 let result = self.serial[index].read(address, data);
                 self.synchronize_serial_interrupt();
                 self.reschedule_serial(index);
                 result
             }
-            Target::UnpopulatedSerial(_) => Err(BusFault::Unmapped),
+            Target::Serial(_, _) => Err(BusError::HardwareFault),
             Target::Mdac(address) => self.mdac.read(address, data),
             Target::Rtc(address) => {
                 self.synchronize_rtc_time();
@@ -303,94 +309,98 @@ impl PhysicalBus for Ip12Bus {
             Target::BoardRevision => read_board_revision(data),
             Target::Dsp56001(address) => self.dsp56001.read(address, data),
             Target::Prom(address) => self.prom.read(address, data),
-            Target::UnpopulatedGio => read_unpopulated_gio(data),
+            Target::Gio(_address) => {
+                data.fill(0);
+                Ok(())
+            }
         }
     }
 
-    fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
-        if address.get() < LOCAL_MEMORY_END {
-            return self.memory.write(&mut self.pic1, address, data);
-        }
+    fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusError> {
+        let result = if address.get() < LOCAL_MEMORY_END {
+            self.memory.write(&self.pic1, address, data)
+        } else {
+            route(address, data.len()).and_then(|target| match target {
+                Target::Pic1(address) => self.pic1.write(address, data),
+                Target::Hpc1(address) => {
+                    self.synchronize_hpc1_time();
+                    self.hpc1.write(address, data)?;
+                    self.handle_hpc1_outputs();
+                    Ok(())
+                }
+                Target::Centronics(address) => self.centronics.write(address, data),
+                Target::Seeq8003(address) => self.seeq8003.write(address, data),
+                Target::Scsi(address) => {
+                    self.wd33c93b.write(address, data)?;
+                    self.handle_scsi_register_write();
+                    Ok(())
+                }
+                Target::CpuAuxControl => {
+                    write_cpu_aux_control(&mut self.cpu_aux_control, &mut self.nvram, data)
+                }
+                Target::Int2(address) => {
+                    self.synchronize_int2_time();
+                    let result = self.int2.write(address, data);
+                    self.reschedule_int2();
+                    result
+                }
+                Target::Serial(index, address) if index < self.serial.len() => {
+                    self.synchronize_serial_for_mmio(index);
+                    let result = self.serial[index].write(address, data);
+                    self.synchronize_serial_interrupt();
+                    self.reschedule_serial(index);
+                    result
+                }
+                Target::Serial(_, address) => {
+                    if data.len() == 1 && matches!(address.get(), 0x03 | 0x07 | 0x0b | 0x0f) {
+                        Ok(())
+                    } else {
+                        Err(BusError::UnimplementedAccess)
+                    }
+                }
+                Target::Mdac(address) => self.mdac.write(address, data),
+                Target::Rtc(address) => {
+                    self.synchronize_rtc_time();
+                    let result = self.rtc.write(address, data);
+                    self.events
+                        .schedule(EventKind::Rtc, self.rtc.time_until_event());
+                    result
+                }
+                Target::BoardRevision => Err(BusError::UnimplementedAccess),
+                Target::Dsp56001(address) => self.dsp56001.write(address, data),
+                Target::Prom(_) => Ok(()),
+                Target::Gio(_address) => Ok(()),
+            })
+        };
 
-        match route(address, data.len())? {
-            Target::Pic1(address) => self.pic1.write(address, data),
-            Target::Hpc1(address) => {
-                self.synchronize_hpc1_time();
-                self.hpc1.write(address, data)?;
-                self.handle_hpc1_outputs();
+        match result {
+            Err(BusError::HardwareFault) => {
+                self.pic1.report_address_error();
                 Ok(())
             }
-            Target::Centronics(address) => self.centronics.write(address, data),
-            Target::Seeq8003(address) => self.seeq8003.write(address, data),
-            Target::Scsi(address) => {
-                self.wd33c93b.write(address, data)?;
-                self.handle_scsi_register_write();
-                Ok(())
-            }
-            Target::CpuAuxControl => {
-                write_cpu_aux_control(&mut self.cpu_aux_control, &mut self.nvram, data)
-            }
-            Target::Int2(address) => {
-                self.synchronize_int2_time();
-                let result = self.int2.write(address, data);
-                self.reschedule_int2();
-                result
-            }
-            Target::Serial(index, address) => {
-                self.synchronize_serial_for_mmio(index);
-                let result = self.serial[index].write(address, data);
-                self.synchronize_serial_interrupt();
-                self.reschedule_serial(index);
-                result
-            }
-            Target::UnpopulatedSerial(address) => write_unpopulated_serial(address, data),
-            Target::Mdac(address) => self.mdac.write(address, data),
-            Target::Rtc(address) => {
-                self.synchronize_rtc_time();
-                let result = self.rtc.write(address, data);
-                self.events
-                    .schedule(EventKind::Rtc, self.rtc.time_until_event());
-                result
-            }
-            Target::BoardRevision => Err(BusFault::UnsupportedAccess),
-            Target::Dsp56001(address) => self.dsp56001.write(address, data),
-            Target::Prom(_) => Ok(()),
-            Target::UnpopulatedGio => Ok(()),
+            result => result,
         }
     }
 }
 
-fn read_board_revision(data: &mut [u8]) -> Result<(), BusFault> {
+fn read_board_revision(data: &mut [u8]) -> Result<(), BusError> {
+    if !(1..=4).contains(&data.len()) {
+        return Err(BusError::InvalidTransaction);
+    }
     if data.len() != 4 {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::UnimplementedAccess);
     }
     data.copy_from_slice(&BOARD_REVISION.to_be_bytes());
     Ok(())
 }
 
-fn read_unpopulated_gio(data: &mut [u8]) -> Result<(), BusFault> {
-    data.fill(0);
-    Ok(())
-}
-
-fn write_unpopulated_serial(address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
-    if data.len() != 1 {
-        return Err(BusFault::UnsupportedAccess);
-    }
-
-    match address.get() {
-        0x03 | 0x07 | 0x0b | 0x0f => Ok(()),
-        _ => Err(BusFault::Unmapped),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 
     use super::address::{
         BOARD_REVISION_BASE, CENTRONICS_EXTERNAL_BASE, CPU_AUX_CONTROL, DSP56001_BASE,
-        DSP56001_END, GIO_BASE, GIO_END, HPC1_DSP_INTERRUPT_MASK_BASE,
+        DSP56001_END, GIO_BASE, GIO_END, HPC1_COUNTER_BASE, HPC1_DSP_INTERRUPT_MASK_BASE,
         HPC1_DSP_INTERRUPT_STATUS_BASE, HPC1_ENDIAN_CONTROL_BASE, INT2_BASE, MDAC_BASE, PIC1_BASE,
         PROM_BASE, RTC_BASE, SCSI_BASE, SERIAL_0_BASE, SERIAL_1_BASE,
     };
@@ -426,11 +436,11 @@ mod tests {
         assert_eq!(read_word(&mut bus, BOARD_REVISION_BASE), Ok(0x8000));
         assert_eq!(
             bus.read(PhysAddr::new(BOARD_REVISION_BASE), &mut [0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             bus.write(PhysAddr::new(BOARD_REVISION_BASE), &[0; 4]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
     }
 
@@ -471,6 +481,71 @@ mod tests {
             Ok(())
         );
         assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn headless_gio_accesses_preserve_the_error_latch() {
+        let mut bus = bus();
+        for pending in [false, true] {
+            if pending {
+                bus.write(PhysAddr::new(0x1fb0_0010), &[0]).unwrap();
+            }
+            for length in 1..=4 {
+                for address in [GIO_BASE, GIO_END - length as u64] {
+                    let mut bytes = [0xff; 4];
+                    bus.debug_read(PhysAddr::new(address), &mut bytes[..length])
+                        .unwrap();
+                    assert_eq!(&bytes[..length], &vec![0; length]);
+                    assert_eq!(bus.error_interrupt_asserted(), pending);
+
+                    bus.read(PhysAddr::new(address), &mut bytes[..length])
+                        .unwrap();
+                    assert_eq!(bus.error_interrupt_asserted(), pending);
+                    assert_eq!(&bytes[..length], &vec![0; length]);
+
+                    bus.write(PhysAddr::new(address), &bytes[..length]).unwrap();
+                    assert_eq!(bus.error_interrupt_asserted(), pending);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_errors_are_not_completed_as_hardware_write_errors() {
+        let mut bus = bus();
+        for (address, length) in [
+            (PIC1_BASE + 0x100, 4),
+            (PIC1_BASE + 0x1_0000, 1),
+            (HPC1_COUNTER_BASE, 4),
+            (SERIAL_1_BASE + 0x0b, 2),
+            (BOARD_REVISION_BASE, 4),
+        ] {
+            assert_eq!(
+                bus.write(PhysAddr::new(address), &[0xa5; 4][..length]),
+                Err(BusError::UnimplementedAccess)
+            );
+            assert!(!bus.error_interrupt_asserted());
+        }
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 0x1_0000), Ok(0));
+        let mut bytes = [0xa5; 4];
+        assert_eq!(
+            bus.read(PhysAddr::new(PIC1_BASE + 0x100), &mut bytes),
+            Err(BusError::UnimplementedAccess)
+        );
+        assert_eq!(bytes, [0xa5; 4]);
+        assert!(!bus.error_interrupt_asserted());
+    }
+
+    #[test]
+    fn a_selected_target_hardware_write_error_uses_board_completion() {
+        let mut bus = bus();
+        let address = PhysAddr::new(PIC1_BASE + 3);
+        let before = read_word(&mut bus, PIC1_BASE).unwrap();
+        assert_eq!(bus.read(address, &mut [0; 2]), Err(BusError::HardwareFault));
+        assert!(!bus.error_interrupt_asserted());
+        assert_eq!(bus.write(address, &[0xaa, 0xbb]), Ok(()));
+        assert!(bus.error_interrupt_asserted());
+        assert_eq!(read_word(&mut bus, PIC1_BASE), Ok(before));
     }
 
     #[test]

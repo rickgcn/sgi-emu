@@ -1,4 +1,4 @@
-use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 use serde::{Deserialize, Serialize};
 
 use super::R3000Config;
@@ -40,7 +40,7 @@ impl Cache {
         address: PhysAddr,
         data: &mut [u8],
         bus: &mut dyn PhysicalBus,
-    ) -> Result<(), BusFault> {
+    ) -> Result<(), BusError> {
         let access = self.access(address, data.len());
         let entry = self.entries[access.index];
         if entry.valid && entry.page_frame == access.page_frame {
@@ -76,7 +76,7 @@ impl Cache {
         data: &[u8],
         partial_store_enabled: bool,
         bus: &mut dyn PhysicalBus,
-    ) -> Result<(), BusFault> {
+    ) -> Result<(), BusError> {
         let access = self.access(address, data.len());
 
         if data.len() == WORD_BYTES {
@@ -191,7 +191,7 @@ impl Caches {
         address: PhysAddr,
         data: &mut [u8],
         bus: &mut dyn PhysicalBus,
-    ) -> Result<(), BusFault> {
+    ) -> Result<(), BusError> {
         self.cache_mut(bank).read(address, data, bus)
     }
 
@@ -201,7 +201,7 @@ impl Caches {
         address: PhysAddr,
         data: &[u8],
         bus: &mut dyn PhysicalBus,
-    ) -> Result<(), BusFault> {
+    ) -> Result<(), BusError> {
         let partial_store_enabled = self.partial_store_enabled;
         self.cache_mut(bank)
             .write(address, data, partial_store_enabled, bus)
@@ -250,7 +250,7 @@ impl Caches {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_core::bus::{BusError, PhysAddr, PhysicalBus};
     use se_float::backend::Backend;
 
     use super::{CacheBank, Caches};
@@ -264,7 +264,7 @@ mod tests {
         reads: Vec<(PhysAddr, usize)>,
         writes: Vec<(PhysAddr, Vec<u8>)>,
         read_fault_address: Option<PhysAddr>,
-        write_fault: Option<BusFault>,
+        write_fault: Option<BusError>,
     }
 
     impl TestBus {
@@ -280,22 +280,22 @@ mod tests {
     }
 
     impl PhysicalBus for TestBus {
-        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
             self.reads.push((address, data.len()));
             if self.read_fault_address == Some(address) {
-                return Err(BusFault::Unmapped);
+                return Err(BusError::HardwareFault);
             }
 
             let start = address.get() as usize;
             let source = self
                 .memory
                 .get(start..start + data.len())
-                .ok_or(BusFault::Unmapped)?;
+                .ok_or(BusError::HardwareFault)?;
             data.copy_from_slice(source);
             Ok(())
         }
 
-        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusError> {
             if let Some(fault) = self.write_fault {
                 return Err(fault);
             }
@@ -526,7 +526,7 @@ mod tests {
                 &mut output,
                 &mut bus,
             ),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
 
         let mut resident = [0; 4];
@@ -612,11 +612,11 @@ mod tests {
         let mut caches = Caches::new(CONFIG);
         caches.write_isolated(CacheBank::Data, PhysAddr::new(0xc0), &[1, 2, 3, 4]);
         let mut bus = TestBus::new();
-        bus.write_fault = Some(BusFault::Unmapped);
+        bus.write_fault = Some(BusError::HardwareFault);
 
         assert_eq!(
             caches.write(CacheBank::Data, PhysAddr::new(0xc1), &[9], &mut bus,),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
 
         let mut data = [0; 4];

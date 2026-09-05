@@ -1,4 +1,4 @@
-use se_core::bus::{PhysAddr, PhysicalBus};
+use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 
 use super::{
     ExecutionOutcome, StepError,
@@ -81,11 +81,17 @@ pub(super) fn execute(
             };
             let length = 4 - byte;
             let mut memory = [0; 4];
-            if state
-                .load_data(translation, &mut memory[..length], bus)
-                .is_err()
-            {
-                return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
+            match state.load_data(translation, &mut memory[..length], bus) {
+                Ok(()) => {}
+                Err(BusError::HardwareFault) => {
+                    return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
+                }
+                Err(fault) => {
+                    return Err(StepError::BusError {
+                        address: translation.address,
+                        fault,
+                    });
+                }
             }
 
             let mut bytes = state.read_gpr_for_load_merge(rt).to_be_bytes();
@@ -123,11 +129,17 @@ pub(super) fn execute(
             translation.address = PhysAddr::new(translation.address.get() - byte as u64);
             let length = byte + 1;
             let mut memory = [0; 4];
-            if state
-                .load_data(translation, &mut memory[..length], bus)
-                .is_err()
-            {
-                return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
+            match state.load_data(translation, &mut memory[..length], bus) {
+                Ok(()) => {}
+                Err(BusError::HardwareFault) => {
+                    return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
+                }
+                Err(fault) => {
+                    return Err(StepError::BusError {
+                        address: translation.address,
+                        fault,
+                    });
+                }
             }
 
             let mut bytes = state.read_gpr_for_load_merge(rt).to_be_bytes();
@@ -171,7 +183,7 @@ pub(super) fn execute(
             let bytes = state.read_gpr(rt).to_be_bytes();
             state
                 .store_memory(translation, &bytes[..4 - byte], bus)
-                .map_err(|fault| StepError::BusFault {
+                .map_err(|fault| StepError::BusError {
                     address: physical_address,
                     fault,
                 })?;
@@ -202,7 +214,7 @@ pub(super) fn execute(
             let bytes = state.read_gpr(rt).to_be_bytes();
             state
                 .store_memory(translation, &bytes[3 - byte..], bus)
-                .map_err(|fault| StepError::BusFault {
+                .map_err(|fault| StepError::BusError {
                     address: physical_address,
                     fault,
                 })?;
@@ -240,8 +252,17 @@ pub(super) fn load(
         }
     };
 
-    if state.load_data(translation, data, bus).is_err() {
-        return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
+    match state.load_data(translation, data, bus) {
+        Ok(()) => {}
+        Err(BusError::HardwareFault) => {
+            return Ok(ExecutionOutcome::Exception(Exception::DataBusError));
+        }
+        Err(fault) => {
+            return Err(StepError::BusError {
+                address: translation.address,
+                fault,
+            });
+        }
     }
 
     Ok(ExecutionOutcome::Completed(()))
@@ -277,7 +298,7 @@ pub(super) fn store(
 
     state
         .store_memory(translation, data, bus)
-        .map_err(|fault| StepError::BusFault {
+        .map_err(|fault| StepError::BusError {
             address: physical_address,
             fault,
         })?;
@@ -305,7 +326,7 @@ fn translate_address(
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 
     use super::{
         Exception, ExecutionOutcome, InstructionEffect, MemoryInstruction, State, StepError,
@@ -328,8 +349,8 @@ mod tests {
         read_data: [u8; 4],
         reads: Vec<(PhysAddr, usize)>,
         writes: Vec<(PhysAddr, Vec<u8>)>,
-        read_fault: Option<BusFault>,
-        write_fault: Option<BusFault>,
+        read_fault: Option<BusError>,
+        write_fault: Option<BusError>,
     }
 
     impl TestBus {
@@ -345,7 +366,7 @@ mod tests {
     }
 
     impl PhysicalBus for TestBus {
-        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
             self.reads.push((address, data.len()));
             if let Some(fault) = self.read_fault {
                 return Err(fault);
@@ -355,7 +376,7 @@ mod tests {
             Ok(())
         }
 
-        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusError> {
             self.writes.push((address, data.to_vec()));
             if let Some(fault) = self.write_fault {
                 return Err(fault);
@@ -907,7 +928,7 @@ mod tests {
         let mut load_state = State::new(TEST_CONFIG);
         load_state.write_gpr(1, 0xa000_0100);
         let mut load_bus = TestBus::new([0; 4]);
-        load_bus.read_fault = Some(BusFault::Unmapped);
+        load_bus.read_fault = Some(BusError::HardwareFault);
 
         assert_eq!(
             execute(
@@ -926,7 +947,7 @@ mod tests {
         store_state.write_gpr(1, 0xa000_0100);
         store_state.write_gpr(2, 0x1234_5678);
         let mut store_bus = TestBus::new([0; 4]);
-        store_bus.write_fault = Some(BusFault::UnsupportedAccess);
+        store_bus.write_fault = Some(BusError::UnimplementedAccess);
 
         assert_eq!(
             execute(
@@ -938,9 +959,9 @@ mod tests {
                 },
                 &mut store_bus,
             ),
-            Err(StepError::BusFault {
+            Err(StepError::BusError {
                 address: PhysAddr::new(0x100),
-                fault: BusFault::UnsupportedAccess,
+                fault: BusError::UnimplementedAccess,
             })
         );
     }
@@ -1007,7 +1028,7 @@ mod tests {
         let mut load_state = State::new(TEST_CONFIG);
         load_state.write_gpr(1, 0xa000_0102);
         let mut load_bus = TestBus::new([0; 4]);
-        load_bus.read_fault = Some(BusFault::Unmapped);
+        load_bus.read_fault = Some(BusError::HardwareFault);
         assert_eq!(
             execute(
                 &mut load_state,
@@ -1026,7 +1047,7 @@ mod tests {
         store_state.write_gpr(1, 0xa000_0102);
         store_state.write_gpr(2, 0x1234_5678);
         let mut store_bus = TestBus::new([0; 4]);
-        store_bus.write_fault = Some(BusFault::UnsupportedAccess);
+        store_bus.write_fault = Some(BusError::UnimplementedAccess);
         assert_eq!(
             execute(
                 &mut store_state,
@@ -1037,9 +1058,9 @@ mod tests {
                 },
                 &mut store_bus,
             ),
-            Err(StepError::BusFault {
+            Err(StepError::BusError {
                 address: PhysAddr::new(0x100),
-                fault: BusFault::UnsupportedAccess,
+                fault: BusError::UnimplementedAccess,
             })
         );
         assert_eq!(

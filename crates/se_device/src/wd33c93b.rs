@@ -1,6 +1,6 @@
 //! Western Digital WD33C93B indirect-register and command model.
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 use serde::{Deserialize, Serialize};
 
 const ADDRESS_PORT: u64 = 0;
@@ -149,9 +149,10 @@ impl Wd33c93b {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] unless the transaction selects exactly one byte
-    /// port.
-    pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction selects
+    /// exactly one modeled byte port.
+    pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         match decode_port(address, data.len())? {
             Port::Address => data[0] = self.auxiliary_status(),
             Port::Data => {
@@ -172,9 +173,10 @@ impl Wd33c93b {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] unless the transaction selects exactly one byte
-    /// port.
-    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction selects
+    /// exactly one modeled byte port.
+    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         match decode_port(address, data.len())? {
             Port::Address => data[0] = self.auxiliary_status(),
             Port::Data => data[0] = self.read_selected_register(self.selected_register),
@@ -186,9 +188,10 @@ impl Wd33c93b {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] unless the transaction selects exactly one byte
-    /// port.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction selects
+    /// exactly one modeled byte port.
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         match decode_port(address, data.len())? {
             Port::Address => self.selected_register = data[0] & 0x1f,
             Port::Data => {
@@ -380,15 +383,19 @@ enum Port {
     Data,
 }
 
-fn decode_port(address: DeviceAddr, length: usize) -> Result<Port, BusFault> {
+fn decode_port(address: DeviceAddr, length: usize) -> Result<Port, BusError> {
+    if !(1..=4).contains(&length) {
+        return Err(BusError::InvalidTransaction);
+    }
+
     if length != 1 {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::UnimplementedAccess);
     }
 
     match address.get() {
         ADDRESS_PORT => Ok(Port::Address),
         DATA_PORT => Ok(Port::Data),
-        _ => Err(BusFault::Unmapped),
+        _ => Err(BusError::UnimplementedAccess),
     }
 }
 
@@ -407,7 +414,7 @@ const fn cdb_length(opcode: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
 
     use super::{
         ADDRESS_PORT, AUXILIARY_STATUS, BUSY, CDB_START, COMMAND, COMMAND_IN_PROGRESS,
@@ -416,7 +423,7 @@ mod tests {
         TRANSFER_COUNT_MSB, UNEXPECTED_DATA_IN_STATUS, UNEXPECTED_DATA_OUT_STATUS, Wd33c93b,
     };
 
-    fn read_port(scsi: &mut Wd33c93b, port: u64) -> Result<u8, BusFault> {
+    fn read_port(scsi: &mut Wd33c93b, port: u64) -> Result<u8, BusError> {
         let mut value = [0];
         scsi.read(DeviceAddr::new(port), &mut value)?;
         Ok(value[0])
@@ -605,11 +612,11 @@ mod tests {
 
         assert_eq!(
             scsi.write(DeviceAddr::new(DATA_PORT), &[1, 2]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             scsi.write(DeviceAddr::new(2), &[1]),
-            Err(BusFault::Unmapped)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(scsi.timeout_period, 0);
         assert_eq!(scsi.selected_register, TIMEOUT_PERIOD);

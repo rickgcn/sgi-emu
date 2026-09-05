@@ -1,6 +1,6 @@
 //! Motorola DSP56001 CPU-visible external SRAM.
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 use serde::{Deserialize, Serialize};
 
 const WORD_COUNT: usize = 32 * 1024;
@@ -27,10 +27,11 @@ impl Dsp56001 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] unless the transaction is one
-    /// aligned four-byte word. Returns [`BusFault::Unmapped`] when the word is
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction is one
+    /// aligned four-byte word. Returns [`BusError::HardwareFault`] when the word is
     /// outside the external SRAM window.
-    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let index = word_index(address, data.len())?;
         data.copy_from_slice(&self.words[index].to_be_bytes());
         Ok(())
@@ -40,12 +41,13 @@ impl Dsp56001 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] unless the transaction is one
-    /// aligned four-byte word. Returns [`BusFault::Unmapped`] without changing
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction is one
+    /// aligned four-byte word. Returns [`BusError::HardwareFault`] without changing
     /// memory when the word is outside the external SRAM window.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         let index = word_index(address, data.len())?;
-        let value = u32::from_be_bytes(data.try_into().map_err(|_| BusFault::UnsupportedAccess)?);
+        let value = u32::from_be_bytes(data.try_into().map_err(|_| BusError::UnimplementedAccess)?);
         self.words[index] = value & DATA_MASK;
         Ok(())
     }
@@ -57,23 +59,27 @@ impl Default for Dsp56001 {
     }
 }
 
-fn word_index(address: DeviceAddr, length: usize) -> Result<usize, BusFault> {
+fn word_index(address: DeviceAddr, length: usize) -> Result<usize, BusError> {
+    if !(1..=4).contains(&length) {
+        return Err(BusError::InvalidTransaction);
+    }
+
     if length != WORD_BYTES as usize || !address.get().is_multiple_of(WORD_BYTES) {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::UnimplementedAccess);
     }
     if address.get() >= BYTE_LEN {
-        return Err(BusFault::Unmapped);
+        return Err(BusError::HardwareFault);
     }
-    usize::try_from(address.get() / WORD_BYTES).map_err(|_| BusFault::Unmapped)
+    usize::try_from(address.get() / WORD_BYTES).map_err(|_| BusError::HardwareFault)
 }
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
 
     use super::{BYTE_LEN, Dsp56001};
 
-    fn read_word(device: &Dsp56001, address: u64) -> Result<u32, BusFault> {
+    fn read_word(device: &Dsp56001, address: u64) -> Result<u32, BusError> {
         let mut bytes = [0; 4];
         device.read(DeviceAddr::new(address), &mut bytes)?;
         Ok(u32::from_be_bytes(bytes))
@@ -125,15 +131,15 @@ mod tests {
 
         assert_eq!(
             device.write(DeviceAddr::new(1), &[0; 4]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             device.write(DeviceAddr::new(0), &[0; 2]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             device.write(DeviceAddr::new(BYTE_LEN), &[0; 4]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(read_word(&device, 0), Ok(0x0012_3456));
     }

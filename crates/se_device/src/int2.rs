@@ -2,7 +2,7 @@
 
 mod timer;
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 use se_core::time::VirtualDuration;
 use serde::{Deserialize, Serialize};
 
@@ -138,9 +138,11 @@ impl Int2 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the complete transaction is not mapped or the
-    /// requested width or direction is unsupported.
-    pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length or
+    /// address overflow, [`BusError::HardwareFault`] for transactions crossing
+    /// ordinary register boundaries, or [`BusError::UnimplementedAccess`] when
+    /// the register, width, or direction is not implemented.
+    pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
         if let Some((register, offset)) = decode_word_register(start, end) {
@@ -162,27 +164,32 @@ impl Int2 {
             || start == PROGRAMMABLE_TIMER_CLOCK
             || start == SYSTEM_TIMER_CONTROL
         {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         }
 
         if let Some(counter) = decode_timer_counter(start) {
             if end != start + 1 {
-                return Err(BusFault::UnsupportedAccess);
+                return Err(BusError::UnimplementedAccess);
             }
             data[0] = self.timer.read_counter(counter)?;
             return Ok(());
         }
 
-        Err(BusFault::Unmapped)
+        if start / REGISTER_BYTES != (end - 1) / REGISTER_BYTES {
+            return Err(BusError::HardwareFault);
+        }
+        Err(BusError::UnimplementedAccess)
     }
 
     /// Reads one fixed-width transaction without changing timer read state.
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the complete transaction is not mapped or the
-    /// requested width or direction is unsupported.
-    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length or
+    /// address overflow, [`BusError::HardwareFault`] for transactions crossing
+    /// ordinary register boundaries, or [`BusError::UnimplementedAccess`] when
+    /// the register, width, or direction is not implemented.
+    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
         if let Some((register, offset)) = decode_word_register(start, end) {
@@ -204,34 +211,39 @@ impl Int2 {
             || start == PROGRAMMABLE_TIMER_CLOCK
             || start == SYSTEM_TIMER_CONTROL
         {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         }
 
         if let Some(counter) = decode_timer_counter(start) {
             if end != start + 1 {
-                return Err(BusFault::UnsupportedAccess);
+                return Err(BusError::UnimplementedAccess);
             }
             data[0] = self.timer.debug_read_counter(counter)?;
             return Ok(());
         }
 
-        Err(BusFault::Unmapped)
+        if start / REGISTER_BYTES != (end - 1) / REGISTER_BYTES {
+            return Err(BusError::HardwareFault);
+        }
+        Err(BusError::UnimplementedAccess)
     }
 
     /// Writes one fixed-width device-local transaction.
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the complete transaction is not mapped or the
-    /// requested width or direction is unsupported.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length or
+    /// address overflow, [`BusError::HardwareFault`] for transactions crossing
+    /// ordinary register boundaries, or [`BusError::UnimplementedAccess`] when
+    /// the register, width, or direction is not implemented.
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
         if let Some((register, offset)) = decode_word_register(start, end) {
             match register {
                 Register::LocalInterrupt0Status
                 | Register::LocalInterrupt1Status
-                | Register::VmeInterruptStatus => return Err(BusFault::UnsupportedAccess),
+                | Register::VmeInterruptStatus => return Err(BusError::UnimplementedAccess),
                 Register::LocalInterrupt0Mask => {
                     write_byte_register(&mut self.local_interrupt_masks[0], offset, data)
                 }
@@ -268,7 +280,7 @@ impl Int2 {
 
         if let Some(counter) = decode_timer_counter(start) {
             if end != start + 1 {
-                return Err(BusFault::UnsupportedAccess);
+                return Err(BusError::UnimplementedAccess);
             }
             return self.timer.write_counter(counter, data[0]);
         }
@@ -282,10 +294,13 @@ impl Int2 {
             || decode_timer_counter(start).is_some()
             || start == SYSTEM_TIMER_CONTROL
         {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         }
 
-        Err(BusFault::Unmapped)
+        if start / REGISTER_BYTES != (end - 1) / REGISTER_BYTES {
+            return Err(BusError::HardwareFault);
+        }
+        Err(BusError::UnimplementedAccess)
     }
 }
 
@@ -310,14 +325,16 @@ enum Register {
     OutputPort,
 }
 
-fn transaction_bounds(address: DeviceAddr, length: usize) -> Result<(u64, u64), BusFault> {
+fn transaction_bounds(address: DeviceAddr, length: usize) -> Result<(u64, u64), BusError> {
     if !(1..=4).contains(&length) {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::InvalidTransaction);
     }
 
     let start = address.get();
-    let length = u64::try_from(length).map_err(|_| BusFault::UnsupportedAccess)?;
-    let end = start.checked_add(length).ok_or(BusFault::Unmapped)?;
+    let length = u64::try_from(length).map_err(|_| BusError::InvalidTransaction)?;
+    let end = start
+        .checked_add(length)
+        .ok_or(BusError::InvalidTransaction)?;
     Ok((start, end))
 }
 
@@ -353,7 +370,7 @@ fn write_byte_register(register: &mut u8, offset: usize, data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
     use se_core::time::VirtualDuration;
 
     use super::{
@@ -365,7 +382,7 @@ mod tests {
 
     const ATTOSECONDS_PER_MICROSECOND: u128 = 1_000_000_000_000;
 
-    fn read_word(int2: &mut Int2, address: u64) -> Result<u32, BusFault> {
+    fn read_word(int2: &mut Int2, address: u64) -> Result<u32, BusError> {
         let mut bytes = [0; 4];
         int2.read(DeviceAddr::new(address), &mut bytes)?;
         Ok(u32::from_be_bytes(bytes))
@@ -416,7 +433,7 @@ mod tests {
         ] {
             assert_eq!(
                 int2.write(DeviceAddr::new(address), &[0; 4]),
-                Err(BusFault::UnsupportedAccess)
+                Err(BusError::UnimplementedAccess)
             );
             assert_eq!(read_word(&mut int2, address), Ok(0));
         }
@@ -491,7 +508,7 @@ mod tests {
         assert_eq!(int2.timer_pending, [false, false]);
         assert_eq!(
             int2.read(DeviceAddr::new(TIMER_ACKNOWLEDGE), &mut [0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
     }
 
@@ -657,28 +674,28 @@ mod tests {
         ] {
             assert_eq!(
                 int2.read(DeviceAddr::new(address), &mut [0]),
-                Err(BusFault::UnsupportedAccess)
+                Err(BusError::UnimplementedAccess)
             );
             assert_eq!(
                 int2.write(DeviceAddr::new(address), &[0, 0]),
-                Err(BusFault::UnsupportedAccess)
+                Err(BusError::UnimplementedAccess)
             );
         }
         assert_eq!(
             int2.read(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &mut [0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             int2.write(DeviceAddr::new(SYSTEM_TIMER_CONTROL), &[0, 0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             int2.read(DeviceAddr::new(PROGRAMMABLE_TIMER_CLOCK), &mut [0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             int2.read(DeviceAddr::new(SYSTEM_TIMER_COUNTER_0 + 1), &mut [0]),
-            Err(BusFault::Unmapped)
+            Err(BusError::UnimplementedAccess)
         );
     }
 
@@ -695,7 +712,7 @@ mod tests {
 
         assert_eq!(
             int2.write(DeviceAddr::new(SYSTEM_TIMER_COUNTER_2), &[4]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(int2.timer, timer_before);
     }
@@ -739,15 +756,15 @@ mod tests {
 
         assert_eq!(
             int2.write(DeviceAddr::new(LOCAL_INTERRUPT_0_MASK), &[]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert_eq!(
             int2.write(DeviceAddr::new(LOCAL_INTERRUPT_0_MASK + 3), &[1, 2]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(
             int2.read(DeviceAddr::new(0x24), &mut [0]),
-            Err(BusFault::Unmapped)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_MASK), Ok(0x5a));
     }

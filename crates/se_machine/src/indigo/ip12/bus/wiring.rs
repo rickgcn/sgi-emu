@@ -1,4 +1,4 @@
-use se_core::bus::BusFault;
+use se_core::bus::BusError;
 use se_core::time::VirtualDuration;
 use se_device::int2::Int2;
 use se_device::nmc93cs46::Nmc93cs46;
@@ -289,9 +289,12 @@ pub(super) fn read_cpu_aux_control(
     value: u8,
     nvram: &Nmc93cs46,
     data: &mut [u8],
-) -> Result<(), BusFault> {
+) -> Result<(), BusError> {
+    if !(1..=4).contains(&data.len()) {
+        return Err(BusError::InvalidTransaction);
+    }
     if data.len() != 1 {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::UnimplementedAccess);
     }
     data[0] = value & CPU_AUX_OUTPUT_BITS | u8::from(nvram.data_out()) << 4;
     Ok(())
@@ -301,9 +304,12 @@ pub(super) fn write_cpu_aux_control(
     value: &mut u8,
     nvram: &mut Nmc93cs46,
     data: &[u8],
-) -> Result<(), BusFault> {
+) -> Result<(), BusError> {
+    if !(1..=4).contains(&data.len()) {
+        return Err(BusError::InvalidTransaction);
+    }
     if data.len() != 1 {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::UnimplementedAccess);
     }
     *value = data[0] & CPU_AUX_OUTPUT_BITS;
     nvram.drive_pins(
