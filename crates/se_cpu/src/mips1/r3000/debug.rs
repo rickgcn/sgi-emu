@@ -413,7 +413,7 @@ pub fn disassemble(word: u32, pc: u32) -> String {
         DecodeResult::UnsupportedCoprocessor { unit } => {
             format!("cop{unit} 0x{word:08x}")
         }
-        DecodeResult::Reserved => format!(".word 0x{word:08x}"),
+        DecodeResult::Undefined | DecodeResult::Reserved => format!(".word 0x{word:08x}"),
     }
 }
 
