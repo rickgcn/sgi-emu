@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crc32fast::hash as crc32;
 use se_core::time::VirtualInstant;
-use se_machine::machine::{MachineNonvolatileState, MachineSnapshot};
+use se_machine::machine::{MachineNonvolatileState, MachineSnapshot, MachineStartupConfiguration};
 use se_machine::serial::SerialPort;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -194,8 +194,7 @@ pub(crate) struct ReplayRestoreState {
 /// Machine-specific nonvolatile state remains owned by the machine layer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RecordManifest {
-    machine_model: String,
-    float_backend: String,
+    machine: MachineStartupConfiguration,
     prom: MediaIdentity,
     disk: Option<MediaIdentity>,
     cdrom: Option<MediaIdentity>,
@@ -206,16 +205,14 @@ impl RecordManifest {
     /// Creates a complete cold-start manifest.
     #[must_use]
     pub fn new(
-        machine_model: String,
-        float_backend: String,
+        machine: MachineStartupConfiguration,
         prom: MediaIdentity,
         disk: Option<MediaIdentity>,
         cdrom: Option<MediaIdentity>,
         nonvolatile_state: MachineNonvolatileState,
     ) -> Self {
         Self {
-            machine_model,
-            float_backend,
+            machine,
             prom,
             disk,
             cdrom,
@@ -223,16 +220,10 @@ impl RecordManifest {
         }
     }
 
-    /// Returns the stable configured machine identifier.
+    /// Returns the recorded construction-time machine configuration.
     #[must_use]
-    pub fn machine_model(&self) -> &str {
-        &self.machine_model
-    }
-
-    /// Returns the stable floating-point backend identifier.
-    #[must_use]
-    pub fn float_backend(&self) -> &str {
-        &self.float_backend
+    pub const fn machine(&self) -> &MachineStartupConfiguration {
+        &self.machine
     }
 
     /// Returns the recorded PROM identity.
@@ -1678,9 +1669,10 @@ mod tests {
 
     use se_core::time::VirtualInstant;
     use se_float::backend::Backend;
-    use se_machine::indigo::ip12::Ip12;
-    use se_machine::indigo::ip12::{Ip12NonvolatileState, Ip12NonvolatileStateParts};
-    use se_machine::machine::{Machine, MachineNonvolatileState};
+    use se_machine::indigo::ip12::{
+        Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12NonvolatileStateParts,
+    };
+    use se_machine::machine::{Machine, MachineNonvolatileState, MachineStartupConfiguration};
 
     use super::{
         DISK_PAGE_BYTES, ExecutionPosition, FILE_HEADER_BYTES, FRAME_HEADER_BYTES, MediaIdentity,
@@ -1696,13 +1688,19 @@ mod tests {
 
     fn manifest() -> RecordManifest {
         RecordManifest::new(
-            String::from("indigo-ip12"),
-            String::from("softfloat"),
+            startup_configuration(),
             MediaIdentity::from_bytes(Path::new("prom.bin"), &[1, 2, 3]),
             None,
             None,
             nonvolatile_state(),
         )
+    }
+
+    fn startup_configuration() -> MachineStartupConfiguration {
+        MachineStartupConfiguration::IndigoIp12 {
+            floating_point_backend: Backend::SoftFloat,
+            memory: Ip12MemoryConfiguration::try_from_simm_mib([2, 0, 8]).unwrap(),
+        }
     }
 
     fn nonvolatile_state() -> MachineNonvolatileState {
@@ -1737,7 +1735,7 @@ mod tests {
             .unwrap();
 
         let replayer = Replayer::open(&path).unwrap();
-        assert_eq!(replayer.manifest().machine_model(), "indigo-ip12");
+        assert_eq!(replayer.manifest().machine(), &startup_configuration());
         assert_eq!(
             replayer.manifest().nonvolatile_state(),
             &nonvolatile_state()
@@ -1784,7 +1782,7 @@ mod tests {
             .unwrap();
 
         let replayer = Replayer::open(&path).unwrap();
-        assert_eq!(replayer.manifest().machine_model(), "indigo-ip12");
+        assert_eq!(replayer.manifest().machine(), &startup_configuration());
         drop(replayer);
         assert!(!partial.exists());
         fs::remove_file(path).unwrap();
@@ -1906,8 +1904,7 @@ mod tests {
 
     fn disk_manifest(disk: &[u8]) -> RecordManifest {
         RecordManifest::new(
-            String::from("indigo-ip12"),
-            String::from("softfloat"),
+            startup_configuration(),
             MediaIdentity::from_bytes(Path::new("prom.bin"), &[1, 2, 3]),
             Some(MediaIdentity::from_bytes(Path::new("disk.img"), disk)),
             None,

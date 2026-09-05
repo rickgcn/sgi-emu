@@ -29,7 +29,7 @@ use se_device::storage::BlockStorage;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
 use se_float::backend::Backend;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use self::bus::Ip12Bus;
 use self::prom::normalize_u56_prom;
@@ -37,9 +37,167 @@ use crate::output::MachineOutput;
 use crate::serial::SerialPort;
 
 const PROM_BYTES: usize = 0x40000;
+#[cfg(test)]
 const RAM_BYTES: usize = 8 * 1024 * 1024;
 const CPU_FREQUENCY_HZ: u64 = 33_000_000;
 const SERIAL_CLOCK_HZ: u64 = 3_686_400;
+
+/// Capacity of one SIMM installed in an Indigo IP12 memory bank.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Ip12SimmSize {
+    /// A 2 MiB SIMM.
+    Mib2,
+    /// A 4 MiB SIMM.
+    Mib4,
+    /// An 8 MiB SIMM.
+    Mib8,
+}
+
+impl Ip12SimmSize {
+    /// Returns the SIMM capacity in mebibytes.
+    #[must_use]
+    pub const fn simm_mib(self) -> u8 {
+        match self {
+            Self::Mib2 => 2,
+            Self::Mib4 => 4,
+            Self::Mib8 => 8,
+        }
+    }
+}
+
+/// Installed memory banks for an Indigo IP12.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ip12MemoryConfiguration {
+    banks: [Option<Ip12SimmSize>; 3],
+}
+
+impl Ip12MemoryConfiguration {
+    /// Creates a configuration from banks A, B, and C.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ip12MemoryConfigurationError::NoInstalledBank`] when all
+    /// three banks are empty.
+    pub const fn new(
+        banks: [Option<Ip12SimmSize>; 3],
+    ) -> Result<Self, Ip12MemoryConfigurationError> {
+        if banks[0].is_none() && banks[1].is_none() && banks[2].is_none() {
+            return Err(Ip12MemoryConfigurationError::NoInstalledBank);
+        }
+        Ok(Self { banks })
+    }
+
+    /// Parses the per-SIMM capacities for banks A, B, and C.
+    ///
+    /// Zero denotes an empty bank. Installed banks accept 2, 4, or 8 MiB
+    /// SIMMs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ip12MemoryConfigurationError`] when a capacity is unsupported
+    /// or every bank is empty.
+    pub fn try_from_simm_mib(simm_mib: [u8; 3]) -> Result<Self, Ip12MemoryConfigurationError> {
+        let mut banks = [None; 3];
+        for (index, capacity) in simm_mib.into_iter().enumerate() {
+            banks[index] = match capacity {
+                0 => None,
+                2 => Some(Ip12SimmSize::Mib2),
+                4 => Some(Ip12SimmSize::Mib4),
+                8 => Some(Ip12SimmSize::Mib8),
+                _ => {
+                    return Err(Ip12MemoryConfigurationError::UnsupportedSimmCapacity {
+                        bank: index,
+                        mib: capacity,
+                    });
+                }
+            };
+        }
+        Self::new(banks)
+    }
+
+    /// Returns banks A, B, and C in socket-group order.
+    #[must_use]
+    pub const fn banks(self) -> [Option<Ip12SimmSize>; 3] {
+        self.banks
+    }
+
+    /// Returns each bank's installed per-SIMM capacity in mebibytes.
+    ///
+    /// Empty banks are represented by zero.
+    #[must_use]
+    pub const fn simm_mib(self) -> [u8; 3] {
+        [
+            simm_mib(self.banks[0]),
+            simm_mib(self.banks[1]),
+            simm_mib(self.banks[2]),
+        ]
+    }
+}
+
+impl Default for Ip12MemoryConfiguration {
+    fn default() -> Self {
+        Self {
+            banks: [Some(Ip12SimmSize::Mib2), None, None],
+        }
+    }
+}
+
+impl Serialize for Ip12MemoryConfiguration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.banks.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Ip12MemoryConfiguration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let banks = <[Option<Ip12SimmSize>; 3]>::deserialize(deserializer)?;
+        Self::new(banks).map_err(serde::de::Error::custom)
+    }
+}
+
+/// An invalid Indigo IP12 memory-bank configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ip12MemoryConfigurationError {
+    /// All three banks are empty.
+    NoInstalledBank,
+    /// A bank specifies a SIMM capacity other than 2, 4, or 8 MiB.
+    UnsupportedSimmCapacity {
+        /// Zero-based bank index in A, B, C order.
+        bank: usize,
+        /// Unsupported per-SIMM capacity in mebibytes.
+        mib: u8,
+    },
+}
+
+impl fmt::Display for Ip12MemoryConfigurationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoInstalledBank => {
+                formatter.write_str("invalid IP12 memory configuration: no bank is installed")
+            }
+            Self::UnsupportedSimmCapacity { bank, mib } => write!(
+                formatter,
+                "invalid IP12 memory bank {} SIMM capacity: expected 0, 2, 4, or 8 MiB, got {mib} MiB",
+                bank + 1
+            ),
+        }
+    }
+}
+
+impl Error for Ip12MemoryConfigurationError {}
+
+const fn simm_mib(simm_size: Option<Ip12SimmSize>) -> u8 {
+    match simm_size {
+        Some(simm_size) => simm_size.simm_mib(),
+        None => 0,
+    }
+}
 
 /// An error encountered while constructing an Indigo IP12.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,6 +366,28 @@ impl Ip12 {
         disk_storage: Option<Box<dyn BlockStorage>>,
         cdrom_storage: Option<Box<dyn BlockStorage>>,
     ) -> Result<Self, Ip12Error> {
+        Self::new_with_memory(
+            raw_prom,
+            floating_point_backend,
+            Ip12MemoryConfiguration::default(),
+            disk_storage,
+            cdrom_storage,
+        )
+    }
+
+    /// Constructs an IP12 with explicit memory banks and optional storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ip12Error`] when the PROM, disk, or CD-ROM image does not
+    /// satisfy its IP12 image contract.
+    pub fn new_with_memory(
+        raw_prom: Vec<u8>,
+        floating_point_backend: Backend,
+        memory: Ip12MemoryConfiguration,
+        disk_storage: Option<Box<dyn BlockStorage>>,
+        cdrom_storage: Option<Box<dyn BlockStorage>>,
+    ) -> Result<Self, Ip12Error> {
         let prom = Rom::new(normalize_u56_prom(raw_prom)?);
         let mut scsi_bus = ScsiBus::new();
         if let Some(storage) = disk_storage {
@@ -230,7 +410,7 @@ impl Ip12 {
             cpu: R3000::new(cpu_config(floating_point_backend)),
             bus: Ip12Bus::new(
                 Pic1::new(0xf7, 2, true),
-                [Some(Ram::new(RAM_BYTES)), None, None, None],
+                memory_modules(memory),
                 Hpc1::new(),
                 CentronicsPort::new(),
                 Seeq8003::new(),
@@ -335,6 +515,20 @@ impl Ip12 {
     }
 }
 
+fn memory_modules(configuration: Ip12MemoryConfiguration) -> [Option<Ram>; 4] {
+    let [bank_a, bank_b, bank_c] = configuration.banks();
+    [
+        bank_a.map(|simm_size| Ram::new(bank_byte_len(simm_size))),
+        bank_b.map(|simm_size| Ram::new(bank_byte_len(simm_size))),
+        bank_c.map(|simm_size| Ram::new(bank_byte_len(simm_size))),
+        None,
+    ]
+}
+
+fn bank_byte_len(simm_size: Ip12SimmSize) -> usize {
+    usize::from(simm_size.simm_mib()) * 4 * 1024 * 1024
+}
+
 const fn cpu_config(floating_point_backend: Backend) -> R3000Config {
     R3000Config::new(
         CPU_FREQUENCY_HZ,
@@ -361,8 +555,9 @@ mod tests {
     use se_float::backend::Backend;
 
     use super::{
-        CPU_FREQUENCY_HZ, Ip12, Ip12Error, Ip12NonvolatileState, Ip12NonvolatileStateParts,
-        PROM_BYTES, RAM_BYTES, cpu_config,
+        CPU_FREQUENCY_HZ, Ip12, Ip12Error, Ip12MemoryConfiguration, Ip12MemoryConfigurationError,
+        Ip12NonvolatileState, Ip12NonvolatileStateParts, Ip12SimmSize, PROM_BYTES, RAM_BYTES,
+        cpu_config,
     };
 
     const MEMORY_CONFIGURATION_INSTRUCTION_BUDGET: usize = 300_000;
@@ -383,6 +578,46 @@ mod tests {
         fn write_all_at(&mut self, _offset: u64, _data: &[u8]) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn memory_configuration_accepts_every_supported_nonempty_bank_combination() {
+        let capacities = [0, 2, 4, 8];
+        let mut accepted = 0;
+        for bank_a in capacities {
+            for bank_b in capacities {
+                for bank_c in capacities {
+                    if [bank_a, bank_b, bank_c] == [0, 0, 0] {
+                        continue;
+                    }
+                    let configuration =
+                        Ip12MemoryConfiguration::try_from_simm_mib([bank_a, bank_b, bank_c])
+                            .unwrap();
+                    assert_eq!(configuration.simm_mib(), [bank_a, bank_b, bank_c]);
+                    accepted += 1;
+                }
+            }
+        }
+        assert_eq!(accepted, 63);
+
+        let configuration = Ip12MemoryConfiguration::try_from_simm_mib([0, 4, 8]).unwrap();
+
+        assert_eq!(
+            configuration.banks(),
+            [None, Some(Ip12SimmSize::Mib4), Some(Ip12SimmSize::Mib8),]
+        );
+    }
+
+    #[test]
+    fn memory_configuration_rejects_empty_and_unsupported_banks() {
+        assert_eq!(
+            Ip12MemoryConfiguration::try_from_simm_mib([0, 0, 0]),
+            Err(Ip12MemoryConfigurationError::NoInstalledBank)
+        );
+        assert_eq!(
+            Ip12MemoryConfiguration::try_from_simm_mib([2, 16, 8]),
+            Err(Ip12MemoryConfigurationError::UnsupportedSimmCapacity { bank: 1, mib: 16 })
+        );
     }
 
     #[test]
@@ -537,6 +772,40 @@ mod tests {
             .unwrap();
         assert_eq!(read_word(&mut machine, RAM_BYTES as u64 - 4), 0x0123_4567);
         assert_eq!(read_word(&mut machine, RAM_BYTES as u64), 0);
+    }
+
+    #[test]
+    fn explicit_memory_configuration_populates_selected_pic1_banks() {
+        let memory = Ip12MemoryConfiguration::try_from_simm_mib([2, 0, 8]).unwrap();
+        let mut machine =
+            Ip12::new_with_memory(vec![0; PROM_BYTES], Backend::SoftFloat, memory, None, None)
+                .unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fa1_0000), &0x0100_023f_u32.to_be_bytes())
+            .unwrap();
+        machine
+            .bus
+            .write(PhysAddr::new(0x1fa1_0004), &0x0702_023f_u32.to_be_bytes())
+            .unwrap();
+
+        machine
+            .bus
+            .write(
+                PhysAddr::new(8 * 1024 * 1024 - 4),
+                &0x0123_4567_u32.to_be_bytes(),
+            )
+            .unwrap();
+        machine
+            .bus
+            .write(
+                PhysAddr::new(40 * 1024 * 1024 - 4),
+                &0x89ab_cdef_u32.to_be_bytes(),
+            )
+            .unwrap();
+
+        assert_eq!(read_word(&mut machine, 8 * 1024 * 1024 - 4), 0x0123_4567);
+        assert_eq!(read_word(&mut machine, 40 * 1024 * 1024 - 4), 0x89ab_cdef);
     }
 
     #[test]

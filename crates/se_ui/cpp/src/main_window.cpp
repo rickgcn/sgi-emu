@@ -58,6 +58,9 @@ QByteArray decoded_bytes(const rust::String& value) {
 MachineSettings from_machine_configuration(const MachineConfiguration& configuration) {
     return {
         from_rust_string(configuration.machine_model),
+        configuration.memory_bank_a_simm_mib,
+        configuration.memory_bank_b_simm_mib,
+        configuration.memory_bank_c_simm_mib,
         from_rust_string(configuration.prom_path),
         from_rust_string(configuration.disk_path),
         from_rust_string(configuration.cdrom_path),
@@ -68,6 +71,9 @@ MachineSettings from_machine_configuration(const MachineConfiguration& configura
 MachineConfiguration to_machine_configuration(const MachineSettings& settings) {
     return {
         to_rust_string(settings.machine_model),
+        settings.memory_bank_a_simm_mib,
+        settings.memory_bank_b_simm_mib,
+        settings.memory_bank_c_simm_mib,
         to_rust_string(settings.prom_path),
         to_rust_string(settings.disk_path),
         to_rust_string(settings.cdrom_path),
@@ -601,6 +607,9 @@ void MainWindow::show_settings() {
 
     const auto selected = dialog.settings();
     if (selected.machine_model == settings_.machine_model
+        && selected.memory_bank_a_simm_mib == settings_.memory_bank_a_simm_mib
+        && selected.memory_bank_b_simm_mib == settings_.memory_bank_b_simm_mib
+        && selected.memory_bank_c_simm_mib == settings_.memory_bank_c_simm_mib
         && selected.prom_path == settings_.prom_path
         && selected.disk_path == settings_.disk_path
         && selected.cdrom_path == settings_.cdrom_path

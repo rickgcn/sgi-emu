@@ -6,15 +6,35 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QToolButton>
 #include <QVariant>
 #include <QWidget>
 
 namespace se_ui {
+namespace {
+
+void populate_memory_bank(QComboBox* combo, std::uint8_t selected_simm_mib) {
+    combo->addItem(QStringLiteral("Not installed"), 0);
+    combo->addItem(QStringLiteral("4 x 2 MiB"), 2);
+    combo->addItem(QStringLiteral("4 x 4 MiB"), 4);
+    combo->addItem(QStringLiteral("4 x 8 MiB"), 8);
+    const auto index = combo->findData(static_cast<int>(selected_simm_mib));
+    combo->setCurrentIndex(index >= 0 ? index : 0);
+}
+
+std::uint8_t selected_simm_mib(const QComboBox* combo) {
+    return static_cast<std::uint8_t>(combo->currentData().toUInt());
+}
+
+} // namespace
 
 SettingsDialog::SettingsDialog(const MachineSettings& settings, QWidget* parent)
     : QDialog(parent)
     , machine_combo_(new QComboBox(this))
+    , memory_bank_a_combo_(new QComboBox(this))
+    , memory_bank_b_combo_(new QComboBox(this))
+    , memory_bank_c_combo_(new QComboBox(this))
     , prom_edit_(new QLineEdit(this))
     , disk_edit_(new QLineEdit(this))
     , cdrom_edit_(new QLineEdit(this))
@@ -25,6 +45,10 @@ SettingsDialog::SettingsDialog(const MachineSettings& settings, QWidget* parent)
     machine_combo_->addItem(QStringLiteral("Indigo IP12"), QStringLiteral("indigo-ip12"));
     const auto machine_index = machine_combo_->findData(settings.machine_model);
     machine_combo_->setCurrentIndex(machine_index >= 0 ? machine_index : 0);
+
+    populate_memory_bank(memory_bank_a_combo_, settings.memory_bank_a_simm_mib);
+    populate_memory_bank(memory_bank_b_combo_, settings.memory_bank_b_simm_mib);
+    populate_memory_bank(memory_bank_c_combo_, settings.memory_bank_c_simm_mib);
 
     prom_edit_->setText(settings.prom_path);
     disk_edit_->setText(settings.disk_path);
@@ -67,11 +91,25 @@ SettingsDialog::SettingsDialog(const MachineSettings& settings, QWidget* parent)
 
     auto* button_box = new QDialogButtonBox(
         QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    connect(button_box, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(button_box, &QDialogButtonBox::accepted, this, [this] {
+        const auto selected = this->settings();
+        if (selected.memory_bank_a_simm_mib == 0 && selected.memory_bank_b_simm_mib == 0
+            && selected.memory_bank_c_simm_mib == 0) {
+            QMessageBox::warning(
+                this,
+                QStringLiteral("Memory configuration"),
+                QStringLiteral("At least one memory bank must be installed."));
+            return;
+        }
+        accept();
+    });
     connect(button_box, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
     auto* layout = new QFormLayout(this);
     layout->addRow(QStringLiteral("Machine"), machine_combo_);
+    layout->addRow(QStringLiteral("Memory bank A"), memory_bank_a_combo_);
+    layout->addRow(QStringLiteral("Memory bank B"), memory_bank_b_combo_);
+    layout->addRow(QStringLiteral("Memory bank C"), memory_bank_c_combo_);
     layout->addRow(QStringLiteral("PROM"), prom_widget);
     layout->addRow(QStringLiteral("Disk image"), disk_widget);
     layout->addRow(QStringLiteral("CD-ROM image"), cdrom_widget);
@@ -83,6 +121,9 @@ SettingsDialog::SettingsDialog(const MachineSettings& settings, QWidget* parent)
 MachineSettings SettingsDialog::settings() const {
     return {
         machine_combo_->currentData().toString(),
+        selected_simm_mib(memory_bank_a_combo_),
+        selected_simm_mib(memory_bank_b_combo_),
+        selected_simm_mib(memory_bank_c_combo_),
         prom_edit_->text(),
         disk_edit_->text(),
         cdrom_edit_->text(),

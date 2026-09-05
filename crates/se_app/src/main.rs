@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use se_cli::Arguments;
 use se_float::backend::Backend;
-use se_machine::indigo::ip12::Ip12;
-use se_machine::machine::Machine;
+use se_machine::indigo::ip12::{Ip12, Ip12MemoryConfiguration};
+use se_machine::machine::{Machine, MachineStartupConfiguration};
 use se_runtime::record::{MediaIdentity, RecordManifest, Recorder, Replayer};
 use se_runtime::runtime::{Runtime, RuntimeConfiguration};
 use se_ui::bridge::ffi::MachineConfiguration;
@@ -67,14 +67,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn build_normal_machine(configuration: &MachineConfiguration) -> Result<Machine, String> {
-    build_ip12(
-        &configuration.machine_model,
-        &configuration.float_backend,
+    let startup_configuration = machine_startup_configuration(configuration)?;
+    let mut machine = build_machine(
+        startup_configuration,
         Path::new(&configuration.prom_path),
         optional_path(&configuration.disk_path),
         optional_path(&configuration.cdrom_path),
-        true,
-    )
+    )?;
+    restore_persisted_state(&mut machine, &configuration.machine_model)?;
+    Ok(machine)
 }
 
 fn build_runtime_configuration(
@@ -96,7 +97,7 @@ fn build_recording_configuration(
     configuration: &MachineConfiguration,
     path: PathBuf,
 ) -> Result<RuntimeConfiguration, String> {
-    validate_machine_and_backend(&configuration.machine_model, &configuration.float_backend)?;
+    let startup_configuration = machine_startup_configuration(configuration)?;
     let prom_path = Path::new(&configuration.prom_path);
     let raw_prom = read_prom(prom_path)?;
     let prom_identity = MediaIdentity::from_bytes(prom_path, &raw_prom);
@@ -108,18 +109,11 @@ fn build_recording_configuration(
     let recorder = Recorder::create_or_replace(path).map_err(|error| error.to_string())?;
     let disk = disk.map(|storage| storage.recording(recorder.disk()).boxed());
     let cdrom = cdrom.map(storage::FileBlockStorage::boxed);
-    let mut machine = build_ip12_from_parts(
-        &configuration.machine_model,
-        &configuration.float_backend,
-        raw_prom,
-        disk,
-        cdrom,
-    )?;
+    let mut machine = build_machine_from_parts(startup_configuration, raw_prom, disk, cdrom)?;
     restore_persisted_state(&mut machine, &configuration.machine_model)?;
     let nonvolatile_state = machine.nonvolatile_state();
     let manifest = RecordManifest::new(
-        configuration.machine_model.clone(),
-        configuration.float_backend.clone(),
+        startup_configuration,
         prom_identity,
         disk_identity,
         cdrom_identity,
@@ -143,7 +137,7 @@ fn build_replay_configuration(
         None => Replayer::open(path).map_err(|error| error.to_string())?,
     };
     let manifest = replayer.manifest().clone();
-    validate_machine_and_backend(manifest.machine_model(), manifest.float_backend())?;
+    let startup_configuration = *manifest.machine();
     let nonvolatile_state = manifest.nonvolatile_state().clone();
     let prom_path = selected_or_hint(&configuration.prom_path, &manifest.prom().path_hint);
     let raw_prom = read_prom(&prom_path)?;
@@ -190,51 +184,62 @@ fn build_replay_configuration(
             Some(storage.boxed())
         }
     };
-    let mut machine = build_ip12_from_parts(
-        manifest.machine_model(),
-        manifest.float_backend(),
-        raw_prom,
-        disk,
-        cdrom,
-    )?;
+    let mut machine = build_machine_from_parts(startup_configuration, raw_prom, disk, cdrom)?;
     machine.restore_nonvolatile_state(nonvolatile_state, 0);
     Ok(RuntimeConfiguration::replaying(machine, replayer))
 }
 
-fn build_ip12(
-    machine_model: &str,
-    float_backend: &str,
+fn build_machine(
+    startup_configuration: MachineStartupConfiguration,
     prom_path: &Path,
     disk_path: Option<&Path>,
     cdrom_path: Option<&Path>,
-    restore_persistence: bool,
 ) -> Result<Machine, String> {
     let raw_prom = read_prom(prom_path)?;
     let disk = open_optional_storage(disk_path, false)?.map(storage::FileBlockStorage::boxed);
     let cdrom = open_optional_storage(cdrom_path, true)?.map(storage::FileBlockStorage::boxed);
-    let mut machine = build_ip12_from_parts(machine_model, float_backend, raw_prom, disk, cdrom)?;
-    if restore_persistence {
-        restore_persisted_state(&mut machine, machine_model)?;
-    }
-    Ok(machine)
+    build_machine_from_parts(startup_configuration, raw_prom, disk, cdrom)
 }
 
-fn build_ip12_from_parts(
-    machine_model: &str,
-    float_backend: &str,
+fn build_machine_from_parts(
+    startup_configuration: MachineStartupConfiguration,
     raw_prom: Vec<u8>,
     disk: Option<Box<dyn se_device::storage::BlockStorage>>,
     cdrom: Option<Box<dyn se_device::storage::BlockStorage>>,
 ) -> Result<Machine, String> {
-    validate_machine_and_backend(machine_model, float_backend)?;
-    let backend = match float_backend {
+    match startup_configuration {
+        MachineStartupConfiguration::IndigoIp12 {
+            floating_point_backend,
+            memory,
+        } => Ip12::new_with_memory(raw_prom, floating_point_backend, memory, disk, cdrom)
+            .map(Machine::IndigoIp12)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn machine_startup_configuration(
+    configuration: &MachineConfiguration,
+) -> Result<MachineStartupConfiguration, String> {
+    validate_machine_and_backend(&configuration.machine_model, &configuration.float_backend)?;
+    let backend = match configuration.float_backend.as_str() {
         "softfloat" => Backend::SoftFloat,
         "native" => Backend::Native,
         _ => unreachable!("backend was validated"),
     };
-    Ip12::new(raw_prom, backend, disk, cdrom)
-        .map(Machine::IndigoIp12)
-        .map_err(|error| error.to_string())
+    let memory = Ip12MemoryConfiguration::try_from_simm_mib(memory_bank_simm_mib(configuration))
+        .map_err(|error| error.to_string())?;
+    Ok(MachineStartupConfiguration::IndigoIp12 {
+        floating_point_backend: backend,
+        memory,
+    })
+}
+
+const fn memory_bank_simm_mib(configuration: &MachineConfiguration) -> [u8; 3] {
+    [
+        configuration.memory_bank_a_simm_mib,
+        configuration.memory_bank_b_simm_mib,
+        configuration.memory_bank_c_simm_mib,
+    ]
 }
 
 fn validate_machine_and_backend(machine_model: &str, float_backend: &str) -> Result<(), String> {

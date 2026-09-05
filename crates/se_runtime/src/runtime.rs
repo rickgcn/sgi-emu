@@ -1482,9 +1482,10 @@ mod tests {
     use se_device::storage::BlockStorage;
     use se_float::backend::Backend;
     use se_machine::indigo::ip12::debug::{DebugRequest, DebugResponse, MemoryAddressSpace};
-    use se_machine::indigo::ip12::{Ip12, Ip12NonvolatileState, Ip12NonvolatileStateParts};
-    use se_machine::machine::Machine;
-    use se_machine::machine::MachineNonvolatileState;
+    use se_machine::indigo::ip12::{
+        Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12NonvolatileStateParts,
+    };
+    use se_machine::machine::{Machine, MachineNonvolatileState, MachineStartupConfiguration};
     use se_machine::serial::SerialPort;
 
     use super::{
@@ -1584,8 +1585,10 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
 
     fn record_manifest() -> RecordManifest {
         RecordManifest::new(
-            String::from("indigo-ip12"),
-            String::from("softfloat"),
+            MachineStartupConfiguration::IndigoIp12 {
+                floating_point_backend: Backend::SoftFloat,
+                memory: Ip12MemoryConfiguration::default(),
+            },
             MediaIdentity::from_bytes(Path::new("prom.bin"), &[0; PROM_BYTES]),
             None,
             None,
