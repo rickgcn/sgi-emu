@@ -38,39 +38,53 @@ impl DeviceAddr {
 
 /// An error raised by a physical bus transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BusFault {
-    /// The addressed physical location is not mapped.
-    Unmapped,
+pub enum BusError {
+    /// The emulated hardware transaction failed.
+    HardwareFault,
 
-    /// The requested transaction is not supported by the target.
-    UnsupportedAccess,
+    /// The caller supplied an invalid transaction.
+    InvalidTransaction,
+
+    /// The requested hardware behavior is not implemented.
+    UnimplementedAccess,
 }
 
 /// An interface for fixed-width physical bus transactions.
 ///
 /// Buffer elements correspond to consecutive physical addresses in ascending
 /// order. Transaction widths are expressed by buffer length. The contract
-/// recognizes lengths from one through four bytes; implementations return
-/// [`BusFault::UnsupportedAccess`] for other lengths or unsupported accesses.
+/// recognizes lengths from one through four bytes, including one atomic
+/// three-byte transaction. Invalid lengths and address overflow return
+/// [`BusError::InvalidTransaction`] before any target side effects.
+///
+/// Hardware failures and unimplemented behavior remain distinct. The machine
+/// completes hardware failures according to its bus contract; it must not
+/// convert invalid or unimplemented requests into hardware error state.
 pub trait PhysicalBus {
     /// Reads one transaction into `data`.
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the address or transaction is not supported.
-    fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault>;
+    /// Returns [`BusError::HardwareFault`] for a hardware failure that the
+    /// machine has not otherwise completed, [`BusError::InvalidTransaction`]
+    /// for an invalid request, or [`BusError::UnimplementedAccess`] for
+    /// behavior that the target does not implement.
+    fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError>;
 
     /// Writes one transaction from `data`.
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the address or transaction is not supported.
-    fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault>;
+    /// Returns [`BusError::HardwareFault`] for a hardware failure that the
+    /// machine has not otherwise completed, [`BusError::InvalidTransaction`]
+    /// for an invalid request, or [`BusError::UnimplementedAccess`] for
+    /// behavior that the target does not implement.
+    fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusError>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BusFault, DeviceAddr, PhysAddr, PhysicalBus};
+    use super::{BusError, DeviceAddr, PhysAddr, PhysicalBus};
 
     #[derive(Default)]
     struct RecordingBus {
@@ -78,9 +92,9 @@ mod tests {
     }
 
     impl PhysicalBus for RecordingBus {
-        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
             if !(1..=4).contains(&data.len()) {
-                return Err(BusFault::UnsupportedAccess);
+                return Err(BusError::InvalidTransaction);
             }
 
             self.transactions.push((address, data.len()));
@@ -88,9 +102,9 @@ mod tests {
             Ok(())
         }
 
-        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusError> {
             if !(1..=4).contains(&data.len()) {
-                return Err(BusFault::UnsupportedAccess);
+                return Err(BusError::InvalidTransaction);
             }
 
             self.transactions.push((address, data.len()));
@@ -128,11 +142,11 @@ mod tests {
 
         assert_eq!(
             bus.write(PhysAddr::new(0), &[]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert_eq!(
             bus.write(PhysAddr::new(0), &[0; 5]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert!(bus.transactions.is_empty());
     }

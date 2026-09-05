@@ -1,6 +1,6 @@
 use std::io;
 
-use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 use se_device::centronics::CentronicsPort;
 use se_device::dp8573a::Dp8573a;
 use se_device::dsp56001::Dsp56001;
@@ -227,13 +227,13 @@ pub(super) fn bus_with_disk_and_cdrom(disk_bytes: Vec<u8>, cdrom_bytes: Vec<u8>)
     )
 }
 
-pub(super) fn read_word(bus: &mut Ip12Bus, address: u64) -> Result<u32, BusFault> {
+pub(super) fn read_word(bus: &mut Ip12Bus, address: u64) -> Result<u32, BusError> {
     let mut bytes = [0; 4];
     bus.read(PhysAddr::new(address), &mut bytes)?;
     Ok(u32::from_be_bytes(bytes))
 }
 
-pub(super) fn read_byte(bus: &mut Ip12Bus, address: u64) -> Result<u8, BusFault> {
+pub(super) fn read_byte(bus: &mut Ip12Bus, address: u64) -> Result<u8, BusError> {
     let mut byte = [0];
     bus.read(PhysAddr::new(address), &mut byte)?;
     Ok(byte[0])

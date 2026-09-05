@@ -1,6 +1,6 @@
 //! Byte-addressed random-access memory.
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 use serde::{Deserialize, Serialize};
 
 /// A fixed-size volatile byte store.
@@ -28,9 +28,10 @@ impl Ram {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] when `data` is empty. Returns
-    /// [`BusFault::Unmapped`] when the complete range is outside the storage.
-    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an empty or overflowing
+    /// range, or [`BusError::HardwareFault`] when the complete range is outside
+    /// the storage.
+    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let range = self.transaction_range(address, data.len())?;
         data.copy_from_slice(&self.bytes[range]);
         Ok(())
@@ -40,10 +41,10 @@ impl Ram {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] when `data` is empty. Returns
-    /// [`BusFault::Unmapped`] without changing storage when the complete range
-    /// is outside the storage.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an empty or overflowing
+    /// range, or [`BusError::HardwareFault`] when the complete range is outside
+    /// the storage. Failures do not change storage.
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         let range = self.transaction_range(address, data.len())?;
         self.bytes[range].copy_from_slice(data);
         Ok(())
@@ -53,24 +54,29 @@ impl Ram {
         &self,
         address: DeviceAddr,
         length: usize,
-    ) -> Result<std::ops::Range<usize>, BusFault> {
+    ) -> Result<std::ops::Range<usize>, BusError> {
         if length == 0 {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::InvalidTransaction);
         }
 
-        let start = usize::try_from(address.get()).map_err(|_| BusFault::Unmapped)?;
-        let end = start.checked_add(length).ok_or(BusFault::Unmapped)?;
-        if end > self.bytes.len() {
-            return Err(BusFault::Unmapped);
+        let start = address.get();
+        let length = u64::try_from(length).map_err(|_| BusError::InvalidTransaction)?;
+        let end = start
+            .checked_add(length)
+            .ok_or(BusError::InvalidTransaction)?;
+        if end > self.bytes.len() as u64 {
+            return Err(BusError::HardwareFault);
         }
 
+        let start = usize::try_from(start).expect("a backed storage offset fits in usize");
+        let end = usize::try_from(end).expect("a backed storage endpoint fits in usize");
         Ok(start..end)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
 
     use super::Ram;
 
@@ -116,11 +122,11 @@ mod tests {
 
         assert_eq!(
             ram.read(DeviceAddr::new(0), &mut []),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert_eq!(
             ram.write(DeviceAddr::new(0), &[]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
     }
 
@@ -132,17 +138,17 @@ mod tests {
         let mut destination = [0xaa; 2];
         assert_eq!(
             ram.read(DeviceAddr::new(7), &mut destination),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(destination, [0xaa; 2]);
 
         assert_eq!(
             ram.write(DeviceAddr::new(7), &[9, 9]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(
             ram.write(DeviceAddr::new(u64::MAX), &[9]),
-            Err(BusFault::Unmapped)
+            Err(BusError::InvalidTransaction)
         );
 
         let mut bytes = [0; 4];

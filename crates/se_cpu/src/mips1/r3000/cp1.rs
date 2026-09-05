@@ -779,7 +779,7 @@ fn comparison_condition(condition: u8, relation: Relation) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_core::bus::{BusError, PhysAddr, PhysicalBus};
     use se_float::{
         backend::Backend,
         format::{Float32, Float64},
@@ -818,13 +818,13 @@ mod tests {
     }
 
     impl PhysicalBus for TestBus {
-        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
             self.reads.push((address, data.len()));
             data.copy_from_slice(&self.read_data[..data.len()]);
             Ok(())
         }
 
-        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusError> {
             self.writes.push((address, data.to_vec()));
             Ok(())
         }

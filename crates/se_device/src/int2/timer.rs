@@ -1,4 +1,4 @@
-use se_core::bus::BusFault;
+use se_core::bus::BusError;
 use se_core::time::VirtualDuration;
 use serde::{Deserialize, Serialize};
 
@@ -56,7 +56,7 @@ impl ProgrammableTimer {
         *self = Self::new();
     }
 
-    pub(super) fn write_control(&mut self, value: u8) -> Result<(), BusFault> {
+    pub(super) fn write_control(&mut self, value: u8) -> Result<(), BusError> {
         let command = ControlCommand::decode(value)?;
         match command {
             ControlCommand::Latch(counter) => self.counters[counter.index()].latch(),
@@ -73,15 +73,15 @@ impl ProgrammableTimer {
         }
     }
 
-    pub(super) fn write_counter(&mut self, counter: CounterId, value: u8) -> Result<(), BusFault> {
+    pub(super) fn write_counter(&mut self, counter: CounterId, value: u8) -> Result<(), BusError> {
         self.counters[counter.index()].write(value)
     }
 
-    pub(super) fn read_counter(&mut self, counter: CounterId) -> Result<u8, BusFault> {
+    pub(super) fn read_counter(&mut self, counter: CounterId) -> Result<u8, BusError> {
         self.counters[counter.index()].read()
     }
 
-    pub(super) fn debug_read_counter(&self, counter: CounterId) -> Result<u8, BusFault> {
+    pub(super) fn debug_read_counter(&self, counter: CounterId) -> Result<u8, BusError> {
         self.counters[counter.index()].peek()
     }
 
@@ -161,9 +161,9 @@ impl Counter {
         self.latch = None;
     }
 
-    fn write(&mut self, value: u8) -> Result<(), BusFault> {
+    fn write(&mut self, value: u8) -> Result<(), BusError> {
         let CounterState::AwaitingCount { mode, low_byte } = self.state else {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         };
 
         let Some(low_byte) = low_byte else {
@@ -181,7 +181,7 @@ impl Counter {
             u32::from(encoded)
         };
         if mode == CounterMode::Mode2 && reload == 1 {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         }
 
         self.state = match mode {
@@ -195,13 +195,13 @@ impl Counter {
         Ok(())
     }
 
-    fn latch(&mut self) -> Result<(), BusFault> {
+    fn latch(&mut self) -> Result<(), BusError> {
         let value = match self.state {
             CounterState::WaitingForGate { reload } => reload,
             CounterState::RateGenerator { remaining, .. } => remaining,
             CounterState::Unconfigured
             | CounterState::AwaitingCount { .. }
-            | CounterState::Quiescent => return Err(BusFault::UnsupportedAccess),
+            | CounterState::Quiescent => return Err(BusError::UnimplementedAccess),
         };
 
         if self.latch.is_none() {
@@ -213,7 +213,7 @@ impl Counter {
         Ok(())
     }
 
-    fn read(&mut self) -> Result<u8, BusFault> {
+    fn read(&mut self) -> Result<u8, BusError> {
         let value = self.peek()?;
         let latch = self
             .latch
@@ -227,8 +227,8 @@ impl Counter {
         Ok(value)
     }
 
-    fn peek(&self) -> Result<u8, BusFault> {
-        let latch = self.latch.ok_or(BusFault::UnsupportedAccess)?;
+    fn peek(&self) -> Result<u8, BusError> {
+        let latch = self.latch.ok_or(BusError::UnimplementedAccess)?;
         let bytes = latch.value.to_le_bytes();
         Ok(bytes[usize::from(latch.read_high)])
     }
@@ -333,19 +333,19 @@ enum ControlCommand {
 }
 
 impl ControlCommand {
-    fn decode(value: u8) -> Result<Self, BusFault> {
+    fn decode(value: u8) -> Result<Self, BusError> {
         let counter = match value >> 6 {
             0 => CounterId::Zero,
             1 => CounterId::One,
             2 => CounterId::Two,
-            _ => return Err(BusFault::UnsupportedAccess),
+            _ => return Err(BusError::UnimplementedAccess),
         };
         let read_write = (value >> 4) & 3;
         if read_write == 0 {
             return Ok(Self::Latch(counter));
         }
         if read_write != 3 || value & 1 != 0 {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         }
 
         match (value >> 1) & 7 {
@@ -358,7 +358,7 @@ impl ControlCommand {
                 mode: CounterMode::Mode2,
             }),
             4 => Ok(Self::Quiesce(counter)),
-            _ => Err(BusFault::UnsupportedAccess),
+            _ => Err(BusError::UnimplementedAccess),
         }
     }
 }
@@ -373,7 +373,7 @@ fn encode_counter(value: u32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::BusFault;
+    use se_core::bus::BusError;
     use se_core::time::VirtualDuration;
 
     use super::{ATTOSECONDS_PER_TICK, CounterId, ProgrammableTimer, TimerOutputs};
@@ -402,7 +402,7 @@ mod tests {
         for control in [0xc0, 0x10, 0x20, 0x30, 0x31, 0x36, 0x3a, 0x3c, 0x3e] {
             assert_eq!(
                 timer.write_control(control),
-                Err(BusFault::UnsupportedAccess)
+                Err(BusError::UnimplementedAccess)
             );
         }
     }
@@ -414,7 +414,10 @@ mod tests {
         timer.advance_time(VirtualDuration::from_attoseconds(ATTOSECONDS_PER_TICK));
         let before = timer.clone();
 
-        assert_eq!(timer.write_control(0xb6), Err(BusFault::UnsupportedAccess));
+        assert_eq!(
+            timer.write_control(0xb6),
+            Err(BusError::UnimplementedAccess)
+        );
         assert_eq!(timer, before);
     }
 
@@ -427,7 +430,7 @@ mod tests {
         assert_eq!(timer.time_until_output(CounterId::One), None);
         assert_eq!(
             timer.write_counter(CounterId::Two, 0),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         timer.write_counter(CounterId::Two, 1).unwrap();
 
@@ -458,7 +461,7 @@ mod tests {
         assert_eq!(timer.read_counter(CounterId::Two), Ok(0x12));
         assert_eq!(
             timer.read_counter(CounterId::Two),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(latch(&mut timer, 0x80, CounterId::Two), 0x1230);
     }
@@ -472,7 +475,7 @@ mod tests {
         timer.write_control(0xb4).unwrap();
         assert_eq!(
             timer.debug_read_counter(CounterId::Two),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         timer.write_counter(CounterId::Two, 0x34).unwrap();
         timer.write_control(0xb4).unwrap();
@@ -486,10 +489,16 @@ mod tests {
     fn latch_rejects_unconfigured_and_partial_counters() {
         let mut timer = ProgrammableTimer::new();
 
-        assert_eq!(timer.write_control(0x80), Err(BusFault::UnsupportedAccess));
+        assert_eq!(
+            timer.write_control(0x80),
+            Err(BusError::UnimplementedAccess)
+        );
         timer.write_control(0xb4).unwrap();
         timer.write_counter(CounterId::Two, 0x34).unwrap();
-        assert_eq!(timer.write_control(0x80), Err(BusFault::UnsupportedAccess));
+        assert_eq!(
+            timer.write_control(0x80),
+            Err(BusError::UnimplementedAccess)
+        );
     }
 
     #[test]
@@ -507,9 +516,12 @@ mod tests {
         timer.write_control(0x78).unwrap();
         assert_eq!(
             timer.write_counter(CounterId::One, 1),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
-        assert_eq!(timer.write_control(0x40), Err(BusFault::UnsupportedAccess));
+        assert_eq!(
+            timer.write_control(0x40),
+            Err(BusError::UnimplementedAccess)
+        );
     }
 
     #[test]

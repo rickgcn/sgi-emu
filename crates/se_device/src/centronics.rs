@@ -1,6 +1,6 @@
 //! SGI Centronics external status and remote-control latch.
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 use serde::{Deserialize, Serialize};
 
 const REGISTER_BYTES: u64 = 4;
@@ -38,9 +38,9 @@ impl CentronicsPort {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the transaction is outside the external slot,
+    /// Returns [`BusError`] when the transaction is outside the external slot,
     /// crosses its boundary, or has an unsupported width or alignment.
-    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let offset = register_transaction(address, data.len())?;
         data.fill(0);
         if transaction_contains_status_lane(offset, data.len()) {
@@ -53,9 +53,9 @@ impl CentronicsPort {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the transaction is outside the external slot,
+    /// Returns [`BusError`] when the transaction is outside the external slot,
     /// crosses its boundary, or has an unsupported width or alignment.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         let offset = register_transaction(address, data.len())?;
         if transaction_contains_status_lane(offset, data.len()) {
             self.remote_output = data[STATUS_LANE - offset] & REMOTE_BITS;
@@ -64,24 +64,28 @@ impl CentronicsPort {
     }
 }
 
-fn register_transaction(address: DeviceAddr, length: usize) -> Result<usize, BusFault> {
+fn register_transaction(address: DeviceAddr, length: usize) -> Result<usize, BusError> {
+    if !(1..=4).contains(&length) {
+        return Err(BusError::InvalidTransaction);
+    }
+
     if !matches!(length, 1 | 2 | 4) {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::UnimplementedAccess);
     }
 
     let start = address.get();
     if start >= REGISTER_BYTES {
-        return Err(BusFault::Unmapped);
+        return Err(BusError::HardwareFault);
     }
-    let length = u64::try_from(length).map_err(|_| BusFault::UnsupportedAccess)?;
+    let length = u64::try_from(length).map_err(|_| BusError::InvalidTransaction)?;
     let end = start
         .checked_add(length)
-        .ok_or(BusFault::UnsupportedAccess)?;
+        .ok_or(BusError::UnimplementedAccess)?;
     if end > REGISTER_BYTES || !start.is_multiple_of(length) {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::UnimplementedAccess);
     }
 
-    usize::try_from(start).map_err(|_| BusFault::UnsupportedAccess)
+    usize::try_from(start).map_err(|_| BusError::UnimplementedAccess)
 }
 
 const fn transaction_contains_status_lane(offset: usize, length: usize) -> bool {
@@ -90,11 +94,11 @@ const fn transaction_contains_status_lane(offset: usize, length: usize) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
 
     use super::CentronicsPort;
 
-    fn read(port: &CentronicsPort, address: u64, length: usize) -> Result<Vec<u8>, BusFault> {
+    fn read(port: &CentronicsPort, address: u64, length: usize) -> Result<Vec<u8>, BusError> {
         let mut data = vec![0; length];
         port.read(DeviceAddr::new(address), &mut data)?;
         Ok(data)
@@ -161,15 +165,21 @@ mod tests {
         let mut port = CentronicsPort::new();
         port.write(DeviceAddr::new(1), &[3]).unwrap();
 
-        for (address, length) in [(0, 0), (0, 3), (1, 2), (2, 4), (3, 2)] {
+        for length in [0, 5] {
+            assert_eq!(
+                port.write(DeviceAddr::new(0), &vec![0; length]),
+                Err(BusError::InvalidTransaction)
+            );
+        }
+        for (address, length) in [(0, 3), (1, 2), (2, 4), (3, 2)] {
             assert_eq!(
                 port.write(DeviceAddr::new(address), &vec![0; length]),
-                Err(BusFault::UnsupportedAccess)
+                Err(BusError::UnimplementedAccess)
             );
         }
         assert_eq!(
             port.write(DeviceAddr::new(4), &[0]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(port.remote_output, 3);
     }

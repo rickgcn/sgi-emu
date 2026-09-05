@@ -1,6 +1,6 @@
 //! Silicon Graphics HPC1.5 register front end.
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 use serde::{Deserialize, Serialize};
 
@@ -447,9 +447,11 @@ impl Hpc1 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the complete transaction is not mapped or the
-    /// requested width or direction is unsupported.
-    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length or
+    /// address overflow, [`BusError::HardwareFault`] outside the modeled
+    /// register windows, or [`BusError::UnimplementedAccess`] for unsupported
+    /// accesses within those windows.
+    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
         if let Some(offset) = register_offset(start, end, ETHERNET_CURRENT_TRANSMIT_BUFFER_POINTER)
@@ -558,7 +560,7 @@ impl Hpc1 {
                 &self.parallel.fifo.data[self.parallel.fifo.read_index].to_be_bytes(),
             );
         } else if special_register_overlap(start, end) {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         } else if internal_register_transaction(start, end) {
             data.fill(0);
         } else if let Some(offset) = register_offset(start, end, ENDIAN_CONTROL) {
@@ -576,9 +578,9 @@ impl Hpc1 {
             || overlaps_register(start, end, DSP_INTERRUPT_MASK)
             || overlaps_register(start, end, MISCELLANEOUS_CONTROL)
         {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         } else {
-            return Err(BusFault::Unmapped);
+            return Err(BusError::HardwareFault);
         }
 
         Ok(())
@@ -588,9 +590,11 @@ impl Hpc1 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the complete transaction is not mapped or the
-    /// requested width or direction is unsupported.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length or
+    /// address overflow, [`BusError::HardwareFault`] outside the modeled
+    /// register windows, or [`BusError::UnimplementedAccess`] for unsupported
+    /// accesses within those windows.
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
         if let Some(offset) = register_offset(start, end, ETHERNET_CURRENT_TRANSMIT_BUFFER_POINTER)
@@ -809,13 +813,13 @@ impl Hpc1 {
             self.parallel.fifo.data[self.parallel.fifo.write_index] =
                 u32::from_be_bytes(data.try_into().unwrap());
         } else if special_register_overlap(start, end) {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         } else if internal_register_transaction(start, end) {
         } else if let Some(offset) = register_offset(start, end, ENDIAN_CONTROL) {
             let value = write_register(u32::from(self.endian_control), offset, data) as u8;
             self.endian_control = REVISION | (value & WRITABLE_ENDIAN_BITS);
         } else if overlaps_register(start, end, FREE_RUNNING_COUNTER) {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         } else if is_word(start, end, DSP_INTERRUPT_STATUS) {
             self.dsp.interrupt_status &=
                 u32::from_be_bytes(data.try_into().unwrap()) as u8 & DSP_INTERRUPT_BITS;
@@ -825,13 +829,13 @@ impl Hpc1 {
         } else if overlaps_register(start, end, DSP_INTERRUPT_STATUS)
             || overlaps_register(start, end, DSP_INTERRUPT_MASK)
         {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         } else if is_word(start, end, MISCELLANEOUS_CONTROL) {
             self.miscellaneous_control = u32::from_be_bytes(data.try_into().unwrap());
         } else if overlaps_register(start, end, MISCELLANEOUS_CONTROL) {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         } else {
-            return Err(BusFault::Unmapped);
+            return Err(BusError::HardwareFault);
         }
 
         Ok(())
@@ -963,14 +967,16 @@ impl Hpc1 {
     }
 }
 
-fn transaction_bounds(address: DeviceAddr, length: usize) -> Result<(u64, u64), BusFault> {
+fn transaction_bounds(address: DeviceAddr, length: usize) -> Result<(u64, u64), BusError> {
     if !(1..=4).contains(&length) {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::InvalidTransaction);
     }
 
     let start = address.get();
-    let length = u64::try_from(length).map_err(|_| BusFault::UnsupportedAccess)?;
-    let end = start.checked_add(length).ok_or(BusFault::Unmapped)?;
+    let length = u64::try_from(length).map_err(|_| BusError::InvalidTransaction)?;
+    let end = start
+        .checked_add(length)
+        .ok_or(BusError::InvalidTransaction)?;
     Ok((start, end))
 }
 
@@ -1044,7 +1050,7 @@ fn fifo_index(value: u32, shift: u32) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
     use super::{
@@ -1065,7 +1071,7 @@ mod tests {
         SCSI_NEXT_DESCRIPTOR_POINTER, SCSI_START_DMA, SCSI_TO_MEMORY,
     };
 
-    fn read_word(hpc1: &Hpc1, address: u64) -> Result<u32, BusFault> {
+    fn read_word(hpc1: &Hpc1, address: u64) -> Result<u32, BusError> {
         let mut bytes = [0; 4];
         hpc1.read(DeviceAddr::new(address), &mut bytes)?;
         Ok(u32::from_be_bytes(bytes))
@@ -1113,11 +1119,11 @@ mod tests {
 
         assert_eq!(
             hpc1.read(DeviceAddr::new(FREE_RUNNING_COUNTER + 3), &mut [0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             hpc1.write(DeviceAddr::new(FREE_RUNNING_COUNTER), &0_u32.to_be_bytes()),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
     }
 
@@ -1149,16 +1155,16 @@ mod tests {
         for address in [DSP_INTERRUPT_STATUS, DSP_INTERRUPT_MASK] {
             assert_eq!(
                 hpc1.read(DeviceAddr::new(address + 3), &mut [0]),
-                Err(BusFault::UnsupportedAccess)
+                Err(BusError::UnimplementedAccess)
             );
             assert_eq!(
                 hpc1.write(DeviceAddr::new(address), &[0; 2]),
-                Err(BusFault::UnsupportedAccess)
+                Err(BusError::UnimplementedAccess)
             );
         }
         assert_eq!(
             hpc1.write(DeviceAddr::new(DSP_INTERRUPT_STATUS + 3), &[0; 2]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(read_word(&hpc1, DSP_INTERRUPT_STATUS), Ok(0));
         assert_eq!(read_word(&hpc1, DSP_INTERRUPT_MASK), Ok(0));
@@ -1624,7 +1630,7 @@ mod tests {
         assert_eq!(read_word(&hpc1, MISCELLANEOUS_CONTROL), Ok(9));
         assert_eq!(
             hpc1.write(DeviceAddr::new(MISCELLANEOUS_CONTROL + 3), &[0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
     }
 
@@ -1669,15 +1675,15 @@ mod tests {
 
         assert_eq!(
             hpc1.write(DeviceAddr::new(ENDIAN_CONTROL), &[]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert_eq!(
             hpc1.write(DeviceAddr::new(ETHERNET_TIMER + 3), &[0xaa, 0xbb]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             hpc1.read(DeviceAddr::new(0x0100), &mut [0]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(read_word(&hpc1, ENDIAN_CONTROL), Ok(0x52));
     }

@@ -1,6 +1,6 @@
 //! Canonical read-only byte storage.
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 
 /// An immutable device-local byte array.
 pub struct Rom {
@@ -20,10 +20,10 @@ impl Rom {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] unless `data` contains one
-    /// through four bytes. Returns [`BusFault::Unmapped`] when the complete
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length or
+    /// address overflow, or [`BusError::HardwareFault`] when the complete
     /// transaction is not backed by this ROM.
-    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let range = self.transaction_range(address, data.len())?;
         copy_read_transaction(&self.bytes[range], data);
         Ok(())
@@ -33,29 +33,35 @@ impl Rom {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] for a supported-width write to
-    /// mapped storage, or [`BusFault::Unmapped`] when the complete transaction
-    /// is outside the ROM.
-    pub fn write(&self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length or
+    /// address overflow, [`BusError::HardwareFault`] outside the storage, or
+    /// [`BusError::UnimplementedAccess`] for writes to backed storage. The
+    /// containing machine determines the hardware write-completion policy.
+    pub fn write(&self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         self.transaction_range(address, data.len())?;
-        Err(BusFault::UnsupportedAccess)
+        Err(BusError::UnimplementedAccess)
     }
 
     fn transaction_range(
         &self,
         address: DeviceAddr,
         length: usize,
-    ) -> Result<std::ops::Range<usize>, BusFault> {
+    ) -> Result<std::ops::Range<usize>, BusError> {
         if !(1..=4).contains(&length) {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::InvalidTransaction);
         }
 
-        let start = usize::try_from(address.get()).map_err(|_| BusFault::Unmapped)?;
-        let end = start.checked_add(length).ok_or(BusFault::Unmapped)?;
-        if end > self.bytes.len() {
-            return Err(BusFault::Unmapped);
+        let start = address.get();
+        let length = u64::try_from(length).map_err(|_| BusError::InvalidTransaction)?;
+        let end = start
+            .checked_add(length)
+            .ok_or(BusError::InvalidTransaction)?;
+        if end > self.bytes.len() as u64 {
+            return Err(BusError::HardwareFault);
         }
 
+        let start = usize::try_from(start).expect("a backed storage offset fits in usize");
+        let end = usize::try_from(end).expect("a backed storage endpoint fits in usize");
         Ok(start..end)
     }
 }
@@ -86,7 +92,7 @@ fn copy_read_transaction(source: &[u8], data: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
 
     use super::Rom;
 
@@ -107,19 +113,19 @@ mod tests {
 
         assert_eq!(
             rom.read(DeviceAddr::new(0), &mut []),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert_eq!(
             rom.read(DeviceAddr::new(0), &mut [0; 5]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert_eq!(
             rom.write(DeviceAddr::new(0), &[]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert_eq!(
             rom.write(DeviceAddr::new(0), &[0; 5]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
     }
 
@@ -131,19 +137,22 @@ mod tests {
 
         assert_eq!(
             rom.read(DeviceAddr::new(4), &mut outside),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(
             rom.read(DeviceAddr::new(2), &mut crossing),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(outside, [0xaa]);
         assert_eq!(crossing, [0xbb; 3]);
         assert_eq!(
             rom.read(DeviceAddr::new(u64::MAX), &mut [0; 1]),
-            Err(BusFault::Unmapped)
+            Err(BusError::InvalidTransaction)
         );
-        assert_eq!(rom.write(DeviceAddr::new(4), &[0]), Err(BusFault::Unmapped));
+        assert_eq!(
+            rom.write(DeviceAddr::new(4), &[0]),
+            Err(BusError::HardwareFault)
+        );
     }
 
     #[test]
@@ -152,7 +161,7 @@ mod tests {
 
         assert_eq!(
             rom.write(DeviceAddr::new(1), &[0xaa, 0xbb]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
 
         let mut data = [0; 4];

@@ -110,7 +110,7 @@ const fn serial_event_kind(index: usize) -> EventKind {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_core::bus::{BusError, PhysAddr, PhysicalBus};
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
     use crate::output::MachineOutput;
@@ -321,7 +321,7 @@ mod tests {
 
         assert_eq!(
             bus.write(PhysAddr::new(TIMER_CONTROL), &[0x76]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         bus.advance_time(
             VirtualDuration::from_attoseconds(7 * ATTOSECONDS_PER_MICROSECOND - 1),
@@ -407,7 +407,7 @@ mod tests {
 
         assert_eq!(
             bus.debug_read(PhysAddr::new(TIMER_ACKNOWLEDGE), &mut [0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert!(!bus.timer_1_interrupt_asserted());
 

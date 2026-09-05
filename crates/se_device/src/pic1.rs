@@ -1,6 +1,6 @@
 //! Silicon Graphics PIC1 reset, GIO configuration, and graphics-DMA register front end.
 
-use se_core::bus::{BusFault, DeviceAddr, PhysAddr};
+use se_core::bus::{BusError, DeviceAddr, PhysAddr};
 use serde::{Deserialize, Serialize};
 
 const CPU_CONTROL: u64 = 0x0000;
@@ -101,9 +101,11 @@ impl Pic1 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the complete transaction is not mapped or the
-    /// requested width or direction is unsupported.
-    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length or
+    /// address overflow, [`BusError::HardwareFault`] for transactions crossing
+    /// ordinary register boundaries, or [`BusError::UnimplementedAccess`] when
+    /// the register, width, or direction is not implemented.
+    pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
         if let Some(index) = memory_configuration_index(start, end)? {
@@ -126,7 +128,7 @@ impl Pic1 {
         } else if let Some(offset) = register_offset(start, end, GIO_ERROR_ADDRESS) {
             read_register(self.gio_error_address, offset, data);
         } else if register_offset(start, end, CLEAR_ERROR).is_some() {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         } else if let Some(offset) = register_offset(start, end, GIO_SLOT_CONFIGURATION_0) {
             read_register(u32::from(self.gio_slot_configurations[0]), offset, data);
         } else if let Some(offset) = register_offset(start, end, GIO_SLOT_CONFIGURATION_1) {
@@ -141,8 +143,10 @@ impl Pic1 {
             read_register(self.three_way_substitution, offset, data);
         } else if let Some(offset) = register_offset(start, end, DESCRIPTOR_ARRAY_BASE) {
             read_register(self.descriptor_array_base, offset, data);
+        } else if start / REGISTER_BYTES != (end - 1) / REGISTER_BYTES {
+            return Err(BusError::HardwareFault);
         } else {
-            return Err(BusFault::Unmapped);
+            return Err(BusError::UnimplementedAccess);
         }
 
         Ok(())
@@ -152,14 +156,16 @@ impl Pic1 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] when the complete transaction is not mapped or the
-    /// requested width or direction is unsupported.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length or
+    /// address overflow, [`BusError::HardwareFault`] for transactions crossing
+    /// ordinary register boundaries, or [`BusError::UnimplementedAccess`] when
+    /// the register, width, or direction is not implemented.
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
         if let Some(index) = memory_configuration_index(start, end)? {
             let value =
-                u32::from_be_bytes(data.try_into().map_err(|_| BusFault::UnsupportedAccess)?);
+                u32::from_be_bytes(data.try_into().map_err(|_| BusError::InvalidTransaction)?);
             self.memory_descriptors[index] = (value >> 16) as u16 & MEMORY_DESCRIPTOR_MASK;
             self.memory_descriptors[index + 1] = value as u16 & MEMORY_DESCRIPTOR_MASK;
             return Ok(());
@@ -177,7 +183,7 @@ impl Pic1 {
             || register_offset(start, end, CPU_ERROR_ADDRESS).is_some()
             || register_offset(start, end, GIO_ERROR_ADDRESS).is_some()
         {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         } else if register_offset(start, end, CLEAR_ERROR).is_some() {
             self.parity_error = 0;
             self.address_error_pending = false;
@@ -202,8 +208,10 @@ impl Pic1 {
         } else if let Some(offset) = register_offset(start, end, DESCRIPTOR_ARRAY_BASE) {
             self.descriptor_array_base =
                 write_register(self.descriptor_array_base, offset, data) & DESCRIPTOR_ADDRESS_MASK;
+        } else if start / REGISTER_BYTES != (end - 1) / REGISTER_BYTES {
+            return Err(BusError::HardwareFault);
         } else {
-            return Err(BusFault::Unmapped);
+            return Err(BusError::UnimplementedAccess);
         }
 
         Ok(())
@@ -217,20 +225,22 @@ impl Pic1 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault::UnsupportedAccess`] when `byte_len` is zero.
+    /// Returns [`BusError::InvalidTransaction`] when `byte_len` is zero or
+    /// the address range overflows.
     pub fn decode_memory(
         &self,
         address: PhysAddr,
         byte_len: usize,
-    ) -> Result<Option<(usize, DeviceAddr)>, BusFault> {
+    ) -> Result<Option<(usize, DeviceAddr)>, BusError> {
         if byte_len == 0 {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::InvalidTransaction);
         }
 
         let start = address.get();
-        let Some(end) = start.checked_add(byte_len as u64) else {
-            return Ok(None);
-        };
+        let length = u64::try_from(byte_len).map_err(|_| BusError::InvalidTransaction)?;
+        let end = start
+            .checked_add(length)
+            .ok_or(BusError::InvalidTransaction)?;
 
         for (index, descriptor) in self.memory_descriptors.iter().copied().enumerate() {
             let Some(size) = memory_size(descriptor) else {
@@ -274,18 +284,20 @@ impl Pic1 {
     }
 }
 
-fn transaction_bounds(address: DeviceAddr, length: usize) -> Result<(u64, u64), BusFault> {
+fn transaction_bounds(address: DeviceAddr, length: usize) -> Result<(u64, u64), BusError> {
     if !(1..=4).contains(&length) {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::InvalidTransaction);
     }
 
     let start = address.get();
-    let length = u64::try_from(length).map_err(|_| BusFault::UnsupportedAccess)?;
-    let end = start.checked_add(length).ok_or(BusFault::Unmapped)?;
+    let length = u64::try_from(length).map_err(|_| BusError::InvalidTransaction)?;
+    let end = start
+        .checked_add(length)
+        .ok_or(BusError::InvalidTransaction)?;
     Ok((start, end))
 }
 
-fn memory_configuration_index(start: u64, end: u64) -> Result<Option<usize>, BusFault> {
+fn memory_configuration_index(start: u64, end: u64) -> Result<Option<usize>, BusError> {
     for (index, base) in [MEMORY_CONFIGURATION_0, MEMORY_CONFIGURATION_1]
         .into_iter()
         .enumerate()
@@ -295,7 +307,7 @@ fn memory_configuration_index(start: u64, end: u64) -> Result<Option<usize>, Bus
             return Ok(Some(index * 2));
         }
         if start < register_end && end > base {
-            return Err(BusFault::UnsupportedAccess);
+            return Err(BusError::UnimplementedAccess);
         }
     }
 
@@ -333,7 +345,7 @@ fn write_register(value: u32, offset: usize, data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr, PhysAddr};
+    use se_core::bus::{BusError, DeviceAddr, PhysAddr};
 
     use super::{
         CLEAR_ERROR, CPU_CONTROL, CPU_ERROR_ADDRESS, DESCRIPTOR_ARRAY_BASE, GIO_BURST, GIO_DELAY,
@@ -346,7 +358,7 @@ mod tests {
         Pic1::new(0xf7, 2, true)
     }
 
-    fn read_word(pic1: &Pic1, address: u64) -> Result<u32, BusFault> {
+    fn read_word(pic1: &Pic1, address: u64) -> Result<u32, BusError> {
         let mut bytes = [0; 4];
         pic1.read(DeviceAddr::new(address), &mut bytes)?;
         Ok(u32::from_be_bytes(bytes))
@@ -553,7 +565,7 @@ mod tests {
 
         assert_eq!(
             pic1.read(DeviceAddr::new(CLEAR_ERROR), &mut [0; 1]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             pic1.write(DeviceAddr::new(CLEAR_ERROR + 1), &[0x12, 0x34]),
@@ -621,15 +633,15 @@ mod tests {
         assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_0), Ok(0x0f3f_0f3f));
         assert_eq!(
             pic1.read(DeviceAddr::new(MEMORY_CONFIGURATION_0), &mut [0]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             pic1.write(DeviceAddr::new(MEMORY_CONFIGURATION_0 + 1), &[0; 4]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             pic1.write(DeviceAddr::new(MEMORY_CONFIGURATION_1 - 1), &[0; 2]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
     }
 
@@ -696,7 +708,7 @@ mod tests {
         );
         assert_eq!(
             pic1.decode_memory(PhysAddr::new(base), 0),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert_eq!(
             pic1.decode_memory(PhysAddr::new(base), 5),
@@ -729,7 +741,7 @@ mod tests {
         ] {
             assert_eq!(
                 pic1.write(DeviceAddr::new(address), &[0]),
-                Err(BusFault::UnsupportedAccess)
+                Err(BusError::UnimplementedAccess)
             );
         }
     }
@@ -799,19 +811,19 @@ mod tests {
 
         assert_eq!(
             pic1.write(DeviceAddr::new(DESCRIPTOR_ARRAY_BASE), &[]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::InvalidTransaction)
         );
         assert_eq!(
             pic1.write(DeviceAddr::new(DESCRIPTOR_ARRAY_BASE + 3), &[1, 2]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(
             pic1.read(DeviceAddr::new(CPU_ERROR_ADDRESS + 3), &mut [0; 2]),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(
             pic1.read(DeviceAddr::new(0x100), &mut [0; 1]),
-            Err(BusFault::Unmapped)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0x0123_4567));
     }

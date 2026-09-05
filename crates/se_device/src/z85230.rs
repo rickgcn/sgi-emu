@@ -1,6 +1,6 @@
 //! Zilog Z85230 serial communications controller front end.
 
-use se_core::bus::{BusFault, DeviceAddr};
+use se_core::bus::{BusError, DeviceAddr};
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 use serde::{Deserialize, Serialize};
 
@@ -171,9 +171,10 @@ impl Z85230 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] unless the transaction selects exactly one byte
-    /// port.
-    pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction selects
+    /// exactly one modeled byte port.
+    pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         match decode_port(address, data.len())? {
             Port::Control(channel) => data[0] = self.read_control(channel),
             Port::Data(channel) => data[0] = self.channels[channel].read_data(),
@@ -185,9 +186,10 @@ impl Z85230 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] unless the transaction selects exactly one byte
-    /// port.
-    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction selects
+    /// exactly one modeled byte port.
+    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         match decode_port(address, data.len())? {
             Port::Control(channel) => data[0] = self.peek_control(channel),
             Port::Data(channel) => data[0] = self.channels[channel].peek_data(),
@@ -199,9 +201,10 @@ impl Z85230 {
     ///
     /// # Errors
     ///
-    /// Returns [`BusFault`] unless the transaction selects exactly one byte
-    /// port.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusFault> {
+    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
+    /// [`BusError::UnimplementedAccess`] unless the transaction selects
+    /// exactly one modeled byte port.
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         match decode_port(address, data.len())? {
             Port::Control(channel) => self.write_control(channel, data[0]),
             Port::Data(channel) => {
@@ -745,9 +748,13 @@ enum Port {
     Data(usize),
 }
 
-fn decode_port(address: DeviceAddr, length: usize) -> Result<Port, BusFault> {
+fn decode_port(address: DeviceAddr, length: usize) -> Result<Port, BusError> {
+    if !(1..=4).contains(&length) {
+        return Err(BusError::InvalidTransaction);
+    }
+
     if length != 1 {
-        return Err(BusFault::UnsupportedAccess);
+        return Err(BusError::UnimplementedAccess);
     }
 
     match address.get() {
@@ -755,7 +762,7 @@ fn decode_port(address: DeviceAddr, length: usize) -> Result<Port, BusFault> {
         CHANNEL_B_DATA => Ok(Port::Data(1)),
         CHANNEL_A_CONTROL => Ok(Port::Control(0)),
         CHANNEL_A_DATA => Ok(Port::Data(0)),
-        _ => Err(BusFault::Unmapped),
+        _ => Err(BusError::UnimplementedAccess),
     }
 }
 
@@ -776,7 +783,7 @@ const fn cts_asserted() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, DeviceAddr};
+    use se_core::bus::{BusError, DeviceAddr};
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
     use super::{
@@ -789,7 +796,7 @@ mod tests {
     const CLOCK_HZ: u64 = 3_686_400;
     const CHARACTER_ATTOSECONDS: u128 = ATTOSECONDS_PER_SECOND / 960;
 
-    fn read_port(serial: &mut Z85230, port: u64) -> Result<u8, BusFault> {
+    fn read_port(serial: &mut Z85230, port: u64) -> Result<u8, BusError> {
         let mut value = [0];
         serial.read(DeviceAddr::new(port), &mut value)?;
         Ok(value[0])
@@ -1593,11 +1600,11 @@ mod tests {
 
         assert_eq!(
             serial.write(DeviceAddr::new(CHANNEL_A_CONTROL), &[1, 2]),
-            Err(BusFault::UnsupportedAccess)
+            Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             serial.write(DeviceAddr::new(0), &[1]),
-            Err(BusFault::Unmapped)
+            Err(BusError::UnimplementedAccess)
         );
     }
 

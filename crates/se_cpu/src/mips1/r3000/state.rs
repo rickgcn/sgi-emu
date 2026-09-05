@@ -1,4 +1,4 @@
-use se_core::bus::{BusFault, PhysicalBus};
+use se_core::bus::{BusError, PhysicalBus};
 use se_float::backend::Backend;
 use serde::{Deserialize, Serialize};
 
@@ -361,7 +361,7 @@ impl State {
         &mut self,
         translation: Translation,
         bus: &mut dyn PhysicalBus,
-    ) -> Result<[u8; 4], BusFault> {
+    ) -> Result<[u8; 4], BusError> {
         validate_memory_access(translation, 4);
 
         let mut data = [0; 4];
@@ -382,7 +382,7 @@ impl State {
         translation: Translation,
         data: &mut [u8],
         bus: &mut dyn PhysicalBus,
-    ) -> Result<(), BusFault> {
+    ) -> Result<(), BusError> {
         validate_memory_access(translation, data.len());
 
         let cache_control = self.data_cache_control();
@@ -412,7 +412,7 @@ impl State {
         translation: Translation,
         data: &[u8],
         bus: &mut dyn PhysicalBus,
-    ) -> Result<(), BusFault> {
+    ) -> Result<(), BusError> {
         validate_memory_access(translation, data.len());
 
         let cache_control = self.data_cache_control();
@@ -687,7 +687,7 @@ fn validate_memory_access(translation: Translation, length: usize) {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusFault, PhysAddr, PhysicalBus};
+    use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 
     use super::{
         AccessType, Cacheability, Cp0, DelaySlot, Exception, InstructionEffect,
@@ -709,8 +709,8 @@ mod tests {
         read_data: [u8; 4],
         reads: Vec<(PhysAddr, usize)>,
         writes: Vec<(PhysAddr, Vec<u8>)>,
-        read_fault: Option<BusFault>,
-        write_fault: Option<BusFault>,
+        read_fault: Option<BusError>,
+        write_fault: Option<BusError>,
     }
 
     impl TestBus {
@@ -726,7 +726,7 @@ mod tests {
     }
 
     impl PhysicalBus for TestBus {
-        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusFault> {
+        fn read(&mut self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
             self.reads.push((address, data.len()));
             if let Some(fault) = self.read_fault {
                 return Err(fault);
@@ -734,12 +734,12 @@ mod tests {
             let source = self
                 .read_data
                 .get(..data.len())
-                .ok_or(BusFault::UnsupportedAccess)?;
+                .ok_or(BusError::UnimplementedAccess)?;
             data.copy_from_slice(source);
             Ok(())
         }
 
-        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusFault> {
+        fn write(&mut self, address: PhysAddr, data: &[u8]) -> Result<(), BusError> {
             if let Some(fault) = self.write_fault {
                 return Err(fault);
             }
@@ -1813,14 +1813,14 @@ mod tests {
         assert_eq!(bus.reads.len(), 2);
         assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
 
-        bus.read_fault = Some(BusFault::Unmapped);
+        bus.read_fault = Some(BusError::HardwareFault);
         data = [0xaa; 4];
         let pc = state.pc();
         let status = state.read_cp0(12);
         let random = state.read_cp0(1);
         assert_eq!(
             state.load_data(uncached, &mut data, &mut bus),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(data, [0xaa; 4]);
         assert_eq!(state.pc(), pc);
@@ -2008,13 +2008,13 @@ mod tests {
         );
         assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
 
-        bus.write_fault = Some(BusFault::Unmapped);
+        bus.write_fault = Some(BusError::HardwareFault);
         let pc = state.pc();
         let status = state.read_cp0(12);
         let random = state.read_cp0(1);
         assert_eq!(
             state.store_memory(translation(0x401, Cacheability::Cached), &[9, 8], &mut bus,),
-            Err(BusFault::Unmapped)
+            Err(BusError::HardwareFault)
         );
         assert_eq!(state.pc(), pc);
         assert_eq!(state.read_cp0(12), status);
