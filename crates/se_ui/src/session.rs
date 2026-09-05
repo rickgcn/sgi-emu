@@ -627,6 +627,9 @@ mod tests {
     fn configuration() -> MachineConfiguration {
         MachineConfiguration {
             machine_model: String::from("indigo-ip12"),
+            memory_bank_a_simm_mib: 2,
+            memory_bank_b_simm_mib: 0,
+            memory_bank_c_simm_mib: 0,
             prom_path: String::from("prom.bin"),
             disk_path: String::new(),
             cdrom_path: String::new(),

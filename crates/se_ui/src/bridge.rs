@@ -67,6 +67,12 @@ pub mod ffi {
     pub struct MachineConfiguration {
         /// Stable machine identifier.
         pub machine_model: String,
+        /// Per-SIMM capacity for IP12 memory bank A, or zero when empty.
+        pub memory_bank_a_simm_mib: u8,
+        /// Per-SIMM capacity for IP12 memory bank B, or zero when empty.
+        pub memory_bank_b_simm_mib: u8,
+        /// Per-SIMM capacity for IP12 memory bank C, or zero when empty.
+        pub memory_bank_c_simm_mib: u8,
         /// Path to the selected PROM image.
         pub prom_path: String,
         /// Path to the optional disk image.

@@ -23,6 +23,9 @@ pub struct ApplicationConfig {
 #[serde(default)]
 struct MachineConfig {
     model: String,
+    memory_bank_a_simm_mib: u8,
+    memory_bank_b_simm_mib: u8,
+    memory_bank_c_simm_mib: u8,
     prom_path: String,
     disk_path: String,
     cdrom_path: String,
@@ -33,6 +36,9 @@ impl Default for MachineConfig {
     fn default() -> Self {
         Self {
             model: String::from("indigo-ip12"),
+            memory_bank_a_simm_mib: 2,
+            memory_bank_b_simm_mib: 0,
+            memory_bank_c_simm_mib: 0,
             prom_path: String::new(),
             disk_path: String::new(),
             cdrom_path: String::new(),
@@ -99,6 +105,9 @@ impl ApplicationConfig {
     pub fn machine_configuration(&self) -> MachineConfiguration {
         MachineConfiguration {
             machine_model: self.machine.model.clone(),
+            memory_bank_a_simm_mib: self.machine.memory_bank_a_simm_mib,
+            memory_bank_b_simm_mib: self.machine.memory_bank_b_simm_mib,
+            memory_bank_c_simm_mib: self.machine.memory_bank_c_simm_mib,
             prom_path: self.machine.prom_path.clone(),
             disk_path: self.machine.disk_path.clone(),
             cdrom_path: self.machine.cdrom_path.clone(),
@@ -117,6 +126,9 @@ impl ApplicationConfig {
 
     pub fn apply_ui_exit_state(&mut self, exit: UiExitState) {
         self.machine.model = exit.machine.machine_model;
+        self.machine.memory_bank_a_simm_mib = exit.machine.memory_bank_a_simm_mib;
+        self.machine.memory_bank_b_simm_mib = exit.machine.memory_bank_b_simm_mib;
+        self.machine.memory_bank_c_simm_mib = exit.machine.memory_bank_c_simm_mib;
         self.machine.prom_path = exit.machine.prom_path;
         self.machine.disk_path = exit.machine.disk_path;
         self.machine.cdrom_path = exit.machine.cdrom_path;
@@ -179,6 +191,9 @@ mod tests {
         let config = ApplicationConfig::default();
 
         assert_eq!(config.machine.model, "indigo-ip12");
+        assert_eq!(config.machine.memory_bank_a_simm_mib, 2);
+        assert_eq!(config.machine.memory_bank_b_simm_mib, 0);
+        assert_eq!(config.machine.memory_bank_c_simm_mib, 0);
         assert!(config.machine.prom_path.is_empty());
         assert!(config.machine.disk_path.is_empty());
         assert!(config.machine.cdrom_path.is_empty());
@@ -196,6 +211,9 @@ mod tests {
 
                 [machine]
                 model = "indigo-ip12"
+                memory_bank_a_simm_mib = 8
+                memory_bank_b_simm_mib = 0
+                memory_bank_c_simm_mib = 4
                 prom_path = "prom.bin"
                 disk_path = "disk.img"
                 cdrom_path = "disc.iso"
@@ -205,6 +223,9 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(config.machine.memory_bank_a_simm_mib, 8);
+        assert_eq!(config.machine.memory_bank_b_simm_mib, 0);
+        assert_eq!(config.machine.memory_bank_c_simm_mib, 4);
         assert_eq!(config.machine.prom_path, "prom.bin");
         assert_eq!(config.machine.disk_path, "disk.img");
         assert_eq!(config.machine.cdrom_path, "disc.iso");
@@ -212,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn older_configuration_without_cdrom_path_uses_an_empty_path() {
+    fn older_configuration_uses_default_values_for_new_machine_settings() {
         let config: ApplicationConfig = toml::from_str(
             r#"
                 [machine]
@@ -226,6 +247,9 @@ mod tests {
 
         assert!(config.machine.cdrom_path.is_empty());
         assert!(config.machine_configuration().cdrom_path.is_empty());
+        assert_eq!(config.machine.memory_bank_a_simm_mib, 2);
+        assert_eq!(config.machine.memory_bank_b_simm_mib, 0);
+        assert_eq!(config.machine.memory_bank_c_simm_mib, 0);
     }
 
     #[test]
@@ -268,12 +292,18 @@ mod tests {
         config.machine.prom_path = String::from("replacement.bin");
         config.machine.disk_path = String::from("disk.img");
         config.machine.cdrom_path = String::from("disc.iso");
+        config.machine.memory_bank_a_simm_mib = 0;
+        config.machine.memory_bank_b_simm_mib = 8;
+        config.machine.memory_bank_c_simm_mib = 4;
         save(&path, &config).unwrap();
 
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.machine.prom_path, "replacement.bin");
         assert_eq!(loaded.machine.disk_path, "disk.img");
         assert_eq!(loaded.machine.cdrom_path, "disc.iso");
+        assert_eq!(loaded.machine.memory_bank_a_simm_mib, 0);
+        assert_eq!(loaded.machine.memory_bank_b_simm_mib, 8);
+        assert_eq!(loaded.machine.memory_bank_c_simm_mib, 4);
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();

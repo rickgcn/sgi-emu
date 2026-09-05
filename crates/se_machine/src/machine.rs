@@ -6,13 +6,34 @@ use std::fmt;
 use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::StepError;
 use se_device::scsi::ScsiSnapshotError;
+use se_float::backend::Backend;
 use serde::{Deserialize, Serialize};
 
 use crate::debug::{DebugRequest, DebugResponse};
 use crate::indigo::ip12::snapshot::Ip12Snapshot;
-use crate::indigo::ip12::{Ip12, Ip12NonvolatileState};
+use crate::indigo::ip12::{Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState};
 use crate::output::MachineOutput;
 use crate::serial::SerialPort;
+
+/// Construction-time configuration for a supported machine model.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum MachineStartupConfiguration {
+    /// Configuration for an SGI Indigo IP12.
+    IndigoIp12 {
+        /// Floating-point implementation selected for the R3010.
+        #[serde(with = "BackendDefinition")]
+        floating_point_backend: Backend,
+        /// Installed IP12 memory banks.
+        memory: Ip12MemoryConfiguration,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(remote = "Backend")]
+enum BackendDefinition {
+    SoftFloat,
+    Native,
+}
 
 /// A configured emulated machine.
 pub enum Machine {
