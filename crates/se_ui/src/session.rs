@@ -12,12 +12,13 @@ use se_machine::indigo::ip12::debug::{
 use se_machine::machine::MachineNonvolatileState;
 use se_machine::serial::SerialPort;
 use se_runtime::control::{RuntimeMode, RuntimeState, RuntimeStatus};
+use se_runtime::record::Replayer;
 use se_runtime::runtime::{DebugReply, Runtime, RuntimeConfiguration, RuntimeError, ShutdownError};
 
 use crate::bridge::ffi::{
     CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineConfiguration,
-    MachineOutputSink, MemoryDto, RegistersDto, RuntimeStatusDto, SerialPortDto, TlbDto,
-    TlbEntryDto, UiExitState, UiStartupState, run_gui,
+    MachineOutputSink, MemoryDto, RegistersDto, ReplaySnapshotCatalogDto, ReplaySnapshotInfoDto,
+    RuntimeStatusDto, SerialPortDto, TlbDto, TlbEntryDto, UiExitState, UiStartupState, run_gui,
 };
 
 /// Constructs a machine from settings selected by a frontend.
@@ -34,8 +35,13 @@ pub enum MachineBuildRequest {
     Normal,
     /// Cold-start recording to the selected Record path.
     Recording(PathBuf),
-    /// Cold-start replay from the selected Record path.
-    Replaying(PathBuf),
+    /// Replay from the selected Record's beginning or a manual snapshot.
+    Replaying {
+        /// Complete Record path.
+        path: PathBuf,
+        /// Opaque snapshot identifier, or `None` for cold Replay.
+        snapshot_id: Option<String>,
+    },
 }
 
 /// Owns the emulator runtime for the lifetime of one Qt event loop.
@@ -133,15 +139,49 @@ impl UiSession {
         &self,
         configuration: &MachineConfiguration,
         path: &str,
+        snapshot_id: &str,
     ) -> RuntimeStatusDto {
         let configuration = match (self.machine_builder)(
             configuration,
-            MachineBuildRequest::Replaying(PathBuf::from(path)),
+            MachineBuildRequest::Replaying {
+                path: PathBuf::from(path),
+                snapshot_id: (!snapshot_id.is_empty()).then(|| snapshot_id.to_owned()),
+            },
         ) {
             Ok(configuration) => configuration,
             Err(error) => return failed_status(error),
         };
         self.runtime_command(|runtime| runtime.configure_with(configuration))
+    }
+
+    /// Loads or rebuilds the manual snapshot catalog for one complete Record.
+    #[must_use]
+    pub fn replay_snapshot_catalog(&self, path: &str) -> ReplaySnapshotCatalogDto {
+        match Replayer::snapshot_catalog(path) {
+            Ok(snapshots) => ReplaySnapshotCatalogDto {
+                success: true,
+                error: String::new(),
+                snapshots: snapshots
+                    .into_iter()
+                    .map(|snapshot| ReplaySnapshotInfoDto {
+                        id: snapshot.id().to_owned(),
+                        epoch: snapshot.position().epoch,
+                        instructions: snapshot.position().completed_instructions,
+                        pc: snapshot.pc(),
+                    })
+                    .collect(),
+            },
+            Err(error) => ReplaySnapshotCatalogDto {
+                success: false,
+                error: error.to_string(),
+                snapshots: Vec::new(),
+            },
+        }
+    }
+
+    /// Creates a manual snapshot of the active paused Replay.
+    pub fn create_replay_snapshot(&self) -> RuntimeStatusDto {
+        self.runtime_command(Runtime::create_replay_snapshot)
     }
 
     /// Discards the Replay machine and cold-constructs a paused Normal machine
@@ -571,5 +611,66 @@ fn format_pending_cp1(pending: Option<PendingCp1DebugSnapshot>) -> String {
         Some(PendingCp1DebugSnapshot::Condition { value }) => {
             format!("condition = {}", u8::from(value))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use se_runtime::runtime::Runtime;
+
+    use super::{MachineBuildRequest, UiSession};
+    use crate::bridge::ffi::MachineConfiguration;
+
+    fn configuration() -> MachineConfiguration {
+        MachineConfiguration {
+            machine_model: String::from("indigo-ip12"),
+            prom_path: String::from("prom.bin"),
+            disk_path: String::new(),
+            cdrom_path: String::new(),
+            float_backend: String::from("softfloat"),
+        }
+    }
+
+    #[test]
+    fn replay_bridge_preserves_the_selected_snapshot_identifier() {
+        let observed = Arc::new(Mutex::new(None));
+        let builder_observed = Arc::clone(&observed);
+        let session = UiSession::new(
+            Runtime::new_unconfigured().unwrap(),
+            Box::new(move |_configuration, request| {
+                let MachineBuildRequest::Replaying { path, snapshot_id } = request else {
+                    panic!("the bridge sent the wrong build request");
+                };
+                *builder_observed.lock().unwrap() = Some((path, snapshot_id));
+                Err(String::from("injected builder stop"))
+            }),
+        );
+
+        let status = session.open_replay(&configuration(), "recording.serec", "point.ckpt");
+
+        assert!(!status.success);
+        assert_eq!(status.command_error, "injected builder stop");
+        let observed = observed.lock().unwrap().take().unwrap();
+        assert_eq!(observed.0, Path::new("recording.serec"));
+        assert_eq!(observed.1.as_deref(), Some("point.ckpt"));
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn replay_snapshot_bridge_reports_catalog_and_runtime_errors() {
+        let session = UiSession::new(
+            Runtime::new_unconfigured().unwrap(),
+            Box::new(|_, _| Err(String::from("unused builder"))),
+        );
+
+        let catalog = session.replay_snapshot_catalog("missing-record.serec");
+        assert!(!catalog.success);
+        assert!(catalog.snapshots.is_empty());
+        assert!(!catalog.error.is_empty());
+        assert!(!session.create_replay_snapshot().success);
+        session.shutdown().unwrap();
     }
 }

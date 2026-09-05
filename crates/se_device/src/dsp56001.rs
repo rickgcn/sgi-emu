@@ -1,6 +1,7 @@
 //! Motorola DSP56001 CPU-visible external SRAM.
 
 use se_core::bus::{BusFault, DeviceAddr};
+use serde::{Deserialize, Serialize};
 
 const WORD_COUNT: usize = 32 * 1024;
 const WORD_BYTES: u64 = 4;
@@ -8,6 +9,7 @@ const BYTE_LEN: u64 = WORD_COUNT as u64 * WORD_BYTES;
 const DATA_MASK: u32 = 0x00ff_ffff;
 
 /// The CPU-visible external memory of the IP12 DSP56001 subsystem.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Dsp56001 {
     words: Box<[u32]>,
 }

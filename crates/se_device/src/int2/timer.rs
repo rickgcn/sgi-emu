@@ -1,5 +1,6 @@
 use se_core::bus::BusFault;
 use se_core::time::VirtualDuration;
+use serde::{Deserialize, Serialize};
 
 const ATTOSECONDS_PER_TICK: u128 = 1_000_000_000_000;
 const COUNTER_ZERO_ENCODING: u32 = 1 << 16;
@@ -35,7 +36,7 @@ pub(super) struct TimerOutputs {
     pub(super) counter_1: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct ProgrammableTimer {
     counters: [Counter; 3],
     deferred_outputs: [bool; 2],
@@ -133,7 +134,7 @@ impl ProgrammableTimer {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Counter {
     state: CounterState,
     latch: Option<LatchedCount>,
@@ -292,7 +293,7 @@ impl Counter {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum CounterState {
     Unconfigured,
     AwaitingCount {
@@ -309,13 +310,13 @@ enum CounterState {
     Quiescent,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum CounterMode {
     Mode1,
     Mode2,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LatchedCount {
     value: u16,
     read_high: bool,

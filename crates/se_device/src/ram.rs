@@ -1,8 +1,10 @@
 //! Byte-addressed random-access memory.
 
 use se_core::bus::{BusFault, DeviceAddr};
+use serde::{Deserialize, Serialize};
 
 /// A fixed-size volatile byte store.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Ram {
     bytes: Box<[u8]>,
 }

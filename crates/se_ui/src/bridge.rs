@@ -132,6 +132,30 @@ pub mod ffi {
         pub command_error: String,
     }
 
+    /// One manually created Replay restore point displayed by Qt.
+    #[derive(Debug)]
+    pub struct ReplaySnapshotInfoDto {
+        /// Opaque identifier passed back when opening the restore point.
+        pub id: String,
+        /// Record epoch containing the restore point.
+        pub epoch: u64,
+        /// Completed instructions within the epoch.
+        pub instructions: u64,
+        /// Next guest instruction address.
+        pub pc: u32,
+    }
+
+    /// Result of loading or rebuilding a Replay snapshot catalog.
+    #[derive(Debug)]
+    pub struct ReplaySnapshotCatalogDto {
+        /// Whether the catalog was loaded successfully.
+        pub success: bool,
+        /// Catalog error when `success` is false.
+        pub error: String,
+        /// Valid restore points sorted by execution position.
+        pub snapshots: Vec<ReplaySnapshotInfoDto>,
+    }
+
     /// Complete register debugger payload.
     #[derive(Debug)]
     pub struct RegistersDto {
@@ -297,7 +321,10 @@ pub mod ffi {
             self: &UiSession,
             configuration: &MachineConfiguration,
             path: &str,
+            snapshot_id: &str,
         ) -> RuntimeStatusDto;
+        fn replay_snapshot_catalog(self: &UiSession, path: &str) -> ReplaySnapshotCatalogDto;
+        fn create_replay_snapshot(self: &UiSession) -> RuntimeStatusDto;
         fn stop_replay(self: &UiSession, configuration: &MachineConfiguration) -> RuntimeStatusDto;
         fn registers(self: &UiSession) -> RegistersDto;
         fn tlb(self: &UiSession, instruction_view: bool) -> TlbDto;

@@ -1,5 +1,8 @@
 //! National Semiconductor NMC93CS46 serial EEPROM.
 
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
+
 const WORD_COUNT: usize = 64;
 const COMMAND_BITS: u8 = 11;
 const DATA_BITS: u8 = 16;
@@ -12,8 +15,9 @@ const OPERATION_MASK: u16 = 0x07c0;
 const ADDRESS_MASK: u16 = 0b11_1111;
 
 /// Nonvolatile words stored by an NMC93CS46.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Nmc93cs46Contents {
+    #[serde(with = "BigArray")]
     words: [u16; WORD_COUNT],
 }
 
@@ -31,7 +35,7 @@ impl Nmc93cs46Contents {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 enum Transfer {
     Command {
         bits: u16,
@@ -50,7 +54,9 @@ enum Transfer {
 }
 
 /// A 64-word serial EEPROM with the command format used by the IP12.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Nmc93cs46 {
+    #[serde(with = "BigArray")]
     words: [u16; WORD_COUNT],
     transfer: Transfer,
     write_enabled: bool,

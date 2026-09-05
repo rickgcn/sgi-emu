@@ -7,5 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde-big-array.workspace = true
 se_core.workspace = true
 se_float.workspace = true

@@ -65,6 +65,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "bincode"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
+dependencies = [
+ "bincode_derive",
+ "serde",
+ "unty",
+]
+
+[[package]]
+name = "bincode_derive"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
+dependencies = [
+ "virtue",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -525,6 +545,9 @@ dependencies = [
 [[package]]
 name = "se_core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "se_cpu"
@@ -532,6 +555,8 @@ version = "0.1.0"
 dependencies = [
  "se_core",
  "se_float",
+ "serde",
+ "serde-big-array",
 ]
 
 [[package]]
@@ -539,6 +564,8 @@ name = "se_device"
 version = "0.1.0"
 dependencies = [
  "se_core",
+ "serde",
+ "serde-big-array",
 ]
 
 [[package]]
@@ -557,6 +584,7 @@ dependencies = [
  "se_cpu",
  "se_device",
  "se_float",
+ "serde",
  "sha2",
 ]
 
@@ -564,11 +592,13 @@ dependencies = [
 name = "se_runtime"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "crc32fast",
  "se_core",
  "se_device",
  "se_float",
  "se_machine",
+ "serde",
  "sha2",
  "windows-sys",
 ]
@@ -600,6 +630,15 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-big-array"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -783,6 +822,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
+name = "unty"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
+
+[[package]]
 name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -793,6 +838,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtue"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vt100"

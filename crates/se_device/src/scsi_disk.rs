@@ -1,6 +1,10 @@
 //! Functional SCSI direct-access disk target.
 
-use crate::scsi::{ScsiCommandPlan, ScsiStatus, ScsiStorageSizeError, ScsiTarget, SenseData};
+use serde::{Deserialize, Serialize};
+
+use crate::scsi::{
+    ScsiCommandPlan, ScsiStatus, ScsiStorageSizeError, ScsiTarget, ScsiTargetSnapshot, SenseData,
+};
 
 const BLOCK_BYTES: u32 = 512;
 
@@ -14,6 +18,7 @@ const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2a;
 
 /// Software-visible state of one SCSI disk target.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ScsiDisk {
     block_count: u64,
     ready: bool,
@@ -132,6 +137,25 @@ impl ScsiDisk {
 impl ScsiTarget for ScsiDisk {
     fn storage_size_bytes(&self) -> u64 {
         self.block_count * u64::from(BLOCK_BYTES)
+    }
+
+    fn snapshot(&self) -> Option<ScsiTargetSnapshot> {
+        Some(ScsiTargetSnapshot::Disk(self.clone()))
+    }
+
+    fn accepts_snapshot(&self, snapshot: &ScsiTargetSnapshot) -> bool {
+        matches!(snapshot, ScsiTargetSnapshot::Disk(state) if state.block_count == self.block_count)
+    }
+
+    fn restore_snapshot(&mut self, snapshot: ScsiTargetSnapshot) -> bool {
+        let ScsiTargetSnapshot::Disk(state) = snapshot else {
+            return false;
+        };
+        if state.block_count != self.block_count {
+            return false;
+        }
+        *self = state;
+        true
     }
 
     /// Decodes one command descriptor block.

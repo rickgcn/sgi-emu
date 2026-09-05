@@ -3,6 +3,10 @@
 use std::error::Error;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
+use crate::scsi_cdrom::ScsiCdrom;
+use crate::scsi_disk::ScsiDisk;
 use crate::storage::BlockStorage;
 
 const FIXED_SENSE_BYTES: usize = 18;
@@ -11,7 +15,7 @@ const LUN_COUNT: usize = 8;
 const TARGET_SLOT_COUNT: usize = TARGET_COUNT * LUN_COUNT;
 
 /// The status returned by a SCSI target command.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ScsiStatus {
     /// The command completed successfully.
     Good,
@@ -66,6 +70,39 @@ pub trait ScsiTarget: Send {
 
     /// Completes storage-backed I/O and returns its target status.
     fn complete_storage(&mut self, succeeded: bool) -> ScsiStatus;
+
+    /// Captures target-local protocol state without its backing storage.
+    fn snapshot(&self) -> Option<ScsiTargetSnapshot> {
+        None
+    }
+
+    /// Reports whether a snapshot can be restored without changing topology.
+    fn accepts_snapshot(&self, _snapshot: &ScsiTargetSnapshot) -> bool {
+        false
+    }
+
+    /// Restores target-local state while preserving the backing storage.
+    fn restore_snapshot(&mut self, _snapshot: ScsiTargetSnapshot) -> bool {
+        false
+    }
+}
+
+/// Restorable state of a supported functional SCSI target.
+#[derive(Clone, Deserialize, Serialize)]
+pub enum ScsiTargetSnapshot {
+    /// Direct-access disk state.
+    Disk(ScsiDisk),
+    /// Read-only CD-ROM state.
+    Cdrom(ScsiCdrom),
+}
+
+impl ScsiTargetSnapshot {
+    fn storage_size_bytes(&self) -> u64 {
+        match self {
+            Self::Disk(target) => target.storage_size_bytes(),
+            Self::Cdrom(target) => target.storage_size_bytes(),
+        }
+    }
 }
 
 /// An invalid storage capacity supplied to a SCSI target constructor.
@@ -262,11 +299,13 @@ struct TargetAttachment {
 
 type TargetRegistry = [Option<TargetAttachment>; TARGET_SLOT_COUNT];
 
+#[derive(Clone, Deserialize, Serialize)]
 struct ScsiTransaction {
     target_slot: usize,
     transfer: ScsiTransfer,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 enum ScsiTransfer {
     ImmediateDataIn {
         data: Vec<u8>,
@@ -289,6 +328,25 @@ pub struct ScsiBus {
     active_transaction: Option<ScsiTransaction>,
 }
 
+/// Complete restorable SCSI protocol state without backing-storage objects.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct ScsiBusSnapshot {
+    targets: Vec<(u8, u8, ScsiTargetSnapshot)>,
+    active_transaction: Option<ScsiTransaction>,
+}
+
+/// A snapshot that is incompatible with the cold-constructed SCSI topology.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScsiSnapshotError;
+
+impl fmt::Display for ScsiSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SCSI snapshot does not match the configured topology or storage")
+    }
+}
+
+impl Error for ScsiSnapshotError {}
+
 impl ScsiBus {
     /// Creates an empty bus with no active transaction.
     #[must_use]
@@ -297,6 +355,70 @@ impl ScsiBus {
             targets: std::array::from_fn(|_| None),
             active_transaction: None,
         }
+    }
+
+    /// Captures target and active-transaction state without storage objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScsiSnapshotError`] when an attached target does not expose
+    /// restorable state.
+    pub fn snapshot(&self) -> Result<ScsiBusSnapshot, ScsiSnapshotError> {
+        let mut targets = Vec::new();
+        for (slot, attachment) in self.targets.iter().enumerate() {
+            let Some(attachment) = attachment else {
+                continue;
+            };
+            let snapshot = attachment.target.snapshot().ok_or(ScsiSnapshotError)?;
+            let (target_id, lun) = address_for_slot(slot);
+            targets.push((target_id, lun, snapshot));
+        }
+        Ok(ScsiBusSnapshot {
+            targets,
+            active_transaction: self.active_transaction.clone(),
+        })
+    }
+
+    /// Restores protocol state while retaining the currently attached storage
+    /// objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScsiSnapshotError`] without changing state when target
+    /// topology, capacity, or an active transfer is incompatible.
+    pub fn restore_snapshot(&mut self, snapshot: ScsiBusSnapshot) -> Result<(), ScsiSnapshotError> {
+        let mut target_states: [Option<ScsiTargetSnapshot>; TARGET_SLOT_COUNT] =
+            std::array::from_fn(|_| None);
+        for (target_id, lun, state) in snapshot.targets {
+            let slot = target_slot(target_id, lun).ok_or(ScsiSnapshotError)?;
+            if target_states[slot].replace(state).is_some() {
+                return Err(ScsiSnapshotError);
+            }
+        }
+
+        for (attachment, state) in self.targets.iter().zip(&target_states) {
+            match (attachment, state) {
+                (None, None) => {}
+                (Some(attachment), Some(state))
+                    if attachment.target.accepts_snapshot(state)
+                        && state.storage_size_bytes() == attachment.storage.size_bytes() => {}
+                _ => return Err(ScsiSnapshotError),
+            }
+        }
+        if let Some(transaction) = &snapshot.active_transaction {
+            validate_snapshot_transaction(transaction, &self.targets)?;
+        }
+
+        for (attachment, state) in self.targets.iter_mut().zip(target_states) {
+            let (Some(attachment), Some(state)) = (attachment, state) else {
+                continue;
+            };
+            if !attachment.target.restore_snapshot(state) {
+                return Err(ScsiSnapshotError);
+            }
+        }
+        self.active_transaction = snapshot.active_transaction;
+        Ok(())
     }
 
     /// Attaches one target and its backing storage.
@@ -677,6 +799,36 @@ impl ScsiBus {
     }
 }
 
+fn validate_snapshot_transaction(
+    transaction: &ScsiTransaction,
+    targets: &TargetRegistry,
+) -> Result<(), ScsiSnapshotError> {
+    let attachment = targets
+        .get(transaction.target_slot)
+        .and_then(Option::as_ref)
+        .ok_or(ScsiSnapshotError)?;
+    match &transaction.transfer {
+        ScsiTransfer::ImmediateDataIn {
+            data, next_offset, ..
+        } if *next_offset < data.len() => Ok(()),
+        ScsiTransfer::StorageDataIn {
+            next_offset,
+            remaining,
+        }
+        | ScsiTransfer::StorageDataOut {
+            next_offset,
+            remaining,
+        } if *remaining != 0
+            && next_offset
+                .checked_add(*remaining)
+                .is_some_and(|end| end <= attachment.storage.size_bytes()) =>
+        {
+            Ok(())
+        }
+        _ => Err(ScsiSnapshotError),
+    }
+}
+
 impl Default for ScsiBus {
     fn default() -> Self {
         Self::new()
@@ -695,7 +847,7 @@ const fn address_for_slot(slot: usize) -> (u8, u8) {
     ((slot / LUN_COUNT) as u8, (slot % LUN_COUNT) as u8)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct SenseData {
     key: u8,
     asc: u8,
@@ -732,6 +884,7 @@ mod tests {
     use std::io;
     use std::sync::{Arc, Mutex};
 
+    use crate::scsi_disk::ScsiDisk;
     use crate::storage::BlockStorage;
 
     use super::{
@@ -971,6 +1124,73 @@ mod tests {
             })
         );
         assert_eq!(bus.active_address(), None);
+    }
+
+    #[test]
+    fn snapshot_restores_an_active_transfer_without_replacing_storage() {
+        let bytes = Arc::new(Mutex::new(
+            (0..512).map(|index| index as u8).collect::<Vec<_>>(),
+        ));
+        let mut original = ScsiBus::new();
+        original
+            .attach(
+                1,
+                0,
+                Box::new(ScsiDisk::try_new(512).unwrap()),
+                Box::new(TestStorage {
+                    bytes: Arc::clone(&bytes),
+                    fail_reads: false,
+                    fail_writes: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            original.start_command(1, 0, &[0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0]),
+            Ok(ScsiCommandStart::DataIn { byte_count: 512 })
+        );
+        assert_eq!(
+            original.transfer_data_in(100, |chunk| {
+                assert_eq!(chunk, &bytes.lock().unwrap()[..100]);
+                true
+            }),
+            Ok(ScsiTransferResult::More {
+                transferred: 100,
+                remaining: 412,
+            })
+        );
+        let snapshot = original.snapshot().unwrap();
+
+        let replacement_bytes = Arc::new(Mutex::new(
+            (0..512)
+                .map(|index| (index as u8).wrapping_add(1))
+                .collect::<Vec<_>>(),
+        ));
+        let mut restored = ScsiBus::new();
+        restored
+            .attach(
+                1,
+                0,
+                Box::new(ScsiDisk::try_new(512).unwrap()),
+                Box::new(TestStorage {
+                    bytes: Arc::clone(&replacement_bytes),
+                    fail_reads: false,
+                    fail_writes: false,
+                }),
+            )
+            .unwrap();
+        restored.restore_snapshot(snapshot).unwrap();
+
+        assert_eq!(restored.active_address(), Some((1, 0)));
+        assert_eq!(
+            restored.transfer_data_in(512, |chunk| {
+                assert_eq!(chunk, &replacement_bytes.lock().unwrap()[100..]);
+                true
+            }),
+            Ok(ScsiTransferResult::Complete {
+                transferred: 412,
+                status: ScsiStatus::Good,
+            })
+        );
     }
 
     #[test]

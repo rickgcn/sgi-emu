@@ -4,6 +4,7 @@ use se_float::{
     format::{Float32, Float64},
     operation::{ComparisonMode, ExceptionFlags, Relation, RoundingMode},
 };
+use serde::{Deserialize, Serialize};
 
 use super::{
     ExecutionOutcome, InstructionCompletion, StepError,
@@ -35,11 +36,12 @@ struct Fcr31Update {
     writeback: bool,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct Cp1 {
     registers: [u32; 32],
     exception_instruction: u32,
     control_status: u32,
+    #[serde(skip, default = "default_backend")]
     backend: Backend,
 }
 
@@ -92,6 +94,10 @@ impl Cp1 {
 
     pub(super) const fn backend(&self) -> Backend {
         self.backend
+    }
+
+    pub(super) fn restore_backend(&mut self, backend: Backend) {
+        self.backend = backend;
     }
 
     pub(super) fn write_condition(&mut self, value: bool) {
@@ -259,6 +265,10 @@ impl Cp1 {
     fn write_control_status(&mut self, value: u32) {
         self.control_status = value & CONTROL_STATUS_WRITABLE_MASK;
     }
+}
+
+const fn default_backend() -> Backend {
+    Backend::SoftFloat
 }
 
 pub(super) fn execute(

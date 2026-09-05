@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use super::{
     ExecutionOutcome, InstructionResult,
     control::branch_resume_pc,
@@ -69,7 +71,7 @@ pub(super) enum Exception {
     Overflow,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct FunctionalState {
     coprocessor_usable: u32,
     interrupt_control: u32,
@@ -111,7 +113,7 @@ impl FunctionalState {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct Cp0 {
     index: u32,
     random: u32,

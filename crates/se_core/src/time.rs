@@ -1,10 +1,12 @@
 //! Frontend-neutral virtual time values.
 
+use serde::{Deserialize, Serialize};
+
 /// The number of attoseconds in one second.
 pub const ATTOSECONDS_PER_SECOND: u128 = 1_000_000_000_000_000_000;
 
 /// A duration measured in guest virtual time.
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct VirtualDuration {
     attoseconds: u128,
 }
@@ -33,7 +35,7 @@ impl VirtualDuration {
 }
 
 /// A point on the guest virtual timeline.
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct VirtualInstant {
     attoseconds: u128,
 }

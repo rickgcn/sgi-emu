@@ -1,6 +1,7 @@
 //! SEEQ 8003 Ethernet controller register front end.
 
 use se_core::bus::{BusFault, DeviceAddr};
+use serde::{Deserialize, Serialize};
 
 const REGISTER_BYTES: u64 = 4;
 const REGISTER_COUNT: u64 = 8;
@@ -10,6 +11,7 @@ const BANK_SELECT_MASK: u8 = 0x60;
 const OLD_DEVICE_STATUS: u8 = 0x80;
 
 /// The software-visible SEEQ 8003 state used by the IP12 machine.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Seeq8003 {
     station_address: [u8; 6],
     multicast_low: [u8; 6],

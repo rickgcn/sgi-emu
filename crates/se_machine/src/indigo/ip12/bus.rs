@@ -9,10 +9,11 @@ use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
-use se_device::scsi::ScsiBus;
+use se_device::scsi::{ScsiBus, ScsiBusSnapshot, ScsiSnapshotError};
 use se_device::seeq8003::Seeq8003;
 use se_device::wd33c93b::{SelectAndTransferRequest, Wd33c93b};
 use se_device::z85230::{Channel, Z85230};
+use serde::{Deserialize, Serialize};
 
 use super::events::{EventKind, Ip12Events};
 use crate::serial::SerialPort;
@@ -46,6 +47,26 @@ pub(super) struct Ip12Bus {
     nvram: Nmc93cs46,
     dsp56001: Dsp56001,
     prom: Rom,
+    cpu_aux_control: u8,
+    events: Ip12Events,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct Ip12BusSnapshot {
+    pic1: Pic1,
+    memory: LocalMemory,
+    hpc1: Hpc1,
+    centronics: CentronicsPort,
+    seeq8003: Seeq8003,
+    int2: Int2,
+    wd33c93b: Wd33c93b,
+    scsi_bus: ScsiBusSnapshot,
+    pending_scsi: Option<SelectAndTransferRequest>,
+    serial: [Z85230; 2],
+    rtc: Dp8573a,
+    mdac: Mdac,
+    nvram: Nmc93cs46,
+    dsp56001: Dsp56001,
     cpu_aux_control: u8,
     events: Ip12Events,
 }
@@ -91,6 +112,50 @@ impl Ip12Bus {
         bus.synchronize_scsi_interrupt();
         bus.synchronize_hpc1_interrupts();
         bus
+    }
+
+    pub(super) fn snapshot(&self) -> Result<Ip12BusSnapshot, ScsiSnapshotError> {
+        Ok(Ip12BusSnapshot {
+            pic1: self.pic1.clone(),
+            memory: self.memory.clone(),
+            hpc1: self.hpc1.clone(),
+            centronics: self.centronics.clone(),
+            seeq8003: self.seeq8003.clone(),
+            int2: self.int2.clone(),
+            wd33c93b: self.wd33c93b.clone(),
+            scsi_bus: self.scsi_bus.snapshot()?,
+            pending_scsi: self.pending_scsi,
+            serial: self.serial.clone(),
+            rtc: self.rtc.clone(),
+            mdac: self.mdac.clone(),
+            nvram: self.nvram.clone(),
+            dsp56001: self.dsp56001.clone(),
+            cpu_aux_control: self.cpu_aux_control,
+            events: self.events.clone(),
+        })
+    }
+
+    pub(super) fn restore_snapshot(
+        &mut self,
+        snapshot: Ip12BusSnapshot,
+    ) -> Result<(), ScsiSnapshotError> {
+        self.scsi_bus.restore_snapshot(snapshot.scsi_bus)?;
+        self.pic1 = snapshot.pic1;
+        self.memory = snapshot.memory;
+        self.hpc1 = snapshot.hpc1;
+        self.centronics = snapshot.centronics;
+        self.seeq8003 = snapshot.seeq8003;
+        self.int2 = snapshot.int2;
+        self.wd33c93b = snapshot.wd33c93b;
+        self.pending_scsi = snapshot.pending_scsi;
+        self.serial = snapshot.serial;
+        self.rtc = snapshot.rtc;
+        self.mdac = snapshot.mdac;
+        self.nvram = snapshot.nvram;
+        self.dsp56001 = snapshot.dsp56001;
+        self.cpu_aux_control = snapshot.cpu_aux_control;
+        self.events = snapshot.events;
+        Ok(())
     }
 
     pub(super) fn reset(&mut self) {

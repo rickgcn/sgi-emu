@@ -1,6 +1,7 @@
 //! Silicon Graphics PIC1 reset, GIO configuration, and graphics-DMA register front end.
 
 use se_core::bus::{BusFault, DeviceAddr, PhysAddr};
+use serde::{Deserialize, Serialize};
 
 const CPU_CONTROL: u64 = 0x0000;
 const RESET_CONFIGURATION: u64 = 0x0004;
@@ -29,6 +30,7 @@ const THREE_WAY_VALUE_MASK: u32 = 0x1fff_ffff;
 const DESCRIPTOR_ADDRESS_MASK: u32 = 0x0fff_ffff;
 
 /// The software-visible PIC1 state needed by the IP12 reset path.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Pic1 {
     reset_configuration: u8,
     revision: u8,

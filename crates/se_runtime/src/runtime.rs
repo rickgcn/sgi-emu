@@ -45,6 +45,7 @@ enum Command {
     Pause(CommandReply<RuntimeStatus>),
     Step(CommandReply<RuntimeStatus>),
     StopRecording(CommandReply<RuntimeStatus>),
+    CreateReplaySnapshot(CommandReply<RuntimeStatus>),
     Status(CommandReply<RuntimeStatus>),
     ToggleBreakpoint {
         address: u32,
@@ -268,6 +269,17 @@ impl Runtime {
     /// the file fails, or the worker is unavailable.
     pub fn stop_recording(&self) -> Result<RuntimeStatus, RuntimeError> {
         self.request(Command::StopRecording)
+    }
+
+    /// Creates one restorable checkpoint at the current paused Replay
+    /// boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] unless an active healthy Replay is paused, or
+    /// when machine capture or atomic cache output fails.
+    pub fn create_replay_snapshot(&self) -> Result<RuntimeStatus, RuntimeError> {
+        self.request(Command::CreateReplaySnapshot)
     }
 
     /// Samples runtime status.
@@ -605,6 +617,10 @@ impl Worker {
                 self.check_record_failure();
                 send_reply(reply, result);
             }
+            Command::CreateReplaySnapshot(reply) => {
+                let result = self.create_replay_snapshot();
+                send_reply(reply, result);
+            }
             Command::Status(reply) => send_reply(reply, Ok(self.status())),
             Command::ToggleBreakpoint { address, reply } => {
                 let result = self.require_machine().map(|()| {
@@ -679,6 +695,7 @@ impl Worker {
             self.machine.as_ref().map(Machine::nonvolatile_state)
         };
         let mut next_preserved_state = None;
+        let mut restore_state = None;
         let next_mode = match mode {
             RuntimeConfigurationMode::Normal => {
                 if let Some(state) = retained_state {
@@ -695,17 +712,38 @@ impl Worker {
             }
             RuntimeConfigurationMode::Replaying(replayer) => {
                 next_preserved_state = retained_state;
-                ActiveMode::Replaying((*replayer).into_session())
+                let (session, restore) = (*replayer).into_session();
+                restore_state = restore;
+                ActiveMode::Replaying(session)
             }
         };
-        self.cpu_clock = Some(CpuClock::new(machine.cpu_frequency_hz()));
+        let mut cpu_clock = CpuClock::new(machine.cpu_frequency_hz());
+        let mut virtual_instant = VirtualInstant::ZERO;
+        let mut position = ExecutionPosition::default();
+        let mut completed_instructions = self.completed_instructions;
+        if let Some(restore) = restore_state {
+            cpu_clock
+                .restore_remainder(restore.cpu_clock_remainder)
+                .map_err(rejection_owned)?;
+            machine
+                .restore_snapshot(restore.machine)
+                .map_err(|error| rejection_owned(error.to_string()))?;
+            if checkpoint_digest(&machine) != restore.machine_fingerprint {
+                return Err(rejection("Replay snapshot machine fingerprint mismatch"));
+            }
+            virtual_instant = restore.virtual_instant;
+            position = restore.position;
+            completed_instructions = restore.completed_instructions;
+        }
+        self.cpu_clock = Some(cpu_clock);
         self.machine = Some(machine);
-        self.virtual_instant = VirtualInstant::ZERO;
+        self.virtual_instant = virtual_instant;
         self.frontend_output = MachineOutput::default();
         self.pending_serial = [VecDeque::new(), VecDeque::new()];
         self.state = RuntimeState::Paused;
         self.mode = next_mode;
-        self.position = ExecutionPosition::default();
+        self.position = position;
+        self.completed_instructions = completed_instructions;
         self.preserved_nonvolatile_state = next_preserved_state;
         self.last_error = None;
         self.session_error = None;
@@ -736,6 +774,47 @@ impl Worker {
         }
         self.mode = ActiveMode::Normal;
         self.session_error = None;
+        self.advance_revision();
+        Ok(self.status())
+    }
+
+    fn create_replay_snapshot(&mut self) -> Result<RuntimeStatus, CommandRejection> {
+        if self.state != RuntimeState::Paused {
+            return Err(rejection(
+                "Replay must be paused before creating a snapshot",
+            ));
+        }
+        let ActiveMode::Replaying(session) = &self.mode else {
+            return Err(rejection("no active Replay is available for a snapshot"));
+        };
+        if let Some(failure) = session.storage_failure() {
+            return Err(rejection_owned(failure));
+        }
+        let machine = self
+            .machine
+            .as_ref()
+            .ok_or_else(|| rejection("no machine is configured"))?;
+        let machine_snapshot = machine
+            .snapshot()
+            .map_err(|error| rejection_owned(error.to_string()))?;
+        let fingerprint = checkpoint_digest(machine);
+        let pc = machine.execution_address();
+        let cpu_clock_remainder = self
+            .cpu_clock
+            .as_ref()
+            .expect("a configured machine has a CPU clock")
+            .accumulated_remainder;
+        session
+            .create_snapshot(
+                self.position,
+                self.completed_instructions,
+                self.virtual_instant,
+                cpu_clock_remainder,
+                fingerprint,
+                machine_snapshot,
+                pc,
+            )
+            .map_err(|error| rejection_owned(error.to_string()))?;
         self.advance_revision();
         Ok(self.status())
     }
@@ -1347,6 +1426,16 @@ impl CpuClock {
         self.accumulated_remainder = 0;
     }
 
+    fn restore_remainder(&mut self, remainder: u128) -> Result<(), String> {
+        if remainder >= self.frequency_hz {
+            return Err(String::from(
+                "Replay snapshot CPU clock remainder is out of range",
+            ));
+        }
+        self.accumulated_remainder = remainder;
+        Ok(())
+    }
+
     fn advance_cycle(&mut self) -> VirtualDuration {
         let accumulated_remainder = self.accumulated_remainder + self.remainder_per_cycle;
         let carry = if accumulated_remainder >= self.frequency_hz {
@@ -1500,7 +1589,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             MediaIdentity::from_bytes(Path::new("prom.bin"), &[0; PROM_BYTES]),
             None,
             None,
-            vec![0x12, 0x34, 0x56],
+            distinct_nonvolatile_state(),
         )
     }
 
@@ -1515,6 +1604,14 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             "sgi-emu-runtime-{name}-{}.serec",
             std::process::id()
         ))
+    }
+
+    fn remove_record_artifacts(path: &Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(format!("{}.partial", path.display()));
+        let _ = fs::remove_file(format!("{}.idx", path.display()));
+        let _ = fs::remove_file(format!("{}.idx.partial", path.display()));
+        let _ = fs::remove_dir_all(format!("{}.ckpt", path.display()));
     }
 
     fn distinct_nonvolatile_state() -> MachineNonvolatileState {
@@ -1826,6 +1923,92 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         assert!(runtime.step().is_err());
         runtime.shutdown().unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn manual_replay_snapshot_restores_runtime_and_machine_state() {
+        let path = record_path("manual-snapshot");
+        remove_record_artifacts(&path);
+
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&[0x2408_0001, 0x2508_0001, 0]),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        runtime.step().unwrap();
+        runtime.step().unwrap();
+        runtime.stop_recording().unwrap();
+        runtime.shutdown().unwrap();
+
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_instructions(&[0x2408_0001, 0x2508_0001, 0]),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        let before_snapshot = runtime.step().unwrap();
+        assert_eq!(before_snapshot.position.completed_instructions, 1);
+        let created = runtime.create_replay_snapshot().unwrap();
+        assert_eq!(created.position, before_snapshot.position);
+        runtime.create_replay_snapshot().unwrap();
+        runtime.shutdown().unwrap();
+
+        let snapshots = Replayer::snapshot_catalog(&path).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].position(), before_snapshot.position);
+        let snapshot_id = snapshots[0].id().to_owned();
+
+        fs::write(format!("{}.idx", path.display()), b"invalid index").unwrap();
+        let rebuilt = Replayer::snapshot_catalog(&path).unwrap();
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].id(), snapshot_id);
+
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let restored = runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_instructions(&[0x2408_0001, 0x2508_0001, 0]),
+                Replayer::open_snapshot(&path, &snapshot_id).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(restored.state, RuntimeState::Paused);
+        assert_eq!(restored.mode, RuntimeMode::Replaying);
+        assert_eq!(restored.position, before_snapshot.position);
+        assert_eq!(restored.completed_instructions, 1);
+        let completed = runtime.step().unwrap();
+        assert_eq!(completed.mode, RuntimeMode::ReplayCompleted);
+        runtime.shutdown().unwrap();
+
+        remove_record_artifacts(&path);
+    }
+
+    #[test]
+    fn manual_replay_snapshot_requires_active_paused_replay() {
+        let runtime = Runtime::new(Some(machine_with_instructions(&[0]))).unwrap();
+        assert!(runtime.create_replay_snapshot().is_err());
+        runtime.shutdown().unwrap();
+
+        let path = record_path("snapshot-state-gate");
+        remove_record_artifacts(&path);
+        let recorder = started_recorder(&path);
+        recorder
+            .finalize(
+                ExecutionPosition::default(),
+                &crate::record::RecordOutcome::UserStopped,
+            )
+            .unwrap();
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_instructions(&[0x1000_ffff, 0]),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        assert!(runtime.create_replay_snapshot().is_err());
+        runtime.shutdown().unwrap();
+        remove_record_artifacts(&path);
     }
 
     #[test]
