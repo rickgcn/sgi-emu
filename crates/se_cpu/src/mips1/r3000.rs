@@ -164,6 +164,16 @@ pub enum StepError {
         /// The raw instruction word.
         instruction: u32,
     },
+
+    /// The instruction encoding has no architecturally defined R3000
+    /// behavior.
+    UndefinedInstruction {
+        /// The virtual address of the instruction.
+        pc: u32,
+
+        /// The raw instruction word.
+        instruction: u32,
+    },
 }
 
 impl fmt::Display for StepError {
@@ -178,6 +188,10 @@ impl fmt::Display for StepError {
             Self::UnsupportedInstruction { pc, instruction } => write!(
                 formatter,
                 "unsupported R3000 instruction 0x{instruction:08x} at 0x{pc:08x}"
+            ),
+            Self::UndefinedInstruction { pc, instruction } => write!(
+                formatter,
+                "undefined R3000 instruction encoding 0x{instruction:08x} at 0x{pc:08x}"
             ),
         }
     }
@@ -296,19 +310,21 @@ impl R3000 {
     /// data reads enter the guest instruction- and data-bus-error exceptions,
     /// respectively. Invalid and unimplemented bus accesses remain host
     /// errors. The machine completes asynchronous hardware write errors.
-    /// Unsupported instructions leave architectural registers unchanged,
-    /// although a successful cached fetch remains visible in the instruction
-    /// cache. A newly detected translation buffer shutdown changes only the
-    /// CP0 shutdown state. Instruction-address alignment is resolved after the
-    /// shutdown guard. For aligned addresses, enabled interrupts are sampled
-    /// after a successful instruction fetch and before decoding or execution.
+    /// Unsupported instructions and encodings with undefined R3000 behavior
+    /// leave architectural registers unchanged, although a successful cached
+    /// fetch remains visible in the instruction cache. A newly detected
+    /// translation buffer shutdown changes only the CP0 shutdown state.
+    /// Instruction-address alignment is resolved after the shutdown guard. For
+    /// aligned addresses, enabled interrupts are sampled after a successful
+    /// instruction fetch and before decoding or execution.
     ///
     /// # Errors
     ///
     /// Returns [`StepError`] when the translation buffer is shut down, a bus
     /// access is invalid or unimplemented, a hardware write failure was not
-    /// completed by the machine, or a valid R3000 instruction is not
-    /// implemented by this processor model.
+    /// completed by the machine, a valid R3000 instruction is not implemented
+    /// by this processor model, or an instruction encoding has no
+    /// architecturally defined R3000 behavior.
     pub fn step(&mut self, bus: &mut dyn PhysicalBus) -> Result<(), StepError> {
         if self.state.is_tlb_shutdown() {
             return Err(StepError::TlbShutdown);
@@ -367,6 +383,12 @@ impl R3000 {
                     .take_exception(Exception::CoprocessorUnusable { unit });
                 self.state.synchronize_cp1_interrupt();
                 return Ok(());
+            }
+            DecodeResult::Undefined => {
+                return Err(StepError::UndefinedInstruction {
+                    pc,
+                    instruction: word,
+                });
             }
             DecodeResult::Reserved => {
                 self.state.take_exception(Exception::ReservedInstruction);
@@ -471,6 +493,7 @@ mod tests {
     const STATUS_IM2: u32 = 1 << 10;
     const STATUS_IM3: u32 = 1 << 11;
     const STATUS_IM6: u32 = 1 << 14;
+    const UNDEFINED_REGIMM_INSTRUCTION: u32 = 0x0424_0000;
     const UNSUPPORTED_CP2_INSTRUCTION: u32 = 0x4a00_0000;
 
     fn translation(address: u64, cacheability: Cacheability) -> Translation {
@@ -2490,6 +2513,60 @@ mod tests {
     }
 
     #[test]
+    fn step_preserves_processor_state_for_undefined_instruction() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        processor.state.write_gpr(1, 0x1234_5678);
+        processor.state.write_gpr(31, 0x89ab_cdef);
+        processor.state.write_hi(0x1357_9bdf);
+        processor.state.write_lo(0x2468_ace0);
+        let before = snapshot(&processor);
+        let cp0_before = (
+            processor.state.read_cp0(12),
+            processor.state.read_cp0(13),
+            processor.state.read_cp0(14),
+        );
+
+        let error = step_with_word(&mut processor, UNDEFINED_REGIMM_INSTRUCTION)
+            .expect_err("the undefined encoding should stop the processor");
+
+        assert_eq!(
+            error,
+            StepError::UndefinedInstruction {
+                pc: 0xbfc0_0000,
+                instruction: UNDEFINED_REGIMM_INSTRUCTION,
+            }
+        );
+        assert_eq!(snapshot(&processor), before);
+        assert_eq!(
+            (
+                processor.state.read_cp0(12),
+                processor.state.read_cp0(13),
+                processor.state.read_cp0(14),
+            ),
+            cp0_before
+        );
+    }
+
+    #[test]
+    fn step_executes_the_irix_regimm_alias_and_its_delay_slot() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        let mut bus = AddressBus::new(&[
+            (BOOT_PHYSICAL_ADDRESS, 0x0443_0002),
+            (BOOT_PHYSICAL_ADDRESS + 4, 0x2401_0001),
+        ]);
+
+        processor
+            .step(&mut bus)
+            .expect("the R3000 BGEZ alias should succeed");
+        processor
+            .step(&mut bus)
+            .expect("the branch delay slot should succeed");
+
+        assert_eq!(processor.state.read_gpr(1), 1);
+        assert_eq!(processor.state.pc(), 0xbfc0_000c);
+    }
+
+    #[test]
     fn step_takes_explicit_instruction_exceptions() {
         for word in [0x0000_000c, 0x0000_000d] {
             let mut processor = R3000::new(super::TEST_CONFIG);
@@ -2690,6 +2767,29 @@ mod tests {
             StepError::UnsupportedInstruction {
                 pc: 0xbfc0_0004,
                 instruction: UNSUPPORTED_CP2_INSTRUCTION,
+            }
+        );
+        assert_eq!(snapshot(&processor), before);
+
+        step_with_word(&mut processor, 0).expect("retry should execute delay slot");
+
+        assert_eq!(processor.state.pc(), 0xbfc0_000c);
+    }
+
+    #[test]
+    fn undefined_instruction_in_delay_slot_preserves_pending_branch() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        step_with_word(&mut processor, 0x1000_0002).expect("BEQ should succeed");
+        let before = snapshot(&processor);
+
+        let error = step_with_word(&mut processor, UNDEFINED_REGIMM_INSTRUCTION)
+            .expect_err("the undefined encoding should stop the processor");
+
+        assert_eq!(
+            error,
+            StepError::UndefinedInstruction {
+                pc: 0xbfc0_0004,
+                instruction: UNDEFINED_REGIMM_INSTRUCTION,
             }
         );
         assert_eq!(snapshot(&processor), before);

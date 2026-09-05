@@ -1,4 +1,5 @@
-const COPROCESSOR_TRANSFER_RESERVED_MASK: u32 = 0x7ff;
+const COPROCESSOR_TRANSFER_UNUSED_MASK: u32 = 0x7ff;
+const REGIMM_SELECTOR_MASK: usize = 0x1d;
 
 const CP0_TLBR: u32 = 0x4200_0001;
 const CP0_TLBWI: u32 = 0x4200_0002;
@@ -10,6 +11,7 @@ const CP0_RFE: u32 = 0x4200_0010;
 pub(super) enum DecodeResult {
     Implemented(Instruction),
     UnsupportedCoprocessor { unit: usize },
+    Undefined,
     Reserved,
 }
 
@@ -340,14 +342,14 @@ pub(super) fn decode(word: u32) -> DecodeResult {
                 offset: immediate(word),
             }))
         }
-        0x06 => DecodeResult::Reserved,
+        0x06 => DecodeResult::Undefined,
         0x07 if rt(word) == 0 => {
             DecodeResult::Implemented(Instruction::Control(ControlInstruction::Bgtz {
                 rs: rs(word),
                 offset: immediate(word),
             }))
         }
-        0x07 => DecodeResult::Reserved,
+        0x07 => DecodeResult::Undefined,
         0x08 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Addi {
             rt: rt(word),
             rs: rs(word),
@@ -502,12 +504,9 @@ fn decode_special(word: u32) -> DecodeResult {
             rt: rt(word),
             rs: rs(word),
         })),
-        0x08 if rd(word) == 0 => {
-            DecodeResult::Implemented(Instruction::Control(ControlInstruction::Jr {
-                rs: rs(word),
-            }))
-        }
-        0x08 => DecodeResult::Reserved,
+        0x08 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Jr {
+            rs: rs(word),
+        })),
         0x09 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Jalr {
             rd: rd(word),
             rs: rs(word),
@@ -515,41 +514,25 @@ fn decode_special(word: u32) -> DecodeResult {
         0x0c => DecodeResult::Implemented(Instruction::Syscall),
         0x0d => DecodeResult::Implemented(Instruction::Breakpoint),
         0x10 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mfhi { rd: rd(word) })),
-        0x11 if rd(word) == 0 => {
-            DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mthi { rs: rs(word) }))
-        }
-        0x11 => DecodeResult::Reserved,
+        0x11 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mthi { rs: rs(word) })),
         0x12 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mflo { rd: rd(word) })),
-        0x13 if rd(word) == 0 => {
-            DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mtlo { rs: rs(word) }))
-        }
-        0x13 => DecodeResult::Reserved,
-        0x18 if rd(word) == 0 => {
-            DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mult {
-                rs: rs(word),
-                rt: rt(word),
-            }))
-        }
-        0x18 => DecodeResult::Reserved,
-        0x19 if rd(word) == 0 => {
-            DecodeResult::Implemented(Instruction::Alu(AluInstruction::Multu {
-                rs: rs(word),
-                rt: rt(word),
-            }))
-        }
-        0x19 => DecodeResult::Reserved,
-        0x1a if rd(word) == 0 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Div {
+        0x13 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mtlo { rs: rs(word) })),
+        0x18 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Mult {
             rs: rs(word),
             rt: rt(word),
         })),
-        0x1a => DecodeResult::Reserved,
-        0x1b if rd(word) == 0 => {
-            DecodeResult::Implemented(Instruction::Alu(AluInstruction::Divu {
-                rs: rs(word),
-                rt: rt(word),
-            }))
-        }
-        0x1b => DecodeResult::Reserved,
+        0x19 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Multu {
+            rs: rs(word),
+            rt: rt(word),
+        })),
+        0x1a => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Div {
+            rs: rs(word),
+            rt: rt(word),
+        })),
+        0x1b => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Divu {
+            rs: rs(word),
+            rt: rt(word),
+        })),
         0x20 => DecodeResult::Implemented(Instruction::Alu(AluInstruction::Add {
             rd: rd(word),
             rs: rs(word),
@@ -605,7 +588,7 @@ fn decode_special(word: u32) -> DecodeResult {
 }
 
 fn decode_regimm(word: u32) -> DecodeResult {
-    match rt(word) {
+    match rt(word) & REGIMM_SELECTOR_MASK {
         0x00 => DecodeResult::Implemented(Instruction::Control(ControlInstruction::Bltz {
             rs: rs(word),
             offset: immediate(word),
@@ -622,37 +605,37 @@ fn decode_regimm(word: u32) -> DecodeResult {
             rs: rs(word),
             offset: immediate(word),
         })),
-        _ => DecodeResult::Reserved,
+        _ => DecodeResult::Undefined,
     }
 }
 
 fn decode_cp0(word: u32) -> DecodeResult {
     match rs(word) {
-        0x00 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+        0x00 if word & COPROCESSOR_TRANSFER_UNUSED_MASK == 0 => {
             DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Mfc0 {
                 rt: rt(word),
                 rd: rd(word),
             }))
         }
-        0x02 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+        0x02 if word & COPROCESSOR_TRANSFER_UNUSED_MASK == 0 => {
             DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Cfc0 {
                 rt: rt(word),
                 rd: rd(word),
             }))
         }
-        0x04 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+        0x04 if word & COPROCESSOR_TRANSFER_UNUSED_MASK == 0 => {
             DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Mtc0 {
                 rt: rt(word),
                 rd: rd(word),
             }))
         }
-        0x06 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+        0x06 if word & COPROCESSOR_TRANSFER_UNUSED_MASK == 0 => {
             DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Ctc0 {
                 rt: rt(word),
                 rd: rd(word),
             }))
         }
-        0x00 | 0x02 | 0x04 | 0x06 => DecodeResult::Reserved,
+        0x00 | 0x02 | 0x04 | 0x06 => DecodeResult::Undefined,
         0x08 if rt(word) == 0 => {
             DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Bc0f {
                 offset: immediate(word),
@@ -663,7 +646,7 @@ fn decode_cp0(word: u32) -> DecodeResult {
                 offset: immediate(word),
             }))
         }
-        0x08 => DecodeResult::Reserved,
+        0x08 => DecodeResult::Undefined,
         0x10..=0x1f if word == CP0_TLBR => {
             DecodeResult::Implemented(Instruction::Cp0(Cp0Instruction::Tlbr))
         }
@@ -685,31 +668,31 @@ fn decode_cp0(word: u32) -> DecodeResult {
 
 fn decode_cp1(word: u32) -> DecodeResult {
     match rs(word) {
-        0x00 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+        0x00 if word & COPROCESSOR_TRANSFER_UNUSED_MASK == 0 => {
             DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Mfc1 {
                 rt: rt(word),
                 rd: rd(word),
             }))
         }
-        0x02 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+        0x02 if word & COPROCESSOR_TRANSFER_UNUSED_MASK == 0 => {
             DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Cfc1 {
                 rt: rt(word),
                 rd: rd(word),
             }))
         }
-        0x04 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+        0x04 if word & COPROCESSOR_TRANSFER_UNUSED_MASK == 0 => {
             DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Mtc1 {
                 rt: rt(word),
                 rd: rd(word),
             }))
         }
-        0x06 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+        0x06 if word & COPROCESSOR_TRANSFER_UNUSED_MASK == 0 => {
             DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Ctc1 {
                 rt: rt(word),
                 rd: rd(word),
             }))
         }
-        0x00 | 0x02 | 0x04 | 0x06 => DecodeResult::Reserved,
+        0x00 | 0x02 | 0x04 | 0x06 => DecodeResult::Undefined,
         0x08 if rt(word) == 0 => {
             DecodeResult::Implemented(Instruction::Cp1(Cp1Instruction::Bc1f {
                 offset: immediate(word),
@@ -720,7 +703,7 @@ fn decode_cp1(word: u32) -> DecodeResult {
                 offset: immediate(word),
             }))
         }
-        0x08 => DecodeResult::Reserved,
+        0x08 => DecodeResult::Undefined,
         0x10..=0x1f => decode_cp1_computational(word),
         _ => DecodeResult::Reserved,
     }
@@ -825,7 +808,7 @@ fn decode_unsupported_coprocessor(word: u32) -> DecodeResult {
     let unit = opcode(word) as usize - 0x10;
 
     match rs(word) {
-        0x00 | 0x02 | 0x04 | 0x06 if word & COPROCESSOR_TRANSFER_RESERVED_MASK == 0 => {
+        0x00 | 0x02 | 0x04 | 0x06 if word & COPROCESSOR_TRANSFER_UNUSED_MASK == 0 => {
             DecodeResult::UnsupportedCoprocessor { unit }
         }
         0x00 | 0x02 | 0x04 | 0x06 => DecodeResult::Reserved,
@@ -1165,7 +1148,7 @@ mod tests {
                 }),
             ),
             (
-                encode_register(1, 31, 0, 31, 0x08),
+                encode_register(1, 31, 30, 31, 0x08),
                 control(ControlInstruction::Jr { rs: 1 }),
             ),
             (
@@ -1235,6 +1218,52 @@ mod tests {
         for (word, expected) in cases {
             assert_eq!(decode(word), expected);
         }
+    }
+
+    #[test]
+    fn decodes_r3000_regimm_bit_one_aliases() {
+        let cases = [
+            (
+                0x02,
+                ControlInstruction::Bltz {
+                    rs: 2,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x03,
+                ControlInstruction::Bgez {
+                    rs: 2,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x12,
+                ControlInstruction::Bltzal {
+                    rs: 2,
+                    offset: 0x8001,
+                },
+            ),
+            (
+                0x13,
+                ControlInstruction::Bgezal {
+                    rs: 2,
+                    offset: 0x8001,
+                },
+            ),
+        ];
+
+        for (selector, instruction) in cases {
+            assert_eq!(
+                decode(encode_immediate(0x01, 2, selector, 0x8001)),
+                control(instruction)
+            );
+        }
+
+        assert_eq!(
+            decode(0x0443_0002),
+            control(ControlInstruction::Bgez { rs: 2, offset: 2 })
+        );
     }
 
     #[test]
@@ -1621,27 +1650,27 @@ mod tests {
                 alu(AluInstruction::Mflo { rd: 3 }),
             ),
             (
-                encode_register(1, 31, 0, 30, 0x11),
+                encode_register(1, 31, 3, 30, 0x11),
                 alu(AluInstruction::Mthi { rs: 1 }),
             ),
             (
-                encode_register(1, 31, 0, 30, 0x13),
+                encode_register(1, 31, 3, 30, 0x13),
                 alu(AluInstruction::Mtlo { rs: 1 }),
             ),
             (
-                encode_register(1, 2, 0, 31, 0x18),
+                encode_register(1, 2, 3, 31, 0x18),
                 alu(AluInstruction::Mult { rs: 1, rt: 2 }),
             ),
             (
-                encode_register(1, 2, 0, 31, 0x19),
+                encode_register(1, 2, 3, 31, 0x19),
                 alu(AluInstruction::Multu { rs: 1, rt: 2 }),
             ),
             (
-                encode_register(1, 2, 0, 31, 0x1a),
+                encode_register(1, 2, 3, 31, 0x1a),
                 alu(AluInstruction::Div { rs: 1, rt: 2 }),
             ),
             (
-                encode_register(1, 2, 0, 31, 0x1b),
+                encode_register(1, 2, 3, 31, 0x1b),
                 alu(AluInstruction::Divu { rs: 1, rt: 2 }),
             ),
             (
@@ -1704,33 +1733,6 @@ mod tests {
             decode(encode_register(1, 2, 3, 0, 0x01)),
             DecodeResult::Reserved
         );
-        assert_eq!(
-            decode(encode_register(1, 2, 3, 0, 0x08)),
-            DecodeResult::Reserved
-        );
-
-        for function in [0x11, 0x13, 0x18, 0x19, 0x1a, 0x1b] {
-            assert_eq!(
-                decode(encode_register(1, 2, 3, 31, function)),
-                DecodeResult::Reserved
-            );
-        }
-
-        assert_eq!(
-            decode(encode_immediate(0x06, 1, 1, 0)),
-            DecodeResult::Reserved
-        );
-        assert_eq!(
-            decode(encode_immediate(0x07, 1, 31, 0)),
-            DecodeResult::Reserved
-        );
-
-        for selector in [0x02, 0x03, 0x12, 0x13, 0x1f] {
-            assert_eq!(
-                decode(encode_immediate(0x01, 1, selector, 0)),
-                DecodeResult::Reserved
-            );
-        }
 
         for opcode in [0x14, 0x15, 0x16, 0x17] {
             assert_eq!(
@@ -1749,14 +1751,7 @@ mod tests {
             );
         }
 
-        for selector in [0x00, 0x02, 0x04, 0x06] {
-            assert_eq!(
-                decode(encode_coprocessor(0x10, selector, 2, 3, 1)),
-                DecodeResult::Reserved
-            );
-        }
-
-        for opcode in 0x10..=0x13 {
+        for opcode in 0x12..=0x13 {
             assert_eq!(
                 decode(encode_coprocessor(opcode, 0x00, 2, 3, 1)),
                 DecodeResult::Reserved
@@ -1774,5 +1769,38 @@ mod tests {
         assert_eq!(decode(CP0_TLBR | (1 << 6)), DecodeResult::Reserved);
         assert_eq!(decode(CP0_RFE | (1 << 6)), DecodeResult::Reserved);
         assert_eq!(decode(0x4200_0000), DecodeResult::Reserved);
+    }
+
+    #[test]
+    fn classifies_encodings_without_defined_r3000_behavior() {
+        assert_eq!(
+            decode(encode_immediate(0x06, 1, 1, 0)),
+            DecodeResult::Undefined
+        );
+        assert_eq!(
+            decode(encode_immediate(0x07, 1, 31, 0)),
+            DecodeResult::Undefined
+        );
+
+        for selector in [0x04, 0x05, 0x14, 0x15, 0x1f] {
+            assert_eq!(
+                decode(encode_immediate(0x01, 1, selector, 0)),
+                DecodeResult::Undefined
+            );
+        }
+
+        for opcode in 0x10..=0x11 {
+            for selector in [0x00, 0x02, 0x04, 0x06] {
+                assert_eq!(
+                    decode(encode_coprocessor(opcode, selector, 2, 3, 1)),
+                    DecodeResult::Undefined
+                );
+            }
+
+            assert_eq!(
+                decode(encode_immediate(opcode, 0x08, 0x02, 0)),
+                DecodeResult::Undefined
+            );
+        }
     }
 }
