@@ -3507,6 +3507,50 @@ mod tests {
     }
 
     #[test]
+    fn status_disable_blocks_an_interrupt_synchronized_during_the_first_successor() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor.state.write_gpr(1, STATUS_BEV | STATUS_IM3);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x04, 1, 12))
+            .expect("MTC0 Status should succeed");
+        processor.set_hardware_interrupt_lines(1 << 1);
+        step_with_word(&mut processor, encode_immediate(0x09, 0, 27, 0xd1c0))
+            .expect("the first hazard instruction should execute");
+
+        assert_eq!(processor.state.read_cp0(12) & STATUS_IEC, 0);
+        assert_eq!(processor.state.read_cp0(13) & STATUS_IM3, 0);
+        let branch_pc = processor.state.pc();
+
+        step_with_word(&mut processor, encode_immediate(0x05, 2, 0, 1))
+            .expect("the disabled processor should execute the second hazard instruction");
+
+        assert_eq!(processor.state.pc(), branch_pc.wrapping_add(4));
+        assert_eq!(processor.state.read_cp0(13) & STATUS_IM3, STATUS_IM3);
+        assert_eq!(processor.state.read_cp0(14), 0);
+        assert_eq!(processor.state.read_gpr(27), 0xffff_d1c0);
+    }
+
+    #[test]
+    fn status_disable_does_not_cancel_an_interrupt_accepted_before_transfer_commit() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor.state.write_gpr(1, STATUS_BEV | STATUS_IM3);
+        processor.set_hardware_interrupt_lines(1 << 1);
+
+        step_with_word(&mut processor, encode_cp0_transfer(0x04, 1, 12))
+            .expect("MTC0 Status should succeed");
+        let successor_pc = processor.state.pc();
+        step_with_word(&mut processor, encode_immediate(0x09, 0, 27, 0xd1c0))
+            .expect("the already accepted interrupt should enter its exception vector");
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(13) & STATUS_IM3, STATUS_IM3);
+        assert_eq!(processor.state.read_cp0(14), successor_pc);
+        assert_eq!(processor.state.read_gpr(27), 0);
+    }
+
+    #[test]
     fn software_interrupt_hazard_delays_interrupt_recognition() {
         let mut processor = R3000::new(super::TEST_CONFIG);
         set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM0 | STATUS_IEC);

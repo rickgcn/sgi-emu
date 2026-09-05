@@ -387,8 +387,17 @@ impl Cp0 {
         }
     }
 
+    /// Commits a guest register transfer to the Status register.
+    ///
+    /// Clearing `IEc` disables interrupt recognition at this transfer boundary.
+    /// Enabling `IEc` and changing interrupt masks or coprocessor usability
+    /// remain subject to the pending functional-state delay.
     fn write_status(&mut self, value: u32) {
         self.status = self.status_after_write(value);
+
+        if self.status & STATUS_IEC == 0 {
+            self.effective.interrupt_control &= !STATUS_IEC;
+        }
 
         let mut functional = self.effective;
         functional.coprocessor_usable = self.status & STATUS_CU_MASK;
@@ -619,7 +628,7 @@ mod tests {
         assert!(cp0.interrupt_requested());
 
         cp0.write_register(12, STATUS_BEV | (1 << 10));
-        assert!(cp0.interrupt_requested());
+        assert!(!cp0.interrupt_requested());
         cp0.commit_pending_functional();
         assert!(!cp0.interrupt_requested());
 
@@ -1080,6 +1089,39 @@ mod tests {
         assert_eq!(cp0.effective.software_interrupts, 0);
         cp0.commit_pending_functional();
         assert_eq!(cp0.effective.software_interrupts, CAUSE_SOFTWARE_IP_MASK);
+    }
+
+    #[test]
+    fn status_disable_updates_only_effective_iec_at_transfer_commit() {
+        const STATUS_CU1: u32 = 1 << 29;
+
+        let mut cp0 = Cp0::new();
+        let enabled = STATUS_BEV | STATUS_CU0 | 0x0000_5500 | STATUS_IEC;
+        cp0.status = enabled;
+        cp0.effective = FunctionalState::from_registers(enabled, CAUSE_SOFTWARE_IP_MASK);
+        let disabled = STATUS_BEV | STATUS_CU1 | 0x0000_aa00;
+
+        cp0.write_register(12, disabled);
+
+        assert_eq!(cp0.read_register(12), disabled);
+        assert_eq!(cp0.effective.coprocessor_usable, STATUS_CU0);
+        assert_eq!(cp0.effective.interrupt_control, 0x0000_5500);
+        assert_eq!(cp0.effective.software_interrupts, CAUSE_SOFTWARE_IP_MASK);
+        assert_eq!(
+            cp0.pending_functional,
+            Some(FunctionalState {
+                coprocessor_usable: STATUS_CU1,
+                interrupt_control: 0x0000_aa00,
+                software_interrupts: CAUSE_SOFTWARE_IP_MASK,
+            })
+        );
+
+        cp0.commit_pending_functional();
+
+        assert_eq!(
+            cp0.effective,
+            FunctionalState::from_registers(disabled, CAUSE_SOFTWARE_IP_MASK)
+        );
     }
 
     #[test]
