@@ -2,49 +2,34 @@
 
 A work-in-progress emulator for Silicon Graphics workstations.
 
-The project is currently focused on the original **SGI Indigo (IP12)** with a 33 MHz MIPS R3000A processor. The current milestone is to boot IRIX 5.3 using a maintainable model of software-visible hardware behavior.
+The project is currently focused on the original **SGI Indigo (IP12)** with a 33 MHz MIPS R3000A processor. The current focus is improving hardware accuracy, completeness, and maintainability while running IRIX 5.3 and NetBSD/sgimips.
 
 > [!IMPORTANT]
-> sgi-emu is under active development. IRIX does not boot yet.
+> sgi-emu is under active development. IRIX 5.3 and NetBSD/sgimips boot, but several devices and hardware behaviors remain incomplete.
 
 ## Current status
 
-The Indigo IP12 PROM currently boots far enough to enter the PROM monitor
-and identify the emulated machine:
+### Software
 
-```text
->> hinv -v
-              Memory size:  8 Mbytes
-   Instruction cache size: 32 Kbytes
-  Instruction refill size: 16 words
-    Instruction streaming: Enabled
-          Data cache size: 32 Kbytes
-         Data refill size: 4 words
-      Partial word stores: Enabled
-                SCSI Disk: dksc(0,1)
-               SCSI CDROM: Controller 0, ID 4
-                CPU board: IP12 33 MHz, revision 0, with FPU
-```
+| Software               | Status                                               |
+| ---------------------- | ---------------------------------------------------- |
+| Indigo IP12 PROM       | Boots and enters the PROM monitor                    |
+| IRIX 5.3               | Boots to multi-user from serial console              |
+| NetBSD/sgimips 11.99.8 | Installs and boots to multi-user from serial console |
 
-Implemented sufficiently for the current PROM path:
+### Hardware
 
-- R3000A CPU
-- CP0 / exceptions / TLB
-- FPU
-- Caches
-- Basic IP12 memory/platform support
-- Basic SCSI device discovery
-
-Still under development:
-
-- PIC1
-- HPC1
-- INT2
-- SCSI disk/CD-ROM I/O
-- Ethernet
-- Audio
-- Graphics
-- IRIX boot
+| Hardware         | Status                    |
+| ---------------- | ------------------------- |
+| CPU              | Usable, needs improvement |
+| PIC1             | Usable, needs improvement |
+| HPC1             | Usable, needs improvement |
+| INT2             | Usable, needs improvement |
+| SCSI Controller  | Usable, needs improvement |
+| SCSI Disk/CD-ROM | Usable, needs improvement |
+| Ethernet         | Still under development   |
+| Audio            | Still under development   |
+| Graphics         | Still under development   |
 
 ## Emulation philosophy
 
@@ -87,6 +72,19 @@ When documentation and existing implementations disagree, preference is given to
 
 ## Getting started
 
+### Requirements
+
+- Rust 1.95 or newer
+- Qt 6 (Core, Gui, and Widgets)
+- A C++17-capable compiler
+- Git
+
+The Qt build must provide `qmake6` or `qmake`. If it is not available in `PATH`, set one of the following environment variables:
+
+- `QMAKE` — path to the Qt 6 qmake executable
+- `QT_DIR` — path to the Qt installation
+- `QT_ROOT_DIR` — path to the Qt installation
+
 ### Building
 
 ```bash
@@ -98,7 +96,7 @@ cargo build --release
 ### Running
 
 ```bash
-cargo run --release
+cargo run --release -p se_app --bin sgi-emu
 ```
 
 ## AI-assisted development
