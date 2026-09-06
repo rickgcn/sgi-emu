@@ -39,6 +39,8 @@ enum class PreparationState {
     Replay,
     ReplayCatalog,
     ReplaySnapshot,
+    Settings,
+    Reset,
 };
 
 class MainWindow final : public QMainWindow {
@@ -77,6 +79,7 @@ private:
 
     const UiSession& session_;
     MachineSettings settings_;
+    std::unique_ptr<MachineSettings> pending_settings_;
 
     QAction* run_action_;
     QAction* run_with_record_action_;

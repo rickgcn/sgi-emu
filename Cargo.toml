@@ -7,6 +7,7 @@ members = [
     "crates/se_device",
     "crates/se_float",
     "crates/se_machine",
+    "crates/se_network",
     "crates/se_runtime",
     "crates/se_ui",
 ]
@@ -32,6 +33,7 @@ qt-build-utils = "=0.10.0"
 rustix = { version = "1", features = ["stdio", "termios"] }
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5"
+serde_json = "1"
 sha2 = "0.10"
 se_cli = { path = "crates/se_cli" }
 se_core = { path = "crates/se_core" }
@@ -39,6 +41,7 @@ se_cpu = { path = "crates/se_cpu" }
 se_device = { path = "crates/se_device" }
 se_float = { path = "crates/se_float" }
 se_machine = { path = "crates/se_machine" }
+se_network = { path = "crates/se_network" }
 se_runtime = { path = "crates/se_runtime" }
 se_ui = { path = "crates/se_ui" }
 toml = "1"

@@ -7,6 +7,7 @@ use crate::serial::SerialPort;
 pub struct MachineOutput {
     serial_a: Vec<u8>,
     serial_b: Vec<u8>,
+    ethernet: Vec<Vec<u8>>,
 }
 
 impl MachineOutput {
@@ -22,7 +23,16 @@ impl MachineOutput {
     /// Reports whether the machine produced no frontend-visible output.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.serial_a.is_empty() && self.serial_b.is_empty()
+        self.serial_a.is_empty() && self.serial_b.is_empty() && self.ethernet.is_empty()
+    }
+
+    /// Takes completed Ethernet frames before frontend output is dispatched.
+    pub fn take_ethernet_frames(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.ethernet)
+    }
+
+    pub(crate) fn push_ethernet(&mut self, frame: Vec<u8>) {
+        self.ethernet.push(frame);
     }
 
     pub(crate) fn push_serial(&mut self, port: SerialPort, value: u8) {

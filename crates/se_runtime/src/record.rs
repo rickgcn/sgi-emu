@@ -1,7 +1,7 @@
 //! Deterministic cold-start recording and replay support.
 //!
 //! A record stores the cold machine configuration, bytes accepted by the
-//! emulated serial controller at exact instruction boundaries, sparse CPU
+//! emulated serial controller and external Ethernet frames at instruction boundaries, sparse CPU
 //! checkpoints, and disk before-images. Replay normally constructs a new
 //! machine at the first PROM instruction; an explicitly created Replay
 //! snapshot may instead restore one paused execution boundary. These
@@ -45,6 +45,7 @@ const FORMAT_VERSION: u32 = 1;
 const FILE_HEADER_BYTES: usize = 12;
 const FRAME_HEADER_BYTES: usize = 8;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_ETHERNET_FRAME_BYTES: usize = 16_384;
 const CACHE_HEADER_BYTES: usize = 24;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"SGICKPT\0";
 const INDEX_MAGIC: [u8; 8] = *b"SGISIDX\0";
@@ -410,6 +411,24 @@ impl Recorder {
         }))
     }
 
+    pub(crate) fn record_ethernet_frame(
+        &self,
+        position: ExecutionPosition,
+        bytes: &[u8],
+    ) -> Result<(), RecordError> {
+        if bytes.len() > MAX_ETHERNET_FRAME_BYTES {
+            return Err(invalid_record(
+                "Ethernet frame exceeds its allocation bound",
+            ));
+        }
+        self.append(RecordFrame::Timeline(TimelineEntry {
+            position,
+            action: TimelineAction::EthernetFrame {
+                bytes: bytes.to_vec(),
+            },
+        }))
+    }
+
     pub(crate) fn record_checkpoint(
         &self,
         position: ExecutionPosition,
@@ -676,9 +695,55 @@ pub(crate) struct TimelineEntry {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum TimelineAction {
-    SerialByte { port: SerialPort, value: u8 },
+    SerialByte {
+        port: SerialPort,
+        value: u8,
+    },
+    EthernetFrame {
+        #[serde(deserialize_with = "deserialize_ethernet_frame")]
+        bytes: Vec<u8>,
+    },
     Reset,
-    Checkpoint { digest: [u8; 32] },
+    Checkpoint {
+        digest: [u8; 32],
+    },
+}
+
+/// Bounds Ethernet allocation before accepting a serialized sequence length.
+fn deserialize_ethernet_frame<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
+    struct FrameVisitor;
+    impl<'de> serde::de::Visitor<'de> for FrameVisitor {
+        type Value = Vec<u8>;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an Ethernet frame within its allocation bound")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Vec<u8>, A::Error> {
+            if sequence
+                .size_hint()
+                .is_some_and(|length| length > MAX_ETHERNET_FRAME_BYTES)
+            {
+                return Err(serde::de::Error::custom(
+                    "Ethernet frame exceeds its allocation bound",
+                ));
+            }
+            let mut bytes = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+            while let Some(byte) = sequence.next_element()? {
+                if bytes.len() == MAX_ETHERNET_FRAME_BYTES {
+                    return Err(serde::de::Error::custom(
+                        "Ethernet frame exceeds its allocation bound",
+                    ));
+                }
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+    deserializer.deserialize_seq(FrameVisitor)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -686,6 +751,7 @@ pub(crate) enum RecordOutcome {
     UserStopped,
     Shutdown,
     ExecutionError { address: u32, description: String },
+    HostNetworkError { description: String },
 }
 
 /// Terminal state, distinct from the pre-instruction checkpoints in the Timeline.
@@ -1713,6 +1779,23 @@ mod tests {
             "sgi-emu-record-{name}-{}.serec",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn ethernet_timeline_rejects_oversize_length_before_allocating() {
+        let frame = super::TimelineAction::EthernetFrame {
+            bytes: vec![0; super::MAX_ETHERNET_FRAME_BYTES + 1],
+        };
+        let encoded = super::encode_value(&frame, "Ethernet input").unwrap();
+        assert!(super::decode_value::<super::TimelineAction>(&encoded, "Ethernet input").is_err());
+        let frame = super::TimelineAction::EthernetFrame {
+            bytes: vec![0xff; 60],
+        };
+        let encoded = super::encode_value(&frame, "Ethernet input").unwrap();
+        assert_eq!(
+            super::decode_value::<super::TimelineAction>(&encoded, "Ethernet input").unwrap(),
+            frame
+        );
     }
 
     fn manifest() -> RecordManifest {

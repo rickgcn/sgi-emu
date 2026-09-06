@@ -14,6 +14,7 @@ use se_device::seeq8003::Seeq8003;
 use se_device::wd33c93b::{Wd33c93b, WdRequest};
 use se_device::z85230::{Channel, Z85230};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::events::{EventKind, Ip12Events};
 use crate::serial::SerialPort;
@@ -37,6 +38,9 @@ pub(super) struct Ip12Bus {
     hpc1: Hpc1,
     centronics: CentronicsPort,
     seeq8003: Seeq8003,
+    ethernet_output: Vec<Vec<u8>>,
+    ethernet_tx_digest: [u8; 32],
+    ethernet_tx_count: u64,
     int2: Int2,
     wd33c93b: Wd33c93b,
     scsi_bus: ScsiBus,
@@ -58,6 +62,9 @@ pub(super) struct Ip12BusSnapshot {
     hpc1: Hpc1,
     centronics: CentronicsPort,
     seeq8003: Seeq8003,
+    ethernet_output: Vec<Vec<u8>>,
+    ethernet_tx_digest: [u8; 32],
+    ethernet_tx_count: u64,
     int2: Int2,
     wd33c93b: Wd33c93b,
     scsi_bus: ScsiBusSnapshot,
@@ -95,6 +102,9 @@ impl Ip12Bus {
             hpc1,
             centronics,
             seeq8003,
+            ethernet_output: Vec::new(),
+            ethernet_tx_digest: [0; 32],
+            ethernet_tx_count: 0,
             int2,
             wd33c93b,
             scsi_bus,
@@ -121,6 +131,9 @@ impl Ip12Bus {
             hpc1: self.hpc1.clone(),
             centronics: self.centronics.clone(),
             seeq8003: self.seeq8003.clone(),
+            ethernet_output: self.ethernet_output.clone(),
+            ethernet_tx_digest: self.ethernet_tx_digest,
+            ethernet_tx_count: self.ethernet_tx_count,
             int2: self.int2.clone(),
             wd33c93b: self.wd33c93b.clone(),
             scsi_bus: self.scsi_bus.snapshot()?,
@@ -145,6 +158,9 @@ impl Ip12Bus {
         self.hpc1 = snapshot.hpc1;
         self.centronics = snapshot.centronics;
         self.seeq8003 = snapshot.seeq8003;
+        self.ethernet_output = snapshot.ethernet_output;
+        self.ethernet_tx_digest = snapshot.ethernet_tx_digest;
+        self.ethernet_tx_count = snapshot.ethernet_tx_count;
         self.int2 = snapshot.int2;
         self.wd33c93b = snapshot.wd33c93b;
         self.pending_scsi = snapshot.pending_scsi;
@@ -163,6 +179,9 @@ impl Ip12Bus {
         self.hpc1.reset();
         self.centronics.reset();
         self.seeq8003.reset();
+        self.ethernet_output.clear();
+        self.ethernet_tx_digest = [0; 32];
+        self.ethernet_tx_count = 0;
         self.wd33c93b.reset();
         self.pending_scsi = None;
         self.scsi_bus.cancel_transaction();
@@ -233,6 +252,33 @@ impl Ip12Bus {
         consumed
     }
 
+    pub(super) fn ethernet_receive_ready(&self) -> bool {
+        self.seeq8003.receive_ready()
+    }
+
+    pub(super) fn receive_ethernet(&mut self, bytes: &[u8]) -> bool {
+        self.synchronize_ethernet_time();
+        let accepted = self.seeq8003.receive(bytes, 0);
+        self.reschedule_ethernet();
+        accepted
+    }
+
+    pub(super) fn hash_ethernet_state(&self, hasher: &mut Sha256) {
+        let bytes = bincode::serde::encode_to_vec(
+            (
+                &self.seeq8003,
+                &self.hpc1,
+                &self.events,
+                &self.ethernet_output,
+                self.ethernet_tx_digest,
+                self.ethernet_tx_count,
+            ),
+            bincode::config::standard(),
+        )
+        .expect("machine network state is serializable");
+        hasher.update(bytes);
+    }
+
     pub(super) fn debug_read(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
         if address.get() < LOCAL_MEMORY_END {
             return self.memory.read(&self.pic1, address, data);
@@ -242,7 +288,7 @@ impl Ip12Bus {
             Target::Pic1(address) => self.pic1.read(address, data),
             Target::Hpc1(address) => self.hpc1.read(address, data),
             Target::Centronics(address) => self.centronics.read(address, data),
-            Target::Seeq8003(address) => self.seeq8003.read(address, data),
+            Target::Seeq8003(address) => self.seeq8003.debug_read(address, data),
             Target::Scsi(address) => self.wd33c93b.debug_read(address, data),
             Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),
             Target::Int2(address) => self.int2.debug_read(address, data),
@@ -273,11 +319,14 @@ impl PhysicalBus for Ip12Bus {
         match route(address, data.len())? {
             Target::Pic1(address) => self.pic1.read(address, data),
             Target::Hpc1(address) => {
-                self.synchronize_hpc1_time();
+                self.synchronize_ethernet_time();
                 self.hpc1.read(address, data)
             }
             Target::Centronics(address) => self.centronics.read(address, data),
-            Target::Seeq8003(address) => self.seeq8003.read(address, data),
+            Target::Seeq8003(address) => {
+                self.synchronize_ethernet_time();
+                self.seeq8003.read(address, data)
+            }
             Target::Scsi(address) => {
                 let result = self.wd33c93b.read(address, data);
                 self.handle_scsi_register_write();
@@ -323,13 +372,18 @@ impl PhysicalBus for Ip12Bus {
             route(address, data.len()).and_then(|target| match target {
                 Target::Pic1(address) => self.pic1.write(address, data),
                 Target::Hpc1(address) => {
-                    self.synchronize_hpc1_time();
+                    self.synchronize_ethernet_time();
                     self.hpc1.write(address, data)?;
                     self.handle_hpc1_outputs();
                     Ok(())
                 }
                 Target::Centronics(address) => self.centronics.write(address, data),
-                Target::Seeq8003(address) => self.seeq8003.write(address, data),
+                Target::Seeq8003(address) => {
+                    self.synchronize_ethernet_time();
+                    self.seeq8003.write(address, data)?;
+                    self.reschedule_ethernet();
+                    Ok(())
+                }
                 Target::Scsi(address) => {
                     self.wd33c93b.write(address, data)?;
                     self.handle_scsi_register_write();

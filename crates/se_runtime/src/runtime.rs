@@ -23,6 +23,8 @@ use se_machine::debug::{DebugRequest, DebugResponse};
 use se_machine::machine::{ExecutionError, Machine, MachineNonvolatileState};
 use se_machine::output::MachineOutput;
 use se_machine::serial::SerialPort;
+use se_network::config::NatConfig;
+use se_network::session::NetworkSession;
 
 use crate::control::{RuntimeMode, RuntimeState, RuntimeStatus};
 use crate::record::{
@@ -41,6 +43,10 @@ fn checkpoint_digest(machine: &Machine) -> [u8; 32] {
 }
 
 enum Command {
+    NetworkFailure {
+        generation: u64,
+        reason: String,
+    },
     Configure {
         configuration: Box<RuntimeConfiguration>,
         reply: CommandReply<RuntimeStatus>,
@@ -80,8 +86,8 @@ pub struct RuntimeConfiguration {
 }
 
 enum RuntimeConfigurationMode {
-    Normal,
-    Recording(Recorder),
+    Normal(NatConfig),
+    Recording(Recorder, NatConfig),
     Replaying(Box<Replayer>),
 }
 
@@ -89,18 +95,34 @@ impl RuntimeConfiguration {
     /// Creates an ordinary machine configuration.
     #[must_use]
     pub fn normal(machine: Machine) -> Self {
+        Self::normal_with_network(machine, NatConfig::default())
+    }
+
+    /// Creates an ordinary configuration with explicit host NAT settings.
+    #[must_use]
+    pub fn normal_with_network(machine: Machine, network: NatConfig) -> Self {
         Self {
             machine,
-            mode: RuntimeConfigurationMode::Normal,
+            mode: RuntimeConfigurationMode::Normal(network),
         }
     }
 
     /// Creates a cold-start recording configuration.
     #[must_use]
     pub fn recording(machine: Machine, recorder: Recorder) -> Self {
+        Self::recording_with_network(machine, recorder, NatConfig::default())
+    }
+
+    /// Creates a cold recording with a fresh host NAT session.
+    #[must_use]
+    pub fn recording_with_network(
+        machine: Machine,
+        recorder: Recorder,
+        network: NatConfig,
+    ) -> Self {
         Self {
             machine,
-            mode: RuntimeConfigurationMode::Recording(recorder),
+            mode: RuntimeConfigurationMode::Recording(recorder, network),
         }
     }
 
@@ -187,14 +209,23 @@ impl Runtime {
     /// Starts a runtime worker with an optional initial machine.
     pub fn new(machine: Option<Machine>) -> io::Result<Self> {
         let (command_sender, command_receiver) = mpsc::channel();
+        let failure_sender = command_sender.clone();
         let worker = thread::Builder::new()
             .name(String::from("sgi-emu-runtime"))
-            .spawn(move || Worker::new(machine).run(&command_receiver))?;
+            .spawn(move || {
+                let mut worker = Worker::new(None);
+                worker.command_sender = Some(failure_sender);
+                worker.run(&command_receiver);
+            })?;
 
-        Ok(Self {
+        let runtime = Self {
             command_sender: Some(command_sender),
             worker: Some(worker),
-        })
+        };
+        if let Some(machine) = machine {
+            runtime.configure(machine).map_err(io::Error::other)?;
+        }
+        Ok(runtime)
     }
 
     /// Starts an unconfigured runtime worker.
@@ -416,6 +447,11 @@ const EXECUTION_BATCH_SIZE: usize = 1024;
 const CHECKPOINT_INTERVAL: u64 = 1_000_000;
 
 struct Worker {
+    network: Option<NetworkSession>,
+    network_config: Option<NatConfig>,
+    network_generation: u64,
+    network_error: Option<String>,
+    command_sender: Option<Sender<Command>>,
     machine: Option<Machine>,
     cpu_clock: Option<CpuClock>,
     virtual_instant: VirtualInstant,
@@ -503,6 +539,11 @@ impl Worker {
             .as_ref()
             .map(|machine| CpuClock::new(machine.cpu_frequency_hz()));
         Self {
+            network: None,
+            network_config: None,
+            network_generation: 0,
+            network_error: None,
+            command_sender: None,
             machine,
             cpu_clock,
             virtual_instant: VirtualInstant::ZERO,
@@ -553,6 +594,14 @@ impl Worker {
 
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
+            Command::NetworkFailure { generation, reason } => {
+                if generation == self.network_generation
+                    && self.network.is_some()
+                    && !self.mode.is_replay()
+                {
+                    self.fail_network(reason);
+                }
+            }
             Command::Configure {
                 configuration,
                 reply,
@@ -580,6 +629,9 @@ impl Worker {
                     } else {
                         None
                     };
+                    if let Some(config) = self.network_config.clone() {
+                        self.replace_network(Some(config))?;
+                    }
                     if let ActiveMode::Recording(session) = &self.mode {
                         session
                             .recorder
@@ -587,6 +639,7 @@ impl Worker {
                             .map_err(|error| rejection_owned(error.to_string()))?;
                     }
                     self.reset_machine();
+                    self.network_error = None;
                     if let Some(next_epoch) = next_epoch {
                         self.position = ExecutionPosition {
                             epoch: next_epoch,
@@ -663,6 +716,7 @@ impl Worker {
                 send_reply(reply, Ok(self.status()));
             }
             Command::Shutdown(reply) => {
+                self.network.take();
                 if matches!(self.mode, ActiveMode::Recording(_)) {
                     let _ = self.stop_recording(RecordOutcome::Shutdown);
                 }
@@ -687,13 +741,24 @@ impl Worker {
                 "the current recording must be stopped before configuring another machine",
             ));
         }
-        if self.mode.is_replay() && !matches!(&configuration.mode, RuntimeConfigurationMode::Normal)
+        if self.mode.is_replay()
+            && !matches!(&configuration.mode, RuntimeConfigurationMode::Normal(_))
         {
             return Err(rejection(
                 "the current Replay must be stopped before starting another session",
             ));
         }
         let RuntimeConfiguration { mut machine, mode } = configuration;
+        let next_network = match &mode {
+            RuntimeConfigurationMode::Normal(config)
+            | RuntimeConfigurationMode::Recording(_, config) => {
+                config
+                    .validate()
+                    .map_err(|error| rejection_owned(error.to_string()))?;
+                Some(config.clone())
+            }
+            RuntimeConfigurationMode::Replaying(_) => None,
+        };
         let retained_state = if self.mode.is_replay() {
             self.preserved_nonvolatile_state.clone()
         } else {
@@ -702,13 +767,13 @@ impl Worker {
         let mut next_preserved_state = None;
         let mut restore_state = None;
         let next_mode = match mode {
-            RuntimeConfigurationMode::Normal => {
+            RuntimeConfigurationMode::Normal(_) => {
                 if let Some(state) = retained_state {
                     machine.restore_nonvolatile_state(state, 0);
                 }
                 ActiveMode::Normal
             }
-            RuntimeConfigurationMode::Recording(recorder) => {
+            RuntimeConfigurationMode::Recording(recorder, _) => {
                 let digest = checkpoint_digest(&machine);
                 recorder
                     .record_checkpoint(ExecutionPosition::default(), digest)
@@ -740,6 +805,9 @@ impl Worker {
             position = restore.position;
             completed_instructions = restore.completed_instructions;
         }
+        self.replace_network(next_network.clone())?;
+        self.network_config = next_network;
+        self.network_error = None;
         self.cpu_clock = Some(cpu_clock);
         self.machine = Some(machine);
         self.virtual_instant = virtual_instant;
@@ -851,6 +919,19 @@ impl Worker {
             };
             session.advance();
             match action {
+                TimelineAction::EthernetFrame { bytes } => {
+                    if !self
+                        .machine
+                        .as_mut()
+                        .expect("Replay requires a machine")
+                        .receive_ethernet(&bytes)
+                    {
+                        return Err(format!(
+                            "Replay Ethernet link was occupied at epoch {}, instruction {}",
+                            self.position.epoch, self.position.completed_instructions
+                        ));
+                    }
+                }
                 TimelineAction::SerialByte { port, value } => {
                     let consumed = self
                         .machine
@@ -907,7 +988,9 @@ impl Worker {
                     }
                     matches!(
                         session.outcome(),
-                        RecordOutcome::UserStopped | RecordOutcome::Shutdown
+                        RecordOutcome::UserStopped
+                            | RecordOutcome::Shutdown
+                            | RecordOutcome::HostNetworkError { .. }
                     )
                 }
             }
@@ -1142,6 +1225,9 @@ impl Worker {
                 Ok(()) => {
                     self.last_error = None;
                     self.advance_revision();
+                    if self.state != RuntimeState::Running {
+                        return;
+                    }
                 }
                 Err(error) => {
                     self.handle_execution_error(error);
@@ -1210,12 +1296,14 @@ impl Worker {
 
     fn execute_normal_instruction(&mut self) -> Result<(), ExecutionError> {
         self.execute_machine_instruction()?;
+        self.drain_network_output();
         if let Err(error) = self.refill_serial_input() {
             unreachable!(
                 "Normal serial input cannot write a Record: {}",
                 error.reason
             );
         }
+        self.process_network_boundary();
         self.deliver_output();
         Ok(())
     }
@@ -1225,11 +1313,13 @@ impl Worker {
         if !self.advance_session_position() {
             return Ok(());
         }
+        self.drain_network_output();
         if let Err(error) = self.refill_serial_input() {
             self.fail_session(error.reason);
             self.deliver_output();
             return Ok(());
         }
+        self.process_network_boundary();
         self.check_record_failure();
         if let Err(error) = self.record_checkpoint_if_due() {
             self.fail_session(error.reason);
@@ -1263,6 +1353,7 @@ impl Worker {
         if !self.advance_session_position() {
             return Ok(());
         }
+        self.drain_network_output();
         self.check_replay_storage_failure();
         if self.replay_boundary_due()
             && let Err(reason) = self.process_replay_boundary()
@@ -1357,6 +1448,114 @@ impl Worker {
         Ok(())
     }
 
+    fn replace_network(&mut self, config: Option<NatConfig>) -> Result<(), CommandRejection> {
+        self.state = if self.machine.is_some() {
+            RuntimeState::Paused
+        } else {
+            RuntimeState::Unconfigured
+        };
+        self.network_generation = self.network_generation.wrapping_add(1);
+        self.network.take();
+        let Some(config) = config else {
+            return Ok(());
+        };
+        let generation = self.network_generation;
+        let sender = self.command_sender.clone();
+        match NetworkSession::start(config, move |reason| {
+            if let Some(sender) = &sender {
+                let _ = sender.send(Command::NetworkFailure { generation, reason });
+            }
+        }) {
+            Ok(network) => {
+                self.network = Some(network);
+                Ok(())
+            }
+            Err(error) => {
+                let reason = format!("NAT initialization failed: {error}");
+                self.fail_network(reason.clone());
+                Err(rejection_owned(reason))
+            }
+        }
+    }
+
+    fn fail_network(&mut self, reason: String) {
+        if self.network_error.is_some() {
+            return;
+        }
+        self.network_error = Some(reason.clone());
+        self.state = if self.machine.is_some() {
+            RuntimeState::Paused
+        } else {
+            RuntimeState::Unconfigured
+        };
+        if matches!(self.mode, ActiveMode::Recording(_)) {
+            let _ = self.stop_recording(RecordOutcome::HostNetworkError {
+                description: reason,
+            });
+        }
+        self.advance_revision();
+    }
+
+    fn drain_network_output(&mut self) {
+        if self.frontend_output.is_empty() {
+            return;
+        }
+        for frame in self.frontend_output.take_ethernet_frames() {
+            if !self.mode.is_replay()
+                && let Some(network) = &self.network
+            {
+                network.try_send_frame(&frame);
+            }
+        }
+    }
+
+    /// Records an input before the machine performs MAC filtering or DMA checks.
+    /// Host queue drops and sockets never become replay machine state.
+    fn process_network_boundary(&mut self) {
+        if !self
+            .network
+            .as_ref()
+            .is_some_and(NetworkSession::has_pending_work)
+        {
+            return;
+        }
+        if self
+            .machine
+            .as_ref()
+            .is_some_and(Machine::ethernet_receive_ready)
+            && let Some(frame) = self
+                .network
+                .as_ref()
+                .and_then(NetworkSession::try_receive_frame)
+            && let Err(error) = self.accept_network_frame(&frame)
+        {
+            self.fail_session(error.to_string());
+            return;
+        }
+        if let Some(failure) = self.network.as_ref().and_then(NetworkSession::take_failure) {
+            self.fail_network(failure);
+        }
+    }
+
+    fn accept_network_frame(&mut self, frame: &[u8]) -> Result<(), io::Error> {
+        if let ActiveMode::Recording(session) = &self.mode {
+            session
+                .recorder
+                .record_ethernet_frame(self.position, frame)
+                .map_err(io::Error::other)?;
+        }
+        let accepted = self
+            .machine
+            .as_mut()
+            .expect("network input requires a machine")
+            .receive_ethernet(frame);
+        debug_assert!(
+            accepted,
+            "a bounded host frame must enter an available link"
+        );
+        Ok(())
+    }
+
     fn deliver_output(&mut self) {
         if self.frontend_output.is_empty() {
             return;
@@ -1378,6 +1577,9 @@ impl Worker {
 
     fn require_runnable(&self) -> Result<(), CommandRejection> {
         self.require_machine()?;
+        if let Some(error) = &self.network_error {
+            return Err(rejection_owned(error.clone()));
+        }
         match self.mode {
             ActiveMode::ReplayCompleted(_) => Err(rejection("replay is complete")),
             ActiveMode::ReplayDiverged { .. } => Err(rejection("replay has diverged")),
@@ -1415,6 +1617,7 @@ impl Worker {
             _ => None,
         };
         RuntimeStatus {
+            can_execute: self.require_runnable().is_ok(),
             state: self.state,
             revision: self.revision,
             completed_instructions: self.completed_instructions,
@@ -1422,7 +1625,10 @@ impl Worker {
             position: self.position,
             replay_final_position,
             session_error,
-            last_error: self.last_error.clone(),
+            last_error: self
+                .network_error
+                .clone()
+                .or_else(|| self.last_error.clone()),
         }
     }
 
@@ -1529,7 +1735,9 @@ mod tests {
         CpuClock, Runtime, RuntimeConfiguration, RuntimeError, checkpoint_digest, serial_port_index,
     };
     use crate::control::{RuntimeMode, RuntimeState};
-    use crate::record::{ExecutionPosition, MediaIdentity, RecordManifest, Recorder, Replayer};
+    use crate::record::{
+        ExecutionPosition, MediaIdentity, RecordManifest, RecordOutcome, Recorder, Replayer,
+    };
 
     const PROM_BYTES: usize = 0x40000;
     const EXTERNAL_PROM_EXECUTION_BUDGET: usize = 400_000_000;
@@ -1932,6 +2140,242 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         assert!(runtime.step().is_err());
         runtime.shutdown().unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ethernet_input_survives_replay_snapshot_and_reset_without_a_live_session() {
+        let path = record_path("ethernet-snapshot-reset");
+        remove_record_artifacts(&path);
+        let program = [0x1000_ffff, 0];
+        let mut worker = super::Worker::new(None);
+        worker
+            .configure(RuntimeConfiguration::recording(
+                machine_with_instructions(&program),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        execute_instructions(&mut worker, 1);
+        // RX is disabled. The external input must still be recorded and occupy
+        // the wire, including its in-flight state at a replay snapshot.
+        worker.accept_network_frame(&[0xff; 60]).unwrap();
+        execute_instructions(&mut worker, 10);
+        let (reply, response) = mpsc::channel();
+        worker.handle_command(super::Command::Reset(reply));
+        response.recv().unwrap().unwrap();
+        worker.accept_network_frame(&[0x55; 60]).unwrap();
+        execute_instructions(&mut worker, 2300);
+        worker.stop_recording(RecordOutcome::UserStopped).unwrap();
+        drop(worker);
+
+        let mut replay = super::Worker::new(None);
+        replay
+            .configure(RuntimeConfiguration::replaying(
+                machine_with_instructions(&program),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        assert!(replay.network.is_none());
+        execute_instructions(&mut replay, 1);
+        replay.create_replay_snapshot().unwrap();
+        let snapshot = Replayer::snapshot_catalog(&path).unwrap();
+        assert_eq!(snapshot.len(), 1);
+        drop(replay);
+        let mut replay = super::Worker::new(None);
+        replay
+            .configure(RuntimeConfiguration::replaying(
+                machine_with_instructions(&program),
+                Replayer::open_snapshot(&path, snapshot[0].id()).unwrap(),
+            ))
+            .unwrap();
+        assert!(replay.network.is_none());
+        execute_instructions(&mut replay, 2310);
+        assert_eq!(
+            replay.status().mode,
+            RuntimeMode::ReplayCompleted,
+            "{:?}",
+            replay.status()
+        );
+        assert_eq!(replay.status().position.epoch, 1);
+        drop(replay);
+        remove_record_artifacts(&path);
+    }
+
+    #[test]
+    fn ethernet_transmit_is_consumed_before_frontend_delivery_in_all_modes() {
+        let path = record_path("ethernet-output-stage");
+        remove_record_artifacts(&path);
+        let mut program = Vec::new();
+        for (address, value) in [
+            (0xbfa1_0000_u32, 0x0f00_023f_u32),
+            (0xbfa1_0004, 0x023f_023f),
+            (0xa000_1000, 0x8000_803c),
+            (0xa000_1004, 0x8000_2000),
+            (0xa000_1008, 0),
+            (0xbfb8_003c, 4),
+            (0xbfb8_011c, 0x0f),
+            (0xbfb8_0010, 0x1000),
+            (0xbfb8_0034, 0x0040_0000),
+        ] {
+            program.extend([
+                0x3c08_0000 | address >> 16,
+                0x3508_0000 | address & 0xffff,
+                0x3c09_0000 | value >> 16,
+                0x3529_0000 | value & 0xffff,
+                0xad09_0000,
+            ]);
+        }
+        program.extend([0x1000_ffff, 0]);
+        for mode in 0..3 {
+            let machine = machine_with_instructions(&program);
+            let configuration = match mode {
+                0 => RuntimeConfiguration::normal(machine),
+                1 => RuntimeConfiguration::recording(machine, started_recorder(&path)),
+                _ => RuntimeConfiguration::replaying(machine, Replayer::open(&path).unwrap()),
+            };
+            let mut worker = super::Worker::new(None);
+            worker.configure(configuration).unwrap();
+            worker.output_handler =
+                Some(Box::new(|_| panic!("network output reached the frontend")));
+            execute_instructions(&mut worker, 3000);
+            let Some(Machine::IndigoIp12(machine)) = &worker.machine else {
+                unreachable!()
+            };
+            assert_eq!(read_physical_word(machine, 0x1fb8_0034), Some(0x0008_0000));
+            assert!(worker.frontend_output.is_empty());
+            if mode == 1 {
+                worker.stop_recording(RecordOutcome::UserStopped).unwrap();
+            } else if mode == 2 {
+                assert_eq!(
+                    worker.status().mode,
+                    RuntimeMode::ReplayCompleted,
+                    "{:?}",
+                    worker.status()
+                );
+                assert!(worker.network.is_none());
+            }
+        }
+        remove_record_artifacts(&path);
+    }
+
+    #[test]
+    fn queued_network_input_waits_for_link_readiness_and_replays_at_its_boundary() {
+        use std::time::{Duration, Instant};
+
+        let path = record_path("queued-ethernet-input");
+        remove_record_artifacts(&path);
+        let program = [0x1000_ffff, 0];
+        let mut worker = super::Worker::new(None);
+        worker
+            .configure(RuntimeConfiguration::recording(
+                machine_with_instructions(&program),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        worker.accept_network_frame(&[0xff; 60]).unwrap();
+        let mut arp = vec![0; 60];
+        let mac = [2, 0, 0, 0, 0, 1];
+        arp[..6].fill(255);
+        arp[6..12].copy_from_slice(&mac);
+        arp[12..22].copy_from_slice(&[8, 6, 0, 1, 8, 0, 6, 4, 0, 1]);
+        arp[22..28].copy_from_slice(&mac);
+        arp[28..32].copy_from_slice(&[10, 0, 2, 15]);
+        arp[38..42].copy_from_slice(&[10, 0, 2, 2]);
+        let network = worker.network.as_ref().unwrap();
+        assert!(network.try_send_frame(&arp));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !network.has_pending_work() {
+            assert!(Instant::now() < deadline, "NAT reply did not arrive");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(network.take_failure().is_none());
+        worker.process_network_boundary();
+        assert!(worker.network.as_ref().unwrap().has_pending_work());
+        execute_instructions(&mut worker, 100);
+        assert!(worker.network.as_ref().unwrap().has_pending_work());
+        execute_instructions(&mut worker, 4900);
+        assert!(!worker.network.as_ref().unwrap().has_pending_work());
+        assert!(worker.machine.as_ref().unwrap().ethernet_receive_ready());
+        let fingerprint = checkpoint_digest(worker.machine.as_ref().unwrap());
+        worker.stop_recording(RecordOutcome::UserStopped).unwrap();
+        drop(worker);
+
+        let mut replay = super::Worker::new(None);
+        replay
+            .configure(RuntimeConfiguration::replaying(
+                machine_with_instructions(&program),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        execute_instructions(&mut replay, 5000);
+        assert_eq!(
+            replay.status().mode,
+            RuntimeMode::ReplayCompleted,
+            "{:?}",
+            replay.status()
+        );
+        assert_eq!(
+            checkpoint_digest(replay.machine.as_ref().unwrap()),
+            fingerprint
+        );
+        assert!(replay.network.is_none());
+        drop(replay);
+        remove_record_artifacts(&path);
+    }
+
+    #[test]
+    fn network_fault_latches_paused_state_and_replays_as_a_terminal_boundary() {
+        let path = record_path("ethernet-fault");
+        remove_record_artifacts(&path);
+        let program = [0x1000_ffff, 0];
+        let mut worker = super::Worker::new(None);
+        worker
+            .configure(RuntimeConfiguration::recording(
+                machine_with_instructions(&program),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        execute_instructions(&mut worker, 3);
+        worker.handle_command(super::Command::NetworkFailure {
+            generation: worker.network_generation.wrapping_sub(1),
+            reason: "stale".into(),
+        });
+        assert!(worker.network_error.is_none());
+        worker.handle_command(super::Command::NetworkFailure {
+            generation: worker.network_generation,
+            reason: "test polling failure".into(),
+        });
+        assert_eq!(worker.status().state, RuntimeState::Paused);
+        assert!(!worker.status().can_execute);
+        assert!(worker.step_once().is_err());
+        let fault_revision = worker.revision;
+        worker.handle_command(super::Command::NetworkFailure {
+            generation: worker.network_generation,
+            reason: "duplicate failure".into(),
+        });
+        assert_eq!(worker.revision, fault_revision);
+        assert!(
+            worker
+                .status()
+                .last_error
+                .unwrap()
+                .contains("polling failure")
+        );
+        let (reply, response) = mpsc::channel();
+        worker.handle_command(super::Command::Reset(reply));
+        assert!(response.recv().unwrap().unwrap().can_execute);
+        drop(worker);
+        let mut replay = super::Worker::new(None);
+        replay
+            .configure(RuntimeConfiguration::replaying(
+                machine_with_instructions(&program),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        execute_instructions(&mut replay, 3);
+        assert_eq!(replay.status().mode, RuntimeMode::ReplayCompleted);
+        assert!(replay.network.is_none());
+        drop(replay);
+        remove_record_artifacts(&path);
     }
 
     #[test]

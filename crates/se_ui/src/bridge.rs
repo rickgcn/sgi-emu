@@ -62,6 +62,26 @@ pub mod ffi {
         pub scrollback_offset: u32,
     }
 
+    /// One editable IPv4 forwarding rule. Text ports preserve invalid input for validation.
+    #[derive(Debug)]
+    pub struct NetworkForwardRule {
+        pub protocol: String,
+        pub host_address: String,
+        pub host_port: String,
+        pub guest_address: String,
+        pub guest_port: String,
+    }
+
+    /// Host NAT settings, excluded from deterministic machine snapshots.
+    #[derive(Debug)]
+    pub struct NetworkConfiguration {
+        pub subnet: String,
+        pub gateway: String,
+        pub dns: String,
+        pub dhcp_start: String,
+        pub forwards: Vec<NetworkForwardRule>,
+    }
+
     /// Machine settings shared by the application and Qt frontend.
     #[derive(Debug)]
     pub struct MachineConfiguration {
@@ -81,6 +101,8 @@ pub mod ffi {
         pub cdrom_path: String,
         /// Stable floating-point backend identifier.
         pub float_backend: String,
+        /// Host NAT configuration for Normal and Recording sessions.
+        pub network: NetworkConfiguration,
     }
 
     /// Values used to initialize the Qt user interface.
@@ -110,6 +132,8 @@ pub mod ffi {
     /// Runtime status returned by a control command.
     #[derive(Debug)]
     pub struct RuntimeStatusDto {
+        /// Runtime authorization shared by Run, Step, and preparation recovery.
+        pub can_execute: bool,
         /// Whether the command succeeded.
         pub success: bool,
         /// Runtime state identifier.
@@ -313,6 +337,10 @@ pub mod ffi {
             self: &UiSession,
             configuration: &MachineConfiguration,
         ) -> RuntimeStatusDto;
+        fn validate_network_configuration(
+            self: &UiSession,
+            configuration: &NetworkConfiguration,
+        ) -> String;
         fn run_machine(self: &UiSession) -> RuntimeStatusDto;
         fn reset_machine(self: &UiSession) -> RuntimeStatusDto;
         fn pause_machine(self: &UiSession) -> RuntimeStatusDto;

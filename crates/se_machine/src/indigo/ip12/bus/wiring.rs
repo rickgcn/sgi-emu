@@ -1,10 +1,12 @@
 use se_core::bus::BusError;
 use se_core::time::VirtualDuration;
+use se_device::hpc1::EthernetRequest;
 use se_device::int2::Int2;
 use se_device::nmc93cs46::Nmc93cs46;
 use se_device::scsi::{ScsiDataDirection, ScsiTransferResult};
 use se_device::wd33c93b::WdWork;
 use se_device::z85230::Z85230;
+use sha2::{Digest, Sha256};
 
 use super::super::events::EventKind;
 use super::Ip12Bus;
@@ -14,6 +16,7 @@ const SCSI_INTERRUPT: u8 = 1 << 2;
 const PARALLEL_INTERRUPT: u8 = 1 << 1;
 const SERIAL_INTERRUPT: u8 = 1 << 5;
 const DSP_INTERRUPT: u8 = 1 << 4;
+const ETHERNET_INTERRUPT: u8 = 1 << 3;
 
 impl Ip12Bus {
     pub(super) fn synchronize_serial_interrupt(&mut self) {
@@ -28,6 +31,10 @@ impl Ip12Bus {
     }
 
     pub(super) fn synchronize_hpc1_interrupts(&mut self) {
+        self.int2.set_local_interrupt_0_input(
+            ETHERNET_INTERRUPT,
+            self.hpc1.ethernet_interrupt_asserted(),
+        );
         drive_hpc1_interrupt_inputs(
             &mut self.int2,
             self.hpc1.parallel_interrupt_asserted(),
@@ -64,6 +71,77 @@ impl Ip12Bus {
             self.transfer_active_scsi_data(self.wd33c93b.remaining_transfer_bytes());
         }
         self.synchronize_scsi_interrupt();
+        self.synchronize_hpc1_interrupts();
+        self.reschedule_ethernet();
+    }
+
+    /// Transfers completed frames and controller signals across the board wiring.
+    ///
+    /// Compatibility routing retains internal loopback while also forwarding TX
+    /// externally: NetBSD IP12 leaves ENET.RESET bit 2 clear during normal traffic.
+    /// This preserves guest connectivity, not the 8020's documented loopback isolation.
+    pub(super) fn transfer_ethernet_signals(&mut self) {
+        if let Some(frame) = self.seeq8003.take_received_frame() {
+            self.hpc1
+                .receive_ethernet_frame(frame.bytes, frame.status, frame.interrupt);
+            self.seeq8003.acknowledge_receive();
+        }
+        if let Some(frame) = self.seeq8003.take_transmitted_frame() {
+            let interrupt = self.seeq8003.transmit_interrupt_asserted();
+            let status = self.seeq8003.acknowledge_transmit();
+            self.hpc1.complete_ethernet_transmit(status, interrupt);
+            let mut digest = Sha256::new();
+            digest.update(self.ethernet_tx_digest);
+            digest.update((frame.len() as u64).to_le_bytes());
+            digest.update(&frame);
+            self.ethernet_tx_digest = digest.finalize().into();
+            self.ethernet_tx_count = self.ethernet_tx_count.wrapping_add(1);
+            if self.hpc1.ethernet_loopback() {
+                self.seeq8003.receive(&frame, 0);
+            }
+            self.ethernet_output.push(frame);
+        }
+        self.synchronize_hpc1_interrupts();
+    }
+
+    pub(super) fn service_ethernet_request(&mut self) {
+        let Some(request) = self
+            .hpc1
+            .next_ethernet_request(self.seeq8003.transmit_ready())
+        else {
+            return;
+        };
+        match request {
+            EthernetRequest::Read {
+                address,
+                length,
+                kind,
+            } => {
+                let mut bytes = [0; 32];
+                let bytes = &mut bytes[..length];
+                let success = self.memory.read_dma(&mut self.pic1, address, bytes);
+                self.hpc1
+                    .complete_ethernet_read(kind, success.then_some(bytes));
+            }
+            EthernetRequest::Write {
+                address,
+                bytes,
+                kind,
+            } => {
+                let success = self.memory.write_dma(&mut self.pic1, address, &bytes);
+                self.hpc1
+                    .complete_ethernet_write(kind, bytes.len(), success);
+            }
+            EthernetRequest::Transmit(frame) => {
+                assert!(self.seeq8003.transmit(frame));
+            }
+            EthernetRequest::Underflow => {
+                self.seeq8003.transmit_underflow();
+                let interrupt = self.seeq8003.transmit_interrupt_asserted();
+                let status = self.seeq8003.acknowledge_transmit();
+                self.hpc1.complete_ethernet_transmit(status, interrupt);
+            }
+        }
         self.synchronize_hpc1_interrupts();
     }
 
@@ -345,6 +423,402 @@ mod tests {
         issue_scsi_command, issue_write_ten, nvram_command, nvram_read_word, nvram_write_word,
         read_byte, read_scsi_register, read_word, write_scsi_register, write_serial_register,
     };
+
+    fn ethernet_bus() -> Ip12Bus {
+        let mut bus = bus();
+        super::super::test_support::configure_memory(&mut bus, 0x0f00_023f, 0x023f_023f);
+        write_memory(&mut bus, 0x1fb8_003c, &4_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_002c, &0x0100_0000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0118, &0xb0_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_011c, &0x0f_u32.to_be_bytes());
+        bus
+    }
+
+    fn ethernet_ticks(bus: &mut Ip12Bus, count: usize, output: &mut MachineOutput) {
+        for _ in 0..count {
+            bus.advance_time(
+                VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND / 33_000_000 + 1),
+                output,
+            );
+        }
+    }
+
+    #[test]
+    fn ethernet_compatibility_loopback_preserves_receive_dma_and_one_external_frame() {
+        for loopback in [false, true] {
+            let mut bus = ethernet_bus();
+            let control = if loopback { 0_u32 } else { 4 };
+            write_memory(&mut bus, 0x1fb8_003c, &control.to_be_bytes());
+            for (address, words) in [
+                (0x1000, [0x8000_803c_u32, 0x8000_2000, 0]),
+                (0x1100, [0xc000_05f2_u32, 0x8000_3000, 0]),
+            ] {
+                for (index, word) in words.into_iter().enumerate() {
+                    write_memory(&mut bus, address + index as u32 * 4, &word.to_be_bytes());
+                }
+            }
+            write_memory(&mut bus, 0x2000, &[0xff; 60]);
+            write_memory(&mut bus, 0x3000, &[0xa5; 63]);
+            write_memory(&mut bus, 0x1fb8_0010, &0x1000_u32.to_be_bytes());
+            write_memory(&mut bus, 0x1fb8_0050, &0x1100_u32.to_be_bytes());
+            write_memory(&mut bus, 0x1fb8_0038, &0x4000_u32.to_be_bytes());
+            write_memory(&mut bus, 0x1fb8_0034, &0x0040_0000_u32.to_be_bytes());
+            let mut output = MachineOutput::default();
+            ethernet_ticks(&mut bus, 2000, &mut output);
+            assert_eq!(output.take_ethernet_frames(), [vec![0xff; 60]]);
+            assert_eq!(bus.ethernet_tx_count, 1);
+            assert_eq!(read_word(&mut bus, 0x1100), Ok(0xc000_05f2));
+            assert_ne!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
+            write_memory(&mut bus, 0x1fb8_003c, &(control | 2).to_be_bytes());
+            ethernet_ticks(&mut bus, 3000, &mut output);
+            assert!(output.take_ethernet_frames().is_empty());
+            assert_eq!(read_word(&mut bus, INT2_BASE).unwrap() & 8 != 0, loopback);
+            assert_eq!(read_memory(&bus, 0x3000, 2), [0xa5; 2]);
+            if loopback {
+                assert_eq!(read_word(&mut bus, 0x1100), Ok(1459));
+                assert_eq!(read_memory(&bus, 0x3002, 60), [0xff; 60]);
+                assert_eq!(read_memory(&bus, 0x303e, 1), [0x30]);
+            } else {
+                assert_eq!(read_word(&mut bus, 0x1100), Ok(0xc000_05f2));
+                assert_eq!(read_memory(&bus, 0x3002, 61), [0xa5; 61]);
+            }
+        }
+    }
+
+    #[test]
+    fn ethernet_dma_state_encoding_and_timing_remain_stable() {
+        use sha2::{Digest, Sha256};
+
+        let mut bus = ethernet_bus();
+        for (address, words) in [
+            (0x1000, [0x8000_803c_u32, 0x8000_2000, 0]),
+            (0x1100, [0xc000_05f2_u32, 0x8000_3000, 0]),
+        ] {
+            for (index, word) in words.into_iter().enumerate() {
+                write_memory(&mut bus, address + index as u32 * 4, &word.to_be_bytes());
+            }
+        }
+        write_memory(&mut bus, 0x2000, &[0x55; 60]);
+        write_memory(&mut bus, 0x1fb8_0010, &0x1000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0050, &0x1100_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_002c, &(1800_u32 << 4).to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0034, &0x0040_0000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0038, &0x4000_u32.to_be_bytes());
+        assert!(bus.receive_ethernet(&[0xff; 60]));
+
+        let mut output = MachineOutput::default();
+        let mut digest = Sha256::new();
+        for _ in 0..2200 {
+            let encoded =
+                bincode::serde::encode_to_vec(&bus.hpc1, bincode::config::standard()).unwrap();
+            let (restored, consumed): (se_device::hpc1::Hpc1, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(consumed, encoded.len());
+            bus.hpc1 = restored;
+            digest.update(encoded);
+            ethernet_ticks(&mut bus, 1, &mut output);
+        }
+        assert_eq!(output.take_ethernet_frames(), [vec![0x55; 60]]);
+        assert_eq!(read_word(&mut bus, 0x1100), Ok(1459));
+        assert_ne!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
+        assert_eq!(
+            format!("{:x}", digest.finalize()),
+            "e63ad8a7a209f7b4f03bfc78b261a2f561db9234b08ebd79cc14be6ce73dbcbd"
+        );
+    }
+
+    #[test]
+    fn ethernet_receive_publishes_frame_then_ownership_and_local_interrupt() {
+        let mut bus = ethernet_bus();
+        for (offset, value) in [(0, 0xc000_05f2_u32), (4, 0x8000_2000), (8, 0x1000)] {
+            write_memory(&mut bus, 0x1000 + offset, &value.to_be_bytes());
+        }
+        write_memory(&mut bus, 0x2000, &[0xa5; 68]);
+        write_memory(&mut bus, 0x1fb8_0050, &0x1000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0038, &0x4000_u32.to_be_bytes());
+        let mut frame = vec![0x42; 60];
+        frame[..6].fill(0xff);
+        assert!(bus.receive_ethernet(&frame));
+        let mut output = MachineOutput::default();
+        ethernet_ticks(&mut bus, 2000, &mut output);
+        assert_eq!(read_memory(&bus, 0x2000, 2), [0xa5; 2]);
+        assert_eq!(read_memory(&bus, 0x2002, 60), frame);
+        assert_eq!(read_memory(&bus, 0x203e, 1), [0x30]);
+        assert_eq!(read_word(&mut bus, 0x1000), Ok(1522 - 63));
+        assert_ne!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
+        write_memory(&mut bus, 0x1fb8_003c, &6_u32.to_be_bytes());
+        assert_eq!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
+    }
+
+    #[test]
+    fn ethernet_stop_restart_keeps_wire_completion_with_its_original_packet() {
+        for old_interrupt in [false, true] {
+            for old_end_of_chain in [false, true] {
+                let mut bus = ethernet_bus();
+                for (address, words) in [
+                    (
+                        0x1000,
+                        [
+                            0x8000_003c_u32 | if old_interrupt { 0x8000 } else { 0 },
+                            0x2000 | if old_end_of_chain { 0x8000_0000 } else { 0 },
+                            0x1200,
+                        ],
+                    ),
+                    (
+                        0x1100,
+                        [
+                            0x8000_003c | if old_interrupt { 0 } else { 0x8000 },
+                            0x8000_2100,
+                            0x1100,
+                        ],
+                    ),
+                ] {
+                    for (index, word) in words.into_iter().enumerate() {
+                        write_memory(&mut bus, address + index as u32 * 4, &word.to_be_bytes());
+                    }
+                }
+                write_memory(&mut bus, 0x2000, &[0x55; 60]);
+                write_memory(&mut bus, 0x2100, &[0x66; 60]);
+                write_memory(&mut bus, 0x1fb8_0010, &0x1000_u32.to_be_bytes());
+                write_memory(&mut bus, 0x1fb8_0034, &0x0040_0000_u32.to_be_bytes());
+                let mut output = MachineOutput::default();
+                ethernet_ticks(&mut bus, 50, &mut output);
+                assert!(!bus.seeq8003.transmit_ready());
+                assert!(output.take_ethernet_frames().is_empty());
+
+                write_memory(&mut bus, 0x1fb8_0034, &0_u32.to_be_bytes());
+                write_memory(&mut bus, 0x1fb8_0010, &0x1100_u32.to_be_bytes());
+                write_memory(&mut bus, 0x1fb8_0034, &0x0040_0000_u32.to_be_bytes());
+                assert!(bus.hpc1.ethernet_time_until_event(true).is_none());
+
+                let snapshot = bus.snapshot().unwrap();
+                let encoded =
+                    bincode::serde::encode_to_vec(&snapshot, bincode::config::standard()).unwrap();
+                let (snapshot, consumed) =
+                    bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                        .unwrap();
+                assert_eq!(consumed, encoded.len());
+                let mut restored = ethernet_bus();
+                restored.restore_snapshot(snapshot).unwrap();
+                let mut restored_output = MachineOutput::default();
+
+                for _ in 0..2000 {
+                    ethernet_ticks(&mut bus, 1, &mut output);
+                    ethernet_ticks(&mut restored, 1, &mut restored_output);
+                    assert_eq!(
+                        read_word(&mut bus, 0x1fb8_0034),
+                        read_word(&mut restored, 0x1fb8_0034)
+                    );
+                    assert_eq!(
+                        read_word(&mut bus, INT2_BASE),
+                        read_word(&mut restored, INT2_BASE)
+                    );
+                }
+                assert_eq!(output.take_ethernet_frames(), [vec![0x55; 60]]);
+                assert_eq!(restored_output.take_ethernet_frames(), [vec![0x55; 60]]);
+                assert_ne!(read_word(&mut bus, 0x1fb8_0034).unwrap() & 0x0040_0000, 0);
+                assert_eq!(
+                    read_word(&mut bus, INT2_BASE).unwrap() & 8 != 0,
+                    old_interrupt
+                );
+                write_memory(&mut bus, 0x1fb8_003c, &6_u32.to_be_bytes());
+                ethernet_ticks(&mut bus, 2500, &mut output);
+                assert_eq!(output.take_ethernet_frames(), [vec![0x66; 60]]);
+                assert_eq!(read_word(&mut bus, 0x1fb8_0034), Ok(0x0008_0000));
+                assert_eq!(read_word(&mut bus, 0x1fb8_0028), Ok(0x1100));
+                assert_eq!(
+                    read_word(&mut bus, INT2_BASE).unwrap() & 8 != 0,
+                    !old_interrupt
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ethernet_stop_keeps_the_existing_wire_transfer_but_reset_cancels_it() {
+        for reset in [false, true] {
+            let mut bus = ethernet_bus();
+            for (offset, word) in [(0, 0x8000_803c_u32), (4, 0x8000_2000), (8, 0)] {
+                write_memory(&mut bus, 0x1000 + offset, &word.to_be_bytes());
+            }
+            write_memory(&mut bus, 0x2000, &[0x55; 60]);
+            write_memory(&mut bus, 0x1fb8_0010, &0x1000_u32.to_be_bytes());
+            write_memory(&mut bus, 0x1fb8_0034, &0x0040_0000_u32.to_be_bytes());
+            let mut output = MachineOutput::default();
+            ethernet_ticks(&mut bus, 50, &mut output);
+            write_memory(&mut bus, 0x1fb8_0034, &0_u32.to_be_bytes());
+            if reset {
+                write_memory(&mut bus, 0x1fb8_003c, &7_u32.to_be_bytes());
+                write_memory(&mut bus, 0x1fb8_003c, &4_u32.to_be_bytes());
+            }
+            ethernet_ticks(&mut bus, 5000, &mut output);
+            let frames = output.take_ethernet_frames();
+            assert_eq!(frames.len(), usize::from(!reset));
+            if !reset {
+                assert_eq!(frames[0], [0x55; 60]);
+            }
+            assert_eq!(read_word(&mut bus, 0x1fb8_0034).unwrap() & 0x0040_0000, 0);
+            assert_eq!(read_word(&mut bus, INT2_BASE).unwrap() & 8 != 0, !reset);
+        }
+    }
+
+    #[test]
+    fn ethernet_receive_without_irq_preserves_frame_status_before_acknowledgement() {
+        let mut bus = ethernet_bus();
+        write_memory(&mut bus, 0x1fb8_0118, &0x80_u32.to_be_bytes());
+        for (offset, value) in [(0, 0xc000_05f2_u32), (4, 0x8000_2000), (8, 0)] {
+            write_memory(&mut bus, 0x1000 + offset, &value.to_be_bytes());
+        }
+        write_memory(&mut bus, 0x1fb8_0050, &0x1000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0038, &0x4000_u32.to_be_bytes());
+        assert!(bus.receive_ethernet(&[0xff; 60]));
+        ethernet_ticks(&mut bus, 2000, &mut MachineOutput::default());
+
+        assert_eq!(read_memory(&bus, 0x2002, 60), [0xff; 60]);
+        assert_eq!(read_memory(&bus, 0x203e, 1), [0x30]);
+        assert_eq!(read_word(&mut bus, 0x1000), Ok(1459));
+        assert_eq!(read_word(&mut bus, 0x1fb8_0038), Ok(0x3000));
+        assert_eq!(read_word(&mut bus, 0x1fb8_0118), Ok(0xb0));
+        assert_eq!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
+    }
+
+    #[test]
+    fn ethernet_chained_transmit_preserves_the_frame_resource_boundary() {
+        for length in [16_384_usize, 16_385] {
+            let mut bus = ethernet_bus();
+            for (address, words) in [
+                (0x1000, [8191_u32, 0x2000, 0x1010]),
+                (0x1010, [8191, 0x3fff, 0x1020]),
+                (
+                    0x1020,
+                    [0x8000_8000 | (length as u32 - 16_382), 0x8000_5ffe, 0],
+                ),
+            ] {
+                for (index, word) in words.into_iter().enumerate() {
+                    write_memory(&mut bus, address + index as u32 * 4, &word.to_be_bytes());
+                }
+            }
+            let frame = vec![0x55; length];
+            write_memory(&mut bus, 0x2000, &frame);
+            write_memory(&mut bus, 0x1fb8_0010, &0x1000_u32.to_be_bytes());
+            write_memory(&mut bus, 0x1fb8_0034, &0x0040_0000_u32.to_be_bytes());
+            let mut output = MachineOutput::default();
+            ethernet_ticks(&mut bus, 500_000, &mut output);
+
+            if length == 16_384 {
+                assert_eq!(output.take_ethernet_frames(), [frame]);
+                assert_eq!(read_word(&mut bus, 0x1fb8_0034), Ok(0x0008_0000));
+            } else {
+                assert!(output.take_ethernet_frames().is_empty());
+                assert_eq!(read_word(&mut bus, 0x1fb8_0034), Ok(0x0001_0000));
+            }
+            assert_ne!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
+        }
+    }
+
+    #[test]
+    fn ethernet_tx_chains_descriptors_and_reset_cancels_wire_completion() {
+        let mut bus = ethernet_bus();
+        for (offset, value) in [
+            (0, 30_u32),
+            (4, 0x2000),
+            (8, 0x1010),
+            (16, 0x8000_801e),
+            (20, 0x8000_201e),
+            (24, 0x1000),
+        ] {
+            write_memory(&mut bus, 0x1000 + offset, &value.to_be_bytes());
+        }
+        let frame = vec![0x55; 60];
+        write_memory(&mut bus, 0x2000, &frame);
+        write_memory(&mut bus, 0x1fb8_0010, &0x1000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0034, &0x0040_0000_u32.to_be_bytes());
+        let mut output = MachineOutput::default();
+        ethernet_ticks(&mut bus, 2000, &mut output);
+        assert_eq!(output.take_ethernet_frames(), [frame]);
+        assert_eq!(
+            read_word(&mut bus, 0x1fb8_0034).unwrap() & 0x0048_0000,
+            0x0008_0000
+        );
+        assert_ne!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
+        write_memory(&mut bus, 0x1fb8_0010, &0x1000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0034, &0x0040_0000_u32.to_be_bytes());
+        ethernet_ticks(&mut bus, 100, &mut output);
+        write_memory(&mut bus, 0x1fb8_003c, &7_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_003c, &4_u32.to_be_bytes());
+        ethernet_ticks(&mut bus, 2000, &mut output);
+        assert!(output.take_ethernet_frames().is_empty());
+        assert_eq!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
+    }
+
+    #[test]
+    fn ethernet_receive_delay_and_snapshot_preserve_dma_completion() {
+        let mut bus = ethernet_bus();
+        for (offset, value) in [(0, 0xc000_05f2_u32), (4, 0x8000_2000), (8, 0)] {
+            write_memory(&mut bus, 0x1000 + offset, &value.to_be_bytes());
+        }
+        write_memory(&mut bus, 0x1fb8_0050, &0x1000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0038, &0x4000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_002c, &(10_000_u32 << 4).to_be_bytes());
+        assert!(bus.receive_ethernet(&[0xff; 60]));
+        let mut output = MachineOutput::default();
+        ethernet_ticks(&mut bus, 100, &mut output);
+        let snapshot = bus.snapshot().unwrap();
+        for restore in [false, true] {
+            if restore {
+                bus.restore_snapshot(snapshot.clone()).unwrap();
+            }
+            ethernet_ticks(&mut bus, 2000, &mut output);
+            assert_eq!(read_word(&mut bus, 0x1000).unwrap(), 1459);
+            assert_eq!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
+            write_memory(&mut bus, 0x1fb8_0058, &0_u32.to_be_bytes());
+            assert_eq!(read_word(&mut bus, 0x1fb8_005c).unwrap(), u32::MAX);
+            write_memory(&mut bus, 0x1fb8_002c, &0x0100_0000_u32.to_be_bytes());
+            ethernet_ticks(&mut bus, 1, &mut output);
+            assert_ne!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
+        }
+    }
+
+    #[test]
+    fn ethernet_overflow_respects_buffer_capacity_and_w1c() {
+        let mut bus = ethernet_bus();
+        for (offset, value) in [(0, 0xc000_0010_u32), (4, 0x2000), (8, 0)] {
+            write_memory(&mut bus, 0x1000 + offset, &value.to_be_bytes());
+        }
+        write_memory(&mut bus, 0x2000, &[0xa5; 32]);
+        write_memory(&mut bus, 0x1fb8_0050, &0x1000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0038, &0x4000_u32.to_be_bytes());
+        assert!(bus.receive_ethernet(&[0xff; 60]));
+        ethernet_ticks(&mut bus, 2100, &mut MachineOutput::default());
+        assert_eq!(read_word(&mut bus, 0x1000).unwrap(), 0);
+        assert_eq!(read_memory(&bus, 0x2000, 2), [0xa5; 2]);
+        assert_eq!(read_memory(&bus, 0x2010, 16), [0xa5; 16]);
+        assert_eq!(read_word(&mut bus, 0x1fb8_003c).unwrap() & 10, 10);
+        write_memory(&mut bus, 0x1fb8_003c, &6_u32.to_be_bytes());
+        assert_eq!(read_word(&mut bus, 0x1fb8_003c).unwrap() & 10, 8);
+        write_memory(&mut bus, 0x1fb8_003c, &12_u32.to_be_bytes());
+        assert_eq!(read_word(&mut bus, 0x1fb8_003c).unwrap() & 10, 0);
+    }
+
+    #[test]
+    fn ethernet_zero_length_cyclic_chain_yields_and_reset_stops_it() {
+        let mut bus = ethernet_bus();
+        for (offset, value) in [(0, 0_u32), (4, 0x2000), (8, 0x1000)] {
+            write_memory(&mut bus, 0x1000 + offset, &value.to_be_bytes());
+        }
+        write_memory(&mut bus, 0x1fb8_0010, &0x1000_u32.to_be_bytes());
+        write_memory(&mut bus, 0x1fb8_0034, &0x0040_0000_u32.to_be_bytes());
+        let mut output = MachineOutput::default();
+        ethernet_ticks(&mut bus, 500, &mut output);
+        assert!(output.take_ethernet_frames().is_empty());
+        assert_ne!(read_word(&mut bus, 0x1fb8_0034).unwrap() & 0x0040_0000, 0);
+        write_memory(&mut bus, 0x1fb8_003c, &7_u32.to_be_bytes());
+        ethernet_ticks(&mut bus, 500, &mut output);
+        assert_eq!(read_word(&mut bus, 0x1fb8_0034).unwrap() & 0x0040_0000, 0);
+        write_memory(&mut bus, 0x1fb8_0034, &0x0040_0000_u32.to_be_bytes());
+        ethernet_ticks(&mut bus, 500, &mut output);
+        assert!(output.take_ethernet_frames().is_empty());
+    }
 
     fn write_memory(bus: &mut Ip12Bus, address: u32, bytes: &[u8]) {
         for (offset, chunk) in bytes.chunks(4).enumerate() {

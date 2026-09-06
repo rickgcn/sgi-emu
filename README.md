@@ -78,6 +78,7 @@ When documentation and existing implementations disagree, preference is given to
 - Qt 6 (Core, Gui, and Widgets)
 - A C++17-capable compiler
 - Git
+- A C11-capable compiler, Python 3, Meson 1.4 or newer, and Ninja
 
 The Qt build must provide `qmake6` or `qmake`. If it is not available in `PATH`, set one of the following environment variables:
 

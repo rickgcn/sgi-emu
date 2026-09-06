@@ -33,18 +33,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    let (machine, startup_error) = if machine_configuration.prom_path.is_empty() {
-        (None, String::new())
+    let runtime = Runtime::new_unconfigured()?;
+    let startup_error = if machine_configuration.prom_path.is_empty() {
+        String::new()
     } else {
-        match build_normal_machine(&machine_configuration) {
-            Ok(machine) => (Some(machine), String::new()),
-            Err(error) => (None, error),
-        }
+        build_runtime_configuration(&machine_configuration, MachineBuildRequest::Normal)
+            .and_then(|configuration| {
+                runtime
+                    .configure_with(configuration)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+            .err()
+            .unwrap_or_default()
     };
 
     if arguments.headless() {
-        let machine = machine.ok_or_else(|| io::Error::other(startup_error))?;
-        let runtime = Runtime::new(Some(machine))?;
+        if !startup_error.is_empty() {
+            return Err(io::Error::other(startup_error).into());
+        }
         let frontend_result = se_cli::headless::run(&runtime);
         if let Some(state) = runtime.shutdown()? {
             persistence::save(&state)?;
@@ -53,14 +60,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let startup = application_config.ui_startup_state(startup_error);
-    let runtime = Runtime::new(machine)?;
-    let session = UiSession::new(runtime, Box::new(build_runtime_configuration));
+    let session = UiSession::new(
+        runtime,
+        Box::new(build_runtime_configuration),
+        Box::new(|configuration| config::parse_network_configuration(configuration).map(|_| ())),
+    );
     let exit = session.run(&startup);
     if let Some(state) = session.shutdown()? {
         persistence::save(&state)?;
     }
 
-    application_config.apply_ui_exit_state(exit);
+    application_config
+        .apply_ui_exit_state(exit)
+        .map_err(io::Error::other)?;
     config::save(&config_path, &application_config)?;
 
     Ok(())
@@ -84,7 +96,9 @@ fn build_runtime_configuration(
 ) -> Result<RuntimeConfiguration, String> {
     match request {
         MachineBuildRequest::Normal => {
-            build_normal_machine(configuration).map(RuntimeConfiguration::normal)
+            let network = config::parse_network_configuration(&configuration.network)?;
+            build_normal_machine(configuration)
+                .map(|machine| RuntimeConfiguration::normal_with_network(machine, network))
         }
         MachineBuildRequest::Recording(path) => build_recording_configuration(configuration, path),
         MachineBuildRequest::Replaying { path, snapshot_id } => {
@@ -97,6 +111,7 @@ fn build_recording_configuration(
     configuration: &MachineConfiguration,
     path: PathBuf,
 ) -> Result<RuntimeConfiguration, String> {
+    let network = config::parse_network_configuration(&configuration.network)?;
     let startup_configuration = machine_startup_configuration(configuration)?;
     let prom_path = Path::new(&configuration.prom_path);
     let raw_prom = read_prom(prom_path)?;
@@ -122,7 +137,9 @@ fn build_recording_configuration(
     recorder
         .start(&manifest)
         .map_err(|error| error.to_string())?;
-    Ok(RuntimeConfiguration::recording(machine, recorder))
+    Ok(RuntimeConfiguration::recording_with_network(
+        machine, recorder, network,
+    ))
 }
 
 fn build_replay_configuration(

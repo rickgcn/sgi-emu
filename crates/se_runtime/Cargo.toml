@@ -12,6 +12,7 @@ crc32fast.workspace = true
 serde.workspace = true
 se_core.workspace = true
 se_machine.workspace = true
+se_network.workspace = true
 sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]

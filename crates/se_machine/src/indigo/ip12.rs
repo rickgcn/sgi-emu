@@ -498,6 +498,17 @@ impl Ip12 {
         consumed
     }
 
+    /// Reports whether the virtual Ethernet link can accept the next frame.
+    #[must_use]
+    pub fn ethernet_receive_ready(&self) -> bool {
+        self.bus.ethernet_receive_ready()
+    }
+
+    /// Supplies one external Ethernet frame before device filtering.
+    pub fn receive_ethernet(&mut self, bytes: &[u8]) -> bool {
+        self.bus.receive_ethernet(bytes)
+    }
+
     fn update_interrupt_lines(&mut self) {
         let mut interrupt_lines = 0;
         if self.bus.local_interrupt_0_asserted() {

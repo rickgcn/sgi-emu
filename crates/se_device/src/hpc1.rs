@@ -1,4 +1,8 @@
-//! Silicon Graphics HPC1.5 register front end.
+//! Silicon Graphics HPC1.5 register and DMA controller.
+//!
+//! The device owns Ethernet, SCSI, parallel, and DSP channel state, register
+//! side effects, and the shared 33 MHz clock. Board memory accesses and
+//! controller signals are exchanged through the public channel interfaces.
 
 use se_core::bus::{BusError, DeviceAddr};
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
@@ -49,9 +53,9 @@ const REVISION: u8 = 0x40;
 const WRITABLE_ENDIAN_BITS: u8 = 0x1f;
 
 const ETHERNET_CURRENT_BUFFER_POINTER_MASK: u32 = 0x8fff_ffff;
-const ETHERNET_DESCRIPTOR_POINTER_MASK: u32 = 0x0fff_ffff;
+const ETHERNET_ADDRESS_MASK: u32 = 0x0fff_ffff;
 const ETHERNET_TRANSMIT_BYTE_COUNT_MASK: u32 = 0x8000_9fff;
-const ETHERNET_RECEIVE_BYTE_COUNT_MASK: u32 = 0x0000_01ff;
+const ETHERNET_BYTE_COUNT_MASK: u32 = 0x0000_1fff;
 const ETHERNET_RESET_CHANNEL: u32 = 0x01;
 const ETHERNET_TRANSMIT_STATUS_BITS: u32 = 0x00ff_0000;
 const ETHERNET_RECEIVE_STATUS_BITS: u32 = 0x0000_ff00;
@@ -59,6 +63,20 @@ const ETHERNET_CONTROL_BITS: u32 = 0x0f;
 const ETHERNET_TIMER_COUNT_MASK: u32 = 0x00ff_fff0;
 const ETHERNET_TIMER_EXPIRED: u32 = 0x0100_0000;
 const ETHERNET_TIMER_COUNT_SHIFT: u32 = 4;
+
+const ETHERNET_TRANSMIT_ACTIVE: u32 = 0x0040_0000;
+/// Successful transmission in the captured HPC transmitter status field.
+/// V30/35 section 8 maps the controller status byte to bits 23 through 16;
+/// the SGI HPC1 driver tests bit 19 for transmission success.
+const ETHERNET_TRANSMIT_SUCCESS: u32 = 0x0008_0000;
+const ETHERNET_RECEIVE_ACTIVE: u32 = 0x0000_4000;
+const ETHERNET_TRANSMIT_END_OF_PACKET: u32 = 1 << 31;
+const ETHERNET_RECEIVE_OWNED: u32 = 1 << 31;
+const ETHERNET_BUFFER_END_OF_CHAIN: u32 = 1 << 31;
+const ETHERNET_TRANSMIT_INTERRUPT_ENABLE: u32 = 0x8000;
+const ETHERNET_INTERRUPT: u32 = 0x02;
+const ETHERNET_LOOPBACK_DISABLE: u32 = 0x04;
+const ETHERNET_OVERFLOW: u32 = 0x08;
 
 const SCSI_RESET: u8 = 0x01;
 const SCSI_FLUSH: u8 = 0x02;
@@ -80,9 +98,68 @@ const WRITABLE_PARALLEL_BITS: u8 = 0xfd;
 
 const DSP_INTERRUPT_BITS: u8 = 0x07;
 
-const FREE_RUNNING_COUNTER_FREQUENCY: u128 = 33_000_000;
+const HPC_CLOCK_FREQUENCY: u128 = 33_000_000;
 const FREE_RUNNING_COUNTER_MODULUS: u128 = 1 << 24;
 const FIFO_ENTRIES: usize = 16;
+
+/// Resource bound for an assembled Ethernet DMA frame, excluding FCS and
+/// the receive status trailer. This is not a hardware MTU or descriptor limit.
+/// A receive allocation can hold one additional byte for the status trailer.
+const MAX_ETHERNET_FRAME_BYTES: usize = 16_384;
+
+/// One DMA cycle rounded up to whole attoseconds. Per-request rounding is
+/// retained independently of the rational counter and receive-timer phase.
+const ETHERNET_DMA_CYCLE_ATTOSECONDS: u128 = ATTOSECONDS_PER_SECOND.div_ceil(HPC_CLOCK_FREQUENCY);
+
+/// An opaque tag returned unchanged with an Ethernet memory-read result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EthernetReadKind {
+    /// Fetch three hardware words of a TX descriptor.
+    TransmitDescriptor,
+    /// Fetch the next TX buffer fragment.
+    TransmitData,
+    /// Fetch three hardware words of an RX descriptor.
+    ReceiveDescriptor,
+}
+
+/// An opaque tag returned unchanged with an Ethernet memory-write result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EthernetWriteKind {
+    /// Store the next RX frame fragment.
+    ReceiveData,
+    /// Publish the RX residual and release ownership.
+    ReceiveCompletion,
+}
+
+/// One bounded operation requested by the Ethernet DMA controller.
+///
+/// The machine services memory and wires controller signals. It does not
+/// interpret descriptors, end markers, residuals, or frame completion.
+#[derive(Debug)]
+pub enum EthernetRequest {
+    /// Read physical RAM through the board memory controller.
+    Read {
+        /// Physical address.
+        address: u32,
+        /// Requested byte count, at most 32.
+        length: usize,
+        /// Completion tag.
+        kind: EthernetReadKind,
+    },
+    /// Write physical RAM through the board memory controller.
+    Write {
+        /// Physical address.
+        address: u32,
+        /// Data to store.
+        bytes: Vec<u8>,
+        /// Completion tag.
+        kind: EthernetWriteKind,
+    },
+    /// Pass an assembled packet to the attached controller's transmitter.
+    Transmit(Vec<u8>),
+    /// Signal an underflow to the attached controller's transmitter.
+    Underflow,
+}
 
 /// One currently available HPC1 SCSI DMA window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,10 +211,78 @@ impl DiagnosticFifo {
         self.read_index = 0;
         self.write_index = 0;
     }
+
+    /// Shares the diagnostic RAM with completed DMA transfers. Each completed
+    /// word is drained at the request boundary; sub-word lanes retain their
+    /// position across descriptor fragments. Unspecified live flag tags are
+    /// zero, rather than inventing 80C03 or HPC3 flag encodings.
+    fn transfer_bytes(&mut self, bytes: &[u8], lane: &mut usize) {
+        for byte in bytes {
+            let shift = (3 - *lane) * 8;
+            let word = &mut self.data[self.write_index];
+            *word = (*word & !(0xff << shift)) | u32::from(*byte) << shift;
+            self.flags[self.write_index] = 0;
+            *lane += 1;
+            if *lane == 4 {
+                *lane = 0;
+                self.write_index = (self.write_index + 1) % FIFO_ENTRIES;
+                self.read_index = self.write_index;
+            }
+        }
+    }
 }
 
+#[derive(Clone, Copy, Deserialize, Serialize)]
+enum EthernetTxStage {
+    Idle,
+    Descriptor,
+    Data,
+    Send,
+    Wire,
+    Fault,
+}
+#[derive(Clone, Copy, Deserialize, Serialize)]
+enum EthernetRxStage {
+    Idle,
+    Descriptor,
+    Data,
+    Completion,
+}
+
+/// Descriptor signals belonging to the packet already submitted to the controller.
+/// STOP detaches DMA progress without cancelling the controller's existing wire
+/// transfer. This retains the model's STOP behavior; reset cancels both devices.
+#[derive(Clone, Deserialize, Serialize)]
+struct EthernetTransmitContext {
+    first_descriptor: u32,
+    next_descriptor: u32,
+    end_of_chain: bool,
+    interrupt_requested: bool,
+    dma_attached: bool,
+}
+
+/// Ethernet register state and in-flight descriptor progress.
 #[derive(Clone, Deserialize, Serialize)]
 struct EthernetChannel {
+    transmit_stage: EthernetTxStage,
+    transmit_inflight: Option<EthernetTransmitContext>,
+    receive_stage: EthernetRxStage,
+    transmit_frame: Vec<u8>,
+    receive_frame: Vec<u8>,
+    receive_offset: usize,
+    receive_interrupt_requested: bool,
+    receive_overflow: bool,
+    transmit_end_of_packet: bool,
+    transmit_end_of_chain: bool,
+    transmit_interrupt_requested: bool,
+    transmit_first_descriptor: bool,
+    receive_end_of_ring: bool,
+    dma_delay_attoseconds: u128,
+    transmit_interrupt_delay_attoseconds: Option<u128>,
+    receive_interrupt_waiting: bool,
+    prefer_receive: bool,
+    transmit_fifo_lane: usize,
+    receive_fifo_lane: usize,
     current_transmit_buffer_pointer: u32,
     next_transmit_descriptor_pointer: u32,
     transmit_byte_count: u32,
@@ -163,6 +308,25 @@ struct EthernetChannel {
 impl EthernetChannel {
     const fn new() -> Self {
         Self {
+            transmit_stage: EthernetTxStage::Idle,
+            transmit_inflight: None,
+            receive_stage: EthernetRxStage::Idle,
+            transmit_frame: Vec::new(),
+            receive_frame: Vec::new(),
+            receive_offset: 0,
+            receive_interrupt_requested: false,
+            receive_overflow: false,
+            transmit_end_of_packet: false,
+            transmit_end_of_chain: false,
+            transmit_interrupt_requested: false,
+            transmit_first_descriptor: true,
+            receive_end_of_ring: false,
+            dma_delay_attoseconds: 0,
+            transmit_interrupt_delay_attoseconds: None,
+            receive_interrupt_waiting: false,
+            prefer_receive: false,
+            transmit_fifo_lane: 0,
+            receive_fifo_lane: 0,
             current_transmit_buffer_pointer: 0,
             next_transmit_descriptor_pointer: 0,
             transmit_byte_count: 0,
@@ -204,6 +368,9 @@ impl EthernetChannel {
     fn write_timer(&mut self, value: u32) {
         self.timer_count = (value & ETHERNET_TIMER_COUNT_MASK) >> ETHERNET_TIMER_COUNT_SHIFT;
         self.timer_expired = value & ETHERNET_TIMER_EXPIRED != 0;
+        if self.timer_count == 0 {
+            self.timer_expired = true;
+        }
     }
 
     fn advance_timer(&mut self, ticks: u128) {
@@ -245,6 +412,433 @@ impl EthernetChannel {
             self.receive_fifo.write_index = fifo_index(value, 10);
         } else {
             self.receive_fifo.read_index = fifo_index(value, 2);
+        }
+    }
+
+    fn write_transmit_status(&mut self, offset: usize, data: &[u8]) {
+        self.transmit_status = masked_write(
+            self.transmit_status,
+            offset,
+            data,
+            ETHERNET_TRANSMIT_STATUS_BITS,
+        );
+        if self.transmit_status & ETHERNET_TRANSMIT_ACTIVE == 0 {
+            if let Some(context) = &mut self.transmit_inflight {
+                context.dma_attached = false;
+            }
+            self.transmit_stage = EthernetTxStage::Idle;
+            self.transmit_frame.clear();
+        } else if matches!(self.transmit_stage, EthernetTxStage::Idle) {
+            self.transmit_first_descriptor = true;
+            self.transmit_stage = EthernetTxStage::Descriptor;
+        }
+    }
+
+    fn write_receive_status(&mut self, offset: usize, data: &[u8]) {
+        self.receive_status = masked_write(
+            self.receive_status,
+            offset,
+            data,
+            ETHERNET_RECEIVE_STATUS_BITS,
+        );
+        if self.receive_status & ETHERNET_RECEIVE_ACTIVE == 0 {
+            self.receive_stage = EthernetRxStage::Idle;
+            self.receive_frame.clear();
+        }
+    }
+
+    fn write_control(&mut self, offset: usize, data: &[u8]) {
+        let old_control = self.control;
+        if offset + data.len() == 4 {
+            let value = masked_write(0, offset, data, ETHERNET_CONTROL_BITS);
+            self.control = (old_control
+                & !(value & (ETHERNET_INTERRUPT | ETHERNET_OVERFLOW))
+                & !(ETHERNET_RESET_CHANNEL | ETHERNET_LOOPBACK_DISABLE))
+                | (value & (ETHERNET_RESET_CHANNEL | ETHERNET_LOOPBACK_DISABLE));
+        }
+        if old_control & ETHERNET_RESET_CHANNEL == 0 && self.control & ETHERNET_RESET_CHANNEL != 0 {
+            self.reset_data_path();
+            self.reset_output_pending = true;
+        }
+    }
+
+    /// Reports the board-facing Ethernet interrupt level.
+    #[must_use]
+    const fn interrupt_asserted(&self) -> bool {
+        self.control & ETHERNET_INTERRUPT != 0
+    }
+
+    /// Reports the low-active 8020 loopback control selected by the host.
+    #[must_use]
+    const fn loopback_enabled(&self) -> bool {
+        self.control & ETHERNET_LOOPBACK_DISABLE == 0
+    }
+
+    /// Accepts one completed controller receive transfer, or drops it if DMA cannot
+    /// accept another frame. Disabled DMA never keeps a packet for later.
+    fn receive_frame(&mut self, bytes: Vec<u8>, status: u8, interrupt_requested: bool) {
+        self.receive_status =
+            (self.receive_status & ETHERNET_RECEIVE_ACTIVE) | u32::from(status) << 8;
+        if self.receive_status & ETHERNET_RECEIVE_ACTIVE == 0
+            || !matches!(self.receive_stage, EthernetRxStage::Idle)
+            || bytes.len() > MAX_ETHERNET_FRAME_BYTES
+            || self.control & ETHERNET_RESET_CHANNEL != 0
+        {
+            return;
+        }
+        self.receive_frame = bytes;
+        self.receive_frame.push(status);
+        self.receive_offset = 0;
+        self.receive_interrupt_requested = interrupt_requested;
+        self.receive_overflow = false;
+        self.receive_stage = EthernetRxStage::Descriptor;
+    }
+
+    /// Returns the next bounded memory or controller operation.
+    ///
+    /// `transmitter_ready` is the attached controller's ready signal. Repeated calls
+    /// cannot bypass DMA bus timing; each memory completion schedules a delay.
+    /// Requests transfer at most 32 bytes; descriptor arbitration is modeled
+    /// as one HPC cycle per transferred word, without internal gate timing.
+    fn next_request(&mut self, transmitter_ready: bool) -> Option<EthernetRequest> {
+        if self.control & ETHERNET_RESET_CHANNEL != 0 || self.dma_delay_attoseconds != 0 {
+            return None;
+        }
+        let receive_first = self.prefer_receive;
+        self.prefer_receive = !receive_first;
+        if receive_first {
+            self.receive_request()
+                .or_else(|| self.transmit_request(transmitter_ready))
+        } else {
+            self.transmit_request(transmitter_ready)
+                .or_else(|| self.receive_request())
+        }
+    }
+
+    /// IRIX 4.0.5 uses RX OWN bit 31, a 13-bit residual, a two-byte offset,
+    /// and one trailing controller status byte. Offset bytes remain untouched and
+    /// completion clears the upper control bits. The latter two behaviors
+    /// are model conventions where IRIX accesses do not determine write strobes.
+    fn receive_request(&mut self) -> Option<EthernetRequest> {
+        if self.receive_status & ETHERNET_RECEIVE_ACTIVE == 0 {
+            self.receive_stage = EthernetRxStage::Idle;
+            return None;
+        }
+        match self.receive_stage {
+            EthernetRxStage::Idle => None,
+            EthernetRxStage::Descriptor => Some(EthernetRequest::Read {
+                address: self.next_receive_descriptor_pointer,
+                length: 12,
+                kind: EthernetReadKind::ReceiveDescriptor,
+            }),
+            EthernetRxStage::Data => {
+                let length = (self.receive_byte_count as usize)
+                    .min(32)
+                    .min(self.receive_frame.len() - self.receive_offset);
+                if length == 0 {
+                    self.receive_overflow = self.receive_offset < self.receive_frame.len();
+                    self.receive_stage = EthernetRxStage::Completion;
+                    return self.receive_request();
+                }
+                Some(EthernetRequest::Write {
+                    address: self.current_receive_buffer_pointer & ETHERNET_ADDRESS_MASK,
+                    bytes: self.receive_frame[self.receive_offset..self.receive_offset + length]
+                        .to_vec(),
+                    kind: EthernetWriteKind::ReceiveData,
+                })
+            }
+            EthernetRxStage::Completion => Some(EthernetRequest::Write {
+                address: self.current_receive_descriptor_pointer,
+                bytes: (self.receive_byte_count & ETHERNET_BYTE_COUNT_MASK)
+                    .to_be_bytes()
+                    .to_vec(),
+                kind: EthernetWriteKind::ReceiveCompletion,
+            }),
+        }
+    }
+
+    fn transmit_request(&mut self, ready: bool) -> Option<EthernetRequest> {
+        // A restarted channel waits for the existing controller transaction.
+        // In particular, a new DMA fault must not abort the preceding packet.
+        if self.transmit_inflight.is_some() {
+            return None;
+        }
+        if matches!(self.transmit_stage, EthernetTxStage::Fault) {
+            self.transmit_stage = EthernetTxStage::Idle;
+            return Some(EthernetRequest::Underflow);
+        }
+        if self.transmit_status & ETHERNET_TRANSMIT_ACTIVE == 0 {
+            return None;
+        }
+        match self.transmit_stage {
+            EthernetTxStage::Idle | EthernetTxStage::Wire | EthernetTxStage::Fault => None,
+            EthernetTxStage::Descriptor => Some(EthernetRequest::Read {
+                address: self.next_transmit_descriptor_pointer,
+                length: 12,
+                kind: EthernetReadKind::TransmitDescriptor,
+            }),
+            EthernetTxStage::Data => {
+                let length = (self.transmit_byte_count & ETHERNET_BYTE_COUNT_MASK).min(32) as usize;
+                if length == 0 {
+                    self.transmit_stage = if self.transmit_end_of_packet {
+                        EthernetTxStage::Send
+                    } else if self.transmit_end_of_chain {
+                        EthernetTxStage::Fault
+                    } else {
+                        EthernetTxStage::Descriptor
+                    };
+                    if self.transmit_interrupt_requested && !self.transmit_end_of_packet {
+                        self.transmit_interrupt_delay_attoseconds =
+                            Some(ETHERNET_DMA_CYCLE_ATTOSECONDS);
+                    }
+                    return self.transmit_request(ready);
+                }
+                Some(EthernetRequest::Read {
+                    address: self.current_transmit_buffer_pointer & ETHERNET_ADDRESS_MASK,
+                    length,
+                    kind: EthernetReadKind::TransmitData,
+                })
+            }
+            EthernetTxStage::Send if ready => {
+                self.transmit_inflight = Some(EthernetTransmitContext {
+                    first_descriptor: self.current_packet_first_transmit_descriptor_pointer,
+                    next_descriptor: self.next_transmit_descriptor_pointer,
+                    end_of_chain: self.transmit_end_of_chain,
+                    interrupt_requested: self.transmit_interrupt_requested,
+                    dma_attached: true,
+                });
+                self.transmit_stage = EthernetTxStage::Wire;
+                Some(EthernetRequest::Transmit(std::mem::take(
+                    &mut self.transmit_frame,
+                )))
+            }
+            EthernetTxStage::Send => None,
+        }
+    }
+
+    /// Completes a RAM read. A missing result indicates a PIC1 DMA fault.
+    fn complete_read(&mut self, kind: EthernetReadKind, data: Option<&[u8]>) {
+        let Some(data) = data else {
+            self.fail_read(kind);
+            return;
+        };
+        self.dma_delay_attoseconds =
+            ETHERNET_DMA_CYCLE_ATTOSECONDS * data.len().div_ceil(4) as u128;
+        if matches!(kind, EthernetReadKind::TransmitData) {
+            if self.transmit_frame.len() + data.len() > MAX_ETHERNET_FRAME_BYTES {
+                self.fail_read(kind);
+                return;
+            }
+            self.transmit_frame.extend_from_slice(data);
+            self.transmit_fifo
+                .transfer_bytes(data, &mut self.transmit_fifo_lane);
+            self.current_transmit_buffer_pointer = (self.current_transmit_buffer_pointer
+                & ETHERNET_BUFFER_END_OF_CHAIN)
+                | ((self.current_transmit_buffer_pointer & ETHERNET_ADDRESS_MASK)
+                    .wrapping_add(data.len() as u32)
+                    & ETHERNET_ADDRESS_MASK);
+            self.transmit_byte_count = (self.transmit_byte_count & !ETHERNET_BYTE_COUNT_MASK)
+                | ((self.transmit_byte_count & ETHERNET_BYTE_COUNT_MASK)
+                    .saturating_sub(data.len() as u32));
+            return;
+        }
+        if data.len() != 12 {
+            self.fail_read(kind);
+            return;
+        }
+        let control = u32::from_be_bytes(data[0..4].try_into().unwrap());
+        let buffer = u32::from_be_bytes(data[4..8].try_into().unwrap());
+        let next = u32::from_be_bytes(data[8..12].try_into().unwrap()) & ETHERNET_ADDRESS_MASK;
+        match kind {
+            EthernetReadKind::ReceiveDescriptor => {
+                if control & ETHERNET_RECEIVE_OWNED == 0 {
+                    self.receive_status &= !ETHERNET_RECEIVE_ACTIVE;
+                    self.receive_stage = EthernetRxStage::Idle;
+                    self.receive_frame.clear();
+                    return;
+                }
+                self.current_receive_descriptor_pointer = self.next_receive_descriptor_pointer;
+                self.next_receive_descriptor_pointer = next;
+                self.receive_byte_count = (control & ETHERNET_BYTE_COUNT_MASK).saturating_sub(2);
+                self.current_receive_buffer_pointer = (buffer & ETHERNET_BUFFER_END_OF_CHAIN)
+                    | ((buffer & ETHERNET_ADDRESS_MASK).wrapping_add(2) & ETHERNET_ADDRESS_MASK);
+                self.receive_end_of_ring = buffer & ETHERNET_BUFFER_END_OF_CHAIN != 0;
+                self.receive_stage = EthernetRxStage::Data;
+            }
+            EthernetReadKind::TransmitDescriptor => {
+                self.current_transmit_descriptor_pointer = self.next_transmit_descriptor_pointer;
+                self.next_transmit_descriptor_pointer = next;
+                if self.transmit_first_descriptor {
+                    self.current_packet_first_transmit_descriptor_pointer =
+                        self.current_transmit_descriptor_pointer;
+                    self.transmit_first_descriptor = false;
+                }
+                self.transmit_byte_count = control & ETHERNET_TRANSMIT_BYTE_COUNT_MASK;
+                self.current_transmit_buffer_pointer =
+                    buffer & ETHERNET_CURRENT_BUFFER_POINTER_MASK;
+                self.transmit_end_of_packet = control & ETHERNET_TRANSMIT_END_OF_PACKET != 0;
+                self.transmit_end_of_chain = buffer & ETHERNET_BUFFER_END_OF_CHAIN != 0;
+                self.transmit_interrupt_requested =
+                    control & ETHERNET_TRANSMIT_INTERRUPT_ENABLE != 0;
+                self.transmit_stage = EthernetTxStage::Data;
+            }
+            EthernetReadKind::TransmitData => unreachable!(),
+        }
+    }
+
+    fn fail_read(&mut self, kind: EthernetReadKind) {
+        if matches!(kind, EthernetReadKind::ReceiveDescriptor) {
+            self.receive_status &= !ETHERNET_RECEIVE_ACTIVE;
+            self.receive_stage = EthernetRxStage::Idle;
+            self.receive_frame.clear();
+        } else {
+            self.transmit_status &= !ETHERNET_TRANSMIT_ACTIVE;
+            self.transmit_stage = EthernetTxStage::Fault;
+            self.transmit_frame.clear();
+        }
+    }
+
+    /// Completes a RAM write, publishing ownership only after all frame bytes.
+    fn complete_write(&mut self, kind: EthernetWriteKind, length: usize, success: bool) {
+        self.dma_delay_attoseconds = ETHERNET_DMA_CYCLE_ATTOSECONDS * length.div_ceil(4) as u128;
+        if !success {
+            self.receive_status &= !ETHERNET_RECEIVE_ACTIVE;
+            self.receive_stage = EthernetRxStage::Idle;
+            self.receive_frame.clear();
+            return;
+        }
+        match kind {
+            EthernetWriteKind::ReceiveData => {
+                self.receive_fifo.transfer_bytes(
+                    &self.receive_frame[self.receive_offset..self.receive_offset + length],
+                    &mut self.receive_fifo_lane,
+                );
+                self.receive_offset += length;
+                self.receive_byte_count = self.receive_byte_count.saturating_sub(length as u32);
+                self.current_receive_buffer_pointer = (self.current_receive_buffer_pointer
+                    & ETHERNET_BUFFER_END_OF_CHAIN)
+                    | ((self.current_receive_buffer_pointer & ETHERNET_ADDRESS_MASK)
+                        .wrapping_add(length as u32)
+                        & ETHERNET_ADDRESS_MASK);
+            }
+            EthernetWriteKind::ReceiveCompletion => {
+                if self.receive_end_of_ring || self.receive_overflow {
+                    self.receive_status &= !ETHERNET_RECEIVE_ACTIVE;
+                }
+                if self.receive_overflow {
+                    self.control |= ETHERNET_OVERFLOW | ETHERNET_INTERRUPT;
+                }
+                if self.receive_interrupt_requested {
+                    self.receive_interrupt_waiting = true;
+                    if self.timer_expired {
+                        self.control |= ETHERNET_INTERRUPT;
+                        self.receive_interrupt_waiting = false;
+                    }
+                }
+                self.receive_frame.clear();
+                self.receive_stage = EthernetRxStage::Idle;
+            }
+        }
+    }
+
+    /// Captures controller TX completion and schedules the separate host interrupt.
+    ///
+    /// Successful TX uses the descriptor XIE request. Controller errors also
+    /// interrupt when requested by the controller. The final status-to-IRQ separation is
+    /// modeled as one HPC clock, not claimed as measured silicon latency.
+    fn complete_transmit(&mut self, status: u8, interrupt: bool) {
+        let continue_dma = self.transmit_status & ETHERNET_TRANSMIT_ACTIVE != 0;
+        let context = self.transmit_inflight.take();
+        let interrupt_requested = context
+            .as_ref()
+            .map_or(self.transmit_interrupt_requested, |context| {
+                context.interrupt_requested
+            });
+        let successful = u32::from(status) << 16 & ETHERNET_TRANSMIT_SUCCESS != 0;
+        if interrupt_requested || (!successful && interrupt) {
+            self.transmit_interrupt_delay_attoseconds = Some(ETHERNET_DMA_CYCLE_ATTOSECONDS);
+        }
+        if context
+            .as_ref()
+            .is_some_and(|context| !context.dma_attached)
+        {
+            // Publish the old controller result without changing a restarted
+            // channel's ACTIVE bit, descriptor pointers, or DMA progress.
+            self.transmit_status =
+                (self.transmit_status & ETHERNET_TRANSMIT_ACTIVE) | u32::from(status) << 16;
+            return;
+        }
+        self.transmit_status = u32::from(status) << 16;
+        if successful && let Some(context) = &context {
+            self.previous_packet_first_transmit_descriptor_pointer = context.first_descriptor;
+            self.current_packet_first_transmit_descriptor_pointer = context.next_descriptor;
+        }
+        let end_of_chain = context.as_ref().is_none_or(|context| context.end_of_chain);
+        if successful && !end_of_chain && continue_dma {
+            self.transmit_status |= ETHERNET_TRANSMIT_ACTIVE;
+            self.transmit_stage = EthernetTxStage::Descriptor;
+        } else {
+            self.transmit_stage = EthernetTxStage::Idle;
+        }
+        self.transmit_first_descriptor = true;
+    }
+
+    /// Returns the next Ethernet DMA, interrupt, or receive-delay deadline.
+    ///
+    /// The receive timer gates completed RX interrupts, not empty expiration
+    /// or TX errors. `clock_phase` is the shared rational HPC clock remainder.
+    #[must_use]
+    fn time_until_event(
+        &self,
+        transmitter_ready: bool,
+        clock_phase: u128,
+    ) -> Option<VirtualDuration> {
+        // START while reset is asserted cannot create a zero-time request loop.
+        // Releasing reset re-evaluates the programmed channel.
+        if self.control & ETHERNET_RESET_CHANNEL != 0 {
+            return None;
+        }
+        let transmit_work = self.transmit_inflight.is_none()
+            && (matches!(
+                self.transmit_stage,
+                EthernetTxStage::Descriptor | EthernetTxStage::Data | EthernetTxStage::Fault
+            ) || (transmitter_ready && matches!(self.transmit_stage, EthernetTxStage::Send)));
+        let dma_work = !matches!(self.receive_stage, EthernetRxStage::Idle) || transmit_work;
+        let timer = if !self.timer_expired && self.timer_count != 0 {
+            Some(
+                (u128::from(self.timer_count) * ATTOSECONDS_PER_SECOND - clock_phase)
+                    .div_ceil(HPC_CLOCK_FREQUENCY),
+            )
+        } else {
+            None
+        };
+        [
+            dma_work.then_some(self.dma_delay_attoseconds),
+            self.transmit_interrupt_delay_attoseconds,
+            timer,
+            (self.timer_expired && self.receive_interrupt_waiting).then_some(0),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(VirtualDuration::from_attoseconds)
+    }
+
+    fn advance_time(&mut self, elapsed: VirtualDuration, ticks: u128) {
+        self.advance_timer(ticks);
+        self.dma_delay_attoseconds = self
+            .dma_delay_attoseconds
+            .saturating_sub(elapsed.as_attoseconds());
+        if let Some(delay) = self.transmit_interrupt_delay_attoseconds.as_mut() {
+            *delay = delay.saturating_sub(elapsed.as_attoseconds());
+            if *delay == 0 {
+                self.control |= ETHERNET_INTERRUPT;
+                self.transmit_interrupt_delay_attoseconds = None;
+            }
+        }
+        if self.timer_expired && self.receive_interrupt_waiting {
+            self.control |= ETHERNET_INTERRUPT;
+            self.receive_interrupt_waiting = false;
         }
     }
 }
@@ -431,6 +1025,12 @@ impl Hpc1 {
         *self = Self::new();
     }
 
+    /// Reports the board-facing Ethernet interrupt level.
+    #[must_use]
+    pub const fn ethernet_interrupt_asserted(&self) -> bool {
+        self.ethernet.interrupt_asserted()
+    }
+
     /// Reports the masked CPU-side DSP interrupt output level.
     #[must_use]
     pub const fn dsp_interrupt_asserted(&self) -> bool {
@@ -612,7 +1212,7 @@ impl Hpc1 {
                 self.ethernet.next_transmit_descriptor_pointer,
                 offset,
                 data,
-                ETHERNET_DESCRIPTOR_POINTER_MASK,
+                ETHERNET_ADDRESS_MASK,
             );
         } else if let Some(offset) = register_offset(start, end, ETHERNET_TRANSMIT_BYTE_COUNT) {
             self.ethernet.transmit_byte_count = masked_write(
@@ -636,7 +1236,7 @@ impl Hpc1 {
                 self.ethernet.current_transmit_descriptor_pointer,
                 offset,
                 data,
-                ETHERNET_DESCRIPTOR_POINTER_MASK,
+                ETHERNET_ADDRESS_MASK,
             );
         } else if let Some(offset) = register_offset(
             start,
@@ -649,7 +1249,7 @@ impl Hpc1 {
                     .current_packet_first_transmit_descriptor_pointer,
                 offset,
                 data,
-                ETHERNET_DESCRIPTOR_POINTER_MASK,
+                ETHERNET_ADDRESS_MASK,
             );
         } else if let Some(offset) = register_offset(
             start,
@@ -662,40 +1262,23 @@ impl Hpc1 {
                     .previous_packet_first_transmit_descriptor_pointer,
                 offset,
                 data,
-                ETHERNET_DESCRIPTOR_POINTER_MASK,
+                ETHERNET_ADDRESS_MASK,
             );
         } else if is_word(start, end, ETHERNET_TIMER) {
             self.ethernet
                 .write_timer(u32::from_be_bytes(data.try_into().unwrap()));
         } else if let Some(offset) = register_offset(start, end, ETHERNET_TRANSMIT_STATUS) {
-            self.ethernet.transmit_status = masked_write(
-                self.ethernet.transmit_status,
-                offset,
-                data,
-                ETHERNET_TRANSMIT_STATUS_BITS,
-            );
+            self.ethernet.write_transmit_status(offset, data);
         } else if let Some(offset) = register_offset(start, end, ETHERNET_RECEIVE_STATUS) {
-            self.ethernet.receive_status = masked_write(
-                self.ethernet.receive_status,
-                offset,
-                data,
-                ETHERNET_RECEIVE_STATUS_BITS,
-            );
+            self.ethernet.write_receive_status(offset, data);
         } else if let Some(offset) = register_offset(start, end, ETHERNET_RESET) {
-            let old_control = self.ethernet.control;
-            self.ethernet.control = masked_write(old_control, offset, data, ETHERNET_CONTROL_BITS);
-            if old_control & ETHERNET_RESET_CHANNEL == 0
-                && self.ethernet.control & ETHERNET_RESET_CHANNEL != 0
-            {
-                self.ethernet.reset_data_path();
-                self.ethernet.reset_output_pending = true;
-            }
+            self.ethernet.write_control(offset, data);
         } else if let Some(offset) = register_offset(start, end, ETHERNET_RECEIVE_BYTE_COUNT) {
             self.ethernet.receive_byte_count = masked_write(
                 self.ethernet.receive_byte_count,
                 offset,
                 data,
-                ETHERNET_RECEIVE_BYTE_COUNT_MASK,
+                ETHERNET_BYTE_COUNT_MASK,
             );
         } else if let Some(offset) =
             register_offset(start, end, ETHERNET_CURRENT_RECEIVE_BUFFER_POINTER)
@@ -713,7 +1296,7 @@ impl Hpc1 {
                 self.ethernet.next_receive_descriptor_pointer,
                 offset,
                 data,
-                ETHERNET_DESCRIPTOR_POINTER_MASK,
+                ETHERNET_ADDRESS_MASK,
             );
         } else if let Some(offset) =
             register_offset(start, end, ETHERNET_CURRENT_RECEIVE_DESCRIPTOR_POINTER)
@@ -722,7 +1305,7 @@ impl Hpc1 {
                 self.ethernet.current_receive_descriptor_pointer,
                 offset,
                 data,
-                ETHERNET_DESCRIPTOR_POINTER_MASK,
+                ETHERNET_ADDRESS_MASK,
             );
         } else if is_word(start, end, ETHERNET_RECEIVE_FIFO_POINTER) {
             self.ethernet
@@ -841,18 +1424,24 @@ impl Hpc1 {
         Ok(())
     }
 
+    /// Returns the next Ethernet DMA, interrupt, or receive-delay deadline.
+    #[must_use]
+    pub fn ethernet_time_until_event(&self, transmitter_ready: bool) -> Option<VirtualDuration> {
+        self.ethernet
+            .time_until_event(transmitter_ready, self.clock_phase)
+    }
+
     /// Advances the 33 MHz HPC1 clock domain by guest virtual time.
     pub fn advance_time(&mut self, elapsed: VirtualDuration) {
         let attoseconds = elapsed.as_attoseconds();
         let whole_seconds = attoseconds / ATTOSECONDS_PER_SECOND;
         let partial_attoseconds = attoseconds % ATTOSECONDS_PER_SECOND;
-        let scaled_partial =
-            partial_attoseconds * FREE_RUNNING_COUNTER_FREQUENCY + self.clock_phase;
+        let scaled_partial = partial_attoseconds * HPC_CLOCK_FREQUENCY + self.clock_phase;
         let partial_ticks = scaled_partial / ATTOSECONDS_PER_SECOND;
         self.clock_phase = scaled_partial % ATTOSECONDS_PER_SECOND;
 
         let whole_ticks = (whole_seconds % FREE_RUNNING_COUNTER_MODULUS)
-            * (FREE_RUNNING_COUNTER_FREQUENCY % FREE_RUNNING_COUNTER_MODULUS);
+            * (HPC_CLOCK_FREQUENCY % FREE_RUNNING_COUNTER_MODULUS);
         let wrapping_ticks = (whole_ticks + partial_ticks % FREE_RUNNING_COUNTER_MODULUS)
             % FREE_RUNNING_COUNTER_MODULUS;
         self.free_running_counter = ((u128::from(self.free_running_counter) + wrapping_ticks)
@@ -863,7 +1452,7 @@ impl Hpc1 {
         } else {
             u128::MAX
         };
-        self.ethernet.advance_timer(timer_ticks);
+        self.ethernet.advance_time(elapsed, timer_ticks);
     }
 
     /// Returns and clears a pending reset request for the attached Ethernet controller.
@@ -871,6 +1460,62 @@ impl Hpc1 {
         let requested = self.ethernet.reset_output_pending;
         self.ethernet.reset_output_pending = false;
         requested
+    }
+
+    /// Reports the low-active 8020 loopback control selected by the host.
+    #[must_use]
+    pub const fn ethernet_loopback(&self) -> bool {
+        self.ethernet.loopback_enabled()
+    }
+
+    /// Accepts completed receive data and its accompanying controller signals.
+    ///
+    /// `bytes` starts at the destination address and excludes FCS. `status`
+    /// is the frame's status byte before controller acknowledgement, and
+    /// `interrupt_requested` is the controller's receive interrupt request.
+    /// HPC captures the status, reserves the two-byte buffer offset, appends
+    /// the status trailer, and updates the descriptor residual on completion.
+    /// Disabled or occupied DMA drops the frame without retaining it for later.
+    pub fn receive_ethernet_frame(
+        &mut self,
+        bytes: Vec<u8>,
+        status: u8,
+        interrupt_requested: bool,
+    ) {
+        self.ethernet
+            .receive_frame(bytes, status, interrupt_requested);
+    }
+
+    /// Returns the next bounded memory or controller operation.
+    ///
+    /// `transmitter_ready` is the attached controller's ready signal. Repeated calls
+    /// cannot bypass DMA bus timing; each memory completion schedules a delay.
+    pub fn next_ethernet_request(&mut self, transmitter_ready: bool) -> Option<EthernetRequest> {
+        self.ethernet.next_request(transmitter_ready)
+    }
+
+    /// Completes a RAM read. A missing result indicates a PIC1 DMA fault.
+    pub fn complete_ethernet_read(&mut self, kind: EthernetReadKind, data: Option<&[u8]>) {
+        self.ethernet.complete_read(kind, data);
+    }
+
+    /// Completes a RAM write, publishing ownership only after all frame bytes.
+    pub fn complete_ethernet_write(
+        &mut self,
+        kind: EthernetWriteKind,
+        length: usize,
+        success: bool,
+    ) {
+        self.ethernet.complete_write(kind, length, success);
+    }
+
+    /// Captures controller TX completion and schedules the separate host interrupt.
+    ///
+    /// Successful TX uses the descriptor XIE request. Controller errors also
+    /// interrupt when requested by the controller. The final status-to-IRQ separation is
+    /// modeled as one HPC clock, not claimed as measured silicon latency.
+    pub fn complete_ethernet_transmit(&mut self, status: u8, interrupt: bool) {
+        self.ethernet.complete_transmit(status, interrupt);
     }
 
     /// Returns and clears a pending reset request for the attached SCSI controller.
@@ -1063,9 +1708,9 @@ mod tests {
         ETHERNET_RECEIVE_FIFO, ETHERNET_RECEIVE_FIFO_POINTER, ETHERNET_RESET, ETHERNET_TIMER,
         ETHERNET_TIMER_COUNT_MASK, ETHERNET_TIMER_COUNT_SHIFT, ETHERNET_TIMER_EXPIRED,
         ETHERNET_TRANSMIT_BYTE_COUNT, ETHERNET_TRANSMIT_FIFO, ETHERNET_TRANSMIT_FIFO_POINTER,
-        FIFO_ENTRIES, FREE_RUNNING_COUNTER, FREE_RUNNING_COUNTER_FREQUENCY,
-        FREE_RUNNING_COUNTER_MODULUS, Hpc1, MISCELLANEOUS_CONTROL, PARALLEL_BYTE_COUNT,
-        PARALLEL_CONTROL, PARALLEL_CURRENT_BUFFER_POINTER, PARALLEL_FIFO, PARALLEL_FIFO_POINTER,
+        FIFO_ENTRIES, FREE_RUNNING_COUNTER, FREE_RUNNING_COUNTER_MODULUS, HPC_CLOCK_FREQUENCY,
+        Hpc1, MISCELLANEOUS_CONTROL, PARALLEL_BYTE_COUNT, PARALLEL_CONTROL,
+        PARALLEL_CURRENT_BUFFER_POINTER, PARALLEL_FIFO, PARALLEL_FIFO_POINTER,
         PARALLEL_NEXT_DESCRIPTOR_POINTER, SCSI_BYTE_COUNT, SCSI_CONTROL,
         SCSI_CURRENT_BUFFER_POINTER, SCSI_DESCRIPTOR_END, SCSI_FIFO, SCSI_FIFO_POINTER, SCSI_FLUSH,
         SCSI_NEXT_DESCRIPTOR_POINTER, SCSI_START_DMA, SCSI_TO_MEMORY,
@@ -1083,6 +1728,148 @@ mod tests {
     }
 
     #[test]
+    fn ethernet_receive_accepts_raw_data_and_preserves_the_status_trailer() {
+        use super::{EthernetReadKind, EthernetRequest, EthernetWriteKind};
+
+        let mut hpc1 = Hpc1::new();
+        write_word(&mut hpc1, 0x50, 0x1000);
+        write_word(&mut hpc1, 0x38, 0x4000);
+        write_word(&mut hpc1, 0x2c, 0x0100_0000);
+        hpc1.receive_ethernet_frame(vec![1, 2, 3, 4, 5], 0x35, true);
+        assert!(matches!(
+            hpc1.next_ethernet_request(true),
+            Some(EthernetRequest::Read {
+                address: 0x1000,
+                kind: EthernetReadKind::ReceiveDescriptor,
+                ..
+            })
+        ));
+        let descriptor = [0x8000_0020_u32, 0x8000_2000, 0]
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        hpc1.complete_ethernet_read(EthernetReadKind::ReceiveDescriptor, Some(&descriptor));
+        hpc1.advance_time(VirtualDuration::from_attoseconds(
+            ATTOSECONDS_PER_SECOND / 1_000_000,
+        ));
+        let Some(EthernetRequest::Write {
+            address,
+            bytes,
+            kind,
+        }) = hpc1.next_ethernet_request(true)
+        else {
+            panic!("receive data must precede descriptor completion");
+        };
+        assert_eq!(address, 0x2002);
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 0x35]);
+        assert_eq!(kind, EthernetWriteKind::ReceiveData);
+        hpc1.complete_ethernet_write(kind, bytes.len(), true);
+        hpc1.advance_time(VirtualDuration::from_attoseconds(
+            ATTOSECONDS_PER_SECOND / 1_000_000,
+        ));
+        let Some(EthernetRequest::Write {
+            address,
+            bytes,
+            kind,
+        }) = hpc1.next_ethernet_request(true)
+        else {
+            panic!("receive data must be followed by descriptor completion");
+        };
+        assert_eq!(address, 0x1000);
+        assert_eq!(bytes, 24_u32.to_be_bytes());
+        assert_eq!(kind, EthernetWriteKind::ReceiveCompletion);
+        hpc1.complete_ethernet_write(kind, bytes.len(), true);
+        assert_eq!(read_word(&hpc1, 0x38), Ok(0x3500));
+        assert!(hpc1.ethernet_interrupt_asserted());
+    }
+
+    #[test]
+    fn ethernet_transmit_completion_uses_captured_status_and_separate_interrupt_requests() {
+        use super::{EthernetReadKind, EthernetRequest};
+
+        for status in [0x08_u8, 0x01] {
+            for xie in [false, true] {
+                for interrupt in [false, true] {
+                    let mut hpc1 = Hpc1::new();
+                    write_word(&mut hpc1, 0x10, 0x1000);
+                    write_word(&mut hpc1, 0x34, 0x0040_0000);
+                    assert!(matches!(
+                        hpc1.next_ethernet_request(true),
+                        Some(EthernetRequest::Read {
+                            kind: EthernetReadKind::TransmitDescriptor,
+                            ..
+                        })
+                    ));
+                    let control = 0x8000_0001_u32 | if xie { 0x8000 } else { 0 };
+                    let descriptor = [control, 0x2000, 0x1010]
+                        .into_iter()
+                        .flat_map(u32::to_be_bytes)
+                        .collect::<Vec<_>>();
+                    hpc1.complete_ethernet_read(
+                        EthernetReadKind::TransmitDescriptor,
+                        Some(&descriptor),
+                    );
+                    hpc1.advance_time(VirtualDuration::from_attoseconds(
+                        ATTOSECONDS_PER_SECOND / 1_000_000,
+                    ));
+                    assert!(matches!(
+                        hpc1.next_ethernet_request(true),
+                        Some(EthernetRequest::Read {
+                            kind: EthernetReadKind::TransmitData,
+                            ..
+                        })
+                    ));
+                    hpc1.complete_ethernet_read(EthernetReadKind::TransmitData, Some(&[0x42]));
+                    hpc1.advance_time(VirtualDuration::from_attoseconds(
+                        ATTOSECONDS_PER_SECOND / 1_000_000,
+                    ));
+                    assert!(matches!(
+                        hpc1.next_ethernet_request(true),
+                        Some(EthernetRequest::Transmit(_))
+                    ));
+                    hpc1.complete_ethernet_transmit(status, interrupt);
+                    assert!(!hpc1.ethernet_interrupt_asserted());
+                    let successful = status == 0x08;
+                    assert_eq!(
+                        read_word(&hpc1, 0x34),
+                        Ok(u32::from(status) << 16 | if successful { 0x0040_0000 } else { 0 })
+                    );
+                    assert_eq!(
+                        read_word(&hpc1, 0x28),
+                        Ok(if successful { 0x1000 } else { 0 })
+                    );
+                    hpc1.advance_time(VirtualDuration::from_attoseconds(
+                        ATTOSECONDS_PER_SECOND / 1_000_000,
+                    ));
+                    assert_eq!(
+                        hpc1.ethernet_interrupt_asserted(),
+                        xie || (!successful && interrupt)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ethernet_receive_resource_bound_excludes_the_status_trailer() {
+        use super::EthernetRequest;
+
+        for length in [16_384, 16_385] {
+            let mut hpc1 = Hpc1::new();
+            write_word(&mut hpc1, 0x50, 0x1000);
+            write_word(&mut hpc1, 0x38, 0x4000);
+            hpc1.receive_ethernet_frame(vec![0x55; length], 0x30, false);
+            assert_eq!(
+                matches!(
+                    hpc1.next_ethernet_request(true),
+                    Some(EthernetRequest::Read { .. })
+                ),
+                length == 16_384
+            );
+        }
+    }
+
+    #[test]
     fn reset_values_match_the_ip12_front_end() {
         let hpc1 = Hpc1::new();
 
@@ -1096,7 +1883,7 @@ mod tests {
     #[test]
     fn free_running_counter_accumulates_exact_fractional_ticks_and_wraps() {
         let mut hpc1 = Hpc1::new();
-        let almost_one_tick = ATTOSECONDS_PER_SECOND / FREE_RUNNING_COUNTER_FREQUENCY;
+        let almost_one_tick = ATTOSECONDS_PER_SECOND / HPC_CLOCK_FREQUENCY;
 
         hpc1.advance_time(VirtualDuration::from_attoseconds(almost_one_tick));
         assert_eq!(read_word(&hpc1, FREE_RUNNING_COUNTER), Ok(0));
@@ -1109,7 +1896,7 @@ mod tests {
         ));
         assert_eq!(
             read_word(&hpc1, FREE_RUNNING_COUNTER),
-            Ok((2 * FREE_RUNNING_COUNTER_FREQUENCY % FREE_RUNNING_COUNTER_MODULUS) as u32)
+            Ok((2 * HPC_CLOCK_FREQUENCY % FREE_RUNNING_COUNTER_MODULUS) as u32)
         );
     }
 
@@ -1207,7 +1994,7 @@ mod tests {
                 ETHERNET_PREVIOUS_PACKET_FIRST_TRANSMIT_DESCRIPTOR_POINTER,
                 0x0fff_ffff,
             ),
-            (ETHERNET_RECEIVE_BYTE_COUNT, 0x0000_01ff),
+            (ETHERNET_RECEIVE_BYTE_COUNT, 0x0000_1fff),
             (ETHERNET_CURRENT_RECEIVE_BUFFER_POINTER, 0x8fff_ffff),
             (ETHERNET_NEXT_RECEIVE_DESCRIPTOR_POINTER, 0x0fff_ffff),
             (ETHERNET_CURRENT_RECEIVE_DESCRIPTOR_POINTER, 0x0fff_ffff),
@@ -1233,7 +2020,7 @@ mod tests {
         );
 
         hpc1.advance_time(VirtualDuration::from_attoseconds(
-            ATTOSECONDS_PER_SECOND / FREE_RUNNING_COUNTER_FREQUENCY + 1,
+            ATTOSECONDS_PER_SECOND / HPC_CLOCK_FREQUENCY + 1,
         ));
         assert_eq!(
             read_word(&hpc1, ETHERNET_TIMER),
@@ -1253,7 +2040,7 @@ mod tests {
             ETHERNET_TIMER_EXPIRED | 100 << ETHERNET_TIMER_COUNT_SHIFT,
         );
         hpc1.advance_time(VirtualDuration::from_attoseconds(
-            ATTOSECONDS_PER_SECOND / FREE_RUNNING_COUNTER_FREQUENCY + 1,
+            ATTOSECONDS_PER_SECOND / HPC_CLOCK_FREQUENCY + 1,
         ));
         assert_eq!(
             read_word(&hpc1, ETHERNET_TIMER),
@@ -1649,7 +2436,7 @@ mod tests {
         hpc1.set_parallel_interrupt_pending_for_test(true);
         write_word(&mut hpc1, MISCELLANEOUS_CONTROL, 9);
         hpc1.advance_time(VirtualDuration::from_attoseconds(
-            ATTOSECONDS_PER_SECOND / FREE_RUNNING_COUNTER_FREQUENCY,
+            ATTOSECONDS_PER_SECOND / HPC_CLOCK_FREQUENCY,
         ));
 
         hpc1.reset();
