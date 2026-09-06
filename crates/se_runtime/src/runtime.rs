@@ -4,6 +4,11 @@
 //! machine is installed. They cannot be attached to a machine that has
 //! already executed. All modes continue to use the same worker command queue,
 //! instruction batching, and timed-instruction path.
+//!
+//! Replay checks ordinary Timeline checkpoints before the next instruction.
+//! Terminal verification belongs to this worker: normal endings are verified
+//! at the final boundary, while execution errors are verified only after the
+//! expected failing instruction and its machine-visible side effects recur.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
@@ -766,8 +771,12 @@ impl Worker {
             ActiveMode::Recording(session) => session.recorder.clone(),
             _ => return Err(rejection("no recording is active")),
         };
-        self.record_checkpoint()?;
-        if let Err(error) = recorder.finalize(self.position, &outcome) {
+        let final_fingerprint = checkpoint_digest(
+            self.machine
+                .as_ref()
+                .expect("Recording requires a configured machine"),
+        );
+        if let Err(error) = recorder.finalize(self.position, &outcome, final_fingerprint) {
             let reason = error.to_string();
             self.set_record_failure(recorder, reason.clone());
             return Err(rejection_owned(reason));
@@ -905,7 +914,32 @@ impl Worker {
             _ => return Ok(()),
         };
         if complete {
+            self.verify_replay_final_fingerprint()?;
             self.complete_replay();
+        }
+        Ok(())
+    }
+
+    /// Checks the machine-defined terminal fingerprint after the outcome occurs.
+    ///
+    /// Normal endings call this at the final instruction boundary. Execution
+    /// errors call it only after the failing instruction has been attempted and
+    /// its address and description have matched. The fingerprint covers only
+    /// the state selected by the machine, not its complete recoverable snapshot.
+    fn verify_replay_final_fingerprint(&self) -> Result<(), String> {
+        let ActiveMode::Replaying(session) = &self.mode else {
+            unreachable!("terminal verification requires an active Replay");
+        };
+        let actual = checkpoint_digest(
+            self.machine
+                .as_ref()
+                .expect("Replay requires a configured machine"),
+        );
+        if actual != session.final_fingerprint() {
+            return Err(format!(
+                "Replay final fingerprint mismatch at epoch {}, instruction {}",
+                self.position.epoch, self.position.completed_instructions
+            ));
         }
         Ok(())
     }
@@ -971,7 +1005,10 @@ impl Worker {
                 _ => false,
             };
             if expected {
-                self.complete_replay();
+                match self.verify_replay_final_fingerprint() {
+                    Ok(()) => self.complete_replay(),
+                    Err(reason) => self.set_replay_divergence(reason),
+                }
             } else {
                 self.set_replay_divergence(format!(
                     "unexpected execution error at 0x{address:08x}: {error_text}"
@@ -2000,6 +2037,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             .finalize(
                 ExecutionPosition::default(),
                 &crate::record::RecordOutcome::UserStopped,
+                checkpoint_digest(&machine_with_instructions(&[0x1000_ffff, 0])),
             )
             .unwrap();
         let runtime = Runtime::new_unconfigured().unwrap();
@@ -2092,7 +2130,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
     }
 
     #[test]
-    fn final_checkpoint_detects_replay_cpu_divergence() {
+    fn final_fingerprint_detects_replay_cpu_divergence() {
         let path = record_path("checkpoint-divergence");
         let _ = fs::remove_file(&path);
         let recorder = started_recorder(&path);
@@ -2116,7 +2154,12 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             .unwrap();
         let status = runtime.step().unwrap();
         assert_eq!(status.mode, RuntimeMode::ReplayDiverged);
-        assert!(status.session_error.is_some());
+        assert!(
+            status
+                .session_error
+                .unwrap()
+                .contains("final fingerprint mismatch")
+        );
         runtime.shutdown().unwrap();
         fs::remove_file(path).unwrap();
     }
@@ -2157,6 +2200,292 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         assert!(replayed.last_error.is_some());
         runtime.shutdown().unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    /// Installs two matching KSEG2 mappings, then faults on a data translation.
+    fn tlb_shutdown_instructions() -> [u32; 16] {
+        [
+            0x3c08_c000, // lui t0, 0xc000
+            0x4088_5000, // mtc0 t0, EntryHi
+            0x2409_0600, // addiu t1, zero, 0x600
+            0x4089_1000, // mtc0 t1, EntryLo
+            0x4080_0000, // mtc0 zero, Index
+            0,
+            0,
+            0x4200_0002, // tlbwi
+            0x2409_0100, // addiu t1, zero, 0x100
+            0x4089_0000, // mtc0 t1, Index
+            0,
+            0,
+            0x4200_0002, // tlbwi
+            0,
+            0,
+            0x8d0a_0000, // lw t2, 0(t0)
+        ]
+    }
+
+    #[test]
+    fn tlb_shutdown_replays_after_checkpoint_and_snapshot_at_the_final_boundary() {
+        let instructions = tlb_shutdown_instructions();
+        let final_count = (instructions.len() - 1) as u64;
+        for reset in [false, true] {
+            let path = record_path(&format!("terminal-tlb-{reset}"));
+            remove_record_artifacts(&path);
+            let mut recording = super::Worker::new(None);
+            recording
+                .configure(RuntimeConfiguration::recording(
+                    machine_with_instructions(&instructions),
+                    started_recorder(&path),
+                ))
+                .unwrap();
+            if reset {
+                let (reply, response) = mpsc::channel();
+                recording.handle_command(super::Command::Reset(reply));
+                response.recv().unwrap().unwrap();
+            }
+            // Use a short deadline to exercise periodic checkpoint scheduling.
+            let super::ActiveMode::Recording(session) = &mut recording.mode else {
+                unreachable!();
+            };
+            session.next_checkpoint_instruction = Some(final_count);
+            for _ in 0..final_count {
+                recording.step_once().unwrap();
+            }
+            let before = checkpoint_digest(recording.machine.as_ref().unwrap());
+            let position = recording.position;
+            let instant = recording.virtual_instant;
+            let completed = recording.completed_instructions;
+            let recorded = recording.step_once().unwrap();
+            assert_eq!(
+                recorded.last_error.as_deref(),
+                Some("R3000 TLB is in shutdown state")
+            );
+            assert_eq!(recorded.mode, RuntimeMode::Normal);
+            assert_eq!(recorded.position, position);
+            assert_eq!(recorded.completed_instructions, completed);
+            assert_eq!(recording.virtual_instant, instant);
+            let terminal = checkpoint_digest(recording.machine.as_ref().unwrap());
+            assert_ne!(before, terminal);
+            drop(recording);
+
+            let mut replay = super::Worker::new(None);
+            replay
+                .configure(RuntimeConfiguration::replaying(
+                    machine_with_instructions(&instructions),
+                    Replayer::open(&path).unwrap(),
+                ))
+                .unwrap();
+            for count in 1..=final_count {
+                replay.step_once().unwrap();
+                if count >= final_count - 1 {
+                    replay.create_replay_snapshot().unwrap();
+                }
+            }
+            assert_eq!(replay.status().mode, RuntimeMode::Replaying);
+            assert_eq!(replay.position, position);
+            assert_eq!(checkpoint_digest(replay.machine.as_ref().unwrap()), before);
+            let completed = replay.step_once().unwrap();
+            assert_eq!(completed.mode, RuntimeMode::ReplayCompleted);
+            assert_eq!(completed.last_error, recorded.last_error);
+            assert!(completed.session_error.is_none());
+            assert_eq!(
+                checkpoint_digest(replay.machine.as_ref().unwrap()),
+                terminal
+            );
+            assert_eq!(replay.virtual_instant, instant);
+            assert!(replay.create_replay_snapshot().is_err());
+            drop(replay);
+
+            let snapshots = Replayer::snapshot_catalog(&path).unwrap();
+            assert_eq!(snapshots.len(), 2);
+            for snapshot in snapshots {
+                let mut replay = super::Worker::new(None);
+                let restored = replay
+                    .configure(RuntimeConfiguration::replaying(
+                        machine_with_instructions(&instructions),
+                        Replayer::open_snapshot(&path, snapshot.id()).unwrap(),
+                    ))
+                    .unwrap();
+                assert_eq!(restored.mode, RuntimeMode::Replaying);
+                assert_eq!(restored.state, RuntimeState::Paused);
+                while replay.position.completed_instructions < final_count {
+                    replay.step_once().unwrap();
+                }
+                let address = replay.machine.as_ref().unwrap().execution_address();
+                replay.breakpoints.insert(address);
+                assert!(replay.pause_for_breakpoint());
+                assert_eq!(checkpoint_digest(replay.machine.as_ref().unwrap()), before);
+                let completed = replay.step_once().unwrap();
+                assert_eq!(completed.mode, RuntimeMode::ReplayCompleted);
+                assert_eq!(completed.position, position);
+                assert_eq!(completed.last_error, recorded.last_error);
+                assert!(completed.session_error.is_none());
+                assert_eq!(
+                    checkpoint_digest(replay.machine.as_ref().unwrap()),
+                    terminal
+                );
+                assert_eq!(replay.virtual_instant, instant);
+            }
+            remove_record_artifacts(&path);
+        }
+    }
+
+    #[test]
+    fn first_instruction_error_replays_without_advancing_time_or_position() {
+        // BLEZ with a nonzero rt field has undefined behavior.
+        let instructions = [0x1821_0000];
+        let path = record_path("first-instruction-error");
+        remove_record_artifacts(&path);
+        let mut recording = super::Worker::new(None);
+        recording
+            .configure(RuntimeConfiguration::recording(
+                machine_with_instructions(&instructions),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        let recorded = recording.step_once().unwrap();
+        assert_eq!(recorded.mode, RuntimeMode::Normal);
+        assert!(recorded.last_error.is_some());
+        assert_eq!(recorded.position, ExecutionPosition::default());
+        drop(recording);
+        let mut replay = super::Worker::new(None);
+        let opened = replay
+            .configure(RuntimeConfiguration::replaying(
+                machine_with_instructions(&instructions),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(opened.mode, RuntimeMode::Replaying);
+        let completed = replay.step_once().unwrap();
+        assert_eq!(completed.mode, RuntimeMode::ReplayCompleted);
+        assert_eq!(completed.last_error, recorded.last_error);
+        assert_eq!(completed.completed_instructions, 0);
+        assert_eq!(completed.position, ExecutionPosition::default());
+        assert_eq!(replay.virtual_instant, se_core::time::VirtualInstant::ZERO);
+        drop(replay);
+        remove_record_artifacts(&path);
+    }
+
+    #[test]
+    fn execution_error_replay_rejects_wrong_outcome_or_terminal_fingerprint() {
+        use crate::record::RecordOutcome;
+
+        let instructions = tlb_shutdown_instructions();
+        let mut machine = machine_with_instructions(&instructions);
+        for _ in 0..instructions.len() - 1 {
+            machine.execute_instruction().unwrap();
+        }
+        let address = machine.execution_address();
+        let description = machine.execute_instruction().unwrap_err().to_string();
+        let terminal = checkpoint_digest(&machine);
+        let position = ExecutionPosition {
+            epoch: 0,
+            completed_instructions: (instructions.len() - 1) as u64,
+        };
+        for case in ["address", "description", "fingerprint", "early", "missing"] {
+            let path = record_path(&format!("terminal-mismatch-{case}"));
+            remove_record_artifacts(&path);
+            let mut expected_position = position;
+            if case == "early" {
+                expected_position.completed_instructions += 1;
+            }
+            let outcome = RecordOutcome::ExecutionError {
+                address: if case == "address" {
+                    address + 4
+                } else {
+                    address
+                },
+                description: if case == "description" {
+                    String::from("different error")
+                } else {
+                    description.clone()
+                },
+            };
+            let mut digest = terminal;
+            if case == "fingerprint" {
+                digest[0] ^= 1;
+            }
+            started_recorder(&path)
+                .finalize(expected_position, &outcome, digest)
+                .unwrap();
+            let mut replay_instructions = instructions;
+            if case == "missing" {
+                replay_instructions[instructions.len() - 1] = 0;
+            }
+            let mut replay = super::Worker::new(None);
+            replay
+                .configure(RuntimeConfiguration::replaying(
+                    machine_with_instructions(&replay_instructions),
+                    Replayer::open(&path).unwrap(),
+                ))
+                .unwrap();
+            for _ in 0..instructions.len() {
+                replay.step_once().unwrap();
+            }
+            let status = replay.status();
+            assert_eq!(status.mode, RuntimeMode::ReplayDiverged, "{case}");
+            let reason = status.session_error.unwrap();
+            let expected = match case {
+                "fingerprint" => "final fingerprint mismatch",
+                "missing" => "instruction succeeded",
+                _ => "unexpected execution error",
+            };
+            assert!(reason.contains(expected), "{case}: {reason}");
+            assert_eq!(status.position, position);
+            assert!(replay.step_once().is_err());
+            drop(replay);
+            remove_record_artifacts(&path);
+        }
+    }
+
+    #[test]
+    fn normal_endings_verify_the_fingerprint_without_executing_the_next_instruction() {
+        use crate::record::RecordOutcome;
+
+        for outcome in [RecordOutcome::UserStopped, RecordOutcome::Shutdown] {
+            for mismatch in [false, true] {
+                let path = record_path(&format!("normal-terminal-{outcome:?}-{mismatch}"));
+                remove_record_artifacts(&path);
+                let machine = machine_with_instructions(&[0x2408_0001]);
+                let mut digest = checkpoint_digest(&machine);
+                if mismatch {
+                    digest[0] ^= 1;
+                }
+                started_recorder(&path)
+                    .finalize(ExecutionPosition::default(), &outcome, digest)
+                    .unwrap();
+                let mut replay = super::Worker::new(None);
+                let status = replay
+                    .configure(RuntimeConfiguration::replaying(
+                        machine,
+                        Replayer::open(&path).unwrap(),
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    status.mode,
+                    if mismatch {
+                        RuntimeMode::ReplayDiverged
+                    } else {
+                        RuntimeMode::ReplayCompleted
+                    }
+                );
+                assert_eq!(status.completed_instructions, 0);
+                assert_eq!(
+                    replay.machine.as_ref().unwrap().execution_address(),
+                    0xbfc0_0000
+                );
+                if mismatch {
+                    assert!(
+                        status
+                            .session_error
+                            .unwrap()
+                            .contains("final fingerprint mismatch")
+                    );
+                }
+                drop(replay);
+                remove_record_artifacts(&path);
+            }
+        }
     }
 
     struct RecordingStorage {
