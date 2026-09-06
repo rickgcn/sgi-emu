@@ -154,6 +154,10 @@ impl Pic1 {
 
     /// Writes one fixed-width device-local transaction.
     ///
+    /// Writes to PARERR are accepted without changing state. Only CLRERR
+    /// clears the latched errors. PARERR write completion is a compatibility
+    /// assumption that has not been verified against hardware.
+    ///
     /// # Errors
     ///
     /// Returns [`BusError::InvalidTransaction`] for an invalid length or
@@ -179,11 +183,12 @@ impl Pic1 {
             self.cpu_control = value & !SYSTEM_INITIALIZE;
         } else if register_offset(start, end, RESET_CONFIGURATION).is_some()
             || register_offset(start, end, SYSTEM_ID).is_some()
-            || register_offset(start, end, PARITY_ERROR).is_some()
             || register_offset(start, end, CPU_ERROR_ADDRESS).is_some()
             || register_offset(start, end, GIO_ERROR_ADDRESS).is_some()
         {
             return Err(BusError::UnimplementedAccess);
+        } else if register_offset(start, end, PARITY_ERROR).is_some() {
+            return Ok(());
         } else if register_offset(start, end, CLEAR_ERROR).is_some() {
             self.parity_error = 0;
             self.address_error_pending = false;
@@ -729,13 +734,42 @@ mod tests {
     }
 
     #[test]
-    fn read_only_registers_reject_writes() {
+    fn parity_error_writes_preserve_latched_errors() {
+        let mut pic1 = pic1();
+        pic1.parity_error = 0xa5;
+        pic1.cpu_error_address = 0x1234_5678;
+        pic1.gio_error_address = 0x9abc_def0;
+        pic1.report_address_error();
+
+        for value in [0_u32, u32::MAX] {
+            for (offset, length) in [(0, 4), (0, 1), (3, 1), (2, 2)] {
+                assert_eq!(
+                    pic1.write(
+                        DeviceAddr::new(PARITY_ERROR + offset),
+                        &value.to_be_bytes()[..length],
+                    ),
+                    Ok(())
+                );
+                assert_eq!(read_word(&pic1, PARITY_ERROR), Ok(0xa5));
+                assert_eq!(read_word(&pic1, CPU_ERROR_ADDRESS), Ok(0x1234_5678));
+                assert_eq!(read_word(&pic1, GIO_ERROR_ADDRESS), Ok(0x9abc_def0));
+                assert!(pic1.error_interrupt_asserted());
+            }
+        }
+
+        assert_eq!(
+            pic1.write(DeviceAddr::new(PARITY_ERROR + 3), &[0; 2]),
+            Err(BusError::HardwareFault)
+        );
+    }
+
+    #[test]
+    fn other_read_only_registers_reject_writes() {
         let mut pic1 = pic1();
 
         for address in [
             RESET_CONFIGURATION,
             SYSTEM_ID,
-            PARITY_ERROR,
             CPU_ERROR_ADDRESS,
             GIO_ERROR_ADDRESS,
         ] {
