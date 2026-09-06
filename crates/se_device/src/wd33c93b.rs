@@ -1,10 +1,25 @@
 //! Western Digital WD33C93B indirect-register and command model.
+//!
+//! The host access layout uses two four-byte windows, with the connected byte
+//! at offsets 2 and 6 (bits 15:8 of each big-endian word). This is the adopted
+//! host layout, not an intrinsic property of the eight-bit WD chip interface.
+//! The machine chooses the physical mapping. Indigo IP12 header byte addresses
+//! and NetBSD word accesses provide the layout evidence; the WD33C93A manual
+//! describes the underlying indirect access and interrupt rules.
+//!
+//! Aligned byte, halfword, and word transactions access at most one chip port.
+//! Unconnected lanes read zero and ignore writes without a chip access. This
+//! convention and rejection of other transaction shapes are model choices,
+//! not verified Indigo hardware responses. Undefined chip registers retain
+//! their all-ones data value in the connected lane.
 
 use se_core::bus::{BusError, DeviceAddr};
 use serde::{Deserialize, Serialize};
 
-const ADDRESS_PORT: u64 = 0;
-const DATA_PORT: u64 = 4;
+const ADDRESS_PORT: u64 = 2;
+const DATA_PORT: u64 = 6;
+const REGISTER_BYTES: u64 = 4;
+const HOST_WINDOW_BYTES: u64 = 8;
 
 const OWN_ID: u8 = 0x00;
 const CONTROL: u8 = 0x01;
@@ -142,67 +157,91 @@ impl Wd33c93b {
         self.software_reset_completed = false;
     }
 
-    /// Reads one byte from the indirect interface.
+    /// Reads one transaction from the device-local host register windows.
     ///
     /// Reading SCSI Status acknowledges the current interrupt and advances the
-    /// selector to Command.
+    /// selector to Command. Each transaction accesses at most one byte port.
     ///
     /// # Errors
     ///
-    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
-    /// [`BusError::UnimplementedAccess`] unless the transaction selects
-    /// exactly one modeled byte port.
+    /// Returns [`BusError::InvalidTransaction`] for invalid lengths or address
+    /// overflow, or [`BusError::UnimplementedAccess`] for unsupported offsets,
+    /// widths, alignment, or transactions crossing a register window.
     pub fn read(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
-        match decode_port(address, data.len())? {
-            Port::Address => data[0] = self.auxiliary_status(),
-            Port::Data => {
-                let register = self.selected_register;
-                data[0] = self.read_selected_register(register);
-                if register == SCSI_STATUS {
-                    self.interrupt_pending = false;
-                    self.selected_register = COMMAND;
-                } else if selector_advances(register) {
-                    self.selected_register = register.wrapping_add(1) & 0x1f;
-                }
+        let access = decode_access(address, data.len())?;
+        data.fill(0);
+        if let Some(lane) = access.lane {
+            data[lane] = self.read_port(access.port);
+        }
+        Ok(())
+    }
+
+    /// Reads a host register window without changing selector or interrupt state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BusError::InvalidTransaction`] for invalid lengths or address
+    /// overflow, or [`BusError::UnimplementedAccess`] for unsupported offsets,
+    /// widths, alignment, or transactions crossing a register window.
+    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
+        let access = decode_access(address, data.len())?;
+        data.fill(0);
+        if let Some(lane) = access.lane {
+            data[lane] = self.peek_port(access.port);
+        }
+        Ok(())
+    }
+
+    /// Writes only the connected byte in a device-local host register window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BusError::InvalidTransaction`] for invalid lengths or address
+    /// overflow, or [`BusError::UnimplementedAccess`] for unsupported offsets,
+    /// widths, alignment, or transactions crossing a register window.
+    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
+        let access = decode_access(address, data.len())?;
+        if let Some(lane) = access.lane {
+            self.write_port(access.port, data[lane]);
+        }
+        Ok(())
+    }
+
+    /// Performs one eight-bit chip read and applies its register side effects.
+    fn read_port(&mut self, port: Port) -> u8 {
+        let value = self.peek_port(port);
+        if matches!(port, Port::Data) {
+            let register = self.selected_register;
+            if register == SCSI_STATUS {
+                self.interrupt_pending = false;
+                self.selected_register = COMMAND;
+            } else if selector_advances(register) {
+                self.selected_register = register.wrapping_add(1) & 0x1f;
             }
         }
-        Ok(())
+        value
     }
 
-    /// Reads one byte without acknowledging interrupts or advancing the selector.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
-    /// [`BusError::UnimplementedAccess`] unless the transaction selects
-    /// exactly one modeled byte port.
-    pub fn debug_read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
-        match decode_port(address, data.len())? {
-            Port::Address => data[0] = self.auxiliary_status(),
-            Port::Data => data[0] = self.read_selected_register(self.selected_register),
+    /// Observes one eight-bit chip port without strobing the selected register.
+    fn peek_port(&self, port: Port) -> u8 {
+        match port {
+            Port::Address => self.auxiliary_status(),
+            Port::Data => self.read_selected_register(self.selected_register),
         }
-        Ok(())
     }
 
-    /// Writes one byte to the indirect interface.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BusError::InvalidTransaction`] for an invalid length, or
-    /// [`BusError::UnimplementedAccess`] unless the transaction selects
-    /// exactly one modeled byte port.
-    pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
-        match decode_port(address, data.len())? {
-            Port::Address => self.selected_register = data[0] & 0x1f,
+    /// Performs one eight-bit chip write and applies its register side effects.
+    fn write_port(&mut self, port: Port, value: u8) {
+        match port {
+            Port::Address => self.selected_register = value & 0x1f,
             Port::Data => {
                 let register = self.selected_register;
-                self.write_selected_register(register, data[0]);
+                self.write_selected_register(register, value);
                 if selector_advances(register) {
                     self.selected_register = register.wrapping_add(1) & 0x1f;
                 }
             }
         }
-        Ok(())
     }
 
     /// Returns and clears one pending Select-And-Transfer request.
@@ -383,20 +422,38 @@ enum Port {
     Data,
 }
 
-fn decode_port(address: DeviceAddr, length: usize) -> Result<Port, BusError> {
+/// One validated host transaction and its optional connected byte.
+struct PortAccess {
+    port: Port,
+    lane: Option<usize>,
+}
+
+fn decode_access(address: DeviceAddr, length: usize) -> Result<PortAccess, BusError> {
     if !(1..=4).contains(&length) {
         return Err(BusError::InvalidTransaction);
     }
 
-    if length != 1 {
+    let start = address.get();
+    let length = length as u64;
+    let end = start
+        .checked_add(length)
+        .ok_or(BusError::InvalidTransaction)?;
+    if end > HOST_WINDOW_BYTES
+        || start / REGISTER_BYTES != (end - 1) / REGISTER_BYTES
+        || !matches!(length, 1 | 2 | 4)
+        || !start.is_multiple_of(length)
+    {
         return Err(BusError::UnimplementedAccess);
     }
 
-    match address.get() {
-        ADDRESS_PORT => Ok(Port::Address),
-        DATA_PORT => Ok(Port::Data),
-        _ => Err(BusError::UnimplementedAccess),
-    }
+    let (port, connected_byte) = if start < REGISTER_BYTES {
+        (Port::Address, ADDRESS_PORT)
+    } else {
+        (Port::Data, DATA_PORT)
+    };
+    let lane = (start <= connected_byte && connected_byte < end)
+        .then(|| (connected_byte - start) as usize);
+    Ok(PortAccess { port, lane })
 }
 
 const fn selector_advances(register: u8) -> bool {
@@ -422,6 +479,90 @@ mod tests {
         OWN_ID, SCSI_STATUS, SELECT_AND_TRANSFER, SOURCE_ID, TARGET_LUN, TIMEOUT_PERIOD,
         TRANSFER_COUNT_MSB, UNEXPECTED_DATA_IN_STATUS, UNEXPECTED_DATA_OUT_STATUS, Wd33c93b,
     };
+
+    fn read_word(scsi: &mut Wd33c93b, offset: u64) -> Result<u32, BusError> {
+        let mut bytes = [0; 4];
+        scsi.read(DeviceAddr::new(offset), &mut bytes)?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
+    #[test]
+    fn access_widths_share_the_connected_byte_and_ignore_other_write_bits() {
+        let mut scsi = Wd33c93b::new();
+        for (offset, selector, value) in [
+            (2, vec![2], vec![0xa5]),
+            (2, vec![2, 0xff], vec![0xa5, 0xff]),
+            (0, vec![0xff, 0xff, 2, 0xff], vec![0xff, 0xff, 0xa5, 0xff]),
+        ] {
+            scsi.write(DeviceAddr::new(offset), &selector).unwrap();
+            scsi.write(DeviceAddr::new(4 + offset), &value).unwrap();
+            for (read_offset, expected) in [
+                (2, vec![0xa5]),
+                (2, vec![0xa5, 0]),
+                (0, vec![0, 0, 0xa5, 0]),
+            ] {
+                scsi.write(DeviceAddr::new(ADDRESS_PORT), &[2]).unwrap();
+                let mut actual = vec![0xff; expected.len()];
+                scsi.read(DeviceAddr::new(4 + read_offset), &mut actual)
+                    .unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn unconnected_lanes_do_not_access_the_selected_register() {
+        let mut scsi = Wd33c93b::new();
+        write_register(&mut scsi, 2, 0xa5);
+        scsi.write(DeviceAddr::new(ADDRESS_PORT), &[2]).unwrap();
+        for slot in [0, 4] {
+            for (offset, length) in [(0, 1), (1, 1), (3, 1), (0, 2)] {
+                let address = DeviceAddr::new(slot + offset);
+                let mut bytes = vec![0xff; length];
+                scsi.write(address, &bytes).unwrap();
+                scsi.read(address, &mut bytes).unwrap();
+                assert_eq!(bytes, vec![0; length]);
+            }
+        }
+        assert_eq!(read_port(&mut scsi, DATA_PORT), Ok(0xa5));
+        scsi.write(DeviceAddr::new(ADDRESS_PORT), &[0x17]).unwrap();
+        assert_eq!(read_port(&mut scsi, 4), Ok(0));
+        assert_eq!(read_port(&mut scsi, ADDRESS_PORT), Ok(0x80));
+    }
+
+    #[test]
+    fn invalid_accesses_preserve_output_and_device_state() {
+        let mut scsi = Wd33c93b::new();
+        scsi.write(DeviceAddr::new(ADDRESS_PORT), &[0x17]).unwrap();
+        for (offset, length, error) in [
+            (0, 0, BusError::InvalidTransaction),
+            (0, 5, BusError::InvalidTransaction),
+            (u64::MAX, 2, BusError::InvalidTransaction),
+            (0, 3, BusError::UnimplementedAccess),
+            (1, 2, BusError::UnimplementedAccess),
+            (2, 4, BusError::UnimplementedAccess),
+            (7, 2, BusError::UnimplementedAccess),
+            (8, 1, BusError::UnimplementedAccess),
+        ] {
+            let mut bytes = vec![0xa5; length];
+            let address = DeviceAddr::new(offset);
+            assert_eq!(scsi.read(address, &mut bytes), Err(error));
+            assert_eq!(bytes, vec![0xa5; length]);
+            assert_eq!(scsi.debug_read(address, &mut bytes), Err(error));
+            assert_eq!(bytes, vec![0xa5; length]);
+            assert_eq!(scsi.write(address, &bytes), Err(error));
+        }
+        assert_eq!(read_port(&mut scsi, ADDRESS_PORT), Ok(0x80));
+        assert_eq!(read_port(&mut scsi, DATA_PORT), Ok(0));
+        assert_eq!(read_port(&mut scsi, ADDRESS_PORT), Ok(0));
+    }
+
+    #[test]
+    fn undefined_chip_registers_keep_their_all_ones_value_in_the_connected_lane() {
+        let mut scsi = Wd33c93b::new();
+        scsi.write(DeviceAddr::new(ADDRESS_PORT), &[0x1a]).unwrap();
+        assert_eq!(read_word(&mut scsi, 4), Ok(0xff00));
+    }
 
     fn read_port(scsi: &mut Wd33c93b, port: u64) -> Result<u8, BusError> {
         let mut value = [0];
@@ -611,11 +752,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            scsi.write(DeviceAddr::new(DATA_PORT), &[1, 2]),
+            scsi.write(DeviceAddr::new(DATA_PORT), &[1, 2, 3]),
             Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
-            scsi.write(DeviceAddr::new(2), &[1]),
+            scsi.write(DeviceAddr::new(8), &[1]),
             Err(BusError::UnimplementedAccess)
         );
         assert_eq!(scsi.timeout_period, 0);

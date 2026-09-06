@@ -323,7 +323,7 @@ pub(super) fn write_cpu_aux_control(
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{DeviceAddr, PhysAddr, PhysicalBus};
+    use se_core::bus::{BusError, DeviceAddr, PhysAddr, PhysicalBus};
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
 
     use crate::output::MachineOutput;
@@ -332,7 +332,8 @@ mod tests {
     use super::{Ip12Bus, SCSI_INTERRUPT, drive_hpc1_interrupt_inputs};
 
     use super::super::address::{
-        HPC1_SCSI_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE, INT2_BASE, SCSI_BASE, SERIAL_1_BASE,
+        HPC1_SCSI_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE, INT2_BASE, SCSI_ADDRESS_PORT,
+        SCSI_DATA_PORT, SCSI_WINDOW_BASE, SERIAL_1_BASE,
     };
     use super::super::test_support::{
         bus, bus_with_cdrom, bus_with_disk, bus_with_disk_and_cdrom, bus_with_disk_failures,
@@ -485,16 +486,114 @@ mod tests {
     }
 
     #[test]
+    fn word_data_reads_advance_once_and_debug_reads_preserve_status() {
+        let mut bus = bus();
+        write_scsi_register(&mut bus, 2, 0xa5);
+        write_scsi_register(&mut bus, 3, 0x5a);
+        bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[2]).unwrap();
+        assert_eq!(read_word(&mut bus, SCSI_WINDOW_BASE + 4), Ok(0xa500));
+        assert_eq!(read_byte(&mut bus, SCSI_DATA_PORT), Ok(0x5a));
+
+        bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[0x17])
+            .unwrap();
+        let mut status = [0xff; 4];
+        for _ in 0..2 {
+            bus.debug_read(PhysAddr::new(SCSI_WINDOW_BASE + 4), &mut status)
+                .unwrap();
+            assert_eq!(status, [0; 4]);
+            assert_eq!(read_word(&mut bus, INT2_BASE).unwrap() & 4, 4);
+        }
+        assert_eq!(read_word(&mut bus, SCSI_WINDOW_BASE + 4), Ok(0));
+        assert_eq!(read_word(&mut bus, INT2_BASE).unwrap() & 4, 0);
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0));
+
+        // Status advanced to Command: this word write executes software reset.
+        bus.write(PhysAddr::new(SCSI_WINDOW_BASE + 4), &[0xff, 0xff, 0, 0xff])
+            .unwrap();
+        assert_eq!(read_word(&mut bus, INT2_BASE).unwrap() & 4, 4);
+        assert!(!bus.wd33c93b.take_reset_completion());
+    }
+
+    #[test]
+    fn word_commands_schedule_requests_and_reset_cancels_them() {
+        let mut bus = bus();
+        bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[0x17])
+            .unwrap();
+        read_word(&mut bus, SCSI_WINDOW_BASE + 4).unwrap();
+        bus.write(
+            PhysAddr::new(SCSI_WINDOW_BASE + 4),
+            &0x800_u32.to_be_bytes(),
+        )
+        .unwrap();
+        assert!(bus.pending_scsi.is_some());
+        bus.write(PhysAddr::new(SCSI_WINDOW_BASE + 4), &0_u32.to_be_bytes())
+            .unwrap();
+        assert!(bus.pending_scsi.is_none());
+        assert!(!bus.wd33c93b.take_reset_completion());
+    }
+
+    #[test]
+    fn unsupported_scsi_cross_port_access_does_not_latch_a_hardware_error() {
+        let mut bus = bus();
+        bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[0x17])
+            .unwrap();
+        let mut bytes = [0xa5; 4];
+        let address = PhysAddr::new(SCSI_ADDRESS_PORT);
+        assert_eq!(
+            bus.read(address, &mut bytes),
+            Err(BusError::UnimplementedAccess)
+        );
+        assert_eq!(bytes, [0xa5; 4]);
+        assert_eq!(
+            bus.debug_read(address, &mut bytes),
+            Err(BusError::UnimplementedAccess)
+        );
+        assert_eq!(bytes, [0xa5; 4]);
+        assert_eq!(
+            bus.write(address, &bytes),
+            Err(BusError::UnimplementedAccess)
+        );
+        assert!(!bus.error_interrupt_asserted());
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x80));
+        assert_eq!(read_byte(&mut bus, SCSI_DATA_PORT), Ok(0));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0));
+    }
+
+    #[test]
+    fn netbsd_scsi_probe_reads_words_without_acknowledging_reset() {
+        let mut bus = bus();
+        write_scsi_register(&mut bus, 2, 0xa5);
+        for _ in 0..100 {
+            read_word(&mut bus, HPC1_SCSI_CONTROL_BASE).unwrap();
+        }
+        bus.write(PhysAddr::new(HPC1_SCSI_CONTROL_BASE), &1_u32.to_be_bytes())
+            .unwrap();
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND / 1000),
+            &mut MachineOutput::default(),
+        );
+        bus.write(PhysAddr::new(HPC1_SCSI_CONTROL_BASE), &0_u32.to_be_bytes())
+            .unwrap();
+        bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[2]).unwrap();
+        for _ in 0..100 {
+            let status = read_word(&mut bus, SCSI_WINDOW_BASE).unwrap();
+            assert_eq!((status >> 8) & 0xff, 0x80);
+            assert_eq!(read_word(&mut bus, INT2_BASE).unwrap() & 4, 4);
+        }
+        assert_eq!(read_byte(&mut bus, SCSI_DATA_PORT), Ok(0xa5));
+    }
+
+    #[test]
     fn hpc1_scsi_reset_reaches_the_wd33c93b() {
         let mut bus = bus();
-        bus.write(PhysAddr::new(SCSI_BASE), &[2]).unwrap();
-        bus.write(PhysAddr::new(SCSI_BASE + 4), &[0xa5]).unwrap();
+        bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[2]).unwrap();
+        bus.write(PhysAddr::new(SCSI_DATA_PORT), &[0xa5]).unwrap();
         bus.write(PhysAddr::new(HPC1_SCSI_CONTROL_BASE + 3), &[1])
             .unwrap();
-        bus.write(PhysAddr::new(SCSI_BASE), &[2]).unwrap();
+        bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[2]).unwrap();
 
-        assert_eq!(read_byte(&mut bus, SCSI_BASE + 4), Ok(0xa5));
-        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x80));
+        assert_eq!(read_byte(&mut bus, SCSI_DATA_PORT), Ok(0xa5));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x80));
     }
 
     #[test]
@@ -517,16 +616,17 @@ mod tests {
     #[test]
     fn scsi_debug_reads_do_not_acknowledge_status() {
         let mut bus = bus();
-        bus.write(PhysAddr::new(SCSI_BASE), &[0x17]).unwrap();
+        bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[0x17])
+            .unwrap();
         let mut status = [0xff];
 
-        bus.debug_read(PhysAddr::new(SCSI_BASE + 4), &mut status)
+        bus.debug_read(PhysAddr::new(SCSI_DATA_PORT), &mut status)
             .unwrap();
 
         assert_eq!(status, [0]);
-        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x80));
-        assert_eq!(read_byte(&mut bus, SCSI_BASE + 4), Ok(0));
-        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x80));
+        assert_eq!(read_byte(&mut bus, SCSI_DATA_PORT), Ok(0));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0));
     }
 
     #[test]
@@ -538,7 +638,7 @@ mod tests {
             .unwrap();
 
         issue_read_ten(&mut bus, 1, 0);
-        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x30));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x30));
         let mut output = MachineOutput::default();
         bus.advance_time(VirtualDuration::ZERO, &mut output);
 
@@ -676,7 +776,7 @@ mod tests {
         bus.advance_time(VirtualDuration::ZERO, &mut output);
 
         assert_eq!(bus.scsi_bus.active_address(), Some((1, 0)));
-        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x30));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x30));
         assert_eq!(
             read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE + 0x0c),
             Ok(0x10)
@@ -929,7 +1029,7 @@ mod tests {
         bus.advance_time(VirtualDuration::ZERO, &mut output);
 
         assert_eq!(bus.scsi_bus.active_address(), Some((1, 0)));
-        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x30));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x30));
     }
 
     #[test]
@@ -1020,7 +1120,7 @@ mod tests {
         bus.advance_time(VirtualDuration::ZERO, &mut output);
 
         assert!(bus.error_interrupt_asserted());
-        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x30));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x30));
     }
 
     #[test]

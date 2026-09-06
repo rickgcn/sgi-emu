@@ -34,8 +34,12 @@ const SEEQ8003_RECEIVE_ALIAS: u64 = 0x1fb8_005b;
 const SEEQ8003_TRANSMIT_ALIAS: u64 = 0x1fb8_005f;
 const SEEQ8003_RECEIVE_COMMAND: u64 = 0x1b;
 const SEEQ8003_TRANSMIT_COMMAND: u64 = 0x1f;
-pub(super) const SCSI_BASE: u64 = 0x1fb8_0122;
-const SCSI_END: u64 = 0x1fb8_0127;
+pub(super) const SCSI_WINDOW_BASE: u64 = 0x1fb8_0120;
+const SCSI_WINDOW_END: u64 = 0x1fb8_0128;
+#[cfg(test)]
+pub(super) const SCSI_ADDRESS_PORT: u64 = SCSI_WINDOW_BASE + 2;
+#[cfg(test)]
+pub(super) const SCSI_DATA_PORT: u64 = SCSI_WINDOW_BASE + 6;
 pub(super) const CENTRONICS_EXTERNAL_BASE: u64 = 0x1fb8_0134;
 const CENTRONICS_EXTERNAL_END: u64 = 0x1fb8_0138;
 pub(super) const CPU_AUX_CONTROL: u64 = 0x1fb8_01bf;
@@ -133,10 +137,10 @@ pub(super) fn route(address: PhysAddr, length: usize) -> Result<Target, BusError
         return Err(BusError::HardwareFault);
     }
 
-    if contains(start, end, SCSI_BASE, SCSI_END) {
-        return Ok(Target::Scsi(DeviceAddr::new(start - SCSI_BASE)));
+    if contains(start, end, SCSI_WINDOW_BASE, SCSI_WINDOW_END) {
+        return Ok(Target::Scsi(DeviceAddr::new(start - SCSI_WINDOW_BASE)));
     }
-    if overlaps(start, end, SCSI_BASE, SCSI_END) {
+    if overlaps(start, end, SCSI_WINDOW_BASE, SCSI_WINDOW_END) {
         return Err(BusError::HardwareFault);
     }
     if contains(
