@@ -41,6 +41,8 @@ const PROM_BYTES: usize = 0x40000;
 const RAM_BYTES: usize = 8 * 1024 * 1024;
 const CPU_FREQUENCY_HZ: u64 = 33_000_000;
 const SERIAL_CLOCK_HZ: u64 = 3_686_400;
+// HP-1 schematic, sheet 15: U72 CLK is connected to CLK.20.
+const SCSI_CLOCK_HZ: u64 = 20_000_000;
 
 /// Capacity of one SIMM installed in an Indigo IP12 memory bank.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -415,7 +417,7 @@ impl Ip12 {
                 CentronicsPort::new(),
                 Seeq8003::new(),
                 Int2::new(),
-                Wd33c93b::new(),
+                Wd33c93b::new(SCSI_CLOCK_HZ),
                 scsi_bus,
                 [Z85230::new(SERIAL_CLOCK_HZ), Z85230::new(SERIAL_CLOCK_HZ)],
                 Dp8573a::new(),
