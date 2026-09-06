@@ -21,7 +21,9 @@ use se_device::z85230::Z85230;
 
 use super::super::PROM_BYTES;
 use super::Ip12Bus;
-use super::address::{CPU_AUX_CONTROL, HPC1_SCSI_REGISTERS_BASE, PIC1_BASE, SCSI_BASE};
+use super::address::{
+    CPU_AUX_CONTROL, HPC1_SCSI_REGISTERS_BASE, PIC1_BASE, SCSI_ADDRESS_PORT, SCSI_DATA_PORT,
+};
 
 pub(super) fn bus() -> Ip12Bus {
     bus_with_memory([Some(Ram::new(8 * 1024 * 1024)), None, None, None])
@@ -264,13 +266,15 @@ pub(super) fn configure_serial_a(bus: &mut Ip12Bus, base: u64) {
 }
 
 pub(super) fn write_scsi_register(bus: &mut Ip12Bus, register: u8, value: u8) {
-    bus.write(PhysAddr::new(SCSI_BASE), &[register]).unwrap();
-    bus.write(PhysAddr::new(SCSI_BASE + 4), &[value]).unwrap();
+    bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[register])
+        .unwrap();
+    bus.write(PhysAddr::new(SCSI_DATA_PORT), &[value]).unwrap();
 }
 
 pub(super) fn read_scsi_register(bus: &mut Ip12Bus, register: u8) -> u8 {
-    bus.write(PhysAddr::new(SCSI_BASE), &[register]).unwrap();
-    read_byte(bus, SCSI_BASE + 4).unwrap()
+    bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[register])
+        .unwrap();
+    read_byte(bus, SCSI_DATA_PORT).unwrap()
 }
 
 pub(super) fn configure_single_scsi_descriptor(bus: &mut Ip12Bus, buffer_address: u32) {

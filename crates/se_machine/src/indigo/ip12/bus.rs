@@ -402,7 +402,7 @@ mod tests {
         BOARD_REVISION_BASE, CENTRONICS_EXTERNAL_BASE, CPU_AUX_CONTROL, DSP56001_BASE,
         DSP56001_END, GIO_BASE, GIO_END, HPC1_COUNTER_BASE, HPC1_DSP_INTERRUPT_MASK_BASE,
         HPC1_DSP_INTERRUPT_STATUS_BASE, HPC1_ENDIAN_CONTROL_BASE, INT2_BASE, MDAC_BASE, PIC1_BASE,
-        PROM_BASE, RTC_BASE, SCSI_BASE, SERIAL_0_BASE, SERIAL_1_BASE,
+        PROM_BASE, RTC_BASE, SCSI_ADDRESS_PORT, SERIAL_0_BASE, SERIAL_1_BASE,
     };
     use super::test_support::{
         bus, configure_memory, nvram_command, nvram_read_word, nvram_write_word, read_byte,
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(read_word(&mut bus, PIC1_BASE + 4), Ok(0xf7));
         assert_eq!(read_word(&mut bus, HPC1_ENDIAN_CONTROL_BASE), Ok(0x40));
         assert_eq!(read_word(&mut bus, BOARD_REVISION_BASE), Ok(0x8000));
-        assert_eq!(read_byte(&mut bus, SCSI_BASE), Ok(0x80));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x80));
         assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0b), Ok(0x04));
         assert_eq!(read_byte(&mut bus, SERIAL_1_BASE + 0x03), Ok(0x04));
 
