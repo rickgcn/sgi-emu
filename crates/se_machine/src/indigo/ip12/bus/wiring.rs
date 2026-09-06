@@ -2,7 +2,8 @@ use se_core::bus::BusError;
 use se_core::time::VirtualDuration;
 use se_device::int2::Int2;
 use se_device::nmc93cs46::Nmc93cs46;
-use se_device::scsi::{ScsiCommandStart, ScsiDataDirection, ScsiTransferResult};
+use se_device::scsi::{ScsiDataDirection, ScsiTransferResult};
+use se_device::wd33c93b::WdWork;
 use se_device::z85230::Z85230;
 
 use super::super::events::EventKind;
@@ -40,7 +41,7 @@ impl Ip12Bus {
             self.scsi_bus.cancel_transaction();
             self.events.schedule(EventKind::Scsi, None);
         }
-        if let Some(request) = self.wd33c93b.take_select_and_transfer_request() {
+        if let Some(request) = self.wd33c93b.take_request() {
             self.pending_scsi = Some(request);
             self.events
                 .schedule(EventKind::Scsi, Some(VirtualDuration::ZERO));
@@ -59,6 +60,9 @@ impl Ip12Bus {
             self.events.schedule(EventKind::Scsi, None);
         }
         self.service_scsi_descriptor_fetch();
+        if self.wd33c93b.dma_pending() {
+            self.transfer_active_scsi_data(self.wd33c93b.remaining_transfer_bytes());
+        }
         self.synchronize_scsi_interrupt();
         self.synchronize_hpc1_interrupts();
     }
@@ -67,31 +71,20 @@ impl Ip12Bus {
         let Some(request) = self.pending_scsi.take() else {
             return;
         };
-        let address = (request.destination_id(), request.lun());
-        match self.scsi_bus.active_address() {
-            Some(active_address) if active_address == address => {
-                self.transfer_active_scsi_data(request.transfer_count());
-            }
-            Some(_) => self.hpc1.stop_scsi_dma(),
-            None => match self.scsi_bus.start_command(
-                request.destination_id(),
-                request.lun(),
-                request.cdb(),
-            ) {
-                Ok(ScsiCommandStart::SelectionTimeout) => {
-                    self.wd33c93b.finish_selection_timeout();
-                }
-                Ok(ScsiCommandStart::Complete { status }) => {
-                    self.wd33c93b.finish_select_and_transfer(status.byte());
-                }
-                Ok(ScsiCommandStart::DataIn { .. }) => {
-                    self.transfer_scsi_data_in(request.transfer_count());
-                }
-                Ok(ScsiCommandStart::DataOut { .. }) => {
-                    self.transfer_scsi_data_out(request.transfer_count());
-                }
-                Err(_) => self.hpc1.stop_scsi_dma(),
+        match self.wd33c93b.service_request(request, &mut self.scsi_bus) {
+            Ok(WdWork::Idle) => {}
+            Ok(WdWork::Dma {
+                direction,
+                byte_count,
+            }) => match direction {
+                ScsiDataDirection::In => self.transfer_scsi_data_in(byte_count),
+                ScsiDataDirection::Out => self.transfer_scsi_data_out(byte_count),
             },
+            Ok(WdWork::SelectionWait(duration)) => {
+                self.pending_scsi = self.wd33c93b.take_request();
+                self.events.schedule(EventKind::Scsi, duration);
+            }
+            Err(_) => self.hpc1.stop_scsi_dma(),
         }
         self.synchronize_scsi_interrupt();
     }
@@ -107,7 +100,7 @@ impl Ip12Bus {
     fn transfer_scsi_data_in(&mut self, mut wd_bytes_remaining: u32) {
         if wd_bytes_remaining == 0 {
             self.hpc1.finish_scsi_dma();
-            self.wd33c93b.request_data_in_continuation();
+            self.finish_scsi_dma_window(None);
             return;
         }
 
@@ -159,13 +152,13 @@ impl Ip12Bus {
                     wd_bytes_remaining -= transferred;
                     if wd_bytes_remaining == 0 {
                         self.hpc1.finish_scsi_dma();
-                        self.wd33c93b.request_data_in_continuation();
+                        self.finish_scsi_dma_window(None);
                         return;
                     }
                 }
                 Ok(ScsiTransferResult::Complete { status, .. }) => {
                     self.hpc1.finish_scsi_dma();
-                    self.wd33c93b.finish_select_and_transfer(status.byte());
+                    self.finish_scsi_dma_window(Some(status));
                     return;
                 }
             }
@@ -175,7 +168,7 @@ impl Ip12Bus {
     fn transfer_scsi_data_out(&mut self, mut wd_bytes_remaining: u32) {
         if wd_bytes_remaining == 0 {
             self.hpc1.finish_scsi_dma();
-            self.wd33c93b.request_data_out_continuation();
+            self.finish_scsi_dma_window(None);
             return;
         }
 
@@ -217,7 +210,7 @@ impl Ip12Bus {
                         .expect("SCSI bus cannot exceed the WD transfer window");
                     if wd_bytes_remaining == 0 {
                         self.hpc1.finish_scsi_dma();
-                        self.wd33c93b.request_data_out_continuation();
+                        self.finish_scsi_dma_window(None);
                         return;
                     }
                 }
@@ -229,10 +222,20 @@ impl Ip12Bus {
                         self.advance_scsi_data_out(transferred);
                     }
                     self.hpc1.finish_scsi_dma();
-                    self.wd33c93b.finish_select_and_transfer(status.byte());
+                    self.finish_scsi_dma_window(Some(status));
                     return;
                 }
             }
+        }
+    }
+
+    fn finish_scsi_dma_window(&mut self, status: Option<se_device::scsi::ScsiStatus>) {
+        if self
+            .wd33c93b
+            .finish_dma(&mut self.scsi_bus, status)
+            .is_err()
+        {
+            self.hpc1.stop_scsi_dma();
         }
     }
 
@@ -776,7 +779,7 @@ mod tests {
         bus.advance_time(VirtualDuration::ZERO, &mut output);
 
         assert_eq!(bus.scsi_bus.active_address(), Some((1, 0)));
-        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x30));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x20));
         assert_eq!(
             read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE + 0x0c),
             Ok(0x10)
@@ -1029,24 +1032,29 @@ mod tests {
         bus.advance_time(VirtualDuration::ZERO, &mut output);
 
         assert_eq!(bus.scsi_bus.active_address(), Some((1, 0)));
-        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x30));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x80));
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x40);
     }
 
     #[test]
-    fn absent_targets_and_wrong_luns_complete_with_selection_timeout() {
-        for (target, lun) in [(1, 0), (4, 0), (4, 1)] {
-            let mut bus = if lun == 0 {
-                bus()
-            } else {
-                bus_with_cdrom(vec![0; 2048], false)
-            };
+    fn absent_targets_complete_after_the_programmed_selection_timeout() {
+        for target in [1, 4] {
+            let mut bus = bus();
             write_scsi_register(&mut bus, 0x17, 0);
             bus.write(PhysAddr::new(INT2_BASE + 7), &[SCSI_INTERRUPT])
                 .unwrap();
-            issue_scsi_command(&mut bus, target, lun, 0, &[0, 0, 0, 0, 0, 0]);
+            issue_scsi_command(&mut bus, target, 0, 0, &[0, 0, 0, 0, 0, 0]);
             let mut output = MachineOutput::default();
 
             bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+            assert!(!bus.local_interrupt_0_asserted());
+            bus.advance_time(
+                VirtualDuration::from_attoseconds(4 * ATTOSECONDS_PER_SECOND / 1000 - 1),
+                &mut output,
+            );
+            assert!(!bus.local_interrupt_0_asserted());
+            bus.advance_time(VirtualDuration::from_attoseconds(1), &mut output);
 
             assert_eq!(
                 read_word(&mut bus, INT2_BASE),
@@ -1120,7 +1128,7 @@ mod tests {
         bus.advance_time(VirtualDuration::ZERO, &mut output);
 
         assert!(bus.error_interrupt_asserted());
-        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x30));
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x20));
     }
 
     #[test]
@@ -1142,6 +1150,346 @@ mod tests {
             .read(DeviceAddr::new(0x2000), &mut copied)
             .unwrap();
         assert_eq!(copied, vec![0; 512]);
+    }
+
+    fn service_scsi(bus: &mut super::Ip12Bus) {
+        bus.advance_time(VirtualDuration::ZERO, &mut MachineOutput::default());
+    }
+
+    fn simple_scsi_command(bus: &mut super::Ip12Bus, command: u8) {
+        write_scsi_register(bus, 0x18, command);
+        service_scsi(bus);
+    }
+
+    fn scsi_count(bus: &mut super::Ip12Bus, count: u32) {
+        for (register, value) in [
+            (0x12, (count >> 16) as u8),
+            (0x13, (count >> 8) as u8),
+            (0x14, count as u8),
+        ] {
+            write_scsi_register(bus, register, value);
+        }
+    }
+
+    fn select_scsi(bus: &mut super::Ip12Bus, target: u8) {
+        read_scsi_register(bus, 0x17);
+        write_scsi_register(bus, 0x15, target);
+        simple_scsi_command(bus, 6);
+        assert_eq!(read_scsi_register(bus, 0x17), 0x11);
+        assert_eq!(read_byte(bus, SCSI_ADDRESS_PORT), Ok(0));
+        service_scsi(bus);
+        assert_eq!(read_scsi_register(bus, 0x17), 0x8e);
+    }
+
+    fn pio_send(bus: &mut super::Ip12Bus, bytes: &[u8]) -> u8 {
+        write_scsi_register(bus, 1, 0);
+        scsi_count(bus, bytes.len() as u32);
+        simple_scsi_command(bus, 0x20);
+        for &byte in bytes {
+            assert_eq!(read_byte(bus, SCSI_ADDRESS_PORT), Ok(0x21));
+            write_scsi_register(bus, 0x19, byte);
+            service_scsi(bus);
+        }
+        assert_eq!(read_scsi_register(bus, 0x14), 0);
+        read_scsi_register(bus, 0x17)
+    }
+
+    fn pio_receive(bus: &mut super::Ip12Bus, count: usize) -> (Vec<u8>, u8) {
+        write_scsi_register(bus, 1, 0);
+        scsi_count(bus, count as u32);
+        simple_scsi_command(bus, 0x20);
+        let mut bytes = Vec::new();
+        for _ in 0..count {
+            assert_eq!(read_byte(bus, SCSI_ADDRESS_PORT), Ok(0x21));
+            bytes.push(read_scsi_register(bus, 0x19));
+            service_scsi(bus);
+        }
+        (bytes, read_scsi_register(bus, 0x17))
+    }
+
+    fn finish_scsi(bus: &mut super::Ip12Bus) -> u8 {
+        // Deliberately poison the automatic CDB registers. Resuming at 0x46
+        // must finish the existing command without decoding another CDB.
+        write_scsi_register(bus, 3, 0xff);
+        scsi_count(bus, 0);
+        write_scsi_register(bus, 0x10, 0x46);
+        simple_scsi_command(bus, 8);
+        assert_eq!(read_scsi_register(bus, 0x17), 0x16);
+        assert_eq!(read_scsi_register(bus, 0x10), 0x60);
+        assert_eq!(bus.scsi_bus.phase(), None);
+        read_scsi_register(bus, 0x0f)
+    }
+
+    #[test]
+    fn netbsd_selection_sdtr_and_polled_disk_probe_complete_in_phases() {
+        let mut bus = bus_with_disk(vec![0; 1024], false);
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x80, 1, 3, 1, 25, 12]), 0x1f);
+        let mut message = Vec::new();
+        for index in 0..5 {
+            // SBT ignores the preset and clears Transfer Count on success.
+            scsi_count(&mut bus, 0x1234);
+            simple_scsi_command(&mut bus, 0xa0);
+            message.push(read_scsi_register(&mut bus, 0x19));
+            service_scsi(&mut bus);
+            assert_eq!(read_scsi_register(&mut bus, 0x17), 0x20);
+            assert_eq!(read_scsi_register(&mut bus, 0x13), 0);
+            assert_eq!(read_scsi_register(&mut bus, 0x14), 0);
+            simple_scsi_command(&mut bus, 3);
+            assert_eq!(
+                read_scsi_register(&mut bus, 0x17),
+                if index == 4 { 0x8a } else { 0x8f }
+            );
+        }
+        assert_eq!(message, [1, 3, 1, 25, 0]);
+        assert_eq!(pio_send(&mut bus, &[0x12, 0, 0, 0, 36, 0]), 0x19);
+        let (inquiry, status) = pio_receive(&mut bus, 36);
+        assert_eq!(status, 0x1b);
+        assert_eq!(&inquiry[8..16], b"SGI-EMU ");
+        assert_eq!(inquiry[7] & 2, 0);
+        assert_eq!(finish_scsi(&mut bus), 0);
+
+        for (cdb, count) in [
+            (vec![0; 6], 0),
+            (vec![0x03, 0, 0, 0, 18, 0], 18),
+            (vec![0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0], 8),
+        ] {
+            select_scsi(&mut bus, 1);
+            scsi_count(&mut bus, 0);
+            simple_scsi_command(&mut bus, 0xa0);
+            write_scsi_register(&mut bus, 0x19, 0x80);
+            service_scsi(&mut bus);
+            assert_eq!(read_scsi_register(&mut bus, 0x17), 0x1a);
+            assert_eq!(
+                pio_send(&mut bus, &cdb),
+                if count == 0 { 0x1b } else { 0x19 }
+            );
+            if count != 0 {
+                let (data, csr) = pio_receive(&mut bus, count);
+                assert_eq!(csr, 0x1b);
+                if cdb[0] == 0x25 {
+                    assert_eq!(data, [0, 0, 0, 1, 0, 0, 2, 0]);
+                }
+            }
+            assert_eq!(finish_scsi(&mut bus), 0);
+        }
+    }
+
+    #[test]
+    fn independent_pio_write_and_dma_read_share_the_same_disk() {
+        let mut bus = bus_with_disk(vec![0; 512], false);
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x80]), 0x1a);
+        assert_eq!(pio_send(&mut bus, &[0x2a, 0, 0, 0, 0, 0, 0, 0, 1, 0]), 0x18);
+        let payload: Vec<u8> = (0..512).map(|index| (index ^ (index >> 8)) as u8).collect();
+        assert_eq!(pio_send(&mut bus, &payload), 0x1b);
+        assert_eq!(finish_scsi(&mut bus), 0);
+
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x80]), 0x1a);
+        assert_eq!(pio_send(&mut bus, &[0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0]), 0x19);
+        write_scsi_register(&mut bus, 1, 0x80);
+        scsi_count(&mut bus, 512);
+        simple_scsi_command(&mut bus, 0x20);
+        assert!(!bus.wd33c93b.interrupt_asserted());
+        // The HPC may be started after the WD has already asserted its request.
+        configure_single_scsi_descriptor(&mut bus, 0x2000);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x1b);
+        assert_eq!(read_memory(&bus, 0x2000, 512), payload);
+        assert_eq!(finish_scsi(&mut bus), 0);
+    }
+
+    #[test]
+    fn unsupported_lun_is_not_a_selection_timeout() {
+        let mut bus = bus_with_disk(vec![0; 512], false);
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x81]), 0x1a);
+        assert_eq!(pio_send(&mut bus, &[0x12, 0, 0, 0, 36, 0]), 0x19);
+        let (inquiry, csr) = pio_receive(&mut bus, 36);
+        assert_eq!(inquiry[0], 0x7f);
+        assert_eq!(csr, 0x1b);
+        assert_eq!(finish_scsi(&mut bus), 0);
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x81]), 0x1a);
+        assert_eq!(pio_send(&mut bus, &[0; 6]), 0x1b);
+        assert_eq!(finish_scsi(&mut bus), 2);
+    }
+
+    #[test]
+    fn pio_snapshot_and_debug_reads_preserve_the_unconsumed_byte() {
+        let mut bus = bus_with_disk(vec![0; 512], false);
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x80]), 0x1a);
+        assert_eq!(pio_send(&mut bus, &[0x12, 0, 0, 0, 36, 0]), 0x19);
+        scsi_count(&mut bus, 36);
+        simple_scsi_command(&mut bus, 0x20);
+        write_scsi_register(&mut bus, 0x1f, 0);
+        bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[0x19])
+            .unwrap();
+        let snapshot = bus.snapshot().unwrap();
+        for _ in 0..2 {
+            let mut byte = [0xff];
+            bus.debug_read(PhysAddr::new(SCSI_DATA_PORT), &mut byte)
+                .unwrap();
+            assert_eq!(byte, [0]);
+        }
+        assert_eq!(read_scsi_register(&mut bus, 0x19), 0);
+        service_scsi(&mut bus);
+        assert_eq!(read_scsi_register(&mut bus, 0x14), 34);
+        bus.restore_snapshot(snapshot).unwrap();
+        assert_eq!(read_scsi_register(&mut bus, 0x14), 35);
+        assert_eq!(read_scsi_register(&mut bus, 0x19), 0);
+        service_scsi(&mut bus);
+        assert_eq!(read_scsi_register(&mut bus, 0x14), 34);
+    }
+
+    #[test]
+    fn disabled_selection_timeout_is_cancelled_by_abort_and_reset() {
+        let mut bus = bus();
+        read_scsi_register(&mut bus, 0x17);
+        write_scsi_register(&mut bus, 0x15, 2);
+        simple_scsi_command(&mut bus, 6);
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND),
+            &mut MachineOutput::default(),
+        );
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x20));
+        simple_scsi_command(&mut bus, 1);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x22);
+        write_scsi_register(&mut bus, 2, 1);
+        simple_scsi_command(&mut bus, 6);
+        simple_scsi_command(&mut bus, 0);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0);
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND),
+            &mut MachineOutput::default(),
+        );
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0));
+    }
+
+    #[test]
+    fn zero_count_transfers_one_byte_and_selection_without_atn_skips_messages() {
+        let mut bus = bus_with_disk(vec![0; 512], false);
+        read_scsi_register(&mut bus, 0x17);
+        write_scsi_register(&mut bus, 0x15, 1);
+        simple_scsi_command(&mut bus, 7);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x11);
+        service_scsi(&mut bus);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x8a);
+        for index in 0..6 {
+            scsi_count(&mut bus, 0);
+            simple_scsi_command(&mut bus, 0x20);
+            assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x21));
+            write_scsi_register(&mut bus, 0x19, 0);
+            service_scsi(&mut bus);
+            assert_eq!(
+                read_scsi_register(&mut bus, 0x17),
+                if index == 5 { 0x1b } else { 0x1a }
+            );
+            assert_eq!(read_scsi_register(&mut bus, 0x14), 0);
+        }
+        assert_eq!(finish_scsi(&mut bus), 0);
+    }
+
+    #[test]
+    fn pio_storage_failures_preserve_residuals_without_fabricating_data() {
+        for write in [false, true] {
+            let mut bus = bus_with_disk_failures(vec![0; 512], !write, write);
+            select_scsi(&mut bus, 1);
+            assert_eq!(pio_send(&mut bus, &[0x80]), 0x1a);
+            assert_eq!(
+                pio_send(
+                    &mut bus,
+                    &[if write { 0x2a } else { 0x28 }, 0, 0, 0, 0, 0, 0, 0, 1, 0]
+                ),
+                if write { 0x18 } else { 0x19 }
+            );
+            scsi_count(&mut bus, 512);
+            simple_scsi_command(&mut bus, 0x20);
+            if write {
+                write_scsi_register(&mut bus, 0x19, 0x5a);
+                service_scsi(&mut bus);
+            }
+            assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x80));
+            assert_eq!(read_scsi_register(&mut bus, 0x17), 0x4b);
+            assert_eq!(read_scsi_register(&mut bus, 0x13), 2);
+            assert_eq!(read_scsi_register(&mut bus, 0x14), 0);
+            assert_eq!(finish_scsi(&mut bus), 2);
+            assert!(!bus.error_interrupt_asserted());
+        }
+    }
+
+    #[test]
+    fn abort_drains_prefetched_input_and_disconnect_releases_the_transaction() {
+        let mut bus = bus_with_disk(vec![0x5a; 512], false);
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x80]), 0x1a);
+        assert_eq!(pio_send(&mut bus, &[0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0]), 0x19);
+        scsi_count(&mut bus, 512);
+        simple_scsi_command(&mut bus, 0x20);
+        simple_scsi_command(&mut bus, 1);
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x21));
+        assert_eq!(read_scsi_register(&mut bus, 0x19), 0x5a);
+        service_scsi(&mut bus);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x29);
+        assert_eq!(read_scsi_register(&mut bus, 0x13), 1);
+        assert_eq!(read_scsi_register(&mut bus, 0x14), 255);
+        assert_eq!(bus.scsi_bus.active_address(), Some((1, 0)));
+        simple_scsi_command(&mut bus, 4);
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0));
+        assert_eq!(bus.scsi_bus.phase(), None);
+        assert_eq!(bus.scsi_bus.active_address(), None);
+    }
+
+    #[test]
+    fn attention_rejects_a_message_and_abort_message_releases_the_bus() {
+        let mut bus = bus_with_disk(vec![0; 512], false);
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x80, 1, 3, 1, 25, 8]), 0x1f);
+        simple_scsi_command(&mut bus, 0xa0);
+        assert_eq!(read_scsi_register(&mut bus, 0x19), 1);
+        service_scsi(&mut bus);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x20);
+        simple_scsi_command(&mut bus, 2);
+        assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0));
+        simple_scsi_command(&mut bus, 3);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x8e);
+        assert_eq!(pio_send(&mut bus, &[7]), 0x1a);
+        simple_scsi_command(&mut bus, 2);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x8e);
+        assert_eq!(pio_send(&mut bus, &[6]), 0x85);
+        assert_eq!(bus.scsi_bus.phase(), None);
+    }
+
+    #[test]
+    fn dma_write_can_continue_in_pio_with_a_short_final_response() {
+        let mut bus = bus_with_disk(vec![0; 512], false);
+        configure_scsi_write_descriptor_chain(&mut bus, 0x1000, 0x2000, &[256]);
+        write_memory(&mut bus, 0x2000, &[0xa5; 256]);
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x80]), 0x1a);
+        assert_eq!(pio_send(&mut bus, &[0x2a, 0, 0, 0, 0, 0, 0, 0, 1, 0]), 0x18);
+        write_scsi_register(&mut bus, 1, 0x80);
+        scsi_count(&mut bus, 256);
+        simple_scsi_command(&mut bus, 0x20);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x18);
+        assert_eq!(pio_send(&mut bus, &[0x5a; 256]), 0x1b);
+        assert_eq!(finish_scsi(&mut bus), 0);
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x80]), 0x1a);
+        assert_eq!(pio_send(&mut bus, &[0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0]), 0x19);
+        scsi_count(&mut bus, 1024);
+        simple_scsi_command(&mut bus, 0x20);
+        for index in 0..512 {
+            assert_eq!(
+                read_scsi_register(&mut bus, 0x19),
+                if index < 256 { 0xa5 } else { 0x5a }
+            );
+            service_scsi(&mut bus);
+        }
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x4b);
+        assert_eq!(read_scsi_register(&mut bus, 0x13), 2);
+        assert_eq!(finish_scsi(&mut bus), 0);
     }
 
     #[test]

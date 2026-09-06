@@ -1,4 +1,11 @@
 //! Shared types and functional bus coordination for SCSI targets.
+//!
+//! A connection owns target selection, message/CDB assembly and information
+//! phases independently of the byte-range storage transaction. Targets remain
+//! connected through Status and Command Complete. The functional target port
+//! accepts IDENTIFY and negotiates asynchronous SDTR, without advertising tagged
+//! queuing or disconnect/reselection. No controller register codes or board DMA
+//! addresses are interpreted here.
 
 use std::error::Error;
 use std::fmt;
@@ -212,6 +219,8 @@ pub enum ScsiBusError {
     NoDataOutTransaction,
     /// The caller supplied a zero-byte transfer limit.
     EmptyDataBuffer,
+    /// The operation does not match the connected target's information phase.
+    InvalidPhase,
 }
 
 impl fmt::Display for ScsiBusError {
@@ -234,6 +243,7 @@ impl fmt::Display for ScsiBusError {
                 formatter.write_str("no SCSI Data Out transaction is active")
             }
             Self::EmptyDataBuffer => formatter.write_str("SCSI transfer limit is zero"),
+            Self::InvalidPhase => formatter.write_str("invalid SCSI information-phase operation"),
         }
     }
 }
@@ -269,6 +279,51 @@ pub enum ScsiDataDirection {
     In,
     /// Bytes move from the initiator to the target.
     Out,
+}
+
+/// Information phases on the functional, single-initiator SCSI bus.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ScsiPhase {
+    /// Initiator-to-target payload.
+    DataOut = 0,
+    /// Target-to-initiator payload.
+    DataIn = 1,
+    /// Command descriptor block.
+    Command = 2,
+    /// Target command status.
+    Status = 3,
+    /// Initiator message bytes.
+    MessageOut = 6,
+    /// Target message bytes, acknowledged explicitly by the initiator.
+    MessageIn = 7,
+}
+
+impl ScsiPhase {
+    /// Returns the MSG, C/D and I/O signal encoding.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self as u8
+    }
+
+    /// Reports whether bytes travel towards the initiator.
+    #[must_use]
+    pub const fn input(self) -> bool {
+        self.bits() & 1 != 0
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct ScsiConnection {
+    target_id: u8,
+    lun: u8,
+    identified: bool,
+    phase: ScsiPhase,
+    return_phase: ScsiPhase,
+    cdb: Vec<u8>,
+    message_out: Vec<u8>,
+    message_in: Vec<u8>,
+    message_offset: usize,
+    status: ScsiStatus,
 }
 
 /// The result of one accepted or rejected data-transfer chunk.
@@ -326,6 +381,7 @@ enum ScsiTransfer {
 pub struct ScsiBus {
     targets: TargetRegistry,
     active_transaction: Option<ScsiTransaction>,
+    connection: Option<ScsiConnection>,
 }
 
 /// Complete restorable SCSI protocol state without backing-storage objects.
@@ -333,6 +389,7 @@ pub struct ScsiBus {
 pub struct ScsiBusSnapshot {
     targets: Vec<(u8, u8, ScsiTargetSnapshot)>,
     active_transaction: Option<ScsiTransaction>,
+    connection: Option<ScsiConnection>,
 }
 
 /// A snapshot that is incompatible with the cold-constructed SCSI topology.
@@ -354,6 +411,7 @@ impl ScsiBus {
         Self {
             targets: std::array::from_fn(|_| None),
             active_transaction: None,
+            connection: None,
         }
     }
 
@@ -376,6 +434,7 @@ impl ScsiBus {
         Ok(ScsiBusSnapshot {
             targets,
             active_transaction: self.active_transaction.clone(),
+            connection: self.connection.clone(),
         })
     }
 
@@ -408,6 +467,16 @@ impl ScsiBus {
         if let Some(transaction) = &snapshot.active_transaction {
             validate_snapshot_transaction(transaction, &self.targets)?;
         }
+        if let Some(connection) = &snapshot.connection
+            && (!self.target_present(connection.target_id)
+                || connection.lun >= 8
+                || connection.cdb.len() > 16
+                || connection.message_out.len() > 257
+                || connection.message_in.len() > 257
+                || connection.message_offset > connection.message_in.len())
+        {
+            return Err(ScsiSnapshotError);
+        }
 
         for (attachment, state) in self.targets.iter_mut().zip(target_states) {
             let (Some(attachment), Some(state)) = (attachment, state) else {
@@ -418,7 +487,296 @@ impl ScsiBus {
             }
         }
         self.active_transaction = snapshot.active_transaction;
+        self.connection = snapshot.connection;
         Ok(())
+    }
+
+    /// Reports selection response independently of the requested logical unit.
+    #[must_use]
+    pub fn target_present(&self, target_id: u8) -> bool {
+        target_id < 8 && (0..8).any(|lun| self.targets[usize::from(target_id) * 8 + lun].is_some())
+    }
+
+    /// Selects a target without executing a CDB. An absent target leaves the bus free.
+    ///
+    /// # Errors
+    /// Returns [`ScsiBusError::InvalidPhase`] when a connection or transaction exists.
+    pub fn select(&mut self, target_id: u8, attention: bool) -> Result<bool, ScsiBusError> {
+        if self.connection.is_some() || self.active_transaction.is_some() {
+            return Err(ScsiBusError::InvalidPhase);
+        }
+        if !self.target_present(target_id) {
+            return Ok(false);
+        }
+        self.connection = Some(ScsiConnection {
+            target_id,
+            lun: 0,
+            identified: false,
+            phase: if attention {
+                ScsiPhase::MessageOut
+            } else {
+                ScsiPhase::Command
+            },
+            return_phase: ScsiPhase::Command,
+            cdb: Vec::new(),
+            message_out: Vec::new(),
+            message_in: Vec::new(),
+            message_offset: 0,
+            status: ScsiStatus::Good,
+        });
+        Ok(true)
+    }
+
+    /// Returns the target's current phase, or `None` for Bus Free.
+    #[must_use]
+    pub fn phase(&self) -> Option<ScsiPhase> {
+        self.connection.as_ref().map(|connection| connection.phase)
+    }
+
+    /// Returns the connected address even after the data transaction has ended.
+    #[must_use]
+    pub fn connected_address(&self) -> Option<(u8, u8)> {
+        self.connection
+            .as_ref()
+            .map(|connection| (connection.target_id, connection.lun))
+    }
+
+    /// Accepts one initiator information byte. `last` releases ATN for Message Out.
+    /// Returns `false` if storage failed before accepting the byte.
+    ///
+    /// # Errors
+    /// Returns [`ScsiBusError`] for an invalid phase or failed transaction coordination.
+    pub fn write_information(&mut self, value: u8, last: bool) -> Result<bool, ScsiBusError> {
+        match self.phase().ok_or(ScsiBusError::InvalidPhase)? {
+            ScsiPhase::MessageOut => {
+                let connection = self.connection.as_mut().unwrap();
+                if connection.message_out.len() == 257 {
+                    return Err(ScsiBusError::InvalidPhase);
+                }
+                connection.message_out.push(value);
+                if last {
+                    self.finish_message_out();
+                }
+            }
+            ScsiPhase::Command => {
+                let connection = self.connection.as_mut().unwrap();
+                if connection.cdb.len() == 16 {
+                    return Err(ScsiBusError::InvalidPhase);
+                }
+                connection.cdb.push(value);
+                let length = match connection.cdb[0] >> 5 {
+                    0 => 6,
+                    1 | 2 => 10,
+                    4 => 16,
+                    5 => 12,
+                    _ => 6,
+                };
+                if connection.cdb.len() == length {
+                    self.execute_connected_command()?;
+                }
+            }
+            ScsiPhase::DataOut => {
+                let result = self.transfer_data_out(1, |bytes| {
+                    bytes[0] = value;
+                    true
+                })?;
+                self.observe_transfer_result(result);
+                return Ok(matches!(
+                    result,
+                    ScsiTransferResult::More { transferred: 1, .. }
+                        | ScsiTransferResult::Complete { transferred: 1, .. }
+                ));
+            }
+            _ => return Err(ScsiBusError::InvalidPhase),
+        }
+        Ok(true)
+    }
+
+    fn finish_message_out(&mut self) {
+        let connection = self.connection.as_mut().unwrap();
+        let bytes = std::mem::take(&mut connection.message_out);
+        if bytes == [6] {
+            self.cancel_transaction();
+            return;
+        }
+        let mut offset = 0;
+        let mut response = Vec::new();
+        while offset < bytes.len() {
+            match bytes[offset] {
+                value if value & 0x80 != 0 => {
+                    connection.lun = value & 7;
+                    connection.identified = true;
+                    offset += 1;
+                }
+                // Agree to asynchronous transfer (offset zero), without advertising tags.
+                1 if offset + 5 <= bytes.len()
+                    && bytes[offset + 1] == 3
+                    && bytes[offset + 2] == 1 =>
+                {
+                    response.extend_from_slice(&[1, 3, 1, bytes[offset + 3], 0]);
+                    offset += 5;
+                }
+                7 | 8 => offset += 1,
+                _ => {
+                    response.push(7);
+                    break;
+                }
+            }
+        }
+        if response.is_empty() {
+            connection.phase = connection.return_phase;
+        } else {
+            connection.message_in = response;
+            connection.message_offset = 0;
+            connection.phase = ScsiPhase::MessageIn;
+        }
+    }
+
+    fn execute_connected_command(&mut self) -> Result<(), ScsiBusError> {
+        let connection = self.connection.as_mut().unwrap();
+        if !connection.identified && connection.cdb[0] >> 5 == 0 {
+            connection.lun = connection.cdb[1] >> 5;
+        }
+        let (target_id, lun, cdb) = (connection.target_id, connection.lun, connection.cdb.clone());
+        let result = self.start_command(target_id, lun, &cdb)?;
+        match result {
+            ScsiCommandStart::Complete { status } => self.set_status(status),
+            ScsiCommandStart::DataIn { .. } => {
+                self.connection.as_mut().unwrap().phase = ScsiPhase::DataIn
+            }
+            ScsiCommandStart::DataOut { .. } => {
+                self.connection.as_mut().unwrap().phase = ScsiPhase::DataOut
+            }
+            ScsiCommandStart::SelectionTimeout => self.start_missing_lun_response(&cdb),
+        }
+        Ok(())
+    }
+
+    fn start_missing_lun_response(&mut self, cdb: &[u8]) {
+        let connection = self.connection.as_ref().unwrap();
+        let target_id = connection.target_id;
+        let data = match cdb[0] {
+            0x12 => {
+                let mut bytes = vec![0; 36];
+                bytes[0] = 0x7f;
+                bytes[4] = 31;
+                bytes.truncate(usize::from(cdb[4]));
+                bytes
+            }
+            0x03 => SenseData::new(5, 0x25, 0).fixed_response(cdb[4]),
+            _ => {
+                self.set_status(ScsiStatus::CheckCondition);
+                return;
+            }
+        };
+        if data.is_empty() {
+            self.set_status(ScsiStatus::Good);
+            return;
+        }
+        // The selected target owns the synthetic unsupported-LUN response; no
+        // command is dispatched to another logical unit.
+        let slot = (usize::from(target_id) * 8..usize::from(target_id) * 8 + 8)
+            .find(|slot| self.targets[*slot].is_some())
+            .unwrap();
+        self.active_transaction = Some(ScsiTransaction {
+            target_slot: slot,
+            transfer: ScsiTransfer::ImmediateDataIn {
+                data,
+                next_offset: 0,
+                final_status: ScsiStatus::Good,
+            },
+        });
+        self.connection.as_mut().unwrap().phase = ScsiPhase::DataIn;
+    }
+
+    /// Receives one target byte. Message In remains paused until acknowledged.
+    /// Returns `None` if storage failed and the target entered Status without a byte.
+    ///
+    /// # Errors
+    /// Returns [`ScsiBusError`] for an invalid phase or failed transaction coordination.
+    pub fn read_information(&mut self) -> Result<Option<u8>, ScsiBusError> {
+        match self.phase().ok_or(ScsiBusError::InvalidPhase)? {
+            ScsiPhase::DataIn => {
+                let mut value = None;
+                let result = self.transfer_data_in(1, |bytes| {
+                    value = Some(bytes[0]);
+                    true
+                })?;
+                self.observe_transfer_result(result);
+                Ok(value)
+            }
+            ScsiPhase::Status => {
+                let connection = self.connection.as_mut().unwrap();
+                let value = connection.status.byte();
+                connection.phase = ScsiPhase::MessageIn;
+                connection.message_in = vec![0];
+                connection.message_offset = 0;
+                Ok(Some(value))
+            }
+            ScsiPhase::MessageIn => {
+                let connection = self.connection.as_mut().unwrap();
+                let value = *connection
+                    .message_in
+                    .get(connection.message_offset)
+                    .ok_or(ScsiBusError::InvalidPhase)?;
+                connection.message_offset += 1;
+                Ok(Some(value))
+            }
+            _ => Err(ScsiBusError::InvalidPhase),
+        }
+    }
+
+    /// Accepts the message byte currently held with ACK asserted.
+    pub fn acknowledge_message(&mut self, attention: bool) {
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+        if connection.phase != ScsiPhase::MessageIn {
+            return;
+        }
+        if attention {
+            connection.message_in.clear();
+            connection.message_offset = 0;
+            connection.phase = ScsiPhase::MessageOut;
+        } else if connection.message_offset == connection.message_in.len() {
+            if connection.message_in == [0] {
+                self.connection = None;
+            } else {
+                connection.message_in.clear();
+                connection.message_offset = 0;
+                connection.phase = connection.return_phase;
+            }
+        }
+    }
+
+    /// Requests Message Out at the next functional handshake boundary.
+    /// Message In is held until the initiator explicitly negates ACK.
+    pub fn assert_attention(&mut self) {
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+        if !matches!(
+            connection.phase,
+            ScsiPhase::MessageIn | ScsiPhase::MessageOut
+        ) {
+            connection.return_phase = connection.phase;
+            connection.phase = ScsiPhase::MessageOut;
+            connection.message_out.clear();
+        }
+    }
+
+    /// Retains the final target status after a DMA data transaction ends.
+    pub fn observe_transfer_result(&mut self, result: ScsiTransferResult) {
+        if let ScsiTransferResult::Complete { status, .. } = result {
+            self.set_status(status);
+        }
+    }
+
+    fn set_status(&mut self, status: ScsiStatus) {
+        if let Some(connection) = self.connection.as_mut() {
+            connection.status = status;
+            connection.phase = ScsiPhase::Status;
+        }
     }
 
     /// Attaches one target and its backing storage.
@@ -674,6 +1032,7 @@ impl ScsiBus {
     /// Cancels the active transaction without changing target state.
     pub fn cancel_transaction(&mut self) {
         self.active_transaction = None;
+        self.connection = None;
     }
 
     fn transfer_immediate_data_in(

@@ -11,7 +11,7 @@ use se_device::ram::Ram;
 use se_device::rom::Rom;
 use se_device::scsi::{ScsiBus, ScsiBusSnapshot, ScsiSnapshotError};
 use se_device::seeq8003::Seeq8003;
-use se_device::wd33c93b::{SelectAndTransferRequest, Wd33c93b};
+use se_device::wd33c93b::{Wd33c93b, WdRequest};
 use se_device::z85230::{Channel, Z85230};
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +40,7 @@ pub(super) struct Ip12Bus {
     int2: Int2,
     wd33c93b: Wd33c93b,
     scsi_bus: ScsiBus,
-    pending_scsi: Option<SelectAndTransferRequest>,
+    pending_scsi: Option<WdRequest>,
     serial: [Z85230; 2],
     rtc: Dp8573a,
     mdac: Mdac,
@@ -61,7 +61,7 @@ pub(super) struct Ip12BusSnapshot {
     int2: Int2,
     wd33c93b: Wd33c93b,
     scsi_bus: ScsiBusSnapshot,
-    pending_scsi: Option<SelectAndTransferRequest>,
+    pending_scsi: Option<WdRequest>,
     serial: [Z85230; 2],
     rtc: Dp8573a,
     mdac: Mdac,
@@ -280,7 +280,7 @@ impl PhysicalBus for Ip12Bus {
             Target::Seeq8003(address) => self.seeq8003.read(address, data),
             Target::Scsi(address) => {
                 let result = self.wd33c93b.read(address, data);
-                self.synchronize_scsi_interrupt();
+                self.handle_scsi_register_write();
                 result
             }
             Target::CpuAuxControl => read_cpu_aux_control(self.cpu_aux_control, &self.nvram, data),

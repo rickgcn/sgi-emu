@@ -38,7 +38,7 @@ pub(super) fn bus_with_memory(memory: [Option<Ram>; 4]) -> Ip12Bus {
         CentronicsPort::new(),
         Seeq8003::new(),
         Int2::new(),
-        Wd33c93b::new(),
+        Wd33c93b::new(super::super::SCSI_CLOCK_HZ),
         ScsiBus::new(),
         [Z85230::new(3_686_400), Z85230::new(3_686_400)],
         Dp8573a::new(),
@@ -134,7 +134,7 @@ pub(super) fn bus_with_disk_failures(
         CentronicsPort::new(),
         Seeq8003::new(),
         Int2::new(),
-        Wd33c93b::new(),
+        Wd33c93b::new(super::super::SCSI_CLOCK_HZ),
         scsi_bus,
         [Z85230::new(3_686_400), Z85230::new(3_686_400)],
         Dp8573a::new(),
@@ -169,7 +169,7 @@ pub(super) fn bus_with_cdrom(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
         CentronicsPort::new(),
         Seeq8003::new(),
         Int2::new(),
-        Wd33c93b::new(),
+        Wd33c93b::new(super::super::SCSI_CLOCK_HZ),
         scsi_bus,
         [Z85230::new(3_686_400), Z85230::new(3_686_400)],
         Dp8573a::new(),
@@ -218,7 +218,7 @@ pub(super) fn bus_with_disk_and_cdrom(disk_bytes: Vec<u8>, cdrom_bytes: Vec<u8>)
         CentronicsPort::new(),
         Seeq8003::new(),
         Int2::new(),
-        Wd33c93b::new(),
+        Wd33c93b::new(super::super::SCSI_CLOCK_HZ),
         scsi_bus,
         [Z85230::new(3_686_400), Z85230::new(3_686_400)],
         Dp8573a::new(),
@@ -362,6 +362,8 @@ pub(super) fn issue_scsi_command(
 ) {
     write_scsi_register(bus, 0x15, target);
     write_scsi_register(bus, 0x0f, lun);
+    write_scsi_register(bus, 0x01, 0x80);
+    write_scsi_register(bus, 0x02, 1);
     for (register, value) in [
         (0x12, (transfer_count >> 16) as u8),
         (0x13, (transfer_count >> 8) as u8),
@@ -372,7 +374,7 @@ pub(super) fn issue_scsi_command(
     for (offset, value) in cdb.iter().copied().enumerate() {
         write_scsi_register(bus, 0x03 + offset as u8, value);
     }
-    write_scsi_register(bus, 0x18, 0x09);
+    write_scsi_register(bus, 0x18, 0x08);
 }
 
 pub(super) fn issue_read_ten(bus: &mut Ip12Bus, target: u8, lba: u32) {
