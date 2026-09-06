@@ -276,7 +276,7 @@ mod tests {
             read_byte(&mut bus, HPC1_ETHERNET_POINTER_BASE + 3),
             Ok(0x80)
         );
-        assert_eq!(read_byte(&mut bus, HPC1_ETHERNET_FIFO_BASE + 3), Ok(0));
+        assert_eq!(read_byte(&mut bus, HPC1_ETHERNET_FIFO_BASE + 3), Ok(0x80));
         assert_eq!(read_word(&mut bus, 0x1fb8_0098), Ok(0));
         let mut scsi_channel_pointer = [0xff; 2];
         bus.read(

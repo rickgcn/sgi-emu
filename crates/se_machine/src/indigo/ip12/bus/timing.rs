@@ -22,6 +22,11 @@ impl Ip12Bus {
                 }
                 EventKind::Rtc => self.synchronize_rtc_time(),
                 EventKind::Hpc1Time => self.synchronize_hpc1_time(),
+                EventKind::Ethernet => {
+                    self.synchronize_ethernet_time();
+                    self.service_ethernet_request();
+                    self.reschedule_ethernet();
+                }
                 EventKind::Serial0 => self.synchronize_serial_time(0, output),
                 EventKind::Serial1 => self.synchronize_serial_time(1, output),
                 EventKind::Scsi => {
@@ -29,6 +34,9 @@ impl Ip12Bus {
                     self.process_scsi_event();
                 }
             }
+        }
+        for frame in self.ethernet_output.drain(..) {
+            output.push_ethernet(frame);
         }
     }
 
@@ -40,6 +48,7 @@ impl Ip12Bus {
         self.reschedule_serial(0);
         self.reschedule_serial(1);
         self.events.schedule(EventKind::Scsi, None);
+        self.reschedule_ethernet();
     }
 
     pub(super) fn synchronize_int2_time(&mut self) {
@@ -62,6 +71,26 @@ impl Ip12Bus {
     pub(super) fn synchronize_hpc1_time(&mut self) {
         let elapsed = self.events.synchronize(EventKind::Hpc1Time);
         self.hpc1.advance_time(elapsed);
+    }
+
+    pub(super) fn synchronize_ethernet_time(&mut self) {
+        self.synchronize_hpc1_time();
+        let elapsed = self.events.synchronize(EventKind::Ethernet);
+        self.seeq8003.advance_time(elapsed);
+        self.transfer_ethernet_signals();
+        self.reschedule_ethernet();
+    }
+
+    pub(super) fn reschedule_ethernet(&mut self) {
+        let after = [
+            self.seeq8003.time_until_event(),
+            self.hpc1
+                .ethernet_time_until_event(self.seeq8003.transmit_ready()),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        self.events.schedule(EventKind::Ethernet, after);
     }
 
     fn synchronize_serial_time(&mut self, index: usize, output: &mut MachineOutput) {

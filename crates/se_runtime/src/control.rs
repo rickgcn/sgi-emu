@@ -31,6 +31,8 @@ pub enum RuntimeMode {
 /// A coherent runtime status sample.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeStatus {
+    /// Whether Run or Step is permitted by the current session and fault state.
+    pub can_execute: bool,
     /// Current execution state.
     pub state: RuntimeState,
     /// Monotonic debugger-visible state revision.

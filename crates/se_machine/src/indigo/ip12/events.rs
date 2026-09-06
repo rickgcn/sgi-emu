@@ -3,7 +3,7 @@
 use se_core::time::{VirtualDuration, VirtualInstant};
 use serde::{Deserialize, Serialize};
 
-const EVENT_COUNT: usize = 6;
+const EVENT_COUNT: usize = 7;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) enum EventKind {
@@ -13,6 +13,7 @@ pub(super) enum EventKind {
     Serial0,
     Serial1,
     Scsi,
+    Ethernet,
 }
 
 impl EventKind {
@@ -23,6 +24,7 @@ impl EventKind {
         Self::Serial0,
         Self::Serial1,
         Self::Scsi,
+        Self::Ethernet,
     ];
 
     const fn index(self) -> usize {
@@ -33,6 +35,7 @@ impl EventKind {
             Self::Serial0 => 3,
             Self::Serial1 => 4,
             Self::Scsi => 5,
+            Self::Ethernet => 6,
         }
     }
 }

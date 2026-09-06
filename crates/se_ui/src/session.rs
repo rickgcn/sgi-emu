@@ -17,8 +17,9 @@ use se_runtime::runtime::{DebugReply, Runtime, RuntimeConfiguration, RuntimeErro
 
 use crate::bridge::ffi::{
     CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineConfiguration,
-    MachineOutputSink, MemoryDto, RegistersDto, ReplaySnapshotCatalogDto, ReplaySnapshotInfoDto,
-    RuntimeStatusDto, SerialPortDto, TlbDto, TlbEntryDto, UiExitState, UiStartupState, run_gui,
+    MachineOutputSink, MemoryDto, NetworkConfiguration, RegistersDto, ReplaySnapshotCatalogDto,
+    ReplaySnapshotInfoDto, RuntimeStatusDto, SerialPortDto, TlbDto, TlbEntryDto, UiExitState,
+    UiStartupState, run_gui,
 };
 
 /// Constructs a machine from settings selected by a frontend.
@@ -28,6 +29,10 @@ pub type MachineBuilder = Box<
         + Sync
         + 'static,
 >;
+
+/// Validates editable network settings without constructing a machine or opening host resources.
+pub type NetworkValidator =
+    Box<dyn Fn(&NetworkConfiguration) -> Result<(), String> + Send + Sync + 'static>;
 
 /// Cold machine mode requested by the Qt session.
 pub enum MachineBuildRequest {
@@ -48,15 +53,21 @@ pub enum MachineBuildRequest {
 pub struct UiSession {
     runtime: Option<Runtime>,
     machine_builder: MachineBuilder,
+    network_validator: NetworkValidator,
 }
 
 impl UiSession {
-    /// Creates a session around a runtime and a machine-construction function.
+    /// Creates a session with application-provided construction and validation callbacks.
     #[must_use]
-    pub fn new(runtime: Runtime, machine_builder: MachineBuilder) -> Self {
+    pub fn new(
+        runtime: Runtime,
+        machine_builder: MachineBuilder,
+        network_validator: NetworkValidator,
+    ) -> Self {
         Self {
             runtime: Some(runtime),
             machine_builder,
+            network_validator,
         }
     }
 
@@ -76,6 +87,15 @@ impl UiSession {
     /// Samples current runtime status for Qt.
     pub fn runtime_status(&self) -> RuntimeStatusDto {
         self.runtime_command(Runtime::status)
+    }
+
+    /// Validates network settings through the application without changing runtime state.
+    ///
+    /// Returns an empty string on success, or a user-visible validation error.
+    pub fn validate_network_configuration(&self, configuration: &NetworkConfiguration) -> String {
+        (self.network_validator)(configuration)
+            .err()
+            .unwrap_or_default()
     }
 
     /// Builds and installs a machine selected in the settings dialog.
@@ -468,6 +488,7 @@ impl UiSession {
 fn status_dto(status: RuntimeStatus) -> RuntimeStatusDto {
     let replay_final_position = status.replay_final_position.unwrap_or_default();
     RuntimeStatusDto {
+        can_execute: status.can_execute,
         success: true,
         state: state_identifier(status.state),
         revision: status.revision,
@@ -504,6 +525,7 @@ const fn state_identifier(state: RuntimeState) -> u8 {
 
 fn failed_status(error: String) -> RuntimeStatusDto {
     RuntimeStatusDto {
+        can_execute: false,
         success: false,
         state: 0,
         revision: 0,
@@ -622,7 +644,7 @@ mod tests {
     use se_runtime::runtime::Runtime;
 
     use super::{MachineBuildRequest, UiSession};
-    use crate::bridge::ffi::MachineConfiguration;
+    use crate::bridge::ffi::{MachineConfiguration, NetworkConfiguration};
 
     fn configuration() -> MachineConfiguration {
         MachineConfiguration {
@@ -634,7 +656,50 @@ mod tests {
             disk_path: String::new(),
             cdrom_path: String::new(),
             float_backend: String::from("softfloat"),
+            network: NetworkConfiguration {
+                subnet: String::new(),
+                gateway: String::new(),
+                dns: String::new(),
+                dhcp_start: String::new(),
+                forwards: Vec::new(),
+            },
         }
+    }
+
+    #[test]
+    fn network_validation_uses_the_application_callback_without_building_a_machine() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let validator_observed = Arc::clone(&observed);
+        let session = UiSession::new(
+            Runtime::new_unconfigured().unwrap(),
+            Box::new(|_, _| panic!("validation must not construct a machine")),
+            Box::new(move |configuration| {
+                validator_observed
+                    .lock()
+                    .unwrap()
+                    .push(configuration.subnet.clone());
+                if configuration.subnet == "rejected" {
+                    Err(String::from("application validation error"))
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        let before = session.runtime_status();
+        let mut network = configuration().network;
+        network.subnet = String::from("rejected");
+        assert_eq!(
+            session.validate_network_configuration(&network),
+            "application validation error"
+        );
+        network.subnet = String::from("accepted");
+        assert!(session.validate_network_configuration(&network).is_empty());
+        assert_eq!(*observed.lock().unwrap(), ["rejected", "accepted"]);
+        let after = session.runtime_status();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.completed_instructions, before.completed_instructions);
+        session.shutdown().unwrap();
     }
 
     #[test]
@@ -650,6 +715,7 @@ mod tests {
                 *builder_observed.lock().unwrap() = Some((path, snapshot_id));
                 Err(String::from("injected builder stop"))
             }),
+            Box::new(|_| Ok(())),
         );
 
         let status = session.open_replay(&configuration(), "recording.serec", "point.ckpt");
@@ -667,6 +733,7 @@ mod tests {
         let session = UiSession::new(
             Runtime::new_unconfigured().unwrap(),
             Box::new(|_, _| Err(String::from("unused builder"))),
+            Box::new(|_| Ok(())),
         );
 
         let catalog = session.replay_snapshot_catalog("missing-record.serec");

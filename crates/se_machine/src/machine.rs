@@ -223,6 +223,22 @@ impl Machine {
         }
     }
 
+    /// Reports whether virtual link spacing permits the next Ethernet input.
+    #[must_use]
+    pub fn ethernet_receive_ready(&self) -> bool {
+        match self {
+            Self::IndigoIp12(machine) => machine.ethernet_receive_ready(),
+        }
+    }
+
+    /// Supplies a frame before MAC filtering and DMA availability checks.
+    /// Returns false for an occupied link or an excessive frame allocation.
+    pub fn receive_ethernet(&mut self, bytes: &[u8]) -> bool {
+        match self {
+            Self::IndigoIp12(machine) => machine.receive_ethernet(bytes),
+        }
+    }
+
     /// Returns the virtual address of the next instruction to execute.
     #[must_use]
     pub fn execution_address(&self) -> u32 {

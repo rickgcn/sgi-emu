@@ -65,6 +65,7 @@ MachineSettings from_machine_configuration(const MachineConfiguration& configura
         from_rust_string(configuration.disk_path),
         from_rust_string(configuration.cdrom_path),
         from_rust_string(configuration.float_backend),
+        from_network_configuration(configuration.network),
     };
 }
 
@@ -78,6 +79,7 @@ MachineConfiguration to_machine_configuration(const MachineSettings& settings) {
         to_rust_string(settings.disk_path),
         to_rust_string(settings.cdrom_path),
         to_rust_string(settings.float_backend),
+        to_network_configuration(settings.network),
     };
 }
 
@@ -195,9 +197,7 @@ void MainWindow::create_actions() {
         style()->standardIcon(QStyle::SP_BrowserReload), QStringLiteral("Reset"), this);
     reset_action_->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+F5")));
     connect(reset_action_, &QAction::triggered, this, [this] {
-        apply_runtime_status(session_.reset_machine(), true);
-        refresh_debuggers();
-        cache_dock_->clear();
+        begin_preparation(PreparationState::Reset, false, [this] { return session_.reset_machine(); });
     });
 
     pause_action_ = new QAction(
@@ -440,10 +440,18 @@ void MainWindow::poll_preparation() {
     preparation_stops_replay_ = false;
     apply_runtime_status(status, false);
     if (!status.success) {
-        if (resume_running) {
+        pending_settings_.reset();
+        const auto current = session_.runtime_status();
+        if (resume_running && current.can_execute) {
             apply_runtime_status(session_.run_machine(), false);
         }
         return;
+    }
+
+    if (completed_state == PreparationState::Settings && pending_settings_ != nullptr) {
+        settings_ = *pending_settings_;
+        pending_settings_.reset();
+        update_machine_status();
     }
 
     if (completed_state == PreparationState::Recording) {
@@ -478,11 +486,20 @@ void MainWindow::apply_preparation_state() {
     create_replay_snapshot_action_->setEnabled(false);
     stop_replay_action_->setEnabled(false);
     settings_action_->setEnabled(false);
+    registers_dock_->setEnabled(false);
+    tlb_dock_->setEnabled(false);
+    cache_dock_->setEnabled(false);
+    disassembly_dock_->setEnabled(false);
+    memory_dock_->setEnabled(false);
     serial_console_dock_->set_input_enabled(false);
     if (preparation_state_ == PreparationState::Recording) {
         session_status_->setText(QStringLiteral("Preparing recording..."));
     } else if (preparation_state_ == PreparationState::ReplaySnapshot) {
         session_status_->setText(QStringLiteral("Creating replay snapshot..."));
+    } else if (preparation_state_ == PreparationState::Settings) {
+        session_status_->setText(QStringLiteral("Applying settings..."));
+    } else if (preparation_state_ == PreparationState::Reset) {
+        session_status_->setText(QStringLiteral("Resetting machine..."));
     } else {
         session_status_->setText(QStringLiteral("Preparing replay..."));
     }
@@ -600,7 +617,7 @@ void MainWindow::stop_replay() {
 }
 
 void MainWindow::show_settings() {
-    SettingsDialog dialog(settings_, this);
+    SettingsDialog dialog(session_, settings_, this);
     if (dialog.exec() != QDialog::Accepted) {
         return;
     }
@@ -613,7 +630,8 @@ void MainWindow::show_settings() {
         && selected.prom_path == settings_.prom_path
         && selected.disk_path == settings_.disk_path
         && selected.cdrom_path == settings_.cdrom_path
-        && selected.float_backend == settings_.float_backend) {
+        && selected.float_backend == settings_.float_backend
+        && selected.network == settings_.network) {
         return;
     }
     if (QMessageBox::question(
@@ -624,29 +642,23 @@ void MainWindow::show_settings() {
         return;
     }
 
-    const auto configuration = to_machine_configuration(selected);
-    const auto status = session_.configure_machine(configuration);
-    if (!status.success) {
-        QMessageBox::critical(
-            this,
-            QStringLiteral("Machine configuration"),
-            from_rust_string(status.command_error));
-        return;
-    }
-
-    settings_ = selected;
-    update_machine_status();
-    registers_dock_->clear();
-    tlb_dock_->clear();
-    cache_dock_->clear();
-    disassembly_dock_->clear();
-    memory_dock_->clear();
-    apply_runtime_status(status, false);
-    refresh_debuggers();
+    auto configuration = std::make_shared<MachineConfiguration>(to_machine_configuration(selected));
+    pending_settings_ = std::make_unique<MachineSettings>(selected);
+    begin_preparation(PreparationState::Settings, false,
+        [this, configuration] { return session_.configure_machine(*configuration); });
 }
 
 void MainWindow::update_runtime() {
     poll_preparation();
+    if (preparation_state_ != PreparationState::None) {
+        apply_preparation_state();
+        return;
+    }
+    registers_dock_->setEnabled(true);
+    tlb_dock_->setEnabled(true);
+    cache_dock_->setEnabled(true);
+    disassembly_dock_->setEnabled(true);
+    memory_dock_->setEnabled(true);
     const auto status = session_.runtime_status();
     apply_runtime_status(status, false);
     apply_preparation_state();
@@ -654,7 +666,7 @@ void MainWindow::update_runtime() {
 }
 
 void MainWindow::refresh_debuggers() {
-    if (!isVisible() || isMinimized()) {
+    if (preparation_state_ != PreparationState::None || !isVisible() || isMinimized()) {
         return;
     }
     if (registers_dock_->isVisible()) {
@@ -691,12 +703,11 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
     const bool recording = status.mode == 1;
     const bool replaying = status.mode == 2;
     const bool replay_session = replaying || status.mode == 3 || status.mode == 4;
-    const bool session_stopped = status.mode == 3 || status.mode == 4;
-    run_action_->setEnabled(paused && !session_stopped);
+    run_action_->setEnabled(paused && status.can_execute);
     run_with_record_action_->setEnabled(configured && normal);
     reset_action_->setEnabled(configured && !replay_session);
     pause_action_->setEnabled(running);
-    step_action_->setEnabled(paused && !session_stopped);
+    step_action_->setEnabled(paused && status.can_execute);
     stop_recording_action_->setEnabled(recording);
     open_replay_action_->setEnabled(normal);
     create_replay_snapshot_action_->setEnabled(paused && replaying);

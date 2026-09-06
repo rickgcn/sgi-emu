@@ -1,5 +1,5 @@
 [package]
-name = "se_machine"
+name = "se_network"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,10 +7,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-bincode.workspace = true
 serde.workspace = true
-se_core.workspace = true
-se_cpu.workspace = true
-se_device.workspace = true
-se_float.workspace = true
-sha2.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+serde_json.workspace = true
