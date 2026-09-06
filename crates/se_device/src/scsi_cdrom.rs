@@ -10,6 +10,7 @@ const BLOCK_BYTES: u32 = 512;
 
 const TEST_UNIT_READY: u8 = 0x00;
 const REQUEST_SENSE: u8 = 0x03;
+const READ_6: u8 = 0x08;
 const INQUIRY: u8 = 0x12;
 const MODE_SENSE_6: u8 = 0x1a;
 const START_STOP_UNIT: u8 = 0x1b;
@@ -96,12 +97,17 @@ impl ScsiCdrom {
         complete_good(data)
     }
 
-    fn read_10(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
+    fn read_6(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
+        // READ(6) carries a 21-bit LBA and encodes 256 blocks as length zero.
+        let lba = u32::from_be_bytes([0, cdb[1] & 0x1f, cdb[2], cdb[3]]);
+        let block_count = if cdb[4] == 0 { 256 } else { u16::from(cdb[4]) };
+        self.read_blocks(lba, block_count)
+    }
+
+    fn read_blocks(&mut self, lba: u32, block_count: u16) -> ScsiCommandPlan {
         if !self.ready {
             return self.check_condition(SenseData::NOT_READY);
         }
-        let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
-        let block_count = u16::from_be_bytes([cdb[7], cdb[8]]);
         if block_count == 0 {
             return complete_good(Vec::new());
         }
@@ -163,14 +169,18 @@ impl ScsiTarget for ScsiCdrom {
                 }
             }
             REQUEST_SENSE if cdb.len() >= 6 => self.request_sense(cdb[4]),
+            READ_6 if cdb.len() >= 6 => self.read_6(cdb),
             INQUIRY if cdb.len() >= 6 => self.inquiry(cdb[4]),
             MODE_SENSE_6 if cdb.len() >= 6 => self.mode_sense(cdb[4]),
             START_STOP_UNIT if cdb.len() >= 6 => self.start_stop(cdb[4]),
             READ_CAPACITY_10 if cdb.len() >= 10 => self.read_capacity(),
-            READ_10 if cdb.len() >= 10 => self.read_10(cdb),
+            READ_10 if cdb.len() >= 10 => self.read_blocks(
+                u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]),
+                u16::from_be_bytes([cdb[7], cdb[8]]),
+            ),
             WRITE_10 if cdb.len() >= 10 => self.check_condition(SenseData::WRITE_PROTECTED),
             TEST_UNIT_READY | REQUEST_SENSE | INQUIRY | MODE_SENSE_6 | START_STOP_UNIT
-            | READ_CAPACITY_10 | READ_10 | WRITE_10 => {
+            | READ_CAPACITY_10 | READ_6 | READ_10 | WRITE_10 => {
                 self.check_condition(SenseData::INVALID_CDB_FIELD)
             }
             _ => self.check_condition(SenseData::UNSUPPORTED_OPCODE),
@@ -253,6 +263,40 @@ mod tests {
             panic!("MODE SENSE should complete immediately");
         };
         assert_eq!(&data_in[9..12], [0, 2, 0]);
+    }
+
+    #[test]
+    fn read_six_decodes_lba_zero_length_and_media_boundaries() {
+        let mut cdrom = cdrom(0x20_0000);
+        for (cdb, lba, count) in [
+            ([8, 0xe1, 0x23, 0x45, 2, 0], 0x1_2345, 2),
+            ([8, 0xff, 0xff, 0xff, 1, 0], 0x1f_ffff, 1),
+            ([8, 0x1f, 0xff, 0, 0, 0], 0x1f_ff00, 256),
+        ] {
+            assert_eq!(
+                cdrom.execute(&cdb),
+                ScsiCommandPlan::ReadStorage {
+                    offset: lba * 512,
+                    byte_count: count * 512
+                }
+            );
+        }
+        cdrom.execute(&[8, 0x1f, 0xff, 1, 0, 0]);
+        assert_eq!(sense(&mut cdrom, 18)[12], 0x21);
+        cdrom.execute(&[0x1b, 0, 0, 0, 0, 0]);
+        cdrom.execute(&[8, 0, 0, 0, 1, 0]);
+        let data = sense(&mut cdrom, 18);
+        assert_eq!((data[2], data[12], data[13]), (2, 4, 2));
+    }
+
+    #[test]
+    fn truncated_read_six_reports_invalid_cdb_fields() {
+        let mut cdrom = cdrom(4);
+        for length in 1..6 {
+            cdrom.execute(&[8, 0, 0, 0, 1, 0][..length]);
+            let data = sense(&mut cdrom, 18);
+            assert_eq!((data[2], data[12]), (5, 0x24));
+        }
     }
 
     #[test]

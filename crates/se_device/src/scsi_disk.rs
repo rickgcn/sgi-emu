@@ -10,6 +10,8 @@ const BLOCK_BYTES: u32 = 512;
 
 const TEST_UNIT_READY: u8 = 0x00;
 const REQUEST_SENSE: u8 = 0x03;
+const READ_6: u8 = 0x08;
+const WRITE_6: u8 = 0x0a;
 const INQUIRY: u8 = 0x12;
 const MODE_SENSE_6: u8 = 0x1a;
 const START_STOP_UNIT: u8 = 0x1b;
@@ -87,12 +89,22 @@ impl ScsiDisk {
         complete_good(data)
     }
 
-    fn read_10(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
+    fn transfer_6(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
+        // The upper three address-byte bits encode LUN, not LBA. Unlike
+        // READ/WRITE(10), a zero length requests 256 logical blocks.
+        let lba = u32::from_be_bytes([0, cdb[1] & 0x1f, cdb[2], cdb[3]]);
+        let block_count = if cdb[4] == 0 { 256 } else { u16::from(cdb[4]) };
+        if cdb[0] == READ_6 {
+            self.read_blocks(lba, block_count)
+        } else {
+            self.write_blocks(lba, block_count)
+        }
+    }
+
+    fn read_blocks(&mut self, lba: u32, block_count: u16) -> ScsiCommandPlan {
         if !self.ready {
             return self.check_condition(SenseData::NOT_READY);
         }
-        let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
-        let block_count = u16::from_be_bytes([cdb[7], cdb[8]]);
         if block_count == 0 {
             return complete_good(Vec::new());
         }
@@ -106,12 +118,10 @@ impl ScsiDisk {
         }
     }
 
-    fn write_10(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
+    fn write_blocks(&mut self, lba: u32, block_count: u16) -> ScsiCommandPlan {
         if !self.ready {
             return self.check_condition(SenseData::NOT_READY);
         }
-        let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
-        let block_count = u16::from_be_bytes([cdb[7], cdb[8]]);
         if block_count == 0 {
             return complete_good(Vec::new());
         }
@@ -173,6 +183,7 @@ impl ScsiTarget for ScsiDisk {
                 }
             }
             REQUEST_SENSE if cdb.len() >= 6 => self.request_sense(cdb[4]),
+            READ_6 | WRITE_6 if cdb.len() >= 6 => self.transfer_6(cdb),
             INQUIRY if cdb.len() >= 6 => self.inquiry(cdb[4]),
             MODE_SENSE_6 if cdb.len() >= 6 => self.mode_sense(cdb[4]),
             START_STOP_UNIT if cdb.len() >= 6 => {
@@ -180,10 +191,16 @@ impl ScsiTarget for ScsiDisk {
                 complete_good(Vec::new())
             }
             READ_CAPACITY_10 if cdb.len() >= 10 => self.read_capacity(),
-            READ_10 if cdb.len() >= 10 => self.read_10(cdb),
-            WRITE_10 if cdb.len() >= 10 => self.write_10(cdb),
+            READ_10 if cdb.len() >= 10 => self.read_blocks(
+                u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]),
+                u16::from_be_bytes([cdb[7], cdb[8]]),
+            ),
+            WRITE_10 if cdb.len() >= 10 => self.write_blocks(
+                u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]),
+                u16::from_be_bytes([cdb[7], cdb[8]]),
+            ),
             TEST_UNIT_READY | REQUEST_SENSE | INQUIRY | MODE_SENSE_6 | START_STOP_UNIT
-            | READ_CAPACITY_10 | READ_10 | WRITE_10 => {
+            | READ_CAPACITY_10 | READ_6 | WRITE_6 | READ_10 | WRITE_10 => {
                 self.check_condition(SenseData::INVALID_CDB_FIELD)
             }
             _ => self.check_condition(SenseData::UNSUPPORTED_OPCODE),
@@ -237,6 +254,62 @@ mod tests {
         };
         assert_eq!(status, ScsiStatus::Good);
         assert_eq!(data_in, [0, 0, 0x12, 0x34, 0, 0, 2, 0]);
+    }
+
+    #[test]
+    fn six_byte_reads_and_writes_decode_lba_and_zero_length() {
+        for opcode in [0x08, 0x0a] {
+            let mut disk = disk(0x20_0000);
+            for (address, length, lba, count) in [
+                ([0xe1, 0x23, 0x45], 2, 0x1_2345, 2),
+                ([0xff, 0xff, 0xff], 1, 0x1f_ffff, 1),
+                ([0x1f, 0xff, 0x00], 0, 0x1f_ff00, 256),
+            ] {
+                let plan = disk.execute(&[opcode, address[0], address[1], address[2], length, 0]);
+                let offset = lba * 512;
+                let byte_count = count * 512;
+                let expected = if opcode == 0x08 {
+                    ScsiCommandPlan::ReadStorage { offset, byte_count }
+                } else {
+                    ScsiCommandPlan::WriteStorage { offset, byte_count }
+                };
+                assert_eq!(plan, expected);
+            }
+            assert!(matches!(
+                disk.execute(&[opcode, 0x1f, 0xff, 1, 0, 0]),
+                ScsiCommandPlan::Complete {
+                    status: ScsiStatus::CheckCondition,
+                    ..
+                }
+            ));
+            let ScsiCommandPlan::Complete { data_in, .. } = disk.execute(&[3, 0, 0, 0, 18, 0])
+            else {
+                panic!("sense response expected");
+            };
+            assert_eq!((data_in[2], data_in[12]), (5, 0x21));
+        }
+    }
+
+    #[test]
+    fn truncated_six_byte_commands_report_invalid_cdb_fields() {
+        let mut disk = disk(512);
+        for opcode in [0x08, 0x0a] {
+            let cdb = [opcode, 0, 0, 0, 1, 0];
+            for length in 1..6 {
+                assert!(matches!(
+                    disk.execute(&cdb[..length]),
+                    ScsiCommandPlan::Complete {
+                        status: ScsiStatus::CheckCondition,
+                        ..
+                    }
+                ));
+                let ScsiCommandPlan::Complete { data_in, .. } = disk.execute(&[3, 0, 0, 0, 18, 0])
+                else {
+                    panic!("sense response expected");
+                };
+                assert_eq!((data_in[2], data_in[12]), (5, 0x24));
+            }
+        }
     }
 
     #[test]
@@ -294,6 +367,8 @@ mod tests {
         let _ = disk.execute(&[0x1b, 0, 0, 0, 0, 0]);
         for cdb in [
             &[0x00, 0, 0, 0, 0, 0][..],
+            &[0x08, 0, 0, 0, 1, 0][..],
+            &[0x0a, 0, 0, 0, 1, 0][..],
             &[0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0][..],
             &[0x2a, 0, 0, 0, 0, 0, 0, 0, 1, 0][..],
         ] {

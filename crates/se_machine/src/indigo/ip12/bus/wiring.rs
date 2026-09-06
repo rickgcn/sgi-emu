@@ -1300,6 +1300,44 @@ mod tests {
     }
 
     #[test]
+    fn six_byte_commands_read_modify_write_disk_sectors_and_read_cdrom() {
+        let cdrom: Vec<u8> = (0..2048).map(|offset| (offset / 512) as u8).collect();
+        let mut bus = bus_with_disk_and_cdrom(vec![0; 1024], cdrom);
+
+        // Follow the label writer's initial read before updating sectors 0 and 1.
+        select_scsi(&mut bus, 1);
+        assert_eq!(pio_send(&mut bus, &[0x80]), 0x1a);
+        assert_eq!(pio_send(&mut bus, &[8, 0, 0, 0, 1, 0]), 0x19);
+        let (original, csr) = pio_receive(&mut bus, 512);
+        assert_eq!(original, vec![0; 512]);
+        assert_eq!(csr, 0x1b);
+        assert_eq!(finish_scsi(&mut bus), 0);
+
+        for sector in 0..2 {
+            select_scsi(&mut bus, 1);
+            assert_eq!(pio_send(&mut bus, &[0x80]), 0x1a);
+            assert_eq!(pio_send(&mut bus, &[0x0a, 0, 0, sector, 1, 0]), 0x18);
+            assert_eq!(pio_send(&mut bus, &[0x5a + sector; 512]), 0x1b);
+            assert_eq!(finish_scsi(&mut bus), 0);
+        }
+
+        configure_scsi_descriptor_chain(&mut bus, 0x1000, 0x2000, &[512, 512]);
+        issue_scsi_command(&mut bus, 1, 0, 1024, &[8, 0, 0, 0, 2, 0]);
+        service_scsi(&mut bus);
+        assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+        assert_eq!(read_memory(&bus, 0x2000, 512), vec![0x5a; 512]);
+        assert_eq!(read_memory(&bus, 0x2200, 512), vec![0x5b; 512]);
+
+        select_scsi(&mut bus, 4);
+        assert_eq!(pio_send(&mut bus, &[0x80]), 0x1a);
+        assert_eq!(pio_send(&mut bus, &[8, 0, 0, 1, 1, 0]), 0x19);
+        let (data, csr) = pio_receive(&mut bus, 512);
+        assert_eq!(data, vec![1; 512]);
+        assert_eq!(csr, 0x1b);
+        assert_eq!(finish_scsi(&mut bus), 0);
+    }
+
+    #[test]
     fn unsupported_lun_is_not_a_selection_timeout() {
         let mut bus = bus_with_disk(vec![0; 512], false);
         select_scsi(&mut bus, 1);
