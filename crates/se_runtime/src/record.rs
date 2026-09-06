@@ -7,6 +7,11 @@
 //! snapshot may instead restore one paused execution boundary. These
 //! machine-specific restore points are not general save states.
 //!
+//! Timeline checkpoints describe boundaries before the next instruction. The
+//! footer stores a separate machine-defined terminal fingerprint: execution
+//! errors must be reproduced before it is checked, since a failed instruction
+//! can change state without advancing the completed-instruction position.
+//!
 //! Recording writes synchronously. A complete file is renamed from
 //! `.serec.partial` only after its footer has been flushed and synchronized.
 
@@ -49,6 +54,10 @@ const CACHE_SCHEMA: u32 = 1;
 pub const DISK_PAGE_BYTES: usize = 4096;
 
 /// Deterministic boundary immediately before the next guest instruction.
+///
+/// Failed instructions do not advance this position. A Record footer therefore
+/// pairs it with an outcome and a fingerprint captured after that outcome;
+/// terminal state may differ from a Timeline checkpoint at the same position.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ExecutionPosition {
     /// Reset epoch, beginning at zero for cold power-on.
@@ -425,10 +434,20 @@ impl Recorder {
         inner.writer.take();
     }
 
+    /// Commits the state fingerprint captured after the ending outcome occurred.
+    ///
+    /// The caller supplies the machine-defined fingerprint. A failed instruction
+    /// may change that state without advancing the execution position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError`] when the writer is inactive, serialization or
+    /// synchronous file output fails, or the completed file cannot be committed.
     pub(crate) fn finalize(
         &self,
         position: ExecutionPosition,
         outcome: &RecordOutcome,
+        final_fingerprint: [u8; 32],
     ) -> Result<(), RecordError> {
         self.update(|inner| {
             require_active(inner)?;
@@ -437,6 +456,7 @@ impl Recorder {
                 &RecordFrame::Footer(RecordFooter {
                     position,
                     outcome: outcome.clone(),
+                    final_fingerprint,
                 }),
             )?;
             let mut writer = inner
@@ -668,10 +688,14 @@ pub(crate) enum RecordOutcome {
     ExecutionError { address: u32, description: String },
 }
 
+/// Terminal state, distinct from the pre-instruction checkpoints in the Timeline.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct RecordFooter {
+    /// Completed execution boundary; a failed instruction does not advance it.
     position: ExecutionPosition,
     outcome: RecordOutcome,
+    /// Machine-defined fingerprint after the outcome, including error side effects.
+    final_fingerprint: [u8; 32],
 }
 
 #[derive(Deserialize, Serialize)]
@@ -721,6 +745,11 @@ impl ReplaySession {
 
     pub(crate) const fn outcome(&self) -> &RecordOutcome {
         &self.footer.outcome
+    }
+
+    /// Returns the fingerprint to verify after reproducing the ending outcome.
+    pub(crate) const fn final_fingerprint(&self) -> [u8; 32] {
+        self.footer.final_fingerprint
     }
 
     pub(crate) fn timeline_consumed(&self) -> bool {
@@ -1731,7 +1760,11 @@ mod tests {
             .record_checkpoint(ExecutionPosition::default(), [7; 32])
             .unwrap();
         recorder
-            .finalize(ExecutionPosition::default(), &RecordOutcome::UserStopped)
+            .finalize(
+                ExecutionPosition::default(),
+                &RecordOutcome::UserStopped,
+                [7; 32],
+            )
             .unwrap();
 
         let replayer = Replayer::open(&path).unwrap();
@@ -1744,6 +1777,7 @@ mod tests {
         assert!(restore.is_none());
         assert_eq!(session.final_position(), ExecutionPosition::default());
         assert_eq!(session.outcome(), &RecordOutcome::UserStopped);
+        assert_eq!(session.final_fingerprint(), [7; 32]);
         fs::remove_file(path).unwrap();
     }
 
@@ -1778,7 +1812,11 @@ mod tests {
         recorder.start(&manifest()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"old complete record");
         recorder
-            .finalize(ExecutionPosition::default(), &RecordOutcome::UserStopped)
+            .finalize(
+                ExecutionPosition::default(),
+                &RecordOutcome::UserStopped,
+                [7; 32],
+            )
             .unwrap();
 
         let replayer = Replayer::open(&path).unwrap();
@@ -1830,7 +1868,11 @@ mod tests {
             .record_checkpoint(ExecutionPosition::default(), [7; 32])
             .unwrap();
         recorder
-            .finalize(ExecutionPosition::default(), &RecordOutcome::UserStopped)
+            .finalize(
+                ExecutionPosition::default(),
+                &RecordOutcome::UserStopped,
+                [7; 32],
+            )
             .unwrap();
     }
 
@@ -1875,6 +1917,34 @@ mod tests {
     }
 
     #[test]
+    fn footer_without_a_terminal_fingerprint_is_rejected() {
+        let path = temporary_path("missing-terminal-fingerprint");
+        write_complete_record(&path);
+        let mut bytes = fs::read(&path).unwrap();
+        let mut offset = FILE_HEADER_BYTES;
+        loop {
+            let length = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            let end = offset + FRAME_HEADER_BYTES + length;
+            if end == bytes.len() {
+                // Keep the frame complete and its CRC valid while omitting the
+                // required fingerprint, so rejection comes from schema decoding.
+                bytes.truncate(end - 32);
+                bytes[offset..offset + 4].copy_from_slice(&((length - 32) as u32).to_le_bytes());
+                let crc = super::crc32(&bytes[offset + FRAME_HEADER_BYTES..]);
+                bytes[offset + 4..offset + 8].copy_from_slice(&crc.to_le_bytes());
+                break;
+            }
+            offset = end;
+        }
+        fs::write(&path, bytes).unwrap();
+        let error = Replayer::open(&path)
+            .err()
+            .expect("the terminal fingerprint is required");
+        assert!(error.to_string().contains("failed to decode Record frame"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn decreasing_timeline_position_is_rejected() {
         let path = temporary_path("position");
         let _ = fs::remove_file(&path);
@@ -1896,6 +1966,7 @@ mod tests {
                     completed_instructions: 0,
                 },
                 &RecordOutcome::UserStopped,
+                [0; 32],
             )
             .unwrap();
         assert!(Replayer::open(&path).is_err());
@@ -1925,7 +1996,11 @@ mod tests {
         disk.capture_before_image(0, || panic!("a captured page must not be read again"))
             .unwrap();
         recorder
-            .finalize(ExecutionPosition::default(), &RecordOutcome::UserStopped)
+            .finalize(
+                ExecutionPosition::default(),
+                &RecordOutcome::UserStopped,
+                [7; 32],
+            )
             .unwrap();
         disk.capture_before_image(1, || {
             panic!("an inactive Record disk must not read the base image")
@@ -1968,7 +2043,11 @@ mod tests {
             .capture_before_image(0, || Ok(initial.clone()))
             .unwrap();
         recorder
-            .finalize(ExecutionPosition::default(), &RecordOutcome::UserStopped)
+            .finalize(
+                ExecutionPosition::default(),
+                &RecordOutcome::UserStopped,
+                [7; 32],
+            )
             .unwrap();
 
         let replayer = Replayer::open(&path).unwrap();
@@ -2024,7 +2103,11 @@ mod tests {
             .capture_before_image(1, || Ok(vec![1, 2, 3]))
             .unwrap();
         recorder
-            .finalize(ExecutionPosition::default(), &RecordOutcome::UserStopped)
+            .finalize(
+                ExecutionPosition::default(),
+                &RecordOutcome::UserStopped,
+                [7; 32],
+            )
             .unwrap();
         let replayer = Replayer::open(&path).unwrap();
         let mut tail = [9, 9, 9];
