@@ -27,6 +27,7 @@ impl Ip12 {
     ) -> Result<(), ScsiSnapshotError> {
         self.bus.restore_snapshot(snapshot.bus)?;
         self.cpu.restore_snapshot(snapshot.cpu);
+        self.update_cp0_condition();
         Ok(())
     }
 }

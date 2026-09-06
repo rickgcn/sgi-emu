@@ -406,7 +406,7 @@ impl Ip12 {
                 .attach(4, 0, Box::new(target), storage)
                 .map_err(Ip12Error::ScsiAttachment)?;
         }
-        Ok(Self {
+        let mut machine = Self {
             cpu: R3000::new(cpu_config(floating_point_backend)),
             bus: Ip12Bus::new(
                 Pic1::new(0xf7, 2, true),
@@ -424,7 +424,9 @@ impl Ip12 {
                 Dsp56001::new(),
                 prom,
             ),
-        })
+        };
+        machine.update_cp0_condition();
+        Ok(machine)
     }
 
     /// Returns the state retained across machine reconstruction and
@@ -451,7 +453,13 @@ impl Ip12 {
     pub fn reset(&mut self) {
         self.cpu.reset();
         self.bus.reset();
+        self.update_cp0_condition();
         self.update_interrupt_lines();
+    }
+
+    /// Drives CPCOND high because CPU stores complete synchronously.
+    fn update_cp0_condition(&mut self) {
+        self.cpu.set_cp0_condition(true);
     }
 
     /// Returns the processor clock frequency in hertz.
@@ -730,6 +738,69 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn cold_start_drives_cp0_condition_for_both_branch_polarities() {
+        let mut machine = machine_with_cp0_branches();
+        assert_cp0_condition_branches(&mut machine);
+    }
+
+    #[test]
+    fn reset_reasserts_cp0_condition() {
+        let mut machine = machine_with_cp0_branches();
+        machine.cpu.set_cp0_condition(false);
+        machine.reset();
+        assert_cp0_condition_branches(&mut machine);
+    }
+
+    #[test]
+    fn snapshot_restore_reasserts_cp0_condition_without_changing_pending_branch() {
+        let mut machine = machine_with_cp0_branches();
+        machine.cpu.set_cp0_condition(false);
+        machine.execute_instruction().unwrap();
+        assert_eq!(machine.execution_address(), 0xbfc0_0004);
+        let snapshot = machine.snapshot().unwrap();
+
+        machine.execute_instruction().unwrap();
+        machine.restore_snapshot(snapshot).unwrap();
+        assert_eq!(machine.execution_address(), 0xbfc0_0004);
+        assert_eq!(machine.cpu.debug_snapshot().gpr[8], 0);
+
+        // Restoring the input must not change a previously selected target.
+        machine.execute_instruction().unwrap();
+        assert_eq!(machine.execution_address(), 0xbfc0_0000);
+        assert_eq!(machine.cpu.debug_snapshot().gpr[8], 1);
+        assert_cp0_condition_branches(&mut machine);
+    }
+
+    fn machine_with_cp0_branches() -> Ip12 {
+        machine_with_instructions(&[
+            0x4100_ffff, // BC0F to itself.
+            0x2508_0001, // ADDIU t0, t0, 1 in the delay slot.
+            0x4101_0002, // BC0T skips the fall-through marker.
+            0x2508_0001, // ADDIU t0, t0, 1 in the delay slot.
+            0x2409_0001, // ADDIU t1, zero, 1 on fall-through.
+            0x240a_0001, // ADDIU t2, zero, 1 at the branch target.
+        ])
+    }
+
+    fn assert_cp0_condition_branches(machine: &mut Ip12) {
+        let initial_delay_slots = machine.cpu.debug_snapshot().gpr[8];
+        machine.execute_instruction().unwrap();
+        assert_eq!(machine.execution_address(), 0xbfc0_0004);
+        machine.execute_instruction().unwrap();
+        assert_eq!(machine.execution_address(), 0xbfc0_0008);
+        machine.execute_instruction().unwrap();
+        assert_eq!(machine.execution_address(), 0xbfc0_000c);
+        machine.execute_instruction().unwrap();
+        assert_eq!(machine.execution_address(), 0xbfc0_0014);
+        machine.execute_instruction().unwrap();
+
+        let state = machine.cpu.debug_snapshot();
+        assert_eq!(state.gpr[8], initial_delay_slots + 2);
+        assert_eq!(state.gpr[9], 0);
+        assert_eq!(state.gpr[10], 1);
     }
 
     #[test]
