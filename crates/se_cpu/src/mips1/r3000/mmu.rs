@@ -85,6 +85,36 @@ impl TlbEntry {
     }
 }
 
+/// Selects the lowest matching slot, tolerating duplicates with identical EntryLo values.
+///
+/// This compatibility rule does not establish how physical R3000 hardware resolves
+/// duplicate tags. Stored EntryLo values contain only PFN, N, D, V, and G bits.
+/// Every matching tag participates, including invalid entries; any differing
+/// EntryLo causes shutdown before validity or write permission is checked.
+/// Global entries may match with different EntryHi ASIDs. The lookup is read-only
+/// and leaves every duplicate slot intact.
+fn match_entries(
+    entries: &[TlbEntry; TLB_ENTRY_COUNT],
+    virtual_page: u32,
+    asid: u32,
+) -> ProbeResult {
+    let mut matching_index: Option<usize> = None;
+
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.tag_matches(virtual_page, asid) {
+            if let Some(first) = matching_index {
+                if entry.entry_lo != entries[first].entry_lo {
+                    return ProbeResult::Shutdown;
+                }
+            } else {
+                matching_index = Some(index);
+            }
+        }
+    }
+
+    matching_index.map_or(ProbeResult::Miss, ProbeResult::Match)
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct PendingTlbWrite {
     index: usize,
@@ -154,18 +184,7 @@ impl Mmu {
     pub(super) fn probe(&self, entry_hi: u32) -> ProbeResult {
         let virtual_page = entry_hi & ENTRY_HI_VPN_MASK;
         let asid = entry_hi & ENTRY_HI_ASID_MASK;
-        let mut matching_index = None;
-
-        for (index, entry) in self.entries.iter().copied().enumerate() {
-            if entry.tag_matches(virtual_page, asid) {
-                if matching_index.is_some() {
-                    return ProbeResult::Shutdown;
-                }
-                matching_index = Some(index);
-            }
-        }
-
-        matching_index.map_or(ProbeResult::Miss, ProbeResult::Match)
+        match_entries(&self.entries, virtual_page, asid)
     }
 
     pub(super) fn advance_instruction_view(&mut self) {
@@ -190,18 +209,11 @@ impl Mmu {
         };
         let virtual_page = virtual_address & ENTRY_HI_VPN_MASK;
         let asid = (u32::from(asid) << 6) & ENTRY_HI_ASID_MASK;
-        let mut matching_entry = None;
-
-        for entry in entries.iter().copied() {
-            if entry.tag_matches(virtual_page, asid) {
-                if matching_entry.is_some() {
-                    return Err(TranslationFault::Shutdown);
-                }
-                matching_entry = Some(entry);
-            }
-        }
-
-        let entry = matching_entry.ok_or(TranslationFault::Miss)?;
+        let entry = match match_entries(entries, virtual_page, asid) {
+            ProbeResult::Miss => return Err(TranslationFault::Miss),
+            ProbeResult::Match(index) => entries[index],
+            ProbeResult::Shutdown => return Err(TranslationFault::Shutdown),
+        };
         if entry.entry_lo & ENTRY_LO_VALID == 0 {
             return Err(TranslationFault::Invalid);
         }
@@ -447,19 +459,208 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_tags_shutdown_before_validity_checks() {
+    fn equivalent_duplicates_preserve_translation_permissions_and_slots() {
+        let virtual_address = 0x4567_8abc;
+        let high = entry_hi(virtual_address, ASID);
+        for flags in [
+            0,
+            ENTRY_LO_VALID,
+            ENTRY_LO_VALID | ENTRY_LO_DIRTY,
+            ENTRY_LO_VALID | ENTRY_LO_DIRTY | ENTRY_LO_NONCACHEABLE,
+        ] {
+            let mut mmu = Mmu::new();
+            let low = entry_lo(0x1234_5000, flags);
+            for index in [44, 2, 63] {
+                // Reserved bits must not affect equivalence after a TLB write.
+                mmu.complete_write(index, high, low | index as u32);
+                mmu.advance_instruction_view();
+                mmu.advance_instruction_view();
+                for access in [AccessType::Load, AccessType::Store, AccessType::Instruction] {
+                    let expected = if flags & ENTRY_LO_VALID == 0 {
+                        Err(TranslationFault::Invalid)
+                    } else if access == AccessType::Store && flags & ENTRY_LO_DIRTY == 0 {
+                        Err(TranslationFault::Modified)
+                    } else {
+                        Ok(translation(
+                            0x1234_5abc,
+                            if flags & ENTRY_LO_NONCACHEABLE == 0 {
+                                Cacheability::Cached
+                            } else {
+                                Cacheability::Uncached
+                            },
+                        ))
+                    };
+                    assert_eq!(mmu.translate(virtual_address, ASID, true, access), expected);
+                }
+                assert_eq!(
+                    mmu.probe(high),
+                    ProbeResult::Match(if index == 44 { 44 } else { 2 })
+                );
+            }
+            for index in [2, 44, 63] {
+                assert_eq!(mmu.read_indexed(index), (high, low));
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_duplicates_check_every_entry_lo_field_and_match() {
+        let virtual_address = 0x4567_8000;
+        let high = entry_hi(virtual_address, ASID);
+        let low = entry_lo(0x1234_5000, ENTRY_LO_VALID | ENTRY_LO_DIRTY);
+        for difference in [
+            0x1000,
+            ENTRY_LO_NONCACHEABLE,
+            ENTRY_LO_DIRTY,
+            ENTRY_LO_VALID,
+            ENTRY_LO_GLOBAL,
+        ] {
+            for conflict_index in [2, 44, 63] {
+                let mut mmu = Mmu::new();
+                for index in [2, 44, 63] {
+                    mmu.complete_write(
+                        index,
+                        high,
+                        if index == conflict_index {
+                            low ^ difference
+                        } else {
+                            low
+                        },
+                    );
+                }
+                mmu.advance_instruction_view();
+                mmu.advance_instruction_view();
+                for access in [AccessType::Load, AccessType::Store, AccessType::Instruction] {
+                    assert_eq!(
+                        mmu.translate(virtual_address, ASID, true, access),
+                        Err(TranslationFault::Shutdown)
+                    );
+                }
+                assert_eq!(mmu.probe(high), ProbeResult::Shutdown);
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_invalid_duplicates_shutdown_before_validity_checks() {
         let mut mmu = Mmu::new();
         let virtual_address = 0x4567_8000;
         let high = entry_hi(virtual_address, ASID);
 
         mmu.complete_write(6, high, 0);
-        mmu.complete_write(7, high, 0);
+        mmu.complete_write(7, high, ENTRY_LO_DIRTY);
 
         assert_eq!(
             mmu.translate(virtual_address, ASID, true, AccessType::Load),
             Err(TranslationFault::Shutdown)
         );
         assert_eq!(mmu.probe(high), ProbeResult::Shutdown);
+    }
+
+    #[test]
+    fn duplicate_matching_respects_asids_and_global_entries() {
+        let mut mmu = Mmu::new();
+        let virtual_address = 0x4567_8000;
+        let low = entry_lo(0x1234_5000, ENTRY_LO_VALID | ENTRY_LO_DIRTY);
+        for (index, asid) in [(2, ASID), (44, ASID ^ 1)] {
+            mmu.complete_write(
+                index,
+                entry_hi(virtual_address, asid),
+                low ^ if index == 44 { 0x1000 } else { 0 },
+            );
+        }
+        assert_eq!(
+            mmu.probe(entry_hi(virtual_address, ASID)),
+            ProbeResult::Match(2)
+        );
+        assert_eq!(
+            mmu.probe(entry_hi(virtual_address, ASID ^ 1)),
+            ProbeResult::Match(44)
+        );
+        assert_eq!(
+            mmu.translate(virtual_address, ASID, true, AccessType::Load),
+            Ok(translation(0x1234_5000, Cacheability::Cached))
+        );
+        assert_eq!(
+            mmu.translate(virtual_address, ASID ^ 1, true, AccessType::Load),
+            Ok(translation(0x1234_4000, Cacheability::Cached))
+        );
+
+        for (index, asid) in [(2, ASID), (44, ASID ^ 1)] {
+            mmu.complete_write(
+                index,
+                entry_hi(virtual_address, asid),
+                low | ENTRY_LO_GLOBAL,
+            );
+        }
+        mmu.advance_instruction_view();
+        mmu.advance_instruction_view();
+        for asid in [ASID, ASID ^ 1, ASID ^ 2] {
+            assert_eq!(
+                mmu.probe(entry_hi(virtual_address, asid)),
+                ProbeResult::Match(2)
+            );
+            for access in [AccessType::Load, AccessType::Store, AccessType::Instruction] {
+                assert_eq!(
+                    mmu.translate(virtual_address, asid, true, access),
+                    Ok(translation(0x1234_5000, Cacheability::Cached))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_conflicts_follow_instruction_view_delay() {
+        let mut mmu = Mmu::new();
+        let virtual_address = 0x4567_8000;
+        let high = entry_hi(virtual_address, ASID);
+        let low = entry_lo(0x1234_5000, ENTRY_LO_VALID | ENTRY_LO_DIRTY);
+        for index in [2, 44] {
+            complete_and_sync(
+                &mut mmu,
+                index,
+                virtual_address,
+                0x1234_5000,
+                ENTRY_LO_VALID | ENTRY_LO_DIRTY,
+            );
+        }
+        for (new_low, main_result, instruction_result) in [
+            (
+                low ^ 0x1000,
+                Err(TranslationFault::Shutdown),
+                Ok(translation(0x1234_5000, Cacheability::Cached)),
+            ),
+            (
+                low,
+                Ok(translation(0x1234_5000, Cacheability::Cached)),
+                Err(TranslationFault::Shutdown),
+            ),
+        ] {
+            mmu.complete_write(44, high, new_low);
+            for _ in 0..2 {
+                assert_eq!(
+                    mmu.translate(virtual_address, ASID, true, AccessType::Load),
+                    main_result
+                );
+                assert_eq!(
+                    mmu.probe(high),
+                    if new_low == low {
+                        ProbeResult::Match(2)
+                    } else {
+                        ProbeResult::Shutdown
+                    }
+                );
+                assert_eq!(
+                    mmu.translate(virtual_address, ASID, true, AccessType::Instruction),
+                    instruction_result
+                );
+                mmu.advance_instruction_view();
+            }
+            assert_eq!(
+                mmu.translate(virtual_address, ASID, true, AccessType::Instruction),
+                main_result
+            );
+        }
     }
 
     #[test]

@@ -1073,6 +1073,60 @@ mod tests {
     }
 
     #[test]
+    fn partial_accesses_translate_equivalent_duplicates() {
+        let mut state = State::new(TEST_CONFIG);
+        state.write_gpr(1, 0x1234_5002);
+        state.write_gpr(2, 0xaabb_ccdd);
+        for index in [1, 2] {
+            state.complete_instruction(
+                None,
+                Some(InstructionEffect::TlbWrite {
+                    index,
+                    entry_hi: 0x1234_5000,
+                    entry_lo: 0x0010_0000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY,
+                }),
+            );
+        }
+        let mut bus = TestBus::new([0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(
+            execute(
+                &mut state,
+                MemoryInstruction::Lwl {
+                    base: 1,
+                    rt: 2,
+                    offset: 0
+                },
+                &mut bus
+            ),
+            completed(Some(InstructionEffect::DelayedGprWrite {
+                index: 2,
+                value: 0x3344_ccdd,
+                load_merge_bypass: true
+            }))
+        );
+        assert_eq!(state.read_gpr(2), 0xaabb_ccdd);
+        assert_eq!(bus.reads, [(PhysAddr::new(0x0010_0000), 4)]);
+        assert!(bus.writes.is_empty());
+        assert_eq!(
+            execute(
+                &mut state,
+                MemoryInstruction::Swr {
+                    base: 1,
+                    rt: 2,
+                    offset: 0
+                },
+                &mut bus
+            ),
+            completed(None)
+        );
+        assert_eq!(
+            bus.writes,
+            [(PhysAddr::new(0x0010_0000), vec![0xbb, 0xcc, 0xdd, 0x44])]
+        );
+        assert!(!state.is_tlb_shutdown());
+    }
+
+    #[test]
     fn partial_accesses_report_duplicate_translation_shutdown() {
         for instruction in [
             MemoryInstruction::Lwl {
