@@ -2646,7 +2646,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         fs::remove_file(path).unwrap();
     }
 
-    /// Installs two matching KSEG2 mappings, then faults on a data translation.
+    /// Installs conflicting KSEG2 mappings, then faults on a data translation.
     fn tlb_shutdown_instructions() -> [u32; 16] {
         [
             0x3c08_c000, // lui t0, 0xc000
@@ -2659,7 +2659,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             0x4200_0002, // tlbwi
             0x2409_0100, // addiu t1, zero, 0x100
             0x4089_0000, // mtc0 t1, Index
-            0,
+            0x4080_1000, // mtc0 zero, EntryLo
             0,
             0x4200_0002, // tlbwi
             0,

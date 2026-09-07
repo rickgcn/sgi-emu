@@ -1490,7 +1490,7 @@ mod tests {
     fn translation_shutdown_changes_only_status_ts() {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         state.mmu.complete_write(24, 0, 0);
-        state.mmu.complete_write(25, 0, 0);
+        state.mmu.complete_write(25, 0, ENTRY_LO_DIRTY);
         state.pending_gpr_write = Some(PendingGprWrite {
             index: 1,
             value: 0x1111_1111,
@@ -1527,6 +1527,26 @@ mod tests {
                 value: 0x2222_2222,
             })
         );
+    }
+
+    #[test]
+    fn equivalent_duplicate_translations_leave_status_unchanged() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        for index in [24, 25] {
+            state
+                .mmu
+                .complete_write(index, 0, 0x1234_5000 | ENTRY_LO_VALID | ENTRY_LO_DIRTY);
+        }
+        state.mmu.advance_instruction_view();
+        state.mmu.advance_instruction_view();
+        let status = state.read_cp0(12);
+        for access in [AccessType::Load, AccessType::Store, AccessType::Instruction] {
+            assert_eq!(
+                state.translate_address(0xabc, access),
+                Ok(translation(0x1234_5abc, Cacheability::Cached))
+            );
+            assert_eq!(state.read_cp0(12), status);
+        }
     }
 
     #[test]
@@ -1581,8 +1601,14 @@ mod tests {
         );
 
         state.mmu.complete_write(24, entry_hi, 0);
-        state.mmu.complete_write(25, entry_hi, 0);
         state.cp0.write_register(10, entry_hi);
+        assert_eq!(
+            state.tlbp_effect(),
+            Ok(InstructionEffect::TlbProbe { index: 23 << 8 })
+        );
+        assert!(!state.is_tlb_shutdown());
+
+        state.mmu.complete_write(25, entry_hi, ENTRY_LO_DIRTY);
         state.pending_cp0_write = Some(PendingCp0Write {
             index: 14,
             value: 0x1234_5678,

@@ -141,8 +141,8 @@ type InstructionResult = Result<ExecutionOutcome<InstructionCompletion>, StepErr
 /// An error encountered while executing one processor step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StepError {
-    /// The translation buffer is in shutdown state after a duplicate tag
-    /// match.
+    /// The translation buffer is in shutdown state after matching tags with
+    /// conflicting EntryLo values.
     TlbShutdown,
 
     /// The physical bus reported an invalid or unimplemented access, or a
@@ -2342,8 +2342,8 @@ mod tests {
     #[test]
     fn data_translation_shutdown_stalls_the_instruction() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        for index in [24, 25] {
-            install_and_sync_tlb_entry(&mut processor, index, 0, 0, 0);
+        for (index, flags) in [(24, 0), (25, ENTRY_LO_DIRTY)] {
+            install_and_sync_tlb_entry(&mut processor, index, 0, 0, flags);
         }
         processor.reset();
         processor.state.write_gpr(1, 0);
@@ -2965,8 +2965,8 @@ mod tests {
     #[test]
     fn translation_shutdown_sets_only_ts_and_stalls_the_processor() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        for index in [24, 25] {
-            install_and_sync_tlb_entry(&mut processor, index, 0, 0, 0);
+        for (index, flags) in [(24, 0), (25, ENTRY_LO_DIRTY)] {
+            install_and_sync_tlb_entry(&mut processor, index, 0, 0, flags);
         }
         processor.reset();
         processor.state.write_gpr(1, 0x1111_1111);
@@ -3001,8 +3001,8 @@ mod tests {
     #[test]
     fn tlbp_duplicate_shutdown_does_not_complete_pending_transfer() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        for index in [24, 25] {
-            install_and_sync_tlb_entry(&mut processor, index, 0, 0, 0);
+        for (index, flags) in [(24, 0), (25, ENTRY_LO_DIRTY)] {
+            install_and_sync_tlb_entry(&mut processor, index, 0, 0, flags);
         }
         processor.reset();
         processor.state.write_gpr(1, 0x1111_1111);
@@ -3619,8 +3619,8 @@ mod tests {
     #[test]
     fn tlb_shutdown_precedes_an_enabled_interrupt() {
         let mut processor = R3000::new(super::TEST_CONFIG);
-        for index in [24, 25] {
-            install_and_sync_tlb_entry(&mut processor, index, 0, 0, 0);
+        for (index, flags) in [(24, 0), (25, ENTRY_LO_DIRTY)] {
+            install_and_sync_tlb_entry(&mut processor, index, 0, 0, flags);
         }
         processor.reset();
         set_cp0_register_and_sync(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
