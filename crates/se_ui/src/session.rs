@@ -9,6 +9,7 @@ use se_machine::debug::{DebugRequest, DebugResponse};
 use se_machine::indigo::ip12::debug::{
     DebugRequest as Ip12DebugRequest, DebugResponse as Ip12DebugResponse, MemoryAddressSpace,
 };
+use se_machine::input::MachineInput;
 use se_machine::machine::MachineNonvolatileState;
 use se_machine::output::VideoOutput;
 use se_machine::serial::SerialPort;
@@ -20,8 +21,8 @@ use crate::bridge::VideoFrameHandle;
 use crate::bridge::ffi::{
     CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineConfiguration,
     MachineOutputSink, MemoryDto, NetworkConfiguration, RegistersDto, ReplaySnapshotCatalogDto,
-    ReplaySnapshotInfoDto, RuntimeStatusDto, SerialPortDto, TlbDto, TlbEntryDto, UiExitState,
-    UiStartupState, VideoOutputStateDto, run_gui,
+    ReplaySnapshotInfoDto, RuntimeStatusDto, SerialPortDto, SgiMouseButtonDto, TlbDto, TlbEntryDto,
+    UiExitState, UiStartupState, VideoOutputStateDto, run_gui,
 };
 
 /// Constructs a machine from settings selected by a frontend.
@@ -483,7 +484,53 @@ impl UiSession {
             SerialPortDto::B => SerialPort::B,
             _ => return failed_status(String::from("unsupported serial port")),
         };
-        self.runtime_command(|runtime| runtime.send_serial(port, bytes))
+        let Some(runtime) = self.runtime.as_ref() else {
+            return failed_status(String::from("runtime is unavailable"));
+        };
+        for value in bytes {
+            if let Err(error) = runtime.send_input(MachineInput::SerialByte {
+                port,
+                value: *value,
+            }) {
+                return failed_status(error.to_string());
+            }
+        }
+        self.runtime_command(Runtime::status)
+    }
+
+    /// Enqueues one validated physical SGI keyboard transition.
+    pub fn send_sgi_key(&self, code: u8, pressed: bool) -> bool {
+        let Some(input) = MachineInput::sgi_keyboard(code, pressed) else {
+            return false;
+        };
+        self.runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.send_input(input).is_ok())
+    }
+
+    /// Enqueues normalized relative SGI mouse motion.
+    pub fn send_sgi_mouse_motion(&self, delta_x: i32, delta_y: i32) -> bool {
+        self.runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .send_input(MachineInput::SgiMouseMotion { delta_x, delta_y })
+                .is_ok()
+        })
+    }
+
+    /// Enqueues one physical SGI mouse button transition.
+    pub fn send_sgi_mouse_button(&self, button: SgiMouseButtonDto, pressed: bool) -> bool {
+        let code = match button {
+            SgiMouseButtonDto::Left => 0,
+            SgiMouseButtonDto::Middle => 1,
+            SgiMouseButtonDto::Right => 2,
+            _ => return false,
+        };
+        let Some(input) = MachineInput::sgi_mouse_button(code, pressed) else {
+            return false;
+        };
+        self.runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.send_input(input).is_ok())
     }
 
     fn runtime_command(
@@ -764,6 +811,26 @@ mod tests {
         assert!(catalog.snapshots.is_empty());
         assert!(!catalog.error.is_empty());
         assert!(!session.create_replay_snapshot().success);
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn sgi_key_bridge_accepts_exactly_the_protocol_keycodes() {
+        let session = UiSession::new(
+            Runtime::new_unconfigured().unwrap(),
+            Box::new(|_, _| Err(String::from("unused builder"))),
+            Box::new(|_| Ok(())),
+        );
+        let accepted: Vec<_> = (0..=u8::MAX)
+            .filter(|code| session.send_sgi_key(*code, true))
+            .collect();
+
+        assert_eq!(accepted.len(), 101);
+        assert_eq!(accepted.first().copied(), Some(2));
+        assert_eq!(accepted.last().copied(), Some(109));
+        for excluded in [0, 1, 12, 59, 70, 71, 76, 77, 78, 110, 111, 112, 255] {
+            assert!(!accepted.contains(&excluded));
+        }
         session.shutdown().unwrap();
     }
 }

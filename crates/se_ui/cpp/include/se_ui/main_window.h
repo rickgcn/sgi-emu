@@ -12,6 +12,7 @@
 
 class QAction;
 class QDockWidget;
+class QEvent;
 class QLabel;
 class QString;
 class QTimer;
@@ -50,6 +51,9 @@ public:
     ~MainWindow() override;
 
     [[nodiscard]] UiExitState exit_state() const;
+
+protected:
+    bool event(QEvent* event) override;
 
 private:
     void create_actions();

@@ -1,11 +1,11 @@
 //! Deterministic cold-start recording and replay support.
 //!
-//! A record stores the cold machine configuration, bytes accepted by the
-//! emulated serial controller and external Ethernet frames at instruction boundaries, sparse CPU
-//! checkpoints, and disk before-images. Replay normally constructs a new
-//! machine at the first PROM instruction; an explicitly created Replay
-//! snapshot may instead restore one paused execution boundary. These
-//! machine-specific restore points are not general save states.
+//! A record stores the cold machine configuration, machine inputs accepted at
+//! instruction boundaries, sparse machine-defined checkpoints, and disk
+//! before-images. Replay normally constructs a new machine at the first PROM
+//! instruction; an explicitly created Replay snapshot may instead restore one
+//! paused execution boundary. These machine-specific restore points are not
+//! general save states.
 //!
 //! Timeline checkpoints describe boundaries before the next instruction. The
 //! footer stores a separate machine-defined terminal fingerprint: execution
@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crc32fast::hash as crc32;
 use se_core::time::VirtualInstant;
+use se_machine::input::MachineInput;
 use se_machine::machine::{MachineNonvolatileState, MachineSnapshot, MachineStartupConfiguration};
-use se_machine::serial::SerialPort;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -392,18 +392,6 @@ impl Recorder {
         }
     }
 
-    pub(crate) fn record_serial_byte(
-        &self,
-        position: ExecutionPosition,
-        port: SerialPort,
-        value: u8,
-    ) -> Result<(), RecordError> {
-        self.append(RecordFrame::Timeline(TimelineEntry {
-            position,
-            action: TimelineAction::SerialByte { port, value },
-        }))
-    }
-
     pub(crate) fn record_reset(&self, position: ExecutionPosition) -> Result<(), RecordError> {
         self.append(RecordFrame::Timeline(TimelineEntry {
             position,
@@ -411,21 +399,20 @@ impl Recorder {
         }))
     }
 
-    pub(crate) fn record_ethernet_frame(
+    pub(crate) fn record_machine_input(
         &self,
         position: ExecutionPosition,
-        bytes: &[u8],
+        input: &MachineInput,
     ) -> Result<(), RecordError> {
-        if bytes.len() > MAX_ETHERNET_FRAME_BYTES {
+        if matches!(input, MachineInput::EthernetFrame { bytes } if bytes.len() > MAX_ETHERNET_FRAME_BYTES)
+        {
             return Err(invalid_record(
                 "Ethernet frame exceeds its allocation bound",
             ));
         }
         self.append(RecordFrame::Timeline(TimelineEntry {
             position,
-            action: TimelineAction::EthernetFrame {
-                bytes: bytes.to_vec(),
-            },
+            action: TimelineAction::MachineInput(input.clone()),
         }))
     }
 
@@ -695,55 +682,9 @@ pub(crate) struct TimelineEntry {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum TimelineAction {
-    SerialByte {
-        port: SerialPort,
-        value: u8,
-    },
-    EthernetFrame {
-        #[serde(deserialize_with = "deserialize_ethernet_frame")]
-        bytes: Vec<u8>,
-    },
+    MachineInput(MachineInput),
     Reset,
-    Checkpoint {
-        digest: [u8; 32],
-    },
-}
-
-/// Bounds Ethernet allocation before accepting a serialized sequence length.
-fn deserialize_ethernet_frame<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<u8>, D::Error> {
-    struct FrameVisitor;
-    impl<'de> serde::de::Visitor<'de> for FrameVisitor {
-        type Value = Vec<u8>;
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("an Ethernet frame within its allocation bound")
-        }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut sequence: A,
-        ) -> Result<Vec<u8>, A::Error> {
-            if sequence
-                .size_hint()
-                .is_some_and(|length| length > MAX_ETHERNET_FRAME_BYTES)
-            {
-                return Err(serde::de::Error::custom(
-                    "Ethernet frame exceeds its allocation bound",
-                ));
-            }
-            let mut bytes = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
-            while let Some(byte) = sequence.next_element()? {
-                if bytes.len() == MAX_ETHERNET_FRAME_BYTES {
-                    return Err(serde::de::Error::custom(
-                        "Ethernet frame exceeds its allocation bound",
-                    ));
-                }
-                bytes.push(byte);
-            }
-            Ok(bytes)
-        }
-    }
-    deserializer.deserialize_seq(FrameVisitor)
+    Checkpoint { digest: [u8; 32] },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1769,6 +1710,7 @@ mod tests {
     use se_machine::indigo::ip12::{
         Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12NonvolatileStateParts,
     };
+    use se_machine::input::MachineInput;
     use se_machine::machine::{Machine, MachineNonvolatileState, MachineStartupConfiguration};
 
     use super::{
@@ -1785,14 +1727,14 @@ mod tests {
 
     #[test]
     fn ethernet_timeline_rejects_oversize_length_before_allocating() {
-        let frame = super::TimelineAction::EthernetFrame {
+        let frame = super::TimelineAction::MachineInput(MachineInput::EthernetFrame {
             bytes: vec![0; super::MAX_ETHERNET_FRAME_BYTES + 1],
-        };
+        });
         let encoded = super::encode_value(&frame, "Ethernet input").unwrap();
         assert!(super::decode_value::<super::TimelineAction>(&encoded, "Ethernet input").is_err());
-        let frame = super::TimelineAction::EthernetFrame {
+        let frame = super::TimelineAction::MachineInput(MachineInput::EthernetFrame {
             bytes: vec![0xff; 60],
-        };
+        });
         let encoded = super::encode_value(&frame, "Ethernet input").unwrap();
         assert_eq!(
             super::decode_value::<super::TimelineAction>(&encoded, "Ethernet input").unwrap(),

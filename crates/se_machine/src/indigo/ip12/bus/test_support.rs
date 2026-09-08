@@ -16,6 +16,8 @@ use se_device::scsi::ScsiBus;
 use se_device::scsi_cdrom::ScsiCdrom;
 use se_device::scsi_disk::ScsiDisk;
 use se_device::seeq8003::Seeq8003;
+use se_device::sgi_keyboard::SgiKeyboard;
+use se_device::sgi_mouse::SgiMouse;
 use se_device::storage::BlockStorage;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
@@ -50,6 +52,8 @@ fn bus_with_memory_and_gio(memory: [Option<Ram>; 4], gio: GioBus) -> Ip12Bus {
         Wd33c93b::new(super::super::SCSI_CLOCK_HZ),
         ScsiBus::new(),
         [Z85230::new(3_686_400), Z85230::new(3_686_400)],
+        SgiKeyboard::new(),
+        SgiMouse::new(),
         Dp8573a::new(),
         Mdac::new(),
         Nmc93cs46::new(),
@@ -147,6 +151,8 @@ pub(super) fn bus_with_disk_failures(
         Wd33c93b::new(super::super::SCSI_CLOCK_HZ),
         scsi_bus,
         [Z85230::new(3_686_400), Z85230::new(3_686_400)],
+        SgiKeyboard::new(),
+        SgiMouse::new(),
         Dp8573a::new(),
         Mdac::new(),
         Nmc93cs46::new(),
@@ -183,6 +189,8 @@ pub(super) fn bus_with_cdrom(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
         Wd33c93b::new(super::super::SCSI_CLOCK_HZ),
         scsi_bus,
         [Z85230::new(3_686_400), Z85230::new(3_686_400)],
+        SgiKeyboard::new(),
+        SgiMouse::new(),
         Dp8573a::new(),
         Mdac::new(),
         Nmc93cs46::new(),
@@ -233,6 +241,8 @@ pub(super) fn bus_with_disk_and_cdrom(disk_bytes: Vec<u8>, cdrom_bytes: Vec<u8>)
         Wd33c93b::new(super::super::SCSI_CLOCK_HZ),
         scsi_bus,
         [Z85230::new(3_686_400), Z85230::new(3_686_400)],
+        SgiKeyboard::new(),
+        SgiMouse::new(),
         Dp8573a::new(),
         Mdac::new(),
         Nmc93cs46::new(),

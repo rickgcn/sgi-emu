@@ -20,6 +20,7 @@ use std::thread::{self, JoinHandle};
 
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration, VirtualInstant};
 use se_machine::debug::{DebugRequest, DebugResponse};
+use se_machine::input::MachineInput;
 use se_machine::machine::{ExecutionError, Machine, MachineNonvolatileState};
 use se_machine::output::MachineOutput;
 use se_machine::serial::SerialPort;
@@ -71,6 +72,7 @@ enum Command {
         bytes: Vec<u8>,
         reply: CommandReply<RuntimeStatus>,
     },
+    MachineInput(MachineInput),
     SetOutputHandler {
         handler: Box<dyn FnMut(MachineOutput) + Send + 'static>,
         reply: CommandReply<RuntimeStatus>,
@@ -360,6 +362,24 @@ impl Runtime {
             bytes: bytes.to_vec(),
             reply,
         })
+    }
+
+    /// Enqueues one frontend-neutral machine input without waiting for the
+    /// worker to process it.
+    ///
+    /// Successful return means only that the runtime command channel accepted
+    /// the input. Live input is ignored by a Replay session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::WorkerUnavailable`] when the worker is no longer
+    /// available.
+    pub fn send_input(&self, input: MachineInput) -> Result<(), RuntimeError> {
+        self.command_sender
+            .as_ref()
+            .ok_or(RuntimeError::WorkerUnavailable)?
+            .send(Command::MachineInput(input))
+            .map_err(|_| RuntimeError::WorkerUnavailable)
     }
 
     /// Installs the frontend-neutral machine-output handler.
@@ -708,6 +728,12 @@ impl Worker {
                 self.check_record_failure();
                 send_reply(reply, result);
             }
+            Command::MachineInput(input) => {
+                if self.machine.is_some() && !self.mode.is_replay() {
+                    let _ = self.accept_live_input(input);
+                    self.check_record_failure();
+                }
+            }
             Command::SetOutputHandler { handler, reply } => {
                 self.output_handler = Some(handler);
                 self.queue_current_video();
@@ -924,28 +950,15 @@ impl Worker {
             };
             session.advance();
             match action {
-                TimelineAction::EthernetFrame { bytes } => {
+                TimelineAction::MachineInput(input) => {
                     if !self
                         .machine
                         .as_mut()
-                        .expect("Replay requires a machine")
-                        .receive_ethernet(&bytes)
+                        .expect("Replay requires a configured machine")
+                        .try_receive_input(&input)
                     {
                         return Err(format!(
-                            "Replay Ethernet link was occupied at epoch {}, instruction {}",
-                            self.position.epoch, self.position.completed_instructions
-                        ));
-                    }
-                }
-                TimelineAction::SerialByte { port, value } => {
-                    let consumed = self
-                        .machine
-                        .as_mut()
-                        .expect("Replay requires a configured machine")
-                        .receive_serial(port, &[value]);
-                    if consumed != 1 {
-                        return Err(format!(
-                            "Replay serial byte was not accepted at epoch {}, instruction {}",
+                            "Replay machine input was not accepted at epoch {}, instruction {}",
                             self.position.epoch, self.position.completed_instructions
                         ));
                     }
@@ -1444,12 +1457,39 @@ impl Worker {
                 if let Some(recorder) = &recorder {
                     for value in pending.iter().take(consumed).copied() {
                         recorder
-                            .record_serial_byte(self.position, port, value)
+                            .record_machine_input(
+                                self.position,
+                                &MachineInput::SerialByte { port, value },
+                            )
                             .map_err(|error| rejection_owned(error.to_string()))?;
                     }
                 }
                 pending.drain(..consumed);
             }
+        }
+        Ok(())
+    }
+
+    fn accept_live_input(&mut self, input: MachineInput) -> Result<(), CommandRejection> {
+        if let MachineInput::SerialByte { port, value } = input {
+            self.pending_serial[serial_port_index(port)].push_back(value);
+            self.refill_serial_input()?;
+            self.advance_revision();
+            return Ok(());
+        }
+        let accepted = self
+            .machine
+            .as_mut()
+            .expect("live input requires a configured machine")
+            .try_receive_input(&input);
+        if accepted {
+            if let ActiveMode::Recording(session) = &self.mode {
+                session
+                    .recorder
+                    .record_machine_input(self.position, &input)
+                    .map_err(|error| rejection_owned(error.to_string()))?;
+            }
+            self.advance_revision();
         }
         Ok(())
     }
@@ -1544,21 +1584,24 @@ impl Worker {
     }
 
     fn accept_network_frame(&mut self, frame: &[u8]) -> Result<(), io::Error> {
-        if let ActiveMode::Recording(session) = &self.mode {
-            session
-                .recorder
-                .record_ethernet_frame(self.position, frame)
-                .map_err(io::Error::other)?;
-        }
+        let input = MachineInput::EthernetFrame {
+            bytes: frame.to_vec(),
+        };
         let accepted = self
             .machine
             .as_mut()
             .expect("network input requires a machine")
-            .receive_ethernet(frame);
+            .try_receive_input(&input);
         debug_assert!(
             accepted,
             "a bounded host frame must enter an available link"
         );
+        if accepted && let ActiveMode::Recording(session) = &self.mode {
+            session
+                .recorder
+                .record_machine_input(self.position, &input)
+                .map_err(io::Error::other)?;
+        }
         Ok(())
     }
 
@@ -1745,6 +1788,7 @@ mod tests {
     use se_machine::indigo::ip12::{
         Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12NonvolatileStateParts,
     };
+    use se_machine::input::MachineInput;
     use se_machine::machine::{Machine, MachineNonvolatileState, MachineStartupConfiguration};
     use se_machine::output::{VideoFrame, VideoOutput};
     use se_machine::serial::SerialPort;
@@ -2583,6 +2627,43 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         assert!(runtime.step().is_err());
         runtime.shutdown().unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn keyboard_and_mouse_inputs_record_and_replay_through_machine_input() {
+        let path = record_path("sgi-input");
+        remove_record_artifacts(&path);
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&[0]),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        for input in [
+            MachineInput::sgi_keyboard(10, true).unwrap(),
+            MachineInput::SgiMouseMotion {
+                delta_x: 12,
+                delta_y: -9,
+            },
+            MachineInput::sgi_mouse_button(0, true).unwrap(),
+        ] {
+            runtime.send_input(input).unwrap();
+        }
+        runtime.status().unwrap();
+        runtime.stop_recording().unwrap();
+        runtime.shutdown().unwrap();
+
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let opened = runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_instructions(&[0]),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(opened.mode, RuntimeMode::ReplayCompleted);
+        runtime.shutdown().unwrap();
+        remove_record_artifacts(&path);
     }
 
     #[test]

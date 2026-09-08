@@ -12,6 +12,8 @@ use se_device::ram::Ram;
 use se_device::rom::Rom;
 use se_device::scsi::{ScsiBus, ScsiBusSnapshot};
 use se_device::seeq8003::Seeq8003;
+use se_device::sgi_keyboard::{SgiKey, SgiKeyboard};
+use se_device::sgi_mouse::{SgiMouse, SgiMouseButton};
 use se_device::wd33c93b::{Wd33c93b, WdRequest};
 use se_device::z85230::{Channel, Z85230};
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,8 @@ pub(super) struct Ip12Bus {
     scsi_bus: ScsiBus,
     pending_scsi: Option<WdRequest>,
     serial: [Z85230; 2],
+    sgi_keyboard: SgiKeyboard,
+    sgi_mouse: SgiMouse,
     rtc: Dp8573a,
     mdac: Mdac,
     nvram: Nmc93cs46,
@@ -74,6 +78,8 @@ pub(super) struct Ip12BusSnapshot {
     scsi_bus: ScsiBusSnapshot,
     pending_scsi: Option<WdRequest>,
     serial: [Z85230; 2],
+    sgi_keyboard: SgiKeyboard,
+    sgi_mouse: SgiMouse,
     rtc: Dp8573a,
     mdac: Mdac,
     nvram: Nmc93cs46,
@@ -95,6 +101,8 @@ impl Ip12Bus {
         wd33c93b: Wd33c93b,
         scsi_bus: ScsiBus,
         serial: [Z85230; 2],
+        sgi_keyboard: SgiKeyboard,
+        sgi_mouse: SgiMouse,
         rtc: Dp8573a,
         mdac: Mdac,
         nvram: Nmc93cs46,
@@ -116,6 +124,8 @@ impl Ip12Bus {
             scsi_bus,
             pending_scsi: None,
             serial,
+            sgi_keyboard,
+            sgi_mouse,
             rtc,
             mdac,
             nvram,
@@ -146,6 +156,8 @@ impl Ip12Bus {
             scsi_bus: self.scsi_bus.snapshot()?,
             pending_scsi: self.pending_scsi,
             serial: self.serial.clone(),
+            sgi_keyboard: self.sgi_keyboard.clone(),
+            sgi_mouse: self.sgi_mouse.clone(),
             rtc: self.rtc.clone(),
             mdac: self.mdac.clone(),
             nvram: self.nvram.clone(),
@@ -176,6 +188,8 @@ impl Ip12Bus {
         self.wd33c93b = snapshot.wd33c93b;
         self.pending_scsi = snapshot.pending_scsi;
         self.serial = snapshot.serial;
+        self.sgi_keyboard = snapshot.sgi_keyboard;
+        self.sgi_mouse = snapshot.sgi_mouse;
         self.rtc = snapshot.rtc;
         self.mdac = snapshot.mdac;
         self.nvram = snapshot.nvram;
@@ -200,6 +214,8 @@ impl Ip12Bus {
         for serial in &mut self.serial {
             serial.reset();
         }
+        self.sgi_keyboard.reset();
+        self.sgi_mouse.reset();
         self.int2.reset();
         self.gio.reset();
         self.events.reset();
@@ -265,6 +281,24 @@ impl Ip12Bus {
         consumed
     }
 
+    pub(super) fn set_sgi_key_state(&mut self, key: SgiKey, pressed: bool) {
+        self.synchronize_serial_for_mmio(0);
+        self.sgi_keyboard.set_key_state(key, pressed);
+        self.reschedule_serial(0);
+    }
+
+    pub(super) fn move_sgi_mouse(&mut self, delta_x: i32, delta_y: i32) {
+        self.synchronize_serial_for_mmio(0);
+        self.sgi_mouse.move_relative(delta_x, delta_y);
+        self.reschedule_serial(0);
+    }
+
+    pub(super) fn set_sgi_mouse_button_state(&mut self, button: SgiMouseButton, pressed: bool) {
+        self.synchronize_serial_for_mmio(0);
+        self.sgi_mouse.set_button_state(button, pressed);
+        self.reschedule_serial(0);
+    }
+
     pub(super) fn ethernet_receive_ready(&self) -> bool {
         self.seeq8003.receive_ready()
     }
@@ -289,6 +323,15 @@ impl Ip12Bus {
             bincode::config::standard(),
         )
         .expect("machine network state is serializable");
+        hasher.update(bytes);
+    }
+
+    pub(super) fn hash_sgi_input_state(&self, hasher: &mut Sha256) {
+        let bytes = bincode::serde::encode_to_vec(
+            (&self.serial[0], &self.sgi_keyboard, &self.sgi_mouse),
+            bincode::config::standard(),
+        )
+        .expect("machine SGI input state is serializable");
         hasher.update(bytes);
     }
 

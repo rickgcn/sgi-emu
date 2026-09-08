@@ -14,6 +14,7 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QIcon>
@@ -125,7 +126,7 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , cache_dock_(nullptr)
     , memory_dock_(nullptr)
     , serial_console_dock_(nullptr)
-    , display_widget_(new DisplayWidget(this))
+    , display_widget_(new DisplayWidget(session, this))
     , machine_output_sink_()
     , update_timer_(new QTimer(this))
     , notification_timer_(new QTimer(this))
@@ -184,6 +185,13 @@ UiExitState MainWindow::exit_state() const {
         encoded_bytes(saveGeometry()),
         encoded_bytes(saveState()),
     };
+}
+
+bool MainWindow::event(QEvent* event) {
+    if (event->type() == QEvent::WindowDeactivate && display_widget_ != nullptr) {
+        display_widget_->release_input();
+    }
+    return QMainWindow::event(event);
 }
 
 void MainWindow::create_actions() {
@@ -344,6 +352,8 @@ void MainWindow::begin_preparation(
     if (preparation_resume_running_) {
         session_.pause_machine();
     }
+    serial_console_dock_->set_input_enabled(false);
+    display_widget_->set_input_enabled(false);
     preparation_state_ = state;
     preparation_stops_replay_ = stops_replay;
     preparation_task_ = std::make_unique<PreparationTask>(std::move(command));
@@ -497,6 +507,7 @@ void MainWindow::apply_preparation_state() {
     disassembly_dock_->setEnabled(false);
     memory_dock_->setEnabled(false);
     serial_console_dock_->set_input_enabled(false);
+    display_widget_->set_input_enabled(false);
     if (preparation_state_ == PreparationState::Recording) {
         session_status_->setText(QStringLiteral("Preparing recording..."));
     } else if (preparation_state_ == PreparationState::ReplaySnapshot) {
@@ -720,6 +731,7 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
     stop_replay_action_->setEnabled(replay_session);
     settings_action_->setEnabled(normal);
     serial_console_dock_->set_input_enabled(!replay_session);
+    display_widget_->set_input_enabled(configured && !replay_session);
 
     const auto session_error = from_rust_string(status.session_error);
     const auto session_error_utf8 = session_error.toUtf8();

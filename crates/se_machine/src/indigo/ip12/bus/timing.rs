@@ -27,8 +27,16 @@ impl Ip12Bus {
                     self.service_ethernet_request();
                     self.reschedule_ethernet();
                 }
-                EventKind::Serial0 => self.synchronize_serial_time(0, output),
-                EventKind::Serial1 => self.synchronize_serial_time(1, output),
+                EventKind::Serial0 => self.synchronize_serial_time(0, |_, _| {}),
+                EventKind::Serial1 => {
+                    self.synchronize_serial_time(1, |channel, value| {
+                        let port = match channel {
+                            Channel::A => SerialPort::A,
+                            Channel::B => SerialPort::B,
+                        };
+                        output.push_serial(port, value);
+                    });
+                }
                 EventKind::Scsi => {
                     let _ = self.events.synchronize(EventKind::Scsi);
                     self.process_scsi_event();
@@ -115,39 +123,71 @@ impl Ip12Bus {
         self.events.schedule(EventKind::Ethernet, after);
     }
 
-    fn synchronize_serial_time(&mut self, index: usize, output: &mut MachineOutput) {
+    fn synchronize_serial_time(&mut self, index: usize, mut output: impl FnMut(Channel, u8)) {
         let kind = serial_event_kind(index);
         let elapsed = self.events.synchronize(kind);
-        self.serial[index].advance_time(elapsed, |channel, value| {
-            if index == 1 {
-                let port = match channel {
-                    Channel::A => SerialPort::A,
-                    Channel::B => SerialPort::B,
+        if index == 0 {
+            let mut remaining = elapsed.as_attoseconds();
+            while remaining != 0 {
+                let next = [
+                    self.sgi_keyboard.time_until_event(),
+                    self.sgi_mouse.time_until_event(),
+                    self.serial[0].time_until_event(),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
+                let Some(next) = next else {
+                    break;
                 };
-                output.push_serial(port, value);
+                let step = remaining.min(next.as_attoseconds());
+                let elapsed = VirtualDuration::from_attoseconds(step);
+                let keyboard = &mut self.sgi_keyboard;
+                let mouse = &mut self.sgi_mouse;
+                let serial = &mut self.serial[0];
+                keyboard.advance_time(elapsed, |value| {
+                    let _ = serial.receive(Channel::A, &[value]);
+                });
+                mouse.advance_time(elapsed, |value| {
+                    let _ = serial.receive(Channel::B, &[value]);
+                });
+                serial.advance_time(elapsed, |channel, value| {
+                    if channel == Channel::A {
+                        keyboard.receive_command(value);
+                    }
+                });
+                remaining -= step;
             }
-        });
+        } else {
+            self.serial[index].advance_time(elapsed, &mut output);
+        }
         self.synchronize_serial_interrupt();
         self.reschedule_serial(index);
     }
 
     pub(super) fn synchronize_serial_for_mmio(&mut self, index: usize) {
-        let kind = serial_event_kind(index);
-        let elapsed = self.events.synchronize(kind);
         let mut produced_output = false;
-        self.serial[index].advance_time(elapsed, |_, _| produced_output = true);
+        self.synchronize_serial_time(index, |_, _| produced_output = true);
         debug_assert!(
             !produced_output,
             "serial deadline must be dispatched before a later MMIO access"
         );
-        self.reschedule_serial(index);
     }
 
     pub(super) fn reschedule_serial(&mut self, index: usize) {
-        self.events.schedule(
-            serial_event_kind(index),
-            self.serial[index].time_until_event(),
-        );
+        let after = if index == 0 {
+            [
+                self.sgi_keyboard.time_until_event(),
+                self.sgi_mouse.time_until_event(),
+                self.serial[0].time_until_event(),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+        } else {
+            self.serial[index].time_until_event()
+        };
+        self.events.schedule(serial_event_kind(index), after);
     }
 }
 
@@ -166,6 +206,9 @@ mod tests {
     use se_device::gio::{
         GioBus, GioDevice, GioDeviceSnapshot, GioDisplayState, GioInterrupt, GioSlot,
     };
+    use se_device::sgi_keyboard::SgiKey;
+    use se_device::sgi_mouse::SgiMouseButton;
+    use se_device::z85230::Channel;
 
     use crate::output::MachineOutput;
     use crate::serial::SerialPort;
@@ -176,6 +219,7 @@ mod tests {
     };
     use super::super::test_support::{
         bus, bus_with_gio, configure_serial_a, read_byte, read_scsi_register, read_word,
+        write_serial_register,
     };
 
     use super::EventKind;
@@ -193,6 +237,8 @@ mod tests {
     const TEST_DEVICE_BASE: u64 = 0x100;
     const TEST_DEVICE_PHYSICAL_BASE: u64 = GIO_GRAPHICS_BASE + TEST_DEVICE_BASE;
     const RETRACE_BOUNDARY: VirtualDuration = VirtualDuration::from_attoseconds(10);
+    const KEYBOARD_CHARACTER_TIME: u128 = 11 * ATTOSECONDS_PER_SECOND / 600;
+    const MOUSE_CHARACTER_TIME: u128 = 10 * ATTOSECONDS_PER_SECOND / 4_800;
 
     struct TimedInterruptDevice {
         enabled: bool,
@@ -363,6 +409,126 @@ mod tests {
 
         assert_eq!(output.serial(SerialPort::A), [0x22]);
         assert!(output.serial(SerialPort::B).is_empty());
+    }
+
+    #[test]
+    fn sgi_keyboard_and_mouse_reach_scc_zero_channels_a_and_b() {
+        let mut bus = bus();
+        write_serial_register(&mut bus, SERIAL_0_BASE, 3, 1);
+        bus.write(PhysAddr::new(SERIAL_0_BASE + 0x03), &[3])
+            .unwrap();
+        bus.write(PhysAddr::new(SERIAL_0_BASE + 0x03), &[1])
+            .unwrap();
+        bus.set_sgi_key_state(SgiKey::KeyA, true);
+        bus.set_sgi_mouse_button_state(SgiMouseButton::Left, true);
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(MOUSE_CHARACTER_TIME + 1),
+            &mut output,
+        );
+        assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x07), Ok(0x83));
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(KEYBOARD_CHARACTER_TIME - MOUSE_CHARACTER_TIME),
+            &mut output,
+        );
+        assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(10));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn completed_scc_zero_commands_start_keyboard_responses_at_that_boundary() {
+        let mut bus = bus();
+        for (register, value) in [
+            (4, 0x45),
+            (11, 0x10),
+            (12, 190),
+            (13, 0),
+            (14, 1),
+            (3, 1),
+            (5, 0x68),
+        ] {
+            write_serial_register(&mut bus, SERIAL_0_BASE, register, value);
+        }
+        bus.write(PhysAddr::new(SERIAL_0_BASE + 0x0f), &[1 << 4])
+            .unwrap();
+        let mut output = MachineOutput::default();
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(KEYBOARD_CHARACTER_TIME * 2),
+            &mut output,
+        );
+        assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(0x6e));
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(KEYBOARD_CHARACTER_TIME + 1),
+            &mut output,
+        );
+        assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(0x00));
+    }
+
+    #[test]
+    fn scc_zero_command_exchange_is_invariant_under_elapsed_fragmentation() {
+        fn configured_bus() -> super::super::Ip12Bus {
+            let mut bus = bus();
+            for (register, value) in [
+                (4, 0x45),
+                (11, 0x10),
+                (12, 190),
+                (13, 0),
+                (14, 1),
+                (3, 1),
+                (5, 0x68),
+            ] {
+                write_serial_register(&mut bus, SERIAL_0_BASE, register, value);
+            }
+            bus.write(PhysAddr::new(SERIAL_0_BASE + 0x0f), &[1 << 4])
+                .unwrap();
+            bus
+        }
+
+        let mut whole = configured_bus();
+        whole.advance_time(
+            VirtualDuration::from_attoseconds(KEYBOARD_CHARACTER_TIME * 3 + 1),
+            &mut MachineOutput::default(),
+        );
+        let whole_response = [
+            read_byte(&mut whole, SERIAL_0_BASE + 0x0f),
+            read_byte(&mut whole, SERIAL_0_BASE + 0x0f),
+        ];
+
+        let mut split = configured_bus();
+        split.advance_time(
+            VirtualDuration::from_attoseconds(KEYBOARD_CHARACTER_TIME),
+            &mut MachineOutput::default(),
+        );
+        split.advance_time(
+            VirtualDuration::from_attoseconds(KEYBOARD_CHARACTER_TIME * 2 + 1),
+            &mut MachineOutput::default(),
+        );
+        let split_response = [
+            read_byte(&mut split, SERIAL_0_BASE + 0x0f),
+            read_byte(&mut split, SERIAL_0_BASE + 0x0f),
+        ];
+
+        assert_eq!(whole_response, [Ok(0x6e), Ok(0)]);
+        assert_eq!(split_response, whole_response);
+    }
+
+    #[test]
+    fn scc_zero_full_receive_fifo_drops_a_completed_keyboard_character() {
+        let mut bus = bus();
+        write_serial_register(&mut bus, SERIAL_0_BASE, 3, 1);
+        assert_eq!(bus.serial[0].receive(Channel::A, &[0x55; 8]), 8);
+        bus.set_sgi_key_state(SgiKey::KeyA, true);
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(KEYBOARD_CHARACTER_TIME + 1),
+            &mut MachineOutput::default(),
+        );
+
+        for _ in 0..8 {
+            assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(0x55));
+        }
+        assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(0));
     }
 
     #[test]
