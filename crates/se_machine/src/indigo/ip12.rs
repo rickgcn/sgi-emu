@@ -26,6 +26,8 @@ use se_device::scsi::{ScsiAttachError, ScsiBus, ScsiSnapshotError};
 use se_device::scsi_cdrom::ScsiCdrom;
 use se_device::scsi_disk::ScsiDisk;
 use se_device::seeq8003::Seeq8003;
+use se_device::sgi_keyboard::{SgiKey, SgiKeyboard};
+use se_device::sgi_mouse::{SgiMouse, SgiMouseButton};
 use se_device::storage::BlockStorage;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
@@ -463,6 +465,8 @@ impl Ip12 {
                 Wd33c93b::new(SCSI_CLOCK_HZ),
                 scsi_bus,
                 [Z85230::new(SERIAL_CLOCK_HZ), Z85230::new(SERIAL_CLOCK_HZ)],
+                SgiKeyboard::new(),
+                SgiMouse::new(),
                 Dp8573a::new(),
                 Mdac::new(),
                 Nmc93cs46::new(),
@@ -549,6 +553,24 @@ impl Ip12 {
         let consumed = self.bus.receive_serial(port, bytes);
         self.update_interrupt_lines();
         consumed
+    }
+
+    /// Applies one physical SGI keyboard key state.
+    pub fn set_sgi_key_state(&mut self, key: SgiKey, pressed: bool) {
+        self.bus.set_sgi_key_state(key, pressed);
+        self.update_interrupt_lines();
+    }
+
+    /// Queues relative SGI mouse motion in guest coordinates.
+    pub fn move_sgi_mouse(&mut self, delta_x: i32, delta_y: i32) {
+        self.bus.move_sgi_mouse(delta_x, delta_y);
+        self.update_interrupt_lines();
+    }
+
+    /// Applies one physical SGI mouse button state.
+    pub fn set_sgi_mouse_button_state(&mut self, button: SgiMouseButton, pressed: bool) {
+        self.bus.set_sgi_mouse_button_state(button, pressed);
+        self.update_interrupt_lines();
     }
 
     /// Reports whether the virtual Ethernet link can accept the next frame.

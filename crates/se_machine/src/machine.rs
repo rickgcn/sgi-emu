@@ -12,6 +12,7 @@ use crate::debug::{DebugRequest, DebugResponse};
 use crate::indigo::GraphicsBoard;
 use crate::indigo::ip12::snapshot::Ip12Snapshot;
 use crate::indigo::ip12::{Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12SnapshotError};
+use crate::input::MachineInput;
 use crate::output::{MachineOutput, VideoOutput};
 use crate::serial::SerialPort;
 
@@ -257,6 +258,35 @@ impl Machine {
     pub fn receive_ethernet(&mut self, bytes: &[u8]) -> bool {
         match self {
             Self::IndigoIp12(machine) => machine.receive_ethernet(bytes),
+        }
+    }
+
+    /// Attempts to accept one frontend-neutral input at the current machine
+    /// boundary.
+    ///
+    /// Keyboard and mouse inputs are accepted even when they describe a
+    /// duplicate state or zero motion. Serial and Ethernet inputs report the
+    /// readiness of their respective external interfaces.
+    pub fn try_receive_input(&mut self, input: &MachineInput) -> bool {
+        match (self, input) {
+            (Self::IndigoIp12(machine), MachineInput::SerialByte { port, value }) => {
+                machine.receive_serial(*port, &[*value]) == 1
+            }
+            (Self::IndigoIp12(machine), MachineInput::EthernetFrame { bytes }) => {
+                machine.receive_ethernet(bytes)
+            }
+            (Self::IndigoIp12(machine), MachineInput::SgiKeyboard { key, pressed }) => {
+                machine.set_sgi_key_state(*key, *pressed);
+                true
+            }
+            (Self::IndigoIp12(machine), MachineInput::SgiMouseMotion { delta_x, delta_y }) => {
+                machine.move_sgi_mouse(*delta_x, *delta_y);
+                true
+            }
+            (Self::IndigoIp12(machine), MachineInput::SgiMouseButton { button, pressed }) => {
+                machine.set_sgi_mouse_button_state(*button, *pressed);
+                true
+            }
         }
     }
 

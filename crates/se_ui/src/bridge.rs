@@ -47,6 +47,14 @@ pub mod ffi {
         B,
     }
 
+    /// A physical button on the SGI three-button mouse.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum SgiMouseButtonDto {
+        Left,
+        Middle,
+        Right,
+    }
+
     /// Complete display state carried by one video update.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum VideoOutputStateDto {
@@ -423,6 +431,13 @@ pub mod ffi {
         ) -> MemoryDto;
         fn toggle_breakpoint(self: &UiSession, address: u32) -> RuntimeStatusDto;
         fn send_serial(self: &UiSession, port: SerialPortDto, bytes: &[u8]) -> RuntimeStatusDto;
+        fn send_sgi_key(self: &UiSession, code: u8, pressed: bool) -> bool;
+        fn send_sgi_mouse_motion(self: &UiSession, delta_x: i32, delta_y: i32) -> bool;
+        fn send_sgi_mouse_button(
+            self: &UiSession,
+            button: SgiMouseButtonDto,
+            pressed: bool,
+        ) -> bool;
         fn attach_machine_output(
             self: &UiSession,
             sink: SharedPtr<MachineOutputSink>,

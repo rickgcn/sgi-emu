@@ -96,6 +96,7 @@ impl Ip12 {
         let mut hasher = Sha256::new();
         hasher.update(b"sgi-emu-machine-state-fingerprint-v1");
         self.bus.hash_ethernet_state(&mut hasher);
+        self.bus.hash_sgi_input_state(&mut hasher);
         let cpu = self.cpu.debug_snapshot();
         hash_u32(&mut hasher, cpu.pc);
         hash_u32(&mut hasher, cpu.hi);
