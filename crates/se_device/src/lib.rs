@@ -3,8 +3,10 @@
 pub mod centronics;
 pub mod dp8573a;
 pub mod dsp56001;
+pub mod gio;
 pub mod hpc1;
 pub mod int2;
+pub mod lg1;
 pub mod mdac;
 pub mod nmc93cs46;
 pub mod pic1;

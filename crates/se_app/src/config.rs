@@ -16,7 +16,6 @@ use se_ui::bridge::ffi::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
 pub struct ApplicationConfig {
     machine: MachineConfig,
     network: NatConfig,
@@ -24,7 +23,6 @@ pub struct ApplicationConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(default)]
 struct MachineConfig {
     model: String,
     memory_bank_a_simm_mib: u8,
@@ -33,6 +31,7 @@ struct MachineConfig {
     prom_path: String,
     disk_path: String,
     cdrom_path: String,
+    graphics_board: GraphicsBoard,
     float_backend: FloatBackend,
 }
 
@@ -46,7 +45,35 @@ impl Default for MachineConfig {
             prom_path: String::new(),
             disk_path: String::new(),
             cdrom_path: String::new(),
+            graphics_board: GraphicsBoard::Lg1,
             float_backend: FloatBackend::SoftFloat,
+        }
+    }
+}
+
+/// The graphics board a new configuration installs.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum GraphicsBoard {
+    /// No graphics board occupies the slot.
+    None,
+    /// An LG1 entry graphics board.
+    #[default]
+    Lg1,
+}
+
+impl GraphicsBoard {
+    const fn identifier(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Lg1 => "lg1",
+        }
+    }
+
+    fn from_identifier(identifier: &str) -> Self {
+        match identifier {
+            "none" => Self::None,
+            _ => Self::Lg1,
         }
     }
 }
@@ -76,7 +103,6 @@ impl FloatBackend {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
 struct UiConfig {
     window_geometry: String,
     window_state: String,
@@ -115,6 +141,7 @@ impl ApplicationConfig {
             prom_path: self.machine.prom_path.clone(),
             disk_path: self.machine.disk_path.clone(),
             cdrom_path: self.machine.cdrom_path.clone(),
+            graphics_board: String::from(self.machine.graphics_board.identifier()),
             float_backend: String::from(self.machine.float_backend.identifier()),
             network: network_configuration_dto(&self.network),
         }
@@ -139,6 +166,7 @@ impl ApplicationConfig {
         self.machine.prom_path = exit.machine.prom_path;
         self.machine.disk_path = exit.machine.disk_path;
         self.machine.cdrom_path = exit.machine.cdrom_path;
+        self.machine.graphics_board = GraphicsBoard::from_identifier(&exit.machine.graphics_board);
         self.machine.float_backend = FloatBackend::from_identifier(&exit.machine.float_backend);
         self.ui.window_geometry = exit.window_geometry;
         self.ui.window_state = exit.window_state;
@@ -262,8 +290,8 @@ mod tests {
     use se_ui::bridge::ffi::{NetworkForwardRule, UiExitState};
 
     use super::{
-        ApplicationConfig, FloatBackend, load, network_configuration_dto,
-        parse_network_configuration, save,
+        ApplicationConfig, FloatBackend, GraphicsBoard, MachineConfig, load,
+        network_configuration_dto, parse_network_configuration, save,
     };
 
     #[test]
@@ -284,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn default_configuration_uses_indigo_and_softfloat() {
+    fn default_configuration_uses_indigo_lg1_and_softfloat() {
         let config = ApplicationConfig::default();
 
         assert_eq!(config.machine.model, "indigo-ip12");
@@ -294,6 +322,7 @@ mod tests {
         assert!(config.machine.prom_path.is_empty());
         assert!(config.machine.disk_path.is_empty());
         assert!(config.machine.cdrom_path.is_empty());
+        assert!(matches!(config.machine.graphics_board, GraphicsBoard::Lg1));
         assert!(matches!(
             config.machine.float_backend,
             FloatBackend::SoftFloat
@@ -361,8 +390,20 @@ mod tests {
                 prom_path = "prom.bin"
                 disk_path = "disk.img"
                 cdrom_path = "disc.iso"
+                graphics_board = "lg1"
                 float_backend = "native"
                 another_future_value = 7
+
+                [network]
+                subnet = "10.0.2.0/24"
+                gateway = "10.0.2.2"
+                dns = "10.0.2.3"
+                dhcp_start = "10.0.2.15"
+                forwards = []
+
+                [ui]
+                window_geometry = ""
+                window_state = ""
             "#,
         )
         .unwrap();
@@ -373,40 +414,33 @@ mod tests {
         assert_eq!(config.machine.prom_path, "prom.bin");
         assert_eq!(config.machine.disk_path, "disk.img");
         assert_eq!(config.machine.cdrom_path, "disc.iso");
+        assert!(matches!(config.machine.graphics_board, GraphicsBoard::Lg1));
         assert!(matches!(config.machine.float_backend, FloatBackend::Native));
     }
 
     #[test]
-    fn older_configuration_uses_default_values_for_new_machine_settings() {
-        let config: ApplicationConfig = toml::from_str(
+    fn configuration_without_graphics_board_is_rejected() {
+        let error = toml::from_str::<MachineConfig>(
             r#"
-                [machine]
                 model = "indigo-ip12"
+                memory_bank_a_simm_mib = 2
+                memory_bank_b_simm_mib = 0
+                memory_bank_c_simm_mib = 0
                 prom_path = "prom.bin"
                 disk_path = "disk.img"
+                cdrom_path = ""
                 float_backend = "native"
             "#,
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert!(config.machine.cdrom_path.is_empty());
-        assert!(config.machine_configuration().cdrom_path.is_empty());
-        assert_eq!(config.machine.memory_bank_a_simm_mib, 2);
-        assert_eq!(config.machine.memory_bank_b_simm_mib, 0);
-        assert_eq!(config.machine.memory_bank_c_simm_mib, 0);
+        assert!(error.to_string().contains("missing field `graphics_board`"));
     }
 
     #[test]
     fn environment_and_arguments_override_saved_machine_configuration_in_order() {
-        let mut config: ApplicationConfig = toml::from_str(
-            r#"
-                [machine]
-                model = "indigo-ip12"
-                prom_path = "saved.bin"
-                float_backend = "soft-float"
-            "#,
-        )
-        .unwrap();
+        let mut config = ApplicationConfig::default();
+        config.machine.prom_path = String::from("saved.bin");
         config.apply_environment_prom(Some(OsStr::new("environment.bin")));
         assert_eq!(config.machine.prom_path, "environment.bin");
 
@@ -425,6 +459,20 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_empty_configuration_is_rejected() {
+        let directory =
+            std::env::temp_dir().join(format!("sgi-emu-empty-config-test-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        fs::write(&path, []).unwrap();
+
+        assert!(load(&path).is_err());
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn saving_replaces_an_existing_configuration() {
         let directory =
             std::env::temp_dir().join(format!("sgi-emu-config-test-{}", std::process::id()));
@@ -439,6 +487,7 @@ mod tests {
         config.machine.memory_bank_a_simm_mib = 0;
         config.machine.memory_bank_b_simm_mib = 8;
         config.machine.memory_bank_c_simm_mib = 4;
+        config.machine.graphics_board = GraphicsBoard::None;
         save(&path, &config).unwrap();
 
         let loaded = load(&path).unwrap();
@@ -448,6 +497,7 @@ mod tests {
         assert_eq!(loaded.machine.memory_bank_a_simm_mib, 0);
         assert_eq!(loaded.machine.memory_bank_b_simm_mib, 8);
         assert_eq!(loaded.machine.memory_bank_c_simm_mib, 4);
+        assert!(matches!(loaded.machine.graphics_board, GraphicsBoard::None));
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();

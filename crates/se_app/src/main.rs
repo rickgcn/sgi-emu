@@ -10,8 +10,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use se_cli::Arguments;
+use se_device::gio::{GioBus, GioSlot};
+use se_device::lg1::Lg1;
 use se_float::backend::Backend;
-use se_machine::indigo::ip12::{Ip12, Ip12MemoryConfiguration};
+use se_machine::indigo::GraphicsBoard;
+use se_machine::indigo::ip12::Ip12;
+use se_machine::indigo::ip12::Ip12MemoryConfiguration;
 use se_machine::machine::{Machine, MachineStartupConfiguration};
 use se_runtime::record::{MediaIdentity, RecordManifest, Recorder, Replayer};
 use se_runtime::runtime::{Runtime, RuntimeConfiguration};
@@ -228,9 +232,17 @@ fn build_machine_from_parts(
         MachineStartupConfiguration::IndigoIp12 {
             floating_point_backend,
             memory,
-        } => Ip12::new_with_memory(raw_prom, floating_point_backend, memory, disk, cdrom)
-            .map(Machine::IndigoIp12)
-            .map_err(|error| error.to_string()),
+            graphics,
+        } => {
+            let mut gio = GioBus::new();
+            if let Some(GraphicsBoard::Lg1) = graphics {
+                gio.attach(GioSlot::Graphics, Box::new(Lg1::new()))
+                    .map_err(|error| error.to_string())?;
+            }
+            Ip12::new_with_memory(raw_prom, floating_point_backend, memory, gio, disk, cdrom)
+                .map(Machine::IndigoIp12)
+                .map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -245,10 +257,20 @@ fn machine_startup_configuration(
     };
     let memory = Ip12MemoryConfiguration::try_from_simm_mib(memory_bank_simm_mib(configuration))
         .map_err(|error| error.to_string())?;
+    let graphics = graphics_configuration(&configuration.graphics_board)?;
     Ok(MachineStartupConfiguration::IndigoIp12 {
         floating_point_backend: backend,
         memory,
+        graphics,
     })
+}
+
+fn graphics_configuration(identifier: &str) -> Result<Option<GraphicsBoard>, String> {
+    match identifier {
+        "none" => Ok(None),
+        "lg1" => Ok(Some(GraphicsBoard::Lg1)),
+        _ => Err(format!("unsupported graphics board: {identifier}")),
+    }
 }
 
 const fn memory_bank_simm_mib(configuration: &MachineConfiguration) -> [u8; 3] {
@@ -338,5 +360,71 @@ fn selected_or_hint(selected: &str, hint: &str) -> PathBuf {
         PathBuf::from(hint)
     } else {
         PathBuf::from(selected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use se_machine::indigo::ip12::Ip12SnapshotError;
+    use se_machine::machine::MachineSnapshotError;
+    use se_machine::output::VideoOutput;
+
+    use super::{
+        Backend, GraphicsBoard, Ip12MemoryConfiguration, MachineStartupConfiguration,
+        build_machine_from_parts,
+    };
+
+    const PROM_BYTES: usize = 0x40000;
+
+    fn startup_configuration(graphics: Option<GraphicsBoard>) -> MachineStartupConfiguration {
+        MachineStartupConfiguration::IndigoIp12 {
+            floating_point_backend: Backend::SoftFloat,
+            memory: Ip12MemoryConfiguration::default(),
+            graphics,
+        }
+    }
+
+    #[test]
+    fn application_composition_installs_the_selected_graphics_board() {
+        let lg1 = build_machine_from_parts(
+            startup_configuration(Some(GraphicsBoard::Lg1)),
+            vec![0; PROM_BYTES],
+            None,
+            None,
+        )
+        .unwrap();
+        let headless =
+            build_machine_from_parts(startup_configuration(None), vec![0; PROM_BYTES], None, None)
+                .unwrap();
+
+        assert!(matches!(lg1.video_output(), VideoOutput::NoSignal));
+        assert!(matches!(
+            headless.video_output(),
+            VideoOutput::NoGraphicsBoard
+        ));
+    }
+
+    #[test]
+    fn machine_snapshot_error_preserves_the_ip12_and_gio_boundaries() {
+        let lg1 = build_machine_from_parts(
+            startup_configuration(Some(GraphicsBoard::Lg1)),
+            vec![0; PROM_BYTES],
+            None,
+            None,
+        )
+        .unwrap();
+        let snapshot = lg1.snapshot().unwrap();
+        let mut headless =
+            build_machine_from_parts(startup_configuration(None), vec![0; PROM_BYTES], None, None)
+                .unwrap();
+
+        assert!(matches!(
+            headless.restore_snapshot(snapshot),
+            Err(MachineSnapshotError::IndigoIp12(Ip12SnapshotError::Gio(_)))
+        ));
+        assert!(matches!(
+            headless.video_output(),
+            VideoOutput::NoGraphicsBoard
+        ));
     }
 }

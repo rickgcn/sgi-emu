@@ -1,7 +1,42 @@
 //! Data transferred across the Rust and Qt boundary.
 
+use se_machine::output::VideoFrame;
+
 use crate::session::UiSession;
 use crate::terminal::{TerminalModel, new_terminal_model, normalize_terminal_paste};
+
+/// An immutable video frame retained across the Rust and Qt boundary.
+pub struct VideoFrameHandle {
+    frame: Option<VideoFrame>,
+}
+
+impl VideoFrameHandle {
+    pub(crate) const fn empty() -> Self {
+        Self { frame: None }
+    }
+
+    pub(crate) const fn new(frame: VideoFrame) -> Self {
+        Self { frame: Some(frame) }
+    }
+
+    /// Returns the frame width, or zero when no frame is present.
+    #[must_use]
+    pub fn width(&self) -> u32 {
+        self.frame.as_ref().map_or(0, VideoFrame::width)
+    }
+
+    /// Returns the frame height, or zero when no frame is present.
+    #[must_use]
+    pub fn height(&self) -> u32 {
+        self.frame.as_ref().map_or(0, VideoFrame::height)
+    }
+
+    /// Returns immutable RGBA8888 pixels, or an empty slice when no frame is present.
+    #[must_use]
+    pub fn pixels(&self) -> &[u8] {
+        self.frame.as_ref().map_or(&[], VideoFrame::pixels)
+    }
+}
 
 #[cxx::bridge(namespace = "se_ui")]
 pub mod ffi {
@@ -10,6 +45,15 @@ pub mod ffi {
     pub enum SerialPortDto {
         A,
         B,
+    }
+
+    /// Complete display state carried by one video update.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum VideoOutputStateDto {
+        NoGraphicsBoard,
+        NoSignal,
+        Blank,
+        Frame,
     }
 
     /// A semantic terminal key interpreted by the Rust terminal model.
@@ -99,6 +143,8 @@ pub mod ffi {
         pub disk_path: String,
         /// Path to the optional CD-ROM image.
         pub cdrom_path: String,
+        /// Stable graphics board identifier.
+        pub graphics_board: String,
         /// Stable floating-point backend identifier.
         pub float_backend: String,
         /// Host NAT configuration for Normal and Recording sessions.
@@ -314,6 +360,11 @@ pub mod ffi {
     extern "Rust" {
         type UiSession;
         type TerminalModel;
+        type VideoFrameHandle;
+
+        fn width(self: &VideoFrameHandle) -> u32;
+        fn height(self: &VideoFrameHandle) -> u32;
+        fn pixels(self: &VideoFrameHandle) -> &[u8];
 
         fn new_terminal_model() -> Box<TerminalModel>;
         fn terminal_feed(self: Pin<&mut TerminalModel>, bytes: &[u8]) -> TerminalSnapshotDto;
@@ -381,21 +432,57 @@ pub mod ffi {
 
     unsafe extern "C++" {
         include!("se_ui/main_window.h");
+        include!("se_ui/machine_output_sink.h");
         include!("se_ui/serial_console_dock.h");
 
         type MachineOutputSink;
 
-        fn publish_output(self: &MachineOutputSink, serial_a: &[u8], serial_b: &[u8]);
+        fn publish_serial(self: &MachineOutputSink, serial_a: &[u8], serial_b: &[u8]);
+        fn publish_video(
+            self: &MachineOutputSink,
+            state: VideoOutputStateDto,
+            frame: Box<VideoFrameHandle>,
+        );
 
         /// Runs the Qt event loop and returns the final user-interface state.
         fn run_gui(session: &UiSession, startup: &UiStartupState) -> UiExitState;
     }
 }
 
-// SAFETY: `MachineOutputSink::publish_output` only mutates mutex-protected
+// SAFETY: `MachineOutputSink` publishing only mutates mutex-protected
 // buffers and schedules GUI work through a queued Qt invocation.
 unsafe impl Send for ffi::MachineOutputSink {}
 
 // SAFETY: all shared state in `MachineOutputSink` is protected by its mutex;
 // the referenced Qt widgets are accessed only by the queued GUI-thread drain.
 unsafe impl Sync for ffi::MachineOutputSink {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use se_machine::output::VideoFrame;
+
+    use super::VideoFrameHandle;
+
+    #[test]
+    fn video_frame_handle_preserves_shared_pixels_without_a_copy() {
+        let pixels = Arc::new(vec![0x5a; 3 * 2 * 4]);
+        let frame = VideoFrame::new(3, 2, Arc::clone(&pixels)).unwrap();
+        let handle = VideoFrameHandle::new(frame);
+
+        assert_eq!(handle.width(), 3);
+        assert_eq!(handle.height(), 2);
+        assert_eq!(handle.pixels(), pixels.as_slice());
+        assert!(std::ptr::eq(handle.pixels(), pixels.as_slice()));
+    }
+
+    #[test]
+    fn empty_video_frame_handle_has_no_dimensions_or_pixels() {
+        let handle = VideoFrameHandle::empty();
+
+        assert_eq!(handle.width(), 0);
+        assert_eq!(handle.height(), 0);
+        assert!(handle.pixels().is_empty());
+    }
+}

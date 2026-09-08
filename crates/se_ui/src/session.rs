@@ -10,16 +10,18 @@ use se_machine::indigo::ip12::debug::{
     DebugRequest as Ip12DebugRequest, DebugResponse as Ip12DebugResponse, MemoryAddressSpace,
 };
 use se_machine::machine::MachineNonvolatileState;
+use se_machine::output::VideoOutput;
 use se_machine::serial::SerialPort;
 use se_runtime::control::{RuntimeMode, RuntimeState, RuntimeStatus};
 use se_runtime::record::Replayer;
 use se_runtime::runtime::{DebugReply, Runtime, RuntimeConfiguration, RuntimeError, ShutdownError};
 
+use crate::bridge::VideoFrameHandle;
 use crate::bridge::ffi::{
     CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineConfiguration,
     MachineOutputSink, MemoryDto, NetworkConfiguration, RegistersDto, ReplaySnapshotCatalogDto,
     ReplaySnapshotInfoDto, RuntimeStatusDto, SerialPortDto, TlbDto, TlbEntryDto, UiExitState,
-    UiStartupState, run_gui,
+    UiStartupState, VideoOutputStateDto, run_gui,
 };
 
 /// Constructs a machine from settings selected by a frontend.
@@ -221,7 +223,27 @@ impl UiSession {
 
         self.runtime_command(|runtime| {
             runtime.set_output_handler(Box::new(move |output| {
-                sink.publish_output(output.serial(SerialPort::A), output.serial(SerialPort::B));
+                sink.publish_serial(output.serial(SerialPort::A), output.serial(SerialPort::B));
+                let Some(video) = output.video() else {
+                    return;
+                };
+                let (state, frame) = match video {
+                    VideoOutput::NoGraphicsBoard => (
+                        VideoOutputStateDto::NoGraphicsBoard,
+                        VideoFrameHandle::empty(),
+                    ),
+                    VideoOutput::NoSignal => {
+                        (VideoOutputStateDto::NoSignal, VideoFrameHandle::empty())
+                    }
+                    VideoOutput::Active { frame: None } => {
+                        (VideoOutputStateDto::Blank, VideoFrameHandle::empty())
+                    }
+                    VideoOutput::Active { frame: Some(frame) } => (
+                        VideoOutputStateDto::Frame,
+                        VideoFrameHandle::new(frame.clone()),
+                    ),
+                };
+                sink.publish_video(state, Box::new(frame));
             }))
         })
     }
@@ -655,6 +677,7 @@ mod tests {
             prom_path: String::from("prom.bin"),
             disk_path: String::new(),
             cdrom_path: String::new(),
+            graphics_board: String::from("lg1"),
             float_backend: String::from("softfloat"),
             network: NetworkConfiguration {
                 subnet: String::new(),

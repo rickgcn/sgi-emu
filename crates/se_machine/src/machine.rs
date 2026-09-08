@@ -5,14 +5,14 @@ use std::fmt;
 
 use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::StepError;
-use se_device::scsi::ScsiSnapshotError;
 use se_float::backend::Backend;
 use serde::{Deserialize, Serialize};
 
 use crate::debug::{DebugRequest, DebugResponse};
+use crate::indigo::GraphicsBoard;
 use crate::indigo::ip12::snapshot::Ip12Snapshot;
-use crate::indigo::ip12::{Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState};
-use crate::output::MachineOutput;
+use crate::indigo::ip12::{Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12SnapshotError};
+use crate::output::{MachineOutput, VideoOutput};
 use crate::serial::SerialPort;
 
 /// Construction-time configuration for a supported machine model.
@@ -25,6 +25,8 @@ pub enum MachineStartupConfiguration {
         floating_point_backend: Backend,
         /// Installed IP12 memory banks.
         memory: Ip12MemoryConfiguration,
+        /// Installed IP12 graphics board.
+        graphics: Option<GraphicsBoard>,
     },
 }
 
@@ -68,8 +70,8 @@ enum MachineSnapshotState {
 pub enum MachineSnapshotError {
     /// Snapshot and cold-constructed machine models differ.
     IncompatibleMachineModel,
-    /// The SCSI topology cannot preserve its attached storage objects.
-    Scsi(ScsiSnapshotError),
+    /// The Indigo IP12 snapshot cannot preserve its configured topology.
+    IndigoIp12(Ip12SnapshotError),
 }
 
 impl fmt::Display for MachineSnapshotError {
@@ -78,7 +80,7 @@ impl fmt::Display for MachineSnapshotError {
             Self::IncompatibleMachineModel => {
                 formatter.write_str("machine snapshot model does not match the configured machine")
             }
-            Self::Scsi(error) => error.fmt(formatter),
+            Self::IndigoIp12(error) => error.fmt(formatter),
         }
     }
 }
@@ -87,14 +89,14 @@ impl Error for MachineSnapshotError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::IncompatibleMachineModel => None,
-            Self::Scsi(error) => Some(error),
+            Self::IndigoIp12(error) => Some(error),
         }
     }
 }
 
-impl From<ScsiSnapshotError> for MachineSnapshotError {
-    fn from(error: ScsiSnapshotError) -> Self {
-        Self::Scsi(error)
+impl From<Ip12SnapshotError> for MachineSnapshotError {
+    fn from(error: Ip12SnapshotError) -> Self {
+        Self::IndigoIp12(error)
     }
 }
 
@@ -212,6 +214,25 @@ impl Machine {
         match self {
             Self::IndigoIp12(machine) => machine.advance_time(elapsed, output),
         }
+    }
+
+    /// Returns what the machine currently drives onto its display.
+    ///
+    /// The query has no side effects and does not advance virtual time, so a
+    /// frontend can ask a paused machine what to present.
+    #[must_use]
+    pub fn video_output(&self) -> VideoOutput {
+        match self {
+            Self::IndigoIp12(machine) => machine.video_output(),
+        }
+    }
+
+    /// Publishes the machine's current display state without advancing time.
+    ///
+    /// This lets a runtime present a cold, reset, or restored machine even
+    /// when no new device event has occurred.
+    pub fn publish_video_output(&self, output: &mut MachineOutput) {
+        output.publish_video(self.video_output());
     }
 
     /// Supplies host bytes to one external serial receiver.

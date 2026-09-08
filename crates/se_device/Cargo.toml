@@ -10,3 +10,6 @@ authors.workspace = true
 serde.workspace = true
 serde-big-array.workspace = true
 se_core.workspace = true
+
+[dev-dependencies]
+bincode.workspace = true

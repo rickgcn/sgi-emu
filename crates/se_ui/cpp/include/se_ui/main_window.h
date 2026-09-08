@@ -24,6 +24,7 @@ struct RuntimeStatusDto;
 struct UiSession;
 
 class CacheDock;
+class DisplayWidget;
 class DisassemblyDock;
 class MemoryDock;
 class PreparationTask;
@@ -98,6 +99,7 @@ private:
     CacheDock* cache_dock_;
     MemoryDock* memory_dock_;
     SerialConsoleDock* serial_console_dock_;
+    DisplayWidget* display_widget_;
     std::shared_ptr<MachineOutputSink> machine_output_sink_;
     QTimer* update_timer_;
     QTimer* notification_timer_;

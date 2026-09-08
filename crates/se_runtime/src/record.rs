@@ -1763,7 +1763,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use se_core::time::VirtualInstant;
+    use se_device::gio::GioBus;
     use se_float::backend::Backend;
+    use se_machine::indigo::GraphicsBoard;
     use se_machine::indigo::ip12::{
         Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12NonvolatileStateParts,
     };
@@ -1812,6 +1814,7 @@ mod tests {
         MachineStartupConfiguration::IndigoIp12 {
             floating_point_backend: Backend::SoftFloat,
             memory: Ip12MemoryConfiguration::try_from_simm_mib([2, 0, 8]).unwrap(),
+            graphics: Some(GraphicsBoard::Lg1),
         }
     }
 
@@ -2144,7 +2147,14 @@ mod tests {
         let (session, restore) = replayer.into_session();
         assert!(restore.is_none());
         let machine = Machine::IndigoIp12(
-            Ip12::new(vec![0; 0x40000], Backend::SoftFloat, None, None).unwrap(),
+            Ip12::new(
+                vec![0; 0x40000],
+                Backend::SoftFloat,
+                GioBus::new(),
+                None,
+                None,
+            )
+            .unwrap(),
         );
         let info = session
             .create_snapshot(

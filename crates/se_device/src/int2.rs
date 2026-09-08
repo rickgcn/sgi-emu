@@ -25,6 +25,18 @@ const SYSTEM_TIMER_CONTROL: u64 = 0x3f;
 const REGISTER_BYTES: u64 = 4;
 const OUTPUT_BITS: u8 = 0x1f;
 
+/// Local-interrupt-one line carrying GIO interrupt level two.
+const LOCAL_1_GIO_INTERRUPT_2: u8 = 0x80;
+
+/// Output port bit that clears and rearms the GIO2 latch, active low.
+const OUTPUT_GIO_INTERRUPT_2_CLEAR: u8 = 1 << 3;
+
+/// GIO2 status bit, reported with "no interrupt" polarity.
+///
+/// The bit reads as one while the input is deasserted and zero while asserted,
+/// which is the polarity the IP12 header records for this status.
+const GIO_INTERRUPT_2_STATUS: u32 = 0x01;
+
 /// The software-visible INT2 state used by the IP12 machine.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Int2 {
@@ -34,6 +46,17 @@ pub struct Int2 {
     output_port: u8,
     timer_pending: [bool; 2],
     timer: ProgrammableTimer,
+    /// Level of GIO interrupt input two.
+    ///
+    /// Attached GIO devices drive one shared level rather than an interrupt
+    /// pulse. Both software-visible views are derived from it.
+    gio_interrupt_2_input: bool,
+    /// Latched edge taken when GIO interrupt input two rises.
+    ///
+    /// The kernel handler clears the latch through the output port rather
+    /// than by writing the status register, so the interrupt survives until
+    /// that pulse arrives even after the level falls again.
+    gio_interrupt_2_latch: bool,
 }
 
 impl Int2 {
@@ -51,6 +74,8 @@ impl Int2 {
             output_port: 0,
             timer_pending: [false; 2],
             timer: ProgrammableTimer::new(),
+            gio_interrupt_2_input: false,
+            gio_interrupt_2_latch: false,
         }
     }
 
@@ -62,6 +87,21 @@ impl Int2 {
         self.output_port = 0;
         self.timer_pending = [false; 2];
         self.timer.reset();
+        self.gio_interrupt_2_input = false;
+        self.gio_interrupt_2_latch = false;
+    }
+
+    /// Drives GIO interrupt input level two.
+    ///
+    /// A rising edge sets the interrupt latch while the active-low clear line
+    /// is released. The latch is not cleared when the level falls; holding
+    /// the clear line low suppresses edges and keeps the latch clear.
+    pub fn set_gio_interrupt_2_input(&mut self, asserted: bool) {
+        let rising_edge = asserted && !self.gio_interrupt_2_input;
+        self.gio_interrupt_2_input = asserted;
+        if rising_edge && self.output_port & OUTPUT_GIO_INTERRUPT_2_CLEAR != 0 {
+            self.gio_interrupt_2_latch = true;
+        }
     }
 
     /// Drives selected local-interrupt-zero input lines.
@@ -91,7 +131,37 @@ impl Int2 {
     /// Reports the masked local-interrupt-one output level.
     #[must_use]
     pub const fn local_interrupt_1_asserted(&self) -> bool {
-        self.local_interrupt_status[1] & self.local_interrupt_masks[1] != 0
+        self.local_interrupt_1_status() & self.local_interrupt_masks[1] != 0
+    }
+
+    /// Returns local-interrupt-one status, including the GIO2 latch.
+    const fn local_interrupt_1_status(&self) -> u8 {
+        if self.gio_interrupt_2_latch {
+            self.local_interrupt_status[1] | LOCAL_1_GIO_INTERRUPT_2
+        } else {
+            self.local_interrupt_status[1]
+        }
+    }
+
+    /// Returns the value one status register read reports.
+    const fn status_value(&self, register: Register) -> u8 {
+        match register {
+            Register::LocalInterrupt0Status => self.local_interrupt_status[0],
+            Register::LocalInterrupt1Status => self.local_interrupt_1_status(),
+            // The GIO2 status uses "no interrupt" polarity.
+            Register::VmeInterruptStatus => {
+                if self.gio_interrupt_2_input {
+                    0
+                } else {
+                    GIO_INTERRUPT_2_STATUS as u8
+                }
+            }
+            Register::LocalInterrupt0Mask => self.local_interrupt_masks[0],
+            Register::LocalInterrupt1Mask => self.local_interrupt_masks[1],
+            Register::VmeInterrupt0Mask => self.vme_interrupt_masks[0],
+            Register::VmeInterrupt1Mask => self.vme_interrupt_masks[1],
+            Register::OutputPort => self.output_port,
+        }
     }
 
     /// Reports whether the timer-zero interrupt output is asserted.
@@ -146,17 +216,7 @@ impl Int2 {
         let (start, end) = transaction_bounds(address, data.len())?;
 
         if let Some((register, offset)) = decode_word_register(start, end) {
-            let value = match register {
-                Register::LocalInterrupt0Status => self.local_interrupt_status[0],
-                Register::LocalInterrupt1Status => self.local_interrupt_status[1],
-                Register::VmeInterruptStatus => 0,
-                Register::LocalInterrupt0Mask => self.local_interrupt_masks[0],
-                Register::LocalInterrupt1Mask => self.local_interrupt_masks[1],
-                Register::VmeInterrupt0Mask => self.vme_interrupt_masks[0],
-                Register::VmeInterrupt1Mask => self.vme_interrupt_masks[1],
-                Register::OutputPort => self.output_port,
-            };
-            read_register(u32::from(value), offset, data);
+            read_register(u32::from(self.status_value(register)), offset, data);
             return Ok(());
         }
 
@@ -193,17 +253,7 @@ impl Int2 {
         let (start, end) = transaction_bounds(address, data.len())?;
 
         if let Some((register, offset)) = decode_word_register(start, end) {
-            let value = match register {
-                Register::LocalInterrupt0Status => self.local_interrupt_status[0],
-                Register::LocalInterrupt1Status => self.local_interrupt_status[1],
-                Register::VmeInterruptStatus => 0,
-                Register::LocalInterrupt0Mask => self.local_interrupt_masks[0],
-                Register::LocalInterrupt1Mask => self.local_interrupt_masks[1],
-                Register::VmeInterrupt0Mask => self.vme_interrupt_masks[0],
-                Register::VmeInterrupt1Mask => self.vme_interrupt_masks[1],
-                Register::OutputPort => self.output_port,
-            };
-            read_register(u32::from(value), offset, data);
+            read_register(u32::from(self.status_value(register)), offset, data);
             return Ok(());
         }
 
@@ -259,6 +309,12 @@ impl Int2 {
                 Register::OutputPort => {
                     write_byte_register(&mut self.output_port, offset, data);
                     self.output_port &= OUTPUT_BITS;
+                    // A low level asynchronously clears and holds the latch.
+                    // Raising the line only releases clear; an input edge
+                    // that occurred while it was low is not reconstructed.
+                    if self.output_port & OUTPUT_GIO_INTERRUPT_2_CLEAR == 0 {
+                        self.gio_interrupt_2_latch = false;
+                    }
                 }
             }
             return Ok(());
@@ -397,13 +453,14 @@ mod tests {
             LOCAL_INTERRUPT_0_MASK,
             LOCAL_INTERRUPT_1_STATUS,
             LOCAL_INTERRUPT_1_MASK,
-            VME_INTERRUPT_STATUS,
             VME_INTERRUPT_0_MASK,
             VME_INTERRUPT_1_MASK,
             OUTPUT_PORT,
         ] {
             assert_eq!(read_word(&mut int2, address), Ok(0));
         }
+        // The GIO2 status is active low, so an idle input reads as one.
+        assert_eq!(read_word(&mut int2, VME_INTERRUPT_STATUS), Ok(1));
         assert_eq!(int2.timer_pending, [false; 2]);
     }
 
@@ -426,16 +483,17 @@ mod tests {
     fn status_registers_are_read_only_and_inactive() {
         let mut int2 = Int2::new();
 
-        for address in [
-            LOCAL_INTERRUPT_0_STATUS,
-            LOCAL_INTERRUPT_1_STATUS,
-            VME_INTERRUPT_STATUS,
+        for (address, idle) in [
+            (LOCAL_INTERRUPT_0_STATUS, 0),
+            (LOCAL_INTERRUPT_1_STATUS, 0),
+            // The GIO2 status reports "no interrupt" as one.
+            (VME_INTERRUPT_STATUS, 1),
         ] {
             assert_eq!(
                 int2.write(DeviceAddr::new(address), &[0; 4]),
                 Err(BusError::UnimplementedAccess)
             );
-            assert_eq!(read_word(&mut int2, address), Ok(0));
+            assert_eq!(read_word(&mut int2, address), Ok(idle));
         }
     }
 
@@ -718,6 +776,157 @@ mod tests {
     }
 
     #[test]
+    fn the_gio_interrupt_2_latch_survives_the_falling_level_until_the_clear_pulse() {
+        let mut int2 = Int2::new();
+        int2.write(DeviceAddr::new(LOCAL_INTERRUPT_1_MASK + 3), &[0x80])
+            .unwrap();
+        // Arm the clear line the way the kernel leaves it between frames.
+        int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0x08])
+            .unwrap();
+
+        int2.set_gio_interrupt_2_input(true);
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_1_STATUS), Ok(0x80));
+        assert!(int2.local_interrupt_1_asserted());
+
+        // Leaving vertical blanking must not withdraw the pending interrupt.
+        int2.set_gio_interrupt_2_input(false);
+        assert!(int2.local_interrupt_1_asserted());
+
+        // The handler pulses the clear line low and then high again.
+        int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0x00])
+            .unwrap();
+        assert!(!int2.local_interrupt_1_asserted());
+        int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0x08])
+            .unwrap();
+        assert!(!int2.local_interrupt_1_asserted());
+
+        // The next frame latches again.
+        int2.set_gio_interrupt_2_input(true);
+        assert!(int2.local_interrupt_1_asserted());
+    }
+
+    #[test]
+    fn gio_interrupt_2_edges_are_ignored_while_clear_is_asserted() {
+        let mut int2 = Int2::new();
+
+        int2.set_gio_interrupt_2_input(true);
+        assert_eq!(read_word(&mut int2, VME_INTERRUPT_STATUS), Ok(0));
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_1_STATUS), Ok(0));
+
+        int2.set_gio_interrupt_2_input(false);
+        assert_eq!(read_word(&mut int2, VME_INTERRUPT_STATUS), Ok(1));
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_1_STATUS), Ok(0));
+    }
+
+    #[test]
+    fn rearming_during_asserted_gio_interrupt_2_waits_for_the_next_edge() {
+        let mut int2 = Int2::new();
+        int2.write(DeviceAddr::new(LOCAL_INTERRUPT_1_MASK + 3), &[0x80])
+            .unwrap();
+        int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0x08])
+            .unwrap();
+        int2.set_gio_interrupt_2_input(true);
+        assert!(int2.local_interrupt_1_asserted());
+
+        int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0x00])
+            .unwrap();
+        int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0x08])
+            .unwrap();
+        assert!(!int2.local_interrupt_1_asserted());
+
+        int2.set_gio_interrupt_2_input(false);
+        assert!(!int2.local_interrupt_1_asserted());
+        int2.set_gio_interrupt_2_input(true);
+        assert!(int2.local_interrupt_1_asserted());
+    }
+
+    #[test]
+    fn gio_interrupt_2_mask_does_not_control_edge_capture() {
+        let mut int2 = Int2::new();
+        int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0x08])
+            .unwrap();
+
+        int2.set_gio_interrupt_2_input(true);
+        assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_1_STATUS), Ok(0x80));
+        assert!(!int2.local_interrupt_1_asserted());
+
+        int2.write(DeviceAddr::new(LOCAL_INTERRUPT_1_MASK + 3), &[0x80])
+            .unwrap();
+        assert!(int2.local_interrupt_1_asserted());
+    }
+
+    #[test]
+    fn writing_the_status_register_does_not_release_the_gio_interrupt_2_latch() {
+        let mut int2 = Int2::new();
+        int2.write(DeviceAddr::new(LOCAL_INTERRUPT_1_MASK + 3), &[0x80])
+            .unwrap();
+        int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0x08])
+            .unwrap();
+        int2.set_gio_interrupt_2_input(true);
+
+        assert_eq!(
+            int2.write(DeviceAddr::new(LOCAL_INTERRUPT_1_STATUS), &[0; 4]),
+            Err(BusError::UnimplementedAccess)
+        );
+
+        assert!(int2.local_interrupt_1_asserted());
+    }
+
+    #[test]
+    fn the_gio_interrupt_2_status_follows_the_level_with_no_interrupt_polarity() {
+        let mut int2 = Int2::new();
+
+        // Outside blanking the status reads as one.
+        assert_eq!(read_word(&mut int2, VME_INTERRUPT_STATUS), Ok(1));
+
+        // Diagnostics wait for the bit to fall and then rise again without
+        // writing any clear register, so the status must follow the level.
+        int2.set_gio_interrupt_2_input(true);
+        assert_eq!(read_word(&mut int2, VME_INTERRUPT_STATUS), Ok(0));
+        int2.set_gio_interrupt_2_input(false);
+        assert_eq!(read_word(&mut int2, VME_INTERRUPT_STATUS), Ok(1));
+    }
+
+    #[test]
+    fn the_gio_interrupt_2_latch_shares_local_interrupt_one_with_other_inputs() {
+        let mut int2 = Int2::new();
+        int2.set_local_interrupt_1_input(1 << 4, true);
+        int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0x08])
+            .unwrap();
+        int2.set_gio_interrupt_2_input(true);
+
+        assert_eq!(
+            read_word(&mut int2, LOCAL_INTERRUPT_1_STATUS),
+            Ok((1 << 4) | 0x80)
+        );
+
+        // Masking the GIO2 line leaves the other input undisturbed.
+        int2.write(DeviceAddr::new(LOCAL_INTERRUPT_1_MASK + 3), &[1 << 4])
+            .unwrap();
+        assert!(int2.local_interrupt_1_asserted());
+        int2.set_local_interrupt_1_input(1 << 4, false);
+        assert!(!int2.local_interrupt_1_asserted());
+    }
+
+    #[test]
+    fn debug_reads_report_the_same_gio_interrupt_2_views() {
+        let mut int2 = Int2::new();
+        int2.write(DeviceAddr::new(OUTPUT_PORT + 3), &[0x08])
+            .unwrap();
+        int2.set_gio_interrupt_2_input(true);
+        let mut status = [0; 4];
+        let mut latched = [0; 4];
+
+        int2.debug_read(DeviceAddr::new(VME_INTERRUPT_STATUS), &mut status)
+            .unwrap();
+        int2.debug_read(DeviceAddr::new(LOCAL_INTERRUPT_1_STATUS), &mut latched)
+            .unwrap();
+
+        assert_eq!(u32::from_be_bytes(status), 0);
+        assert_eq!(u32::from_be_bytes(latched), 0x80);
+    }
+
+    #[test]
     fn reset_clears_mutable_state() {
         let mut int2 = Int2::new();
         int2.write(DeviceAddr::new(LOCAL_INTERRUPT_0_MASK + 3), &[0xa5])
@@ -736,12 +945,14 @@ mod tests {
         int2.advance_time(VirtualDuration::from_attoseconds(123));
         int2.set_local_interrupt_0_input(1 << 5, true);
         int2.set_local_interrupt_1_input(1 << 4, true);
+        int2.set_gio_interrupt_2_input(true);
 
         int2.reset();
 
         assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_MASK), Ok(0));
         assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_0_STATUS), Ok(0));
         assert_eq!(read_word(&mut int2, LOCAL_INTERRUPT_1_STATUS), Ok(0));
+        assert_eq!(read_word(&mut int2, VME_INTERRUPT_STATUS), Ok(1));
         assert_eq!(read_word(&mut int2, VME_INTERRUPT_1_MASK), Ok(0));
         assert_eq!(read_word(&mut int2, OUTPUT_PORT), Ok(0));
         assert_eq!(int2.timer_pending, [false; 2]);

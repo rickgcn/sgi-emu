@@ -652,6 +652,7 @@ impl Worker {
                         session.reset_checkpoint_deadline();
                     }
                     self.advance_revision();
+                    self.deliver_output();
                     Ok(self.status())
                 });
                 self.check_record_failure();
@@ -709,6 +710,8 @@ impl Worker {
             }
             Command::SetOutputHandler { handler, reply } => {
                 self.output_handler = Some(handler);
+                self.queue_current_video();
+                self.deliver_output();
                 send_reply(reply, Ok(self.status()));
             }
             Command::ClearOutputHandler(reply) => {
@@ -828,6 +831,8 @@ impl Worker {
             self.set_replay_divergence(reason);
         }
         self.advance_revision();
+        self.queue_current_video();
+        self.deliver_output();
         Ok(self.status())
     }
 
@@ -1189,6 +1194,7 @@ impl Worker {
         self.pending_serial = [VecDeque::new(), VecDeque::new()];
         self.last_error = None;
         self.ignore_breakpoint_once = None;
+        self.queue_current_video();
     }
 
     fn step_once(&mut self) -> Result<RuntimeStatus, CommandRejection> {
@@ -1567,6 +1573,12 @@ impl Worker {
         }
     }
 
+    fn queue_current_video(&mut self) {
+        if let Some(machine) = self.machine.as_ref() {
+            machine.publish_video_output(&mut self.frontend_output);
+        }
+    }
+
     fn require_machine(&self) -> Result<(), CommandRejection> {
         if self.machine.is_some() {
             Ok(())
@@ -1715,21 +1727,28 @@ fn send_reply<T>(reply: CommandReply<T>, result: Result<T, CommandRejection>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::env;
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
 
     use se_core::time::ATTOSECONDS_PER_SECOND;
+    use se_device::gio::{GioBus, GioSlot};
+    use se_device::lg1::Lg1;
     use se_device::storage::BlockStorage;
     use se_float::backend::Backend;
+    use se_machine::indigo::GraphicsBoard;
     use se_machine::indigo::ip12::debug::{DebugRequest, DebugResponse, MemoryAddressSpace};
     use se_machine::indigo::ip12::{
         Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12NonvolatileStateParts,
     };
     use se_machine::machine::{Machine, MachineNonvolatileState, MachineStartupConfiguration};
+    use se_machine::output::{VideoFrame, VideoOutput};
     use se_machine::serial::SerialPort;
+    use sha2::{Digest, Sha256};
 
     use super::{
         CpuClock, Runtime, RuntimeConfiguration, RuntimeError, checkpoint_digest, serial_port_index,
@@ -1745,7 +1764,7 @@ mod tests {
     const POST_PROMPT_INSTRUCTIONS: usize = 2_000_000;
     const P5_START_PC: u32 = 0xbfc0_0fb0;
     const P5_COMPLETE_PC: u32 = 0xbfc0_1020;
-    const HEADLESS_GRAPHICS_PROBE_PC: u32 = 0xbfc1_e69c;
+    const GRAPHICS_PROBE_PC: u32 = 0xbfc1_e69c;
     const SERIAL_RECEIVE_POLL_PC: u32 = 0xbfc2_28a0;
     const VOLUME_HEADER_MAGIC_CHECK_PC: u32 = 0xbfc2_b3fc;
     const VOLUME_HEADER_CHECKSUM_PC: u32 = 0xbfc2_b45c;
@@ -1764,6 +1783,77 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
 \n\rDiagnostics failed.\n\
 \r[Press any key to continue.]";
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ExternalPromStop {
+        SerialPrompt,
+        NonUniformVideoFrame,
+        VolumeHeaderValidation,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FrameFingerprint {
+        instruction: usize,
+        width: u32,
+        height: u32,
+        sha256: [u8; 32],
+        distinct_color_count: usize,
+        dominant_color: [u8; 4],
+        non_dominant_pixel_count: usize,
+        all_alpha_opaque: bool,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum VideoTransition {
+        NoGraphicsBoard { instruction: usize },
+        NoSignal { instruction: usize },
+        Blank { instruction: usize },
+        Frame(FrameFingerprint),
+    }
+
+    impl VideoTransition {
+        fn same_content(&self, other: &Self) -> bool {
+            match (self, other) {
+                (Self::NoGraphicsBoard { .. }, Self::NoGraphicsBoard { .. })
+                | (Self::NoSignal { .. }, Self::NoSignal { .. })
+                | (Self::Blank { .. }, Self::Blank { .. }) => true,
+                (Self::Frame(left), Self::Frame(right)) => {
+                    left.width == right.width
+                        && left.height == right.height
+                        && left.sha256 == right.sha256
+                        && left.distinct_color_count == right.distinct_color_count
+                        && left.dominant_color == right.dominant_color
+                        && left.non_dominant_pixel_count == right.non_dominant_pixel_count
+                        && left.all_alpha_opaque == right.all_alpha_opaque
+                }
+                _ => false,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct VideoCapture {
+        transitions: Vec<VideoTransition>,
+        first_non_uniform_frame: Option<FrameFingerprint>,
+    }
+
+    impl VideoCapture {
+        fn observe(&mut self, transition: VideoTransition) {
+            if let VideoTransition::Frame(frame) = &transition
+                && frame.distinct_color_count > 1
+                && self.first_non_uniform_frame.is_none()
+            {
+                self.first_non_uniform_frame = Some(frame.clone());
+            }
+            if self
+                .transitions
+                .last()
+                .is_none_or(|previous| !previous.same_content(&transition))
+            {
+                self.transitions.push(transition);
+            }
+        }
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct ExternalPromRun {
         serial_a: Vec<u8>,
@@ -1772,12 +1862,57 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         receive_poll_count: usize,
         p5_started: bool,
         p5_completed: bool,
-        headless_graphics_probe_observed: bool,
+        graphics_probe_observed: bool,
         volume_header_magic_checked: bool,
         volume_header_checksum_checked: bool,
         gio_burst: Option<u32>,
         gio_delay: Option<u32>,
         cpu_frequency_string: Vec<Option<u8>>,
+        initial_video: VideoTransition,
+        video_transitions: Vec<VideoTransition>,
+        first_non_uniform_frame: Option<FrameFingerprint>,
+        final_video: VideoTransition,
+    }
+
+    fn frame_fingerprint(frame: &VideoFrame, instruction: usize) -> FrameFingerprint {
+        let mut colors = HashMap::<[u8; 4], usize>::new();
+        let mut all_alpha_opaque = true;
+        for pixel in frame.pixels().chunks_exact(4) {
+            let color: [u8; 4] = pixel.try_into().unwrap();
+            all_alpha_opaque &= color[3] == 0xff;
+            *colors.entry(color).or_default() += 1;
+        }
+        let (dominant_color, dominant_count) = colors
+            .iter()
+            .map(|(&color, &count)| (color, count))
+            .max_by(|(left_color, left_count), (right_color, right_count)| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| right_color.cmp(left_color))
+            })
+            .expect("a validated video frame contains pixels");
+        let pixel_count = frame.pixels().len() / 4;
+        FrameFingerprint {
+            instruction,
+            width: frame.width(),
+            height: frame.height(),
+            sha256: Sha256::digest(frame.pixels()).into(),
+            distinct_color_count: colors.len(),
+            dominant_color,
+            non_dominant_pixel_count: pixel_count - dominant_count,
+            all_alpha_opaque,
+        }
+    }
+
+    fn video_transition(output: &VideoOutput, instruction: usize) -> VideoTransition {
+        match output {
+            VideoOutput::NoGraphicsBoard => VideoTransition::NoGraphicsBoard { instruction },
+            VideoOutput::NoSignal => VideoTransition::NoSignal { instruction },
+            VideoOutput::Active { frame: None } => VideoTransition::Blank { instruction },
+            VideoOutput::Active { frame: Some(frame) } => {
+                VideoTransition::Frame(frame_fingerprint(frame, instruction))
+            }
+        }
     }
 
     fn read_physical_word(machine: &Ip12, address: u64) -> Option<u32> {
@@ -1798,6 +1933,17 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         Some(u32::from_be_bytes([first, second, third, fourth]))
     }
 
+    fn read_physical_byte(machine: &Ip12, address: u64) -> Option<u8> {
+        let DebugResponse::Memory(memory) = machine.debug(DebugRequest::Memory {
+            address_space: MemoryAddressSpace::Physical,
+            start: address,
+            length: 1,
+        }) else {
+            unreachable!();
+        };
+        memory.bytes.into_iter().next().flatten()
+    }
+
     fn machine_with_instructions(instructions: &[u32]) -> Machine {
         let mut raw_prom = vec![0; PROM_BYTES];
         for (destination, instruction) in raw_prom
@@ -1807,7 +1953,9 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             let [first, second, third, fourth] = instruction.to_be_bytes();
             destination.copy_from_slice(&[second, first, fourth, third]);
         }
-        Machine::IndigoIp12(Ip12::new(raw_prom, Backend::SoftFloat, None, None).unwrap())
+        Machine::IndigoIp12(
+            Ip12::new(raw_prom, Backend::SoftFloat, GioBus::new(), None, None).unwrap(),
+        )
     }
 
     fn machine_that_transmits_serial_a(values: &[u8]) -> Machine {
@@ -1833,6 +1981,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             MachineStartupConfiguration::IndigoIp12 {
                 floating_point_backend: Backend::SoftFloat,
                 memory: Ip12MemoryConfiguration::default(),
+                graphics: Some(GraphicsBoard::Lg1),
             },
             MediaIdentity::from_bytes(Path::new("prom.bin"), &[0; PROM_BYTES]),
             None,
@@ -2092,6 +2241,33 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             panic!("discarded output must not be retained for a later handler")
         }));
         worker.execute_timed_instruction().unwrap();
+    }
+
+    #[test]
+    fn output_handler_receives_current_video_after_attach_configure_and_reset() {
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let video = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&video);
+        runtime
+            .set_output_handler(Box::new(move |output| {
+                if let Some(update) = output.video() {
+                    received.lock().unwrap().push(update.clone());
+                }
+            }))
+            .unwrap();
+        assert!(video.lock().unwrap().is_empty());
+
+        runtime.configure(reset_machine()).unwrap();
+        assert_eq!(*video.lock().unwrap(), [VideoOutput::NoGraphicsBoard]);
+
+        runtime.reset().unwrap();
+        assert_eq!(
+            *video.lock().unwrap(),
+            [VideoOutput::NoGraphicsBoard, VideoOutput::NoGraphicsBoard]
+        );
+
+        runtime.clear_output_handler().unwrap();
+        runtime.shutdown().unwrap();
     }
 
     #[test]
@@ -2980,19 +3156,45 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         bytes
     }
 
+    fn dynamic_sgi_storage() -> Box<dyn BlockStorage> {
+        Box::new(RecordingStorage {
+            bytes: dynamic_sgi_volume_header(),
+            reads: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
     fn run_external_ip12_prom(
         raw_prom: Vec<u8>,
+        graphics: Option<GraphicsBoard>,
         storage: Option<Box<dyn BlockStorage>>,
+        stop: ExternalPromStop,
     ) -> ExternalPromRun {
-        let continue_after_diagnostics = storage.is_some();
+        let mut gio = GioBus::new();
+        if let Some(GraphicsBoard::Lg1) = graphics {
+            gio.attach(GioSlot::Graphics, Box::new(Lg1::new())).unwrap();
+        }
         let machine = Machine::IndigoIp12(
-            Ip12::new(raw_prom, Backend::SoftFloat, storage, None)
-                .expect("the PROM dump and storage should be valid"),
+            Ip12::new_with_memory(
+                raw_prom,
+                Backend::SoftFloat,
+                Ip12MemoryConfiguration::default(),
+                gio,
+                storage,
+                None,
+            )
+            .expect("the PROM dump and storage should be valid"),
         );
+        let initial_video = video_transition(&machine.video_output(), 0);
         let serial_a = Arc::new(Mutex::new(Vec::new()));
         let serial_b = Arc::new(Mutex::new(Vec::new()));
+        let video_capture = Arc::new(Mutex::new(VideoCapture::default()));
+        let video_instruction = Arc::new(AtomicUsize::new(0));
+        let non_uniform_video_frame = Arc::new(AtomicBool::new(false));
         let output_a = Arc::clone(&serial_a);
         let output_b = Arc::clone(&serial_b);
+        let captured_video = Arc::clone(&video_capture);
+        let captured_video_instruction = Arc::clone(&video_instruction);
+        let captured_non_uniform_video_frame = Arc::clone(&non_uniform_video_frame);
         let mut worker = super::Worker::new(Some(machine));
         worker.output_handler = Some(Box::new(move |output| {
             output_a
@@ -3003,6 +3205,18 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
                 .lock()
                 .unwrap()
                 .extend_from_slice(output.serial(SerialPort::B));
+            if let Some(video) = output.video() {
+                let transition =
+                    video_transition(video, captured_video_instruction.load(Ordering::Relaxed));
+                let non_uniform = matches!(
+                    &transition,
+                    VideoTransition::Frame(frame) if frame.distinct_color_count > 1
+                );
+                captured_video.lock().unwrap().observe(transition);
+                if non_uniform {
+                    captured_non_uniform_video_frame.store(true, Ordering::Relaxed);
+                }
+            }
         }));
 
         let mut executed = 0;
@@ -3010,10 +3224,11 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         let mut receive_poll_count = 0;
         let mut p5_started = false;
         let mut p5_completed = false;
-        let mut headless_graphics_probe_observed = false;
+        let mut graphics_probe_observed = false;
         let mut volume_header_magic_checked = false;
         let mut volume_header_checksum_checked = false;
         let mut system_start_requested = false;
+        let mut stop_reached = false;
         while executed < EXTERNAL_PROM_EXECUTION_BUDGET {
             let address = worker.machine.as_ref().unwrap().execution_address();
             if address == P5_START_PC {
@@ -3022,8 +3237,8 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             if address == P5_COMPLETE_PC {
                 p5_completed = true;
             }
-            if address == HEADLESS_GRAPHICS_PROBE_PC {
-                headless_graphics_probe_observed = true;
+            if address == GRAPHICS_PROBE_PC {
+                graphics_probe_observed = true;
             }
             if address == VOLUME_HEADER_MAGIC_CHECK_PC {
                 volume_header_magic_checked = true;
@@ -3033,6 +3248,9 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             }
             if prompt_completed_at.is_some() && address == SERIAL_RECEIVE_POLL_PC {
                 receive_poll_count += 1;
+            }
+            if graphics == Some(GraphicsBoard::Lg1) {
+                video_instruction.store(executed + 1, Ordering::Relaxed);
             }
             if let Err(error) = worker.execute_timed_instruction() {
                 panic!(
@@ -3048,32 +3266,33 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
                     .ends_with(b"[Press any key to continue.]")
             {
                 prompt_completed_at = Some(executed);
-                if continue_after_diagnostics {
+                if stop == ExternalPromStop::VolumeHeaderValidation {
                     worker.pending_serial[serial_port_index(SerialPort::B)].push_back(b'\r');
                 }
             }
-            if continue_after_diagnostics
+            if stop == ExternalPromStop::VolumeHeaderValidation
                 && !system_start_requested
                 && serial_b.lock().unwrap().ends_with(b"Option? ")
             {
                 worker.pending_serial[serial_port_index(SerialPort::B)].extend(b"1\r");
                 system_start_requested = true;
             }
-            if continue_after_diagnostics {
-                if volume_header_magic_checked && volume_header_checksum_checked {
-                    break;
+            stop_reached = match stop {
+                ExternalPromStop::SerialPrompt => prompt_completed_at
+                    .is_some_and(|instruction| executed - instruction == POST_PROMPT_INSTRUCTIONS),
+                ExternalPromStop::NonUniformVideoFrame => {
+                    non_uniform_video_frame.load(Ordering::Relaxed)
                 }
-            } else if let Some(prompt_instruction) = prompt_completed_at
-                && executed - prompt_instruction == POST_PROMPT_INSTRUCTIONS
-            {
+                ExternalPromStop::VolumeHeaderValidation => {
+                    volume_header_magic_checked && volume_header_checksum_checked
+                }
+            };
+            if stop_reached {
                 break;
             }
         }
 
-        let prompt_instruction = prompt_completed_at.or_else(|| {
-            if continue_after_diagnostics {
-                return None;
-            }
+        if !stop_reached {
             let machine = worker.machine.as_ref().unwrap();
             let address = machine.execution_address();
             let Machine::IndigoIp12(machine) = machine;
@@ -3095,17 +3314,28 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
                 .collect::<Option<Vec<_>>>()
                 .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
                 .map(u32::from_be_bytes);
+            let rtc_time: Vec<_> = [0x1b, 0x1f, 0x23, 0x27, 0x2b, 0x2f]
+                .into_iter()
+                .map(|offset| read_physical_byte(machine, 0x1fb8_0e00 + offset))
+                .collect();
             let serial_b = serial_b.lock().unwrap();
             let tail_start = serial_b.len().saturating_sub(512);
             let serial_tail = String::from_utf8_lossy(&serial_b[tail_start..]);
+            let video_capture = video_capture.lock().unwrap();
             panic!(
-                "PROM did not reach its input prompt within {EXTERNAL_PROM_EXECUTION_BUDGET} \
+                "PROM did not satisfy {stop:?} within {EXTERNAL_PROM_EXECUTION_BUDGET} \
                  instructions; PC=0x{address:08x}; a0=0x{:08x}; ra=0x{:08x}; sp=0x{:08x}; \
-                 caller={caller:?}; \
+                 caller={caller:?}; graphics_probe={graphics_probe_observed}; \
+                 volume_header_magic={volume_header_magic_checked}; \
+                 volume_header_checksum={volume_header_checksum_checked}; \
+                 rtc_time={:?}; \
+                 video_transitions={:?}; \
                  serial B tail:\n{serial_tail}",
-                cpu.gpr[4], cpu.gpr[31], cpu.gpr[29]
+                cpu.gpr[4], cpu.gpr[31], cpu.gpr[29], rtc_time, video_capture.transitions
             )
-        });
+        }
+        let final_video =
+            video_transition(&worker.machine.as_ref().unwrap().video_output(), executed);
         let Machine::IndigoIp12(machine) = worker.machine.as_ref().unwrap();
         let DebugResponse::Memory(cpu_frequency) = machine.debug(DebugRequest::Memory {
             address_space: MemoryAddressSpace::Physical,
@@ -3115,31 +3345,37 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             unreachable!();
         };
 
+        let video_capture = video_capture.lock().unwrap();
         ExternalPromRun {
             serial_a: serial_a.lock().unwrap().clone(),
             serial_b: serial_b.lock().unwrap().clone(),
-            prompt_instruction,
+            prompt_instruction: prompt_completed_at,
             receive_poll_count,
             p5_started,
             p5_completed,
-            headless_graphics_probe_observed,
+            graphics_probe_observed,
             volume_header_magic_checked,
             volume_header_checksum_checked,
             gio_burst: read_physical_word(machine, PIC1_GIO_BURST_ADDRESS),
             gio_delay: read_physical_word(machine, PIC1_GIO_DELAY_ADDRESS),
             cpu_frequency_string: cpu_frequency.bytes,
+            initial_video,
+            video_transitions: video_capture.transitions.clone(),
+            first_non_uniform_frame: video_capture.first_non_uniform_frame.clone(),
+            final_video,
         }
     }
 
     #[test]
     #[ignore = "requires an external 070-8088-002 IP12 PROM dump"]
-    fn ip12_prom_reaches_serial_receive_wait_deterministically() {
+    fn headless_ip12_prom_reaches_serial_receive_wait_deterministically() {
         let path = env::var_os("SE_INDIGO_IP12_PROM")
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
 
-        let first = run_external_ip12_prom(raw_prom.clone(), None);
-        let second = run_external_ip12_prom(raw_prom, None);
+        let first =
+            run_external_ip12_prom(raw_prom.clone(), None, None, ExternalPromStop::SerialPrompt);
+        let second = run_external_ip12_prom(raw_prom, None, None, ExternalPromStop::SerialPrompt);
 
         assert_eq!(first, second);
         assert!(first.serial_a.is_empty());
@@ -3154,7 +3390,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         assert!(first.receive_poll_count != 0);
         assert!(first.p5_started);
         assert!(first.p5_completed);
-        assert!(first.headless_graphics_probe_observed);
+        assert!(first.graphics_probe_observed);
         assert!(!first.volume_header_magic_checked);
         assert!(!first.volume_header_checksum_checked);
         assert_eq!(first.gio_burst, Some(1));
@@ -3163,6 +3399,58 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             first.cpu_frequency_string,
             [Some(b'3'), Some(b'3'), Some(0)]
         );
+        assert!(matches!(
+            first.initial_video,
+            VideoTransition::NoGraphicsBoard { instruction: 0 }
+        ));
+        assert!(matches!(
+            first.final_video,
+            VideoTransition::NoGraphicsBoard { .. }
+        ));
+        assert!(first.video_transitions.is_empty());
+        assert_eq!(first.first_non_uniform_frame, None);
+    }
+
+    #[test]
+    #[ignore = "requires an external 070-8088-002 IP12 PROM dump"]
+    fn lg1_ip12_prom_produces_a_deterministic_visible_frame() {
+        let path = env::var_os("SE_INDIGO_IP12_PROM")
+            .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
+        let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
+
+        let first = run_external_ip12_prom(
+            raw_prom.clone(),
+            Some(GraphicsBoard::Lg1),
+            Some(dynamic_sgi_storage()),
+            ExternalPromStop::NonUniformVideoFrame,
+        );
+        let second = run_external_ip12_prom(
+            raw_prom,
+            Some(GraphicsBoard::Lg1),
+            Some(dynamic_sgi_storage()),
+            ExternalPromStop::NonUniformVideoFrame,
+        );
+
+        assert_eq!(first, second);
+        assert!(matches!(
+            first.initial_video,
+            VideoTransition::NoSignal { instruction: 0 }
+        ));
+        let frame = first
+            .first_non_uniform_frame
+            .as_ref()
+            .expect("the stop condition requires a non-uniform frame");
+        assert_eq!((frame.width, frame.height), (1024, 768));
+        assert!(frame.instruction < EXTERNAL_PROM_EXECUTION_BUDGET);
+        assert!(frame.distinct_color_count >= 2);
+        assert!(frame.non_dominant_pixel_count > 0);
+        assert!(frame.all_alpha_opaque);
+        assert_eq!(first.final_video, VideoTransition::Frame(frame.clone()));
+        assert_eq!(
+            first.video_transitions.last(),
+            Some(&VideoTransition::Frame(frame.clone()))
+        );
+        assert!(first.graphics_probe_observed);
     }
 
     #[test]
@@ -3177,7 +3465,12 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             reads: Arc::clone(&reads),
         };
 
-        let run = run_external_ip12_prom(raw_prom, Some(Box::new(storage)));
+        let run = run_external_ip12_prom(
+            raw_prom,
+            None,
+            Some(Box::new(storage)),
+            ExternalPromStop::VolumeHeaderValidation,
+        );
 
         let storage_reads = reads.lock().unwrap().clone();
         let serial_b = String::from_utf8_lossy(&run.serial_b);
@@ -3202,7 +3495,16 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
     }
 
     fn reset_machine() -> Machine {
-        Machine::IndigoIp12(Ip12::new(vec![0; 0x40000], Backend::SoftFloat, None, None).unwrap())
+        Machine::IndigoIp12(
+            Ip12::new(
+                vec![0; 0x40000],
+                Backend::SoftFloat,
+                GioBus::new(),
+                None,
+                None,
+            )
+            .unwrap(),
+        )
     }
 
     #[test]

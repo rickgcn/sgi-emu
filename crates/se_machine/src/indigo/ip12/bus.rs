@@ -2,6 +2,7 @@ use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 use se_device::centronics::CentronicsPort;
 use se_device::dp8573a::{Dp8573a, Dp8573aBatteryState};
 use se_device::dsp56001::Dsp56001;
+use se_device::gio::{GioBus, GioBusSnapshot, GioDisplayState, GioSlot, GioSnapshotError};
 use se_device::hpc1::Hpc1;
 use se_device::int2::Int2;
 use se_device::mdac::Mdac;
@@ -9,14 +10,16 @@ use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
-use se_device::scsi::{ScsiBus, ScsiBusSnapshot, ScsiSnapshotError};
+use se_device::scsi::{ScsiBus, ScsiBusSnapshot};
 use se_device::seeq8003::Seeq8003;
 use se_device::wd33c93b::{Wd33c93b, WdRequest};
 use se_device::z85230::{Channel, Z85230};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::Ip12SnapshotError;
 use super::events::{EventKind, Ip12Events};
+use crate::output::{VideoFrame, VideoOutput};
 use crate::serial::SerialPort;
 
 const BOARD_REVISION: u32 = 0x0000_8000;
@@ -52,6 +55,7 @@ pub(super) struct Ip12Bus {
     dsp56001: Dsp56001,
     prom: Rom,
     cpu_aux_control: u8,
+    gio: GioBus,
     events: Ip12Events,
 }
 
@@ -75,6 +79,7 @@ pub(super) struct Ip12BusSnapshot {
     nvram: Nmc93cs46,
     dsp56001: Dsp56001,
     cpu_aux_control: u8,
+    gio: GioBusSnapshot,
     events: Ip12Events,
 }
 
@@ -95,6 +100,7 @@ impl Ip12Bus {
         nvram: Nmc93cs46,
         dsp56001: Dsp56001,
         prom: Rom,
+        gio: GioBus,
     ) -> Self {
         let mut bus = Self {
             pic1,
@@ -116,6 +122,7 @@ impl Ip12Bus {
             dsp56001,
             prom,
             cpu_aux_control: 0,
+            gio,
             events: Ip12Events::new(),
         };
         bus.schedule_timed_devices();
@@ -124,7 +131,7 @@ impl Ip12Bus {
         bus
     }
 
-    pub(super) fn snapshot(&self) -> Result<Ip12BusSnapshot, ScsiSnapshotError> {
+    pub(super) fn snapshot(&self) -> Result<Ip12BusSnapshot, Ip12SnapshotError> {
         Ok(Ip12BusSnapshot {
             pic1: self.pic1.clone(),
             memory: self.memory.clone(),
@@ -144,6 +151,7 @@ impl Ip12Bus {
             nvram: self.nvram.clone(),
             dsp56001: self.dsp56001.clone(),
             cpu_aux_control: self.cpu_aux_control,
+            gio: self.gio.snapshot(),
             events: self.events.clone(),
         })
     }
@@ -151,7 +159,10 @@ impl Ip12Bus {
     pub(super) fn restore_snapshot(
         &mut self,
         snapshot: Ip12BusSnapshot,
-    ) -> Result<(), ScsiSnapshotError> {
+    ) -> Result<(), Ip12SnapshotError> {
+        if !self.gio.accepts_snapshot(&snapshot.gio) {
+            return Err(GioSnapshotError.into());
+        }
         self.scsi_bus.restore_snapshot(snapshot.scsi_bus)?;
         self.pic1 = snapshot.pic1;
         self.memory = snapshot.memory;
@@ -170,6 +181,7 @@ impl Ip12Bus {
         self.nvram = snapshot.nvram;
         self.dsp56001 = snapshot.dsp56001;
         self.cpu_aux_control = snapshot.cpu_aux_control;
+        self.gio.restore_snapshot(snapshot.gio)?;
         self.events = snapshot.events;
         Ok(())
     }
@@ -189,6 +201,7 @@ impl Ip12Bus {
             serial.reset();
         }
         self.int2.reset();
+        self.gio.reset();
         self.events.reset();
         self.schedule_timed_devices();
         self.synchronize_serial_interrupt();
@@ -279,6 +292,30 @@ impl Ip12Bus {
         hasher.update(bytes);
     }
 
+    /// Returns what the primary graphics slot currently drives to the display.
+    #[must_use]
+    pub(in super::super) fn video_output(&self) -> VideoOutput {
+        match self.gio.display_state(GioSlot::Graphics) {
+            None => VideoOutput::NoGraphicsBoard,
+            Some(GioDisplayState::NoSignal) => VideoOutput::NoSignal,
+            Some(GioDisplayState::Blank) => VideoOutput::Active { frame: None },
+            Some(GioDisplayState::Active {
+                width,
+                height,
+                pixels,
+            }) => VideoOutput::Active {
+                frame: VideoFrame::new(width, height, pixels),
+            },
+        }
+    }
+
+    /// Takes a pending primary-display update without advancing virtual time.
+    pub(super) fn take_video_output_update(&mut self) -> Option<VideoOutput> {
+        self.gio
+            .take_display_update(GioSlot::Graphics)
+            .then(|| self.video_output())
+    }
+
     pub(super) fn debug_read(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {
         if address.get() < LOCAL_MEMORY_END {
             return self.memory.read(&self.pic1, address, data);
@@ -302,10 +339,7 @@ impl Ip12Bus {
             Target::BoardRevision => read_board_revision(data),
             Target::Dsp56001(address) => self.dsp56001.read(address, data),
             Target::Prom(address) => self.prom.read(address, data),
-            Target::Gio(_address) => {
-                data.fill(0);
-                Ok(())
-            }
+            Target::Gio(slot, address) => self.gio.debug_read(slot, address, data),
         }
     }
 }
@@ -358,9 +392,12 @@ impl PhysicalBus for Ip12Bus {
             Target::BoardRevision => read_board_revision(data),
             Target::Dsp56001(address) => self.dsp56001.read(address, data),
             Target::Prom(address) => self.prom.read(address, data),
-            Target::Gio(_address) => {
-                data.fill(0);
-                Ok(())
+            Target::Gio(slot, address) => {
+                self.synchronize_gio_time();
+                let result = self.gio.read(slot, address, data);
+                self.synchronize_gio_interrupts();
+                self.reschedule_gio();
+                result
             }
         }
     }
@@ -423,7 +460,13 @@ impl PhysicalBus for Ip12Bus {
                 Target::BoardRevision => Err(BusError::UnimplementedAccess),
                 Target::Dsp56001(address) => self.dsp56001.write(address, data),
                 Target::Prom(_) => Ok(()),
-                Target::Gio(_address) => Ok(()),
+                Target::Gio(slot, address) => {
+                    self.synchronize_gio_time();
+                    let result = self.gio.write(slot, address, data);
+                    self.synchronize_gio_interrupts();
+                    self.reschedule_gio();
+                    result
+                }
             })
         };
 
@@ -454,7 +497,8 @@ mod tests {
 
     use super::address::{
         BOARD_REVISION_BASE, CENTRONICS_EXTERNAL_BASE, CPU_AUX_CONTROL, DSP56001_BASE,
-        DSP56001_END, GIO_BASE, GIO_END, HPC1_COUNTER_BASE, HPC1_DSP_INTERRUPT_MASK_BASE,
+        DSP56001_END, GIO_GRAPHICS_BASE, GIO_GRAPHICS_END, GIO_SLOT_0_BASE, GIO_SLOT_0_END,
+        GIO_SLOT_1_BASE, GIO_SLOT_1_END, HPC1_COUNTER_BASE, HPC1_DSP_INTERRUPT_MASK_BASE,
         HPC1_DSP_INTERRUPT_STATUS_BASE, HPC1_ENDIAN_CONTROL_BASE, INT2_BASE, MDAC_BASE, PIC1_BASE,
         PROM_BASE, RTC_BASE, SCSI_ADDRESS_PORT, SERIAL_0_BASE, SERIAL_1_BASE,
     };
@@ -529,9 +573,12 @@ mod tests {
         assert_eq!(read_word(&mut bus, PIC1_BASE + 0x2_000c), Ok(0xf2));
         assert_eq!(read_word(&mut bus, DSP56001_BASE), Ok(0x0012_3456));
         assert_eq!(read_word(&mut bus, DSP56001_END - 4), Ok(0x0065_4321));
-        assert_eq!(read_word(&mut bus, GIO_BASE), Ok(0));
+        assert_eq!(read_word(&mut bus, GIO_GRAPHICS_BASE), Ok(0));
         assert_eq!(
-            bus.write(PhysAddr::new(GIO_END - 4), &0x1234_5678_u32.to_be_bytes()),
+            bus.write(
+                PhysAddr::new(GIO_GRAPHICS_END - 4),
+                &0x1234_5678_u32.to_be_bytes(),
+            ),
             Ok(())
         );
         assert!(!bus.error_interrupt_asserted());
@@ -545,7 +592,14 @@ mod tests {
                 bus.write(PhysAddr::new(0x1fb0_0010), &[0]).unwrap();
             }
             for length in 1..=4 {
-                for address in [GIO_BASE, GIO_END - length as u64] {
+                for address in [
+                    GIO_GRAPHICS_BASE,
+                    GIO_GRAPHICS_END - length as u64,
+                    GIO_SLOT_0_BASE,
+                    GIO_SLOT_0_END - length as u64,
+                    GIO_SLOT_1_BASE,
+                    GIO_SLOT_1_END - length as u64,
+                ] {
                     let mut bytes = [0xff; 4];
                     bus.debug_read(PhysAddr::new(address), &mut bytes[..length])
                         .unwrap();

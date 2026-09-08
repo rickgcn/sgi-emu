@@ -74,6 +74,7 @@ SettingsDialog::SettingsDialog(const UiSession& session, const MachineSettings& 
     , prom_edit_(new QLineEdit(this))
     , disk_edit_(new QLineEdit(this))
     , cdrom_edit_(new QLineEdit(this))
+    , graphics_board_combo_(new QComboBox(this))
     , float_backend_combo_(new QComboBox(this))
     , subnet_edit_(new QLineEdit(settings.network.subnet, this))
     , gateway_edit_(new QLineEdit(settings.network.gateway, this))
@@ -94,6 +95,11 @@ SettingsDialog::SettingsDialog(const UiSession& session, const MachineSettings& 
     prom_edit_->setText(settings.prom_path);
     disk_edit_->setText(settings.disk_path);
     cdrom_edit_->setText(settings.cdrom_path);
+
+    graphics_board_combo_->addItem(QStringLiteral("LG1"), QStringLiteral("lg1"));
+    graphics_board_combo_->addItem(QStringLiteral("None"), QStringLiteral("none"));
+    const auto graphics_index = graphics_board_combo_->findData(settings.graphics_board);
+    graphics_board_combo_->setCurrentIndex(graphics_index >= 0 ? graphics_index : 0);
 
     float_backend_combo_->addItem(QStringLiteral("SoftFloat"), QStringLiteral("softfloat"));
     float_backend_combo_->addItem(QStringLiteral("Native"), QStringLiteral("native"));
@@ -160,6 +166,7 @@ SettingsDialog::SettingsDialog(const UiSession& session, const MachineSettings& 
     layout->addRow(QStringLiteral("PROM"), prom_widget);
     layout->addRow(QStringLiteral("Disk image"), disk_widget);
     layout->addRow(QStringLiteral("CD-ROM image"), cdrom_widget);
+    layout->addRow(QStringLiteral("Graphics board"), graphics_board_combo_);
     layout->addRow(QStringLiteral("Float backend"), float_backend_combo_);
     auto* network_tab = new QWidget(this);
     auto* network_layout = new QVBoxLayout(network_tab);
@@ -217,6 +224,7 @@ MachineSettings SettingsDialog::settings() const {
         prom_edit_->text(),
         disk_edit_->text(),
         cdrom_edit_->text(),
+        graphics_board_combo_->currentData().toString(),
         float_backend_combo_->currentData().toString(),
         network,
     };

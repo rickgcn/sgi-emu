@@ -4,6 +4,7 @@ use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 use se_device::centronics::CentronicsPort;
 use se_device::dp8573a::Dp8573a;
 use se_device::dsp56001::Dsp56001;
+use se_device::gio::GioBus;
 use se_device::hpc1::Hpc1;
 use se_device::int2::Int2;
 use se_device::mdac::Mdac;
@@ -30,6 +31,14 @@ pub(super) fn bus() -> Ip12Bus {
 }
 
 pub(super) fn bus_with_memory(memory: [Option<Ram>; 4]) -> Ip12Bus {
+    bus_with_memory_and_gio(memory, GioBus::new())
+}
+
+pub(super) fn bus_with_gio(gio: GioBus) -> Ip12Bus {
+    bus_with_memory_and_gio([Some(Ram::new(8 * 1024 * 1024)), None, None, None], gio)
+}
+
+fn bus_with_memory_and_gio(memory: [Option<Ram>; 4], gio: GioBus) -> Ip12Bus {
     let bytes = (0..PROM_BYTES).map(|index| index as u8).collect();
     Ip12Bus::new(
         Pic1::new(0xf7, 2, true),
@@ -46,6 +55,7 @@ pub(super) fn bus_with_memory(memory: [Option<Ram>; 4]) -> Ip12Bus {
         Nmc93cs46::new(),
         Dsp56001::new(),
         Rom::new(bytes),
+        gio,
     )
 }
 
@@ -142,6 +152,7 @@ pub(super) fn bus_with_disk_failures(
         Nmc93cs46::new(),
         Dsp56001::new(),
         Rom::new(prom),
+        GioBus::new(),
     )
 }
 
@@ -177,6 +188,7 @@ pub(super) fn bus_with_cdrom(bytes: Vec<u8>, fail_reads: bool) -> Ip12Bus {
         Nmc93cs46::new(),
         Dsp56001::new(),
         Rom::new(prom),
+        GioBus::new(),
     )
 }
 
@@ -226,6 +238,7 @@ pub(super) fn bus_with_disk_and_cdrom(disk_bytes: Vec<u8>, cdrom_bytes: Vec<u8>)
         Nmc93cs46::new(),
         Dsp56001::new(),
         Rom::new(prom),
+        GioBus::new(),
     )
 }
 

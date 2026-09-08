@@ -44,6 +44,7 @@ struct MachineSettings {
     QString prom_path;
     QString disk_path;
     QString cdrom_path;
+    QString graphics_board;
     QString float_backend;
     NetworkSettings network;
 };
@@ -68,6 +69,7 @@ private:
     QLineEdit* prom_edit_;
     QLineEdit* disk_edit_;
     QLineEdit* cdrom_edit_;
+    QComboBox* graphics_board_combo_;
     QComboBox* float_backend_combo_;
     QLineEdit* subnet_edit_;
     QLineEdit* gateway_edit_;
