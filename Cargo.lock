@@ -564,6 +564,7 @@ dependencies = [
 name = "se_device"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "se_core",
  "serde",
  "serde-big-array",

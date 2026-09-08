@@ -33,10 +33,17 @@ impl Ip12Bus {
                     let _ = self.events.synchronize(EventKind::Scsi);
                     self.process_scsi_event();
                 }
+                EventKind::Gio => {
+                    self.synchronize_gio_time();
+                    self.reschedule_gio();
+                }
             }
         }
         for frame in self.ethernet_output.drain(..) {
             output.push_ethernet(frame);
+        }
+        if let Some(video) = self.take_video_output_update() {
+            output.publish_video(video);
         }
     }
 
@@ -49,6 +56,21 @@ impl Ip12Bus {
         self.reschedule_serial(1);
         self.events.schedule(EventKind::Scsi, None);
         self.reschedule_ethernet();
+        self.synchronize_gio_interrupts();
+        self.reschedule_gio();
+    }
+
+    /// Advances the GIO bus and transfers its output pins.
+    pub(super) fn synchronize_gio_time(&mut self) {
+        let elapsed = self.events.synchronize(EventKind::Gio);
+        self.gio.advance_time(elapsed);
+        self.synchronize_gio_interrupts();
+    }
+
+    /// Schedules the next event produced by an attached GIO device.
+    pub(super) fn reschedule_gio(&mut self) {
+        self.events
+            .schedule(EventKind::Gio, self.gio.time_until_event());
     }
 
     pub(super) fn synchronize_int2_time(&mut self) {
@@ -139,19 +161,24 @@ const fn serial_event_kind(index: usize) -> EventKind {
 
 #[cfg(test)]
 mod tests {
-    use se_core::bus::{BusError, PhysAddr, PhysicalBus};
+    use se_core::bus::{BusError, DeviceAddr, PhysAddr, PhysicalBus};
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
+    use se_device::gio::{
+        GioBus, GioDevice, GioDeviceSnapshot, GioDisplayState, GioInterrupt, GioSlot,
+    };
 
     use crate::output::MachineOutput;
     use crate::serial::SerialPort;
 
     use super::super::address::{
-        HPC1_COUNTER_BASE, HPC1_ETHERNET_TIMER_BASE, INT2_BASE, RTC_BASE, SERIAL_0_BASE,
-        SERIAL_1_BASE,
+        GIO_GRAPHICS_BASE, HPC1_COUNTER_BASE, HPC1_ETHERNET_TIMER_BASE, INT2_BASE, RTC_BASE,
+        SERIAL_0_BASE, SERIAL_1_BASE,
     };
     use super::super::test_support::{
-        bus, configure_serial_a, read_byte, read_scsi_register, read_word,
+        bus, bus_with_gio, configure_serial_a, read_byte, read_scsi_register, read_word,
     };
+
+    use super::EventKind;
 
     const ATTOSECONDS_PER_MICROSECOND: u128 = ATTOSECONDS_PER_SECOND / 1_000_000;
     const TIMER_ACKNOWLEDGE: u64 = INT2_BASE + 0x23;
@@ -159,12 +186,161 @@ mod tests {
     const TIMER_COUNTER_1: u64 = INT2_BASE + 0x37;
     const TIMER_COUNTER_2: u64 = INT2_BASE + 0x3b;
     const TIMER_CONTROL: u64 = INT2_BASE + 0x3f;
+    const LOCAL_INTERRUPT_0_STATUS: u64 = INT2_BASE;
+    const LOCAL_INTERRUPT_1_STATUS: u64 = INT2_BASE + 0x08;
+    const VME_INTERRUPT_STATUS: u64 = INT2_BASE + 0x10;
+    const OUTPUT_PORT: u64 = INT2_BASE + 0x1c;
+    const TEST_DEVICE_BASE: u64 = 0x100;
+    const TEST_DEVICE_PHYSICAL_BASE: u64 = GIO_GRAPHICS_BASE + TEST_DEVICE_BASE;
+    const RETRACE_BOUNDARY: VirtualDuration = VirtualDuration::from_attoseconds(10);
+
+    struct TimedInterruptDevice {
+        enabled: bool,
+        asserted: bool,
+        interrupt: GioInterrupt,
+    }
+
+    impl TimedInterruptDevice {
+        const fn new(interrupt: GioInterrupt) -> Self {
+            Self {
+                enabled: true,
+                asserted: false,
+                interrupt,
+            }
+        }
+    }
+
+    impl GioDevice for TimedInterruptDevice {
+        fn reset(&mut self) {
+            self.enabled = true;
+            self.asserted = false;
+        }
+
+        fn debug_read(&self, _address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
+            data.fill(0);
+            Ok(())
+        }
+
+        fn read(&mut self, _address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
+            data.fill(0);
+            Ok(())
+        }
+
+        fn write(&mut self, _address: DeviceAddr, _data: &[u8]) -> Result<(), BusError> {
+            self.enabled = false;
+            self.asserted = false;
+            Ok(())
+        }
+
+        fn advance_time(&mut self, elapsed: VirtualDuration) {
+            if self.enabled && elapsed == RETRACE_BOUNDARY {
+                self.asserted = !self.asserted;
+            }
+        }
+
+        fn time_until_event(&self) -> Option<VirtualDuration> {
+            self.enabled.then_some(RETRACE_BOUNDARY)
+        }
+
+        fn interrupt_asserted(&self, interrupt: GioInterrupt) -> bool {
+            self.asserted && interrupt == self.interrupt
+        }
+
+        fn display_state(&self) -> Option<GioDisplayState> {
+            None
+        }
+
+        fn take_display_update(&mut self) -> bool {
+            false
+        }
+
+        fn snapshot(&self) -> GioDeviceSnapshot {
+            panic!("this test device is never snapshotted")
+        }
+
+        fn accepts_snapshot(&self, _snapshot: &GioDeviceSnapshot) -> bool {
+            false
+        }
+
+        fn restore_snapshot(&mut self, _snapshot: GioDeviceSnapshot) {
+            panic!("this test device rejects every snapshot")
+        }
+    }
+
+    fn bus_with_timed_interrupt(interrupt: GioInterrupt) -> super::Ip12Bus {
+        let mut gio = GioBus::new();
+        gio.attach(
+            GioSlot::Graphics,
+            Box::new(TimedInterruptDevice::new(interrupt)),
+        )
+        .unwrap();
+        bus_with_gio(gio)
+    }
 
     fn configure_timer(bus: &mut super::Ip12Bus, control: u8, address: u64, reload: u16) {
         bus.write(PhysAddr::new(TIMER_CONTROL), &[control]).unwrap();
         for value in reload.to_le_bytes() {
             bus.write(PhysAddr::new(address), &[value]).unwrap();
         }
+    }
+
+    #[test]
+    fn a_gio_device_can_withdraw_retrace_and_cancel_its_deadline() {
+        let mut bus = bus_with_timed_interrupt(GioInterrupt::Interrupt2);
+        let mut output = MachineOutput::default();
+        bus.write(PhysAddr::new(OUTPUT_PORT + 3), &[0x08]).unwrap();
+        let blanking_start = bus.gio.time_until_event().unwrap();
+
+        bus.advance_time(blanking_start, &mut output);
+
+        assert_eq!(read_word(&mut bus, VME_INTERRUPT_STATUS), Ok(0));
+        assert_eq!(read_word(&mut bus, LOCAL_INTERRUPT_1_STATUS), Ok(0x80));
+        bus.write(PhysAddr::new(TEST_DEVICE_PHYSICAL_BASE), &[0])
+            .unwrap();
+        assert_eq!(read_word(&mut bus, VME_INTERRUPT_STATUS), Ok(1));
+        assert_eq!(read_word(&mut bus, LOCAL_INTERRUPT_1_STATUS), Ok(0x80));
+        assert!(!bus.events.has_deadline(EventKind::Gio));
+
+        bus.advance_time(blanking_start, &mut output);
+        assert_eq!(read_word(&mut bus, VME_INTERRUPT_STATUS), Ok(1));
+        assert_eq!(read_word(&mut bus, LOCAL_INTERRUPT_1_STATUS), Ok(0x80));
+    }
+
+    #[test]
+    fn gio_interrupt_levels_zero_and_one_reach_their_distinct_int2_inputs() {
+        for (interrupt, expected_status) in [
+            (GioInterrupt::Interrupt0, 1),
+            (GioInterrupt::Interrupt1, 1 << 6),
+        ] {
+            let mut bus = bus_with_timed_interrupt(interrupt);
+            let baseline = read_word(&mut bus, LOCAL_INTERRUPT_0_STATUS).unwrap();
+            assert_eq!(baseline & expected_status, 0);
+            bus.advance_time(RETRACE_BOUNDARY, &mut MachineOutput::default());
+
+            assert_eq!(
+                read_word(&mut bus, LOCAL_INTERRUPT_0_STATUS),
+                Ok(baseline | expected_status)
+            );
+            assert_eq!(read_word(&mut bus, LOCAL_INTERRUPT_1_STATUS), Ok(0));
+        }
+    }
+
+    #[test]
+    fn an_empty_gio_bus_has_no_retrace_or_deadline() {
+        let mut bus = bus();
+        bus.reset();
+        bus.write(PhysAddr::new(OUTPUT_PORT + 3), &[0x08]).unwrap();
+
+        assert_eq!(read_word(&mut bus, VME_INTERRUPT_STATUS), Ok(1));
+        assert_eq!(read_word(&mut bus, LOCAL_INTERRUPT_1_STATUS), Ok(0));
+        assert!(!bus.events.has_deadline(EventKind::Gio));
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(ATTOSECONDS_PER_SECOND),
+            &mut MachineOutput::default(),
+        );
+        assert_eq!(read_word(&mut bus, VME_INTERRUPT_STATUS), Ok(1));
+        assert_eq!(read_word(&mut bus, LOCAL_INTERRUPT_1_STATUS), Ok(0));
     }
 
     #[test]

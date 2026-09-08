@@ -1,13 +1,9 @@
 #pragma once
 
-#include "rust/cxx.h"
-
 #include <QDockWidget>
 
 #include <cstdint>
 #include <functional>
-#include <memory>
-#include <mutex>
 #include <vector>
 
 namespace se_ui {
@@ -39,24 +35,6 @@ private:
     Vt100Widget* serial_a_;
     Vt100Widget* serial_b_;
     bool input_enabled_;
-};
-
-class MachineOutputSink final : public std::enable_shared_from_this<MachineOutputSink> {
-public:
-    explicit MachineOutputSink(SerialConsoleDock* console);
-
-    void publish_output(
-        rust::Slice<const std::uint8_t> serial_a,
-        rust::Slice<const std::uint8_t> serial_b) const;
-
-private:
-    void drain() const;
-
-    SerialConsoleDock* console_;
-    mutable std::mutex mutex_;
-    mutable std::vector<std::uint8_t> pending_serial_a_;
-    mutable std::vector<std::uint8_t> pending_serial_b_;
-    mutable bool delivery_scheduled_;
 };
 
 } // namespace se_ui

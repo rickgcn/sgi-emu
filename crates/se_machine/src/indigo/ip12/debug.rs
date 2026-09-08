@@ -272,6 +272,7 @@ fn hash_bool(hasher: &mut Sha256, value: bool) {
 #[cfg(test)]
 mod tests {
     use se_cpu::mips1::r3000::debug::TlbView;
+    use se_device::gio::GioBus;
     use se_float::backend::Backend;
 
     use super::{DebugRequest, DebugResponse, Ip12, MemoryAddressSpace};
@@ -279,7 +280,14 @@ mod tests {
 
     #[test]
     fn debug_queries_do_not_advance_the_machine() {
-        let machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let machine = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         let pc = machine.execution_address();
 
         assert!(matches!(
@@ -295,7 +303,14 @@ mod tests {
 
     #[test]
     fn machine_state_fingerprint_is_stable_and_tracks_processor_state() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let mut machine = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         let baseline = machine.machine_state_fingerprint();
 
         assert_eq!(baseline, machine.machine_state_fingerprint());
@@ -305,7 +320,14 @@ mod tests {
 
     #[test]
     fn machine_state_fingerprint_tracks_uncommitted_interrupt_input() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let mut machine = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         let baseline = machine.machine_state_fingerprint();
 
         machine.cpu.set_hardware_interrupt_lines(1 << 3);
@@ -319,7 +341,14 @@ mod tests {
 
     #[test]
     fn physical_memory_reports_mapped_and_unmapped_bytes() {
-        let machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let machine = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         let response = machine.debug(DebugRequest::Memory {
             address_space: MemoryAddressSpace::Physical,
             start: 0x1fbf_ffff,

@@ -3,7 +3,6 @@
 #include "se_ui/src/bridge.rs.h"
 #include "se_ui/vt100_widget.h"
 
-#include <QMetaObject>
 #include <QString>
 #include <QTabWidget>
 
@@ -56,54 +55,6 @@ void SerialConsoleDock::send_serial(
     if (status_handler_) {
         status_handler_(status);
     }
-}
-
-MachineOutputSink::MachineOutputSink(SerialConsoleDock* console)
-    : console_(console)
-    , delivery_scheduled_(false) {
-}
-
-void MachineOutputSink::publish_output(
-    rust::Slice<const std::uint8_t> serial_a,
-    rust::Slice<const std::uint8_t> serial_b) const {
-    if (serial_a.empty() && serial_b.empty()) {
-        return;
-    }
-
-    bool schedule_delivery = false;
-    {
-        const std::lock_guard lock(mutex_);
-        pending_serial_a_.insert(pending_serial_a_.end(), serial_a.begin(), serial_a.end());
-        pending_serial_b_.insert(pending_serial_b_.end(), serial_b.begin(), serial_b.end());
-        if (!delivery_scheduled_) {
-            delivery_scheduled_ = true;
-            schedule_delivery = true;
-        }
-    }
-
-    if (!schedule_delivery) {
-        return;
-    }
-
-    const auto self = shared_from_this();
-    if (!QMetaObject::invokeMethod(
-            console_, [self] { self->drain(); }, Qt::QueuedConnection)) {
-        const std::lock_guard lock(mutex_);
-        delivery_scheduled_ = false;
-    }
-}
-
-void MachineOutputSink::drain() const {
-    std::vector<std::uint8_t> serial_a;
-    std::vector<std::uint8_t> serial_b;
-    {
-        const std::lock_guard lock(mutex_);
-        serial_a.swap(pending_serial_a_);
-        serial_b.swap(pending_serial_b_);
-        delivery_scheduled_ = false;
-    }
-
-    console_->append_serial(serial_a, serial_b);
 }
 
 } // namespace se_ui

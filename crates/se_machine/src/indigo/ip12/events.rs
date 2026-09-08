@@ -3,7 +3,7 @@
 use se_core::time::{VirtualDuration, VirtualInstant};
 use serde::{Deserialize, Serialize};
 
-const EVENT_COUNT: usize = 7;
+const EVENT_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) enum EventKind {
@@ -14,6 +14,7 @@ pub(super) enum EventKind {
     Serial1,
     Scsi,
     Ethernet,
+    Gio,
 }
 
 impl EventKind {
@@ -25,6 +26,7 @@ impl EventKind {
         Self::Serial1,
         Self::Scsi,
         Self::Ethernet,
+        Self::Gio,
     ];
 
     const fn index(self) -> usize {
@@ -36,6 +38,7 @@ impl EventKind {
             Self::Serial1 => 4,
             Self::Scsi => 5,
             Self::Ethernet => 6,
+            Self::Gio => 7,
         }
     }
 }
@@ -106,6 +109,11 @@ impl Ip12Events {
         self.now = VirtualInstant::ZERO;
         self.slots = [EventSlot::EMPTY; EVENT_COUNT];
         self.next_event = None;
+    }
+
+    #[cfg(test)]
+    pub(super) const fn has_deadline(&self, kind: EventKind) -> bool {
+        self.slots[kind.index()].deadline.is_some()
     }
 
     fn recompute_next_event(&mut self) {

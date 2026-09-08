@@ -1,5 +1,6 @@
 use se_core::bus::BusError;
 use se_core::time::VirtualDuration;
+use se_device::gio::GioInterrupt;
 use se_device::hpc1::EthernetRequest;
 use se_device::int2::Int2;
 use se_device::nmc93cs46::Nmc93cs46;
@@ -10,8 +11,9 @@ use sha2::{Digest, Sha256};
 
 use super::super::events::EventKind;
 use super::Ip12Bus;
-
 const CPU_AUX_OUTPUT_BITS: u8 = 0x0f;
+const GIO_INTERRUPT_0: u8 = 1 << 0;
+const GIO_INTERRUPT_1: u8 = 1 << 6;
 const SCSI_INTERRUPT: u8 = 1 << 2;
 const PARALLEL_INTERRUPT: u8 = 1 << 1;
 const SERIAL_INTERRUPT: u8 = 1 << 5;
@@ -19,6 +21,20 @@ const DSP_INTERRUPT: u8 = 1 << 4;
 const ETHERNET_INTERRUPT: u8 = 1 << 3;
 
 impl Ip12Bus {
+    /// Transfers the three shared GIO interrupt levels to their INT2 inputs.
+    pub(super) fn synchronize_gio_interrupts(&mut self) {
+        self.int2.set_local_interrupt_0_input(
+            GIO_INTERRUPT_0,
+            self.gio.interrupt_asserted(GioInterrupt::Interrupt0),
+        );
+        self.int2.set_local_interrupt_0_input(
+            GIO_INTERRUPT_1,
+            self.gio.interrupt_asserted(GioInterrupt::Interrupt1),
+        );
+        self.int2
+            .set_gio_interrupt_2_input(self.gio.interrupt_asserted(GioInterrupt::Interrupt2));
+    }
+
     pub(super) fn synchronize_serial_interrupt(&mut self) {
         let asserted = self.serial.iter().any(Z85230::interrupt_asserted);
         self.int2

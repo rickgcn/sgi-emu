@@ -6,6 +6,7 @@
 #include "se_ui/debugger/registers_dock.h"
 #include "se_ui/debugger/tlb_dock.h"
 #include "se_ui/display_widget.h"
+#include "se_ui/machine_output_sink.h"
 #include "se_ui/serial_console_dock.h"
 #include "se_ui/src/bridge.rs.h"
 
@@ -64,6 +65,7 @@ MachineSettings from_machine_configuration(const MachineConfiguration& configura
         from_rust_string(configuration.prom_path),
         from_rust_string(configuration.disk_path),
         from_rust_string(configuration.cdrom_path),
+        from_rust_string(configuration.graphics_board),
         from_rust_string(configuration.float_backend),
         from_network_configuration(configuration.network),
     };
@@ -78,6 +80,7 @@ MachineConfiguration to_machine_configuration(const MachineSettings& settings) {
         to_rust_string(settings.prom_path),
         to_rust_string(settings.disk_path),
         to_rust_string(settings.cdrom_path),
+        to_rust_string(settings.graphics_board),
         to_rust_string(settings.float_backend),
         to_network_configuration(settings.network),
     };
@@ -122,6 +125,7 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , cache_dock_(nullptr)
     , memory_dock_(nullptr)
     , serial_console_dock_(nullptr)
+    , display_widget_(new DisplayWidget(this))
     , machine_output_sink_()
     , update_timer_(new QTimer(this))
     , notification_timer_(new QTimer(this))
@@ -142,7 +146,7 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , runtime_status_(new QLabel(this)) {
     setObjectName(QStringLiteral("MainWindow"));
     setWindowTitle(QStringLiteral("sgi-emu"));
-    setCentralWidget(new DisplayWidget(this));
+    setCentralWidget(display_widget_);
     resize(1100, 720);
 
     create_actions();
@@ -153,7 +157,8 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     set_default_dock_layout();
     restore_window_state(startup);
 
-    machine_output_sink_ = std::make_shared<MachineOutputSink>(serial_console_dock_);
+    machine_output_sink_ =
+        std::make_shared<MachineOutputSink>(serial_console_dock_, display_widget_);
     apply_runtime_status(session_.attach_machine_output(machine_output_sink_), true);
 
     connect(update_timer_, &QTimer::timeout, this, &MainWindow::update_runtime);
@@ -630,6 +635,7 @@ void MainWindow::show_settings() {
         && selected.prom_path == settings_.prom_path
         && selected.disk_path == settings_.disk_path
         && selected.cdrom_path == settings_.cdrom_path
+        && selected.graphics_board == settings_.graphics_board
         && selected.float_backend == settings_.float_backend
         && selected.network == settings_.network) {
         return;

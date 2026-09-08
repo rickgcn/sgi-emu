@@ -1,10 +1,15 @@
 use se_core::bus::{BusError, DeviceAddr, PhysAddr};
+use se_device::gio::GioSlot;
 
 use super::super::PROM_BYTES;
 
 pub(super) const LOCAL_MEMORY_END: u64 = 0x1000_0000;
-pub(super) const GIO_BASE: u64 = 0x1f00_0000;
-pub(super) const GIO_END: u64 = 0x1f40_0000;
+pub(super) const GIO_GRAPHICS_BASE: u64 = 0x1f00_0000;
+pub(super) const GIO_GRAPHICS_END: u64 = 0x1f40_0000;
+pub(super) const GIO_SLOT_0_BASE: u64 = 0x1f40_0000;
+pub(super) const GIO_SLOT_0_END: u64 = 0x1f60_0000;
+pub(super) const GIO_SLOT_1_BASE: u64 = 0x1f60_0000;
+pub(super) const GIO_SLOT_1_END: u64 = 0x1f80_0000;
 pub(super) const PIC1_BASE: u64 = 0x1fa0_0000;
 const PIC1_END: u64 = 0x1fab_0000;
 const HPC1_BASE: u64 = 0x1fb8_0000;
@@ -76,7 +81,7 @@ pub(super) enum Target {
     BoardRevision,
     Dsp56001(DeviceAddr),
     Prom(DeviceAddr),
-    Gio(DeviceAddr),
+    Gio(GioSlot, DeviceAddr),
 }
 
 pub(super) fn route(address: PhysAddr, length: usize) -> Result<Target, BusError> {
@@ -96,11 +101,17 @@ pub(super) fn route(address: PhysAddr, length: usize) -> Result<Target, BusError
     if overlaps(start, end, PROM_BASE, PROM_END) {
         return Err(BusError::HardwareFault);
     }
-    if contains(start, end, GIO_BASE, GIO_END) {
-        return Ok(Target::Gio(DeviceAddr::new(start - GIO_BASE)));
-    }
-    if overlaps(start, end, GIO_BASE, GIO_END) {
-        return Err(BusError::HardwareFault);
+    for (slot, range_start, range_end) in [
+        (GioSlot::Graphics, GIO_GRAPHICS_BASE, GIO_GRAPHICS_END),
+        (GioSlot::Slot0, GIO_SLOT_0_BASE, GIO_SLOT_0_END),
+        (GioSlot::Slot1, GIO_SLOT_1_BASE, GIO_SLOT_1_END),
+    ] {
+        if contains(start, end, range_start, range_end) {
+            return Ok(Target::Gio(slot, DeviceAddr::new(start - range_start)));
+        }
+        if overlaps(start, end, range_start, range_end) {
+            return Err(BusError::HardwareFault);
+        }
     }
 
     if start == SEEQ8003_RECEIVE_ALIAS && end == start + 1 {
@@ -244,10 +255,11 @@ mod tests {
 
     use super::super::test_support::{bus, read_byte, read_word};
     use super::{
-        CENTRONICS_EXTERNAL_BASE, CPU_AUX_CONTROL, DSP56001_END, GIO_BASE, HPC1_COUNTER_BASE,
-        HPC1_DSP_INTERRUPT_MASK_BASE, HPC1_DSP_INTERRUPT_STATUS_BASE, HPC1_ETHERNET_FIFO_BASE,
-        HPC1_ETHERNET_POINTER_BASE, HPC1_MISCELLANEOUS_CONTROL_BASE, HPC1_SCSI_REGISTERS_BASE,
-        PIC1_BASE, PROM_BASE, PROM_END, SEEQ8003_EXTERNAL_BASE, SERIAL_2_BASE,
+        CENTRONICS_EXTERNAL_BASE, CPU_AUX_CONTROL, DSP56001_END, GIO_GRAPHICS_BASE,
+        HPC1_COUNTER_BASE, HPC1_DSP_INTERRUPT_MASK_BASE, HPC1_DSP_INTERRUPT_STATUS_BASE,
+        HPC1_ETHERNET_FIFO_BASE, HPC1_ETHERNET_POINTER_BASE, HPC1_MISCELLANEOUS_CONTROL_BASE,
+        HPC1_SCSI_REGISTERS_BASE, PIC1_BASE, PROM_BASE, PROM_END, SEEQ8003_EXTERNAL_BASE,
+        SERIAL_2_BASE,
     };
 
     #[test]
@@ -428,7 +440,7 @@ mod tests {
     fn invalid_transactions_never_reach_a_target_or_latch_a_hardware_error() {
         let mut bus = bus();
 
-        for address in [0, PROM_BASE, GIO_BASE, SERIAL_2_BASE, PIC1_BASE] {
+        for address in [0, PROM_BASE, GIO_GRAPHICS_BASE, SERIAL_2_BASE, PIC1_BASE] {
             for length in [0, 5] {
                 let mut bytes = vec![0xa5; length];
                 assert_eq!(

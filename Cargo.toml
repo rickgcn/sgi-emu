@@ -31,7 +31,7 @@ cxx-build = "=1.0.199"
 directories = "6"
 qt-build-utils = "=0.10.0"
 rustix = { version = "1", features = ["stdio", "termios"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde-big-array = "0.5"
 serde_json = "1"
 sha2 = "0.10"

@@ -14,6 +14,7 @@ use se_cpu::mips1::r3000::{R3000, R3000Config, StepError};
 use se_device::centronics::CentronicsPort;
 use se_device::dp8573a::{Dp8573a, Dp8573aBatteryState, Dp8573aStateError};
 use se_device::dsp56001::Dsp56001;
+use se_device::gio::{GioBus, GioSnapshotError};
 use se_device::hpc1::Hpc1;
 use se_device::int2::Int2;
 use se_device::mdac::Mdac;
@@ -21,7 +22,7 @@ use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
-use se_device::scsi::{ScsiAttachError, ScsiBus};
+use se_device::scsi::{ScsiAttachError, ScsiBus, ScsiSnapshotError};
 use se_device::scsi_cdrom::ScsiCdrom;
 use se_device::scsi_disk::ScsiDisk;
 use se_device::seeq8003::Seeq8003;
@@ -33,7 +34,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use self::bus::Ip12Bus;
 use self::prom::normalize_u56_prom;
-use crate::output::MachineOutput;
+use crate::output::{MachineOutput, VideoOutput};
 use crate::serial::SerialPort;
 
 const PROM_BYTES: usize = 0x40000;
@@ -258,6 +259,45 @@ impl Error for Ip12Error {
     }
 }
 
+/// An IP12 snapshot that cannot preserve configured device topology.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ip12SnapshotError {
+    /// The SCSI snapshot differs from the configured targets and storage.
+    Scsi(ScsiSnapshotError),
+    /// The GIO snapshot differs from the configured device topology.
+    Gio(GioSnapshotError),
+}
+
+impl fmt::Display for Ip12SnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scsi(error) => error.fmt(formatter),
+            Self::Gio(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for Ip12SnapshotError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Scsi(error) => Some(error),
+            Self::Gio(error) => Some(error),
+        }
+    }
+}
+
+impl From<ScsiSnapshotError> for Ip12SnapshotError {
+    fn from(error: ScsiSnapshotError) -> Self {
+        Self::Scsi(error)
+    }
+}
+
+impl From<GioSnapshotError> for Ip12SnapshotError {
+    fn from(error: GioSnapshotError) -> Self {
+        Self::Gio(error)
+    }
+}
+
 /// Nonvolatile state retained by an Indigo IP12.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Ip12NonvolatileState {
@@ -365,6 +405,7 @@ impl Ip12 {
     pub fn new(
         raw_prom: Vec<u8>,
         floating_point_backend: Backend,
+        gio: GioBus,
         disk_storage: Option<Box<dyn BlockStorage>>,
         cdrom_storage: Option<Box<dyn BlockStorage>>,
     ) -> Result<Self, Ip12Error> {
@@ -372,12 +413,13 @@ impl Ip12 {
             raw_prom,
             floating_point_backend,
             Ip12MemoryConfiguration::default(),
+            gio,
             disk_storage,
             cdrom_storage,
         )
     }
 
-    /// Constructs an IP12 with explicit memory banks and optional storage.
+    /// Constructs an IP12 with explicit boards and optional storage.
     ///
     /// # Errors
     ///
@@ -387,6 +429,7 @@ impl Ip12 {
         raw_prom: Vec<u8>,
         floating_point_backend: Backend,
         memory: Ip12MemoryConfiguration,
+        gio: GioBus,
         disk_storage: Option<Box<dyn BlockStorage>>,
         cdrom_storage: Option<Box<dyn BlockStorage>>,
     ) -> Result<Self, Ip12Error> {
@@ -425,6 +468,7 @@ impl Ip12 {
                 Nmc93cs46::new(),
                 Dsp56001::new(),
                 prom,
+                gio,
             ),
         };
         machine.update_cp0_condition();
@@ -487,6 +531,15 @@ impl Ip12 {
     /// Advances timed devices and appends frontend-visible output.
     pub fn advance_time(&mut self, elapsed: VirtualDuration, output: &mut MachineOutput) {
         self.bus.advance_time(elapsed, output);
+    }
+
+    /// Returns what the machine currently drives onto its display.
+    ///
+    /// The query has no side effects and does not advance virtual time, so a
+    /// paused machine can be asked what to present.
+    #[must_use]
+    pub fn video_output(&self) -> VideoOutput {
+        self.bus.video_output()
     }
 
     /// Supplies host bytes to one external serial receiver.
@@ -572,6 +625,7 @@ mod tests {
     use crate::serial::SerialPort;
     use se_core::bus::{PhysAddr, PhysicalBus};
     use se_core::time::VirtualDuration;
+    use se_device::gio::GioBus;
     use se_device::storage::BlockStorage;
     use se_float::backend::Backend;
 
@@ -644,7 +698,13 @@ mod tests {
     #[test]
     fn constructor_reports_invalid_prom_size() {
         assert!(matches!(
-            Ip12::new(vec![0; PROM_BYTES - 1], Backend::SoftFloat, None, None),
+            Ip12::new(
+                vec![0; PROM_BYTES - 1],
+                Backend::SoftFloat,
+                GioBus::new(),
+                None,
+                None,
+            ),
             Err(Ip12Error::InvalidPromSize {
                 expected: PROM_BYTES,
                 actual
@@ -659,6 +719,7 @@ mod tests {
                 Ip12::new(
                     vec![0; PROM_BYTES],
                     Backend::SoftFloat,
+                    GioBus::new(),
                     Some(Box::new(SizedStorage(bytes))),
                     None,
                 ),
@@ -670,6 +731,7 @@ mod tests {
             Ip12::new(
                 vec![0; PROM_BYTES],
                 Backend::SoftFloat,
+                GioBus::new(),
                 Some(Box::new(SizedStorage(512))),
                 None,
             )
@@ -684,6 +746,7 @@ mod tests {
                 Ip12::new(
                     vec![0; PROM_BYTES],
                     Backend::SoftFloat,
+                    GioBus::new(),
                     None,
                     Some(Box::new(SizedStorage(bytes))),
                 ),
@@ -695,6 +758,7 @@ mod tests {
             Ip12::new(
                 vec![0; PROM_BYTES],
                 Backend::SoftFloat,
+                GioBus::new(),
                 None,
                 Some(Box::new(SizedStorage(2048))),
             )
@@ -820,7 +884,8 @@ mod tests {
     fn cpu_configuration_matches_the_ip12_board() {
         for backend in [Backend::SoftFloat, Backend::Native] {
             let config = cpu_config(backend);
-            let mut machine = Ip12::new(vec![0; PROM_BYTES], backend, None, None).unwrap();
+            let mut machine =
+                Ip12::new(vec![0; PROM_BYTES], backend, GioBus::new(), None, None).unwrap();
             let reset_configuration = read_word(&mut machine, 0x1fa0_0004) as u8;
 
             assert_eq!(reset_configuration & 0xf0, 0xf0);
@@ -841,7 +906,14 @@ mod tests {
 
     #[test]
     fn production_topology_contains_one_eight_megabyte_ram_module() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let mut machine = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         machine
             .bus
             .write(PhysAddr::new(0x1fa1_0000), &0x0f00_023f_u32.to_be_bytes())
@@ -861,9 +933,15 @@ mod tests {
     #[test]
     fn explicit_memory_configuration_populates_selected_pic1_banks() {
         let memory = Ip12MemoryConfiguration::try_from_simm_mib([2, 0, 8]).unwrap();
-        let mut machine =
-            Ip12::new_with_memory(vec![0; PROM_BYTES], Backend::SoftFloat, memory, None, None)
-                .unwrap();
+        let mut machine = Ip12::new_with_memory(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            memory,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         machine
             .bus
             .write(PhysAddr::new(0x1fa1_0000), &0x0100_023f_u32.to_be_bytes())
@@ -951,7 +1029,8 @@ mod tests {
     fn reset_restores_the_cpu_and_asic_front_end_without_changing_ram_or_prom() {
         let mut raw_prom = vec![0; PROM_BYTES];
         raw_prom[0x100..0x104].copy_from_slice(&[0x34, 0x12, 0x78, 0x56]);
-        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat, None, None).unwrap();
+        let mut machine =
+            Ip12::new(raw_prom, Backend::SoftFloat, GioBus::new(), None, None).unwrap();
 
         machine.execute_instruction().unwrap();
         assert_eq!(machine.execution_address(), 0xbfc0_0004);
@@ -1022,7 +1101,14 @@ mod tests {
 
     #[test]
     fn pic1_error_output_drives_and_releases_cpu_interrupt_input_five() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let mut machine = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         machine
             .bus
             .write(
@@ -1146,7 +1232,14 @@ mod tests {
 
     #[test]
     fn serial_receive_interrupt_drives_cpu_interrupt_input_one() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let mut machine = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         for (register, value) in [(3, 1), (1, 0x10), (9, 1 << 3)] {
             machine
                 .bus
@@ -1172,7 +1265,14 @@ mod tests {
 
     #[test]
     fn hpc1_interrupt_outputs_drive_cpu_inputs_one_and_two() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let mut machine = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         machine
             .bus
             .write(PhysAddr::new(0x1fb8_01c7), &[1 << 1])
@@ -1201,7 +1301,14 @@ mod tests {
 
     #[test]
     fn int2_timers_drive_cpu_interrupt_inputs_three_and_four() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let mut machine = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         for (control, address) in [
             (0xb4, 0x1fb8_01fb),
             (0x34, 0x1fb8_01f3),
@@ -1247,7 +1354,14 @@ mod tests {
 
     #[test]
     fn guest_system_initialize_uses_the_machine_reset_path() {
-        let mut machine = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, None, None).unwrap();
+        let mut machine = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
         machine
             .bus
             .write(PhysAddr::new(0x1fb8_00c3), &[0x1f])
@@ -1294,7 +1408,7 @@ mod tests {
             let [first, second, third, fourth] = instruction.to_be_bytes();
             destination.copy_from_slice(&[second, first, fourth, third]);
         }
-        Ip12::new(raw_prom, Backend::SoftFloat, None, None).unwrap()
+        Ip12::new(raw_prom, Backend::SoftFloat, GioBus::new(), None, None).unwrap()
     }
 
     #[test]
@@ -1303,7 +1417,7 @@ mod tests {
         let path = env::var_os("SE_INDIGO_IP12_PROM")
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
-        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat, None, None)
+        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat, GioBus::new(), None, None)
             .expect("the PROM dump should be valid");
 
         assert_eq!(machine.cpu.program_counter(), 0xbfc0_0000);
@@ -1322,7 +1436,7 @@ mod tests {
         let path = env::var_os("SE_INDIGO_IP12_PROM")
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
-        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat, None, None)
+        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat, GioBus::new(), None, None)
             .expect("the PROM dump should be valid");
 
         for _ in 0..256 {
@@ -1343,7 +1457,7 @@ mod tests {
         let path = env::var_os("SE_INDIGO_IP12_PROM")
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
-        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat, None, None)
+        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat, GioBus::new(), None, None)
             .expect("the PROM dump should be valid");
 
         for _ in 0..20_000 {
@@ -1364,7 +1478,7 @@ mod tests {
         let path = env::var_os("SE_INDIGO_IP12_PROM")
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
-        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat, None, None)
+        let mut machine = Ip12::new(raw_prom, Backend::SoftFloat, GioBus::new(), None, None)
             .expect("the PROM dump should be valid");
 
         machine
