@@ -43,6 +43,15 @@ impl Ip12Bus {
                 }
                 EventKind::Gio => {
                     self.synchronize_gio_time();
+                    self.synchronize_graphics_dma_input();
+                    self.reschedule_gio();
+                }
+                EventKind::Pic1 => {
+                    self.synchronize_gio_time();
+                    self.synchronize_graphics_dma_input();
+                    self.service_graphics_dma_request();
+                    self.synchronize_gio_interrupts();
+                    self.synchronize_graphics_dma_input();
                     self.reschedule_gio();
                 }
             }
@@ -65,7 +74,10 @@ impl Ip12Bus {
         self.events.schedule(EventKind::Scsi, None);
         self.reschedule_ethernet();
         self.synchronize_gio_interrupts();
+        self.pic1
+            .set_graphics_dma_sync_input(self.gio.dma_sync_asserted());
         self.reschedule_gio();
+        self.reschedule_pic1();
     }
 
     /// Advances the GIO bus and transfers its output pins.
@@ -79,6 +91,26 @@ impl Ip12Bus {
     pub(super) fn reschedule_gio(&mut self) {
         self.events
             .schedule(EventKind::Gio, self.gio.time_until_event());
+    }
+
+    /// Advances PIC1 to the current machine time without servicing DMA work.
+    pub(super) fn synchronize_pic1_time(&mut self) {
+        let elapsed = self.events.synchronize(EventKind::Pic1);
+        self.pic1.advance_time(elapsed);
+    }
+
+    /// Transfers the current GIO DMASYNC level after synchronizing PIC1.
+    pub(super) fn synchronize_graphics_dma_input(&mut self) {
+        self.synchronize_pic1_time();
+        self.pic1
+            .set_graphics_dma_sync_input(self.gio.dma_sync_asserted());
+        self.reschedule_pic1();
+    }
+
+    /// Schedules the next software-visible event produced by PIC1.
+    pub(super) fn reschedule_pic1(&mut self) {
+        self.events
+            .schedule(EventKind::Pic1, self.pic1.graphics_dma_time_until_event());
     }
 
     pub(super) fn synchronize_int2_time(&mut self) {
@@ -201,11 +233,14 @@ const fn serial_event_kind(index: usize) -> EventKind {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use se_core::bus::{BusError, DeviceAddr, PhysAddr, PhysicalBus};
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
     use se_device::gio::{
         GioBus, GioDevice, GioDeviceSnapshot, GioDisplayState, GioInterrupt, GioSlot,
     };
+    use se_device::lg1::Lg1;
     use se_device::sgi_keyboard::SgiKey;
     use se_device::sgi_mouse::SgiMouseButton;
     use se_device::z85230::Channel;
@@ -214,12 +249,12 @@ mod tests {
     use crate::serial::SerialPort;
 
     use super::super::address::{
-        GIO_GRAPHICS_BASE, HPC1_COUNTER_BASE, HPC1_ETHERNET_TIMER_BASE, INT2_BASE, RTC_BASE,
-        SERIAL_0_BASE, SERIAL_1_BASE,
+        GIO_GRAPHICS_BASE, HPC1_COUNTER_BASE, HPC1_ETHERNET_TIMER_BASE, INT2_BASE, PIC1_BASE,
+        RTC_BASE, SERIAL_0_BASE, SERIAL_1_BASE,
     };
     use super::super::test_support::{
-        bus, bus_with_gio, configure_serial_a, read_byte, read_scsi_register, read_word,
-        write_serial_register,
+        bus, bus_with_gio, configure_memory, configure_serial_a, read_byte, read_scsi_register,
+        read_word, write_serial_register,
     };
 
     use super::EventKind;
@@ -236,6 +271,17 @@ mod tests {
     const OUTPUT_PORT: u64 = INT2_BASE + 0x1c;
     const TEST_DEVICE_BASE: u64 = 0x100;
     const TEST_DEVICE_PHYSICAL_BASE: u64 = GIO_GRAPHICS_BASE + TEST_DEVICE_BASE;
+    const GRAPHICS_DABR: u64 = PIC1_BASE + 0xa_0000;
+    const GRAPHICS_START: u64 = PIC1_BASE + 0xa_0100;
+    const GRAPHICS_DMA_INTERRUPT_ENABLE: u32 = 1 << 4;
+    const GRAPHICS_DMA_SYNC_ENABLE: u32 = 1 << 5;
+    const GRAPHICS_DMA_STRIDE_INCREMENT: u32 = 1 << 31;
+    const GRAPHICS_DMA_LAST_DESCRIPTOR: u32 = 1 << 15;
+    const GRAPHICS_DMA_LINE_INCREMENT: u32 = 1 << 14;
+    const GRAPHICS_DMA_GIO_TO_MEMORY: u32 = 2 << 12;
+    const GRAPHICS_DMA_CYCLE: u128 = ATTOSECONDS_PER_SECOND.div_ceil(33_000_000);
+    const LG1_GRAPHICS_DMA_PORT: u32 = 0x1f3f_0870;
+    const LG1_REX_SET_BASE: u64 = LG1_GRAPHICS_DMA_PORT as u64 - 0x0870;
     const RETRACE_BOUNDARY: VirtualDuration = VirtualDuration::from_attoseconds(10);
     const KEYBOARD_CHARACTER_TIME: u128 = 11 * ATTOSECONDS_PER_SECOND / 600;
     const MOUSE_CHARACTER_TIME: u128 = 10 * ATTOSECONDS_PER_SECOND / 4_800;
@@ -244,6 +290,90 @@ mod tests {
         enabled: bool,
         asserted: bool,
         interrupt: GioInterrupt,
+    }
+
+    #[derive(Default)]
+    struct DmaObservations {
+        reads: Vec<(u64, usize)>,
+        writes: Vec<(u64, Vec<u8>)>,
+    }
+
+    struct DmaTestDevice {
+        observations: Arc<Mutex<DmaObservations>>,
+        sync: Arc<Mutex<bool>>,
+    }
+
+    impl GioDevice for DmaTestDevice {
+        fn reset(&mut self) {}
+
+        fn debug_read(&self, _address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
+            data.fill(0);
+            Ok(())
+        }
+
+        fn read(&mut self, _address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
+            data.fill(0);
+            Ok(())
+        }
+
+        fn write(&mut self, _address: DeviceAddr, _data: &[u8]) -> Result<(), BusError> {
+            Ok(())
+        }
+
+        fn read_dma(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
+            self.observations
+                .lock()
+                .unwrap()
+                .reads
+                .push((address.get(), data.len()));
+            for (index, byte) in data.iter_mut().enumerate() {
+                *byte = address.get().wrapping_add(index as u64) as u8;
+            }
+            Ok(())
+        }
+
+        fn write_dma(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
+            self.observations
+                .lock()
+                .unwrap()
+                .writes
+                .push((address.get(), data.to_vec()));
+            Ok(())
+        }
+
+        fn dma_sync_asserted(&self) -> bool {
+            *self.sync.lock().unwrap()
+        }
+
+        fn advance_time(&mut self, _elapsed: VirtualDuration) {}
+
+        fn time_until_event(&self) -> Option<VirtualDuration> {
+            None
+        }
+
+        fn interrupt_asserted(&self, _interrupt: GioInterrupt) -> bool {
+            false
+        }
+
+        fn display_state(&self) -> Option<GioDisplayState> {
+            None
+        }
+
+        fn take_display_update(&mut self) -> bool {
+            false
+        }
+
+        fn snapshot(&self) -> GioDeviceSnapshot {
+            panic!("this test device is never snapshotted")
+        }
+
+        fn accepts_snapshot(&self, _snapshot: &GioDeviceSnapshot) -> bool {
+            false
+        }
+
+        fn restore_snapshot(&mut self, _snapshot: GioDeviceSnapshot) {
+            panic!("this test device rejects every snapshot")
+        }
     }
 
     impl TimedInterruptDevice {
@@ -276,6 +406,19 @@ mod tests {
             self.enabled = false;
             self.asserted = false;
             Ok(())
+        }
+
+        fn read_dma(&mut self, _address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
+            data.fill(0);
+            Ok(())
+        }
+
+        fn write_dma(&mut self, _address: DeviceAddr, _data: &[u8]) -> Result<(), BusError> {
+            Ok(())
+        }
+
+        fn dma_sync_asserted(&self) -> bool {
+            false
         }
 
         fn advance_time(&mut self, elapsed: VirtualDuration) {
@@ -321,6 +464,56 @@ mod tests {
         )
         .unwrap();
         bus_with_gio(gio)
+    }
+
+    fn bus_with_dma_device(
+        sync_asserted: bool,
+    ) -> (
+        super::Ip12Bus,
+        Arc<Mutex<DmaObservations>>,
+        Arc<Mutex<bool>>,
+    ) {
+        let observations = Arc::new(Mutex::new(DmaObservations::default()));
+        let sync = Arc::new(Mutex::new(sync_asserted));
+        let mut gio = GioBus::new();
+        gio.attach(
+            GioSlot::Graphics,
+            Box::new(DmaTestDevice {
+                observations: Arc::clone(&observations),
+                sync: Arc::clone(&sync),
+            }),
+        )
+        .unwrap();
+        (bus_with_gio(gio), observations, sync)
+    }
+
+    fn write_graphics_descriptor(bus: &mut super::Ip12Bus, address: u64, words: [u32; 5]) {
+        for (index, word) in words.into_iter().enumerate() {
+            bus.write(
+                PhysAddr::new(address + (index * 4) as u64),
+                &word.to_be_bytes(),
+            )
+            .unwrap();
+        }
+    }
+
+    fn start_graphics_dma(bus: &mut super::Ip12Bus, descriptor_address: u32) {
+        bus.write(
+            PhysAddr::new(GRAPHICS_DABR),
+            &descriptor_address.to_be_bytes(),
+        )
+        .unwrap();
+        bus.write(PhysAddr::new(GRAPHICS_START), &0_u32.to_be_bytes())
+            .unwrap();
+    }
+
+    fn read_memory(bus: &mut super::Ip12Bus, address: u64, length: usize) -> Vec<u8> {
+        let mut bytes = vec![0; length];
+        for (index, chunk) in bytes.chunks_mut(4).enumerate() {
+            bus.read(PhysAddr::new(address + (index * 4) as u64), chunk)
+                .unwrap();
+        }
+        bytes
     }
 
     fn configure_timer(bus: &mut super::Ip12Bus, control: u8, address: u64, reload: u16) {
@@ -387,6 +580,341 @@ mod tests {
         );
         assert_eq!(read_word(&mut bus, VME_INTERRUPT_STATUS), Ok(1));
         assert_eq!(read_word(&mut bus, LOCAL_INTERRUPT_1_STATUS), Ok(0));
+    }
+
+    #[test]
+    fn graphics_dma_transfers_strided_memory_lines_at_timed_boundaries() {
+        let (mut bus, observations, _) = bus_with_dma_device(true);
+        configure_memory(&mut bus, 0x0100_023f, 0x023f_023f);
+        bus.write(
+            PhysAddr::new(PIC1_BASE),
+            &GRAPHICS_DMA_INTERRUPT_ENABLE.to_be_bytes(),
+        )
+        .unwrap();
+        write_graphics_descriptor(
+            &mut bus,
+            0x1000,
+            [
+                0x2000,
+                GRAPHICS_DMA_STRIDE_INCREMENT
+                    | (4 << 16)
+                    | GRAPHICS_DMA_LAST_DESCRIPTOR
+                    | GRAPHICS_DMA_LINE_INCREMENT
+                    | 4,
+                TEST_DEVICE_PHYSICAL_BASE as u32,
+                (4 << 16) | 1,
+                0,
+            ],
+        );
+        bus.write(PhysAddr::new(0x2000), &[1, 2, 3, 4]).unwrap();
+        bus.write(PhysAddr::new(0x2008), &[5, 6, 7, 8]).unwrap();
+
+        assert!(bus.interrupt_asserted());
+        start_graphics_dma(&mut bus, 0x1000);
+        assert!(!bus.interrupt_asserted());
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 5 - 1),
+            &mut MachineOutput::default(),
+        );
+        assert!(observations.lock().unwrap().writes.is_empty());
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(1),
+            &mut MachineOutput::default(),
+        );
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 0xa_0004), Ok(0x2000));
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 0xa_000c), Ok(0x1f00_0100));
+        assert!(observations.lock().unwrap().writes.is_empty());
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE),
+            &mut MachineOutput::default(),
+        );
+        assert_eq!(
+            observations.lock().unwrap().writes,
+            [(TEST_DEVICE_BASE, vec![1, 2, 3, 4])]
+        );
+        assert!(!bus.interrupt_asserted());
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE),
+            &mut MachineOutput::default(),
+        );
+        assert_eq!(
+            observations.lock().unwrap().writes,
+            [
+                (TEST_DEVICE_BASE, vec![1, 2, 3, 4]),
+                (TEST_DEVICE_BASE + 8, vec![5, 6, 7, 8]),
+            ]
+        );
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 8), Ok(0x88));
+        assert!(bus.interrupt_asserted());
+    }
+
+    #[test]
+    fn graphics_dma_reads_gio_before_committing_a_whole_memory_line() {
+        let (mut bus, observations, _) = bus_with_dma_device(true);
+        configure_memory(&mut bus, 0x0100_023f, 0x023f_023f);
+        write_graphics_descriptor(
+            &mut bus,
+            0x1000,
+            [
+                0x3000,
+                GRAPHICS_DMA_LAST_DESCRIPTOR | GRAPHICS_DMA_GIO_TO_MEMORY | 6,
+                (TEST_DEVICE_PHYSICAL_BASE + 0x20) as u32,
+                0,
+                0,
+            ],
+        );
+        start_graphics_dma(&mut bus, 0x1000);
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 7),
+            &mut MachineOutput::default(),
+        );
+
+        assert_eq!(
+            observations.lock().unwrap().reads,
+            [(TEST_DEVICE_BASE + 0x20, 8)]
+        );
+        assert_eq!(
+            read_memory(&mut bus, 0x3000, 8),
+            [0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27]
+        );
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 8), Ok(0x88));
+    }
+
+    #[test]
+    fn zero_width_graphics_dma_completes_without_endpoint_transactions() {
+        let (mut bus, observations, _) = bus_with_dma_device(true);
+        configure_memory(&mut bus, 0x0100_023f, 0x023f_023f);
+        write_graphics_descriptor(
+            &mut bus,
+            0x1000,
+            [0xffff_ffff, GRAPHICS_DMA_LAST_DESCRIPTOR, 0xffff_ffff, 0, 0],
+        );
+        start_graphics_dma(&mut bus, 0x1000);
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 6),
+            &mut MachineOutput::default(),
+        );
+
+        let observations = observations.lock().unwrap();
+        assert!(observations.reads.is_empty());
+        assert!(observations.writes.is_empty());
+        drop(observations);
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 8), Ok(0x88));
+    }
+
+    #[test]
+    fn graphics_dma_gse_waits_for_the_wired_gio_sync_level() {
+        let (mut bus, observations, sync) = bus_with_dma_device(false);
+        configure_memory(&mut bus, 0x0100_023f, 0x023f_023f);
+        write_graphics_descriptor(
+            &mut bus,
+            0x1000,
+            [
+                0x2000,
+                GRAPHICS_DMA_LAST_DESCRIPTOR | 4,
+                TEST_DEVICE_PHYSICAL_BASE as u32,
+                0,
+                0,
+            ],
+        );
+        bus.write(PhysAddr::new(0x2000), &[1, 2, 3, 4]).unwrap();
+        bus.write(
+            PhysAddr::new(PIC1_BASE),
+            &GRAPHICS_DMA_SYNC_ENABLE.to_be_bytes(),
+        )
+        .unwrap();
+        start_graphics_dma(&mut bus, 0x1000);
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 100),
+            &mut MachineOutput::default(),
+        );
+        assert!(observations.lock().unwrap().writes.is_empty());
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 8), Ok(0x80));
+
+        *sync.lock().unwrap() = true;
+        bus.read(PhysAddr::new(TEST_DEVICE_PHYSICAL_BASE), &mut [0; 4])
+            .unwrap();
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 6),
+            &mut MachineOutput::default(),
+        );
+
+        assert_eq!(
+            observations.lock().unwrap().writes,
+            [(TEST_DEVICE_BASE, vec![1, 2, 3, 4])]
+        );
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 8), Ok(0x88));
+    }
+
+    #[test]
+    fn graphics_dma_endpoint_failures_stop_without_reordering_side_effects() {
+        let mut empty_bus = bus();
+        configure_memory(&mut empty_bus, 0x0100_023f, 0x023f_023f);
+        write_graphics_descriptor(
+            &mut empty_bus,
+            0x1000,
+            [
+                0x2000,
+                GRAPHICS_DMA_LAST_DESCRIPTOR | 4,
+                TEST_DEVICE_PHYSICAL_BASE as u32,
+                0,
+                0,
+            ],
+        );
+        empty_bus
+            .write(PhysAddr::new(0x2000), &[1, 2, 3, 4])
+            .unwrap();
+        start_graphics_dma(&mut empty_bus, 0x1000);
+        empty_bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 6),
+            &mut MachineOutput::default(),
+        );
+        assert_eq!(read_word(&mut empty_bus, PIC1_BASE + 8), Ok(0x8c));
+
+        let (mut read_first_bus, observations, _) = bus_with_dma_device(true);
+        configure_memory(&mut read_first_bus, 0x0100_023f, 0x023f_023f);
+        write_graphics_descriptor(
+            &mut read_first_bus,
+            0x1000,
+            [
+                0x0100_0000,
+                GRAPHICS_DMA_LAST_DESCRIPTOR | GRAPHICS_DMA_GIO_TO_MEMORY | 4,
+                TEST_DEVICE_PHYSICAL_BASE as u32,
+                0,
+                0,
+            ],
+        );
+        start_graphics_dma(&mut read_first_bus, 0x1000);
+        read_first_bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 6),
+            &mut MachineOutput::default(),
+        );
+
+        assert_eq!(observations.lock().unwrap().reads, [(TEST_DEVICE_BASE, 4)]);
+        assert_eq!(read_word(&mut read_first_bus, PIC1_BASE + 8), Ok(0x8c));
+        assert!(read_first_bus.interrupt_asserted());
+    }
+
+    #[test]
+    fn graphics_dma_snapshot_preserves_the_exact_pending_deadline() {
+        let mut gio = GioBus::new();
+        gio.attach(GioSlot::Graphics, Box::new(Lg1::new())).unwrap();
+        let mut bus = bus_with_gio(gio);
+        configure_memory(&mut bus, 0x0100_023f, 0x023f_023f);
+        write_graphics_descriptor(
+            &mut bus,
+            0x1000,
+            [
+                0x2000,
+                GRAPHICS_DMA_LAST_DESCRIPTOR | 4,
+                LG1_GRAPHICS_DMA_PORT,
+                0,
+                0,
+            ],
+        );
+        bus.write(PhysAddr::new(0x2000), &[1, 2, 3, 4]).unwrap();
+        start_graphics_dma(&mut bus, 0x1000);
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 2),
+            &mut MachineOutput::default(),
+        );
+        let saved = bus.snapshot().unwrap();
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 4),
+            &mut MachineOutput::default(),
+        );
+        let expected =
+            bincode::serde::encode_to_vec(bus.snapshot().unwrap(), bincode::config::standard())
+                .unwrap();
+
+        bus.restore_snapshot(saved).unwrap();
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 4),
+            &mut MachineOutput::default(),
+        );
+        let restored =
+            bincode::serde::encode_to_vec(bus.snapshot().unwrap(), bincode::config::standard())
+                .unwrap();
+
+        assert_eq!(restored, expected);
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 8), Ok(0x88));
+    }
+
+    #[test]
+    fn graphics_dma_crosses_lg1_rectangle_scanlines_in_both_directions() {
+        let mut gio = GioBus::new();
+        gio.attach(GioSlot::Graphics, Box::new(Lg1::new())).unwrap();
+        let mut bus = bus_with_gio(gio);
+        configure_memory(&mut bus, 0x0100_023f, 0x023f_023f);
+        let pixels = (0..78).map(|value| value as u8).collect::<Vec<_>>();
+        for (index, bytes) in pixels.chunks(4).enumerate() {
+            bus.write(PhysAddr::new(0x2000 + (index * 4) as u64), bytes)
+                .unwrap();
+        }
+        for (offset, value) in [
+            (0x000c_u64, 0x10_u32),
+            (0x001c, 0),
+            (0x0084, 0x36),
+            (0x0088, 1),
+            (0x47a8, 0x2000_0000),
+            (0x0000, 0x3020_00a9),
+            (0x0008, 0x13ff_0000),
+        ] {
+            bus.write(
+                PhysAddr::new(LG1_REX_SET_BASE + offset),
+                &value.to_be_bytes(),
+            )
+            .unwrap();
+        }
+        write_graphics_descriptor(
+            &mut bus,
+            0x1000,
+            [
+                0x2000,
+                GRAPHICS_DMA_LAST_DESCRIPTOR | pixels.len() as u32,
+                LG1_GRAPHICS_DMA_PORT,
+                0,
+                0,
+            ],
+        );
+        start_graphics_dma(&mut bus, 0x1000);
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 25),
+            &mut MachineOutput::default(),
+        );
+
+        for (offset, value) in [(0x000c_u64, 0x10_u32), (0x001c, 0), (0x0000, 0x3000_00ab)] {
+            bus.write(
+                PhysAddr::new(LG1_REX_SET_BASE + offset),
+                &value.to_be_bytes(),
+            )
+            .unwrap();
+        }
+        write_graphics_descriptor(
+            &mut bus,
+            0x1100,
+            [
+                0x3000,
+                GRAPHICS_DMA_LAST_DESCRIPTOR | GRAPHICS_DMA_GIO_TO_MEMORY | pixels.len() as u32,
+                LG1_GRAPHICS_DMA_PORT,
+                0,
+                0,
+            ],
+        );
+        start_graphics_dma(&mut bus, 0x1100);
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 25),
+            &mut MachineOutput::default(),
+        );
+
+        assert_eq!(read_memory(&mut bus, 0x3000, pixels.len()), pixels);
+        assert_eq!(read_word(&mut bus, PIC1_BASE + 8), Ok(0x88));
     }
 
     #[test]

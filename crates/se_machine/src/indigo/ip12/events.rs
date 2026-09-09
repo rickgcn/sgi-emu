@@ -3,7 +3,7 @@
 use se_core::time::{VirtualDuration, VirtualInstant};
 use serde::{Deserialize, Serialize};
 
-const EVENT_COUNT: usize = 8;
+const EVENT_COUNT: usize = 9;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) enum EventKind {
@@ -15,6 +15,7 @@ pub(super) enum EventKind {
     Scsi,
     Ethernet,
     Gio,
+    Pic1,
 }
 
 impl EventKind {
@@ -27,6 +28,7 @@ impl EventKind {
         Self::Scsi,
         Self::Ethernet,
         Self::Gio,
+        Self::Pic1,
     ];
 
     const fn index(self) -> usize {
@@ -39,6 +41,7 @@ impl EventKind {
             Self::Scsi => 5,
             Self::Ethernet => 6,
             Self::Gio => 7,
+            Self::Pic1 => 8,
         }
     }
 }
@@ -141,13 +144,21 @@ mod tests {
     #[test]
     fn due_events_follow_the_fixed_order() {
         let mut events = Ip12Events::new();
-        for kind in [EventKind::Scsi, EventKind::Serial1, EventKind::Rtc] {
+        for kind in [
+            EventKind::Pic1,
+            EventKind::Gio,
+            EventKind::Scsi,
+            EventKind::Serial1,
+            EventKind::Rtc,
+        ] {
             events.schedule(kind, Some(VirtualDuration::ZERO));
         }
 
         assert_eq!(events.take_due(), Some(EventKind::Rtc));
         assert_eq!(events.take_due(), Some(EventKind::Serial1));
         assert_eq!(events.take_due(), Some(EventKind::Scsi));
+        assert_eq!(events.take_due(), Some(EventKind::Gio));
+        assert_eq!(events.take_due(), Some(EventKind::Pic1));
         assert_eq!(events.take_due(), None);
     }
 

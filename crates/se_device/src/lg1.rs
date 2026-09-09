@@ -28,6 +28,8 @@ const GIO_PIO_BASE: u64 = 0x003f_0000;
 /// Bytes decoded by the board's PIO aperture.
 const GIO_PIO_BYTES: u64 = 0x8000;
 const GIO_PIO_END: u64 = GIO_PIO_BASE + GIO_PIO_BYTES;
+/// REX1 host-data GO port selected by graphics DMA.
+const GRAPHICS_DMA_PORT: u64 = GIO_PIO_BASE + rex1::GO_OFFSET + rex1::RWAUX1;
 
 /// Board revision reported through the configuration interface.
 ///
@@ -240,6 +242,52 @@ impl GioDevice for Lg1 {
         Ok(())
     }
 
+    /// Reads a DMA stream through the REX1 RWAUX1 GO port.
+    ///
+    /// Each big-endian word runs one REX host-data command. PIC1 transfers
+    /// complete GIO words even when the descriptor width is not word-aligned.
+    fn read_dma(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
+        if address.get() != GRAPHICS_DMA_PORT {
+            return Err(BusError::UnimplementedAccess);
+        }
+        if !data.len().is_multiple_of(4) {
+            return Err(BusError::InvalidTransaction);
+        }
+        for bytes in data.chunks_exact_mut(4) {
+            bytes.copy_from_slice(&self.rex.read_host_data_go(&mut self.vram).to_be_bytes());
+        }
+        Ok(())
+    }
+
+    /// Writes a DMA stream through the REX1 RWAUX1 GO port.
+    ///
+    /// Each big-endian word runs one REX host-data command. Rectangle stop
+    /// conditions, rather than byte-lane suppression, bound the final pixels.
+    fn write_dma(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
+        if address.get() != GRAPHICS_DMA_PORT {
+            return Err(BusError::UnimplementedAccess);
+        }
+        if !data.len().is_multiple_of(4) {
+            return Err(BusError::InvalidTransaction);
+        }
+        for bytes in data.chunks_exact(4) {
+            self.rex.write_host_data_go(
+                u32::from_be_bytes(bytes.try_into().expect("DMA chunks have a fixed width")),
+                &mut self.vram,
+            );
+        }
+        Ok(())
+    }
+
+    /// Reports the REX1 DMA endpoint ready.
+    ///
+    /// REX commands currently complete synchronously and the model has no
+    /// input FIFO occupancy or backpressure. A future asynchronous FIFO can
+    /// derive this signal from its readiness without changing PIC1.
+    fn dma_sync_asserted(&self) -> bool {
+        true
+    }
+
     fn snapshot(&self) -> GioDeviceSnapshot {
         GioDeviceSnapshot::Lg1(Box::new(self.clone()))
     }
@@ -388,7 +436,8 @@ fn register_offset(address: DeviceAddr, length: usize) -> Result<Option<u64>, Bu
 mod tests {
     use se_core::bus::{BusError, DeviceAddr};
 
-    use super::{GIO_PIO_BASE, GIO_PIO_END, Lg1};
+    use super::vram::PlaneGroup;
+    use super::{GIO_PIO_BASE, GIO_PIO_END, GRAPHICS_DMA_PORT, Lg1};
     use crate::gio::{GioDevice, GioDisplayState, GioInterrupt};
 
     /// Offset of the drawing command register in the SET window.
@@ -397,6 +446,8 @@ mod tests {
     const XSTARTI: u64 = 0x000c;
     /// Offset of the full horizontal start coordinate.
     const XSTART: u64 = 0x0014;
+    /// Offset of the saved horizontal continuation coordinate.
+    const XSAVE: u64 = 0x002c;
     /// Offset of the integer vertical start coordinate.
     const YSTARTI: u64 = 0x001c;
     /// Offset of the integer horizontal end coordinate.
@@ -783,5 +834,99 @@ mod tests {
         assert_eq!(restored.time_until_event(), board.time_until_event());
         assert!(restored.take_display_update());
         assert!(!restored.take_display_update());
+    }
+
+    #[test]
+    fn graphics_dma_streams_complete_big_endian_host_words() {
+        let mut board = Lg1::new();
+        write(&mut board, XSTARTI, 8);
+        write(&mut board, YSTARTI, 3);
+        write(&mut board, XENDI, 1023);
+        write(&mut board, AUX2, 0x2000_0000);
+        write(&mut board, COMMAND, 0x0020_01a1);
+        write(&mut board, XSTATE, 0x13ff_0000);
+
+        assert!(board.dma_sync_asserted());
+        assert_eq!(
+            board.write_dma(
+                DeviceAddr::new(GRAPHICS_DMA_PORT),
+                &[1, 2, 3, 4, 5, 6, 7, 8]
+            ),
+            Ok(())
+        );
+        for (x, value) in (8..16).zip(1..=8) {
+            assert_eq!(board.vram.read(PlaneGroup::Pixel, x, 3), value);
+        }
+        assert_eq!(board.vram.read(PlaneGroup::Pixel, 16, 3), 0);
+
+        write(&mut board, XSAVE, 8);
+        write(&mut board, COMMAND, 0x0020_00ab);
+        let mut bytes = [0; 8];
+        assert_eq!(
+            board.read_dma(DeviceAddr::new(GRAPHICS_DMA_PORT), &mut bytes),
+            Ok(())
+        );
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+
+        assert_eq!(
+            board.write_dma(DeviceAddr::new(GRAPHICS_DMA_PORT), &[0; 6]),
+            Err(BusError::InvalidTransaction)
+        );
+        assert_eq!(
+            board.read_dma(DeviceAddr::new(GRAPHICS_DMA_PORT), &mut [0; 6]),
+            Err(BusError::InvalidTransaction)
+        );
+    }
+
+    #[test]
+    fn graphics_dma_host_data_crosses_rectangle_scanlines_inside_words() {
+        let mut board = Lg1::new();
+        write(&mut board, XSTARTI, 0x10);
+        write(&mut board, YSTARTI, 0);
+        write(&mut board, XENDI, 0x36);
+        write(&mut board, YENDI, 1);
+        write(&mut board, AUX2, 0x2000_0000);
+        write(&mut board, COMMAND, 0x3020_00a9);
+        write(&mut board, XSTATE, 0x13ff_0000);
+        let mut pixels = (0..78).map(|value| value as u8).collect::<Vec<_>>();
+        pixels.extend([0xee, 0xff]);
+
+        assert_eq!(
+            board.write_dma(DeviceAddr::new(GRAPHICS_DMA_PORT), &pixels),
+            Ok(())
+        );
+        for (index, value) in pixels.iter().copied().take(78).enumerate() {
+            let x = 0x10 + index as u32 % 39;
+            let y = index as u32 / 39;
+            assert_eq!(board.vram.read(PlaneGroup::Pixel, x, y), value);
+        }
+        assert_eq!(board.vram.read(PlaneGroup::Pixel, 0x10, 2), 0);
+
+        write(&mut board, XSTARTI, 0x10);
+        write(&mut board, YSTARTI, 0);
+        write(&mut board, COMMAND, 0x3000_00ab);
+        let mut readback = vec![0; pixels.len()];
+        assert_eq!(
+            board.read_dma(DeviceAddr::new(GRAPHICS_DMA_PORT), &mut readback),
+            Ok(())
+        );
+        assert_eq!(readback[..78], pixels[..78]);
+    }
+
+    #[test]
+    fn graphics_dma_rejects_non_host_data_ports_without_side_effects() {
+        let mut board = Lg1::new();
+        let before = bincode::serde::encode_to_vec(&board, bincode::config::standard()).unwrap();
+
+        assert_eq!(
+            board.write_dma(DeviceAddr::new(GRAPHICS_DMA_PORT - 4), &[1, 2, 3, 4]),
+            Err(BusError::UnimplementedAccess)
+        );
+        assert_eq!(
+            board.read_dma(DeviceAddr::new(GRAPHICS_DMA_PORT + 4), &mut [0; 4]),
+            Err(BusError::UnimplementedAccess)
+        );
+        let after = bincode::serde::encode_to_vec(&board, bincode::config::standard()).unwrap();
+        assert_eq!(after, before);
     }
 }

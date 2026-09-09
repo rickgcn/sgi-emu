@@ -49,7 +49,7 @@ const ZPATTERN: u64 = 0x0060;
 const LSPATTERN: u64 = 0x0064;
 const LSMODE: u64 = 0x0068;
 const AWEIGHT: u64 = 0x006c;
-const RWAUX1: u64 = 0x0070;
+pub(super) const RWAUX1: u64 = 0x0070;
 const RWAUX2: u64 = 0x0074;
 const RWMASK: u64 = 0x0078;
 const SMASK1X: u64 = 0x007c;
@@ -410,6 +410,12 @@ impl Rex1 {
         self.execute(vram);
     }
 
+    /// Writes one complete host-data word and runs it.
+    pub(super) fn write_host_data_go(&mut self, value: u32, vram: &mut Vram) {
+        self.next.rwaux1 = value;
+        self.execute(vram);
+    }
+
     /// Reads a GO window register and runs the resulting command.
     ///
     /// The command runs before the access returns, so a pixel read-back
@@ -420,6 +426,12 @@ impl Rex1 {
     pub(super) fn read_drawing_go(&mut self, offset: u64, vram: &mut Vram) -> u32 {
         self.execute(vram);
         self.current.read(offset)
+    }
+
+    /// Runs one complete host-data word read.
+    pub(super) fn read_host_data_go(&mut self, vram: &mut Vram) -> u32 {
+        self.execute(vram);
+        self.current.rwaux1
     }
 
     /// Reads the pad word between the drawing pages.
@@ -689,50 +701,97 @@ impl Rex1 {
     /// Writes packed host pixels into the frame buffer.
     ///
     /// One host word carries four pixels with the leftmost in the most
-    /// significant byte.
+    /// significant byte. A continued block command traverses the programmed
+    /// rectangle, returning to XSTART and advancing Y after XEND even when a
+    /// scan-line boundary falls inside one host word.
     fn write_packed_pixels(
         &mut self,
         vram: &mut Vram,
         group: PlaneGroup,
         start_x: u32,
-        y: u32,
+        start_y: u32,
         end_x: u32,
     ) {
+        let command = self.next.command;
+        let rectangle = command & (CMD_BLOCK | CMD_QUADMODE | CMD_XYCONTINUE)
+            == (CMD_BLOCK | CMD_QUADMODE | CMD_XYCONTINUE);
         let stop_on_x = self.next.command & CMD_STOPONX != 0;
         let packed = self.next.rwaux1;
+        let origin_x = self.next.xstart >> COORDINATE_FRACTION_BITS;
+        let end_y = self.next.yendf >> END_FRACTION_BITS;
+        let x_ascending = origin_x <= end_x;
+        let y_ascending = start_y <= end_y;
+        let mut x = start_x;
+        let mut y = start_y;
 
         for lane in 0..PACKED_PIXELS {
-            let x = start_x + lane;
-            if stop_on_x && x > end_x {
+            if !rectangle && stop_on_x && x > end_x {
                 break;
             }
             let shift = 8 * (PACKED_PIXELS - 1 - lane);
             self.write_pixel(vram, group, x, y, ((packed >> shift) & 0xff) as u8);
+            if rectangle && x == end_x {
+                x = origin_x;
+                if y == end_y {
+                    break;
+                }
+                y = if y_ascending { y + 1 } else { y - 1 };
+            } else {
+                x = if rectangle && !x_ascending {
+                    x - 1
+                } else {
+                    x + 1
+                };
+            }
         }
-        self.next.xsave = start_x + PACKED_PIXELS;
+        self.next.xsave = x;
+        self.next.ystart = y << COORDINATE_FRACTION_BITS;
     }
 
     /// Reads four packed pixels into the host data latch.
     ///
     /// The guest issues this command and then takes the value from the GO
     /// data register, so the pixels must be latched before the access
-    /// returns.
+    /// returns. Continued block reads follow the same rectangular traversal
+    /// as host-data writes.
     fn read_packed_pixels(&mut self, vram: &Vram) {
         let group = PlaneGroup::from_aux2(self.next.aux2);
-        let start_x = if self.next.command & CMD_XYCONTINUE == 0 {
+        let command = self.next.command;
+        let rectangle = command & (CMD_BLOCK | CMD_QUADMODE | CMD_XYCONTINUE)
+            == (CMD_BLOCK | CMD_QUADMODE | CMD_XYCONTINUE);
+        let origin_x = self.next.xstart >> COORDINATE_FRACTION_BITS;
+        let mut x = if command & CMD_XYCONTINUE == 0 {
             self.next.xstart >> COORDINATE_FRACTION_BITS
         } else {
             self.next.xsave
         };
-        let y = self.next.ystart >> COORDINATE_FRACTION_BITS;
+        let end_x = self.next.xendf >> END_FRACTION_BITS;
+        let end_y = self.next.yendf >> END_FRACTION_BITS;
+        let x_ascending = origin_x <= end_x;
+        let mut y = self.next.ystart >> COORDINATE_FRACTION_BITS;
+        let y_ascending = y <= end_y;
 
-        let mut latch = 0_u32;
+        let mut latch = self.next.rwaux1;
         for lane in 0..PACKED_PIXELS {
             let shift = 8 * (PACKED_PIXELS - 1 - lane);
-            latch |= u32::from(vram.read(group, start_x + lane, y)) << shift;
+            latch = (latch & !(0xff << shift)) | u32::from(vram.read(group, x, y)) << shift;
+            if rectangle && x == end_x {
+                x = origin_x;
+                if y == end_y {
+                    break;
+                }
+                y = if y_ascending { y + 1 } else { y - 1 };
+            } else {
+                x = if rectangle && !x_ascending {
+                    x - 1
+                } else {
+                    x + 1
+                };
+            }
         }
         self.next.rwaux1 = latch;
-        self.next.xsave = start_x + PACKED_PIXELS;
+        self.next.xsave = x;
+        self.next.ystart = y << COORDINATE_FRACTION_BITS;
     }
 
     /// Returns the color a drawing command writes.

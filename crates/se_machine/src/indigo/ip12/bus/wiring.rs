@@ -4,6 +4,7 @@ use se_device::gio::GioInterrupt;
 use se_device::hpc1::EthernetRequest;
 use se_device::int2::Int2;
 use se_device::nmc93cs46::Nmc93cs46;
+use se_device::pic1::{GraphicsDmaDirection, GraphicsDmaRequest};
 use se_device::scsi::{ScsiDataDirection, ScsiTransferResult};
 use se_device::wd33c93b::WdWork;
 use se_device::z85230::Z85230;
@@ -159,6 +160,69 @@ impl Ip12Bus {
             }
         }
         self.synchronize_hpc1_interrupts();
+    }
+
+    /// Services at most one bounded PIC1 graphics DMA request.
+    ///
+    /// PIC1 interprets descriptors and owns progress. This board-level path
+    /// only routes local-memory and GIO transfers and returns their result. A
+    /// zero-width line reaches its timed boundary but performs no endpoint
+    /// transaction.
+    pub(super) fn service_graphics_dma_request(&mut self) {
+        let Some(request) = self.pic1.next_graphics_dma_request() else {
+            return;
+        };
+        match request {
+            GraphicsDmaRequest::ReadDescriptor { address } => {
+                let mut descriptor = [0; 20];
+                let success = self
+                    .memory
+                    .read_dma(&mut self.pic1, address, &mut descriptor);
+                self.pic1
+                    .complete_graphics_dma_descriptor(success.then_some(descriptor));
+            }
+            GraphicsDmaRequest::TransferLine {
+                direction,
+                memory_address,
+                gio_address,
+                length,
+            } => {
+                let success =
+                    self.transfer_graphics_dma_line(direction, memory_address, gio_address, length);
+                self.pic1.complete_graphics_dma_line(success);
+            }
+        }
+    }
+
+    fn transfer_graphics_dma_line(
+        &mut self,
+        direction: GraphicsDmaDirection,
+        memory_address: u32,
+        gio_address: u32,
+        length: usize,
+    ) -> bool {
+        if length == 0 {
+            return true;
+        }
+        let Ok(super::address::Target::Gio(slot, device_address)) =
+            super::address::route(se_core::bus::PhysAddr::new(u64::from(gio_address)), 1)
+        else {
+            return false;
+        };
+        let mut bytes = vec![0; length];
+        match direction {
+            GraphicsDmaDirection::MemoryToGio => {
+                self.memory
+                    .read_dma(&mut self.pic1, memory_address, &mut bytes)
+                    && self.gio.write_dma(slot, device_address, &bytes).is_ok()
+            }
+            GraphicsDmaDirection::GioToMemory => {
+                self.gio.read_dma(slot, device_address, &mut bytes).is_ok()
+                    && self
+                        .memory
+                        .write_dma(&mut self.pic1, memory_address, &bytes)
+            }
+        }
     }
 
     pub(super) fn process_scsi_event(&mut self) {
@@ -1046,7 +1110,7 @@ mod tests {
             bus.write(address, &bytes),
             Err(BusError::UnimplementedAccess)
         );
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
         assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x80));
         assert_eq!(read_byte(&mut bus, SCSI_DATA_PORT), Ok(0));
         assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0));
@@ -1103,7 +1167,7 @@ mod tests {
             read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE + 8),
             Ok(0x0c00_0000)
         );
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -1153,7 +1217,7 @@ mod tests {
         assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
         assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
         assert!(!bus.local_interrupt_0_asserted());
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -1183,7 +1247,7 @@ mod tests {
 
         assert_eq!(read_memory(&bus, 0x3000, BYTE_COUNT), payload);
         assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -1274,7 +1338,7 @@ mod tests {
             read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE + 0x0c),
             Ok(0x10)
         );
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
 
         bus.reset();
         configure_single_scsi_descriptor(&mut bus, 0x3000);
@@ -1292,7 +1356,7 @@ mod tests {
 
         bus.advance_time(VirtualDuration::ZERO, &mut output);
 
-        assert!(bus.error_interrupt_asserted());
+        assert!(bus.interrupt_asserted());
         assert_eq!(bus.scsi_bus.active_address(), Some((1, 0)));
         assert_eq!(read_scsi_register(&mut bus, 0x13), 2);
         assert_eq!(read_scsi_register(&mut bus, 0x14), 0);
@@ -1324,7 +1388,7 @@ mod tests {
         );
         assert_eq!(read_word(&mut bus, HPC1_SCSI_REGISTERS_BASE + 0x0c), Ok(0));
         assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
 
         configure_single_scsi_descriptor(&mut bus, 0x2400);
         issue_scsi_command(&mut bus, 1, 0, 18, &[0x03, 0, 0, 0, 18, 0]);
@@ -1380,7 +1444,7 @@ mod tests {
                 .unwrap();
             assert_eq!(copied, vec![expected; 512]);
             assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
-            assert!(!bus.error_interrupt_asserted());
+            assert!(!bus.interrupt_asserted());
         }
     }
 
@@ -1409,7 +1473,7 @@ mod tests {
             .unwrap();
         assert_eq!(copied, cdrom);
         assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -1474,7 +1538,7 @@ mod tests {
         assert_eq!(bus.scsi_bus.active_address(), None);
         assert_eq!(read_scsi_register(&mut bus, 0x10), 0x60);
         assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -1568,7 +1632,7 @@ mod tests {
 
         assert_eq!(read_scsi_register(&mut bus, 0x0f), 2);
         assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -1582,7 +1646,7 @@ mod tests {
 
         assert_eq!(read_scsi_register(&mut bus, 0x0f), 2);
         assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -1617,7 +1681,7 @@ mod tests {
 
         bus.advance_time(VirtualDuration::ZERO, &mut output);
 
-        assert!(bus.error_interrupt_asserted());
+        assert!(bus.interrupt_asserted());
         assert_eq!(read_byte(&mut bus, SCSI_ADDRESS_PORT), Ok(0x20));
     }
 
@@ -1943,7 +2007,7 @@ mod tests {
             assert_eq!(read_scsi_register(&mut bus, 0x13), 2);
             assert_eq!(read_scsi_register(&mut bus, 0x14), 0);
             assert_eq!(finish_scsi(&mut bus), 2);
-            assert!(!bus.error_interrupt_asserted());
+            assert!(!bus.interrupt_asserted());
         }
     }
 

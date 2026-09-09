@@ -598,7 +598,7 @@ impl Ip12 {
         if self.bus.timer_1_interrupt_asserted() {
             interrupt_lines |= 1 << 4;
         }
-        if self.bus.error_interrupt_asserted() {
+        if self.bus.interrupt_asserted() {
             interrupt_lines |= 1 << 5;
         }
         self.cpu.set_hardware_interrupt_lines(interrupt_lines);
@@ -1085,7 +1085,7 @@ mod tests {
             .write(PhysAddr::new(0x0060_0000), &0x89ab_cdef_u32.to_be_bytes())
             .unwrap();
         machine.bus.write(PhysAddr::new(0x00c0_0000), &[0]).unwrap();
-        assert!(machine.bus.error_interrupt_asserted());
+        assert!(machine.bus.interrupt_asserted());
         advance_machine_interrupt_inputs(&mut machine);
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
@@ -1103,7 +1103,7 @@ mod tests {
         assert_eq!(read_word(&mut machine, 0x1fa0_0004), 0xf7);
         assert_eq!(read_word(&mut machine, 0x1fa0_0008), 0x88);
         assert_eq!(read_word(&mut machine, 0x1fa1_0000), 0);
-        assert!(!machine.bus.error_interrupt_asserted());
+        assert!(!machine.bus.interrupt_asserted());
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
             0
@@ -1159,7 +1159,7 @@ mod tests {
 
         machine.execute_instruction().unwrap();
         machine.execute_instruction().unwrap();
-        assert!(machine.bus.error_interrupt_asserted());
+        assert!(machine.bus.interrupt_asserted());
         assert_eq!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 15),
             0
@@ -1222,7 +1222,7 @@ mod tests {
                 assert_eq!(state.gpr[12], 0x8000);
                 assert_eq!(state.gpr[13], 0);
                 assert_eq!(state.cp0.registers[12] & 1, 0);
-                assert!(!machine.bus.error_interrupt_asserted());
+                assert!(!machine.bus.interrupt_asserted());
             }
             assert_eq!(
                 machine.execution_address(),
@@ -1523,7 +1523,7 @@ mod tests {
         assert_eq!(read_word(&mut machine, 0x1fa1_0000), 0x0100_003f);
         assert_eq!(read_word(&mut machine, 0x1fa1_0004), 0x003f_003f);
         assert_ne!(read_word(&mut machine, 0x1fa0_0000) & 0x400, 0);
-        assert!(!machine.bus.error_interrupt_asserted());
+        assert!(!machine.bus.interrupt_asserted());
 
         for offset in (0..0x28).step_by(4) {
             assert_eq!(
@@ -1540,7 +1540,7 @@ mod tests {
         assert_eq!(read_word(&mut machine, 0x0038_21c4), 0xa03f_fff0);
         let stack_pointer = machine.cpu.debug_snapshot().gpr[29];
         assert!((0xa038_0000..0xa040_0000).contains(&stack_pointer));
-        assert!(!machine.bus.error_interrupt_asserted());
+        assert!(!machine.bus.interrupt_asserted());
     }
 
     fn execute_until(machine: &mut Ip12, target: u32, budget: usize) {

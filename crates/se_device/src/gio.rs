@@ -78,6 +78,21 @@ pub trait GioDevice: Send {
     /// Writes one device-local transaction.
     fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError>;
 
+    /// Reads one DMA burst whose address remains asserted for the whole stream.
+    ///
+    /// Unlike MMIO, successive bytes do not select successive device
+    /// addresses. The device interprets the byte stream at the selected port.
+    fn read_dma(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError>;
+
+    /// Writes one DMA burst whose address remains asserted for the whole stream.
+    ///
+    /// Unlike MMIO, successive bytes do not select successive device
+    /// addresses. The device interprets the byte stream at the selected port.
+    fn write_dma(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError>;
+
+    /// Reports the device's graphics-DMA synchronization output.
+    fn dma_sync_asserted(&self) -> bool;
+
     /// Advances device time.
     fn advance_time(&mut self, elapsed: VirtualDuration);
 
@@ -251,6 +266,48 @@ impl GioBus {
         }
     }
 
+    /// Reads one DMA burst from an attached device.
+    ///
+    /// Empty slots fail instead of inheriting the zero-filled MMIO behavior,
+    /// because a DMA channel must observe the absence of its endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BusError::HardwareFault`] for an empty slot, or returns the
+    /// attached device's DMA error.
+    pub fn read_dma(
+        &mut self,
+        slot: GioSlot,
+        address: DeviceAddr,
+        data: &mut [u8],
+    ) -> Result<(), BusError> {
+        self.slots[slot.index()]
+            .as_mut()
+            .ok_or(BusError::HardwareFault)?
+            .read_dma(address, data)
+    }
+
+    /// Writes one DMA burst to an attached device.
+    ///
+    /// Empty slots fail instead of inheriting the dropped-write MMIO behavior,
+    /// because a DMA channel must observe the absence of its endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BusError::HardwareFault`] for an empty slot, or returns the
+    /// attached device's DMA error.
+    pub fn write_dma(
+        &mut self,
+        slot: GioSlot,
+        address: DeviceAddr,
+        data: &[u8],
+    ) -> Result<(), BusError> {
+        self.slots[slot.index()]
+            .as_mut()
+            .ok_or(BusError::HardwareFault)?
+            .write_dma(address, data)
+    }
+
     /// Restores every attached device to reset state.
     pub fn reset(&mut self) {
         for device in self.slots.iter_mut().flatten() {
@@ -282,6 +339,15 @@ impl GioBus {
             .iter()
             .flatten()
             .any(|device| device.interrupt_asserted(interrupt))
+    }
+
+    /// Reports the wired graphics-DMA synchronization level.
+    #[must_use]
+    pub fn dma_sync_asserted(&self) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|device| device.dma_sync_asserted())
     }
 
     /// Returns the display output of the device in one slot, if any.
@@ -370,6 +436,8 @@ mod tests {
         debug_reads: Vec<(DeviceAddr, usize)>,
         reads: Vec<(DeviceAddr, usize)>,
         writes: Vec<(DeviceAddr, Vec<u8>)>,
+        dma_reads: Vec<(DeviceAddr, usize)>,
+        dma_writes: Vec<(DeviceAddr, Vec<u8>)>,
         elapsed: Vec<VirtualDuration>,
         resets: usize,
         display_update: bool,
@@ -381,6 +449,7 @@ mod tests {
         deadline: Option<VirtualDuration>,
         interrupts: [bool; 3],
         display: Option<GioDisplayState>,
+        dma_sync: bool,
     }
 
     impl TestDevice {
@@ -391,6 +460,7 @@ mod tests {
                 deadline: None,
                 interrupts: [false; 3],
                 display: None,
+                dma_sync: false,
             }
         }
     }
@@ -427,6 +497,29 @@ mod tests {
                 .writes
                 .push((address, data.to_vec()));
             Ok(())
+        }
+
+        fn read_dma(&mut self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
+            self.observations
+                .lock()
+                .unwrap()
+                .dma_reads
+                .push((address, data.len()));
+            data.fill(self.read_value);
+            Ok(())
+        }
+
+        fn write_dma(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
+            self.observations
+                .lock()
+                .unwrap()
+                .dma_writes
+                .push((address, data.to_vec()));
+            Ok(())
+        }
+
+        fn dma_sync_asserted(&self) -> bool {
+            self.dma_sync
         }
 
         fn advance_time(&mut self, elapsed: VirtualDuration) {
@@ -554,6 +647,55 @@ mod tests {
         let observations = observations.lock().unwrap();
         assert!(observations.reads.is_empty());
         assert!(observations.writes.is_empty());
+    }
+
+    #[test]
+    fn dma_routes_one_addressed_stream_and_rejects_empty_slots() {
+        let observations = Arc::new(Mutex::new(Observations::default()));
+        let mut bus = GioBus::new();
+        bus.attach(
+            GioSlot::Graphics,
+            Box::new(TestDevice::new(Arc::clone(&observations), 0x5a)),
+        )
+        .unwrap();
+
+        let mut read = [0; 7];
+        assert_eq!(
+            bus.read_dma(GioSlot::Graphics, DeviceAddr::new(0x1234), &mut read),
+            Ok(())
+        );
+        assert_eq!(read, [0x5a; 7]);
+        assert_eq!(
+            bus.write_dma(GioSlot::Graphics, DeviceAddr::new(0x5678), &[1, 2, 3]),
+            Ok(())
+        );
+        assert_eq!(
+            bus.write_dma(GioSlot::Slot0, DeviceAddr::new(0), &[]),
+            Err(BusError::HardwareFault)
+        );
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.dma_reads, [(DeviceAddr::new(0x1234), 7)]);
+        assert_eq!(
+            observations.dma_writes,
+            [(DeviceAddr::new(0x5678), vec![1, 2, 3])]
+        );
+    }
+
+    #[test]
+    fn dma_sync_is_the_wired_or_of_attached_devices() {
+        let observations = Arc::new(Mutex::new(Observations::default()));
+        let mut low = TestDevice::new(Arc::clone(&observations), 0);
+        low.dma_sync = false;
+        let mut high = TestDevice::new(observations, 0);
+        high.dma_sync = true;
+        let mut bus = GioBus::new();
+
+        assert!(!bus.dma_sync_asserted());
+        bus.attach(GioSlot::Slot0, Box::new(low)).unwrap();
+        assert!(!bus.dma_sync_asserted());
+        bus.attach(GioSlot::Graphics, Box::new(high)).unwrap();
+        assert!(bus.dma_sync_asserted());
     }
 
     #[test]
