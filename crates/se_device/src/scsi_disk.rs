@@ -18,6 +18,7 @@ const START_STOP_UNIT: u8 = 0x1b;
 const READ_CAPACITY_10: u8 = 0x25;
 const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2a;
+const READ_DEFECT_DATA_10: u8 = 0x37;
 
 /// Software-visible state of one SCSI disk target.
 #[derive(Clone, Deserialize, Serialize)]
@@ -86,6 +87,27 @@ impl ScsiDisk {
         let mut data = Vec::with_capacity(8);
         data.extend_from_slice(&last_lba.to_be_bytes());
         data.extend_from_slice(&BLOCK_BYTES.to_be_bytes());
+        complete_good(data)
+    }
+
+    fn read_defect_data(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
+        if !self.ready {
+            return self.check_condition(SenseData::NOT_READY);
+        }
+
+        let selector = cdb[2];
+        let defect_list_format = selector & 0x07;
+        let supported_selector =
+            selector & 0xe0 == 0 && selector & 0x10 != 0 && matches!(defect_list_format, 0 | 4 | 5);
+        let supported_other_fields =
+            cdb[1] & 0x1f == 0 && cdb[3..7].iter().all(|&byte| byte == 0) && cdb[9] == 0;
+        if !supported_selector || !supported_other_fields {
+            return self.check_condition(SenseData::INVALID_CDB_FIELD);
+        }
+
+        let allocation_length = usize::from(u16::from_be_bytes([cdb[7], cdb[8]]));
+        let mut data = vec![0, selector, 0, 0];
+        data.truncate(allocation_length);
         complete_good(data)
     }
 
@@ -199,8 +221,9 @@ impl ScsiTarget for ScsiDisk {
                 u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]),
                 u16::from_be_bytes([cdb[7], cdb[8]]),
             ),
+            READ_DEFECT_DATA_10 if cdb.len() >= 10 => self.read_defect_data(cdb),
             TEST_UNIT_READY | REQUEST_SENSE | INQUIRY | MODE_SENSE_6 | START_STOP_UNIT
-            | READ_CAPACITY_10 | READ_6 | WRITE_6 | READ_10 | WRITE_10 => {
+            | READ_CAPACITY_10 | READ_6 | WRITE_6 | READ_10 | WRITE_10 | READ_DEFECT_DATA_10 => {
                 self.check_condition(SenseData::INVALID_CDB_FIELD)
             }
             _ => self.check_condition(SenseData::UNSUPPORTED_OPCODE),
@@ -335,6 +358,101 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn read_defect_data_reports_empty_fx_defect_lists() {
+        for selector in [0x10, 0x18, 0x14, 0x1c, 0x15, 0x1d] {
+            for allocation_length in [0_u16, 1, 2, 3, 4, 0x0ffc, 0x8004] {
+                let [allocation_msb, allocation_lsb] = allocation_length.to_be_bytes();
+                let cdb = [
+                    0x37,
+                    0,
+                    selector,
+                    0,
+                    0,
+                    0,
+                    0,
+                    allocation_msb,
+                    allocation_lsb,
+                    0,
+                ];
+                let ScsiCommandPlan::Complete { status, data_in } = disk(1).execute(&cdb) else {
+                    panic!("READ DEFECT DATA should complete immediately");
+                };
+                assert_eq!(status, ScsiStatus::Good);
+                let expected = [0, selector, 0, 0];
+                assert_eq!(
+                    data_in,
+                    expected[..usize::from(allocation_length).min(expected.len())]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_defect_data_rejects_fields_outside_the_fx_subset() {
+        let mut commands = Vec::new();
+        for selector in [0x00, 0x11, 0x30] {
+            commands.push([0x37, 0, selector, 0, 0, 0, 0, 0, 4, 0]);
+        }
+        for index in [1, 3, 4, 5, 6, 9] {
+            let mut cdb = [0x37, 0, 0x10, 0, 0, 0, 0, 0, 4, 0];
+            cdb[index] = 1;
+            commands.push(cdb);
+        }
+
+        for cdb in commands {
+            let mut disk = disk(1);
+            assert!(matches!(
+                disk.execute(&cdb),
+                ScsiCommandPlan::Complete {
+                    status: ScsiStatus::CheckCondition,
+                    ..
+                }
+            ));
+            let ScsiCommandPlan::Complete { data_in, .. } = disk.execute(&[0x03, 0, 0, 0, 18, 0])
+            else {
+                panic!("REQUEST SENSE should complete immediately");
+            };
+            assert_eq!((data_in[2], data_in[12], data_in[13]), (5, 0x24, 0));
+        }
+    }
+
+    #[test]
+    fn read_defect_data_requires_a_ready_disk_and_a_complete_cdb() {
+        let cdb = [0x37, 0, 0x10, 0, 0, 0, 0, 0, 4, 0];
+
+        for length in 1..cdb.len() {
+            let mut disk = disk(1);
+            assert!(matches!(
+                disk.execute(&cdb[..length]),
+                ScsiCommandPlan::Complete {
+                    status: ScsiStatus::CheckCondition,
+                    ..
+                }
+            ));
+            let ScsiCommandPlan::Complete { data_in, .. } = disk.execute(&[0x03, 0, 0, 0, 18, 0])
+            else {
+                panic!("REQUEST SENSE should complete immediately");
+            };
+            assert_eq!((data_in[2], data_in[12], data_in[13]), (5, 0x24, 0));
+        }
+
+        let mut disk = disk(1);
+        let _ = disk.execute(&[0x1b, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            disk.execute(&cdb),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::CheckCondition,
+                ..
+            }
+        ));
+        let ScsiCommandPlan::Complete { data_in, .. } = disk.execute(&[0x03, 0, 0, 0, 18, 0])
+        else {
+            panic!("REQUEST SENSE should complete immediately");
+        };
+        assert_eq!((data_in[2], data_in[12], data_in[13]), (2, 0x04, 0x02));
     }
 
     #[test]
