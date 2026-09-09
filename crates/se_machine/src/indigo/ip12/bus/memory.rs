@@ -164,7 +164,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(read_word(&mut bus, 8 * 1024 * 1024 - 4), Ok(0x0123_4567));
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -179,7 +179,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(read_word(&mut bus, address), Ok(0));
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -199,11 +199,11 @@ mod tests {
             bus.write(PhysAddr::new(0), &0x0123_4567_u32.to_be_bytes()),
             Ok(())
         );
-        assert!(bus.error_interrupt_asserted());
+        assert!(bus.interrupt_asserted());
 
         bus.write(PhysAddr::new(PIC1_BASE + 0x1_0210), &[0])
             .unwrap();
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -245,7 +245,7 @@ mod tests {
             bus.write(PhysAddr::new(LOCAL_MEMORY_END - 2), &[1, 2, 3, 4]),
             Ok(())
         );
-        assert!(bus.error_interrupt_asserted());
+        assert!(bus.interrupt_asserted());
         assert_eq!(
             bus.read(PhysAddr::new(LOCAL_MEMORY_END - 2), &mut [0; 4]),
             Err(BusError::HardwareFault)

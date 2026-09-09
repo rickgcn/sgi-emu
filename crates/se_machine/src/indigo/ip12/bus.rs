@@ -246,8 +246,8 @@ impl Ip12Bus {
         self.pic1.take_system_reset_request()
     }
 
-    pub(super) fn error_interrupt_asserted(&self) -> bool {
-        self.pic1.error_interrupt_asserted()
+    pub(super) fn interrupt_asserted(&self) -> bool {
+        self.pic1.interrupt_asserted()
     }
 
     pub(super) fn local_interrupt_0_asserted(&self) -> bool {
@@ -394,7 +394,12 @@ impl PhysicalBus for Ip12Bus {
         }
 
         match route(address, data.len())? {
-            Target::Pic1(address) => self.pic1.read(address, data),
+            Target::Pic1(address) => {
+                self.synchronize_pic1_time();
+                let result = self.pic1.read(address, data);
+                self.reschedule_pic1();
+                result
+            }
             Target::Hpc1(address) => {
                 self.synchronize_ethernet_time();
                 self.hpc1.read(address, data)
@@ -437,8 +442,10 @@ impl PhysicalBus for Ip12Bus {
             Target::Prom(address) => self.prom.read(address, data),
             Target::Gio(slot, address) => {
                 self.synchronize_gio_time();
+                self.synchronize_graphics_dma_input();
                 let result = self.gio.read(slot, address, data);
                 self.synchronize_gio_interrupts();
+                self.synchronize_graphics_dma_input();
                 self.reschedule_gio();
                 result
             }
@@ -450,7 +457,12 @@ impl PhysicalBus for Ip12Bus {
             self.memory.write(&self.pic1, address, data)
         } else {
             route(address, data.len()).and_then(|target| match target {
-                Target::Pic1(address) => self.pic1.write(address, data),
+                Target::Pic1(address) => {
+                    self.synchronize_pic1_time();
+                    let result = self.pic1.write(address, data);
+                    self.reschedule_pic1();
+                    result
+                }
                 Target::Hpc1(address) => {
                     self.synchronize_ethernet_time();
                     self.hpc1.write(address, data)?;
@@ -505,8 +517,10 @@ impl PhysicalBus for Ip12Bus {
                 Target::Prom(_) => Ok(()),
                 Target::Gio(slot, address) => {
                     self.synchronize_gio_time();
+                    self.synchronize_graphics_dma_input();
                     let result = self.gio.write(slot, address, data);
                     self.synchronize_gio_interrupts();
+                    self.synchronize_graphics_dma_input();
                     self.reschedule_gio();
                     result
                 }
@@ -624,7 +638,7 @@ mod tests {
             ),
             Ok(())
         );
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -647,15 +661,15 @@ mod tests {
                     bus.debug_read(PhysAddr::new(address), &mut bytes[..length])
                         .unwrap();
                     assert_eq!(&bytes[..length], &vec![0; length]);
-                    assert_eq!(bus.error_interrupt_asserted(), pending);
+                    assert_eq!(bus.interrupt_asserted(), pending);
 
                     bus.read(PhysAddr::new(address), &mut bytes[..length])
                         .unwrap();
-                    assert_eq!(bus.error_interrupt_asserted(), pending);
+                    assert_eq!(bus.interrupt_asserted(), pending);
                     assert_eq!(&bytes[..length], &vec![0; length]);
 
                     bus.write(PhysAddr::new(address), &bytes[..length]).unwrap();
-                    assert_eq!(bus.error_interrupt_asserted(), pending);
+                    assert_eq!(bus.interrupt_asserted(), pending);
                 }
             }
         }
@@ -675,7 +689,7 @@ mod tests {
                 bus.write(PhysAddr::new(address), &[0xa5; 4][..length]),
                 Err(BusError::UnimplementedAccess)
             );
-            assert!(!bus.error_interrupt_asserted());
+            assert!(!bus.interrupt_asserted());
         }
         assert_eq!(read_word(&mut bus, PIC1_BASE + 0x1_0000), Ok(0));
         let mut bytes = [0xa5; 4];
@@ -684,7 +698,7 @@ mod tests {
             Err(BusError::UnimplementedAccess)
         );
         assert_eq!(bytes, [0xa5; 4]);
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
     }
 
     #[test]
@@ -693,9 +707,9 @@ mod tests {
         let address = PhysAddr::new(PIC1_BASE + 3);
         let before = read_word(&mut bus, PIC1_BASE).unwrap();
         assert_eq!(bus.read(address, &mut [0; 2]), Err(BusError::HardwareFault));
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
         assert_eq!(bus.write(address, &[0xaa, 0xbb]), Ok(()));
-        assert!(bus.error_interrupt_asserted());
+        assert!(bus.interrupt_asserted());
         assert_eq!(read_word(&mut bus, PIC1_BASE), Ok(before));
     }
 
@@ -709,7 +723,7 @@ mod tests {
         )
         .unwrap();
         bus.write(PhysAddr::new(12 * 1024 * 1024), &[0]).unwrap();
-        assert!(bus.error_interrupt_asserted());
+        assert!(bus.interrupt_asserted());
         bus.write(
             PhysAddr::new(PIC1_BASE + 0xa_0000),
             &0x0123_4567_u32.to_be_bytes(),
@@ -744,7 +758,7 @@ mod tests {
         bus.reset();
 
         assert_eq!(read_word(&mut bus, PIC1_BASE + 0x1_0000), Ok(0));
-        assert!(!bus.error_interrupt_asserted());
+        assert!(!bus.interrupt_asserted());
         configure_memory(&mut bus, 0x0100_023f, 0x023f_023f);
         assert_eq!(read_word(&mut bus, 6 * 1024 * 1024), Ok(0x0123_4567));
         assert_eq!(read_word(&mut bus, PIC1_BASE + 0xa_0000), Ok(0));

@@ -338,13 +338,13 @@ mod tests {
                     Err(BusError::HardwareFault)
                 );
                 assert_eq!(data, [0xa5; 4]);
-                assert!(!bus.error_interrupt_asserted());
+                assert!(!bus.interrupt_asserted());
 
                 bus.write(PhysAddr::new(address), &data[..length]).unwrap();
-                assert!(bus.error_interrupt_asserted());
+                assert!(bus.interrupt_asserted());
                 bus.write(PhysAddr::new(PIC1_BASE + 0x1_0210), &[0])
                     .unwrap();
-                assert!(!bus.error_interrupt_asserted());
+                assert!(!bus.interrupt_asserted());
             }
         }
     }
@@ -363,7 +363,7 @@ mod tests {
             assert_eq!(byte, [0xa5]);
             for value in [9, 0xc0, 5, 0] {
                 assert_eq!(bus.write(address, &[value]), Ok(()));
-                assert!(!bus.error_interrupt_asserted());
+                assert!(!bus.interrupt_asserted());
             }
         }
         for (offset, length) in [(0, 1), (1, 1), (3, 2), (3, 3), (3, 4)] {
@@ -371,13 +371,13 @@ mod tests {
                 bus.write(PhysAddr::new(SERIAL_2_BASE + offset), &[0; 4][..length]),
                 Err(BusError::UnimplementedAccess)
             );
-            assert!(!bus.error_interrupt_asserted());
+            assert!(!bus.interrupt_asserted());
         }
 
         bus.write(PhysAddr::new(0x1fb0_0010), &[0]).unwrap();
         bus.write(PhysAddr::new(SERIAL_2_BASE + 0x0b), &[0])
             .unwrap();
-        assert!(bus.error_interrupt_asserted());
+        assert!(bus.interrupt_asserted());
     }
 
     #[test]
@@ -414,7 +414,7 @@ mod tests {
             bus.write(PhysAddr::new(CPU_AUX_CONTROL - 1), &[0xaa, 0xbb]),
             Ok(())
         );
-        assert!(bus.error_interrupt_asserted());
+        assert!(bus.interrupt_asserted());
         bus.write(PhysAddr::new(PIC1_BASE + 0x1_0210), &[0])
             .unwrap();
         assert_eq!(
@@ -433,7 +433,7 @@ mod tests {
             bus.write(PhysAddr::new(DSP56001_END - 2), &[0xaa; 4]),
             Ok(())
         );
-        assert!(bus.error_interrupt_asserted());
+        assert!(bus.interrupt_asserted());
     }
 
     #[test]
@@ -456,7 +456,7 @@ mod tests {
                     Err(BusError::InvalidTransaction)
                 );
                 assert_eq!(bytes, vec![0xa5; length]);
-                assert!(!bus.error_interrupt_asserted());
+                assert!(!bus.interrupt_asserted());
             }
         }
         for length in 1..=4 {
@@ -470,7 +470,7 @@ mod tests {
                 Err(BusError::InvalidTransaction)
             );
             assert_eq!(bytes, [0xa5; 4]);
-            assert!(!bus.error_interrupt_asserted());
+            assert!(!bus.interrupt_asserted());
         }
     }
 }
