@@ -285,6 +285,7 @@ mod tests {
     const RETRACE_BOUNDARY: VirtualDuration = VirtualDuration::from_attoseconds(10);
     const KEYBOARD_CHARACTER_TIME: u128 = 11 * ATTOSECONDS_PER_SECOND / 600;
     const MOUSE_CHARACTER_TIME: u128 = 10 * ATTOSECONDS_PER_SECOND / 4_800;
+    const DUART_LOOPBACK_CHARACTER_TIME: u128 = 11 * ATTOSECONDS_PER_SECOND / 38_400;
 
     struct TimedInterruptDevice {
         enabled: bool,
@@ -992,6 +993,46 @@ mod tests {
             &mut output,
         );
         assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(0x00));
+    }
+
+    #[test]
+    fn scc_zero_internal_loopback_discards_keyboard_responses() {
+        let mut bus = bus();
+        for (register, value) in [
+            (4, 0x45),
+            (11, 0x10),
+            (12, 1),
+            (13, 0),
+            (14, 0x11),
+            (3, 1),
+            (5, 0x68),
+        ] {
+            write_serial_register(&mut bus, SERIAL_0_BASE, register, value);
+        }
+        let mut output = MachineOutput::default();
+
+        bus.write(PhysAddr::new(SERIAL_0_BASE + 0x0f), &[0xf0])
+            .unwrap();
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(DUART_LOOPBACK_CHARACTER_TIME + 1),
+            &mut output,
+        );
+        assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(0xf0));
+
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(KEYBOARD_CHARACTER_TIME * 2 + 2),
+            &mut output,
+        );
+        bus.write(PhysAddr::new(SERIAL_0_BASE + 0x0f), &[0xcc])
+            .unwrap();
+        bus.advance_time(
+            VirtualDuration::from_attoseconds(DUART_LOOPBACK_CHARACTER_TIME + 1),
+            &mut output,
+        );
+
+        assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(0xcc));
+        assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(0));
+        assert!(output.is_empty());
     }
 
     #[test]

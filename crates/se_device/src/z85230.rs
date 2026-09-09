@@ -131,11 +131,12 @@ impl Z85230 {
         self.interrupt_under_service = [false; 4];
     }
 
-    /// Supplies host bytes to one receiver.
+    /// Supplies bytes arriving at one channel's external receive input.
     ///
-    /// Returns the number of bytes consumed. A disabled receiver consumes and
-    /// discards the complete slice. An enabled receiver consumes only the
-    /// prefix that fits in its receive FIFO.
+    /// Returns the number of bytes consumed. A disabled receiver, or a receiver
+    /// whose input is internally looped back from its transmitter, consumes and
+    /// discards the complete slice. An enabled receiver connected to its
+    /// external input consumes only the prefix that fits in its receive FIFO.
     pub fn receive(&mut self, channel: Channel, bytes: &[u8]) -> usize {
         self.channels[channel_index(channel)].receive(bytes)
     }
@@ -504,7 +505,7 @@ impl ChannelState {
     }
 
     fn receive(&mut self, bytes: &[u8]) -> usize {
-        if !self.receiver_enabled() {
+        if self.local_loopback_enabled() || !self.receiver_enabled() {
             return bytes.len();
         }
 
@@ -567,6 +568,10 @@ impl ChannelState {
     fn receiver_enabled(&self) -> bool {
         let wr3 = self.write_register(3);
         wr3 & RECEIVER_ENABLE != 0 && (wr3 & AUTO_ENABLE == 0 || dcd_asserted())
+    }
+
+    fn local_loopback_enabled(&self) -> bool {
+        self.write_register(14) & LOCAL_LOOPBACK != 0
     }
 
     fn receive_interrupt_pending(&self) -> bool {
@@ -643,7 +648,7 @@ impl ChannelState {
         self.active_character = Some(ActiveCharacter {
             value,
             remaining_attoseconds,
-            local_loopback: self.write_register(14) & LOCAL_LOOPBACK != 0,
+            local_loopback: self.local_loopback_enabled(),
         });
         true
     }
@@ -788,9 +793,10 @@ mod tests {
 
     use super::{
         ALL_SENT, ASYNC_EIGHT_BIT_RESIDUE, CHANNEL_A_CONTROL, CHANNEL_A_DATA, CHANNEL_B_CONTROL,
-        CHANNEL_B_DATA, Channel, InterruptSource, MASTER_INTERRUPT_ENABLE,
-        RECEIVE_CHARACTER_AVAILABLE, RESET_WRITE_REGISTER_PRIME_SEVEN, RESET_WRITE_REGISTERS,
-        TRANSMIT_BUFFER_EMPTY, TRANSMIT_INTERRUPT_ENABLE, WHOLE_CHIP_RESET, Z85230,
+        CHANNEL_B_DATA, Channel, InterruptSource, LOCAL_LOOPBACK, MASTER_INTERRUPT_ENABLE,
+        RECEIVE_CHARACTER_AVAILABLE, RECEIVER_ENABLE, RESET_WRITE_REGISTER_PRIME_SEVEN,
+        RESET_WRITE_REGISTERS, TRANSMIT_BUFFER_EMPTY, TRANSMIT_INTERRUPT_ENABLE, WHOLE_CHIP_RESET,
+        Z85230,
     };
 
     const CLOCK_HZ: u64 = 3_686_400;
@@ -1442,6 +1448,40 @@ mod tests {
             Ok(TRANSMIT_BUFFER_EMPTY)
         );
         assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(0));
+    }
+
+    #[test]
+    fn local_loopback_ignores_external_receive_input() {
+        let mut serial = Z85230::new(CLOCK_HZ);
+        configure_9600_8n1(&mut serial, CHANNEL_A_CONTROL);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 3, RECEIVER_ENABLE);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 1, 2 << 3);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 9, MASTER_INTERRUPT_ENABLE);
+        write_register(&mut serial, CHANNEL_A_CONTROL, 14, LOCAL_LOOPBACK | 1);
+
+        assert_eq!(serial.receive(Channel::A, &[0x6e, 0x00]), 2);
+        assert!(!serial.interrupt_asserted());
+        assert_eq!(
+            read_port(&mut serial, CHANNEL_A_CONTROL),
+            Ok(TRANSMIT_BUFFER_EMPTY)
+        );
+
+        serial
+            .write(DeviceAddr::new(CHANNEL_A_DATA), &[0xcc])
+            .unwrap();
+        serial.advance_time(
+            VirtualDuration::from_attoseconds(CHARACTER_ATTOSECONDS),
+            |_, _| {},
+        );
+        assert!(serial.interrupt_asserted());
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(0xcc));
+        assert!(!serial.interrupt_asserted());
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(0));
+
+        write_register(&mut serial, CHANNEL_A_CONTROL, 14, 1);
+        assert_eq!(serial.receive(Channel::A, &[0x6e]), 1);
+        assert!(serial.interrupt_asserted());
+        assert_eq!(read_port(&mut serial, CHANNEL_A_DATA), Ok(0x6e));
     }
 
     #[test]
