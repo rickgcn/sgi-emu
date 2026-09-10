@@ -683,9 +683,11 @@ impl Rex1 {
             x += 1;
         }
 
-        // A fragment that reached the right edge completes the row; the guest
-        // continues the next row from the saved left edge.
-        if stop_on_x && x > end_x {
+        // STOPONX clips each submitted fragment at XEND. BLOCK distinguishes
+        // the final fragment of a scan line, which restores the saved left
+        // edge and advances Y; with XYCONTINUE, preceding fragments resume
+        // from XEND + 1.
+        if command & CMD_BLOCK != 0 && stop_on_x && x > end_x {
             let next_y = if y > end_y {
                 y.saturating_sub(1)
             } else {
@@ -1238,27 +1240,36 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_glyph_advances_to_the_next_row_only_at_the_right_edge() {
+    fn a_wide_glyph_advances_only_after_the_block_fragment() {
         let mut rex = Rex1::new();
         let mut vram = Vram::new();
         select_pixel_planes(&mut rex);
         rex.write_drawing(COLORREDI, 0x21);
         rex.write_drawing(RWMASK, 0xff);
-        rex.write_drawing(XSTARTI, 0);
-        rex.write_drawing(YSTARTI, 0);
-        rex.write_drawing(XENDI, 39);
-        rex.write_drawing(COMMAND, 0x3000_05b1);
+        rex.write_drawing(XSTARTI, 4);
+        rex.write_drawing(YSTARTI, 12);
+        rex.write_drawing(YENDI, 0);
 
-        // The first segment covers pixels 0 through 31 and stays on row zero.
-        rex.write_drawing_go(ZPATTERN, 0xffff_ffff, &mut vram);
-        assert_eq!(vram.read(PlaneGroup::Pixel, 31, 0), 0x21);
-        assert_eq!(vram.read(PlaneGroup::Pixel, 32, 0), 0);
+        // The firmware omits BLOCK from every complete sixteen-pixel fragment
+        // so reaching the fragment's XEND continues on the same scan line.
+        rex.write_drawing(COMMAND, 0x3000_05a1);
+        rex.write_drawing(XENDI, 19);
+        rex.write_drawing_go(ZPATTERN, 0xffff_0000, &mut vram);
+        assert!((4..=19).all(|x| vram.read(PlaneGroup::Pixel, x, 12) == 0x21));
+        assert_eq!(rex.read_drawing(YSTARTI), 12);
 
-        // The second segment reaches the right edge and advances the row.
-        rex.write_drawing_go(ZPATTERN, 0xffff_ffff, &mut vram);
-        assert_eq!(vram.read(PlaneGroup::Pixel, 39, 0), 0x21);
-        rex.write_drawing_go(ZPATTERN, 0xffff_ffff, &mut vram);
-        assert_eq!(vram.read(PlaneGroup::Pixel, 0, 1), 0x21);
+        // BLOCK marks the final fragment, which completes the scan line and
+        // restores the saved left edge before advancing toward YEND.
+        rex.write_drawing(COMMAND, 0x3000_05a9);
+        rex.write_drawing(XENDI, 27);
+        rex.write_drawing_go(ZPATTERN, 0xff00_0000, &mut vram);
+        assert!((20..=27).all(|x| vram.read(PlaneGroup::Pixel, x, 12) == 0x21));
+        assert_eq!(rex.read_drawing(YSTARTI), 11);
+
+        rex.write_drawing(COMMAND, 0x3000_05a1);
+        rex.write_drawing(XENDI, 19);
+        rex.write_drawing_go(ZPATTERN, 0x8000_0000, &mut vram);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 4, 11), 0x21);
     }
 
     #[test]
