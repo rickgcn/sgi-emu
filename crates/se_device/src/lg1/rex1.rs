@@ -567,19 +567,24 @@ impl Rex1 {
             return;
         }
 
-        // A block command with both stop conditions fills the rectangle
-        // bounded by the start and end coordinates; the PROM clears the
-        // screen and fills boxes this way. Without them the command touches
-        // the single addressed pixel.
+        // A quad that stops on X draws one horizontal span. Adding BLOCK and
+        // STOPONY extends the same address generation across the rectangle;
+        // the PROM clears the screen and fills boxes with that combination.
+        let fills_span = command & (CMD_BLOCK | CMD_QUADMODE | CMD_STOPONX | CMD_STOPONY)
+            == (CMD_QUADMODE | CMD_STOPONX);
         let fills_area = command & CMD_BLOCK != 0
             && command & CMD_QUADMODE != 0
             && command & (CMD_STOPONX | CMD_STOPONY) == (CMD_STOPONX | CMD_STOPONY);
-        if !fills_area {
-            self.write_pixel(vram, group, start_x, start_y, self.source_color());
+        if fills_span {
+            self.draw_rectangle(vram, group, start_x, start_y, end_x, start_y);
+            return;
+        }
+        if fills_area {
+            self.draw_rectangle(vram, group, start_x, start_y, end_x, end_y);
             return;
         }
 
-        self.draw_rectangle(vram, group, start_x, start_y, end_x, end_y);
+        self.write_pixel(vram, group, start_x, start_y, self.source_color());
     }
 
     /// Draws a rectangle through the selected source and raster operation.
@@ -986,6 +991,31 @@ mod tests {
 
         assert_eq!(vram.read(PlaneGroup::Pixel, 4, 6), 0x33);
         assert_eq!(vram.read(PlaneGroup::Pixel, 5, 6), 0);
+    }
+
+    #[test]
+    fn a_quad_stopping_on_x_draws_a_solid_horizontal_span() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        for y in 2..=4 {
+            for x in 3..=9 {
+                vram.write_masked(PlaneGroup::Pixel, x, y, 0x5a, 0xff);
+            }
+        }
+        rex.write_drawing(COMMAND, 0x0000_0121);
+        rex.write_drawing(XSTATE, 0x030f_0021);
+        rex.write_drawing(XSTARTI, 4);
+        rex.write_drawing(YSTARTI, 3);
+
+        rex.write_drawing_go(XENDI, 8, &mut vram);
+
+        for x in 3..=9 {
+            let expected = if (4..=8).contains(&x) { 0x51 } else { 0x5a };
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, 3), expected);
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, 2), 0x5a);
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, 4), 0x5a);
+        }
     }
 
     #[test]
