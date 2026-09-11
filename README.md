@@ -2,34 +2,44 @@
 
 A work-in-progress emulator for Silicon Graphics workstations.
 
-The project is currently focused on the original **SGI Indigo (IP12)** with a 33 MHz MIPS R3000A processor. The current focus is improving hardware accuracy, completeness, and maintainability while running IRIX 5.3 and NetBSD/sgimips.
+The project is currently focused on the original **SGI Indigo (IP12)** with a 33 MHz MIPS R3000A processor. It can currently boot **IRIX 5.3** into the Indigo Magic desktop, as well as boot NetBSD/sgimips.
 
 > [!IMPORTANT]
-> sgi-emu is under active development. IRIX 5.3 and NetBSD/sgimips boot, but several devices and hardware behaviors remain incomplete.
+> sgi-emu is under active development. Many hardware behaviors are still incomplete or under active validation.
+
+<p align="center">
+  <img src="assets/indigo-irix-5.3.png"
+       alt="IRIX 5.3 running on an emulated SGI Indigo IP12"
+       width="900">
+</p>
+
+<p align="center">
+  <em>IRIX 5.3 running on the emulated Indigo IP12 with LG1 graphics.</em>
+</p>
 
 ## Current status
 
 ### Software
 
-| Software               | Status                                               |
-| ---------------------- | ---------------------------------------------------- |
-| Indigo IP12 PROM       | Boots and enters the PROM monitor                    |
-| IRIX 5.3               | Boots to multi-user from serial console              |
-| NetBSD/sgimips 11.99.8 | Installs and boots to multi-user from serial console |
+| Software               | Status                            |
+| ---------------------- | --------------------------------- |
+| Indigo IP12 PROM       | Boots and enters the PROM monitor |
+| IRIX 5.3               | Boots to the Indigo Magic desktop |
+| NetBSD/sgimips 11.99.8 | Installs and boots to multi-user  |
 
 ### Hardware
 
-| Hardware         | Status                    |
-| ---------------- | ------------------------- |
-| CPU              | Usable, needs improvement |
-| PIC1             | Usable, needs improvement |
-| HPC1             | Usable, needs improvement |
-| INT2             | Usable, needs improvement |
-| SCSI Controller  | Usable, needs improvement |
-| SCSI Disk/CD-ROM | Usable, needs improvement |
-| Ethernet         | Still under development   |
-| Audio            | Still under development   |
-| Graphics         | Still under development   |
+| Hardware         | Status          |
+| ---------------- | --------------- |
+| CPU              | Usable          |
+| PIC1             | Usable          |
+| HPC1             | Usable          |
+| INT2             | Usable          |
+| SCSI Controller  | Usable          |
+| SCSI Disk/CD-ROM | Partial         |
+| Ethernet         | Usable          |
+| Audio            | Not implemented |
+| Graphics         | Partial         |
 
 ## Emulation philosophy
 
