@@ -83,6 +83,7 @@ const OPCODE_LDPIXEL: u32 = 0x3;
 const CMD_BLOCK: u32 = 1 << 3;
 const CMD_LENGTH32: u32 = 1 << 4;
 const CMD_QUADMODE: u32 = 1 << 5;
+const CMD_XMAJOR: u32 = 1 << 6;
 const CMD_XYCONTINUE: u32 = 1 << 7;
 const CMD_STOPONX: u32 = 1 << 8;
 const CMD_STOPONY: u32 = 1 << 9;
@@ -129,6 +130,9 @@ const FRAMEBUFFER_COORDINATE_BIAS: u32 = 0x0800;
 
 /// Mask applied by the twelve-bit drawing address generators.
 const FRAMEBUFFER_COORDINATE_MASK: u32 = 0x0fff;
+
+/// Mask retaining one complete 12.15 drawing coordinate.
+const FULL_COORDINATE_MASK: u32 = 0x07ff_ffff;
 
 /// Largest valid value in a color DDA before its overflow bit clamps it.
 const MAX_COLOR: i64 = (1 << (8 + COLOR_FRACTION_BITS)) - 1;
@@ -345,6 +349,16 @@ const fn signed_color_slope(value: u32) -> i64 {
         value
     } else {
         value - 0x0020_0000
+    }
+}
+
+/// Sign-extends one normalized 2.15 minor-coordinate slope.
+const fn signed_minor_slope(value: u32) -> i32 {
+    let value = (value & 0x0001_ffff) as i32;
+    if value & 0x0001_0000 == 0 {
+        value
+    } else {
+        value - 0x0002_0000
     }
 }
 
@@ -613,6 +627,21 @@ impl Rex1 {
             return;
         }
 
+        // IRIS GL programs aliased vectors as one of two non-quad DDA
+        // primitives. X-major lines combine XMAJOR with STOPONX, while
+        // Y-major lines use STOPONY. The host supplies the minor-axis step
+        // through MINORSLOPE and expands wide lines by triggering parallel
+        // copies of the same primitive.
+        let line_mode = command & (CMD_XMAJOR | CMD_QUADMODE | CMD_STOPONX | CMD_STOPONY);
+        if line_mode == (CMD_XMAJOR | CMD_STOPONX) {
+            self.draw_line(vram, group, true, end_x);
+            return;
+        }
+        if line_mode == CMD_STOPONY {
+            self.draw_line(vram, group, false, end_y);
+            return;
+        }
+
         if command & (CMD_ENLSPATTERN | CMD_QUADMODE | CMD_STOPONX)
             == (CMD_ENLSPATTERN | CMD_QUADMODE | CMD_STOPONX)
         {
@@ -644,6 +673,66 @@ impl Rex1 {
             start_y,
             self.source_color(0, start_x, start_y),
         );
+    }
+
+    /// Draws one aliased X-major or Y-major vector through the coordinate DDA.
+    ///
+    /// Start coordinates retain 15 fractional bits. Each pixel advances the
+    /// selected major coordinate by one and the other coordinate by the signed
+    /// 2.15 MINORSLOPE value. LSPATTERN is consumed from its most significant
+    /// bit when enabled; LSMODE supplies the 17-32 bit pattern length and the
+    /// repeat count used for each bit.
+    fn draw_line(&self, vram: &mut Vram, group: PlaneGroup, x_major: bool, end_major: u32) {
+        let command = self.next.command;
+        let minor_step = signed_minor_slope(self.next.minorslope);
+        let mut x = self.next.xstart;
+        let mut y = self.next.ystart;
+        let start_major = if x_major { x } else { y } >> COORDINATE_FRACTION_BITS;
+        let major_step = if start_major <= end_major {
+            1_i32 << COORDINATE_FRACTION_BITS
+        } else {
+            -(1_i32 << COORDINATE_FRACTION_BITS)
+        };
+        let pattern_length = ((self.next.lsmode >> 16) & 0x0f) + 17;
+        let pattern_repeat = ((self.next.lsmode >> 8) & 0xff).max(1);
+        let opaque = self.next.shared_command_flags & CMD_LSOPAQUE != 0;
+        let background = self.next.colorback as u8;
+
+        for pixel in 0..MAX_COMMAND_PIXELS {
+            let pixel_x = x >> COORDINATE_FRACTION_BITS;
+            let pixel_y = y >> COORDINATE_FRACTION_BITS;
+            let pattern_set = if command & CMD_ENLSPATTERN == 0 {
+                true
+            } else {
+                let bit = 31 - ((pixel / pattern_repeat) % pattern_length);
+                self.next.lspattern & (1 << bit) != 0
+            };
+
+            if pattern_set {
+                self.write_pixel(
+                    vram,
+                    group,
+                    pixel_x,
+                    pixel_y,
+                    self.source_color(pixel, pixel_x, pixel_y),
+                );
+            } else if opaque {
+                self.write_pixel(vram, group, pixel_x, pixel_y, background);
+            }
+
+            let major = if x_major { pixel_x } else { pixel_y };
+            if major == end_major {
+                break;
+            }
+
+            if x_major {
+                x = x.wrapping_add_signed(major_step) & FULL_COORDINATE_MASK;
+                y = y.wrapping_add_signed(minor_step) & FULL_COORDINATE_MASK;
+            } else {
+                x = x.wrapping_add_signed(minor_step) & FULL_COORDINATE_MASK;
+                y = y.wrapping_add_signed(major_step) & FULL_COORDINATE_MASK;
+            }
+        }
     }
 
     /// Draws a rectangle through the selected source and raster operation.
@@ -1209,10 +1298,10 @@ mod tests {
     use super::super::vram::{PlaneGroup, Vram};
     use super::{
         AUX1, AUX2, COLORBLUEI, COLORGREENF, COLORGREENI, COLORREDF, COLORREDI, COMMAND,
-        COORDINATE_FRACTION_BITS, ConfigAccess, LSMODE, LSPATTERN, PeripheralPort, RWAUX1, RWMASK,
-        Rex1, SLOPEBLUE, SLOPEGREEN, SLOPERED, SMASK1X, SMASK1Y, SMASK2X, SMASK2Y, SMASK3X,
-        SMASK3Y, SMASK4X, SMASK4Y, XENDI, XSAVE, XSTART, XSTARTI, XSTATE, XYMOVE, XYWIN, YENDI,
-        YSTARTI, ZPATTERN, color_slope, minor_slope, signed_color_slope,
+        COORDINATE_FRACTION_BITS, ConfigAccess, LSMODE, LSPATTERN, MINORSLOPE, PeripheralPort,
+        RWAUX1, RWMASK, Rex1, SLOPEBLUE, SLOPEGREEN, SLOPERED, SMASK1X, SMASK1Y, SMASK2X, SMASK2Y,
+        SMASK3X, SMASK3Y, SMASK4X, SMASK4Y, XENDI, XSAVE, XSTART, XSTARTI, XSTATE, XYMOVE, XYWIN,
+        YENDI, YSTARTI, ZPATTERN, color_slope, minor_slope, signed_color_slope, signed_minor_slope,
     };
 
     /// Selects the pixel plane group through the configuration window.
@@ -1451,6 +1540,135 @@ mod tests {
 
         assert_eq!(vram.read(PlaneGroup::Pixel, 4, 6), 0x33);
         assert_eq!(vram.read(PlaneGroup::Pixel, 5, 6), 0);
+    }
+
+    #[test]
+    fn an_x_major_line_advances_the_minor_coordinate() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(COMMAND, 0x3004_0941);
+        rex.write_drawing(COLORREDI, 0x5a);
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(LSPATTERN, 0xffff_ffff);
+        rex.write_drawing(LSMODE, 0x000f_0101);
+        rex.write_drawing(XSTARTI, 1);
+        rex.write_drawing(YSTARTI, 1);
+        rex.write_drawing(XENDI, 5);
+
+        rex.write_drawing_go(MINORSLOPE, (256.5_f32).to_bits(), &mut vram);
+
+        for (x, y) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3)] {
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, y), 0x5a);
+        }
+        assert_eq!(vram.read(PlaneGroup::Pixel, 2, 2), 0);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 4, 3), 0);
+    }
+
+    #[test]
+    fn a_y_major_line_advances_the_minor_coordinate() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(COMMAND, 0x3004_0a01);
+        rex.write_drawing(COLORREDI, 0x5a);
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(LSPATTERN, 0xffff_ffff);
+        rex.write_drawing(LSMODE, 0x000f_0101);
+        rex.write_drawing(XSTARTI, 5);
+        rex.write_drawing(YSTARTI, 1);
+        rex.write_drawing(YENDI, 5);
+
+        rex.write_drawing_go(MINORSLOPE, (-257.0_f32).to_bits(), &mut vram);
+
+        for (x, y) in [(5, 1), (4, 2), (3, 3), (2, 4), (1, 5)] {
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, y), 0x5a);
+        }
+        assert_eq!(vram.read(PlaneGroup::Pixel, 5, 2), 0);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 2, 5), 0);
+    }
+
+    #[test]
+    fn line_major_coordinates_advance_toward_descending_endpoints() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(COLORREDI, 0x5a);
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(LSPATTERN, 0xffff_ffff);
+        rex.write_drawing(LSMODE, 0x000f_0101);
+        rex.write_drawing(COMMAND, 0x3004_0941);
+        rex.write_drawing(XSTARTI, 5);
+        rex.write_drawing(YSTARTI, 1);
+        rex.write_drawing(XENDI, 1);
+
+        rex.write_drawing_go(MINORSLOPE, (257.0_f32).to_bits(), &mut vram);
+
+        for (x, y) in [(5, 1), (4, 2), (3, 3), (2, 4), (1, 5)] {
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, y), 0x5a);
+        }
+
+        rex.write_drawing(COMMAND, 0x3004_0a01);
+        rex.write_drawing(XSTARTI, 8);
+        rex.write_drawing(YSTARTI, 8);
+        rex.write_drawing(YENDI, 6);
+
+        rex.write_drawing_go(MINORSLOPE, (-257.0_f32).to_bits(), &mut vram);
+
+        for (x, y) in [(8, 8), (7, 7), (6, 6)] {
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, y), 0x5a);
+        }
+    }
+
+    #[test]
+    fn a_vector_line_consumes_the_programmed_stipple_most_significant_bit_first() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(COMMAND, 0x3004_0941);
+        rex.write_drawing(COLORREDI, 0x5a);
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(LSPATTERN, 0xa000_0000);
+        rex.write_drawing(LSMODE, 0x0000_0101);
+        rex.write_drawing(XSTARTI, 1);
+        rex.write_drawing(YSTARTI, 1);
+        rex.write_drawing(XENDI, 5);
+
+        rex.write_drawing_go(MINORSLOPE, (256.0_f32).to_bits(), &mut vram);
+
+        for x in [1, 3] {
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, 1), 0x5a);
+        }
+        for x in [2, 4, 5] {
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, 1), 0);
+        }
+    }
+
+    #[test]
+    fn repeated_minor_start_go_writes_expand_an_x_major_wide_line() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(COMMAND, 0x3004_0941);
+        rex.write_drawing(COLORREDI, 0x5a);
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(LSPATTERN, 0xffff_ffff);
+        rex.write_drawing(LSMODE, 0x000f_0101);
+        rex.write_drawing(XSTARTI, 2);
+        rex.write_drawing(XENDI, 4);
+        rex.write_drawing(MINORSLOPE, (256.0_f32).to_bits());
+
+        for y in 3..=5 {
+            rex.write_drawing_go(YSTARTI, y, &mut vram);
+        }
+
+        for y in 3..=5 {
+            for x in 2..=4 {
+                assert_eq!(vram.read(PlaneGroup::Pixel, x, y), 0x5a);
+            }
+        }
+        assert_eq!(vram.read(PlaneGroup::Pixel, 1, 4), 0);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 5, 4), 0);
     }
 
     #[test]
@@ -2310,6 +2528,11 @@ mod tests {
         // The sign bit selects a negation rather than a two's complement
         // value, so the read-back differs from ordinary signed storage.
         assert_eq!(minor_slope(0x8000_1234), 0x0001_edcc);
+
+        let positive_minor = minor_slope((256.5_f32).to_bits());
+        let negative_minor = minor_slope((-257.0_f32).to_bits());
+        assert_eq!(signed_minor_slope(positive_minor), 1 << 14);
+        assert_eq!(signed_minor_slope(negative_minor), -(1 << 15));
 
         // The color formula duplicates bit nineteen into bit twenty.
         assert_eq!(color_slope(0x0010_0000), 0x0010_0000);
