@@ -935,6 +935,11 @@ mod tests {
         let mut rex = Rex1::new();
         let mut vram = Vram::new();
         select_pixel_planes(&mut rex);
+        for y in 0..=3 {
+            for x in 0..=4 {
+                vram.write_masked(PlaneGroup::Pixel, x, y, 0x5a, 0xff);
+            }
+        }
         rex.write_drawing(COMMAND, 0x329);
         rex.write_drawing(XSTATE, 0x03ff_0000);
         rex.write_drawing(XSTARTI, 0);
@@ -943,9 +948,10 @@ mod tests {
 
         rex.write_drawing_go(YENDI, 2, &mut vram);
 
-        for y in 0..=2 {
-            for x in 0..=3 {
-                assert_eq!(vram.read(PlaneGroup::Pixel, x, y), 0);
+        for y in 0..=3 {
+            for x in 0..=4 {
+                let expected = if x <= 3 && y <= 2 { 0 } else { 0x5a };
+                assert_eq!(vram.read(PlaneGroup::Pixel, x, y), expected);
             }
         }
         assert_eq!(rex.read_drawing(YENDI), 2);
@@ -962,7 +968,10 @@ mod tests {
         rex.write_drawing(RWMASK, 0xff);
         rex.write_drawing(XSTARTI, 2);
         rex.write_drawing_go(YSTARTI, 2, &mut vram);
+        rex.write_drawing(XSTARTI, 1023);
+        rex.write_drawing_go(YSTARTI, 767, &mut vram);
         assert_eq!(vram.read(PlaneGroup::Pixel, 2, 2), 0x5a);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 1023, 767), 0x5a);
 
         rex.write_drawing(COMMAND, 0x329);
         rex.write_drawing(XSTATE, 0x03ff_0000);
