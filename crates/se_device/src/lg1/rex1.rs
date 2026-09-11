@@ -533,7 +533,7 @@ impl Rex1 {
                 self.config.rwvc1 = value & 0xff;
                 return ConfigAccess::Write(PeripheralPort::Vc1, value as u8);
             }
-            TOGGLECTXT => core::mem::swap(&mut self.current, &mut self.next),
+            TOGGLECTXT => self.latch_next_context(),
             CONFIGMODE => self.config.configmode = value,
             XYWIN => self.config.xywin = value & 0x0fff_0fff,
             _ => {}
@@ -568,7 +568,12 @@ impl Rex1 {
             OPCODE_NOP => {}
             _ => {}
         }
-        self.current = self.next.clone();
+        self.latch_next_context();
+    }
+
+    /// Makes the working context visible to SET reads without consuming it.
+    fn latch_next_context(&mut self) {
+        self.current.clone_from(&self.next);
     }
 
     /// Runs one drawing command.
@@ -1147,9 +1152,9 @@ mod tests {
     use super::{
         AUX1, AUX2, COLORBLUEI, COLORGREENF, COLORGREENI, COLORREDF, COLORREDI, COMMAND,
         COORDINATE_FRACTION_BITS, ConfigAccess, LSMODE, LSPATTERN, PeripheralPort, RWAUX1, RWMASK,
-        Rex1, SLOPEBLUE, SLOPEGREEN, SLOPERED, SMASK1X, SMASK1Y, SMASK2X, SMASK2Y, XENDI, XSAVE,
-        XSTART, XSTARTI, XSTATE, XYMOVE, XYWIN, YENDI, YSTARTI, ZPATTERN, color_slope, minor_slope,
-        signed_color_slope,
+        Rex1, SLOPEBLUE, SLOPEGREEN, SLOPERED, SMASK1X, SMASK1Y, SMASK2X, SMASK2Y, SMASK3X,
+        SMASK3Y, SMASK4X, SMASK4Y, XENDI, XSAVE, XSTART, XSTARTI, XSTATE, XYMOVE, XYWIN, YENDI,
+        YSTARTI, ZPATTERN, color_slope, minor_slope, signed_color_slope,
     };
 
     /// Selects the pixel plane group through the configuration window.
@@ -1203,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn toggling_the_context_exchanges_both_register_files() {
+    fn toggling_the_context_latches_next_without_replacing_it() {
         let mut rex = Rex1::new();
         let mut vram = Vram::new();
         rex.write_drawing(XSTARTI, 7);
@@ -1214,6 +1219,37 @@ mod tests {
         rex.write_config(super::TOGGLECTXT, 0);
 
         assert_eq!(rex.read_drawing(XSTARTI), 9);
+
+        rex.write_drawing(YSTARTI, 3);
+        rex.write_drawing_go(COMMAND, 0, &mut vram);
+
+        assert_eq!(rex.read_drawing(XSTARTI), 9);
+        assert_eq!(rex.read_drawing(YSTARTI), 3);
+    }
+
+    #[test]
+    fn rex_clear_replaces_the_diagnostic_context_before_vram_fill() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        rex.write_config(XYWIN, 0x0800_0800);
+
+        rex.write_config(AUX2, 0x7fff_ffff);
+        rex.write_drawing(SMASK1X, 0x03ff_03ff);
+        rex.write_drawing(SMASK1Y, 0x03ff_03ff);
+        rex.write_config(SMASK2X, 0x03ff_03ff);
+        rex.write_config(SMASK2Y, 0x03ff_03ff);
+        rex.write_config(SMASK3X, 0x03ff_03ff);
+        rex.write_config(SMASK3Y, 0x03ff_03ff);
+        rex.write_config(SMASK4X, 0x03ff_03ff);
+        rex.write_config(SMASK4Y, 0x03ff_03ff);
+        rex.write_drawing_go(COMMAND, 0, &mut vram);
+
+        rex.write_config(AUX2, 0x2000_0000);
+        rex.write_config(super::TOGGLECTXT, 0);
+        draw_solid_rectangle(&mut rex, &mut vram, 1, 1, 1, 1);
+
+        assert_eq!(vram.read(PlaneGroup::Pixel, 1, 1), 0x5a);
+        assert_eq!(vram.read(PlaneGroup::Cid, 1, 1), 0);
     }
 
     #[test]
@@ -1791,7 +1827,7 @@ mod tests {
     }
 
     #[test]
-    fn context_toggle_preserves_shared_xstate_flags() {
+    fn context_toggle_latches_shared_xstate_flags() {
         let mut rex = Rex1::new();
         let mut setup_vram = Vram::new();
         select_pixel_planes(&mut rex);
@@ -1802,8 +1838,7 @@ mod tests {
         rex.write_drawing(XSTATE, 0x83ff_070f);
         rex.read_drawing_go(COMMAND, &mut setup_vram);
 
-        // Replace the next context with a transparent version, then exchange
-        // contexts. The captured context must restore the aliased opaque bit.
+        // Replace the next context with a transparent version, then latch it.
         rex.write_drawing(XSTATE, 0x03ff_070f);
         rex.write_config(super::TOGGLECTXT, 0);
         rex.write_drawing(XSAVE, 0);
@@ -1812,7 +1847,7 @@ mod tests {
         rex.write_drawing_go(ZPATTERN, 0x8000_0000, &mut vram);
 
         assert_eq!(vram.read(PlaneGroup::Pixel, 0, 0), 0x0f);
-        assert_eq!(vram.read(PlaneGroup::Pixel, 1, 0), 0x07);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 1, 0), 0);
     }
 
     #[test]
