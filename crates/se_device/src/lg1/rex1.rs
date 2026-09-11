@@ -87,6 +87,7 @@ const CMD_XYCONTINUE: u32 = 1 << 7;
 const CMD_STOPONX: u32 = 1 << 8;
 const CMD_STOPONY: u32 = 1 << 9;
 const CMD_ENZPATTERN: u32 = 1 << 10;
+const CMD_ENLSPATTERN: u32 = 1 << 11;
 const CMD_COLORCOMP: u32 = 1 << 16;
 const CMD_LOGICSRC: u32 = 1 << 19;
 const CMD_COLORAUX: u32 = 1 << 21;
@@ -141,9 +142,8 @@ pub(super) struct Registers {
     source_rop: u32,
     /// Command-position flags shared with the high XSTATE nibble.
     ///
-    /// Both register views replace all four flags when written. The line
-    /// stipple and framebuffer-source effects remain outside the first model,
-    /// but their state still belongs to each drawing context.
+    /// Both register views replace all four flags when written, and drawing
+    /// reads this normalized form regardless of which view the guest used.
     shared_command_flags: u32,
     xstart: u32,
     ystart: u32,
@@ -567,6 +567,13 @@ impl Rex1 {
             return;
         }
 
+        if command & (CMD_ENLSPATTERN | CMD_QUADMODE | CMD_STOPONX)
+            == (CMD_ENLSPATTERN | CMD_QUADMODE | CMD_STOPONX)
+        {
+            self.draw_line_stipple(vram, group, start_x, start_y, end_x, end_y);
+            return;
+        }
+
         // A quad that stops on X draws one horizontal span. Adding BLOCK and
         // STOPONY extends the same address generation across the rectangle;
         // the PROM clears the screen and fills boxes with that combination.
@@ -702,6 +709,58 @@ impl Rex1 {
             self.next.xsave = self.next.xstart >> COORDINATE_FRACTION_BITS;
         } else {
             self.next.xsave = x;
+        }
+    }
+
+    /// Draws one span selected by the line stipple pattern.
+    ///
+    /// Xsgi supplies patterns between seventeen and thirty-two pixels wide.
+    /// LSMODE encodes that width minus seventeen in bits 19:16, while the
+    /// pattern is consumed from its most significant bit and repeats at the
+    /// programmed width. A continued block consumes one GO pattern write per
+    /// rectangle row, restoring XSTART and advancing Y for the following row.
+    fn draw_line_stipple(
+        &mut self,
+        vram: &mut Vram,
+        group: PlaneGroup,
+        start_x: u32,
+        y: u32,
+        end_x: u32,
+        end_y: u32,
+    ) {
+        let command = self.next.command;
+        let pattern = self.next.lspattern;
+        let length = ((self.next.lsmode >> 16) & 0x0f) + 17;
+        let opaque = self.next.shared_command_flags & CMD_LSOPAQUE != 0;
+        let foreground = self.source_color();
+        let background = self.next.colorback as u8;
+        let x_ascending = start_x <= end_x;
+        let mut x = start_x;
+
+        for pixel in 0..MAX_COMMAND_PIXELS {
+            let bit = 31 - (pixel % length);
+            if pattern & (1 << bit) != 0 {
+                self.write_pixel(vram, group, x, y, foreground);
+            } else if opaque {
+                self.write_pixel(vram, group, x, y, background);
+            }
+
+            if x == end_x {
+                break;
+            }
+            x = if x_ascending { x + 1 } else { x - 1 };
+        }
+
+        let continues_rows = command & (CMD_BLOCK | CMD_QUADMODE | CMD_XYCONTINUE | CMD_STOPONX)
+            == (CMD_BLOCK | CMD_QUADMODE | CMD_XYCONTINUE | CMD_STOPONX);
+        if continues_rows {
+            let next_y = if y > end_y {
+                y.saturating_sub(1)
+            } else {
+                y.saturating_add(1)
+            };
+            self.next.ystart = next_y << COORDINATE_FRACTION_BITS;
+            self.next.xsave = self.next.xstart >> COORDINATE_FRACTION_BITS;
         }
     }
 
@@ -881,8 +940,9 @@ const fn signed_coordinate(value: u32) -> i32 {
 mod tests {
     use super::super::vram::{PlaneGroup, Vram};
     use super::{
-        AUX2, COLORREDI, COMMAND, ConfigAccess, PeripheralPort, RWAUX1, RWMASK, Rex1, XENDI, XSAVE,
-        XSTART, XSTARTI, XSTATE, XYMOVE, YENDI, YSTARTI, ZPATTERN, color_slope, minor_slope,
+        AUX2, COLORREDI, COMMAND, ConfigAccess, LSMODE, LSPATTERN, PeripheralPort, RWAUX1, RWMASK,
+        Rex1, XENDI, XSAVE, XSTART, XSTARTI, XSTATE, XYMOVE, YENDI, YSTARTI, ZPATTERN, color_slope,
+        minor_slope,
     };
 
     /// Selects the pixel plane group through the configuration window.
@@ -1024,6 +1084,79 @@ mod tests {
             assert_eq!(vram.read(PlaneGroup::Pixel, x, 3), expected);
             assert_eq!(vram.read(PlaneGroup::Pixel, x, 2), 0x5a);
             assert_eq!(vram.read(PlaneGroup::Pixel, x, 4), 0x5a);
+        }
+    }
+
+    #[test]
+    fn a_transparent_line_stipple_selects_pixels_across_a_span() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        for y in 2..=4 {
+            for x in 1..=21 {
+                vram.write_masked(PlaneGroup::Pixel, x, y, 0x5a, 0xff);
+            }
+        }
+        rex.write_drawing(COMMAND, 0x0000_0921);
+        rex.write_drawing(XSTATE, 0x03ff_00f0);
+        rex.write_drawing(LSMODE, 0);
+        rex.write_drawing(LSPATTERN, 0xa000_0000);
+        rex.write_drawing(XSTARTI, 2);
+        rex.write_drawing(YSTARTI, 3);
+
+        rex.write_drawing_go(XENDI, 20, &mut vram);
+
+        for x in 1..=21 {
+            let expected = if matches!(x, 2 | 4 | 19) { 0xf0 } else { 0x5a };
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, 3), expected);
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, 2), 0x5a);
+            assert_eq!(vram.read(PlaneGroup::Pixel, x, 4), 0x5a);
+        }
+    }
+
+    #[test]
+    fn an_opaque_stippled_rectangle_consumes_one_pattern_per_row() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        for y in 2..=5 {
+            for x in 3..=8 {
+                vram.write_masked(PlaneGroup::Pixel, x, y, 0x5a, 0xff);
+            }
+        }
+        rex.write_drawing(XSTATE, 0x03ff_11f0);
+        rex.write_drawing(LSMODE, 0);
+        rex.write_drawing(XSTARTI, 4);
+        rex.write_drawing(YSTARTI, 3);
+        rex.write_drawing(XENDI, 7);
+        rex.write_drawing(YENDI, 4);
+        rex.write_drawing_go(COMMAND, 0, &mut vram);
+        rex.write_drawing(COMMAND, 0x3040_09a9);
+
+        rex.write_drawing_go(LSPATTERN, 0xa000_0000, &mut vram);
+
+        assert_eq!(
+            (4..=7)
+                .map(|x| vram.read(PlaneGroup::Pixel, x, 3))
+                .collect::<Vec<_>>(),
+            vec![0xf0, 0x11, 0xf0, 0x11]
+        );
+        assert!((4..=7).all(|x| vram.read(PlaneGroup::Pixel, x, 4) == 0x5a));
+
+        rex.write_drawing_go(LSPATTERN, 0x5000_0000, &mut vram);
+
+        assert_eq!(
+            (4..=7)
+                .map(|x| vram.read(PlaneGroup::Pixel, x, 4))
+                .collect::<Vec<_>>(),
+            vec![0x11, 0xf0, 0x11, 0xf0]
+        );
+        for y in 3..=4 {
+            assert_eq!(vram.read(PlaneGroup::Pixel, 3, y), 0x5a);
+            assert_eq!(vram.read(PlaneGroup::Pixel, 8, y), 0x5a);
+        }
+        for y in [2, 5] {
+            assert!((3..=8).all(|x| vram.read(PlaneGroup::Pixel, x, y) == 0x5a));
         }
     }
 
