@@ -460,6 +460,8 @@ mod tests {
     const XSTATE: u64 = 0x0008;
     /// Offset of the auxiliary configuration register.
     const AUX2: u64 = 0x47a8;
+    /// Offset of the drawing window origin.
+    const XYWIN: u64 = 0x47fc;
     /// Offset of the clock and revision port.
     const WCLOCK: u64 = 0x47e4;
     /// Offset of the palette data port.
@@ -476,6 +478,11 @@ mod tests {
         board
             .write(DeviceAddr::new(GIO_PIO_BASE + offset), &value.to_be_bytes())
             .unwrap();
+    }
+
+    /// Maps zero-based logical drawing coordinates onto the stored frame buffer.
+    fn set_identity_window_origin(board: &mut Lg1) {
+        write(board, XYWIN, 0x0800_0800);
     }
 
     /// Reads one board register.
@@ -619,6 +626,7 @@ mod tests {
     fn drawn_pixels_reach_the_composed_frame() {
         let mut board = Lg1::new();
         start_video(&mut board);
+        set_identity_window_origin(&mut board);
         // Give palette entry one a distinct color.
         write_peripheral(&mut board, RWDAC, 0, 1);
         for component in [0x11, 0x22, 0x33] {
@@ -647,6 +655,7 @@ mod tests {
     fn the_prom_clear_screen_reaches_the_whole_visible_frame() {
         let mut board = Lg1::new();
         start_video(&mut board);
+        set_identity_window_origin(&mut board);
         write_peripheral(&mut board, RWDAC, 0, 0);
         for component in [0x40, 0x50, 0x60] {
             write_peripheral(&mut board, RWDAC, 1, component);
@@ -839,6 +848,7 @@ mod tests {
     #[test]
     fn graphics_dma_streams_complete_big_endian_host_words() {
         let mut board = Lg1::new();
+        set_identity_window_origin(&mut board);
         write(&mut board, XSTARTI, 8);
         write(&mut board, YSTARTI, 3);
         write(&mut board, XENDI, 1023);
@@ -881,6 +891,7 @@ mod tests {
     #[test]
     fn graphics_dma_discards_unused_lanes_at_rectangle_scanline_ends() {
         let mut board = Lg1::new();
+        set_identity_window_origin(&mut board);
         write(&mut board, XSTARTI, 0x10);
         write(&mut board, YSTARTI, 0);
         write(&mut board, XENDI, 0x36);

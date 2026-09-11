@@ -88,8 +88,9 @@ pub(super) fn compose_blank(pixels: &mut [u8]) {
 /// Returns the palette map bits contributed by one display mode.
 ///
 /// The XMAP mode stores the four-bit map number in bits five through two.
-/// Eight-bit color-index pixels use the lower two map bits as the high bits
-/// of the Bt479's ten-bit palette address.
+/// Its lower two bits become the high bits of the Bt479's ten-bit palette
+/// address. The common `0x0300` prefix does not select the RGB map; Xsgi adds
+/// it to both color-index and RGB display modes.
 const fn color_index_base(mode: u16) -> u16 {
     ((mode >> 2) & 0x03) << 8
 }
@@ -261,6 +262,26 @@ mod tests {
         compose(&vram, &vc1, &dac, &mut pixels);
 
         assert_eq!(pixel_at(&pixels, 0, 0), [2, 2, 2, 0xff]);
+    }
+
+    #[test]
+    fn the_common_xmap_prefix_does_not_override_the_palette_map() {
+        let mut vram = Vram::new();
+        let mut vc1 = Vc1::new();
+        let mut dac = Bt479::new();
+        write_palette(&mut dac, 3, [1, 1, 1]);
+        select_bank(&mut dac, 2);
+        write_palette(&mut dac, 3, [2, 2, 2]);
+        vc1.write(Vc1Selector::AddressHigh, 0);
+        vc1.write(Vc1Selector::AddressLow, 0);
+        vc1.write(Vc1Selector::XmapMode, 0x03);
+        vc1.write(Vc1Selector::XmapMode, 0x00);
+        vram.write_masked(PlaneGroup::Pixel, 0, 0, 3, 0xff);
+        let mut pixels = vec![0; FRAME_BYTES];
+
+        compose(&vram, &vc1, &dac, &mut pixels);
+
+        assert_eq!(pixel_at(&pixels, 0, 0), [1, 1, 1, 0xff]);
     }
 
     #[test]

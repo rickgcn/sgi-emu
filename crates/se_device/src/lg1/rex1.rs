@@ -88,7 +88,10 @@ const CMD_STOPONX: u32 = 1 << 8;
 const CMD_STOPONY: u32 = 1 << 9;
 const CMD_ENZPATTERN: u32 = 1 << 10;
 const CMD_ENLSPATTERN: u32 = 1 << 11;
+const CMD_RGBMODE: u32 = 1 << 14;
+const CMD_DITHER: u32 = 1 << 15;
 const CMD_COLORCOMP: u32 = 1 << 16;
+const CMD_SHADE: u32 = 1 << 17;
 const CMD_LOGICSRC: u32 = 1 << 19;
 const CMD_COLORAUX: u32 = 1 << 21;
 const CMD_LSOPAQUE: u32 = 1 << 22;
@@ -103,6 +106,12 @@ const XSTATE_ZOPAQUE: u32 = 1 << 31;
 const AUX1_COLORCOMPLT: u32 = 1 << 6;
 const AUX1_COLORCOMPEQ: u32 = 1 << 7;
 const AUX1_COLORCOMPGT: u32 = 1 << 8;
+const AUX1_DITHERRANGE: u32 = 1 << 9;
+
+/// Low AUX2 nibble selecting the four screen masks.
+const AUX2_SCREEN_MASK_ENABLES: u32 = 0x0f;
+/// AUX2 bit offset of the matching inside-mask polarity nibble.
+const AUX2_SCREEN_MASK_INSIDE_SHIFT: u32 = 4;
 
 /// Fractional bits held by a full coordinate register.
 const COORDINATE_FRACTION_BITS: u32 = 15;
@@ -110,6 +119,15 @@ const COORDINATE_FRACTION_BITS: u32 = 15;
 const END_FRACTION_BITS: u32 = 11;
 /// Fractional bits held by a full color register.
 const COLOR_FRACTION_BITS: u32 = 11;
+
+/// REX coordinate corresponding to the upper-left stored frame-buffer pixel.
+const FRAMEBUFFER_COORDINATE_BIAS: u32 = 0x0800;
+
+/// Mask applied by the twelve-bit drawing address generators.
+const FRAMEBUFFER_COORDINATE_MASK: u32 = 0x0fff;
+
+/// Largest valid value in a color DDA before its overflow bit clamps it.
+const MAX_COLOR: i64 = (1 << (8 + COLOR_FRACTION_BITS)) - 1;
 
 /// Pixels transferred by one packed host pixel access.
 const PACKED_PIXELS: u32 = 4;
@@ -120,6 +138,9 @@ const PACKED_PIXELS: u32 = 4;
 /// always finishes first. The bound only stops a malformed guest command from
 /// running without end.
 const MAX_COMMAND_PIXELS: u32 = 1 << 21;
+
+/// Window-relative four-by-four Bayer thresholds used for RGB dithering.
+const DITHER_MATRIX: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 /// One complete set of drawing registers.
 ///
@@ -311,6 +332,16 @@ const fn color_slope(value: u32) -> u32 {
         slope = (!(slope & 0xffef_ffff)).wrapping_add(1);
     }
     ((slope & 0x0008_0000) << 1) | (slope & 0x001f_ffff)
+}
+
+/// Sign-extends the normalized twenty-one-bit color DDA slope.
+const fn signed_color_slope(value: u32) -> i64 {
+    let value = (value & 0x001f_ffff) as i64;
+    if value & 0x0010_0000 == 0 {
+        value
+    } else {
+        value - 0x0020_0000
+    }
 }
 
 /// Registers that exist once per board rather than once per context.
@@ -556,10 +587,15 @@ impl Rex1 {
         let end_y = self.next.yendf >> END_FRACTION_BITS;
 
         // The auxiliary color flag takes the source from the host data
-        // register instead of the color registers, which is how the X server
-        // moves four packed pixels per access.
+        // register instead of the color registers. Color-index commands move
+        // four packed pixels per access, while RGB commands move one 24-bit
+        // pixel per access.
         if host_pixels {
-            self.write_packed_pixels(vram, group, start_x, start_y, end_x);
+            if command & CMD_RGBMODE != 0 {
+                self.write_host_rgb_pixel(vram, group, start_x, start_y);
+            } else {
+                self.write_packed_pixels(vram, group, start_x, start_y, end_x);
+            }
             return;
         }
 
@@ -592,7 +628,13 @@ impl Rex1 {
             return;
         }
 
-        self.write_pixel(vram, group, start_x, start_y, self.source_color());
+        self.write_pixel(
+            vram,
+            group,
+            start_x,
+            start_y,
+            self.source_color(0, start_x, start_y),
+        );
     }
 
     /// Draws a rectangle through the selected source and raster operation.
@@ -612,7 +654,6 @@ impl Rex1 {
         let logic_source = self.next.shared_command_flags & CMD_LOGICSRC != 0;
         let x_offset = signed_coordinate(self.next.xymove >> 16);
         let y_offset = signed_coordinate(self.next.xymove);
-        let color = self.source_color();
         let x_ascending = start_x <= end_x;
         let y_ascending = start_y <= end_y;
         let mut budget = MAX_COMMAND_PIXELS;
@@ -620,6 +661,7 @@ impl Rex1 {
 
         loop {
             let mut x = start_x;
+            let mut shade_step = 0;
             loop {
                 if budget == 0 {
                     return;
@@ -629,11 +671,13 @@ impl Rex1 {
                     let source_x = i64::from(x) + i64::from(x_offset);
                     let source_y = i64::from(y) + i64::from(y_offset);
                     match (u32::try_from(source_x), u32::try_from(source_y)) {
-                        (Ok(source_x), Ok(source_y)) => vram.read(group, source_x, source_y),
+                        (Ok(source_x), Ok(source_y)) => {
+                            self.read_pixel(vram, group, source_x, source_y)
+                        }
                         _ => 0,
                     }
                 } else {
-                    color
+                    self.source_color(shade_step, x, y)
                 };
                 self.write_pixel(vram, group, x, y, source);
 
@@ -645,6 +689,7 @@ impl Rex1 {
                 } else {
                     x -= 1;
                 }
+                shade_step += 1;
             }
 
             if y == end_y {
@@ -680,7 +725,6 @@ impl Rex1 {
         let length = if command & CMD_LENGTH32 == 0 { 16 } else { 32 };
         let opaque = self.next.shared_command_flags & CMD_ZOPAQUE != 0;
         let stop_on_x = command & CMD_STOPONX != 0;
-        let foreground = self.source_color();
         let background = self.next.colorback as u8;
 
         let mut x = start_x;
@@ -689,7 +733,7 @@ impl Rex1 {
                 break;
             }
             if pattern & (0x8000_0000 >> bit) != 0 {
-                self.write_pixel(vram, group, x, y, foreground);
+                self.write_pixel(vram, group, x, y, self.source_color(bit, x, y));
             } else if opaque {
                 self.write_pixel(vram, group, x, y, background);
             }
@@ -733,7 +777,6 @@ impl Rex1 {
         let pattern = self.next.lspattern;
         let length = ((self.next.lsmode >> 16) & 0x0f) + 17;
         let opaque = self.next.shared_command_flags & CMD_LSOPAQUE != 0;
-        let foreground = self.source_color();
         let background = self.next.colorback as u8;
         let x_ascending = start_x <= end_x;
         let mut x = start_x;
@@ -741,7 +784,7 @@ impl Rex1 {
         for pixel in 0..MAX_COMMAND_PIXELS {
             let bit = 31 - (pixel % length);
             if pattern & (1 << bit) != 0 {
-                self.write_pixel(vram, group, x, y, foreground);
+                self.write_pixel(vram, group, x, y, self.source_color(pixel, x, y));
             } else if opaque {
                 self.write_pixel(vram, group, x, y, background);
             }
@@ -835,6 +878,37 @@ impl Rex1 {
         self.next.ystart = y << COORDINATE_FRACTION_BITS;
     }
 
+    /// Writes one host-supplied RGB pixel and advances the rectangle address.
+    ///
+    /// In RGB mode, RWAUX1 carries one `0x00RRGGBB` pixel instead of four
+    /// color indices. A continued block advances each GO access toward XEND;
+    /// reaching the inclusive row end restores XSTART and advances Y toward
+    /// YEND. Other commands retain the one-pixel X increment.
+    fn write_host_rgb_pixel(&mut self, vram: &mut Vram, group: PlaneGroup, x: u32, y: u32) {
+        let rgb = self.next.rwaux1;
+        let red = (rgb >> 16) as u8;
+        let green = (rgb >> 8) as u8;
+        let blue = rgb as u8;
+        self.write_pixel(vram, group, x, y, self.rgb_pixel(red, green, blue, x, y));
+
+        let origin_x = self.next.xstart >> COORDINATE_FRACTION_BITS;
+        let end_x = self.next.xendf >> END_FRACTION_BITS;
+        let end_y = self.next.yendf >> END_FRACTION_BITS;
+        let rectangle =
+            self.next.command & (CMD_BLOCK | CMD_XYCONTINUE) == (CMD_BLOCK | CMD_XYCONTINUE);
+        if rectangle && x == end_x {
+            self.next.xsave = origin_x;
+            if y != end_y {
+                let next_y = if y < end_y { y + 1 } else { y - 1 };
+                self.next.ystart = next_y << COORDINATE_FRACTION_BITS;
+            }
+        } else if rectangle && origin_x > end_x {
+            self.next.xsave = x.wrapping_sub(1) & FRAMEBUFFER_COORDINATE_MASK;
+        } else {
+            self.next.xsave = x.wrapping_add(1) & FRAMEBUFFER_COORDINATE_MASK;
+        }
+    }
+
     /// Reads four packed pixels into the host data latch.
     ///
     /// The guest issues this command and then takes the value from the GO
@@ -861,7 +935,8 @@ impl Rex1 {
         let mut latch = self.next.rwaux1;
         for lane in 0..PACKED_PIXELS {
             let shift = 8 * (PACKED_PIXELS - 1 - lane);
-            latch = (latch & !(0xff << shift)) | u32::from(vram.read(group, x, y)) << shift;
+            latch =
+                (latch & !(0xff << shift)) | u32::from(self.read_pixel(vram, group, x, y)) << shift;
             if rectangle && x == end_x {
                 x = origin_x;
                 if y != end_y {
@@ -881,12 +956,66 @@ impl Rex1 {
         self.next.ystart = y << COORDINATE_FRACTION_BITS;
     }
 
-    /// Returns the color a drawing command writes.
+    /// Returns the color a drawing command writes at one DDA step.
     ///
-    /// Color index drawing uses the red integer view, which is the register
-    /// the PROM loads before every filled area and glyph.
-    const fn source_color(&self) -> u8 {
-        (self.next.color[0] >> COLOR_FRACTION_BITS) as u8
+    /// Color-index drawing uses the red iterator directly. RGB drawing packs
+    /// its three eight-bit iterators into the board's red 3, blue 2, green 3
+    /// palette index. SHADE advances each iterator by its programmed slope;
+    /// the twentieth color bit clamps underflow and overflow at the endpoints.
+    fn source_color(&self, shade_step: u32, x: u32, y: u32) -> u8 {
+        let red = self.color_component(0, shade_step);
+        if self.next.command & CMD_RGBMODE == 0 {
+            return red;
+        }
+
+        let green = self.color_component(1, shade_step);
+        let blue = self.color_component(2, shade_step);
+        self.rgb_pixel(red, green, blue, x, y)
+    }
+
+    /// Converts full RGB components to the board's R3/B2/G3 pixel format.
+    ///
+    /// The scaled dither uses the low two bits of window-relative coordinates.
+    /// Other command combinations retain direct component truncation.
+    fn rgb_pixel(&self, red: u8, green: u8, blue: u8, x: u32, y: u32) -> u8 {
+        if self.next.command & CMD_DITHER == 0 || self.next.aux1 & AUX1_DITHERRANGE == 0 {
+            return pack_rgb(red, green, blue);
+        }
+
+        let threshold = DITHER_MATRIX[(y & 3) as usize][(x & 3) as usize];
+        let red = dither_rgb_component(red, 3, threshold);
+        let green = dither_rgb_component(green, 3, threshold);
+        let blue = dither_rgb_component(blue, 2, threshold);
+        (red << 5) | (blue << 3) | green
+    }
+
+    /// Returns one clamped eight-bit color-iterator component.
+    fn color_component(&self, component: usize, shade_step: u32) -> u8 {
+        let mut color = i64::from(self.next.color[component]);
+        if self.next.command & CMD_SHADE != 0 {
+            color += signed_color_slope(self.next.color_slope[component]) * i64::from(shade_step);
+        }
+        (color.clamp(0, MAX_COLOR) >> COLOR_FRACTION_BITS) as u8
+    }
+
+    /// Reads one logical drawing coordinate through the window origin.
+    fn read_pixel(&self, vram: &Vram, group: PlaneGroup, x: u32, y: u32) -> u8 {
+        let Some((x, y)) = self.framebuffer_coordinate(x, y) else {
+            return 0;
+        };
+        vram.read(group, x, y)
+    }
+
+    /// Maps logical drawing coordinates into stored frame-buffer coordinates.
+    fn framebuffer_coordinate(&self, x: u32, y: u32) -> Option<(u32, u32)> {
+        let window_x = self.config.xywin >> 16;
+        let window_y = self.config.xywin;
+        let x = (x + window_x) & FRAMEBUFFER_COORDINATE_MASK;
+        let y = (y + window_y) & FRAMEBUFFER_COORDINATE_MASK;
+        Some((
+            x.checked_sub(FRAMEBUFFER_COORDINATE_BIAS)?,
+            y.checked_sub(FRAMEBUFFER_COORDINATE_BIAS)?,
+        ))
     }
 
     /// Applies the logic operation and write mask for one pixel.
@@ -895,6 +1024,12 @@ impl Rex1 {
     /// selected by the write mask replace stored data. Color comparison, when
     /// enabled, can reject the pixel before it is written.
     fn write_pixel(&self, vram: &mut Vram, group: PlaneGroup, x: u32, y: u32, source: u8) {
+        let Some((x, y)) = self.framebuffer_coordinate(x, y) else {
+            return;
+        };
+        if !self.screen_masks_admit(x, y) {
+            return;
+        }
         let destination = vram.read(group, x, y);
         if !self.color_comparison_passes(source, destination) {
             return;
@@ -902,6 +1037,44 @@ impl Rex1 {
         let operation = self.next.source_rop;
         let result = logic_operation(operation, source, destination);
         vram.write_masked(group, x, y, result, self.write_mask());
+    }
+
+    /// Reports whether every enabled screen-mask relation admits a write.
+    ///
+    /// Screen-mask coordinates are absolute frame-buffer coordinates. AUX2
+    /// selects each rectangle and independently chooses whether its inclusive
+    /// interior or exterior admits drawing. A pixel is accepted only when it
+    /// satisfies every selected relation.
+    fn screen_masks_admit(&self, x: u32, y: u32) -> bool {
+        let aux2 = self.next.aux2;
+        let enabled = aux2 & AUX2_SCREEN_MASK_ENABLES;
+        if enabled == 0 {
+            return true;
+        }
+
+        let masks = [
+            (self.next.smask1x, self.next.smask1y),
+            (self.config.smask2x, self.config.smask2y),
+            (self.config.smask3x, self.config.smask3y),
+            (self.config.smask4x, self.config.smask4y),
+        ];
+        masks
+            .iter()
+            .enumerate()
+            .all(|(index, &(x_bounds, y_bounds))| {
+                let enable = 1 << index;
+                if enabled & enable == 0 {
+                    return true;
+                }
+
+                let left = x_bounds & 0x03ff;
+                let right = (x_bounds >> 16) & 0x03ff;
+                let top = y_bounds & 0x03ff;
+                let bottom = (y_bounds >> 16) & 0x03ff;
+                let inside = (left..=right).contains(&x) && (top..=bottom).contains(&y);
+                let admits_inside = aux2 & (enable << AUX2_SCREEN_MASK_INSIDE_SHIFT) != 0;
+                inside == admits_inside
+            })
     }
 
     /// Returns the eight-bit write mask applied to pixel writes.
@@ -923,6 +1096,17 @@ impl Rex1 {
             || (aux1 & AUX1_COLORCOMPEQ != 0 && source == destination)
             || (aux1 & AUX1_COLORCOMPGT != 0 && source > destination)
     }
+}
+
+/// Packs full RGB components into the board's R3/B2/G3 color index.
+const fn pack_rgb(red: u8, green: u8, blue: u8) -> u8 {
+    (red & 0xe0) | ((blue >> 3) & 0x18) | (green >> 5)
+}
+
+/// Scales and dithers one eight-bit RGB component to two or three bits.
+const fn dither_rgb_component(value: u8, stored_bits: u32, threshold: u8) -> u8 {
+    let scaled = (value >> (4 - stored_bits)) - (value >> 4);
+    (scaled >> 4) + ((scaled & 0x0f) > threshold) as u8
 }
 
 /// Applies one of the sixteen bitwise raster operations.
@@ -961,14 +1145,35 @@ const fn signed_coordinate(value: u32) -> i32 {
 mod tests {
     use super::super::vram::{PlaneGroup, Vram};
     use super::{
-        AUX2, COLORREDI, COMMAND, ConfigAccess, LSMODE, LSPATTERN, PeripheralPort, RWAUX1, RWMASK,
-        Rex1, XENDI, XSAVE, XSTART, XSTARTI, XSTATE, XYMOVE, YENDI, YSTARTI, ZPATTERN, color_slope,
-        minor_slope,
+        AUX1, AUX2, COLORBLUEI, COLORGREENF, COLORGREENI, COLORREDF, COLORREDI, COMMAND,
+        COORDINATE_FRACTION_BITS, ConfigAccess, LSMODE, LSPATTERN, PeripheralPort, RWAUX1, RWMASK,
+        Rex1, SLOPEBLUE, SLOPEGREEN, SLOPERED, SMASK1X, SMASK1Y, SMASK2X, SMASK2Y, XENDI, XSAVE,
+        XSTART, XSTARTI, XSTATE, XYMOVE, XYWIN, YENDI, YSTARTI, ZPATTERN, color_slope, minor_slope,
+        signed_color_slope,
     };
 
     /// Selects the pixel plane group through the configuration window.
     fn select_pixel_planes(rex: &mut Rex1) {
         rex.write_config(AUX2, 0x2000_0000);
+        rex.write_config(XYWIN, 0x0800_0800);
+    }
+
+    /// Draws a solid color-index rectangle with source-copy logic.
+    fn draw_solid_rectangle(
+        rex: &mut Rex1,
+        vram: &mut Vram,
+        left: u32,
+        top: u32,
+        right: u32,
+        bottom: u32,
+    ) {
+        rex.write_drawing(COMMAND, 0x329);
+        rex.write_drawing(XSTATE, 0x03ff_0000);
+        rex.write_drawing(COLORREDI, 0x5a);
+        rex.write_drawing(XSTARTI, left);
+        rex.write_drawing(YSTARTI, top);
+        rex.write_drawing(XENDI, right);
+        rex.write_drawing_go(YENDI, bottom, vram);
     }
 
     #[test]
@@ -1067,6 +1272,77 @@ mod tests {
     }
 
     #[test]
+    fn an_inside_screen_mask_admits_pixels_within_its_rectangle() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        rex.write_config(XYWIN, 0x0800_0800);
+        rex.write_config(AUX2, 0x2000_0011);
+        rex.write_drawing(SMASK1X, (4 << 16) | 2);
+        rex.write_drawing(SMASK1Y, (5 << 16) | 3);
+
+        draw_solid_rectangle(&mut rex, &mut vram, 0, 0, 6, 6);
+
+        for y in 0..=6 {
+            for x in 0..=6 {
+                let expected = if (2..=4).contains(&x) && (3..=5).contains(&y) {
+                    0x5a
+                } else {
+                    0
+                };
+                assert_eq!(vram.read(PlaneGroup::Pixel, x, y), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn an_outside_screen_mask_admits_pixels_beyond_its_rectangle() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        rex.write_config(XYWIN, 0x0800_0800);
+        rex.write_config(AUX2, 0x2000_0001);
+        rex.write_drawing(SMASK1X, (4 << 16) | 2);
+        rex.write_drawing(SMASK1Y, (5 << 16) | 3);
+
+        draw_solid_rectangle(&mut rex, &mut vram, 0, 0, 6, 6);
+
+        for y in 0..=6 {
+            for x in 0..=6 {
+                let expected = if (2..=4).contains(&x) && (3..=5).contains(&y) {
+                    0
+                } else {
+                    0x5a
+                };
+                assert_eq!(vram.read(PlaneGroup::Pixel, x, y), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn enabled_screen_mask_relations_are_combined() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        rex.write_config(XYWIN, 0x0800_0800);
+        rex.write_config(AUX2, 0x2000_0013);
+        rex.write_drawing(SMASK1X, (5 << 16) | 1);
+        rex.write_drawing(SMASK1Y, (5 << 16) | 1);
+        rex.write_config(SMASK2X, (4 << 16) | 3);
+        rex.write_config(SMASK2Y, (5 << 16) | 1);
+
+        draw_solid_rectangle(&mut rex, &mut vram, 0, 0, 6, 6);
+
+        for y in 0..=6 {
+            for x in 0..=6 {
+                let expected = if (x == 1 || x == 2 || x == 5) && (1..=5).contains(&y) {
+                    0x5a
+                } else {
+                    0
+                };
+                assert_eq!(vram.read(PlaneGroup::Pixel, x, y), expected);
+            }
+        }
+    }
+
+    #[test]
     fn a_point_command_triggered_by_a_go_read_draws_one_pixel() {
         let mut rex = Rex1::new();
         let mut vram = Vram::new();
@@ -1081,6 +1357,103 @@ mod tests {
 
         assert_eq!(vram.read(PlaneGroup::Pixel, 4, 6), 0x33);
         assert_eq!(vram.read(PlaneGroup::Pixel, 5, 6), 0);
+    }
+
+    #[test]
+    fn the_window_origin_offsets_logical_drawing_coordinates() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_config(XYWIN, 0x0804_0806);
+        rex.write_drawing(COLORREDI, 0x5a);
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(XSTARTI, 0);
+        rex.write_drawing(YSTARTI, 0);
+
+        rex.write_drawing_go(COMMAND, 0x3000_0001, &mut vram);
+
+        assert_eq!(vram.read(PlaneGroup::Pixel, 4, 6), 0x5a);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 0, 0), 0);
+    }
+
+    #[test]
+    fn rgb_mode_packs_red_blue_green_into_the_eight_bit_pixel() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(COLORREDI, 0xe0);
+        rex.write_drawing(COLORGREENI, 0xa0);
+        rex.write_drawing(COLORBLUEI, 0x80);
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(XSTARTI, 4);
+        rex.write_drawing(YSTARTI, 6);
+
+        rex.write_drawing_go(COMMAND, 0x3000_4001, &mut vram);
+
+        assert_eq!(vram.read(PlaneGroup::Pixel, 4, 6), 0xf5);
+    }
+
+    #[test]
+    fn a_shaded_rgb_span_advances_all_three_color_iterators() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(COLORREDI, 0);
+        rex.write_drawing(COLORGREENI, 0);
+        rex.write_drawing(COLORBLUEI, 0);
+        rex.write_drawing(SLOPERED, (4096.0_f32 + 32.0).to_bits());
+        rex.write_drawing(SLOPEGREEN, (4096.0_f32 + 32.0).to_bits());
+        rex.write_drawing(SLOPEBLUE, (4096.0_f32 + 64.0).to_bits());
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(XSTARTI, 4);
+        rex.write_drawing(YSTARTI, 6);
+
+        rex.write_drawing(COMMAND, 0x3206_4121);
+        rex.write_drawing_go(XENDI, 6, &mut vram);
+
+        assert_eq!(
+            (4..=6)
+                .map(|x| vram.read(PlaneGroup::Pixel, x, 6))
+                .collect::<Vec<_>>(),
+            vec![0x00, 0x29, 0x52]
+        );
+    }
+
+    #[test]
+    fn a_shaded_color_index_span_uses_the_red_iterator() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(COLORREDI, 10);
+        rex.write_drawing(SLOPERED, (4096.0_f32 + 1.0).to_bits());
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(XSTARTI, 4);
+        rex.write_drawing(YSTARTI, 6);
+
+        rex.write_drawing(COMMAND, 0x3002_0121);
+        rex.write_drawing_go(XENDI, 6, &mut vram);
+
+        assert_eq!(
+            (4..=6)
+                .map(|x| vram.read(PlaneGroup::Pixel, x, 6))
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn shaded_color_iterators_clamp_at_both_endpoints() {
+        let mut rex = Rex1::new();
+        rex.write_drawing(COLORREDF, (1 << 11) | (1 << 10));
+        rex.write_drawing(COLORGREENF, (254 << 11) | (1 << 10));
+        rex.write_drawing(SLOPERED, (-4096.0_f32 - 2.0).to_bits());
+        rex.write_drawing(SLOPEGREEN, (4096.0_f32 + 2.0).to_bits());
+        rex.write_drawing(COMMAND, 0x0002_0000);
+
+        assert_eq!(rex.color_component(0, 0), 1);
+        assert_eq!(rex.color_component(0, 1), 0);
+        assert_eq!(rex.color_component(1, 0), 254);
+        assert_eq!(rex.color_component(1, 1), 255);
     }
 
     #[test]
@@ -1499,6 +1872,56 @@ mod tests {
     }
 
     #[test]
+    fn rgb_host_pixel_writes_traverse_a_descending_rectangle() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(XSTARTI, 8);
+        rex.write_drawing(YSTARTI, 4);
+        rex.write_drawing(XENDI, 9);
+        rex.write_drawing(YENDI, 3);
+        rex.write_drawing(COMMAND, 0x3024_c089);
+
+        rex.write_drawing_go(RWAUX1, 0x00ff_0000, &mut vram);
+        rex.write_drawing_go(RWAUX1, 0x0000_ff00, &mut vram);
+        rex.write_drawing_go(RWAUX1, 0x0000_00ff, &mut vram);
+        rex.write_drawing_go(RWAUX1, 0x00ff_ffff, &mut vram);
+
+        assert_eq!(vram.read(PlaneGroup::Pixel, 8, 4), 0xe0);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 9, 4), 0x07);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 8, 3), 0x18);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 9, 3), 0xff);
+        assert_eq!(rex.next.xsave, 8);
+        assert_eq!(rex.next.ystart >> COORDINATE_FRACTION_BITS, 3);
+    }
+
+    #[test]
+    fn rgb_host_pixels_use_window_relative_scaled_bayer_dither() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(AUX1, 0x200);
+        rex.write_drawing(RWMASK, 0xff);
+        rex.write_drawing(XSTARTI, 0);
+        rex.write_drawing(YSTARTI, 0);
+        rex.write_drawing(XENDI, 3);
+        rex.write_drawing(YENDI, 0);
+        rex.write_drawing(COMMAND, 0x3024_c089);
+
+        for _ in 0..4 {
+            rex.write_drawing_go(RWAUX1, 0x0080_8080, &mut vram);
+        }
+
+        assert_eq!(
+            (0..=3)
+                .map(|x| vram.read(PlaneGroup::Pixel, x, 0))
+                .collect::<Vec<_>>(),
+            vec![0x94, 0x6b, 0x94, 0x6b]
+        );
+    }
+
+    #[test]
     fn one_packed_tile_word_repeats_across_each_programmed_scan_line() {
         let mut rex = Rex1::new();
         let mut vram = Vram::new();
@@ -1626,6 +2049,7 @@ mod tests {
     fn drawing_reaches_the_plane_group_selected_by_aux2() {
         let mut rex = Rex1::new();
         let mut vram = Vram::new();
+        rex.write_config(XYWIN, 0x0800_0800);
         rex.write_drawing(COLORREDI, 0x03);
         rex.write_drawing(RWMASK, 0xff);
         rex.write_drawing(XSTARTI, 1);
@@ -1718,6 +2142,11 @@ mod tests {
         assert_eq!(color_slope(0x0010_0000), 0x0010_0000);
         assert_eq!(color_slope(0x0008_0000), 0x0018_0000);
         assert_eq!(color_slope(0x000f_ffff), 0x001f_ffff);
+
+        let positive = color_slope((4096.0_f32 + 1.0).to_bits());
+        let negative = color_slope((-4096.0_f32 - 1.0).to_bits());
+        assert_eq!(signed_color_slope(positive), 1 << 11);
+        assert_eq!(signed_color_slope(negative), -(1 << 11));
     }
 
     #[test]
