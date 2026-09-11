@@ -48,8 +48,10 @@ pub(super) fn compose(vram: &Vram, vc1: &Vc1, dac: &Bt479, pixels: &mut [u8]) {
         for x in 0..DISPLAY_WIDTH {
             let overlay = overlay[x as usize];
             let index = if overlay == 0 {
-                color_index_base(vc1.display_mode(identifiers[x as usize]))
-                    | u16::from(source[x as usize])
+                color_index(
+                    vc1.display_mode(identifiers[x as usize]),
+                    source[x as usize],
+                )
             } else {
                 OVERLAY_PALETTE_BASE | u16::from(overlay)
             };
@@ -85,14 +87,24 @@ pub(super) fn compose_blank(pixels: &mut [u8]) {
     }
 }
 
-/// Returns the palette map bits contributed by one display mode.
+/// Returns the palette index selected by one display mode and VRAM byte.
 ///
-/// The XMAP mode stores the four-bit map number in bits five through two.
-/// Its lower two bits become the high bits of the Bt479's ten-bit palette
-/// address. The common `0x0300` prefix does not select the RGB map; Xsgi adds
-/// it to both color-index and RGB display modes.
-const fn color_index_base(mode: u16) -> u16 {
-    ((mode >> 2) & 0x03) << 8
+/// Mode bit zero selects two packed four-bit buffers instead of one eight-bit
+/// pixel. Bit one displays the high nibble when set and the low nibble when
+/// clear. In four-bit mode, bits 7:4 select a sixteen-entry submap and bits
+/// 3:2 select its Bt479 palette bank. In eight-bit mode, bits 3:2 select the
+/// palette bank and the complete VRAM byte supplies the entry address.
+const fn color_index(mode: u16, pixel: u8) -> u16 {
+    if mode & 1 == 0 {
+        (((mode >> 2) & 0x03) << 8) | pixel as u16
+    } else {
+        let pixel = if mode & 2 == 0 {
+            pixel & 0x0f
+        } else {
+            pixel >> 4
+        };
+        ((mode & 0x000c) << 6) | (mode & 0x00f0) | pixel as u16
+    }
 }
 
 /// Draws the hardware cursor over the composed image.
@@ -282,6 +294,32 @@ mod tests {
         compose(&vram, &vc1, &dac, &mut pixels);
 
         assert_eq!(pixel_at(&pixels, 0, 0), [1, 1, 1, 0xff]);
+    }
+
+    #[test]
+    fn four_bit_modes_select_packed_buffers_and_palette_submaps() {
+        let mut vram = Vram::new();
+        let mut vc1 = Vc1::new();
+        let mut dac = Bt479::new();
+        select_bank(&mut dac, 1);
+        write_palette(&mut dac, 0x25, [1, 2, 3]);
+        write_palette(&mut dac, 0x2a, [4, 5, 6]);
+        vram.write_masked(PlaneGroup::Pixel, 0, 0, 0xa5, 0xff);
+        let mut pixels = vec![0; FRAME_BYTES];
+
+        vc1.write(Vc1Selector::AddressHigh, 0);
+        vc1.write(Vc1Selector::AddressLow, 0);
+        vc1.write(Vc1Selector::XmapMode, 0x03);
+        vc1.write(Vc1Selector::XmapMode, 0x25);
+        compose(&vram, &vc1, &dac, &mut pixels);
+        assert_eq!(pixel_at(&pixels, 0, 0), [1, 2, 3, 0xff]);
+
+        vc1.write(Vc1Selector::AddressHigh, 0);
+        vc1.write(Vc1Selector::AddressLow, 0);
+        vc1.write(Vc1Selector::XmapMode, 0x03);
+        vc1.write(Vc1Selector::XmapMode, 0x27);
+        compose(&vram, &vc1, &dac, &mut pixels);
+        assert_eq!(pixel_at(&pixels, 0, 0), [4, 5, 6, 0xff]);
     }
 
     #[test]
