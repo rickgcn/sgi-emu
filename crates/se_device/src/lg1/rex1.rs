@@ -467,20 +467,31 @@ impl Rex1 {
 
     /// Reads a GO window register and runs the resulting command.
     ///
-    /// The command runs before the access returns, so a pixel read-back
-    /// presents the pixels that command latched. Whether the hardware instead
-    /// returns the previous contents and latches for the following access is
-    /// not established by the sequences examined so far; this is the smaller
-    /// model, and a guest that depends on the delay would expose it.
+    /// The command runs before the access returns, so the access presents the
+    /// state the command produced. The host-data register is the exception and
+    /// presents its previous contents instead, see
+    /// [`Self::read_host_data_go`].
     pub(super) fn read_drawing_go(&mut self, offset: u64, vram: &mut Vram) -> u32 {
+        if offset == RWAUX1 {
+            return self.read_host_data_go(vram);
+        }
         self.execute(vram);
         self.current.read(offset)
     }
 
     /// Runs one complete host-data word read.
+    ///
+    /// The access presents the value the register held before the pending
+    /// command runs, and the pixels that command latches are presented to the
+    /// following access. This is the same access ordering as the three
+    /// configuration data ports. Xsgi depends on it: the caret save-under
+    /// reads one word beyond the rectangle and discards the first, so
+    /// presenting the freshly latched word would shift every saved word by one
+    /// and restore the image four pixels to the right.
     pub(super) fn read_host_data_go(&mut self, vram: &mut Vram) -> u32 {
+        let previous = self.current.rwaux1;
         self.execute(vram);
-        self.current.rwaux1
+        previous
     }
 
     /// Reads the pad word between the drawing pages.
@@ -2363,7 +2374,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_pixel_reads_latch_four_pixels_for_the_host() {
+    fn packed_pixel_reads_present_the_previous_word_first() {
         let mut rex = Rex1::new();
         let mut vram = Vram::new();
         select_pixel_planes(&mut rex);
@@ -2373,6 +2384,8 @@ mod tests {
         rex.write_drawing(COMMAND, 0x0020_01a1);
         rex.write_drawing(XSTATE, 0x13ff_0000);
         rex.write_drawing_go(RWAUX1, 0x0102_0304, &mut vram);
+        rex.write_drawing(XSTARTI, 20);
+        rex.write_drawing_go(RWAUX1, 0x0506_0708, &mut vram);
 
         // The read-back command sets XYCONTINUE, so it resumes from the saved
         // column rather than the start coordinate. Rewinding that column is
@@ -2380,7 +2393,12 @@ mod tests {
         rex.write_drawing(XSAVE, 8);
         rex.write_drawing(COMMAND, 0x0020_00ab);
 
+        // The first access still presents the word the last host-data write
+        // left in the register. The pixels it latches follow on the next
+        // access, and the access after that presents the moved-on read.
+        assert_eq!(rex.read_drawing_go(RWAUX1, &mut vram), 0x0506_0708);
         assert_eq!(rex.read_drawing_go(RWAUX1, &mut vram), 0x0102_0304);
+        assert_eq!(rex.read_drawing_go(RWAUX1, &mut vram), 0x0000_0000);
     }
 
     #[test]
