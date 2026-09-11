@@ -28,6 +28,9 @@ const VID_LC: u16 = 0x02;
 /// Control bank address of the frame counter.
 const VID_FC: u16 = 0x10;
 
+/// Control bank address of the display-identifier frame-table pointer.
+const DID_EP: u16 = 0x40;
+
 /// Test bank address of the chip revision register.
 const CHIP_REVISION: u16 = 0x05;
 
@@ -43,6 +46,9 @@ const SYS_CTRL_VTG: u8 = 1 << 1;
 /// System control bit that enables the VC1 data path, active high.
 const SYS_CTRL_VC1: u8 = 1 << 2;
 
+/// System control bit that enables display-identifier generation.
+const SYS_CTRL_DID: u8 = 1 << 3;
+
 /// System control bit that displays the hardware cursor, active high.
 pub(super) const SYS_CTRL_CURSOR_DISPLAY: u8 = 1 << 5;
 
@@ -52,6 +58,8 @@ const CUR_EP: u16 = 0x20;
 const CUR_XL: u16 = 0x22;
 /// Control bank address of the cursor vertical position.
 const CUR_YL: u16 = 0x24;
+/// Control bank address of the cursor palette mode.
+const CUR_MODE: u16 = 0x26;
 /// Control bank address of the cursor line length.
 const CUR_LY: u16 = 0x28;
 /// Control bank address of the display-ID horizontal modulus.
@@ -65,8 +73,9 @@ const CURSOR_Y_OFFSET: i32 = 39;
 
 /// Bytes of bitmap data describing one cursor.
 ///
-/// The cursor covers thirty-two rows of thirty-two two-bit pixels, which is
-/// the length the target PROM uploads into timing SRAM.
+/// The cursor covers thirty-two rows of thirty-two pixels. Two consecutive
+/// one-bit planes select foreground and background, so each plane occupies
+/// one hundred twenty-eight bytes.
 pub(super) const CURSOR_BITMAP_BYTES: usize = 256;
 
 /// System control value presented before software programs the generator.
@@ -159,7 +168,10 @@ pub(super) struct Cursor {
     pub(super) left: i32,
     /// Signed screen row of the topmost cursor pixel.
     pub(super) top: i32,
-    /// Two-bit cursor pixels, packed most significant pixel first.
+    /// Base of the sixteen-entry palette submap selected by CUR_MODE.
+    pub(super) palette_base: u16,
+    /// Foreground and background bit planes, each packed most significant
+    /// pixel first and stored as one thirty-two-bit word per row.
     pub(super) bitmap: [u8; CURSOR_BITMAP_BYTES],
 }
 
@@ -230,6 +242,55 @@ impl Vc1 {
         }
     }
 
+    /// Returns the sixteen-bit XMAP mode selected by one display identifier.
+    pub(super) fn display_mode(&self, identifier: u8) -> u16 {
+        let index = usize::from(identifier & 0x1f) * 2;
+        u16::from_be_bytes([self.xmap[index], self.xmap[index + 1]])
+    }
+
+    /// Fills one displayed scan line with the generated display identifiers.
+    ///
+    /// Each frame-table word points to a line table. The first line-table
+    /// word gives the number of following entries, whose upper eleven bits
+    /// are a starting X coordinate and whose lower five bits select an XMAP
+    /// mode. Entries are ordered from left to right.
+    pub(super) fn fill_display_identifiers(&self, y: u32, identifiers: &mut [u8]) {
+        assert_eq!(
+            identifiers.len(),
+            DISPLAY_WIDTH as usize,
+            "display identifier row must match the displayed width"
+        );
+        identifiers.fill(0);
+        if self.system_control & SYS_CTRL_DID == 0 || y >= DISPLAY_HEIGHT {
+            return;
+        }
+
+        let frame_table = usize::from(self.control_word(DID_EP) & ENTRY_POINTER_ADDRESS);
+        let frame_entry = frame_table + y as usize * 2;
+        let Some(line_table) = self.sram_word(frame_entry).map(usize::from) else {
+            return;
+        };
+        let Some(entry_count) = self.sram_word(line_table).map(usize::from) else {
+            return;
+        };
+
+        let mut start = 0;
+        let mut identifier = 0;
+        for entry in 0..entry_count.min(DISPLAY_WIDTH as usize) {
+            let Some(encoded) = self.sram_word(line_table + 2 + entry * 2) else {
+                break;
+            };
+            let boundary = usize::from(encoded >> 5).min(identifiers.len());
+            if boundary < start {
+                continue;
+            }
+            identifiers[start..boundary].fill(identifier);
+            start = boundary;
+            identifier = (encoded & 0x1f) as u8;
+        }
+        identifiers[start..].fill(identifier);
+    }
+
     /// Returns the hardware cursor when the guest has enabled its display.
     ///
     /// The cursor position registers are offset from the visible origin by
@@ -250,6 +311,7 @@ impl Vc1 {
         Some(Cursor {
             left: i32::from(self.control_word(CUR_XL)) - CURSOR_X_OFFSET,
             top: i32::from(self.control_word(CUR_YL)) - CURSOR_Y_OFFSET,
+            palette_base: (self.control_word(CUR_MODE) >> 6) & 0x03f0,
             bitmap,
         })
     }
@@ -261,6 +323,14 @@ impl Vc1 {
             self.control[index],
             self.control[(index + 1) % CONTROL_BYTES],
         ])
+    }
+
+    /// Returns one big-endian word from timing SRAM.
+    fn sram_word(&self, address: usize) -> Option<u16> {
+        Some(u16::from_be_bytes([
+            *self.sram.get(address)?,
+            *self.sram.get(address.checked_add(1)?)?,
+        ]))
     }
 
     /// Reports whether the current scan position lies in vertical blanking.
@@ -451,9 +521,9 @@ mod tests {
     use se_core::time::VirtualDuration;
 
     use super::{
-        CHIP_REVISION, CUR_LY, CUR_XL, CUR_YL, DID_HOR_MOD, DISPLAY_HEIGHT,
-        LINE_PERIOD_ATTOSECONDS, SYS_CTRL_VC1, SYS_CTRL_VTG, Selector, SignalState, VID_EP, Vc1,
-        decode_frame_total_lines,
+        CHIP_REVISION, CUR_LY, CUR_XL, CUR_YL, DID_EP, DID_HOR_MOD, DISPLAY_HEIGHT, DISPLAY_WIDTH,
+        LINE_PERIOD_ATTOSECONDS, SYS_CTRL_DID, SYS_CTRL_VC1, SYS_CTRL_VTG, Selector, SignalState,
+        VID_EP, Vc1, decode_frame_total_lines,
     };
 
     /// The video frame table uploaded by the target PROM.
@@ -794,6 +864,40 @@ mod tests {
                 (index % 4) * 4
             );
         }
+    }
+
+    #[test]
+    fn did_line_entries_select_modes_from_their_starting_columns() {
+        let mut vc1 = Vc1::new();
+        write_control_word(&mut vc1, DID_EP, 0x4000);
+        upload(&mut vc1, 0x4000, &[0x48, 0x00]);
+        upload(
+            &mut vc1,
+            0x4800,
+            &[0x00, 0x03, 0x00, 0x01, 0x0c, 0x82, 0x57, 0x83],
+        );
+        vc1.write(Selector::SystemControl, SYS_CTRL_DID);
+        let mut identifiers = [0; DISPLAY_WIDTH as usize];
+
+        vc1.fill_display_identifiers(0, &mut identifiers);
+
+        assert!(identifiers[..100].iter().all(|identifier| *identifier == 1));
+        assert!(
+            identifiers[100..700]
+                .iter()
+                .all(|identifier| *identifier == 2)
+        );
+        assert!(identifiers[700..].iter().all(|identifier| *identifier == 3));
+    }
+
+    #[test]
+    fn a_disabled_did_generator_selects_mode_zero() {
+        let vc1 = Vc1::new();
+        let mut identifiers = [0xff; DISPLAY_WIDTH as usize];
+
+        vc1.fill_display_identifiers(0, &mut identifiers);
+
+        assert!(identifiers.iter().all(|identifier| *identifier == 0));
     }
 
     #[test]

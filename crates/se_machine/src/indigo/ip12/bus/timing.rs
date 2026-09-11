@@ -853,8 +853,13 @@ mod tests {
         gio.attach(GioSlot::Graphics, Box::new(Lg1::new())).unwrap();
         let mut bus = bus_with_gio(gio);
         configure_memory(&mut bus, 0x0100_023f, 0x023f_023f);
-        let pixels = (0..78).map(|value| value as u8).collect::<Vec<_>>();
-        for (index, bytes) in pixels.chunks(4).enumerate() {
+        let transfer = (0..39)
+            .map(|value| value as u8)
+            .chain([0xee])
+            .chain((39..78).map(|value| value as u8))
+            .chain([0xff])
+            .collect::<Vec<_>>();
+        for (index, bytes) in transfer.chunks(4).enumerate() {
             bus.write(PhysAddr::new(0x2000 + (index * 4) as u64), bytes)
                 .unwrap();
         }
@@ -878,7 +883,7 @@ mod tests {
             0x1000,
             [
                 0x2000,
-                GRAPHICS_DMA_LAST_DESCRIPTOR | pixels.len() as u32,
+                GRAPHICS_DMA_LAST_DESCRIPTOR | 78,
                 LG1_GRAPHICS_DMA_PORT,
                 0,
                 0,
@@ -902,7 +907,7 @@ mod tests {
             0x1100,
             [
                 0x3000,
-                GRAPHICS_DMA_LAST_DESCRIPTOR | GRAPHICS_DMA_GIO_TO_MEMORY | pixels.len() as u32,
+                GRAPHICS_DMA_LAST_DESCRIPTOR | GRAPHICS_DMA_GIO_TO_MEMORY | 78,
                 LG1_GRAPHICS_DMA_PORT,
                 0,
                 0,
@@ -914,7 +919,9 @@ mod tests {
             &mut MachineOutput::default(),
         );
 
-        assert_eq!(read_memory(&mut bus, 0x3000, pixels.len()), pixels);
+        let readback = read_memory(&mut bus, 0x3000, transfer.len());
+        assert_eq!(readback[..39], transfer[..39]);
+        assert_eq!(readback[40..79], transfer[40..79]);
         assert_eq!(read_word(&mut bus, PIC1_BASE + 8), Ok(0x88));
     }
 

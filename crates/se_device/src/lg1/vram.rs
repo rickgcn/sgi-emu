@@ -82,6 +82,12 @@ impl Vram {
         &self.pixel[start..start + WIDTH as usize]
     }
 
+    /// Returns the overlay plane row for one displayed scan line.
+    pub(super) fn overlay_row(&self, y: u32) -> &[u8] {
+        let start = row_start(y);
+        &self.overlay[start..start + WIDTH as usize]
+    }
+
     /// Reads one plane value, returning zero outside the stored area.
     pub(super) fn read(&self, group: PlaneGroup, x: u32, y: u32) -> u8 {
         let Some(index) = index(x, y) else {
@@ -210,8 +216,8 @@ mod tests {
         assert_eq!(vram.pixel_row(9).len(), WIDTH as usize);
         assert_eq!(vram.pixel_row(9)[7], 0x33);
         assert_eq!(vram.pixel_row(8)[7], 0);
-        // The overlay plane keeps its own value at the same coordinate.
-        assert_eq!(vram.read(PlaneGroup::Overlay, 7, 9), 0x02);
+        assert_eq!(vram.overlay_row(9)[7], 0x02);
+        assert_eq!(vram.overlay_row(8)[7], 0);
     }
 
     #[test]

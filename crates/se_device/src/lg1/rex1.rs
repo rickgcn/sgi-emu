@@ -544,6 +544,7 @@ impl Rex1 {
     fn draw(&mut self, vram: &mut Vram) {
         let command = self.next.command;
         let group = PlaneGroup::from_aux2(self.next.aux2);
+        let host_pixels = self.next.shared_command_flags & CMD_COLORAUX != 0;
         let start_x = if command & CMD_XYCONTINUE == 0 {
             self.next.xsave = self.next.xstart >> COORDINATE_FRACTION_BITS;
             self.next.xstart >> COORDINATE_FRACTION_BITS
@@ -557,7 +558,7 @@ impl Rex1 {
         // The auxiliary color flag takes the source from the host data
         // register instead of the color registers, which is how the X server
         // moves four packed pixels per access.
-        if self.next.shared_command_flags & CMD_COLORAUX != 0 {
+        if host_pixels {
             self.write_packed_pixels(vram, group, start_x, start_y, end_x);
             return;
         }
@@ -767,9 +768,10 @@ impl Rex1 {
     /// Writes packed host pixels into the frame buffer.
     ///
     /// One host word carries four pixels with the leftmost in the most
-    /// significant byte. A continued block command traverses the programmed
-    /// rectangle, returning to XSTART and advancing Y after XEND even when a
-    /// scan-line boundary falls inside one host word.
+    /// significant byte. A non-continued QUADMODE/STOPONX command repeats
+    /// those four pixels as a tile through XEND. A continued block command
+    /// instead consumes one host word at a time; reaching XEND discards any
+    /// unused byte lanes, restores XSTART, and advances Y for the next word.
     fn write_packed_pixels(
         &mut self,
         vram: &mut Vram,
@@ -779,6 +781,8 @@ impl Rex1 {
         end_x: u32,
     ) {
         let command = self.next.command;
+        let tiled_span = command & (CMD_BLOCK | CMD_QUADMODE | CMD_XYCONTINUE | CMD_STOPONX)
+            == (CMD_QUADMODE | CMD_STOPONX);
         let rectangle = command & (CMD_BLOCK | CMD_QUADMODE | CMD_XYCONTINUE)
             == (CMD_BLOCK | CMD_QUADMODE | CMD_XYCONTINUE);
         let stop_on_x = self.next.command & CMD_STOPONX != 0;
@@ -789,28 +793,45 @@ impl Rex1 {
         let y_ascending = start_y <= end_y;
         let mut x = start_x;
         let mut y = start_y;
+        let mut span_complete = false;
+
+        if tiled_span {
+            let mut x = origin_x;
+            for pixel in 0..MAX_COMMAND_PIXELS {
+                let lane = pixel % PACKED_PIXELS;
+                let shift = 8 * (PACKED_PIXELS - 1 - lane);
+                self.write_pixel(vram, group, x, y, ((packed >> shift) & 0xff) as u8);
+                if x == end_x {
+                    break;
+                }
+                x = if x_ascending { x + 1 } else { x - 1 };
+            }
+            self.next.xsave = origin_x;
+            return;
+        }
 
         for lane in 0..PACKED_PIXELS {
-            if !rectangle && stop_on_x && x > end_x {
+            let past_end = if x_ascending { x > end_x } else { x < end_x };
+            if !rectangle && stop_on_x && past_end {
+                span_complete = true;
                 break;
             }
             let shift = 8 * (PACKED_PIXELS - 1 - lane);
             self.write_pixel(vram, group, x, y, ((packed >> shift) & 0xff) as u8);
             if rectangle && x == end_x {
                 x = origin_x;
-                if y == end_y {
-                    break;
+                if y != end_y {
+                    y = if y_ascending { y + 1 } else { y - 1 };
                 }
-                y = if y_ascending { y + 1 } else { y - 1 };
+                break;
+            } else if !rectangle && stop_on_x && x == end_x {
+                span_complete = true;
+                break;
             } else {
-                x = if rectangle && !x_ascending {
-                    x - 1
-                } else {
-                    x + 1
-                };
+                x = if x_ascending { x + 1 } else { x - 1 };
             }
         }
-        self.next.xsave = x;
+        self.next.xsave = if span_complete { origin_x } else { x };
         self.next.ystart = y << COORDINATE_FRACTION_BITS;
     }
 
@@ -843,10 +864,10 @@ impl Rex1 {
             latch = (latch & !(0xff << shift)) | u32::from(vram.read(group, x, y)) << shift;
             if rectangle && x == end_x {
                 x = origin_x;
-                if y == end_y {
-                    break;
+                if y != end_y {
+                    y = if y_ascending { y + 1 } else { y - 1 };
                 }
-                y = if y_ascending { y + 1 } else { y - 1 };
+                break;
             } else {
                 x = if rectangle && !x_ascending {
                     x - 1
@@ -1466,7 +1487,7 @@ mod tests {
         // which takes the source from the host data register. XSTATE follows
         // the command so it supplies the shared logic operation, matching the
         // order the PROM uses when it clears the screen.
-        rex.write_drawing(COMMAND, 0x0020_0121);
+        rex.write_drawing(COMMAND, 0x0020_01a1);
         rex.write_drawing(XSTATE, 0x13ff_0000);
 
         rex.write_drawing_go(RWAUX1, 0x0102_0304, &mut vram);
@@ -1475,6 +1496,37 @@ mod tests {
         assert_eq!(vram.read(PlaneGroup::Pixel, 9, 3), 2);
         assert_eq!(vram.read(PlaneGroup::Pixel, 10, 3), 3);
         assert_eq!(vram.read(PlaneGroup::Pixel, 11, 3), 4);
+    }
+
+    #[test]
+    fn one_packed_tile_word_repeats_across_each_programmed_scan_line() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(XSTARTI, 8);
+        rex.write_drawing(YSTARTI, 3);
+        rex.write_drawing(XENDI, 13);
+        rex.write_drawing(COMMAND, 0x0020_0121);
+        rex.write_drawing(XSTATE, 0x13ff_0000);
+
+        rex.write_drawing_go(RWAUX1, 0x0102_0304, &mut vram);
+
+        assert_eq!(
+            (8..=13)
+                .map(|x| vram.read(PlaneGroup::Pixel, x, 3))
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 1, 2]
+        );
+
+        rex.write_drawing(YSTARTI, 4);
+        rex.write_drawing_go(RWAUX1, 0x090a_0b0c, &mut vram);
+
+        assert_eq!(
+            (8..=11)
+                .map(|x| vram.read(PlaneGroup::Pixel, x, 4))
+                .collect::<Vec<_>>(),
+            vec![9, 10, 11, 12]
+        );
     }
 
     #[test]
@@ -1504,7 +1556,7 @@ mod tests {
         rex.write_drawing(XSTARTI, 8);
         rex.write_drawing(YSTARTI, 3);
         rex.write_drawing(XENDI, 1023);
-        rex.write_drawing(COMMAND, 0x0020_0121);
+        rex.write_drawing(COMMAND, 0x0020_01a1);
         rex.write_drawing(XSTATE, 0x13ff_0000);
         rex.write_drawing_go(RWAUX1, 0x0102_0304, &mut vram);
 
@@ -1518,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn a_continuing_packed_read_advances_to_the_next_group_of_pixels() {
+    fn rewriting_xstart_redirects_a_packed_host_pixel_stream() {
         let mut rex = Rex1::new();
         let mut vram = Vram::new();
         select_pixel_planes(&mut rex);
@@ -1527,17 +1579,24 @@ mod tests {
         rex.write_drawing(XENDI, 1023);
         rex.write_drawing(COMMAND, 0x0020_0121);
         rex.write_drawing(XSTATE, 0x13ff_0000);
-        // The packed write command leaves XYCONTINUE clear, so each access
-        // restarts at the start coordinate and the guest advances it itself.
         rex.write_drawing_go(RWAUX1, 0x0102_0304, &mut vram);
-        rex.write_drawing(XSTARTI, 12);
+        // Writing XSTART also updates XSAVE, so the second access begins at
+        // the newly programmed column rather than continuing from twelve.
+        rex.write_drawing(XSTARTI, 20);
         rex.write_drawing_go(RWAUX1, 0x0506_0708, &mut vram);
 
-        rex.write_drawing(XSAVE, 8);
-        rex.write_drawing(COMMAND, 0x0020_00ab);
-
-        assert_eq!(rex.read_drawing_go(RWAUX1, &mut vram), 0x0102_0304);
-        assert_eq!(rex.read_drawing_go(RWAUX1, &mut vram), 0x0506_0708);
+        assert_eq!(
+            (8..=11)
+                .map(|x| vram.read(PlaneGroup::Pixel, x, 3))
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            (20..=23)
+                .map(|x| vram.read(PlaneGroup::Pixel, x, 3))
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7, 8]
+        );
     }
 
     #[test]

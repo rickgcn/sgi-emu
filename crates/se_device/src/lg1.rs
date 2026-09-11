@@ -261,8 +261,8 @@ impl GioDevice for Lg1 {
 
     /// Writes a DMA stream through the REX1 RWAUX1 GO port.
     ///
-    /// Each big-endian word runs one REX host-data command. Rectangle stop
-    /// conditions, rather than byte-lane suppression, bound the final pixels.
+    /// Each big-endian word runs one REX host-data command. At a rectangle
+    /// scan-line end, REX discards unused lanes before the next word begins.
     fn write_dma(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         if address.get() != GRAPHICS_DMA_PORT {
             return Err(BusError::UnimplementedAccess);
@@ -879,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn graphics_dma_host_data_crosses_rectangle_scanlines_inside_words() {
+    fn graphics_dma_discards_unused_lanes_at_rectangle_scanline_ends() {
         let mut board = Lg1::new();
         write(&mut board, XSTARTI, 0x10);
         write(&mut board, YSTARTI, 0);
@@ -888,14 +888,23 @@ mod tests {
         write(&mut board, AUX2, 0x2000_0000);
         write(&mut board, COMMAND, 0x3020_00a9);
         write(&mut board, XSTATE, 0x13ff_0000);
-        let mut pixels = (0..78).map(|value| value as u8).collect::<Vec<_>>();
-        pixels.extend([0xee, 0xff]);
+        let pixels = (0..39)
+            .map(|value| value as u8)
+            .chain([0xee])
+            .chain((39..78).map(|value| value as u8))
+            .chain([0xff])
+            .collect::<Vec<_>>();
 
         assert_eq!(
             board.write_dma(DeviceAddr::new(GRAPHICS_DMA_PORT), &pixels),
             Ok(())
         );
-        for (index, value) in pixels.iter().copied().take(78).enumerate() {
+        for (index, value) in pixels[..39]
+            .iter()
+            .chain(&pixels[40..79])
+            .copied()
+            .enumerate()
+        {
             let x = 0x10 + index as u32 % 39;
             let y = index as u32 / 39;
             assert_eq!(board.vram.read(PlaneGroup::Pixel, x, y), value);
@@ -910,7 +919,8 @@ mod tests {
             board.read_dma(DeviceAddr::new(GRAPHICS_DMA_PORT), &mut readback),
             Ok(())
         );
-        assert_eq!(readback[..78], pixels[..78]);
+        assert_eq!(readback[..39], pixels[..39]);
+        assert_eq!(readback[40..79], pixels[40..79]);
     }
 
     #[test]
