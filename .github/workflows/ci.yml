@@ -4,9 +4,15 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "crates/**"
+      - "3rdparty/**"
   pull_request:
     branches:
       - main
+    paths:
+      - "crates/**"
+      - "3rdparty/**"
 
 permissions:
   contents: read
