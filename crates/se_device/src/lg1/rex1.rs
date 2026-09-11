@@ -1037,22 +1037,32 @@ mod tests {
     }
 
     #[test]
-    fn every_logic_operation_combines_source_and_destination() {
-        for operation in 0..16_u32 {
+    fn every_logic_operation_matches_the_lg1_truth_table() {
+        const SOURCE: u8 = 0xcc;
+        const DESTINATION: u8 = 0xf0;
+        const EXPECTED: [u8; 16] = [
+            0x00, 0xc0, 0x0c, 0xcc, 0x30, 0xf0, 0x3c, 0xfc, 0x03, 0xc3, 0x0f, 0xcf, 0x33, 0xf3,
+            0x3f, 0xff,
+        ];
+
+        for (operation, expected) in EXPECTED.into_iter().enumerate() {
             let mut rex = Rex1::new();
             let mut vram = Vram::new();
             select_pixel_planes(&mut rex);
             rex.write_drawing(RWMASK, 0xff);
             rex.write_drawing(XSTARTI, 0);
             rex.write_drawing(YSTARTI, 0);
-            rex.write_drawing(COLORREDI, 0xf0);
+            rex.write_drawing(COLORREDI, u32::from(DESTINATION));
             rex.write_drawing_go(COMMAND, 0x3000_0001, &mut vram);
 
-            rex.write_drawing(COLORREDI, 0xcc);
-            rex.write_drawing_go(COMMAND, (operation << 28) | 0x0001, &mut vram);
+            rex.write_drawing(COLORREDI, u32::from(SOURCE));
+            rex.write_drawing_go(COMMAND, ((operation as u32) << 28) | 0x0001, &mut vram);
 
-            let expected = super::logic_operation(operation, 0xcc, 0xf0);
-            assert_eq!(vram.read(PlaneGroup::Pixel, 0, 0), expected);
+            assert_eq!(
+                vram.read(PlaneGroup::Pixel, 0, 0),
+                expected,
+                "logic operation {operation:#x}"
+            );
         }
     }
 
