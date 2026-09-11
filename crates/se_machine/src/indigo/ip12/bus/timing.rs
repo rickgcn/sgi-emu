@@ -908,7 +908,7 @@ mod tests {
             0x1100,
             [
                 0x3000,
-                GRAPHICS_DMA_LAST_DESCRIPTOR | GRAPHICS_DMA_GIO_TO_MEMORY | 78,
+                GRAPHICS_DMA_LAST_DESCRIPTOR | GRAPHICS_DMA_GIO_TO_MEMORY | 82,
                 LG1_GRAPHICS_DMA_PORT,
                 0,
                 0,
@@ -916,13 +916,15 @@ mod tests {
         );
         start_graphics_dma(&mut bus, 0x1100);
         bus.advance_time(
-            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 25),
+            VirtualDuration::from_attoseconds(GRAPHICS_DMA_CYCLE * 26),
             &mut MachineOutput::default(),
         );
 
-        let readback = read_memory(&mut bus, 0x3000, transfer.len());
-        assert_eq!(readback[..39], transfer[..39]);
-        assert_eq!(readback[40..79], transfer[40..79]);
+        // The host-data register presents its previous contents on the first
+        // access, so one extra word arrives ahead of the pixels.
+        let readback = read_memory(&mut bus, 0x3000, transfer.len() + 4);
+        assert_eq!(readback[4..43], transfer[..39]);
+        assert_eq!(readback[44..83], transfer[40..79]);
         assert_eq!(read_word(&mut bus, PIC1_BASE + 8), Ok(0x88));
     }
 

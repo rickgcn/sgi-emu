@@ -876,7 +876,9 @@ mod tests {
             board.read_dma(DeviceAddr::new(GRAPHICS_DMA_PORT), &mut bytes),
             Ok(())
         );
-        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+        // The leading word presents the register's previous contents; the
+        // pixels it latched follow on the next word.
+        assert_eq!(bytes, [5, 6, 7, 8, 1, 2, 3, 4]);
 
         assert_eq!(
             board.write_dma(DeviceAddr::new(GRAPHICS_DMA_PORT), &[0; 6]),
@@ -925,13 +927,14 @@ mod tests {
         write(&mut board, XSTARTI, 0x10);
         write(&mut board, YSTARTI, 0);
         write(&mut board, COMMAND, 0x3000_00ab);
-        let mut readback = vec![0; pixels.len()];
+        let mut readback = vec![0; pixels.len() + 4];
         assert_eq!(
             board.read_dma(DeviceAddr::new(GRAPHICS_DMA_PORT), &mut readback),
             Ok(())
         );
-        assert_eq!(readback[..39], pixels[..39]);
-        assert_eq!(readback[40..79], pixels[40..79]);
+        // Skip the leading previous-contents word; the pixels start after it.
+        assert_eq!(readback[4..43], pixels[..39]);
+        assert_eq!(readback[44..83], pixels[40..79]);
     }
 
     #[test]
