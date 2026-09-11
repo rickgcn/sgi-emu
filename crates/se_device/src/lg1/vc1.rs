@@ -276,17 +276,19 @@ impl Vc1 {
 
         let mut start = 0;
         let mut identifier = 0;
+        let mut has_boundary = false;
         for entry in 0..entry_count.min(DISPLAY_WIDTH as usize) {
             let Some(encoded) = self.sram_word(line_table + 2 + entry * 2) else {
                 break;
             };
             let boundary = usize::from(encoded >> 5).min(identifiers.len());
-            if boundary < start {
+            if has_boundary && boundary <= start {
                 continue;
             }
             identifiers[start..boundary].fill(identifier);
             start = boundary;
             identifier = (encoded & 0x1f) as u8;
+            has_boundary = true;
         }
         identifiers[start..].fill(identifier);
     }
@@ -888,6 +890,26 @@ mod tests {
                 .all(|identifier| *identifier == 2)
         );
         assert!(identifiers[700..].iter().all(|identifier| *identifier == 3));
+    }
+
+    #[test]
+    fn did_pipeline_padding_cannot_replace_the_visible_identifier() {
+        let mut vc1 = Vc1::new();
+        write_control_word(&mut vc1, DID_EP, 0x4000);
+        upload(&mut vc1, 0x4000, &[0x48, 0x00]);
+        upload(
+            &mut vc1,
+            0x4800,
+            &[
+                0x00, 0x05, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ],
+        );
+        vc1.write(Selector::SystemControl, SYS_CTRL_DID);
+        let mut identifiers = [0; DISPLAY_WIDTH as usize];
+
+        vc1.fill_display_identifiers(0, &mut identifiers);
+
+        assert!(identifiers.iter().all(|identifier| *identifier == 4));
     }
 
     #[test]
