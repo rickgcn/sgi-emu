@@ -581,6 +581,7 @@ const fn mode_identifier(mode: RuntimeMode) -> u8 {
         RuntimeMode::Replaying => 2,
         RuntimeMode::ReplayCompleted => 3,
         RuntimeMode::ReplayDiverged => 4,
+        RuntimeMode::RecordCompleted => 5,
     }
 }
 

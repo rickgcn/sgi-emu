@@ -20,6 +20,9 @@ pub enum RuntimeMode {
     Normal,
     /// External inputs are being recorded.
     Recording,
+    /// Recording ended while the machine continues on isolated nonvolatile
+    /// storage.
+    RecordCompleted,
     /// Recorded inputs are being replayed and checkpoints are being verified.
     Replaying,
     /// Replay reached the record footer.

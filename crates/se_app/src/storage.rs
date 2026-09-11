@@ -5,7 +5,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use se_device::storage::BlockStorage;
-use se_runtime::record::{DISK_PAGE_BYTES, MediaIdentity, RecordDisk, ReplayDisk};
+use se_runtime::record::{MediaIdentity, RecordDisk, ReplayDisk};
 
 enum FileStorageMode {
     Normal,
@@ -53,30 +53,6 @@ impl FileBlockStorage {
         self
     }
 
-    pub(crate) fn replay_initial_identity(&mut self, path: &Path) -> io::Result<MediaIdentity> {
-        let mut hasher = sha2::Sha256::new();
-        let mut offset = 0;
-        let mut buffer = vec![0; 128 * 1024];
-        while offset < self.size_bytes {
-            let count = usize::try_from((self.size_bytes - offset).min(buffer.len() as u64))
-                .map_err(|_| io::Error::other("storage hash length does not fit usize"))?;
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.read_exact(&mut buffer[..count])?;
-            if let FileStorageMode::Replay(replay) = &self.mode {
-                replay.overlay_initial_read(offset, &mut buffer[..count])?;
-            }
-            use sha2::Digest;
-            hasher.update(&buffer[..count]);
-            offset += count as u64;
-        }
-        use sha2::Digest;
-        Ok(MediaIdentity {
-            path_hint: path.to_string_lossy().into_owned(),
-            size_bytes: self.size_bytes,
-            sha256: hasher.finalize().into(),
-        })
-    }
-
     pub(crate) fn boxed(self) -> Box<dyn BlockStorage> {
         Box::new(self)
     }
@@ -98,7 +74,8 @@ impl BlockStorage for FileBlockStorage {
             return Err(error);
         }
         let result = match &self.mode {
-            FileStorageMode::Normal | FileStorageMode::Recording(_) => Ok(()),
+            FileStorageMode::Normal => Ok(()),
+            FileStorageMode::Recording(recording) => recording.overlay_read(offset, buffer),
             FileStorageMode::Replay(replay) => replay.overlay_read(offset, buffer),
         };
         if let Err(error) = &result {
@@ -116,17 +93,11 @@ impl BlockStorage for FileBlockStorage {
             }
             FileStorageMode::Recording(recording) => {
                 let recording = recording.clone();
-                let result = (|| {
-                    capture_before_images(
-                        &mut self.file,
-                        self.size_bytes,
-                        offset,
-                        data.len(),
-                        &recording,
-                    )?;
-                    self.file.seek(SeekFrom::Start(offset))?;
-                    self.file.write_all(data)
-                })();
+                let result =
+                    recording.write_all_at(offset, data, self.size_bytes, |page_offset, page| {
+                        self.file.seek(SeekFrom::Start(page_offset))?;
+                        self.file.read_exact(page)
+                    });
                 if let Err(error) = &result {
                     recording.report_storage_error(error);
                 }
@@ -158,33 +129,6 @@ impl FileBlockStorage {
     }
 }
 
-fn capture_before_images(
-    file: &mut File,
-    size_bytes: u64,
-    offset: u64,
-    length: usize,
-    recording: &RecordDisk,
-) -> io::Result<()> {
-    if length == 0 {
-        return Ok(());
-    }
-    let end = offset + length as u64;
-    let first_page = offset / DISK_PAGE_BYTES as u64;
-    let last_page = end.saturating_sub(1) / DISK_PAGE_BYTES as u64;
-    for page_index in first_page..=last_page {
-        let page_offset = page_index * DISK_PAGE_BYTES as u64;
-        let page_length = usize::try_from((size_bytes - page_offset).min(DISK_PAGE_BYTES as u64))
-            .map_err(|_| io::Error::other("disk page length does not fit usize"))?;
-        recording.capture_before_image(page_index, || {
-            let mut bytes = vec![0; page_length];
-            file.seek(SeekFrom::Start(page_offset))?;
-            file.read_exact(&mut bytes)?;
-            Ok(bytes)
-        })?;
-    }
-    Ok(())
-}
-
 fn check_range(offset: u64, length: usize, size_bytes: u64) -> io::Result<()> {
     let byte_count = u64::try_from(length)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "storage length overflow"))?;
@@ -207,6 +151,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use se_device::storage::BlockStorage;
+    use se_runtime::record::Recorder;
 
     use super::FileBlockStorage;
 
@@ -263,5 +208,31 @@ mod tests {
         drop(storage);
         assert_eq!(fs::read(&path).unwrap(), [1, 2, 3, 4]);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recording_storage_reads_its_cow_without_modifying_the_base_file() {
+        let path = temporary_path("recording-base");
+        let record_path = temporary_path("recording-output").with_extension("serec");
+        let partial_path = PathBuf::from(format!("{}.partial", record_path.display()));
+        let _ = fs::remove_file(&record_path);
+        let _ = fs::remove_file(&partial_path);
+        fs::write(&path, [1, 2, 3, 4, 5, 6]).unwrap();
+        let recorder = Recorder::create(&record_path).unwrap();
+
+        let mut storage = FileBlockStorage::open_read_only(&path)
+            .unwrap()
+            .recording(recorder.disk());
+        storage.write_all_at(1, &[9, 8]).unwrap();
+        storage.write_all_at(4, &[7]).unwrap();
+        let mut visible = [0; 6];
+        storage.read_exact_at(0, &mut visible).unwrap();
+
+        assert_eq!(visible, [1, 9, 8, 4, 7, 6]);
+        assert_eq!(fs::read(&path).unwrap(), [1, 2, 3, 4, 5, 6]);
+        drop(storage);
+        drop(recorder);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(partial_path).unwrap();
     }
 }

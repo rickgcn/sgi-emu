@@ -566,7 +566,8 @@ void MainWindow::run_with_record() {
             QStringLiteral("Cold-start recording"),
             QStringLiteral(
                 "Recording cold-starts the machine and discards its volatile state. "
-                "Guest disk writes will still modify the selected disk image. Continue?"))
+                "Guest disk and nonvolatile-state changes remain isolated and will be "
+                "discarded when this machine is replaced or the application exits. Continue?"))
         != QMessageBox::Yes) {
         return;
     }
@@ -586,7 +587,7 @@ void MainWindow::stop_recording() {
     const auto status = session_.stop_recording();
     apply_runtime_status(status, true);
     if (status.success) {
-        show_notification(QStringLiteral("Recording saved"), 3000);
+        show_notification(QStringLiteral("Recording saved; storage remains isolated"), 3000);
     }
 }
 
@@ -719,17 +720,19 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
     const bool normal = status.mode == 0;
     const bool recording = status.mode == 1;
     const bool replaying = status.mode == 2;
+    const bool record_completed = status.mode == 5;
+    const bool normal_session = normal || record_completed;
     const bool replay_session = replaying || status.mode == 3 || status.mode == 4;
     run_action_->setEnabled(paused && status.can_execute);
-    run_with_record_action_->setEnabled(configured && normal);
+    run_with_record_action_->setEnabled(configured && normal_session);
     reset_action_->setEnabled(configured && !replay_session);
     pause_action_->setEnabled(running);
     step_action_->setEnabled(paused && status.can_execute);
     stop_recording_action_->setEnabled(recording);
-    open_replay_action_->setEnabled(normal);
+    open_replay_action_->setEnabled(normal_session);
     create_replay_snapshot_action_->setEnabled(paused && replaying);
     stop_replay_action_->setEnabled(replay_session);
-    settings_action_->setEnabled(normal);
+    settings_action_->setEnabled(normal_session);
     serial_console_dock_->set_input_enabled(!replay_session);
     display_widget_->set_input_enabled(configured && !replay_session);
 
@@ -760,6 +763,10 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
         session_status_->setText(QStringLiteral("Session: Replay complete"));
     } else if (status.mode == 4) {
         session_status_->setText(QStringLiteral("Session: Replay diverged"));
+    } else if (record_completed) {
+        session_status_->setText(
+            session_error.isEmpty() ? QStringLiteral("Session: Record complete (isolated)")
+                                    : QStringLiteral("Session: Record failed (isolated)"));
     } else if (!session_error.isEmpty()) {
         session_status_->setText(QStringLiteral("Session: Record failed"));
     } else {
