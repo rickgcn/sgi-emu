@@ -1,11 +1,12 @@
 //! Deterministic cold-start recording and replay support.
 //!
 //! A record stores the cold machine configuration, machine inputs accepted at
-//! instruction boundaries, sparse machine-defined checkpoints, and disk
-//! before-images. Replay normally constructs a new machine at the first PROM
-//! instruction; an explicitly created Replay snapshot may instead restore one
-//! paused execution boundary. These machine-specific restore points are not
-//! general save states.
+//! instruction boundaries, and sparse machine-defined checkpoints. Writable
+//! disks remain isolated behind an in-memory copy-on-write view for the entire
+//! lifetime of the Recording machine. Replay normally constructs a new machine
+//! at the first PROM instruction; an explicitly created Replay snapshot may
+//! instead restore one paused execution boundary. These machine-specific
+//! restore points are not general save states.
 //!
 //! Timeline checkpoints describe boundaries before the next instruction. The
 //! footer stores a separate machine-defined terminal fingerprint: execution
@@ -15,6 +16,7 @@
 //! Recording writes synchronously. A complete file is renamed from
 //! `.serec.partial` only after its footer has been flushed and synchronized.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -51,7 +53,7 @@ const SNAPSHOT_MAGIC: [u8; 8] = *b"SGICKPT\0";
 const INDEX_MAGIC: [u8; 8] = *b"SGISIDX\0";
 const CACHE_SCHEMA: u32 = 1;
 
-/// Granularity used for writable-disk before-images and replay COW pages.
+/// Granularity used for writable-disk COW pages.
 pub const DISK_PAGE_BYTES: usize = 4096;
 
 /// Deterministic boundary immediately before the next guest instruction.
@@ -186,7 +188,7 @@ struct ReplaySnapshot {
     last_verified_checkpoint: Option<ExecutionPosition>,
     machine_fingerprint: [u8; 32],
     machine: MachineSnapshot,
-    cow_pages: BTreeMap<u64, BeforeImageData>,
+    cow_pages: BTreeMap<u64, CowPageData>,
     pc: u32,
 }
 
@@ -299,6 +301,7 @@ impl From<io::Error> for RecordError {
 pub struct Recorder {
     inner: Arc<Mutex<RecorderInner>>,
     failed: Arc<AtomicBool>,
+    disk_storage: Arc<Mutex<BTreeMap<u64, Vec<u8>>>>,
 }
 
 impl Recorder {
@@ -358,12 +361,12 @@ impl Recorder {
                 final_path,
                 partial_path,
                 replace_existing,
-                captured_pages: BTreeSet::new(),
                 started: false,
                 active: true,
                 failure: None,
             })),
             failed: Arc::new(AtomicBool::new(false)),
+            disk_storage: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -389,6 +392,7 @@ impl Recorder {
     pub fn disk(&self) -> RecordDisk {
         RecordDisk {
             recorder: self.clone(),
+            storage: Arc::clone(&self.disk_storage),
         }
     }
 
@@ -512,6 +516,7 @@ impl Recorder {
 #[derive(Clone)]
 pub struct RecordDisk {
     recorder: Recorder,
+    storage: Arc<Mutex<BTreeMap<u64, Vec<u8>>>>,
 }
 
 /// Parsed complete Record and optional manual restore point.
@@ -640,7 +645,7 @@ impl Replayer {
         let cow_pages = snapshot
             .cow_pages
             .into_iter()
-            .map(|(page_index, data)| decode_before_image(data).map(|bytes| (page_index, bytes)))
+            .map(|(page_index, data)| decode_cow_page(data).map(|bytes| (page_index, bytes)))
             .collect::<Result<_, _>>()?;
         lock_unpoisoned(&self.storage.state).cow_pages = cow_pages;
         self.initial_cursor = snapshot.timeline_cursor;
@@ -709,15 +714,11 @@ struct RecordFooter {
 enum RecordFrame {
     Manifest(Box<RecordManifest>),
     Timeline(TimelineEntry),
-    DiskBeforeImage {
-        page_index: u64,
-        data: BeforeImageData,
-    },
     Footer(RecordFooter),
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-enum BeforeImageData {
+enum CowPageData {
     Raw(Vec<u8>),
     Zero(usize),
 }
@@ -799,7 +800,7 @@ impl ReplaySession {
             .cow_pages
             .iter()
             .map(|(&page_index, bytes)| {
-                encode_before_image(bytes.clone()).map(|data| (page_index, data))
+                encode_cow_page(bytes.clone()).map(|data| (page_index, data))
             })
             .collect::<Result<_, _>>()?;
         let snapshot = ReplaySnapshot {
@@ -846,7 +847,6 @@ struct RecorderInner {
     final_path: PathBuf,
     partial_path: PathBuf,
     replace_existing: bool,
-    captured_pages: BTreeSet<u64>,
     started: bool,
     active: bool,
     failure: Option<String>,
@@ -860,17 +860,8 @@ struct ReplayStorage {
 }
 
 struct ReplayStorageState {
-    file: File,
-    before_images: BTreeMap<u64, BeforeImageLocation>,
     cow_pages: BTreeMap<u64, Vec<u8>>,
     failure: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-struct BeforeImageLocation {
-    payload_offset: u64,
-    payload_length: usize,
-    payload_crc: u32,
 }
 
 fn require_active(inner: &RecorderInner) -> Result<(), RecordError> {
@@ -908,7 +899,6 @@ fn parse_record(
 
     let mut manifest = None;
     let mut timeline = Vec::new();
-    let mut before_images = BTreeMap::new();
     let mut footer = None;
     let mut last_position = None;
     let mut frame_index = 0_usize;
@@ -926,7 +916,6 @@ fn parse_record(
             return Err(invalid_record("Record frame exceeds the size limit"));
         }
         let expected_crc = u32::from_le_bytes(frame_header[4..8].try_into().unwrap());
-        let payload_offset = file.stream_position()?;
         let mut payload = vec![0; payload_length];
         file.read_exact(&mut payload)?;
         if crc32(&payload) != expected_crc {
@@ -946,26 +935,6 @@ fn parse_record(
                 require_manifest(&manifest)?;
                 update_position(&mut last_position, entry.position)?;
                 timeline.push(entry);
-            }
-            RecordFrame::DiskBeforeImage { page_index, data } => {
-                let manifest = require_manifest(&manifest)?;
-                let disk = manifest.disk().ok_or_else(|| {
-                    invalid_record("Record has a disk before-image without a disk")
-                })?;
-                validate_before_image(page_index, before_image_length(&data)?, disk.size_bytes)?;
-                if before_images
-                    .insert(
-                        page_index,
-                        BeforeImageLocation {
-                            payload_offset,
-                            payload_length,
-                            payload_crc: expected_crc,
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(invalid_record("duplicate disk before-image page"));
-                }
             }
             RecordFrame::Footer(value) => {
                 require_manifest(&manifest)?;
@@ -988,8 +957,6 @@ fn parse_record(
         footer,
         storage: Arc::new(ReplayStorage {
             state: Mutex::new(ReplayStorageState {
-                file,
-                before_images,
                 cow_pages: BTreeMap::new(),
                 failure: None,
             }),
@@ -1043,34 +1010,34 @@ fn decode_value<T: DeserializeOwned>(bytes: &[u8], name: &str) -> Result<T, Reco
     Ok(value)
 }
 
-fn encode_before_image(bytes: Vec<u8>) -> Result<BeforeImageData, RecordError> {
+fn encode_cow_page(bytes: Vec<u8>) -> Result<CowPageData, RecordError> {
     if bytes.is_empty() || bytes.len() > DISK_PAGE_BYTES {
-        return Err(invalid_record("invalid disk before-image length"));
+        return Err(invalid_record("invalid disk COW page length"));
     }
     if bytes.iter().all(|&byte| byte == 0) {
-        Ok(BeforeImageData::Zero(bytes.len()))
+        Ok(CowPageData::Zero(bytes.len()))
     } else {
-        Ok(BeforeImageData::Raw(bytes))
+        Ok(CowPageData::Raw(bytes))
     }
 }
 
-fn before_image_length(data: &BeforeImageData) -> Result<usize, RecordError> {
+fn cow_page_length(data: &CowPageData) -> Result<usize, RecordError> {
     let length = match data {
-        BeforeImageData::Raw(bytes) => bytes.len(),
-        BeforeImageData::Zero(length) => *length,
+        CowPageData::Raw(bytes) => bytes.len(),
+        CowPageData::Zero(length) => *length,
     };
     if length == 0 || length > DISK_PAGE_BYTES {
-        Err(invalid_record("invalid disk before-image length"))
+        Err(invalid_record("invalid disk COW page length"))
     } else {
         Ok(length)
     }
 }
 
-fn decode_before_image(data: BeforeImageData) -> Result<Vec<u8>, RecordError> {
-    before_image_length(&data)?;
+fn decode_cow_page(data: CowPageData) -> Result<Vec<u8>, RecordError> {
+    cow_page_length(&data)?;
     Ok(match data {
-        BeforeImageData::Raw(bytes) => bytes,
-        BeforeImageData::Zero(length) => vec![0; length],
+        CowPageData::Raw(bytes) => bytes,
+        CowPageData::Zero(length) => vec![0; length],
     })
 }
 
@@ -1339,7 +1306,7 @@ fn validate_replay_snapshot(
     match replayer.manifest.disk() {
         Some(disk) => {
             for (&page_index, page) in &snapshot.cow_pages {
-                validate_before_image(page_index, before_image_length(page)?, disk.size_bytes)?;
+                validate_cow_page(page_index, cow_page_length(page)?, disk.size_bytes)?;
             }
         }
         None if snapshot.cow_pages.is_empty() => {}
@@ -1352,21 +1319,17 @@ fn validate_replay_snapshot(
     Ok(())
 }
 
-fn validate_before_image(
-    page_index: u64,
-    length: usize,
-    disk_size: u64,
-) -> Result<(), RecordError> {
+fn validate_cow_page(page_index: u64, length: usize, disk_size: u64) -> Result<(), RecordError> {
     let page_offset = page_index
         .checked_mul(DISK_PAGE_BYTES as u64)
-        .ok_or_else(|| invalid_record("disk before-image offset overflow"))?;
+        .ok_or_else(|| invalid_record("disk COW page offset overflow"))?;
     if page_offset >= disk_size {
-        return Err(invalid_record("disk before-image page is out of range"));
+        return Err(invalid_record("disk COW page is out of range"));
     }
     let expected = usize::try_from((disk_size - page_offset).min(DISK_PAGE_BYTES as u64))
-        .map_err(|_| invalid_record("disk before-image length does not fit usize"))?;
+        .map_err(|_| invalid_record("disk COW page length does not fit usize"))?;
     if length != expected {
-        return Err(invalid_record("disk before-image has the wrong length"));
+        return Err(invalid_record("disk COW page has the wrong length"));
     }
     Ok(())
 }
@@ -1450,49 +1413,70 @@ fn wide_path(path: &Path) -> Vec<u16> {
 }
 
 impl RecordDisk {
-    /// Saves one page as it existed before the first Recording write.
+    /// Applies the Recording machine's in-memory COW pages to a completed base
+    /// read.
     ///
-    /// Repeated calls for the same page are no-ops. Once Recording finishes or
-    /// fails, the capability also becomes a no-op so the application adapter
-    /// can continue as ordinary direct storage. `read_page` is called only
-    /// when the page needs its first Before Image.
+    /// The COW remains live after the Record footer is finalized so continued
+    /// execution cannot modify the selected host disk image.
     ///
     /// # Errors
     ///
-    /// Returns an I/O-shaped [`io::Error`] when Record output fails.
-    pub fn capture_before_image(
+    /// Returns an error when the requested range overflows.
+    pub fn overlay_read(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+        let pages = lock_unpoisoned(&self.storage);
+        overlay_cow_pages(&pages, offset, buffer)
+    }
+
+    /// Writes into the Recording machine's in-memory COW without modifying the
+    /// base disk.
+    ///
+    /// The callback supplies one complete base page when Recording first
+    /// writes that page. COW contents remain available after Recording stops
+    /// and are discarded only with the machine storage adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ranges or base reads.
+    pub fn write_all_at(
         &self,
-        page_index: u64,
-        read_page: impl FnOnce() -> io::Result<Vec<u8>>,
+        offset: u64,
+        data: &[u8],
+        size_bytes: u64,
+        mut read_base_page: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
     ) -> io::Result<()> {
-        let mut inner = lock_unpoisoned(&self.recorder.inner);
-        if !inner.active {
+        check_range(offset, data.len(), size_bytes)?;
+        if data.is_empty() {
             return Ok(());
         }
-        if let Some(failure) = &inner.failure {
-            return Err(io::Error::other(format!(
-                "recording already failed: {failure}"
-            )));
+        let mut pages = lock_unpoisoned(&self.storage);
+        let end = offset + data.len() as u64;
+        let first_page = offset / DISK_PAGE_BYTES as u64;
+        let last_page = (end - 1) / DISK_PAGE_BYTES as u64;
+        for page_index in first_page..=last_page {
+            let page_offset = page_index * DISK_PAGE_BYTES as u64;
+            let page_length =
+                usize::try_from((size_bytes - page_offset).min(DISK_PAGE_BYTES as u64))
+                    .map_err(|_| io::Error::other("disk page length does not fit usize"))?;
+            let page = match pages.entry(page_index) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let mut page = vec![0; page_length];
+                    read_base_page(page_offset, &mut page)?;
+                    entry.insert(page)
+                }
+            };
+            let write_start = offset.max(page_offset);
+            let write_end = end.min(page_offset + page_length as u64);
+            let source_start = usize::try_from(write_start - offset)
+                .map_err(|_| io::Error::other("Recording write offset does not fit usize"))?;
+            let source_end = usize::try_from(write_end - offset)
+                .map_err(|_| io::Error::other("Recording write end does not fit usize"))?;
+            let page_start = usize::try_from(write_start - page_offset)
+                .map_err(|_| io::Error::other("Recording page offset does not fit usize"))?;
+            let page_end = page_start + (source_end - source_start);
+            page[page_start..page_end].copy_from_slice(&data[source_start..source_end]);
         }
-        if inner.captured_pages.contains(&page_index) {
-            return Ok(());
-        }
-        let result: Result<(), RecordError> = (|| {
-            require_active(&inner)?;
-            let bytes = read_page().map_err(RecordError::Io)?;
-            let data = encode_before_image(bytes)?;
-            write_frame(
-                &mut inner,
-                &RecordFrame::DiskBeforeImage { page_index, data },
-            )?;
-            inner.captured_pages.insert(page_index);
-            Ok(())
-        })();
-        if let Err(error) = &result {
-            inner.failure = Some(error.to_string());
-            self.recorder.failed.store(true, Ordering::Release);
-        }
-        result.map_err(record_io_error)
+        Ok(())
     }
 
     /// Retains a host storage failure for the runtime worker.
@@ -1505,27 +1489,48 @@ impl RecordDisk {
     }
 }
 
+fn overlay_cow_pages(
+    pages: &BTreeMap<u64, Vec<u8>>,
+    offset: u64,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    let end = offset
+        .checked_add(buffer.len() as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "COW read range overflow"))?;
+    let first_page = offset / DISK_PAGE_BYTES as u64;
+    let last_page = (end - 1) / DISK_PAGE_BYTES as u64;
+    for page_index in first_page..=last_page {
+        let Some(page) = pages.get(&page_index) else {
+            continue;
+        };
+        let page_offset = page_index * DISK_PAGE_BYTES as u64;
+        let start = offset.max(page_offset);
+        let finish = end.min(page_offset + page.len() as u64);
+        let target_start = usize::try_from(start - offset)
+            .map_err(|_| io::Error::other("COW overlay offset does not fit usize"))?;
+        let target_end = usize::try_from(finish - offset)
+            .map_err(|_| io::Error::other("COW overlay end does not fit usize"))?;
+        let page_start = usize::try_from(start - page_offset)
+            .map_err(|_| io::Error::other("COW page offset does not fit usize"))?;
+        let page_end = page_start + (target_end - target_start);
+        buffer[target_start..target_end].copy_from_slice(&page[page_start..page_end]);
+    }
+    Ok(())
+}
+
 impl ReplayDisk {
-    /// Applies Replay COW or recorded Before Images to a completed base read.
+    /// Applies Replay COW pages to a completed base read.
     ///
     /// # Errors
     ///
     /// Returns an error when the range overflows or Replay storage failed.
     pub fn overlay_read(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
-        let mut state = lock_unpoisoned(&self.storage.state);
+        let state = lock_unpoisoned(&self.storage.state);
         ensure_replay_storage_healthy(&state)?;
-        overlay_range(&mut state, offset, buffer, true)
-    }
-
-    /// Applies only Before Images while validating the logical initial disk.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the range overflows or Replay storage failed.
-    pub fn overlay_initial_read(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
-        let mut state = lock_unpoisoned(&self.storage.state);
-        ensure_replay_storage_healthy(&state)?;
-        overlay_range(&mut state, offset, buffer, false)
+        overlay_cow_pages(&state.cow_pages, offset, buffer)
     }
 
     /// Writes into an in-memory page COW without modifying the base disk.
@@ -1557,14 +1562,14 @@ impl ReplayDisk {
             let page_length =
                 usize::try_from((size_bytes - page_offset).min(DISK_PAGE_BYTES as u64))
                     .map_err(|_| io::Error::other("disk page length does not fit usize"))?;
-            if !state.cow_pages.contains_key(&page_index) {
-                let mut page = vec![0; page_length];
-                read_base_page(page_offset, &mut page)?;
-                if let Some(before) = read_before_image(&mut state, page_index)? {
-                    page.copy_from_slice(&before);
+            let page = match state.cow_pages.entry(page_index) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let mut page = vec![0; page_length];
+                    read_base_page(page_offset, &mut page)?;
+                    entry.insert(page)
                 }
-                state.cow_pages.insert(page_index, page);
-            }
+            };
             let write_start = offset.max(page_offset);
             let write_end = end.min(page_offset + page_length as u64);
             let source_start = usize::try_from(write_start - offset)
@@ -1574,11 +1579,7 @@ impl ReplayDisk {
             let page_start = usize::try_from(write_start - page_offset)
                 .map_err(|_| io::Error::other("Replay page offset does not fit usize"))?;
             let page_end = page_start + (source_end - source_start);
-            state
-                .cow_pages
-                .get_mut(&page_index)
-                .expect("the Replay COW page was inserted")[page_start..page_end]
-                .copy_from_slice(&data[source_start..source_end]);
+            page[page_start..page_end].copy_from_slice(&data[source_start..source_end]);
         }
         Ok(())
     }
@@ -1591,80 +1592,6 @@ impl ReplayDisk {
             self.storage.failed.store(true, Ordering::Release);
         }
     }
-}
-
-fn overlay_range(
-    state: &mut ReplayStorageState,
-    offset: u64,
-    buffer: &mut [u8],
-    include_cow: bool,
-) -> io::Result<()> {
-    if buffer.is_empty() {
-        return Ok(());
-    }
-    let end = offset
-        .checked_add(buffer.len() as u64)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Replay read range overflow"))?;
-    let first_page = offset / DISK_PAGE_BYTES as u64;
-    let last_page = (end - 1) / DISK_PAGE_BYTES as u64;
-    for page_index in first_page..=last_page {
-        let page_offset = page_index * DISK_PAGE_BYTES as u64;
-        let start = offset.max(page_offset);
-        let finish = end.min(page_offset + DISK_PAGE_BYTES as u64);
-        let target_start = usize::try_from(start - offset)
-            .map_err(|_| io::Error::other("Replay overlay offset does not fit usize"))?;
-        let target_end = usize::try_from(finish - offset)
-            .map_err(|_| io::Error::other("Replay overlay end does not fit usize"))?;
-        let page_start = usize::try_from(start - page_offset)
-            .map_err(|_| io::Error::other("Replay page offset does not fit usize"))?;
-        let page_end = page_start + (target_end - target_start);
-
-        if include_cow && let Some(page) = state.cow_pages.get(&page_index) {
-            buffer[target_start..target_end].copy_from_slice(&page[page_start..page_end]);
-            continue;
-        }
-        if let Some(page) = read_before_image(state, page_index)? {
-            buffer[target_start..target_end].copy_from_slice(&page[page_start..page_end]);
-        }
-    }
-    Ok(())
-}
-
-fn read_before_image(
-    state: &mut ReplayStorageState,
-    page_index: u64,
-) -> io::Result<Option<Vec<u8>>> {
-    let Some(location) = state.before_images.get(&page_index).copied() else {
-        return Ok(None);
-    };
-    state.file.seek(SeekFrom::Start(location.payload_offset))?;
-    let mut payload = vec![0; location.payload_length];
-    state.file.read_exact(&mut payload)?;
-    if crc32(&payload) != location.payload_crc {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Record before-image frame CRC mismatch",
-        ));
-    }
-    let frame = decode_value::<RecordFrame>(&payload, "Record before-image frame")
-        .map_err(record_io_error)?;
-    let RecordFrame::DiskBeforeImage {
-        page_index: decoded_page_index,
-        data,
-    } = frame
-    else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Record before-image index refers to another frame type",
-        ));
-    };
-    if decoded_page_index != page_index {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Record before-image index refers to another page",
-        ));
-    }
-    decode_before_image(data).map(Some).map_err(record_io_error)
 }
 
 fn ensure_replay_storage_healthy(state: &ReplayStorageState) -> io::Result<()> {
@@ -1689,13 +1616,6 @@ fn check_range(offset: u64, length: usize, size_bytes: u64) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-fn record_io_error(error: RecordError) -> io::Error {
-    match error {
-        RecordError::Io(error) => error,
-        RecordError::InvalidData(reason) => io::Error::other(reason),
-    }
 }
 
 #[cfg(test)]
@@ -2012,17 +1932,26 @@ mod tests {
     }
 
     #[test]
-    fn before_image_is_captured_once_and_cow_has_priority() {
-        let path = temporary_path("priority");
+    fn recording_cow_survives_finalize_without_modifying_the_base() {
+        let path = temporary_path("recording-cow");
         let _ = fs::remove_file(&path);
-        let initial = vec![1; DISK_PAGE_BYTES];
+        let initial = vec![1; DISK_PAGE_BYTES * 2];
         let recorder = Recorder::create(&path).unwrap();
         recorder.start(&disk_manifest(&initial)).unwrap();
         let disk = recorder.disk();
-        disk.capture_before_image(0, || Ok(initial.clone()))
-            .unwrap();
-        disk.capture_before_image(0, || panic!("a captured page must not be read again"))
-            .unwrap();
+        let mut base_reads = 0;
+        disk.write_all_at(10, &[7, 8], initial.len() as u64, |offset, page| {
+            base_reads += 1;
+            let start = offset as usize;
+            page.copy_from_slice(&initial[start..start + page.len()]);
+            Ok(())
+        })
+        .unwrap();
+        disk.write_all_at(12, &[6], initial.len() as u64, |_offset, _page| {
+            panic!("an existing Recording COW page must not read the base again")
+        })
+        .unwrap();
+        assert_eq!(base_reads, 1);
         recorder
             .finalize(
                 ExecutionPosition::default(),
@@ -2030,29 +1959,31 @@ mod tests {
                 [7; 32],
             )
             .unwrap();
-        disk.capture_before_image(1, || {
-            panic!("an inactive Record disk must not read the base image")
-        })
+        disk.write_all_at(
+            DISK_PAGE_BYTES as u64 + 1,
+            &[5],
+            initial.len() as u64,
+            |offset, page| {
+                let start = offset as usize;
+                page.copy_from_slice(&initial[start..start + page.len()]);
+                Ok(())
+            },
+        )
         .unwrap();
 
-        let replayer = Replayer::open(&path).unwrap();
-        let replay_disk = replayer.disk();
-        let mut base = vec![9; DISK_PAGE_BYTES];
-        replay_disk.overlay_initial_read(0, &mut base).unwrap();
-        assert_eq!(base, initial);
+        let mut visible = initial.clone();
+        disk.overlay_read(0, &mut visible).unwrap();
+        assert_eq!(&visible[10..13], &[7, 8, 6]);
+        assert_eq!(visible[DISK_PAGE_BYTES + 1], 5);
+        assert!(initial.iter().all(|&byte| byte == 1));
 
-        replay_disk
-            .write_all_at(10, &[7, 8], DISK_PAGE_BYTES as u64, |_offset, page| {
-                page.fill(9);
-                Ok(())
-            })
+        let replayer = Replayer::open(&path).unwrap();
+        let mut replay_initial = initial.clone();
+        replayer
+            .disk()
+            .overlay_read(0, &mut replay_initial)
             .unwrap();
-        let mut replay_read = vec![9; DISK_PAGE_BYTES];
-        replay_disk.overlay_read(0, &mut replay_read).unwrap();
-        assert_eq!(&replay_read[..10], &initial[..10]);
-        assert_eq!(&replay_read[10..12], &[7, 8]);
-        assert_eq!(&replay_read[12..], &initial[12..]);
-        drop(replay_disk);
+        assert_eq!(replay_initial, initial);
         drop(replayer);
         fs::remove_file(path).unwrap();
     }
@@ -2067,10 +1998,6 @@ mod tests {
         let recorder = Recorder::create(&path).unwrap();
         recorder.start(&disk_manifest(&initial)).unwrap();
         recorder
-            .disk()
-            .capture_before_image(0, || Ok(initial.clone()))
-            .unwrap();
-        recorder
             .finalize(
                 ExecutionPosition::default(),
                 &RecordOutcome::UserStopped,
@@ -2082,7 +2009,7 @@ mod tests {
         replayer
             .disk()
             .write_all_at(10, &[7, 8], DISK_PAGE_BYTES as u64, |_offset, page| {
-                page.fill(9);
+                page.copy_from_slice(&initial);
                 Ok(())
             })
             .unwrap();
@@ -2112,7 +2039,7 @@ mod tests {
 
         let restored = Replayer::open_snapshot(&path, info.id()).unwrap();
         let restored_disk = restored.disk();
-        let mut bytes = vec![9; DISK_PAGE_BYTES];
+        let mut bytes = initial.clone();
         restored_disk.overlay_read(0, &mut bytes).unwrap();
         assert_eq!(&bytes[..10], &initial[..10]);
         assert_eq!(&bytes[10..12], &[7, 8]);
@@ -2122,37 +2049,6 @@ mod tests {
         drop(restored);
         fs::remove_file(format!("{}.idx", path.display())).unwrap();
         fs::remove_dir_all(format!("{}.ckpt", path.display())).unwrap();
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn partial_tail_before_image_restores_only_its_real_length() {
-        let path = temporary_path("tail");
-        let _ = fs::remove_file(&path);
-        let mut initial = vec![0; DISK_PAGE_BYTES + 3];
-        initial[DISK_PAGE_BYTES..].copy_from_slice(&[1, 2, 3]);
-        let recorder = Recorder::create(&path).unwrap();
-        recorder.start(&disk_manifest(&initial)).unwrap();
-        recorder
-            .disk()
-            .capture_before_image(1, || Ok(vec![1, 2, 3]))
-            .unwrap();
-        recorder
-            .finalize(
-                ExecutionPosition::default(),
-                &RecordOutcome::UserStopped,
-                [7; 32],
-            )
-            .unwrap();
-        let replayer = Replayer::open(&path).unwrap();
-        let mut tail = [9, 9, 9];
-        let replay_disk = replayer.disk();
-        replay_disk
-            .overlay_initial_read(DISK_PAGE_BYTES as u64, &mut tail)
-            .unwrap();
-        assert_eq!(tail, [1, 2, 3]);
-        drop(replay_disk);
-        drop(replayer);
         fs::remove_file(path).unwrap();
     }
 }

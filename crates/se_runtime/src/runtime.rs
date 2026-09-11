@@ -493,6 +493,7 @@ struct Worker {
 enum ActiveMode {
     Normal,
     Recording(RecordingSession),
+    RecordCompleted,
     Replaying(ReplaySession),
     ReplayCompleted(ReplaySession),
     ReplayDiverged {
@@ -534,6 +535,7 @@ impl ActiveMode {
         match self {
             Self::Normal => RuntimeMode::Normal,
             Self::Recording(_) => RuntimeMode::Recording,
+            Self::RecordCompleted => RuntimeMode::RecordCompleted,
             Self::Replaying(_) => RuntimeMode::Replaying,
             Self::ReplayCompleted(_) => RuntimeMode::ReplayCompleted,
             Self::ReplayDiverged { .. } => RuntimeMode::ReplayDiverged,
@@ -749,11 +751,10 @@ impl Worker {
                 if matches!(self.mode, ActiveMode::Recording(_)) {
                     let _ = self.stop_recording(RecordOutcome::Shutdown);
                 }
-                let state = if self.mode.is_replay() {
-                    self.preserved_nonvolatile_state.clone()
-                } else {
-                    self.machine.as_ref().map(Machine::nonvolatile_state)
-                };
+                let state = self
+                    .preserved_nonvolatile_state
+                    .clone()
+                    .or_else(|| self.machine.as_ref().map(Machine::nonvolatile_state));
                 let _ = reply.send(state);
                 return true;
             }
@@ -788,11 +789,10 @@ impl Worker {
             }
             RuntimeConfigurationMode::Replaying(_) => None,
         };
-        let retained_state = if self.mode.is_replay() {
-            self.preserved_nonvolatile_state.clone()
-        } else {
-            self.machine.as_ref().map(Machine::nonvolatile_state)
-        };
+        let retained_state = self
+            .preserved_nonvolatile_state
+            .clone()
+            .or_else(|| self.machine.as_ref().map(Machine::nonvolatile_state));
         let mut next_preserved_state = None;
         let mut restore_state = None;
         let next_mode = match mode {
@@ -803,6 +803,8 @@ impl Worker {
                 ActiveMode::Normal
             }
             RuntimeConfigurationMode::Recording(recorder, _) => {
+                next_preserved_state =
+                    Some(retained_state.unwrap_or_else(|| machine.nonvolatile_state()));
                 let digest = checkpoint_digest(&machine);
                 recorder
                     .record_checkpoint(ExecutionPosition::default(), digest)
@@ -880,7 +882,7 @@ impl Worker {
             self.set_record_failure(recorder, reason.clone());
             return Err(rejection_owned(reason));
         }
-        self.mode = ActiveMode::Normal;
+        self.mode = ActiveMode::RecordCompleted;
         self.session_error = None;
         self.advance_revision();
         Ok(self.status())
@@ -1155,7 +1157,7 @@ impl Worker {
     fn set_record_failure(&mut self, recorder: Recorder, reason: String) {
         recorder.disable();
         self.state = RuntimeState::Paused;
-        self.mode = ActiveMode::Normal;
+        self.mode = ActiveMode::RecordCompleted;
         self.session_error = Some(reason);
         self.advance_revision();
     }
@@ -1228,7 +1230,7 @@ impl Worker {
 
     fn execute_batch(&mut self) {
         match self.mode.public_mode() {
-            RuntimeMode::Normal => self.execute_normal_batch(),
+            RuntimeMode::Normal | RuntimeMode::RecordCompleted => self.execute_normal_batch(),
             RuntimeMode::Recording => self.execute_recording_batch(),
             RuntimeMode::Replaying => self.execute_replay_batch(),
             RuntimeMode::ReplayCompleted | RuntimeMode::ReplayDiverged => {}
@@ -1306,7 +1308,7 @@ impl Worker {
 
     fn execute_timed_instruction(&mut self) -> Result<(), ExecutionError> {
         match self.mode.public_mode() {
-            RuntimeMode::Normal => self.execute_normal_instruction(),
+            RuntimeMode::Normal | RuntimeMode::RecordCompleted => self.execute_normal_instruction(),
             RuntimeMode::Recording => self.execute_recording_instruction(),
             RuntimeMode::Replaying => self.execute_replay_instruction(),
             RuntimeMode::ReplayCompleted | RuntimeMode::ReplayDiverged => Ok(()),
@@ -2337,7 +2339,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         runtime.send_serial(SerialPort::B, b"after reset").unwrap();
         runtime.step().unwrap();
         let stopped = runtime.stop_recording().unwrap();
-        assert_eq!(stopped.mode, RuntimeMode::Normal);
+        assert_eq!(stopped.mode, RuntimeMode::RecordCompleted);
         runtime.shutdown().unwrap();
 
         let replayer = Replayer::open(&path).unwrap();
@@ -2768,13 +2770,13 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         runtime.run().unwrap();
         let stopped = runtime.stop_recording().unwrap();
         assert_eq!(stopped.state, RuntimeState::Running);
-        assert_eq!(stopped.mode, RuntimeMode::Normal);
+        assert_eq!(stopped.mode, RuntimeMode::RecordCompleted);
         runtime.shutdown().unwrap();
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn recording_storage_failure_pauses_and_returns_to_normal_mode() {
+    fn recording_storage_failure_pauses_in_isolated_mode() {
         let path = record_path("storage-failure");
         let _ = fs::remove_file(&path);
         let partial = PathBuf::from(format!("{}.partial", path.display()));
@@ -2792,7 +2794,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         let status = runtime.step().unwrap();
 
         assert_eq!(status.state, RuntimeState::Paused);
-        assert_eq!(status.mode, RuntimeMode::Normal);
+        assert_eq!(status.mode, RuntimeMode::RecordCompleted);
         assert_eq!(
             status.session_error.as_deref(),
             Some("host storage error: test failure")
@@ -2828,6 +2830,53 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             .unwrap();
         assert_eq!(runtime.shutdown().unwrap(), Some(expected));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn record_completion_preserves_the_pre_record_nonvolatile_state() {
+        let path = record_path("record-nonvolatile-isolation");
+        remove_record_artifacts(&path);
+        let expected = distinct_nonvolatile_state();
+        let mut normal_machine = machine_with_instructions(&[0]);
+        normal_machine.restore_nonvolatile_state(expected.clone(), 0);
+        let runtime = Runtime::new(Some(normal_machine)).unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&[0]),
+                started_recorder(&path),
+            ))
+            .unwrap();
+
+        let stopped = runtime.stop_recording().unwrap();
+        assert_eq!(stopped.mode, RuntimeMode::RecordCompleted);
+        assert_eq!(runtime.shutdown().unwrap(), Some(expected));
+        remove_record_artifacts(&path);
+    }
+
+    #[test]
+    fn normal_configuration_after_record_restores_the_preserved_state() {
+        let path = record_path("record-normal-restore");
+        remove_record_artifacts(&path);
+        let expected = distinct_nonvolatile_state();
+        let mut normal_machine = machine_with_instructions(&[0]);
+        normal_machine.restore_nonvolatile_state(expected.clone(), 0);
+        let runtime = Runtime::new(Some(normal_machine)).unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&[0]),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        runtime.stop_recording().unwrap();
+
+        let configured = runtime
+            .configure_with(RuntimeConfiguration::normal(machine_with_instructions(&[
+                0,
+            ])))
+            .unwrap();
+        assert_eq!(configured.mode, RuntimeMode::Normal);
+        assert_eq!(runtime.shutdown().unwrap(), Some(expected));
+        remove_record_artifacts(&path);
     }
 
     #[test]
@@ -2881,7 +2930,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             runtime.step().unwrap();
         }
         let recorded = runtime.step().unwrap();
-        assert_eq!(recorded.mode, RuntimeMode::Normal);
+        assert_eq!(recorded.mode, RuntimeMode::RecordCompleted);
         assert_eq!(recorded.state, RuntimeState::Paused);
         assert!(recorded.last_error.is_some());
         runtime.shutdown().unwrap();
@@ -2961,7 +3010,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
                 recorded.last_error.as_deref(),
                 Some("R3000 TLB is in shutdown state")
             );
-            assert_eq!(recorded.mode, RuntimeMode::Normal);
+            assert_eq!(recorded.mode, RuntimeMode::RecordCompleted);
             assert_eq!(recorded.position, position);
             assert_eq!(recorded.completed_instructions, completed);
             assert_eq!(recording.virtual_instant, instant);
@@ -3045,7 +3094,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             ))
             .unwrap();
         let recorded = recording.step_once().unwrap();
-        assert_eq!(recorded.mode, RuntimeMode::Normal);
+        assert_eq!(recorded.mode, RuntimeMode::RecordCompleted);
         assert!(recorded.last_error.is_some());
         assert_eq!(recorded.position, ExecutionPosition::default());
         drop(recording);

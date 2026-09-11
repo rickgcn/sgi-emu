@@ -120,7 +120,7 @@ fn build_recording_configuration(
     let prom_path = Path::new(&configuration.prom_path);
     let raw_prom = read_prom(prom_path)?;
     let prom_identity = MediaIdentity::from_bytes(prom_path, &raw_prom);
-    let mut disk = open_optional_storage(optional_path(&configuration.disk_path), false)?;
+    let mut disk = open_optional_storage(optional_path(&configuration.disk_path), true)?;
     let mut cdrom = open_optional_storage(optional_path(&configuration.cdrom_path), true)?;
     let disk_identity = identity_for_storage(&mut disk, optional_path(&configuration.disk_path))?;
     let cdrom_identity =
@@ -172,19 +172,18 @@ fn build_replay_configuration(
         None => None,
         Some(expected) => {
             let path = selected_or_hint(&configuration.disk_path, &expected.path_hint);
-            let mut storage = storage::FileBlockStorage::open_read_only(&path)
-                .map_err(|error| {
+            let mut storage =
+                storage::FileBlockStorage::open_read_only(&path).map_err(|error| {
                     format!("failed to open Replay disk '{}': {error}", path.display())
-                })?
-                .replay(replayer.disk());
-            let identity = storage.replay_initial_identity(&path).map_err(|error| {
+                })?;
+            let identity = storage.identity(&path).map_err(|error| {
                 format!(
                     "failed to validate Replay disk '{}': {error}",
                     path.display()
                 )
             })?;
             ensure_identity("disk", expected, &identity)?;
-            Some(storage.boxed())
+            Some(storage.replay(replayer.disk()).boxed())
         }
     };
     let cdrom = match manifest.cdrom() {
