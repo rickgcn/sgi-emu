@@ -107,6 +107,10 @@ const AUX1_COLORCOMPLT: u32 = 1 << 6;
 const AUX1_COLORCOMPEQ: u32 = 1 << 7;
 const AUX1_COLORCOMPGT: u32 = 1 << 8;
 const AUX1_DITHERRANGE: u32 = 1 << 9;
+const AUX1_WRITE_BUFFER_ZERO: u32 = 1 << 2;
+const AUX1_WRITE_BUFFER_ONE: u32 = 1 << 3;
+const AUX1_READ_BUFFER_ONE: u32 = 1 << 4;
+const AUX1_DOUBLE_BUFFER: u32 = 1 << 5;
 
 /// Low AUX2 nibble selecting the four screen masks.
 const AUX2_SCREEN_MASK_ENABLES: u32 = 0x0f;
@@ -984,14 +988,25 @@ impl Rex1 {
     /// Other command combinations retain direct component truncation.
     fn rgb_pixel(&self, red: u8, green: u8, blue: u8, x: u32, y: u32) -> u8 {
         if self.next.command & CMD_DITHER == 0 || self.next.aux1 & AUX1_DITHERRANGE == 0 {
-            return pack_rgb(red, green, blue);
+            return if self.next.aux1 & AUX1_DOUBLE_BUFFER == 0 {
+                pack_rgb(red, green, blue)
+            } else {
+                pack_double_buffer_rgb(red, green, blue)
+            };
         }
 
         let threshold = DITHER_MATRIX[(y & 3) as usize][(x & 3) as usize];
-        let red = dither_rgb_component(red, 3, threshold);
-        let green = dither_rgb_component(green, 3, threshold);
-        let blue = dither_rgb_component(blue, 2, threshold);
-        (red << 5) | (blue << 3) | green
+        if self.next.aux1 & AUX1_DOUBLE_BUFFER == 0 {
+            let red = dither_rgb_component(red, 3, threshold);
+            let green = dither_rgb_component(green, 3, threshold);
+            let blue = dither_rgb_component(blue, 2, threshold);
+            (red << 5) | (blue << 3) | green
+        } else {
+            let red = dither_rgb_component(red, 1, threshold);
+            let green = dither_rgb_component(green, 2, threshold);
+            let blue = dither_rgb_component(blue, 1, threshold);
+            (red << 3) | (green << 1) | blue
+        }
     }
 
     /// Returns one clamped eight-bit color-iterator component.
@@ -1008,7 +1023,7 @@ impl Rex1 {
         let Some((x, y)) = self.framebuffer_coordinate(x, y) else {
             return 0;
         };
-        vram.read(group, x, y)
+        self.read_pixel_value(group, vram.read(group, x, y))
     }
 
     /// Maps logical drawing coordinates into stored frame-buffer coordinates.
@@ -1035,13 +1050,16 @@ impl Rex1 {
         if !self.screen_masks_admit(x, y) {
             return;
         }
-        let destination = vram.read(group, x, y);
+        let raw_destination = vram.read(group, x, y);
+        let source = self.source_pixel_value(group, source);
+        let destination = self.read_pixel_value(group, raw_destination);
         if !self.color_comparison_passes(source, destination) {
             return;
         }
         let operation = self.next.source_rop;
         let result = logic_operation(operation, source, destination);
-        vram.write_masked(group, x, y, result, self.write_mask());
+        let (result, write_mask) = self.stored_pixel_write(group, result);
+        vram.write_masked(group, x, y, result, write_mask);
     }
 
     /// Reports whether every enabled screen-mask relation admits a write.
@@ -1082,13 +1100,48 @@ impl Rex1 {
             })
     }
 
-    /// Returns the eight-bit write mask applied to pixel writes.
+    /// Selects the logical pixel used by reads and read-modify-write drawing.
+    fn read_pixel_value(&self, group: PlaneGroup, pixel: u8) -> u8 {
+        if group != PlaneGroup::Pixel || self.next.aux1 & AUX1_DOUBLE_BUFFER == 0 {
+            return pixel;
+        }
+        if self.next.aux1 & AUX1_READ_BUFFER_ONE == 0 {
+            pixel & 0x0f
+        } else {
+            pixel >> 4
+        }
+    }
+
+    /// Converts a generated source value to the active logical pixel depth.
+    fn source_pixel_value(&self, group: PlaneGroup, pixel: u8) -> u8 {
+        if group == PlaneGroup::Pixel && self.next.aux1 & AUX1_DOUBLE_BUFFER != 0 {
+            pixel & 0x0f
+        } else {
+            pixel
+        }
+    }
+
+    /// Routes one logical result and write mask to the selected pixel buffers.
     ///
-    /// The mask lives in the low byte of `RWMASK`; the XSTATE alias window
-    /// updates that same byte, so both guest paths converge on one field.
-    /// The upper byte holds the read mask, whose effect is not established.
-    const fn write_mask(&self) -> u8 {
-        (self.next.rwmask & 0xff) as u8
+    /// In double-buffer mode each stored byte contains two four-bit pixels.
+    /// AUX1 independently enables the low and high buffers, while RWMASK
+    /// supplies the logical four-plane mask used for either destination.
+    fn stored_pixel_write(&self, group: PlaneGroup, result: u8) -> (u8, u8) {
+        let write_mask = self.next.rwmask as u8;
+        if group != PlaneGroup::Pixel || self.next.aux1 & AUX1_DOUBLE_BUFFER == 0 {
+            return (result, write_mask);
+        }
+
+        let logical_result = result & 0x0f;
+        let logical_mask = write_mask & 0x0f;
+        let mut stored_mask = 0;
+        if self.next.aux1 & AUX1_WRITE_BUFFER_ZERO != 0 {
+            stored_mask |= logical_mask;
+        }
+        if self.next.aux1 & AUX1_WRITE_BUFFER_ONE != 0 {
+            stored_mask |= logical_mask << 4;
+        }
+        (logical_result | (logical_result << 4), stored_mask)
     }
 
     /// Reports whether color comparison admits one pixel.
@@ -1106,6 +1159,11 @@ impl Rex1 {
 /// Packs full RGB components into the board's R3/B2/G3 color index.
 const fn pack_rgb(red: u8, green: u8, blue: u8) -> u8 {
     (red & 0xe0) | ((blue >> 3) & 0x18) | (green >> 5)
+}
+
+/// Packs full RGB components into one R1/G2/B1 double-buffer pixel.
+const fn pack_double_buffer_rgb(red: u8, green: u8, blue: u8) -> u8 {
+    ((red >> 4) & 0x08) | ((green >> 5) & 0x06) | (blue >> 7)
 }
 
 /// Scales and dithers one eight-bit RGB component to two or three bits.
@@ -1430,6 +1488,14 @@ mod tests {
     }
 
     #[test]
+    fn double_buffer_rgb_uses_the_four_bit_pixel_format() {
+        assert_eq!(super::pack_double_buffer_rgb(0xff, 0x00, 0x00), 0x08);
+        assert_eq!(super::pack_double_buffer_rgb(0x00, 0xff, 0x00), 0x06);
+        assert_eq!(super::pack_double_buffer_rgb(0x00, 0x00, 0xff), 0x01);
+        assert_eq!(super::pack_double_buffer_rgb(0xff, 0xff, 0xff), 0x0f);
+    }
+
+    #[test]
     fn a_shaded_rgb_span_advances_all_three_color_iterators() {
         let mut rex = Rex1::new();
         let mut vram = Vram::new();
@@ -1606,6 +1672,53 @@ mod tests {
         rex.write_drawing_go(COMMAND, 0x3000_0001, &mut vram);
 
         assert_eq!(vram.read(PlaneGroup::Pixel, 1, 1), 0xf0);
+    }
+
+    #[test]
+    fn aux1_routes_double_buffer_writes_to_the_selected_nibbles() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        vram.write_masked(PlaneGroup::Pixel, 1, 1, 0x53, 0xff);
+        rex.write_drawing(RWMASK, 0x0f);
+        rex.write_drawing(COLORREDI, 0x0a);
+        rex.write_drawing(XSTARTI, 1);
+        rex.write_drawing(YSTARTI, 1);
+
+        rex.write_drawing(AUX1, 0x226);
+        rex.write_drawing_go(COMMAND, 0x3000_0001, &mut vram);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 1, 1), 0x5a);
+
+        rex.write_drawing(AUX1, 0x23a);
+        rex.write_drawing(COLORREDI, 0x0c);
+        rex.write_drawing_go(COMMAND, 0x3000_0001, &mut vram);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 1, 1), 0xca);
+
+        rex.write_drawing(AUX1, 0x23e);
+        rex.write_drawing(COLORREDI, 0x03);
+        rex.write_drawing_go(COMMAND, 0x3000_0001, &mut vram);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 1, 1), 0x33);
+    }
+
+    #[test]
+    fn double_buffer_logic_uses_the_aux1_read_buffer() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(RWMASK, 0x0f);
+        rex.write_drawing(COLORREDI, 0x03);
+        rex.write_drawing(XSTARTI, 1);
+        rex.write_drawing(YSTARTI, 1);
+
+        vram.write_masked(PlaneGroup::Pixel, 1, 1, 0xa5, 0xff);
+        rex.write_drawing(AUX1, 0x226);
+        rex.write_drawing_go(COMMAND, 0x6000_0001, &mut vram);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 1, 1), 0xa6);
+
+        vram.write_masked(PlaneGroup::Pixel, 1, 1, 0xa5, 0xff);
+        rex.write_drawing(AUX1, 0x23a);
+        rex.write_drawing_go(COMMAND, 0x6000_0001, &mut vram);
+        assert_eq!(vram.read(PlaneGroup::Pixel, 1, 1), 0x95);
     }
 
     #[test]
@@ -1953,6 +2066,31 @@ mod tests {
                 .map(|x| vram.read(PlaneGroup::Pixel, x, 0))
                 .collect::<Vec<_>>(),
             vec![0x94, 0x6b, 0x94, 0x6b]
+        );
+    }
+
+    #[test]
+    fn double_buffer_rgb_dither_writes_the_selected_four_bit_buffer() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        select_pixel_planes(&mut rex);
+        rex.write_drawing(AUX1, 0x226);
+        rex.write_drawing(RWMASK, 0x0f);
+        rex.write_drawing(XSTARTI, 0);
+        rex.write_drawing(YSTARTI, 0);
+        rex.write_drawing(XENDI, 3);
+        rex.write_drawing(YENDI, 0);
+        rex.write_drawing(COMMAND, 0x3024_c089);
+
+        for _ in 0..4 {
+            rex.write_drawing_go(RWAUX1, 0x0080_8080, &mut vram);
+        }
+
+        assert_eq!(
+            (0..=3)
+                .map(|x| vram.read(PlaneGroup::Pixel, x, 0))
+                .collect::<Vec<_>>(),
+            vec![0x0d, 0x02, 0x0d, 0x02]
         );
     }
 
