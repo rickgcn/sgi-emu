@@ -1162,12 +1162,15 @@ impl Rex1 {
         vram.write_masked(group, x, y, result, write_mask);
     }
 
-    /// Reports whether every enabled screen-mask relation admits a write.
+    /// Reports whether the enabled screen-mask relations admit a write.
     ///
-    /// Screen-mask coordinates are absolute frame-buffer coordinates. AUX2
-    /// selects each rectangle and independently chooses whether its inclusive
-    /// interior or exterior admits drawing. A pixel is accepted only when it
-    /// satisfies every selected relation.
+    /// Screen-mask coordinates are absolute frame-buffer coordinates. The
+    /// first mask bounds the drawing on its own, and its polarity selects
+    /// whether the pixel must lie inside or outside its rectangle. The
+    /// remaining masks group by polarity: inside-polarity masks admit the
+    /// union of their rectangles, so a window whose visible region is several
+    /// disjoint rectangles needs one mask per rectangle, while outside
+    /// polarity masks each exclude their rectangles.
     fn screen_masks_admit(&self, x: u32, y: u32) -> bool {
         let aux2 = self.next.aux2;
         let enabled = aux2 & AUX2_SCREEN_MASK_ENABLES;
@@ -1181,23 +1184,35 @@ impl Rex1 {
             (self.config.smask3x, self.config.smask3y),
             (self.config.smask4x, self.config.smask4y),
         ];
-        masks
-            .iter()
-            .enumerate()
-            .all(|(index, &(x_bounds, y_bounds))| {
-                let enable = 1 << index;
-                if enabled & enable == 0 {
-                    return true;
-                }
+        let inside = |x_bounds: u32, y_bounds: u32| {
+            let left = x_bounds & 0x03ff;
+            let right = (x_bounds >> 16) & 0x03ff;
+            let top = y_bounds & 0x03ff;
+            let bottom = (y_bounds >> 16) & 0x03ff;
+            (left..=right).contains(&x) && (top..=bottom).contains(&y)
+        };
+        let admits_inside =
+            |index: usize| aux2 & ((1 << index) << AUX2_SCREEN_MASK_INSIDE_SHIFT) != 0;
 
-                let left = x_bounds & 0x03ff;
-                let right = (x_bounds >> 16) & 0x03ff;
-                let top = y_bounds & 0x03ff;
-                let bottom = (y_bounds >> 16) & 0x03ff;
-                let inside = (left..=right).contains(&x) && (top..=bottom).contains(&y);
-                let admits_inside = aux2 & (enable << AUX2_SCREEN_MASK_INSIDE_SHIFT) != 0;
-                inside == admits_inside
-            })
+        let (first_x, first_y) = masks[0];
+        if enabled & 1 != 0 && inside(first_x, first_y) != admits_inside(0) {
+            return false;
+        }
+
+        let mut inside_masks_enabled = false;
+        let mut admits_union = false;
+        for (index, &(x_bounds, y_bounds)) in masks.iter().enumerate().skip(1) {
+            if enabled & (1 << index) == 0 {
+                continue;
+            }
+            if admits_inside(index) {
+                inside_masks_enabled = true;
+                admits_union |= inside(x_bounds, y_bounds);
+            } else if inside(x_bounds, y_bounds) {
+                return false;
+            }
+        }
+        admits_union || !inside_masks_enabled
     }
 
     /// Selects the logical pixel used by reads and read-modify-write drawing.
@@ -1531,6 +1546,82 @@ mod tests {
                 } else {
                     0
                 };
+                assert_eq!(vram.read(PlaneGroup::Pixel, x, y), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn inside_screen_masks_admit_the_union_of_their_rectangles() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        rex.write_config(XYWIN, 0x0800_0800);
+        rex.write_config(AUX2, 0x2000_0077);
+        rex.write_drawing(SMASK1X, 5 << 16);
+        rex.write_drawing(SMASK1Y, 5 << 16);
+        rex.write_config(SMASK2X, 5 << 16);
+        rex.write_config(SMASK2Y, 2 << 16);
+        rex.write_config(SMASK3X, (5 << 16) | 3);
+        rex.write_config(SMASK3Y, (5 << 16) | 3);
+
+        draw_solid_rectangle(&mut rex, &mut vram, 0, 0, 5, 5);
+
+        for y in 0..=5 {
+            for x in 0..=5 {
+                let covered = x <= 2 && y >= 3;
+                let expected = if covered { 0 } else { 0x5a };
+                assert_eq!(vram.read(PlaneGroup::Pixel, x, y), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_screen_mask_bounds_the_inside_union() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        rex.write_config(XYWIN, 0x0800_0800);
+        rex.write_config(AUX2, 0x2000_0033);
+        rex.write_drawing(SMASK1X, (4 << 16) | 1);
+        rex.write_drawing(SMASK1Y, (4 << 16) | 1);
+        rex.write_config(SMASK2X, 6 << 16);
+        rex.write_config(SMASK2Y, 6 << 16);
+
+        draw_solid_rectangle(&mut rex, &mut vram, 0, 0, 6, 6);
+
+        for y in 0..=6 {
+            for x in 0..=6 {
+                let expected = if (1..=4).contains(&x) && (1..=4).contains(&y) {
+                    0x5a
+                } else {
+                    0
+                };
+                assert_eq!(vram.read(PlaneGroup::Pixel, x, y), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn outside_screen_masks_exclude_from_the_admitted_union() {
+        let mut rex = Rex1::new();
+        let mut vram = Vram::new();
+        rex.write_config(XYWIN, 0x0800_0800);
+        rex.write_config(AUX2, 0x2000_007f);
+        rex.write_drawing(SMASK1X, 5 << 16);
+        rex.write_drawing(SMASK1Y, 5 << 16);
+        rex.write_config(SMASK2X, 5 << 16);
+        rex.write_config(SMASK2Y, 2 << 16);
+        rex.write_config(SMASK3X, (5 << 16) | 3);
+        rex.write_config(SMASK3Y, (5 << 16) | 3);
+        rex.write_config(SMASK4X, 1 << 16);
+        rex.write_config(SMASK4Y, 1 << 16);
+
+        draw_solid_rectangle(&mut rex, &mut vram, 0, 0, 5, 5);
+
+        for y in 0..=5 {
+            for x in 0..=5 {
+                let covered = x <= 2 && y >= 3;
+                let excluded = x <= 1 && y <= 1;
+                let expected = if covered || excluded { 0 } else { 0x5a };
                 assert_eq!(vram.read(PlaneGroup::Pixel, x, y), expected);
             }
         }
