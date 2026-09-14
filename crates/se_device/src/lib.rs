@@ -18,6 +18,5 @@ pub mod scsi_disk;
 pub mod seeq8003;
 pub mod sgi_keyboard;
 pub mod sgi_mouse;
-pub mod storage;
 pub mod wd33c93b;
 pub mod z85230;

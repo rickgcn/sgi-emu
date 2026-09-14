@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use se_device::storage::BlockStorage;
+use se_core::storage::StorageMedium;
 use se_runtime::record::{MediaIdentity, RecordDisk, ReplayDisk};
 
 enum FileStorageMode {
@@ -53,12 +53,12 @@ impl FileBlockStorage {
         self
     }
 
-    pub(crate) fn boxed(self) -> Box<dyn BlockStorage> {
+    pub(crate) fn boxed(self) -> Box<dyn StorageMedium> {
         Box::new(self)
     }
 }
 
-impl BlockStorage for FileBlockStorage {
+impl StorageMedium for FileBlockStorage {
     fn size_bytes(&self) -> u64 {
         self.size_bytes
     }
@@ -150,7 +150,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use se_device::storage::BlockStorage;
+    use se_core::storage::StorageMedium;
     use se_runtime::record::Recorder;
 
     use super::FileBlockStorage;

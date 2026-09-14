@@ -122,7 +122,7 @@ pub fn build(prepared: PreparedIp12Build) -> Result<Ip12, Ip12AssemblyError> {
 
     let mut scsi = ScsiBus::new();
     for attachment in plan.scsi() {
-        let storage = resources.take_block_storage(&attachment.medium);
+        let storage = resources.take_storage(&attachment.medium);
         let bytes = storage.size_bytes();
         let target: Box<dyn ScsiTarget> = match attachment.device {
             ScsiDevice::Disk => Box::new(ScsiDisk::try_new(bytes).map_err(|source| {
@@ -176,7 +176,7 @@ mod tests {
     use se_config::draft::{Edit, MachineDraft};
     use se_config::id::{DeviceKindId, NodeId, PropertyId};
     use se_config::value::PropertyValue;
-    use se_device::storage::BlockStorage;
+    use se_core::storage::StorageMedium;
 
     use super::super::definition::Ip12Definition;
     use super::super::plan::{Ip12BuildPlan, PreparedIp12Build, ScsiDevice};
@@ -189,7 +189,7 @@ mod tests {
         bytes: Vec<u8>,
     }
 
-    impl BlockStorage for MemoryStorage {
+    impl StorageMedium for MemoryStorage {
         fn size_bytes(&self) -> u64 {
             self.bytes.len() as u64
         }
@@ -268,14 +268,14 @@ mod tests {
         plan.prepare_with(|id, requirement| {
             Ok::<_, Infallible>(match requirement.kind {
                 ResourceKind::Bytes => PreparedResource::Bytes(vec![0; firmware_bytes]),
-                ResourceKind::BlockStorage { access } => {
+                ResourceKind::Storage { access } => {
                     let address = medium_addresses
                         .get(id)
                         .expect("every medium role belongs to an attachment");
                     let capacity = capacities.get(address).copied().unwrap_or(2048);
-                    PreparedResource::BlockStorage {
+                    PreparedResource::Storage {
                         access,
-                        storage: Box::new(MemoryStorage {
+                        medium: Box::new(MemoryStorage {
                             bytes: vec![0; capacity],
                         }),
                     }
@@ -341,7 +341,7 @@ mod tests {
             plan_b.resources().get(&role).unwrap().path,
             std::path::Path::new("new.img")
         );
-        assert_eq!(capabilities.take_block_storage(&role).size_bytes(), 2048);
+        assert_eq!(capabilities.take_storage(&role).size_bytes(), 2048);
     }
 
     #[test]

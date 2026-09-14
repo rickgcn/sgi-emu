@@ -1780,10 +1780,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
 
+    use se_core::storage::StorageMedium;
     use se_core::time::ATTOSECONDS_PER_SECOND;
     use se_device::gio::{GioBus, GioSlot};
     use se_device::lg1::Lg1;
-    use se_device::storage::BlockStorage;
     use se_float::backend::Backend;
     use se_machine::indigo::GraphicsBoard;
     use se_machine::indigo::ip12::debug::{DebugRequest, DebugResponse, MemoryAddressSpace};
@@ -3243,7 +3243,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         reads: Arc<Mutex<Vec<(u64, usize)>>>,
     }
 
-    impl BlockStorage for RecordingStorage {
+    impl StorageMedium for RecordingStorage {
         fn size_bytes(&self) -> u64 {
             self.bytes.len() as u64
         }
@@ -3286,7 +3286,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         bytes
     }
 
-    fn dynamic_sgi_storage() -> Box<dyn BlockStorage> {
+    fn dynamic_sgi_storage() -> Box<dyn StorageMedium> {
         Box::new(RecordingStorage {
             bytes: dynamic_sgi_volume_header(),
             reads: Arc::new(Mutex::new(Vec::new())),
@@ -3296,7 +3296,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
     fn run_external_ip12_prom(
         raw_prom: Vec<u8>,
         graphics: Option<GraphicsBoard>,
-        storage: Option<Box<dyn BlockStorage>>,
+        storage: Option<Box<dyn StorageMedium>>,
         stop: ExternalPromStop,
     ) -> ExternalPromRun {
         let mut gio = GioBus::new();

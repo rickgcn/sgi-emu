@@ -12,6 +12,7 @@ pub(crate) mod snapshot;
 use std::error::Error;
 use std::fmt;
 
+use se_core::storage::StorageMedium;
 use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::{R3000, R3000Config, StepError};
 use se_device::centronics::CentronicsPort;
@@ -31,7 +32,6 @@ use se_device::scsi_disk::ScsiDisk;
 use se_device::seeq8003::Seeq8003;
 use se_device::sgi_keyboard::{SgiKey, SgiKeyboard};
 use se_device::sgi_mouse::{SgiMouse, SgiMouseButton};
-use se_device::storage::BlockStorage;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
 use se_float::backend::Backend;
@@ -411,8 +411,8 @@ impl Ip12 {
         raw_prom: Vec<u8>,
         floating_point_backend: Backend,
         gio: GioBus,
-        disk_storage: Option<Box<dyn BlockStorage>>,
-        cdrom_storage: Option<Box<dyn BlockStorage>>,
+        disk_storage: Option<Box<dyn StorageMedium>>,
+        cdrom_storage: Option<Box<dyn StorageMedium>>,
     ) -> Result<Self, Ip12Error> {
         Self::new_with_memory(
             raw_prom,
@@ -435,8 +435,8 @@ impl Ip12 {
         floating_point_backend: Backend,
         memory: Ip12MemoryConfiguration,
         gio: GioBus,
-        disk_storage: Option<Box<dyn BlockStorage>>,
-        cdrom_storage: Option<Box<dyn BlockStorage>>,
+        disk_storage: Option<Box<dyn StorageMedium>>,
+        cdrom_storage: Option<Box<dyn StorageMedium>>,
     ) -> Result<Self, Ip12Error> {
         validate_u56_prom_size(raw_prom.len())?;
         let mut scsi_bus = ScsiBus::new();
@@ -660,9 +660,9 @@ mod tests {
     use crate::output::MachineOutput;
     use crate::serial::SerialPort;
     use se_core::bus::{PhysAddr, PhysicalBus};
+    use se_core::storage::StorageMedium;
     use se_core::time::VirtualDuration;
     use se_device::gio::GioBus;
-    use se_device::storage::BlockStorage;
     use se_float::backend::Backend;
 
     use super::{
@@ -676,7 +676,7 @@ mod tests {
 
     struct SizedStorage(u64);
 
-    impl BlockStorage for SizedStorage {
+    impl StorageMedium for SizedStorage {
         fn size_bytes(&self) -> u64 {
             self.0
         }

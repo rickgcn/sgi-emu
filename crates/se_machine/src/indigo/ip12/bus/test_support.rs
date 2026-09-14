@@ -1,6 +1,7 @@
 use std::io;
 
 use se_core::bus::{BusError, PhysAddr, PhysicalBus};
+use se_core::storage::StorageMedium;
 use se_device::centronics::CentronicsPort;
 use se_device::dp8573a::Dp8573a;
 use se_device::dsp56001::Dsp56001;
@@ -18,7 +19,6 @@ use se_device::scsi_disk::ScsiDisk;
 use se_device::seeq8003::Seeq8003;
 use se_device::sgi_keyboard::SgiKeyboard;
 use se_device::sgi_mouse::SgiMouse;
-use se_device::storage::BlockStorage;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
 
@@ -70,7 +70,7 @@ struct MemoryStorage {
     writable: bool,
 }
 
-impl BlockStorage for MemoryStorage {
+impl StorageMedium for MemoryStorage {
     fn size_bytes(&self) -> u64 {
         self.bytes.len() as u64
     }
