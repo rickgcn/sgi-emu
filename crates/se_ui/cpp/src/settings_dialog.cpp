@@ -191,7 +191,6 @@ NetworkSettings SettingsDialog::settings() const {
 void SettingsDialog::rebuild_machine_view() {
     QString selected;
     QSet<QString> expanded;
-    const bool first_render = machine_tree_->topLevelItemCount() == 0;
     if (machine_tree_->currentItem() != nullptr) {
         selected = machine_tree_->currentItem()->data(0, Qt::UserRole).toString();
     }
@@ -208,7 +207,7 @@ void SettingsDialog::rebuild_machine_view() {
         item->setText(0, from_rust(node.label));
         item->setData(0, Qt::UserRole, id);
         items.insert(id, item);
-        if (first_render || expanded.contains(id)) { item->setExpanded(true); }
+        item->setExpanded(expanded.contains(id));
     }
     auto* current = items.value(selected, nullptr);
     if (current == nullptr && machine_tree_->topLevelItemCount() > 0) {
