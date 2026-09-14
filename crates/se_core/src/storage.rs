@@ -1,5 +1,6 @@
 //! Shared fixed-capacity byte-range storage contracts.
 
+use std::fmt;
 use std::io;
 
 /// The access granted to a storage medium.
@@ -11,6 +12,15 @@ pub enum StorageAccess {
     ReadWrite,
 }
 
+impl fmt::Display for StorageAccess {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadOnly => formatter.write_str("read-only"),
+            Self::ReadWrite => formatter.write_str("read-write"),
+        }
+    }
+}
+
 /// A fixed-size storage medium that supports exact byte-range I/O.
 pub trait StorageMedium: Send {
     /// Returns the storage capacity in bytes.
@@ -20,13 +30,13 @@ pub trait StorageMedium: Send {
     ///
     /// # Errors
     ///
-    /// Returns the host I/O error when the complete range cannot be read.
+    /// Returns an I/O error when the complete range cannot be read.
     fn read_exact_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()>;
 
     /// Writes exactly one byte range at `offset` without changing capacity.
     ///
     /// # Errors
     ///
-    /// Returns the host I/O error when the complete range cannot be written.
+    /// Returns an I/O error when the complete range cannot be written.
     fn write_all_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()>;
 }

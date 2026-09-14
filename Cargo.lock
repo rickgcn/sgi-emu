@@ -627,6 +627,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "se_session"
+version = "0.1.0"
+dependencies = [
+ "se_config",
+ "se_core",
+ "se_machine",
+]
+
+[[package]]
 name = "se_ui"
 version = "0.1.0"
 dependencies = [
