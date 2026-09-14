@@ -5,4 +5,5 @@ pub mod indigo;
 pub mod input;
 pub mod machine;
 pub mod output;
+pub mod resource;
 pub mod serial;
