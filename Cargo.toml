@@ -2,6 +2,7 @@
 members = [
     "crates/se_app",
     "crates/se_cli",
+    "crates/se_config",
     "crates/se_core",
     "crates/se_cpu",
     "crates/se_device",
