@@ -94,7 +94,7 @@ impl MachineDefinition for Ip12Definition {
     }
 
     fn display_name(&self) -> &str {
-        "SGI Indigo (IP12)"
+        "IRIS Indigo (IP12)"
     }
 
     fn default_draft(&self) -> MachineDraft {

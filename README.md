@@ -2,7 +2,7 @@
 
 A work-in-progress emulator for Silicon Graphics workstations.
 
-The project is currently focused on the original **SGI Indigo (IP12)** with a 33 MHz MIPS R3000A processor. It can currently boot **IRIX 5.3** into the Indigo Magic desktop, as well as boot NetBSD/sgimips.
+The project is currently focused on the original **IRIS Indigo (IP12)** with a 33 MHz MIPS R3000A processor. It can currently boot **IRIX 5.3** into the Indigo Magic desktop, as well as boot NetBSD/sgimips.
 
 > [!IMPORTANT]
 > sgi-emu is under active development. Many hardware behaviors are still incomplete or under active validation.
