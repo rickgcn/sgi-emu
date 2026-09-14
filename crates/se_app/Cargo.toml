@@ -15,6 +15,7 @@ directories.workspace = true
 serde.workspace = true
 sha2.workspace = true
 se_cli.workspace = true
+se_core.workspace = true
 se_device.workspace = true
 se_float.workspace = true
 se_machine.workspace = true

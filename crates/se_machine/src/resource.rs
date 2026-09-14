@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 
-use se_device::storage::BlockStorage;
+use se_core::storage::{StorageAccess, StorageMedium};
 
 /// A stable resource role within one build plan.
 ///
@@ -28,24 +28,15 @@ impl ResourceId {
     }
 }
 
-/// The access needed for a block-storage resource.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BlockStorageAccess {
-    /// The medium is read without writes.
-    ReadOnly,
-    /// The medium may be read and written.
-    ReadWrite,
-}
-
 /// The kind of host resource a later preparation step must provide.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceKind {
     /// A complete byte image, such as firmware.
     Bytes,
-    /// A block-storage medium with the requested access.
-    BlockStorage {
+    /// A storage medium with the requested access.
+    Storage {
         /// The access requested by the attached device.
-        access: BlockStorageAccess,
+        access: StorageAccess,
     },
 }
 
@@ -134,12 +125,12 @@ impl ResourceRequirements {
 pub enum PreparedResource {
     /// A complete byte image, such as firmware.
     Bytes(Vec<u8>),
-    /// An owned block-storage capability with its exact access mode.
-    BlockStorage {
+    /// An owned storage capability with its exact access mode.
+    Storage {
         /// Access granted to the machine.
-        access: BlockStorageAccess,
+        access: StorageAccess,
         /// Storage used directly by an attached device.
-        storage: Box<dyn BlockStorage>,
+        medium: Box<dyn StorageMedium>,
     },
 }
 
@@ -149,7 +140,7 @@ impl PreparedResource {
     pub fn kind(&self) -> ResourceKind {
         match self {
             Self::Bytes(_) => ResourceKind::Bytes,
-            Self::BlockStorage { access, .. } => ResourceKind::BlockStorage { access: *access },
+            Self::Storage { access, .. } => ResourceKind::Storage { access: *access },
         }
     }
 }
@@ -170,10 +161,10 @@ impl PreparedResources {
         }
     }
 
-    pub(crate) fn take_block_storage(&mut self, id: &ResourceId) -> Box<dyn BlockStorage> {
+    pub(crate) fn take_storage(&mut self, id: &ResourceId) -> Box<dyn StorageMedium> {
         match self.resources.remove(id) {
-            Some(PreparedResource::BlockStorage { storage, .. }) => storage,
-            _ => panic!("prepared block storage must match the build plan"),
+            Some(PreparedResource::Storage { medium, .. }) => medium,
+            _ => panic!("prepared storage must match the build plan"),
         }
     }
 
@@ -251,11 +242,11 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc::{self, Sender};
 
-    use se_device::storage::BlockStorage;
+    use se_core::storage::{StorageAccess, StorageMedium};
 
     use super::{
-        BlockStorageAccess, PrepareResourcesError, PreparedResource, ResourceId, ResourceKind,
-        ResourceRequirement, ResourceRequirements,
+        PrepareResourcesError, PreparedResource, ResourceId, ResourceKind, ResourceRequirement,
+        ResourceRequirements,
     };
 
     struct TestStorage {
@@ -270,7 +261,7 @@ mod tests {
         }
     }
 
-    impl BlockStorage for TestStorage {
+    impl StorageMedium for TestStorage {
         fn size_bytes(&self) -> u64 {
             512
         }
@@ -299,23 +290,23 @@ mod tests {
         requirements.insert(bytes.clone(), requirement(ResourceKind::Bytes));
         requirements.insert(
             block.clone(),
-            requirement(ResourceKind::BlockStorage {
-                access: BlockStorageAccess::ReadOnly,
+            requirement(ResourceKind::Storage {
+                access: StorageAccess::ReadOnly,
             }),
         );
         let mut prepared = requirements
             .prepare_with(|_, item| {
                 Ok::<_, io::Error>(match item.kind {
                     ResourceKind::Bytes => PreparedResource::Bytes(vec![1, 2, 3]),
-                    ResourceKind::BlockStorage { access } => PreparedResource::BlockStorage {
+                    ResourceKind::Storage { access } => PreparedResource::Storage {
                         access,
-                        storage: Box::new(TestStorage { dropped: None }),
+                        medium: Box::new(TestStorage { dropped: None }),
                     },
                 })
             })
             .expect("all required capabilities must prepare");
         assert_eq!(prepared.take_bytes(&bytes), [1, 2, 3]);
-        assert_eq!(prepared.take_block_storage(&block).size_bytes(), 512);
+        assert_eq!(prepared.take_storage(&block).size_bytes(), 512);
         assert!(prepared.is_empty());
     }
 
@@ -324,17 +315,17 @@ mod tests {
         let mut requirements = ResourceRequirements::default();
         requirements.insert(
             ResourceId::new("a.block"),
-            requirement(ResourceKind::BlockStorage {
-                access: BlockStorageAccess::ReadWrite,
+            requirement(ResourceKind::Storage {
+                access: StorageAccess::ReadWrite,
             }),
         );
         requirements.insert(ResourceId::new("b.bytes"), requirement(ResourceKind::Bytes));
         let (sender, receiver) = mpsc::channel();
         let error = match requirements.prepare_with(|id, _| {
             if id.as_str() == "a.block" {
-                Ok(PreparedResource::BlockStorage {
-                    access: BlockStorageAccess::ReadWrite,
-                    storage: Box::new(TestStorage {
+                Ok(PreparedResource::Storage {
+                    access: StorageAccess::ReadWrite,
+                    medium: Box::new(TestStorage {
                         dropped: Some(sender.clone()),
                     }),
                 })
@@ -360,9 +351,9 @@ mod tests {
             requirement(ResourceKind::Bytes),
         );
         let error = match requirements.prepare_with(|_, _| {
-            Ok::<_, io::Error>(PreparedResource::BlockStorage {
-                access: BlockStorageAccess::ReadOnly,
-                storage: Box::new(TestStorage { dropped: None }),
+            Ok::<_, io::Error>(PreparedResource::Storage {
+                access: StorageAccess::ReadOnly,
+                medium: Box::new(TestStorage { dropped: None }),
             })
         }) {
             Ok(_) => panic!("block storage cannot satisfy a byte image"),
@@ -373,25 +364,25 @@ mod tests {
             error,
             PrepareResourcesError::KindMismatch {
                 required: ResourceKind::Bytes,
-                provided: ResourceKind::BlockStorage { .. },
+                provided: ResourceKind::Storage { .. },
                 ..
             }
         ));
     }
 
     #[test]
-    fn block_storage_access_requires_an_exact_match() {
+    fn storage_access_requires_an_exact_match() {
         let mut requirements = ResourceRequirements::default();
         requirements.insert(
             ResourceId::new("medium"),
-            requirement(ResourceKind::BlockStorage {
-                access: BlockStorageAccess::ReadOnly,
+            requirement(ResourceKind::Storage {
+                access: StorageAccess::ReadOnly,
             }),
         );
         let error = match requirements.prepare_with(|_, _| {
-            Ok::<_, io::Error>(PreparedResource::BlockStorage {
-                access: BlockStorageAccess::ReadWrite,
-                storage: Box::new(TestStorage { dropped: None }),
+            Ok::<_, io::Error>(PreparedResource::Storage {
+                access: StorageAccess::ReadWrite,
+                medium: Box::new(TestStorage { dropped: None }),
             })
         }) {
             Ok(_) => panic!("write access must not silently satisfy read-only access"),
@@ -401,11 +392,11 @@ mod tests {
         assert!(matches!(
             error,
             PrepareResourcesError::KindMismatch {
-                required: ResourceKind::BlockStorage {
-                    access: BlockStorageAccess::ReadOnly
+                required: ResourceKind::Storage {
+                    access: StorageAccess::ReadOnly
                 },
-                provided: ResourceKind::BlockStorage {
-                    access: BlockStorageAccess::ReadWrite
+                provided: ResourceKind::Storage {
+                    access: StorageAccess::ReadWrite
                 },
                 ..
             }

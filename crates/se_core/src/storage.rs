@@ -1,9 +1,18 @@
-//! Host-backed storage ports consumed by device models.
+//! Shared fixed-capacity byte-range storage contracts.
 
 use std::io;
 
-/// A fixed-size storage object that supports exact byte-range I/O.
-pub trait BlockStorage: Send {
+/// The access granted to a storage medium.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageAccess {
+    /// The medium is read without writes.
+    ReadOnly,
+    /// The medium may be read and written.
+    ReadWrite,
+}
+
+/// A fixed-size storage medium that supports exact byte-range I/O.
+pub trait StorageMedium: Send {
     /// Returns the storage capacity in bytes.
     fn size_bytes(&self) -> u64;
 

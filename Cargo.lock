@@ -521,6 +521,7 @@ dependencies = [
  "clap",
  "directories",
  "se_cli",
+ "se_core",
  "se_device",
  "se_float",
  "se_machine",

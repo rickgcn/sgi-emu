@@ -12,6 +12,7 @@ use se_config::view::{
     AttachmentView, ChoiceOption, ConfigurationView, DeviceChoice, NodeRole, PathKind,
     PropertyEditor, PropertyView, TopologyNode,
 };
+use se_core::storage::StorageAccess;
 use se_device::gio::GioSlot;
 use se_float::backend::Backend;
 
@@ -19,9 +20,7 @@ use super::Ip12MemoryConfiguration;
 use super::plan::{
     GioAttachment, GioDevice, Ip12BuildPlan, Ip12CompileError, ScsiAttachment, ScsiDevice,
 };
-use crate::resource::{
-    BlockStorageAccess, ResourceId, ResourceKind, ResourceRequirement, ResourceRequirements,
-};
+use crate::resource::{ResourceId, ResourceKind, ResourceRequirement, ResourceRequirements};
 
 const MODEL: &str = "indigo-ip12";
 const GRAPHICS_SLOT: &str = "gio.0.slot.graphics";
@@ -500,11 +499,11 @@ impl<'a> Projection<'a> {
                                     medium_id.clone(),
                                     ResourceRequirement {
                                         path: PathBuf::from(path),
-                                        kind: ResourceKind::BlockStorage {
+                                        kind: ResourceKind::Storage {
                                             access: if device == device_kind(SCSI_DISK) {
-                                                BlockStorageAccess::ReadWrite
+                                                StorageAccess::ReadWrite
                                             } else {
-                                                BlockStorageAccess::ReadOnly
+                                                StorageAccess::ReadOnly
                                             },
                                         },
                                     },
@@ -752,11 +751,12 @@ mod tests {
     use se_config::id::{DeviceKindId, MachineModelId, NodeId, PropertyId};
     use se_config::value::PropertyValue;
     use se_config::view::{ConfigurationView, NodeRole, PathKind, PropertyEditor, TopologyNode};
+    use se_core::storage::StorageAccess;
     use se_device::gio::GioSlot;
     use se_float::backend::Backend;
 
     use crate::indigo::ip12::plan::{GioDevice, ScsiDevice};
-    use crate::resource::{BlockStorageAccess, ResourceId, ResourceKind};
+    use crate::resource::{ResourceId, ResourceKind};
 
     use super::{
         FIRMWARE_PATH, FPU_BACKEND, GRAPHICS_SLOT, Ip12Definition, LG1, MODEL, SCSI_CDROM,
@@ -975,11 +975,11 @@ mod tests {
             assert_eq!(resource.path, PathBuf::from(path));
             assert_eq!(
                 resource.kind,
-                ResourceKind::BlockStorage {
+                ResourceKind::Storage {
                     access: if kind == SCSI_DISK {
-                        BlockStorageAccess::ReadWrite
+                        StorageAccess::ReadWrite
                     } else {
-                        BlockStorageAccess::ReadOnly
+                        StorageAccess::ReadOnly
                     }
                 }
             );

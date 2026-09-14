@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use se_cli::Arguments;
+use se_core::storage::StorageMedium;
 use se_device::gio::{GioBus, GioSlot};
 use se_device::lg1::Lg1;
 use se_float::backend::Backend;
@@ -224,8 +225,8 @@ fn build_machine(
 fn build_machine_from_parts(
     startup_configuration: MachineStartupConfiguration,
     raw_prom: Vec<u8>,
-    disk: Option<Box<dyn se_device::storage::BlockStorage>>,
-    cdrom: Option<Box<dyn se_device::storage::BlockStorage>>,
+    disk: Option<Box<dyn StorageMedium>>,
+    cdrom: Option<Box<dyn StorageMedium>>,
 ) -> Result<Machine, String> {
     match startup_configuration {
         MachineStartupConfiguration::IndigoIp12 {
