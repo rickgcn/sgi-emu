@@ -189,6 +189,7 @@ NetworkSettings SettingsDialog::settings() const {
 }
 
 void SettingsDialog::rebuild_machine_view() {
+    const bool initial_tree = machine_tree_->topLevelItemCount() == 0;
     QString selected;
     QSet<QString> expanded;
     if (machine_tree_->currentItem() != nullptr) {
@@ -207,7 +208,7 @@ void SettingsDialog::rebuild_machine_view() {
         item->setText(0, from_rust(node.label));
         item->setData(0, Qt::UserRole, id);
         items.insert(id, item);
-        item->setExpanded(expanded.contains(id));
+        item->setExpanded(expanded.contains(id) || (initial_tree && parent == nullptr));
     }
     auto* current = items.value(selected, nullptr);
     if (current == nullptr && machine_tree_->topLevelItemCount() > 0) {
