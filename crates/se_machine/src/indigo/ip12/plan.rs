@@ -8,7 +8,10 @@ use se_device::gio::GioSlot;
 use se_float::backend::Backend;
 
 use super::Ip12MemoryConfiguration;
-use crate::resource::{ResourceId, ResourceRequirements};
+use crate::resource::{
+    PrepareResourcesError, PreparedResource, PreparedResources, ResourceId, ResourceRequirement,
+    ResourceRequirements,
+};
 
 /// An IP12 configuration ready for later resource preparation and assembly.
 ///
@@ -41,6 +44,27 @@ impl Ip12BuildPlan {
             scsi,
             resources,
         }
+    }
+
+    /// Prepares every resource and binds the resulting capabilities to this plan.
+    ///
+    /// The provider receives each resource role and its host requirement. A
+    /// successful result owns both this exact plan and all capabilities needed
+    /// to assemble it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareResourcesError`] if a provider fails or supplies an
+    /// incompatible resource kind or access mode.
+    pub fn prepare_with<E>(
+        self,
+        prepare: impl FnMut(&ResourceId, &ResourceRequirement) -> Result<PreparedResource, E>,
+    ) -> Result<PreparedIp12Build, PrepareResourcesError<E>> {
+        let resources = self.resources.prepare_with(prepare)?;
+        Ok(PreparedIp12Build {
+            plan: self,
+            resources,
+        })
     }
 
     /// Returns the selected floating-point implementation.
@@ -77,6 +101,20 @@ impl Ip12BuildPlan {
     #[must_use]
     pub fn resources(&self) -> &ResourceRequirements {
         &self.resources
+    }
+}
+
+/// An IP12 plan and the capabilities prepared for that exact plan.
+///
+/// The pair cannot be assembled with a different plan or separated by callers.
+pub struct PreparedIp12Build {
+    plan: Ip12BuildPlan,
+    resources: PreparedResources,
+}
+
+impl PreparedIp12Build {
+    pub(super) fn into_parts(self) -> (Ip12BuildPlan, PreparedResources) {
+        (self.plan, self.resources)
     }
 }
 
