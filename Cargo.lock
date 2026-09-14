@@ -544,6 +544,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "se_config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "se_core"
 version = "0.1.0"
 dependencies = [
