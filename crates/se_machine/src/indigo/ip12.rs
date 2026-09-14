@@ -4,6 +4,7 @@ mod bus;
 pub mod debug;
 pub mod definition;
 mod events;
+pub mod plan;
 mod prom;
 pub(crate) mod snapshot;
 

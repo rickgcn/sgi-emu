@@ -1,6 +1,7 @@
-//! Editable configuration topology for the SGI Indigo IP12.
+//! Editable configuration topology and typed build-plan analysis for the SGI Indigo IP12.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use se_config::definition::MachineDefinition;
 use se_config::diagnostic::{Diagnostic, DiagnosticSeverity, DiagnosticTarget};
@@ -11,6 +12,16 @@ use se_config::view::{
     AttachmentView, ChoiceOption, ConfigurationView, DeviceChoice, NodeRole, PathKind,
     PropertyEditor, PropertyView, TopologyNode,
 };
+use se_device::gio::GioSlot;
+use se_float::backend::Backend;
+
+use super::Ip12MemoryConfiguration;
+use super::plan::{
+    GioAttachment, GioDevice, Ip12BuildPlan, Ip12CompileError, ScsiAttachment, ScsiDevice,
+};
+use crate::resource::{
+    BlockStorageAccess, ResourceId, ResourceKind, ResourceRequirement, ResourceRequirements,
+};
 
 const MODEL: &str = "indigo-ip12";
 const GRAPHICS_SLOT: &str = "gio.0.slot.graphics";
@@ -20,8 +31,63 @@ const SCSI_CDROM: &str = "scsi.cdrom";
 const FPU_BACKEND: &str = "cpu.0.fpu.0.backend";
 const FIRMWARE_PATH: &str = "firmware.0.image-path";
 
-/// Resolves an Indigo IP12 draft into an editable topology and diagnostics.
+/// Resolves Indigo IP12 drafts and compiles valid drafts into build plans.
 pub struct Ip12Definition;
+
+impl Ip12Definition {
+    /// Compiles a semantically valid draft into typed IP12 construction inputs.
+    ///
+    /// Paths are preserved without accessing the host filesystem. Missing or
+    /// invalid draft values return the same errors that resolution reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ip12CompileError`] when the draft has any semantic error.
+    pub fn compile(&self, draft: &MachineDraft) -> Result<Ip12BuildPlan, Ip12CompileError> {
+        let analysis = self.analyze(draft);
+        let Analysis {
+            view,
+            backend,
+            memory,
+            gio,
+            scsi,
+            resources,
+        } = analysis;
+        let errors: Vec<_> = view
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+            .collect();
+        if !errors.is_empty() {
+            return Err(Ip12CompileError {
+                diagnostics: errors,
+            });
+        }
+        let floating_point_backend =
+            backend.expect("error-free IP12 analysis must produce an FPU backend");
+        let memory = memory.expect("error-free IP12 analysis must produce a memory configuration");
+        Ok(Ip12BuildPlan::new(
+            floating_point_backend,
+            memory,
+            ResourceId::new("firmware.0.image"),
+            gio,
+            scsi,
+            resources,
+        ))
+    }
+
+    fn analyze(&self, draft: &MachineDraft) -> Analysis {
+        let mut projection = Projection::new(draft, self.model_id(), self.display_name());
+        projection.cpu();
+        projection.memory();
+        projection.gio();
+        projection.scsi();
+        projection.serial();
+        projection.parallel_and_ethernet();
+        projection.firmware();
+        projection.finish()
+    }
+}
 
 impl MachineDefinition for Ip12Definition {
     fn model_id(&self) -> MachineModelId {
@@ -53,16 +119,17 @@ impl MachineDefinition for Ip12Definition {
     }
 
     fn resolve(&self, draft: &MachineDraft) -> ConfigurationView {
-        let mut projection = Projection::new(draft, self.model_id(), self.display_name());
-        projection.cpu();
-        projection.memory();
-        projection.gio();
-        projection.scsi();
-        projection.serial();
-        projection.parallel_and_ethernet();
-        projection.firmware();
-        projection.finish()
+        self.analyze(draft).view
     }
+}
+
+struct Analysis {
+    view: ConfigurationView,
+    backend: Option<Backend>,
+    memory: Option<Ip12MemoryConfiguration>,
+    gio: Vec<GioAttachment>,
+    scsi: Vec<ScsiAttachment>,
+    resources: ResourceRequirements,
 }
 
 struct Projection<'a> {
@@ -70,6 +137,11 @@ struct Projection<'a> {
     view: ConfigurationView,
     known_properties: BTreeSet<PropertyId>,
     known_slots: BTreeSet<NodeId>,
+    backend: Option<Backend>,
+    memory: Option<Ip12MemoryConfiguration>,
+    gio: Vec<GioAttachment>,
+    scsi: Vec<ScsiAttachment>,
+    resources: ResourceRequirements,
 }
 
 impl<'a> Projection<'a> {
@@ -92,10 +164,15 @@ impl<'a> Projection<'a> {
             view,
             known_properties: BTreeSet::new(),
             known_slots: BTreeSet::new(),
+            backend: None,
+            memory: None,
+            gio: Vec::new(),
+            scsi: Vec::new(),
+            resources: ResourceRequirements::default(),
         }
     }
 
-    fn finish(mut self) -> ConfigurationView {
+    fn finish(mut self) -> Analysis {
         for property in self.draft.properties.keys() {
             if !self.known_properties.contains(property) {
                 self.report(
@@ -114,7 +191,14 @@ impl<'a> Projection<'a> {
                 );
             }
         }
-        self.view
+        Analysis {
+            view: self.view,
+            backend: self.backend,
+            memory: self.memory,
+            gio: self.gio,
+            scsi: self.scsi,
+            resources: self.resources,
+        }
     }
 
     fn report(&mut self, code: &str, target: DiagnosticTarget, message: &str) {
@@ -146,7 +230,12 @@ impl<'a> Projection<'a> {
         let property = property_id(FPU_BACKEND);
         let value = self.required_value(&property, PropertyValue::Text("softfloat".into()));
         match &value {
-            PropertyValue::Text(backend) if backend == "softfloat" || backend == "native" => {}
+            PropertyValue::Text(backend) if backend == "softfloat" => {
+                self.backend = Some(Backend::SoftFloat);
+            }
+            PropertyValue::Text(backend) if backend == "native" => {
+                self.backend = Some(Backend::Native);
+            }
             PropertyValue::Text(_) => self.report(
                 "ip12.property.unsupported-value",
                 DiagnosticTarget::Property(property.clone()),
@@ -186,7 +275,9 @@ impl<'a> Projection<'a> {
             "Memory",
         ));
         let mut populated = false;
-        for bank in ['a', 'b', 'c'] {
+        let mut simm_mib = [0; 3];
+        let mut all_sizes_valid = true;
+        for (index, bank) in ['a', 'b', 'c'].into_iter().enumerate() {
             let bank_id = memory_bank(bank);
             let property = memory_property(bank);
             let default = if bank == 'a' { 2 } else { 0 };
@@ -212,6 +303,11 @@ impl<'a> Projection<'a> {
             };
             if valid_size.is_some_and(|size| size > 0) {
                 populated = true;
+            }
+            if let Some(size) = valid_size {
+                simm_mib[index] = size as u8;
+            } else {
+                all_sizes_valid = false;
             }
             let mut bank_node = node(
                 bank_id.clone(),
@@ -265,6 +361,9 @@ impl<'a> Projection<'a> {
                 "At least one memory bank must contain a supported SIMM capacity.",
             );
         }
+        if populated && all_sizes_valid {
+            self.memory = Ip12MemoryConfiguration::try_from_simm_mib(simm_mib).ok();
+        }
     }
 
     fn gio(&mut self) {
@@ -314,6 +413,10 @@ impl<'a> Projection<'a> {
                 },
             ));
             if supported {
+                self.gio.push(GioAttachment {
+                    slot: GioSlot::Graphics,
+                    device: GioDevice::Lg1,
+                });
                 self.view.nodes.push(node(
                     node_id("gio.0.slot.graphics.device.video.0"),
                     Some(device_id),
@@ -389,7 +492,34 @@ impl<'a> Projection<'a> {
                         let value =
                             self.required_value(&medium, PropertyValue::Text(String::new()));
                         match &value {
-                            PropertyValue::Text(path) if !path.trim().is_empty() => {}
+                            PropertyValue::Text(path) if !path.trim().is_empty() => {
+                                let medium_id = ResourceId::new(format!(
+                                    "scsi.0.target.{target}.lun.{lun}.medium"
+                                ));
+                                self.resources.insert(
+                                    medium_id.clone(),
+                                    ResourceRequirement {
+                                        path: PathBuf::from(path),
+                                        kind: ResourceKind::BlockStorage {
+                                            access: if device == device_kind(SCSI_DISK) {
+                                                BlockStorageAccess::ReadWrite
+                                            } else {
+                                                BlockStorageAccess::ReadOnly
+                                            },
+                                        },
+                                    },
+                                );
+                                self.scsi.push(ScsiAttachment {
+                                    target: target as u8,
+                                    lun: lun as u8,
+                                    device: if device == device_kind(SCSI_DISK) {
+                                        ScsiDevice::Disk
+                                    } else {
+                                        ScsiDevice::Cdrom
+                                    },
+                                    medium: medium_id,
+                                });
+                            }
                             PropertyValue::Text(_) => self.report(
                                 "ip12.scsi.medium-required",
                                 DiagnosticTarget::Property(medium.clone()),
@@ -475,7 +605,15 @@ impl<'a> Projection<'a> {
         let property = property_id(FIRMWARE_PATH);
         let value = self.required_value(&property, PropertyValue::Text(String::new()));
         match &value {
-            PropertyValue::Text(path) if !path.trim().is_empty() => {}
+            PropertyValue::Text(path) if !path.trim().is_empty() => {
+                self.resources.insert(
+                    ResourceId::new("firmware.0.image"),
+                    ResourceRequirement {
+                        path: PathBuf::from(path),
+                        kind: ResourceKind::Bytes,
+                    },
+                );
+            }
             PropertyValue::Text(_) => self.report(
                 "ip12.firmware.image-required",
                 DiagnosticTarget::Property(property.clone()),
@@ -606,6 +744,7 @@ fn error(code: &str, target: DiagnosticTarget, message: &str) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     use se_config::definition::MachineDefinition;
     use se_config::diagnostic::{DiagnosticSeverity, DiagnosticTarget};
@@ -613,6 +752,11 @@ mod tests {
     use se_config::id::{DeviceKindId, MachineModelId, NodeId, PropertyId};
     use se_config::value::PropertyValue;
     use se_config::view::{ConfigurationView, NodeRole, PathKind, PropertyEditor, TopologyNode};
+    use se_device::gio::GioSlot;
+    use se_float::backend::Backend;
+
+    use crate::indigo::ip12::plan::{GioDevice, ScsiDevice};
+    use crate::resource::{BlockStorageAccess, ResourceId, ResourceKind};
 
     use super::{
         FIRMWARE_PATH, FPU_BACKEND, GRAPHICS_SLOT, Ip12Definition, LG1, MODEL, SCSI_CDROM,
@@ -657,6 +801,319 @@ mod tests {
             slot,
             device: device.map(device_kind),
         });
+    }
+
+    fn valid_draft() -> MachineDraft {
+        let mut draft = Ip12Definition.default_draft();
+        set(
+            &mut draft,
+            property_id(FIRMWARE_PATH),
+            PropertyValue::Text("/definitely/not/a/real/prom.bin".into()),
+        );
+        draft
+    }
+
+    fn assert_compile_matches_resolution(draft: &MachineDraft) {
+        let view = Ip12Definition.resolve(draft);
+        let compile_error = Ip12Definition
+            .compile(draft)
+            .expect_err("an invalid draft must not compile");
+        let view_errors: Vec<_> = view
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+            .cloned()
+            .collect();
+        assert!(!view_errors.is_empty());
+        assert_eq!(compile_error.diagnostics(), view_errors);
+        assert!(contains(&view, &node_id(MODEL)));
+    }
+
+    #[test]
+    fn default_compile_requires_firmware_and_nonexistent_path_is_preserved() {
+        let draft = Ip12Definition.default_draft();
+        assert_compile_matches_resolution(&draft);
+        assert!(error(
+            &Ip12Definition.resolve(&draft),
+            "ip12.firmware.image-required",
+            DiagnosticTarget::Property(property_id(FIRMWARE_PATH))
+        ));
+
+        let draft = valid_draft();
+        let plan = Ip12Definition
+            .compile(&draft)
+            .expect("compilation must not inspect the firmware path");
+        assert_eq!(plan.floating_point_backend(), Backend::SoftFloat);
+        assert_eq!(plan.memory().simm_mib(), [2, 0, 0]);
+        assert_eq!(plan.firmware().as_str(), "firmware.0.image");
+        assert_eq!(plan.resources().len(), 1);
+        assert_eq!(
+            plan.resources()
+                .get(plan.firmware())
+                .map(|item| (&item.path, item.kind)),
+            Some((
+                &PathBuf::from("/definitely/not/a/real/prom.bin"),
+                ResourceKind::Bytes
+            ))
+        );
+        assert_eq!(plan.gio().len(), 1);
+        assert_eq!(plan.gio()[0].slot, GioSlot::Graphics);
+        assert_eq!(plan.gio()[0].device, GioDevice::Lg1);
+        assert!(plan.scsi().is_empty());
+    }
+
+    #[test]
+    fn fpu_and_memory_compile_to_existing_hardware_types() {
+        let mut draft = valid_draft();
+        set(
+            &mut draft,
+            property_id(FPU_BACKEND),
+            PropertyValue::Text("native".into()),
+        );
+        set(&mut draft, memory_property('c'), PropertyValue::Integer(8));
+        let plan = Ip12Definition.compile(&draft).expect("valid draft");
+        assert_eq!(plan.floating_point_backend(), Backend::Native);
+        assert_eq!(plan.memory().simm_mib(), [2, 0, 8]);
+
+        for invalid in [
+            PropertyValue::Text("whatever".into()),
+            PropertyValue::Bool(true),
+        ] {
+            set(&mut draft, property_id(FPU_BACKEND), invalid);
+            assert_compile_matches_resolution(&draft);
+        }
+        set(
+            &mut draft,
+            property_id(FPU_BACKEND),
+            PropertyValue::Text("softfloat".into()),
+        );
+        set(
+            &mut draft,
+            memory_property('a'),
+            PropertyValue::Integer(114_514),
+        );
+        assert_compile_matches_resolution(&draft);
+        set(&mut draft, memory_property('a'), PropertyValue::Integer(0));
+        set(&mut draft, memory_property('c'), PropertyValue::Integer(0));
+        assert!(error(
+            &Ip12Definition.resolve(&draft),
+            "ip12.memory.no-installed-bank",
+            DiagnosticTarget::Node(node_id("memory"))
+        ));
+        assert_compile_matches_resolution(&draft);
+    }
+
+    #[test]
+    fn missing_memory_fallback_stays_in_the_view() {
+        let mut draft = valid_draft();
+        let property = memory_property('a');
+        draft.properties.remove(&property);
+        let view = Ip12Definition.resolve(&draft);
+        assert_eq!(value(&view, &property), &PropertyValue::Integer(2));
+        assert!(error(
+            &view,
+            "ip12.property.missing",
+            DiagnosticTarget::Property(property.clone())
+        ));
+        assert!(!draft.properties.contains_key(&property));
+        assert_compile_matches_resolution(&draft);
+    }
+
+    #[test]
+    fn detached_lg1_compiles_to_an_empty_gio_list() {
+        let mut draft = valid_draft();
+        attach(&mut draft, node_id(GRAPHICS_SLOT), None);
+        let plan = Ip12Definition
+            .compile(&draft)
+            .expect("empty graphics slot is valid");
+        assert!(plan.gio().is_empty());
+    }
+
+    #[test]
+    fn multiple_scsi_devices_compile_with_independent_ordered_media() {
+        let mut draft = valid_draft();
+        let devices = [
+            (1, 0, SCSI_DISK, "/this/does/not/exist.img"),
+            (2, 0, SCSI_DISK, "two.img"),
+            (3, 5, SCSI_DISK, "three.img"),
+            (4, 0, SCSI_CDROM, "install.iso"),
+        ];
+        for (target, lun, kind, path) in devices.into_iter().rev() {
+            attach(&mut draft, scsi_lun(target, lun), Some(kind));
+            set(
+                &mut draft,
+                scsi_medium(target, lun),
+                PropertyValue::Text(path.into()),
+            );
+        }
+        let plan = Ip12Definition
+            .compile(&draft)
+            .expect("paths are not opened");
+        assert_eq!(plan.scsi().len(), 4);
+        assert_eq!(plan.resources().len(), 5);
+        for (attachment, (target, lun, kind, path)) in plan.scsi().iter().zip(devices) {
+            assert_eq!(
+                (attachment.target, attachment.lun),
+                (target as u8, lun as u8)
+            );
+            assert_eq!(
+                attachment.device,
+                if kind == SCSI_DISK {
+                    ScsiDevice::Disk
+                } else {
+                    ScsiDevice::Cdrom
+                }
+            );
+            assert_eq!(
+                attachment.medium.as_str(),
+                format!("scsi.0.target.{target}.lun.{lun}.medium")
+            );
+            let resource = plan
+                .resources()
+                .get(&attachment.medium)
+                .expect("each attachment needs a distinct medium role");
+            assert_eq!(resource.path, PathBuf::from(path));
+            assert_eq!(
+                resource.kind,
+                ResourceKind::BlockStorage {
+                    access: if kind == SCSI_DISK {
+                        BlockStorageAccess::ReadWrite
+                    } else {
+                        BlockStorageAccess::ReadOnly
+                    }
+                }
+            );
+        }
+        let roles: Vec<_> = plan.resources().iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(roles[0], "firmware.0.image");
+        assert_eq!(roles[1], "scsi.0.target.1.lun.0.medium");
+        assert_eq!(
+            plan,
+            Ip12Definition.compile(&draft).expect("deterministic plan")
+        );
+    }
+
+    #[test]
+    fn detached_stale_medium_is_ignored_until_reattached() {
+        let mut draft = valid_draft();
+        let slot = scsi_lun(2, 3);
+        let medium = scsi_medium(2, 3);
+        attach(&mut draft, slot.clone(), Some(SCSI_DISK));
+        set(
+            &mut draft,
+            medium.clone(),
+            PropertyValue::Text("stale.img".into()),
+        );
+        let medium_id = ResourceId::new("scsi.0.target.2.lun.3.medium");
+        assert!(Ip12Definition.compile(&draft).is_ok());
+        attach(&mut draft, slot.clone(), None);
+        let detached = Ip12Definition
+            .compile(&draft)
+            .expect("stale path is inactive");
+        assert!(draft.properties.contains_key(&medium));
+        assert!(detached.scsi().is_empty());
+        assert!(detached.resources().get(&medium_id).is_none());
+        set(&mut draft, medium.clone(), PropertyValue::Integer(99));
+        assert!(Ip12Definition.compile(&draft).is_ok());
+        set(&mut draft, medium, PropertyValue::Text("stale.img".into()));
+        attach(&mut draft, slot, Some(SCSI_DISK));
+        let reattached = Ip12Definition
+            .compile(&draft)
+            .expect("stale path is reused");
+        assert_eq!(reattached.scsi().len(), 1);
+        assert_eq!(reattached.scsi()[0].medium, medium_id);
+        assert_eq!(
+            reattached
+                .resources()
+                .get(&medium_id)
+                .map(|item| &item.path),
+            Some(&PathBuf::from("stale.img"))
+        );
+    }
+
+    #[test]
+    fn attached_scsi_medium_must_be_valid_text() {
+        for kind in [SCSI_DISK, SCSI_CDROM] {
+            let mut draft = valid_draft();
+            attach(&mut draft, scsi_lun(1, 0), Some(kind));
+            assert_compile_matches_resolution(&draft);
+            set(
+                &mut draft,
+                scsi_medium(1, 0),
+                PropertyValue::Text("   ".into()),
+            );
+            assert_compile_matches_resolution(&draft);
+            set(&mut draft, scsi_medium(1, 0), PropertyValue::Integer(3));
+            assert_compile_matches_resolution(&draft);
+        }
+    }
+
+    #[test]
+    fn duplicate_host_paths_have_distinct_resource_roles() {
+        let mut draft = valid_draft();
+        for target in [1, 2] {
+            attach(&mut draft, scsi_lun(target, 0), Some(SCSI_DISK));
+            set(
+                &mut draft,
+                scsi_medium(target, 0),
+                PropertyValue::Text("same.img".into()),
+            );
+        }
+        let plan = Ip12Definition
+            .compile(&draft)
+            .expect("path collisions are checked later");
+        assert_ne!(plan.scsi()[0].medium, plan.scsi()[1].medium);
+        for attachment in plan.scsi() {
+            assert_eq!(
+                plan.resources()
+                    .get(&attachment.medium)
+                    .map(|item| &item.path),
+                Some(&PathBuf::from("same.img"))
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_draft_reasons_match_resolved_diagnostics() {
+        let mut model = valid_draft();
+        model.model = MachineModelId("indy".into());
+        assert_compile_matches_resolution(&model);
+
+        let mut unknown_property = valid_draft();
+        set(
+            &mut unknown_property,
+            property_id("unknown.property"),
+            PropertyValue::Bool(true),
+        );
+        assert_compile_matches_resolution(&unknown_property);
+
+        let mut unknown_slot = valid_draft();
+        attach(&mut unknown_slot, node_id("gio.0.slot.99"), Some(LG1));
+        assert_compile_matches_resolution(&unknown_slot);
+
+        let mut unsupported_device = valid_draft();
+        attach(
+            &mut unsupported_device,
+            scsi_lun(1, 0),
+            Some("unsupported.device"),
+        );
+        assert_compile_matches_resolution(&unsupported_device);
+
+        let mut wrong_type = valid_draft();
+        set(
+            &mut wrong_type,
+            memory_property('a'),
+            PropertyValue::Text("2".into()),
+        );
+        assert_compile_matches_resolution(&wrong_type);
+
+        let mut unsupported_value = valid_draft();
+        set(
+            &mut unsupported_value,
+            memory_property('a'),
+            PropertyValue::Integer(114_514),
+        );
+        assert_compile_matches_resolution(&unsupported_value);
     }
 
     #[test]
