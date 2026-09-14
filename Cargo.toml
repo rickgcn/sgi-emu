@@ -37,6 +37,7 @@ serde-big-array = "0.5"
 serde_json = "1"
 sha2 = "0.10"
 se_cli = { path = "crates/se_cli" }
+se_config = { path = "crates/se_config" }
 se_core = { path = "crates/se_core" }
 se_cpu = { path = "crates/se_cpu" }
 se_device = { path = "crates/se_device" }

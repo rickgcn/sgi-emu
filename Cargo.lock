@@ -591,6 +591,7 @@ name = "se_machine"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "se_config",
  "se_core",
  "se_cpu",
  "se_device",
