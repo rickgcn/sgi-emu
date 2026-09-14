@@ -548,19 +548,7 @@ impl<'a> Projection<'a> {
     }
 
     fn serial(&mut self) {
-        for (controller, channels) in [
-            (
-                0,
-                [("a", "Channel A — Keyboard"), ("b", "Channel B — Mouse")],
-            ),
-            (
-                1,
-                [
-                    ("a", "Channel A — Serial Port A"),
-                    ("b", "Channel B — Serial Port B"),
-                ],
-            ),
-        ] {
+        for controller in 0..2 {
             let controller_id = node_id(&format!("serial.{controller}"));
             self.view.nodes.push(node(
                 controller_id.clone(),
@@ -568,13 +556,56 @@ impl<'a> Projection<'a> {
                 NodeRole::Component,
                 format!("Serial Controller {controller}"),
             ));
-            for (channel, label) in channels {
+            for (channel, port_label, device_label) in [
+                (
+                    "a",
+                    if controller == 0 {
+                        "Keyboard Port"
+                    } else {
+                        "Serial Port A"
+                    },
+                    if controller == 0 {
+                        Some("SGI Keyboard")
+                    } else {
+                        None
+                    },
+                ),
+                (
+                    "b",
+                    if controller == 0 {
+                        "Mouse Port"
+                    } else {
+                        "Serial Port B"
+                    },
+                    if controller == 0 {
+                        Some("SGI Mouse")
+                    } else {
+                        None
+                    },
+                ),
+            ] {
+                let channel_id = node_id(&format!("serial.{controller}.channel.{channel}"));
                 self.view.nodes.push(node(
-                    node_id(&format!("serial.{controller}.channel.{channel}")),
+                    channel_id.clone(),
                     Some(controller_id.clone()),
-                    NodeRole::Endpoint,
-                    label,
+                    NodeRole::Component,
+                    format!("Channel {}", channel.to_ascii_uppercase()),
                 ));
+                let port_id = node_id(&format!("serial.{controller}.channel.{channel}.port"));
+                self.view.nodes.push(node(
+                    port_id.clone(),
+                    Some(channel_id),
+                    NodeRole::Endpoint,
+                    port_label,
+                ));
+                if let Some(device_label) = device_label {
+                    self.view.nodes.push(node(
+                        node_id(&format!("serial.{controller}.channel.{channel}.device")),
+                        Some(port_id),
+                        NodeRole::Device,
+                        device_label,
+                    ));
+                }
             }
         }
     }
@@ -1205,11 +1236,11 @@ mod tests {
         }
         assert!(!contains(&view, &scsi_lun(0, 0)));
 
-        for (controller, channel, label) in [
-            (0, "a", "Channel A — Keyboard"),
-            (0, "b", "Channel B — Mouse"),
-            (1, "a", "Channel A — Serial Port A"),
-            (1, "b", "Channel B — Serial Port B"),
+        for (controller, channel, port_label, device_label) in [
+            (0, "a", "Keyboard Port", Some("SGI Keyboard")),
+            (0, "b", "Mouse Port", Some("SGI Mouse")),
+            (1, "a", "Serial Port A", None),
+            (1, "b", "Serial Port B", None),
         ] {
             let id = node_id(&format!("serial.{controller}.channel.{channel}"));
             let channel_node = node(&view, &id);
@@ -1217,8 +1248,27 @@ mod tests {
                 channel_node.parent,
                 Some(node_id(&format!("serial.{controller}")))
             );
-            assert_eq!(channel_node.role, NodeRole::Endpoint);
-            assert_eq!(channel_node.label, label);
+            assert_eq!(channel_node.role, NodeRole::Component);
+            assert_eq!(
+                channel_node.label,
+                format!("Channel {}", channel.to_ascii_uppercase())
+            );
+            let port = node(
+                &view,
+                &node_id(&format!("serial.{controller}.channel.{channel}.port")),
+            );
+            assert_eq!(port.parent, Some(id.clone()));
+            assert_eq!(port.role, NodeRole::Endpoint);
+            assert_eq!(port.label, port_label);
+            if let Some(label) = device_label {
+                let device = node(
+                    &view,
+                    &node_id(&format!("serial.{controller}.channel.{channel}.device")),
+                );
+                assert_eq!(device.parent, Some(port.id.clone()));
+                assert_eq!(device.role, NodeRole::Device);
+                assert_eq!(device.label, label);
+            }
         }
         assert_eq!(node(&view, &node_id("parallel.0")).role, NodeRole::Endpoint);
         assert_eq!(

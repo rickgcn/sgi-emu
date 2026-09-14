@@ -1,84 +1,146 @@
-//! Frontend-neutral inputs accepted by emulated machines.
+//! Typed frontend-neutral inputs accepted by emulated machines.
 
 use std::fmt;
 
-use se_device::sgi_keyboard::SgiKey;
-use se_device::sgi_mouse::SgiMouseButton;
 use serde::{Deserialize, Serialize};
 
-use crate::serial::SerialPort;
+use crate::endpoint::{EndpointKey, EndpointKind};
 
 const MAX_ETHERNET_FRAME_BYTES: usize = 16_384;
 
-/// One input submitted at a deterministic machine boundary.
-///
-/// Keyboard and mouse button variants contain validated physical identifiers.
-/// Byte-oriented frontends can construct them without depending on device
-/// types by using [`Self::sgi_keyboard`] and [`Self::sgi_mouse_button`].
+/// One physical or logical key supported by the frontend.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum KeyboardKey {
+    /// An uppercase ASCII letter, A through Z.
+    Letter(u8),
+    /// A main-row digit, zero through nine.
+    Digit(u8),
+    /// A keypad digit, zero through nine.
+    KeypadDigit(u8),
+    /// A function key, F1 through F12.
+    Function(u8),
+    /// A named key that is not a letter, digit, or function key.
+    Named(KeyboardNamedKey),
+}
+
+/// Named frontend keyboard keys.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum KeyboardNamedKey {
+    LeftControl,
+    RightControl,
+    LeftShift,
+    RightShift,
+    LeftAlt,
+    RightAlt,
+    CapsLock,
+    Escape,
+    Tab,
+    Enter,
+    Backspace,
+    Delete,
+    Space,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Insert,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    PrintScreen,
+    ScrollLock,
+    Pause,
+    NumLock,
+    Semicolon,
+    Comma,
+    Minus,
+    LeftBracket,
+    RightBracket,
+    Apostrophe,
+    Period,
+    Slash,
+    Equal,
+    Grave,
+    Backslash,
+    KeypadPeriod,
+    KeypadMinus,
+    KeypadPlus,
+    KeypadSlash,
+    KeypadAsterisk,
+    KeypadEnter,
+}
+
+/// One physical pointer button.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PointerButton {
+    Left,
+    Middle,
+    Right,
+}
+
+/// Strongly typed input data carried to one endpoint.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum MachineInput {
-    /// One byte arriving at an external serial port.
-    SerialByte {
-        /// External serial port.
-        port: SerialPort,
-        /// Received byte.
-        value: u8,
+pub enum MachineInputPayload {
+    SerialByte(u8),
+    Keyboard {
+        key: KeyboardKey,
+        pressed: bool,
     },
-    /// One Ethernet frame arriving before MAC filtering.
+    PointerMotion {
+        delta_x: i32,
+        delta_y: i32,
+    },
+    PointerButton {
+        button: PointerButton,
+        pressed: bool,
+    },
     EthernetFrame {
-        /// Frame bytes with a bounded serialized allocation.
         #[serde(deserialize_with = "deserialize_ethernet_frame")]
         bytes: Vec<u8>,
     },
-    /// One physical SGI keyboard key state.
-    SgiKeyboard {
-        /// Physical keyboard key.
-        key: SgiKey,
-        /// Whether the key is pressed.
-        pressed: bool,
-    },
-    /// Relative SGI mouse motion in guest coordinates.
-    SgiMouseMotion {
-        /// Horizontal displacement, positive to the right.
-        delta_x: i32,
-        /// Vertical displacement, positive upward.
-        delta_y: i32,
-    },
-    /// One physical SGI mouse button state.
-    SgiMouseButton {
-        /// Physical mouse button.
-        button: SgiMouseButton,
-        /// Whether the button is pressed.
-        pressed: bool,
-    },
+}
+
+impl MachineInputPayload {
+    /// Returns the endpoint payload family required by this input.
+    #[must_use]
+    pub const fn kind(&self) -> EndpointKind {
+        match self {
+            Self::SerialByte(_) => EndpointKind::Serial,
+            Self::Keyboard { .. } => EndpointKind::Keyboard,
+            Self::PointerMotion { .. } | Self::PointerButton { .. } => EndpointKind::Pointer,
+            Self::EthernetFrame { .. } => EndpointKind::Ethernet,
+        }
+    }
+}
+
+/// One input submitted at a deterministic machine boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MachineInput {
+    endpoint: EndpointKey,
+    payload: MachineInputPayload,
 }
 
 impl MachineInput {
-    /// Creates a validated physical SGI keyboard transition from a protocol
-    /// key code.
+    /// Constructs one typed input for an opaque machine endpoint.
     #[must_use]
-    pub fn sgi_keyboard(code: u8, pressed: bool) -> Option<Self> {
-        let key = SgiKey::try_from(code).ok()?;
-        Some(Self::SgiKeyboard { key, pressed })
+    pub fn new(endpoint: EndpointKey, payload: MachineInputPayload) -> Self {
+        Self { endpoint, payload }
     }
 
-    /// Creates a validated physical SGI mouse button transition from a
-    /// frontend-neutral button code.
-    ///
-    /// Button codes are zero for left, one for middle, and two for right.
+    /// Returns the destination endpoint.
     #[must_use]
-    pub fn sgi_mouse_button(code: u8, pressed: bool) -> Option<Self> {
-        let button = match code {
-            0 => SgiMouseButton::Left,
-            1 => SgiMouseButton::Middle,
-            2 => SgiMouseButton::Right,
-            _ => return None,
-        };
-        Some(Self::SgiMouseButton { button, pressed })
+    pub const fn endpoint(&self) -> &EndpointKey {
+        &self.endpoint
+    }
+
+    /// Returns the typed input data.
+    #[must_use]
+    pub const fn payload(&self) -> &MachineInputPayload {
+        &self.payload
     }
 }
 
-/// Bounds Ethernet allocation before accepting a serialized sequence length.
 fn deserialize_ethernet_frame<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<u8>, D::Error> {
@@ -121,39 +183,18 @@ fn deserialize_ethernet_frame<'de, D: serde::Deserializer<'de>>(
 
 #[cfg(test)]
 mod tests {
-    use se_device::sgi_keyboard::SgiKey;
-
-    use super::{MAX_ETHERNET_FRAME_BYTES, MachineInput};
-
-    #[test]
-    fn keyboard_constructor_accepts_exactly_the_device_key_codes() {
-        for code in u8::MIN..=u8::MAX {
-            assert_eq!(
-                MachineInput::sgi_keyboard(code, true).is_some(),
-                SgiKey::try_from(code).is_ok(),
-                "unexpected validation result for key code {code}"
-            );
-        }
-    }
-
-    #[test]
-    fn mouse_button_constructor_accepts_exactly_three_buttons() {
-        for code in u8::MIN..=u8::MAX {
-            assert_eq!(
-                MachineInput::sgi_mouse_button(code, true).is_some(),
-                code <= 2,
-                "unexpected validation result for mouse button code {code}"
-            );
-        }
-    }
+    use super::{MAX_ETHERNET_FRAME_BYTES, MachineInput, MachineInputPayload};
+    use crate::endpoint::EndpointKey;
 
     #[test]
     fn serialized_ethernet_input_rejects_an_oversize_allocation() {
-        let input = MachineInput::EthernetFrame {
-            bytes: vec![0; MAX_ETHERNET_FRAME_BYTES + 1],
-        };
+        let input = MachineInput::new(
+            EndpointKey::new("ethernet.0"),
+            MachineInputPayload::EthernetFrame {
+                bytes: vec![0; MAX_ETHERNET_FRAME_BYTES + 1],
+            },
+        );
         let encoded = bincode::serde::encode_to_vec(&input, bincode::config::standard()).unwrap();
-
         assert!(
             bincode::serde::decode_from_slice::<MachineInput, _>(
                 &encoded,

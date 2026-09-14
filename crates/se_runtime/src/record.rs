@@ -30,7 +30,7 @@ use crc32fast::hash as crc32;
 use se_config::draft::MachineDraft;
 use se_core::storage::{StorageAccess, StorageMedium};
 use se_core::time::VirtualInstant;
-use se_machine::input::MachineInput;
+use se_machine::input::{MachineInput, MachineInputPayload};
 use se_machine::machine::{MachineNonvolatileState, MachineSnapshot};
 use se_machine::resource::{ResourceId, ResourceKind};
 use serde::de::DeserializeOwned;
@@ -421,7 +421,7 @@ impl Recorder {
         position: ExecutionPosition,
         input: &MachineInput,
     ) -> Result<(), RecordError> {
-        if matches!(input, MachineInput::EthernetFrame { bytes } if bytes.len() > MAX_ETHERNET_FRAME_BYTES)
+        if matches!(input.payload(), MachineInputPayload::EthernetFrame { bytes } if bytes.len() > MAX_ETHERNET_FRAME_BYTES)
         {
             return Err(invalid_record(
                 "Ethernet frame exceeds its allocation bound",
@@ -1680,9 +1680,10 @@ mod tests {
     use se_core::time::VirtualInstant;
     use se_device::gio::GioBus;
     use se_float::backend::Backend;
+    use se_machine::endpoint::EndpointKind;
     use se_machine::indigo::ip12::definition::Ip12Definition;
     use se_machine::indigo::ip12::{Ip12, Ip12NonvolatileState, Ip12NonvolatileStateParts};
-    use se_machine::input::MachineInput;
+    use se_machine::input::{MachineInput, MachineInputPayload};
     use se_machine::machine::{Machine, MachineNonvolatileState};
     use se_machine::resource::{ResourceId, ResourceKind};
 
@@ -1700,14 +1701,38 @@ mod tests {
 
     #[test]
     fn ethernet_timeline_rejects_oversize_length_before_allocating() {
-        let frame = super::TimelineAction::MachineInput(MachineInput::EthernetFrame {
-            bytes: vec![0; super::MAX_ETHERNET_FRAME_BYTES + 1],
-        });
+        let machine = Machine::IndigoIp12(
+            Ip12::new(
+                vec![0; 0x40000],
+                Backend::SoftFloat,
+                GioBus::new(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let ethernet = machine
+            .endpoint_catalog()
+            .endpoints()
+            .iter()
+            .find(|descriptor| descriptor.kind() == EndpointKind::Ethernet)
+            .unwrap()
+            .key()
+            .clone();
+        let frame = super::TimelineAction::MachineInput(MachineInput::new(
+            ethernet.clone(),
+            MachineInputPayload::EthernetFrame {
+                bytes: vec![0; super::MAX_ETHERNET_FRAME_BYTES + 1],
+            },
+        ));
         let encoded = super::encode_value(&frame, "Ethernet input").unwrap();
         assert!(super::decode_value::<super::TimelineAction>(&encoded, "Ethernet input").is_err());
-        let frame = super::TimelineAction::MachineInput(MachineInput::EthernetFrame {
-            bytes: vec![0xff; 60],
-        });
+        let frame = super::TimelineAction::MachineInput(MachineInput::new(
+            ethernet,
+            MachineInputPayload::EthernetFrame {
+                bytes: vec![0xff; 60],
+            },
+        ));
         let encoded = super::encode_value(&frame, "Ethernet input").unwrap();
         assert_eq!(
             super::decode_value::<super::TimelineAction>(&encoded, "Ethernet input").unwrap(),

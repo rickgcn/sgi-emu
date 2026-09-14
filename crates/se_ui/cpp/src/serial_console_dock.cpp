@@ -3,7 +3,8 @@
 #include "se_ui/src/bridge.rs.h"
 #include "se_ui/vt100_widget.h"
 
-#include <QString>
+#include <QLabel>
+#include <QStackedWidget>
 #include <QTabWidget>
 
 #include <cstddef>
@@ -11,47 +12,63 @@
 
 namespace se_ui {
 
-SerialConsoleDock::SerialConsoleDock(
-    const UiSession& session,
-    StatusHandler status_handler,
-    QWidget* parent)
+SerialConsoleDock::SerialConsoleDock(const UiSession& session, StatusHandler status_handler, QWidget* parent)
     : QDockWidget(QStringLiteral("Serial Console"), parent)
     , session_(session)
     , status_handler_(std::move(status_handler))
-    , serial_a_(new Vt100Widget(this))
-    , serial_b_(new Vt100Widget(this))
+    , stack_(new QStackedWidget(this))
+    , empty_(new QLabel(QStringLiteral("No serial ports"), stack_))
+    , tabs_(new QTabWidget(stack_))
+    , terminals_()
     , input_enabled_(true) {
     setObjectName(QStringLiteral("SerialConsoleDock"));
-    serial_a_->set_input_handler(
-        [this](const auto& bytes) { send_serial(SerialPortDto::A, bytes); });
-    serial_b_->set_input_handler(
-        [this](const auto& bytes) { send_serial(SerialPortDto::B, bytes); });
+    empty_->setAlignment(Qt::AlignCenter);
+    stack_->addWidget(empty_);
+    stack_->addWidget(tabs_);
+    stack_->setCurrentWidget(empty_);
+    setWidget(stack_);
+}
 
-    auto* tabs = new QTabWidget(this);
-    tabs->addTab(serial_a_, QStringLiteral("Serial A"));
-    tabs->addTab(serial_b_, QStringLiteral("Serial B"));
-    setWidget(tabs);
+void SerialConsoleDock::rebuild(const EndpointCatalogDto& catalog) {
+    while (tabs_->count() != 0) {
+        auto* widget = tabs_->widget(0);
+        tabs_->removeTab(0);
+        delete widget;
+    }
+    terminals_.clear();
+    for (const auto& descriptor : catalog.endpoints) {
+        if (descriptor.kind != EndpointKindDto::Serial) {
+            continue;
+        }
+        const auto identity = endpoint_identity(descriptor.handle);
+        auto* terminal = new Vt100Widget(tabs_);
+        terminal->set_input_handler([this, identity](const auto& bytes) { send_serial(identity, bytes); });
+        tabs_->addTab(terminal, QString::fromUtf8(descriptor.label.data(), static_cast<qsizetype>(descriptor.label.size())));
+        terminals_.emplace_back(identity, terminal);
+    }
+    stack_->setCurrentWidget(terminals_.empty() ? static_cast<QWidget*>(empty_) : static_cast<QWidget*>(tabs_));
 }
 
 void SerialConsoleDock::set_input_enabled(bool enabled) {
     input_enabled_ = enabled;
 }
 
-void SerialConsoleDock::append_serial(
-    const std::vector<std::uint8_t>& serial_a,
-    const std::vector<std::uint8_t>& serial_b) {
-    serial_a_->feed(serial_a);
-    serial_b_->feed(serial_b);
+void SerialConsoleDock::append_serial(std::uint64_t generation, rust::Str key, const std::vector<std::uint8_t>& bytes) {
+    const EndpointIdentity identity{generation, std::string(key.data(), key.size())};
+    for (const auto& [candidate, terminal] : terminals_) {
+        if (candidate == identity) {
+            terminal->feed(bytes);
+            return;
+        }
+    }
 }
 
-void SerialConsoleDock::send_serial(
-    SerialPortDto port,
-    const std::vector<std::uint8_t>& bytes) const {
+void SerialConsoleDock::send_serial(const EndpointIdentity& identity, const std::vector<std::uint8_t>& bytes) const {
     if (bytes.empty() || !input_enabled_) {
         return;
     }
-    const auto status = session_.send_serial(
-        port, rust::Slice<const std::uint8_t>(bytes.data(), bytes.size()));
+    const auto handle = endpoint_handle_dto(identity);
+    const auto status = session_.send_serial(handle, rust::Slice<const std::uint8_t>(bytes.data(), bytes.size()));
     if (status_handler_) {
         status_handler_(status);
     }

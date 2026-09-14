@@ -1,14 +1,21 @@
 #pragma once
 
+#include "se_ui/endpoint_identity.h"
+
 #include <QDockWidget>
 
 #include <cstdint>
 #include <functional>
+#include <utility>
 #include <vector>
+
+class QLabel;
+class QStackedWidget;
+class QTabWidget;
 
 namespace se_ui {
 
-enum class SerialPortDto : std::uint8_t;
+struct EndpointCatalogDto;
 struct RuntimeStatusDto;
 struct UiSession;
 class Vt100Widget;
@@ -17,23 +24,21 @@ class SerialConsoleDock final : public QDockWidget {
 public:
     using StatusHandler = std::function<void(const RuntimeStatusDto&)>;
 
-    SerialConsoleDock(
-        const UiSession& session,
-        StatusHandler status_handler,
-        QWidget* parent = nullptr);
+    SerialConsoleDock(const UiSession& session, StatusHandler status_handler, QWidget* parent = nullptr);
 
-    void append_serial(
-        const std::vector<std::uint8_t>& serial_a,
-        const std::vector<std::uint8_t>& serial_b);
+    void rebuild(const EndpointCatalogDto& catalog);
+    void append_serial(std::uint64_t generation, rust::Str key, const std::vector<std::uint8_t>& bytes);
     void set_input_enabled(bool enabled);
 
 private:
-    void send_serial(SerialPortDto port, const std::vector<std::uint8_t>& bytes) const;
+    void send_serial(const EndpointIdentity& identity, const std::vector<std::uint8_t>& bytes) const;
 
     const UiSession& session_;
     StatusHandler status_handler_;
-    Vt100Widget* serial_a_;
-    Vt100Widget* serial_b_;
+    QStackedWidget* stack_;
+    QLabel* empty_;
+    QTabWidget* tabs_;
+    std::vector<std::pair<EndpointIdentity, Vt100Widget*>> terminals_;
     bool input_enabled_;
 };
 

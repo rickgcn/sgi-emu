@@ -1,8 +1,8 @@
 use se_core::time::VirtualDuration;
 use se_device::z85230::Channel;
 
+use crate::endpoint::EndpointKey;
 use crate::output::MachineOutput;
-use crate::serial::SerialPort;
 
 use super::super::events::EventKind;
 use super::Ip12Bus;
@@ -30,11 +30,11 @@ impl Ip12Bus {
                 EventKind::Serial0 => self.synchronize_serial_time(0, |_, _| {}),
                 EventKind::Serial1 => {
                     self.synchronize_serial_time(1, |channel, value| {
-                        let port = match channel {
-                            Channel::A => SerialPort::A,
-                            Channel::B => SerialPort::B,
+                        let key = match channel {
+                            Channel::A => EndpointKey::new("serial.external.a"),
+                            Channel::B => EndpointKey::new("serial.external.b"),
                         };
-                        output.push_serial(port, value);
+                        output.push_serial(key, value);
                     });
                 }
                 EventKind::Scsi => {
@@ -57,10 +57,10 @@ impl Ip12Bus {
             }
         }
         for frame in self.ethernet_output.drain(..) {
-            output.push_ethernet(frame);
+            output.push_ethernet(EndpointKey::new("ethernet.0"), frame);
         }
         if let Some(video) = self.take_video_output_update() {
-            output.publish_video(video);
+            output.publish_video(EndpointKey::new("video.0"), video);
         }
     }
 
@@ -245,8 +245,8 @@ mod tests {
     use se_device::sgi_mouse::SgiMouseButton;
     use se_device::z85230::Channel;
 
+    use crate::endpoint::EndpointKey;
     use crate::output::MachineOutput;
-    use crate::serial::SerialPort;
 
     use super::super::address::{
         GIO_GRAPHICS_BASE, HPC1_COUNTER_BASE, HPC1_ETHERNET_TIMER_BASE, INT2_BASE, PIC1_BASE,
@@ -946,8 +946,15 @@ mod tests {
         assert!(output.is_empty());
         bus.advance_time(VirtualDuration::from_attoseconds(1), &mut output);
 
-        assert_eq!(output.serial(SerialPort::A), [0x22]);
-        assert!(output.serial(SerialPort::B).is_empty());
+        assert_eq!(
+            output.serial(&EndpointKey::new("serial.external.a")),
+            [0x22]
+        );
+        assert!(
+            output
+                .serial(&EndpointKey::new("serial.external.b"))
+                .is_empty()
+        );
     }
 
     #[test]

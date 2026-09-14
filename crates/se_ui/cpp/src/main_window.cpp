@@ -5,7 +5,7 @@
 #include "se_ui/debugger/memory_dock.h"
 #include "se_ui/debugger/registers_dock.h"
 #include "se_ui/debugger/tlb_dock.h"
-#include "se_ui/display_widget.h"
+#include "se_ui/display_workspace.h"
 #include "se_ui/machine_output_sink.h"
 #include "se_ui/serial_console_dock.h"
 #include "se_ui/src/bridge.rs.h"
@@ -34,6 +34,7 @@
 #include <chrono>
 #include <functional>
 #include <future>
+#include <limits>
 
 namespace se_ui {
 namespace {
@@ -96,7 +97,8 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , cache_dock_(nullptr)
     , memory_dock_(nullptr)
     , serial_console_dock_(nullptr)
-    , display_widget_(new DisplayWidget(session, this))
+    , display_workspace_(new DisplayWorkspace(session, this))
+    , last_endpoint_generation_(std::numeric_limits<std::uint64_t>::max())
     , machine_output_sink_()
     , update_timer_(new QTimer(this))
     , notification_timer_(new QTimer(this))
@@ -117,7 +119,7 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , runtime_status_(new QLabel(this)) {
     setObjectName(QStringLiteral("MainWindow"));
     setWindowTitle(QStringLiteral("sgi-emu"));
-    setCentralWidget(display_widget_);
+    setCentralWidget(display_workspace_);
     resize(1100, 720);
 
     create_actions();
@@ -129,7 +131,7 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     restore_window_state(startup);
 
     machine_output_sink_ =
-        std::make_shared<MachineOutputSink>(serial_console_dock_, display_widget_);
+        std::make_shared<MachineOutputSink>(serial_console_dock_, display_workspace_);
     apply_runtime_status(session_.attach_machine_output(machine_output_sink_), true);
 
     connect(update_timer_, &QTimer::timeout, this, &MainWindow::update_runtime);
@@ -158,8 +160,8 @@ UiExitState MainWindow::exit_state() const {
 }
 
 bool MainWindow::event(QEvent* event) {
-    if (event->type() == QEvent::WindowDeactivate && display_widget_ != nullptr) {
-        display_widget_->release_input();
+    if (event->type() == QEvent::WindowDeactivate && display_workspace_ != nullptr) {
+        display_workspace_->release_input();
     }
     return QMainWindow::event(event);
 }
@@ -323,7 +325,7 @@ void MainWindow::begin_preparation(
         session_.pause_machine();
     }
     serial_console_dock_->set_input_enabled(false);
-    display_widget_->set_input_enabled(false);
+    display_workspace_->set_input_enabled(false);
     preparation_state_ = state;
     preparation_stops_replay_ = stops_replay;
     preparation_task_ = std::make_unique<PreparationTask>(std::move(command));
@@ -474,7 +476,7 @@ void MainWindow::apply_preparation_state() {
     disassembly_dock_->setEnabled(false);
     memory_dock_->setEnabled(false);
     serial_console_dock_->set_input_enabled(false);
-    display_widget_->set_input_enabled(false);
+    display_workspace_->set_input_enabled(false);
     if (preparation_state_ == PreparationState::Recording) {
         session_status_->setText(QStringLiteral("Preparing recording..."));
     } else if (preparation_state_ == PreparationState::ReplaySnapshot) {
@@ -673,6 +675,21 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
 
     update_performance_status(status);
 
+    if (status.machine_generation != last_endpoint_generation_) {
+        const auto catalog = session_.endpoint_catalog();
+        if (catalog.success) {
+            serial_console_dock_->rebuild(catalog);
+            display_workspace_->rebuild(catalog);
+            last_endpoint_generation_ = catalog.generation;
+            const auto refreshed = session_.refresh_outputs();
+            if (!refreshed.success) {
+                show_notification(QStringLiteral("Error: %1").arg(from_rust_string(refreshed.command_error)), 5000);
+            }
+        } else {
+            show_notification(QStringLiteral("Error: %1").arg(from_rust_string(catalog.error)), 5000);
+        }
+    }
+
     const bool configured = status.state != 0;
     const bool paused = status.state == 1;
     const bool running = status.state == 2;
@@ -693,7 +710,7 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
     stop_replay_action_->setEnabled(replay_session);
     settings_action_->setEnabled(normal_session);
     serial_console_dock_->set_input_enabled(!replay_session);
-    display_widget_->set_input_enabled(configured && !replay_session);
+    display_workspace_->set_input_enabled(configured && !replay_session);
 
     const auto session_error = from_rust_string(status.session_error);
     const auto session_error_utf8 = session_error.toUtf8();
