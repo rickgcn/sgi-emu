@@ -6,10 +6,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
-use se_config::definition::MachineDefinition;
 use se_config::draft::MachineDraft;
-use se_machine::indigo::ip12::definition::Ip12Definition;
 use se_network::config::{NatConfig, PortForwardRule, TransportProtocol};
+use se_session::machine::default_machine_draft;
 use se_ui::bridge::ffi::{NetworkConfiguration, NetworkForwardRule, UiExitState, UiStartupState};
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +22,7 @@ pub struct ApplicationConfig {
 impl Default for ApplicationConfig {
     fn default() -> Self {
         Self {
-            machine: Ip12Definition.default_draft(),
+            machine: default_machine_draft(),
             network: NatConfig::default(),
             ui: UiConfig::default(),
         }
@@ -186,23 +185,16 @@ mod tests {
     };
 
     #[test]
-    fn default_configuration_uses_an_ip12_draft() {
+    fn default_configuration_uses_the_session_draft() {
         let config = ApplicationConfig::default();
-        assert_eq!(config.machine.model.0, "indigo-ip12");
-        assert_eq!(
-            config
-                .machine
-                .properties
-                .get(&PropertyId(String::from("firmware.0.image-path"))),
-            Some(&PropertyValue::Text(String::new()))
-        );
+        assert_eq!(config.machine, se_session::machine::default_machine_draft());
     }
 
     #[test]
     fn machine_draft_round_trips_without_a_ui_projection() {
         let mut config = ApplicationConfig::default();
         config.machine.apply(Edit::SetProperty {
-            property: PropertyId(String::from("firmware.0.image-path")),
+            property: PropertyId(String::from("test.opaque")),
             value: PropertyValue::Text(String::from("prom.bin")),
         });
         let serialized = toml::to_string(&config).unwrap();
@@ -273,7 +265,7 @@ mod tests {
         let mut config = ApplicationConfig::default();
         save(&path, &config).unwrap();
         config.machine.apply(Edit::SetProperty {
-            property: PropertyId(String::from("firmware.0.image-path")),
+            property: PropertyId(String::from("test.opaque")),
             value: PropertyValue::Text(String::from("replacement.bin")),
         });
         save(&path, &config).unwrap();

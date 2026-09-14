@@ -7,8 +7,11 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+directories.workspace = true
+serde.workspace = true
+se_config.workspace = true
 se_core.workspace = true
 se_machine.workspace = true
-
-[dev-dependencies]
-se_config.workspace = true
+se_network.workspace = true
+se_runtime.workspace = true
+toml.workspace = true

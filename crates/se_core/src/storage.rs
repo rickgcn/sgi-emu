@@ -1,10 +1,11 @@
 //! Shared fixed-capacity byte-range storage contracts.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io;
 
 /// The access granted to a storage medium.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum StorageAccess {
     /// The medium is read without writes.
     ReadOnly,

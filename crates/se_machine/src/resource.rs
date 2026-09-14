@@ -6,12 +6,14 @@ use std::fmt;
 use std::path::PathBuf;
 
 use se_core::storage::{StorageAccess, StorageMedium};
+use serde::{Deserialize, Serialize};
 
 /// A stable resource role within one build plan.
 ///
 /// The role identifies a topology location, not a host file or a device
 /// instance. Moving a device to another location may change its resource ID.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct ResourceId(String);
 
 impl ResourceId {
@@ -29,7 +31,7 @@ impl ResourceId {
 }
 
 /// The kind of host resource a later preparation step must provide.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ResourceKind {
     /// A complete byte image, such as firmware.
     Bytes,

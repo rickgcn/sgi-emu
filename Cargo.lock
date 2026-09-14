@@ -409,16 +409,11 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "se_config",
- "se_core",
- "se_device",
- "se_float",
- "se_machine",
  "se_network",
  "se_runtime",
  "se_session",
  "se_ui",
  "serde",
- "sha2",
  "toml",
 ]
 
@@ -494,6 +489,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "crc32fast",
+ "se_config",
  "se_core",
  "se_device",
  "se_float",
@@ -508,9 +504,14 @@ dependencies = [
 name = "se_session"
 version = "0.1.0"
 dependencies = [
+ "directories",
  "se_config",
  "se_core",
  "se_machine",
+ "se_network",
+ "se_runtime",
+ "serde",
+ "toml",
 ]
 
 [[package]]

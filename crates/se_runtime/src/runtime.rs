@@ -15,6 +15,7 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::mem;
+use std::ops::Deref;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 
@@ -203,8 +204,22 @@ impl Error for ShutdownError {}
 
 /// Host-side execution runtime.
 pub struct Runtime {
-    command_sender: Option<Sender<Command>>,
+    handle: RuntimeHandle,
     worker: Option<JoinHandle<()>>,
+}
+
+/// Cloneable command surface that does not own the worker lifetime.
+#[derive(Clone)]
+pub struct RuntimeHandle {
+    command_sender: Sender<Command>,
+}
+
+impl Deref for Runtime {
+    type Target = RuntimeHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
 }
 
 impl Runtime {
@@ -221,7 +236,7 @@ impl Runtime {
             })?;
 
         let runtime = Self {
-            command_sender: Some(command_sender),
+            handle: RuntimeHandle { command_sender },
             worker: Some(worker),
         };
         if let Some(machine) = machine {
@@ -235,6 +250,43 @@ impl Runtime {
         Self::new(None)
     }
 
+    /// Returns a cloneable control surface for the worker.
+    #[must_use]
+    pub fn handle(&self) -> RuntimeHandle {
+        self.handle.clone()
+    }
+
+    /// Requests shutdown and waits for the worker to exit.
+    pub fn shutdown(mut self) -> Result<Option<MachineNonvolatileState>, ShutdownError> {
+        self.shutdown_inner()
+    }
+
+    fn shutdown_inner(&mut self) -> Result<Option<MachineNonvolatileState>, ShutdownError> {
+        if self.worker.is_none() {
+            return Ok(None);
+        }
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        let state_unavailable = self
+            .handle
+            .command_sender
+            .send(Command::Shutdown(reply_sender))
+            .is_err();
+        let final_state = if state_unavailable {
+            None
+        } else {
+            reply_receiver.recv().ok()
+        };
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| ShutdownError::WorkerPanicked)?;
+        }
+        if state_unavailable {
+            return Err(ShutdownError::WorkerUnavailable);
+        }
+        final_state.ok_or(ShutdownError::WorkerUnavailable)
+    }
+}
+
+impl RuntimeHandle {
     /// Replaces the current machine and leaves execution paused at reset.
     ///
     /// # Errors
@@ -376,8 +428,6 @@ impl Runtime {
     /// available.
     pub fn send_input(&self, input: MachineInput) -> Result<(), RuntimeError> {
         self.command_sender
-            .as_ref()
-            .ok_or(RuntimeError::WorkerUnavailable)?
             .send(Command::MachineInput(input))
             .map_err(|_| RuntimeError::WorkerUnavailable)
     }
@@ -405,21 +455,12 @@ impl Runtime {
         self.request(Command::ClearOutputHandler)
     }
 
-    /// Requests shutdown and waits for the worker to exit.
-    pub fn shutdown(mut self) -> Result<Option<MachineNonvolatileState>, ShutdownError> {
-        self.shutdown_inner()
-    }
-
     fn request<T>(
         &self,
         make_command: impl FnOnce(CommandReply<T>) -> Command,
     ) -> Result<T, RuntimeError> {
-        let sender = self
-            .command_sender
-            .as_ref()
-            .ok_or(RuntimeError::WorkerUnavailable)?;
         let (reply_sender, reply_receiver) = mpsc::channel();
-        sender
+        self.command_sender
             .send(make_command(reply_sender))
             .map_err(|_| RuntimeError::WorkerUnavailable)?;
         reply_receiver
@@ -428,32 +469,6 @@ impl Runtime {
             .map_err(|rejection| RuntimeError::CommandRejected {
                 reason: rejection.reason,
             })
-    }
-
-    fn shutdown_inner(&mut self) -> Result<Option<MachineNonvolatileState>, ShutdownError> {
-        let mut final_state = None;
-        let mut state_unavailable = false;
-        if let Some(command_sender) = self.command_sender.take() {
-            let (reply_sender, reply_receiver) = mpsc::channel();
-            if command_sender
-                .send(Command::Shutdown(reply_sender))
-                .is_err()
-            {
-                state_unavailable = true;
-            } else {
-                match reply_receiver.recv() {
-                    Ok(state) => final_state = state,
-                    Err(_) => state_unavailable = true,
-                }
-            }
-        }
-        if let Some(worker) = self.worker.take() {
-            worker.join().map_err(|_| ShutdownError::WorkerPanicked)?;
-        }
-        if state_unavailable {
-            return Err(ShutdownError::WorkerUnavailable);
-        }
-        Ok(final_state)
     }
 }
 
@@ -1772,6 +1787,7 @@ fn send_reply<T>(reply: CommandReply<T>, result: Result<T, CommandRejection>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::env;
     use std::fs;
@@ -1780,19 +1796,21 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
 
+    use se_config::definition::MachineDefinition;
     use se_core::storage::StorageMedium;
     use se_core::time::ATTOSECONDS_PER_SECOND;
     use se_device::gio::{GioBus, GioSlot};
     use se_device::lg1::Lg1;
     use se_float::backend::Backend;
-    use se_machine::indigo::GraphicsBoard;
     use se_machine::indigo::ip12::debug::{DebugRequest, DebugResponse, MemoryAddressSpace};
+    use se_machine::indigo::ip12::definition::Ip12Definition;
     use se_machine::indigo::ip12::{
         Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12NonvolatileStateParts,
     };
     use se_machine::input::MachineInput;
-    use se_machine::machine::{Machine, MachineNonvolatileState, MachineStartupConfiguration};
+    use se_machine::machine::{Machine, MachineNonvolatileState};
     use se_machine::output::{VideoFrame, VideoOutput};
+    use se_machine::resource::ResourceId;
     use se_machine::serial::SerialPort;
     use sha2::{Digest, Sha256};
 
@@ -1800,9 +1818,7 @@ mod tests {
         CpuClock, Runtime, RuntimeConfiguration, RuntimeError, checkpoint_digest, serial_port_index,
     };
     use crate::control::{RuntimeMode, RuntimeState};
-    use crate::record::{
-        ExecutionPosition, MediaIdentity, RecordManifest, RecordOutcome, Recorder, Replayer,
-    };
+    use crate::record::{ExecutionPosition, RecordManifest, RecordOutcome, Recorder, Replayer};
 
     const PROM_BYTES: usize = 0x40000;
     const EXTERNAL_PROM_EXECUTION_BUDGET: usize = 400_000_000;
@@ -2024,16 +2040,32 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
 
     fn record_manifest() -> RecordManifest {
         RecordManifest::new(
-            MachineStartupConfiguration::IndigoIp12 {
-                floating_point_backend: Backend::SoftFloat,
-                memory: Ip12MemoryConfiguration::default(),
-                graphics: Some(GraphicsBoard::Lg1),
-            },
-            MediaIdentity::from_bytes(Path::new("prom.bin"), &[0; PROM_BYTES]),
-            None,
-            None,
+            Ip12Definition.default_draft(),
+            BTreeMap::new(),
             distinct_nonvolatile_state(),
         )
+    }
+
+    #[test]
+    fn cloned_handles_control_only_the_owner_lifetime() {
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let first = runtime.handle();
+        let second = first.clone();
+        assert_eq!(first.status().unwrap().state, RuntimeState::Unconfigured);
+        first.configure(machine_with_instructions(&[0])).unwrap();
+        assert_eq!(second.status().unwrap().state, RuntimeState::Paused);
+        second.step().unwrap();
+        assert_eq!(first.status().unwrap().completed_instructions, 1);
+        assert!(runtime.shutdown().unwrap().is_some());
+        assert_eq!(first.status(), Err(RuntimeError::WorkerUnavailable));
+        assert_eq!(second.reset(), Err(RuntimeError::WorkerUnavailable));
+        assert_eq!(
+            first.send_input(MachineInput::SerialByte {
+                port: SerialPort::A,
+                value: 1
+            }),
+            Err(RuntimeError::WorkerUnavailable)
+        );
     }
 
     fn started_recorder(path: &Path) -> Recorder {
@@ -2782,7 +2814,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         let partial = PathBuf::from(format!("{}.partial", path.display()));
         let _ = fs::remove_file(&partial);
         let recorder = started_recorder(&path);
-        let disk = recorder.disk();
+        let disk = recorder.storage(ResourceId::new("test.storage"));
         let runtime = Runtime::new_unconfigured().unwrap();
         runtime
             .configure_with(RuntimeConfiguration::recording(
@@ -3295,12 +3327,12 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
 
     fn run_external_ip12_prom(
         raw_prom: Vec<u8>,
-        graphics: Option<GraphicsBoard>,
+        graphics: bool,
         storage: Option<Box<dyn StorageMedium>>,
         stop: ExternalPromStop,
     ) -> ExternalPromRun {
         let mut gio = GioBus::new();
-        if let Some(GraphicsBoard::Lg1) = graphics {
+        if graphics {
             gio.attach(GioSlot::Graphics, Box::new(Lg1::new())).unwrap();
         }
         let machine = Machine::IndigoIp12(
@@ -3379,7 +3411,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             if prompt_completed_at.is_some() && address == SERIAL_RECEIVE_POLL_PC {
                 receive_poll_count += 1;
             }
-            if graphics == Some(GraphicsBoard::Lg1) {
+            if graphics {
                 video_instruction.store(executed + 1, Ordering::Relaxed);
             }
             if let Err(error) = worker.execute_timed_instruction() {
@@ -3503,9 +3535,13 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             .expect("SE_INDIGO_IP12_PROM must name the external PROM dump");
         let raw_prom = fs::read(path).expect("the external PROM dump should be readable");
 
-        let first =
-            run_external_ip12_prom(raw_prom.clone(), None, None, ExternalPromStop::SerialPrompt);
-        let second = run_external_ip12_prom(raw_prom, None, None, ExternalPromStop::SerialPrompt);
+        let first = run_external_ip12_prom(
+            raw_prom.clone(),
+            false,
+            None,
+            ExternalPromStop::SerialPrompt,
+        );
+        let second = run_external_ip12_prom(raw_prom, false, None, ExternalPromStop::SerialPrompt);
 
         assert_eq!(first, second);
         assert!(first.serial_a.is_empty());
@@ -3550,13 +3586,13 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
 
         let first = run_external_ip12_prom(
             raw_prom.clone(),
-            Some(GraphicsBoard::Lg1),
+            true,
             Some(dynamic_sgi_storage()),
             ExternalPromStop::NonUniformVideoFrame,
         );
         let second = run_external_ip12_prom(
             raw_prom,
-            Some(GraphicsBoard::Lg1),
+            true,
             Some(dynamic_sgi_storage()),
             ExternalPromStop::NonUniformVideoFrame,
         );
@@ -3597,7 +3633,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
 
         let run = run_external_ip12_prom(
             raw_prom,
-            None,
+            false,
             Some(Box::new(storage)),
             ExternalPromStop::VolumeHeaderValidation,
         );
