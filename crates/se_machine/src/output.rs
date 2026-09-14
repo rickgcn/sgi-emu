@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::serial::SerialPort;
+use crate::endpoint::{EndpointKey, EndpointKind};
 
 /// Bytes occupied by one pixel of a video frame.
 const BYTES_PER_PIXEL: u32 = 4;
@@ -73,8 +73,6 @@ impl VideoFrame {
 /// signal without a frame means black, not "keep showing the last picture".
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VideoOutput {
-    /// The machine has no graphics board installed.
-    NoGraphicsBoard,
     /// A board is installed but drives no valid video signal.
     NoSignal,
     /// A valid signal is present, carrying a frame when one is complete.
@@ -87,19 +85,59 @@ pub enum VideoOutput {
 /// Output accumulated during one machine time advancement.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct MachineOutput {
-    serial_a: Vec<u8>,
-    serial_b: Vec<u8>,
-    ethernet: Vec<Vec<u8>>,
-    video: Option<VideoOutput>,
+    entries: Vec<(EndpointKey, EndpointOutput)>,
+}
+
+/// One strongly typed output stream or current state.
+#[derive(Debug, Eq, PartialEq)]
+pub enum EndpointOutput {
+    /// Ordered serial bytes from one endpoint.
+    Serial(Vec<u8>),
+    /// Ordered Ethernet frames from one endpoint.
+    Ethernet(Vec<Vec<u8>>),
+    /// The latest complete video state for one endpoint.
+    Video(VideoOutput),
+}
+
+impl EndpointOutput {
+    /// Returns the endpoint payload family produced by this output.
+    #[must_use]
+    pub const fn kind(&self) -> EndpointKind {
+        match self {
+            Self::Serial(_) => EndpointKind::Serial,
+            Self::Ethernet(_) => EndpointKind::Ethernet,
+            Self::Video(_) => EndpointKind::Video,
+        }
+    }
 }
 
 impl MachineOutput {
-    /// Returns the bytes emitted by one external serial port.
+    /// Returns outputs in deterministic machine emission order.
     #[must_use]
-    pub fn serial(&self, port: SerialPort) -> &[u8] {
-        match port {
-            SerialPort::A => &self.serial_a,
-            SerialPort::B => &self.serial_b,
+    pub fn entries(&self) -> &[(EndpointKey, EndpointOutput)] {
+        &self.entries
+    }
+
+    /// Takes all outputs in deterministic machine emission order.
+    pub fn into_entries(self) -> Vec<(EndpointKey, EndpointOutput)> {
+        self.entries
+    }
+
+    /// Finds output for one exact endpoint identity.
+    #[must_use]
+    pub fn get(&self, key: &EndpointKey) -> Option<&EndpointOutput> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, output)| output)
+    }
+
+    /// Returns emitted bytes for one serial endpoint.
+    #[must_use]
+    pub fn serial(&self, key: &EndpointKey) -> &[u8] {
+        match self.get(key) {
+            Some(EndpointOutput::Serial(bytes)) => bytes,
+            _ => &[],
         }
     }
 
@@ -108,32 +146,70 @@ impl MachineOutput {
     /// [`None`] means the display is unchanged and the frontend keeps showing
     /// whatever it already presents.
     #[must_use]
-    pub const fn video(&self) -> Option<&VideoOutput> {
-        self.video.as_ref()
+    pub fn video(&self, key: &EndpointKey) -> Option<&VideoOutput> {
+        match self.get(key) {
+            Some(EndpointOutput::Video(video)) => Some(video),
+            _ => None,
+        }
     }
 
     /// Reports whether the machine produced no frontend-visible output.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.serial_a.is_empty()
-            && self.serial_b.is_empty()
-            && self.ethernet.is_empty()
-            && self.video.is_none()
+        self.entries.is_empty()
     }
 
     /// Takes completed Ethernet frames before frontend output is dispatched.
-    pub fn take_ethernet_frames(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.ethernet)
+    #[cfg(test)]
+    pub(crate) fn take_ethernet_frames(&mut self) -> Vec<Vec<u8>> {
+        self.take_ethernet_outputs()
+            .into_iter()
+            .flat_map(|(_, frames)| frames)
+            .collect()
     }
 
-    pub(crate) fn push_ethernet(&mut self, frame: Vec<u8>) {
-        self.ethernet.push(frame);
+    /// Takes endpoint-keyed Ethernet frames before frontend output is dispatched.
+    pub fn take_ethernet_outputs(&mut self) -> Vec<(EndpointKey, Vec<Vec<u8>>)> {
+        let mut outputs = Vec::new();
+        let mut index = 0;
+        while index < self.entries.len() {
+            if matches!(self.entries[index].1, EndpointOutput::Ethernet(_)) {
+                let (key, EndpointOutput::Ethernet(frames)) = self.entries.remove(index) else {
+                    unreachable!()
+                };
+                outputs.push((key, frames));
+            } else {
+                index += 1;
+            }
+        }
+        outputs
     }
 
-    pub(crate) fn push_serial(&mut self, port: SerialPort, value: u8) {
-        match port {
-            SerialPort::A => self.serial_a.push(value),
-            SerialPort::B => self.serial_b.push(value),
+    pub(crate) fn push_ethernet(&mut self, key: EndpointKey, frame: Vec<u8>) {
+        match self
+            .entries
+            .iter_mut()
+            .find(|(candidate, _)| candidate == &key)
+        {
+            Some((_, EndpointOutput::Ethernet(frames))) => frames.push(frame),
+            None => self
+                .entries
+                .push((key, EndpointOutput::Ethernet(vec![frame]))),
+            Some(_) => unreachable!("one endpoint cannot publish different output kinds"),
+        }
+    }
+
+    pub(crate) fn push_serial(&mut self, key: EndpointKey, value: u8) {
+        match self
+            .entries
+            .iter_mut()
+            .find(|(candidate, _)| candidate == &key)
+        {
+            Some((_, EndpointOutput::Serial(bytes))) => bytes.push(value),
+            None => self
+                .entries
+                .push((key, EndpointOutput::Serial(vec![value]))),
+            Some(_) => unreachable!("one endpoint cannot publish different output kinds"),
         }
     }
 
@@ -141,8 +217,16 @@ impl MachineOutput {
     ///
     /// Only the newest state matters, so a machine that changes its display
     /// several times within one advancement delivers one update.
-    pub(crate) fn publish_video(&mut self, output: VideoOutput) {
-        self.video = Some(output);
+    pub(crate) fn publish_video(&mut self, key: EndpointKey, output: VideoOutput) {
+        match self
+            .entries
+            .iter_mut()
+            .find(|(candidate, _)| candidate == &key)
+        {
+            Some((_, EndpointOutput::Video(video))) => *video = output,
+            None => self.entries.push((key, EndpointOutput::Video(output))),
+            Some(_) => unreachable!("one endpoint cannot publish different output kinds"),
+        }
     }
 }
 
@@ -150,7 +234,7 @@ impl MachineOutput {
 mod tests {
     use std::sync::Arc;
 
-    use crate::serial::SerialPort;
+    use crate::endpoint::EndpointKey;
 
     use super::{MachineOutput, VideoFrame, VideoOutput};
 
@@ -163,12 +247,14 @@ mod tests {
     #[test]
     fn serial_ports_keep_independent_byte_order() {
         let mut output = MachineOutput::default();
-        output.push_serial(SerialPort::B, 3);
-        output.push_serial(SerialPort::A, 1);
-        output.push_serial(SerialPort::A, 2);
+        let a = EndpointKey::new("serial.external.a");
+        let b = EndpointKey::new("serial.external.b");
+        output.push_serial(b.clone(), 3);
+        output.push_serial(a.clone(), 1);
+        output.push_serial(a.clone(), 2);
 
-        assert_eq!(output.serial(SerialPort::A), [1, 2]);
-        assert_eq!(output.serial(SerialPort::B), [3]);
+        assert_eq!(output.serial(&a), [1, 2]);
+        assert_eq!(output.serial(&b), [3]);
         assert!(!output.is_empty());
     }
 
@@ -206,30 +292,35 @@ mod tests {
         let output = MachineOutput::default();
 
         assert!(output.is_empty());
-        assert_eq!(output.video(), None);
+        assert_eq!(output.video(&EndpointKey::new("video.0")), None);
     }
 
     #[test]
     fn publishing_a_display_state_makes_the_output_non_empty() {
         let mut output = MachineOutput::default();
 
-        output.publish_video(VideoOutput::NoSignal);
+        let key = EndpointKey::new("video.0");
+        output.publish_video(key.clone(), VideoOutput::NoSignal);
 
         assert!(!output.is_empty());
-        assert_eq!(output.video(), Some(&VideoOutput::NoSignal));
+        assert_eq!(output.video(&key), Some(&VideoOutput::NoSignal));
     }
 
     #[test]
     fn only_the_newest_display_state_is_delivered() {
         let mut output = MachineOutput::default();
 
-        output.publish_video(VideoOutput::NoSignal);
-        output.publish_video(VideoOutput::Active {
-            frame: frame(2, 2, 1),
-        });
+        let key = EndpointKey::new("video.0");
+        output.publish_video(key.clone(), VideoOutput::NoSignal);
+        output.publish_video(
+            key.clone(),
+            VideoOutput::Active {
+                frame: frame(2, 2, 1),
+            },
+        );
 
         assert_eq!(
-            output.video(),
+            output.video(&key),
             Some(&VideoOutput::Active {
                 frame: frame(2, 2, 1)
             })
@@ -241,10 +332,11 @@ mod tests {
         let mut blank = MachineOutput::default();
         let mut absent = MachineOutput::default();
 
-        blank.publish_video(VideoOutput::Active { frame: None });
-        absent.publish_video(VideoOutput::NoSignal);
+        let key = EndpointKey::new("video.0");
+        blank.publish_video(key.clone(), VideoOutput::Active { frame: None });
+        absent.publish_video(key.clone(), VideoOutput::NoSignal);
 
-        assert_ne!(blank.video(), absent.video());
-        assert_ne!(blank.video(), Some(&VideoOutput::NoGraphicsBoard));
+        assert_ne!(blank.video(&key), absent.video(&key));
+        assert_ne!(blank.video(&key), None);
     }
 }

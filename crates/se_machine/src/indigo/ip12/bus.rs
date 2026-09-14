@@ -22,7 +22,6 @@ use sha2::{Digest, Sha256};
 use super::Ip12SnapshotError;
 use super::events::{EventKind, Ip12Events};
 use crate::output::{VideoFrame, VideoOutput};
-use crate::serial::SerialPort;
 
 const BOARD_REVISION: u32 = 0x0000_8000;
 
@@ -271,11 +270,7 @@ impl Ip12Bus {
         self.int2.timer_1_interrupt_asserted()
     }
 
-    pub(super) fn receive_serial(&mut self, port: SerialPort, bytes: &[u8]) -> usize {
-        let channel = match port {
-            SerialPort::A => Channel::A,
-            SerialPort::B => Channel::B,
-        };
+    pub(super) fn receive_serial(&mut self, channel: Channel, bytes: &[u8]) -> usize {
         let consumed = self.serial[1].receive(channel, bytes);
         self.synchronize_serial_interrupt();
         consumed
@@ -297,10 +292,6 @@ impl Ip12Bus {
         self.synchronize_serial_for_mmio(0);
         self.sgi_mouse.set_button_state(button, pressed);
         self.reschedule_serial(0);
-    }
-
-    pub(super) fn ethernet_receive_ready(&self) -> bool {
-        self.seeq8003.receive_ready()
     }
 
     pub(super) fn receive_ethernet(&mut self, bytes: &[u8]) -> bool {
@@ -336,19 +327,23 @@ impl Ip12Bus {
     }
 
     /// Returns what the primary graphics slot currently drives to the display.
+    pub(super) fn has_video_output(&self) -> bool {
+        self.gio.display_state(GioSlot::Graphics).is_some()
+    }
+
     #[must_use]
-    pub(in super::super) fn video_output(&self) -> VideoOutput {
+    pub(in super::super) fn video_output(&self) -> Option<VideoOutput> {
         match self.gio.display_state(GioSlot::Graphics) {
-            None => VideoOutput::NoGraphicsBoard,
-            Some(GioDisplayState::NoSignal) => VideoOutput::NoSignal,
-            Some(GioDisplayState::Blank) => VideoOutput::Active { frame: None },
+            None => None,
+            Some(GioDisplayState::NoSignal) => Some(VideoOutput::NoSignal),
+            Some(GioDisplayState::Blank) => Some(VideoOutput::Active { frame: None }),
             Some(GioDisplayState::Active {
                 width,
                 height,
                 pixels,
-            }) => VideoOutput::Active {
+            }) => Some(VideoOutput::Active {
                 frame: VideoFrame::new(width, height, pixels),
-            },
+            }),
         }
     }
 
@@ -357,6 +352,7 @@ impl Ip12Bus {
         self.gio
             .take_display_update(GioSlot::Graphics)
             .then(|| self.video_output())
+            .flatten()
     }
 
     pub(super) fn debug_read(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {

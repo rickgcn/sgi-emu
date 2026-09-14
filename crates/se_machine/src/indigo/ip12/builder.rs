@@ -182,7 +182,6 @@ mod tests {
     use super::super::plan::{Ip12BuildPlan, PreparedIp12Build, ScsiDevice};
     use super::super::{Ip12Error, Ip12SnapshotError, PROM_BYTES};
     use super::{Ip12AssemblyError, build};
-    use crate::output::VideoOutput;
     use crate::resource::{PreparedResource, ResourceKind};
 
     struct MemoryStorage {
@@ -292,10 +291,7 @@ mod tests {
             .expect("the draft is valid");
         let prepared = prepare(plan, PROM_BYTES, &BTreeMap::new());
         let machine = build(prepared).expect("the PROM bytes construct a board");
-        assert!(!matches!(
-            machine.video_output(),
-            VideoOutput::NoGraphicsBoard
-        ));
+        assert!(machine.video_output().is_some());
     }
 
     #[test]
@@ -305,7 +301,7 @@ mod tests {
             .expect("the draft is valid");
         let prepared = prepare(plan, PROM_BYTES, &BTreeMap::new());
         let machine = build(prepared).expect("an empty graphics slot is valid");
-        assert_eq!(machine.video_output(), VideoOutput::NoGraphicsBoard);
+        assert_eq!(machine.video_output(), None);
     }
 
     #[test]

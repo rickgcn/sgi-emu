@@ -40,16 +40,117 @@ impl VideoFrameHandle {
 
 #[cxx::bridge(namespace = "se_ui")]
 pub mod ffi {
-    /// A frontend-neutral external serial port.
+    /// Frontend-visible endpoint payload family.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum SerialPortDto {
-        A,
-        B,
+    pub enum EndpointKindDto {
+        Serial,
+        Keyboard,
+        Pointer,
+        Ethernet,
+        Video,
     }
 
-    /// A physical button on the SGI three-button mouse.
+    /// Direction in which one endpoint carries data.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum SgiMouseButtonDto {
+    pub enum EndpointDirectionDto {
+        Input,
+        Output,
+        Bidirectional,
+    }
+
+    /// Opaque live endpoint identity.
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct EndpointHandleDto {
+        pub generation: u64,
+        pub key: String,
+    }
+
+    /// One endpoint in the active runtime catalog.
+    #[derive(Debug)]
+    pub struct EndpointDescriptorDto {
+        pub handle: EndpointHandleDto,
+        pub label: String,
+        pub kind: EndpointKindDto,
+        pub direction: EndpointDirectionDto,
+    }
+
+    /// Coherent active runtime endpoint snapshot.
+    #[derive(Debug)]
+    pub struct EndpointCatalogDto {
+        pub success: bool,
+        pub error: String,
+        pub generation: u64,
+        pub endpoints: Vec<EndpointDescriptorDto>,
+    }
+
+    /// A generic keyboard key family.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum KeyboardKeyKindDto {
+        Letter,
+        Digit,
+        KeypadDigit,
+        Function,
+        Named,
+    }
+
+    /// Generic named keyboard keys supported by the display frontend.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum KeyboardNamedKeyDto {
+        LeftControl,
+        RightControl,
+        LeftShift,
+        RightShift,
+        LeftAlt,
+        RightAlt,
+        CapsLock,
+        Escape,
+        Tab,
+        Enter,
+        Backspace,
+        Delete,
+        Space,
+        ArrowLeft,
+        ArrowRight,
+        ArrowUp,
+        ArrowDown,
+        Insert,
+        Home,
+        End,
+        PageUp,
+        PageDown,
+        PrintScreen,
+        ScrollLock,
+        Pause,
+        NumLock,
+        Semicolon,
+        Comma,
+        Minus,
+        LeftBracket,
+        RightBracket,
+        Apostrophe,
+        Period,
+        Slash,
+        Equal,
+        Grave,
+        Backslash,
+        KeypadPeriod,
+        KeypadMinus,
+        KeypadPlus,
+        KeypadSlash,
+        KeypadAsterisk,
+        KeypadEnter,
+    }
+
+    /// Frontend-neutral keyboard identity.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct KeyboardKeyDto {
+        pub kind: KeyboardKeyKindDto,
+        pub value: u8,
+    }
+
+    /// A physical pointer button.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum PointerButtonDto {
         Left,
         Middle,
         Right,
@@ -58,7 +159,6 @@ pub mod ffi {
     /// Complete display state carried by one video update.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum VideoOutputStateDto {
-        NoGraphicsBoard,
         NoSignal,
         Blank,
         Frame,
@@ -250,6 +350,8 @@ pub mod ffi {
         pub state: u8,
         /// Debugger-visible revision.
         pub revision: u64,
+        /// Installed machine instance generation.
+        pub machine_generation: u64,
         /// Instructions completed during the runtime's lifetime.
         pub completed_instructions: u64,
         /// Deterministic session mode identifier.
@@ -448,6 +550,8 @@ pub mod ffi {
         fn normalize_terminal_paste(text: &str) -> Vec<u8>;
 
         fn runtime_status(self: &UiSession) -> RuntimeStatusDto;
+        fn endpoint_catalog(self: &UiSession) -> EndpointCatalogDto;
+        fn refresh_outputs(self: &UiSession) -> RuntimeStatusDto;
         fn begin_machine_edit(self: &UiSession) -> MachineConfigurationViewDto;
         fn apply_machine_edit(
             self: &UiSession,
@@ -489,12 +593,27 @@ pub mod ffi {
             length: u32,
         ) -> MemoryDto;
         fn toggle_breakpoint(self: &UiSession, address: u32) -> RuntimeStatusDto;
-        fn send_serial(self: &UiSession, port: SerialPortDto, bytes: &[u8]) -> RuntimeStatusDto;
-        fn send_sgi_key(self: &UiSession, code: u8, pressed: bool) -> bool;
-        fn send_sgi_mouse_motion(self: &UiSession, delta_x: i32, delta_y: i32) -> bool;
-        fn send_sgi_mouse_button(
+        fn send_serial(
             self: &UiSession,
-            button: SgiMouseButtonDto,
+            handle: &EndpointHandleDto,
+            bytes: &[u8],
+        ) -> RuntimeStatusDto;
+        fn send_keyboard(
+            self: &UiSession,
+            handle: &EndpointHandleDto,
+            key: KeyboardKeyDto,
+            pressed: bool,
+        ) -> bool;
+        fn send_pointer_motion(
+            self: &UiSession,
+            handle: &EndpointHandleDto,
+            delta_x: i32,
+            delta_y: i32,
+        ) -> bool;
+        fn send_pointer_button(
+            self: &UiSession,
+            handle: &EndpointHandleDto,
+            button: PointerButtonDto,
             pressed: bool,
         ) -> bool;
         fn attach_machine_output(
@@ -511,9 +630,11 @@ pub mod ffi {
 
         type MachineOutputSink;
 
-        fn publish_serial(self: &MachineOutputSink, serial_a: &[u8], serial_b: &[u8]);
+        fn publish_serial(self: &MachineOutputSink, generation: u64, key: &str, bytes: &[u8]);
         fn publish_video(
             self: &MachineOutputSink,
+            generation: u64,
+            key: &str,
             state: VideoOutputStateDto,
             frame: Box<VideoFrameHandle>,
         );

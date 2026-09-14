@@ -9,23 +9,25 @@ use se_cpu::mips1::r3000::debug::{
     CacheView, PendingCp0DebugSnapshot, PendingCp1DebugSnapshot, TlbView,
 };
 use se_machine::debug::{DebugRequest, DebugResponse};
+use se_machine::endpoint::{EndpointDirection, EndpointKind};
 use se_machine::indigo::ip12::debug::{
     DebugRequest as Ip12DebugRequest, DebugResponse as Ip12DebugResponse, MemoryAddressSpace,
 };
-use se_machine::input::MachineInput;
+use se_machine::input::{KeyboardKey, KeyboardNamedKey, PointerButton};
 use se_machine::output::VideoOutput;
-use se_machine::serial::SerialPort;
 use se_runtime::control::{RuntimeMode, RuntimeState, RuntimeStatus};
+use se_runtime::endpoint::{EndpointHandle, RuntimeOutputPayload};
 use se_runtime::record::Replayer;
 use se_runtime::runtime::{DebugReply, RuntimeConfiguration, RuntimeError, RuntimeHandle};
 
 use crate::bridge::VideoFrameHandle;
 use crate::bridge::ffi::{
-    CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineConfigurationEditDto,
-    MachineConfigurationViewDto, MachineOutputSink, MemoryDto, NetworkConfiguration, RegistersDto,
-    ReplaySnapshotCatalogDto, ReplaySnapshotInfoDto, RuntimeStatusDto, SerialPortDto,
-    SgiMouseButtonDto, TlbDto, TlbEntryDto, UiExitState, UiStartupState, VideoOutputStateDto,
-    run_gui,
+    CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, EndpointCatalogDto,
+    EndpointDescriptorDto, EndpointDirectionDto, EndpointHandleDto, EndpointKindDto,
+    KeyboardKeyDto, KeyboardKeyKindDto, MachineConfigurationEditDto, MachineConfigurationViewDto,
+    MachineOutputSink, MemoryDto, NetworkConfiguration, PointerButtonDto, RegistersDto,
+    ReplaySnapshotCatalogDto, ReplaySnapshotInfoDto, RuntimeStatusDto, TlbDto, TlbEntryDto,
+    UiExitState, UiStartupState, VideoOutputStateDto, run_gui,
 };
 use crate::configuration::{edit_from_dto, failed_view, view_dto};
 
@@ -107,6 +109,38 @@ impl UiSession {
     /// Samples current runtime status for Qt.
     pub fn runtime_status(&self) -> RuntimeStatusDto {
         self.runtime_command(RuntimeHandle::status)
+    }
+
+    /// Samples the current endpoint catalog for Qt.
+    pub fn endpoint_catalog(&self) -> EndpointCatalogDto {
+        match self.runtime.endpoint_catalog() {
+            Ok(catalog) => EndpointCatalogDto {
+                success: true,
+                error: String::new(),
+                generation: catalog.generation(),
+                endpoints: catalog
+                    .endpoints()
+                    .iter()
+                    .map(|descriptor| EndpointDescriptorDto {
+                        handle: endpoint_handle_dto(descriptor.handle()),
+                        label: descriptor.label().into(),
+                        kind: endpoint_kind_dto(descriptor.kind()),
+                        direction: endpoint_direction_dto(descriptor.direction()),
+                    })
+                    .collect(),
+            },
+            Err(error) => EndpointCatalogDto {
+                success: false,
+                error: error.to_string(),
+                generation: 0,
+                endpoints: Vec::new(),
+            },
+        }
+    }
+
+    /// Republishes current video states after endpoint widgets are rebuilt.
+    pub fn refresh_outputs(&self) -> RuntimeStatusDto {
+        self.runtime_command(RuntimeHandle::refresh_outputs)
     }
 
     /// Validates network settings through the application without changing runtime state.
@@ -332,27 +366,30 @@ impl UiSession {
 
         self.runtime_command(|runtime| {
             runtime.set_output_handler(Box::new(move |output| {
-                sink.publish_serial(output.serial(SerialPort::A), output.serial(SerialPort::B));
-                let Some(video) = output.video() else {
-                    return;
-                };
-                let (state, frame) = match video {
-                    VideoOutput::NoGraphicsBoard => (
-                        VideoOutputStateDto::NoGraphicsBoard,
-                        VideoFrameHandle::empty(),
-                    ),
-                    VideoOutput::NoSignal => {
-                        (VideoOutputStateDto::NoSignal, VideoFrameHandle::empty())
+                for item in output {
+                    let generation = item.handle().generation();
+                    let key = item.handle().key().as_str();
+                    match item.payload() {
+                        RuntimeOutputPayload::Serial(bytes) => {
+                            sink.publish_serial(generation, key, bytes)
+                        }
+                        RuntimeOutputPayload::Video(video) => {
+                            let (state, frame) = match video {
+                                VideoOutput::NoSignal => {
+                                    (VideoOutputStateDto::NoSignal, VideoFrameHandle::empty())
+                                }
+                                VideoOutput::Active { frame: None } => {
+                                    (VideoOutputStateDto::Blank, VideoFrameHandle::empty())
+                                }
+                                VideoOutput::Active { frame: Some(frame) } => (
+                                    VideoOutputStateDto::Frame,
+                                    VideoFrameHandle::new(frame.clone()),
+                                ),
+                            };
+                            sink.publish_video(generation, key, state, Box::new(frame));
+                        }
                     }
-                    VideoOutput::Active { frame: None } => {
-                        (VideoOutputStateDto::Blank, VideoFrameHandle::empty())
-                    }
-                    VideoOutput::Active { frame: Some(frame) } => (
-                        VideoOutputStateDto::Frame,
-                        VideoFrameHandle::new(frame.clone()),
-                    ),
-                };
-                sink.publish_video(state, Box::new(frame));
+                }
             }))
         })
     }
@@ -580,51 +617,76 @@ impl UiSession {
         }
     }
 
-    /// Supplies one byte batch to an external serial port.
-    pub fn send_serial(&self, port: SerialPortDto, bytes: &[u8]) -> RuntimeStatusDto {
-        let port = match port {
-            SerialPortDto::A => SerialPort::A,
-            SerialPortDto::B => SerialPort::B,
-            _ => return failed_status(String::from("unsupported serial port")),
-        };
-        for value in bytes {
-            if let Err(error) = self.runtime.send_input(MachineInput::SerialByte {
-                port,
-                value: *value,
-            }) {
-                return failed_status(error.to_string());
-            }
+    /// Supplies one byte batch to an exact live serial endpoint.
+    pub fn send_serial(&self, handle: &EndpointHandleDto, bytes: &[u8]) -> RuntimeStatusDto {
+        match self
+            .resolve_endpoint_handle(handle)
+            .and_then(|handle| self.runtime.send_serial(handle, bytes))
+        {
+            Ok(status) => status_dto(status),
+            Err(error) => failed_status(error.to_string()),
         }
-        self.runtime_command(RuntimeHandle::status)
     }
 
-    /// Enqueues one validated physical SGI keyboard transition.
-    pub fn send_sgi_key(&self, code: u8, pressed: bool) -> bool {
-        let Some(input) = MachineInput::sgi_keyboard(code, pressed) else {
+    /// Sends one frontend-neutral keyboard transition.
+    pub fn send_keyboard(
+        &self,
+        handle: &EndpointHandleDto,
+        key: KeyboardKeyDto,
+        pressed: bool,
+    ) -> bool {
+        let Some(key) = keyboard_key_from_dto(key) else {
             return false;
         };
-        self.runtime.send_input(input).is_ok()
-    }
-
-    /// Enqueues normalized relative SGI mouse motion.
-    pub fn send_sgi_mouse_motion(&self, delta_x: i32, delta_y: i32) -> bool {
-        self.runtime
-            .send_input(MachineInput::SgiMouseMotion { delta_x, delta_y })
+        self.resolve_endpoint_handle(handle)
+            .and_then(|handle| self.runtime.send_keyboard(handle, key, pressed))
             .is_ok()
     }
 
-    /// Enqueues one physical SGI mouse button transition.
-    pub fn send_sgi_mouse_button(&self, button: SgiMouseButtonDto, pressed: bool) -> bool {
-        let code = match button {
-            SgiMouseButtonDto::Left => 0,
-            SgiMouseButtonDto::Middle => 1,
-            SgiMouseButtonDto::Right => 2,
+    /// Sends normalized relative pointer motion.
+    pub fn send_pointer_motion(
+        &self,
+        handle: &EndpointHandleDto,
+        delta_x: i32,
+        delta_y: i32,
+    ) -> bool {
+        self.resolve_endpoint_handle(handle)
+            .and_then(|handle| self.runtime.send_pointer_motion(handle, delta_x, delta_y))
+            .is_ok()
+    }
+
+    /// Sends one frontend-neutral pointer button transition.
+    pub fn send_pointer_button(
+        &self,
+        handle: &EndpointHandleDto,
+        button: PointerButtonDto,
+        pressed: bool,
+    ) -> bool {
+        let button = match button {
+            PointerButtonDto::Left => PointerButton::Left,
+            PointerButtonDto::Middle => PointerButton::Middle,
+            PointerButtonDto::Right => PointerButton::Right,
             _ => return false,
         };
-        let Some(input) = MachineInput::sgi_mouse_button(code, pressed) else {
-            return false;
-        };
-        self.runtime.send_input(input).is_ok()
+        self.resolve_endpoint_handle(handle)
+            .and_then(|handle| self.runtime.send_pointer_button(handle, button, pressed))
+            .is_ok()
+    }
+
+    fn resolve_endpoint_handle(
+        &self,
+        handle: &EndpointHandleDto,
+    ) -> Result<EndpointHandle, RuntimeError> {
+        let catalog = self.runtime.endpoint_catalog()?;
+        if handle.generation != catalog.generation() {
+            return Err(RuntimeError::StaleEndpoint);
+        }
+        catalog
+            .endpoints()
+            .iter()
+            .find(|descriptor| descriptor.handle().key().as_str() == handle.key)
+            .map(|descriptor| descriptor.handle().clone())
+            .ok_or(RuntimeError::UnknownEndpoint)
     }
 
     fn runtime_command(
@@ -642,6 +704,97 @@ impl UiSession {
     }
 }
 
+fn endpoint_handle_dto(handle: &EndpointHandle) -> EndpointHandleDto {
+    EndpointHandleDto {
+        generation: handle.generation(),
+        key: handle.key().as_str().into(),
+    }
+}
+
+const fn endpoint_kind_dto(kind: EndpointKind) -> EndpointKindDto {
+    match kind {
+        EndpointKind::Serial => EndpointKindDto::Serial,
+        EndpointKind::Keyboard => EndpointKindDto::Keyboard,
+        EndpointKind::Pointer => EndpointKindDto::Pointer,
+        EndpointKind::Ethernet => EndpointKindDto::Ethernet,
+        EndpointKind::Video => EndpointKindDto::Video,
+    }
+}
+
+const fn endpoint_direction_dto(direction: EndpointDirection) -> EndpointDirectionDto {
+    match direction {
+        EndpointDirection::Input => EndpointDirectionDto::Input,
+        EndpointDirection::Output => EndpointDirectionDto::Output,
+        EndpointDirection::Bidirectional => EndpointDirectionDto::Bidirectional,
+    }
+}
+
+fn keyboard_key_from_dto(key: KeyboardKeyDto) -> Option<KeyboardKey> {
+    match key.kind {
+        KeyboardKeyKindDto::Letter if key.value.is_ascii_uppercase() => {
+            Some(KeyboardKey::Letter(key.value))
+        }
+        KeyboardKeyKindDto::Digit if key.value <= 9 => Some(KeyboardKey::Digit(key.value)),
+        KeyboardKeyKindDto::KeypadDigit if key.value <= 9 => {
+            Some(KeyboardKey::KeypadDigit(key.value))
+        }
+        KeyboardKeyKindDto::Function if (1..=12).contains(&key.value) => {
+            Some(KeyboardKey::Function(key.value))
+        }
+        KeyboardKeyKindDto::Named => {
+            use KeyboardNamedKey as K;
+            let named = match key.value {
+                0 => K::LeftControl,
+                1 => K::RightControl,
+                2 => K::LeftShift,
+                3 => K::RightShift,
+                4 => K::LeftAlt,
+                5 => K::RightAlt,
+                6 => K::CapsLock,
+                7 => K::Escape,
+                8 => K::Tab,
+                9 => K::Enter,
+                10 => K::Backspace,
+                11 => K::Delete,
+                12 => K::Space,
+                13 => K::ArrowLeft,
+                14 => K::ArrowRight,
+                15 => K::ArrowUp,
+                16 => K::ArrowDown,
+                17 => K::Insert,
+                18 => K::Home,
+                19 => K::End,
+                20 => K::PageUp,
+                21 => K::PageDown,
+                22 => K::PrintScreen,
+                23 => K::ScrollLock,
+                24 => K::Pause,
+                25 => K::NumLock,
+                26 => K::Semicolon,
+                27 => K::Comma,
+                28 => K::Minus,
+                29 => K::LeftBracket,
+                30 => K::RightBracket,
+                31 => K::Apostrophe,
+                32 => K::Period,
+                33 => K::Slash,
+                34 => K::Equal,
+                35 => K::Grave,
+                36 => K::Backslash,
+                37 => K::KeypadPeriod,
+                38 => K::KeypadMinus,
+                39 => K::KeypadPlus,
+                40 => K::KeypadSlash,
+                41 => K::KeypadAsterisk,
+                42 => K::KeypadEnter,
+                _ => return None,
+            };
+            Some(KeyboardKey::Named(named))
+        }
+        _ => None,
+    }
+}
+
 fn status_dto(status: RuntimeStatus) -> RuntimeStatusDto {
     let replay_final_position = status.replay_final_position.unwrap_or_default();
     RuntimeStatusDto {
@@ -649,6 +802,7 @@ fn status_dto(status: RuntimeStatus) -> RuntimeStatusDto {
         success: true,
         state: state_identifier(status.state),
         revision: status.revision,
+        machine_generation: status.machine_generation,
         completed_instructions: status.completed_instructions,
         mode: mode_identifier(status.mode),
         epoch: status.position.epoch,
@@ -687,6 +841,7 @@ fn failed_status(error: String) -> RuntimeStatusDto {
         success: false,
         state: 0,
         revision: 0,
+        machine_generation: 0,
         completed_instructions: 0,
         mode: 0,
         epoch: 0,
@@ -801,7 +956,7 @@ mod tests {
 
     use se_config::definition::MachineDefinition;
     use se_config::draft::{Edit, MachineDraft};
-    use se_config::id::PropertyId;
+    use se_config::id::{NodeId, PropertyId};
     use se_config::value::PropertyValue;
     use se_machine::indigo::ip12::builder;
     use se_machine::indigo::ip12::definition::Ip12Definition;
@@ -811,7 +966,8 @@ mod tests {
 
     use super::UiSession;
     use crate::bridge::ffi::{
-        MachineConfigurationEditDto, MachinePropertyValueDto, NetworkConfiguration,
+        EndpointKindDto, KeyboardKeyDto, KeyboardKeyKindDto, MachineConfigurationEditDto,
+        MachinePropertyValueDto, NetworkConfiguration,
     };
 
     fn draft() -> MachineDraft {
@@ -1034,14 +1190,126 @@ mod tests {
     }
 
     #[test]
-    fn sgi_key_bridge_accepts_exactly_protocol_keycodes() {
-        let (runtime, session) = session(false);
-        let accepted: Vec<_> = (0..=u8::MAX)
-            .filter(|code| session.send_sgi_key(*code, true))
-            .collect();
-        assert_eq!(accepted.len(), 101);
-        assert_eq!(accepted.first().copied(), Some(2));
-        assert_eq!(accepted.last().copied(), Some(109));
+    fn keyboard_bridge_accepts_semantic_keys_for_the_live_endpoint() {
+        let (runtime, session) = session(true);
+        assert!(session.configure_machine(&network()).success);
+        let catalog = session.endpoint_catalog();
+        let keyboard = &catalog
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == EndpointKindDto::Keyboard)
+            .unwrap()
+            .handle;
+        assert!(session.send_keyboard(
+            keyboard,
+            KeyboardKeyDto {
+                kind: KeyboardKeyKindDto::Letter,
+                value: b'A',
+            },
+            true
+        ));
+        assert!(!session.send_keyboard(
+            keyboard,
+            KeyboardKeyDto {
+                kind: KeyboardKeyKindDto::Letter,
+                value: b'a',
+            },
+            true
+        ));
+        assert!(!session.send_keyboard(
+            keyboard,
+            KeyboardKeyDto {
+                kind: KeyboardKeyKindDto::Function,
+                value: 13,
+            },
+            true
+        ));
+        assert!(!session.send_keyboard(
+            keyboard,
+            KeyboardKeyDto {
+                kind: KeyboardKeyKindDto::Named,
+                value: 255,
+            },
+            true
+        ));
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn endpoint_bridge_reflects_replacement_and_rejects_stale_handles() {
+        let (runtime, session) = session(true);
+        let empty = session.endpoint_catalog();
+        assert!(empty.success);
+        assert_eq!(empty.generation, 0);
+        assert!(empty.endpoints.is_empty());
+
+        assert!(session.configure_machine(&network()).success);
+        let graphics = session.endpoint_catalog();
+        let count = |kind| {
+            graphics
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == kind)
+                .count()
+        };
+        assert_eq!(count(EndpointKindDto::Keyboard), 1);
+        assert_eq!(count(EndpointKindDto::Pointer), 1);
+        assert_eq!(count(EndpointKindDto::Serial), 2);
+        assert_eq!(count(EndpointKindDto::Ethernet), 1);
+        assert_eq!(count(EndpointKindDto::Video), 1);
+        assert!(
+            graphics
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.handle.generation == graphics.generation)
+        );
+        let old_keyboard = &graphics
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == EndpointKindDto::Keyboard)
+            .unwrap()
+            .handle;
+
+        let mut headless_draft = draft();
+        headless_draft.apply(Edit::SetAttachment {
+            slot: NodeId(String::from("gio.0.slot.graphics")),
+            device: None,
+        });
+        let plan = Ip12Definition.compile(&headless_draft).unwrap();
+        let prepared = plan
+            .prepare_with(|_, requirement| match requirement.kind {
+                ResourceKind::Bytes => Ok::<_, String>(PreparedResource::Bytes(vec![0; 0x40000])),
+                ResourceKind::Storage { .. } => Err(String::from("unexpected storage")),
+            })
+            .unwrap();
+        runtime
+            .configure(Machine::IndigoIp12(builder::build(prepared).unwrap()))
+            .unwrap();
+        let headless = session.endpoint_catalog();
+        assert_eq!(headless.generation, graphics.generation + 1);
+        assert_eq!(
+            headless
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == EndpointKindDto::Serial)
+                .count(),
+            2
+        );
+        assert!(
+            !headless
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.kind == EndpointKindDto::Video)
+        );
+        assert!(!session.send_keyboard(
+            old_keyboard,
+            KeyboardKeyDto {
+                kind: KeyboardKeyKindDto::Letter,
+                value: b'A',
+            },
+            true
+        ));
         drop(session);
         runtime.shutdown().unwrap();
     }

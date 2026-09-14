@@ -6,9 +6,11 @@ use std::path::PathBuf;
 
 use qt_build_utils::{QtBuild, QtInstallationQMake};
 
-const CPP_SOURCES: [&str; 11] = [
+const CPP_SOURCES: [&str; 13] = [
     "cpp/src/main_window.cpp",
     "cpp/src/display_widget.cpp",
+    "cpp/src/display_workspace.cpp",
+    "cpp/src/endpoint_identity.cpp",
     "cpp/src/machine_output_sink.cpp",
     "cpp/src/settings_dialog.cpp",
     "cpp/src/debugger/registers_dock.cpp",
@@ -20,9 +22,11 @@ const CPP_SOURCES: [&str; 11] = [
     "cpp/src/vt100_widget.cpp",
 ];
 
-const HEADERS: [&str; 11] = [
+const HEADERS: [&str; 13] = [
     "cpp/include/se_ui/main_window.h",
     "cpp/include/se_ui/display_widget.h",
+    "cpp/include/se_ui/display_workspace.h",
+    "cpp/include/se_ui/endpoint_identity.h",
     "cpp/include/se_ui/machine_output_sink.h",
     "cpp/include/se_ui/settings_dialog.h",
     "cpp/include/se_ui/debugger/registers_dock.h",

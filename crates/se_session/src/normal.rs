@@ -215,7 +215,6 @@ mod tests {
     use se_machine::indigo::ip12::builder::{Ip12AssemblyError, build};
     use se_machine::indigo::ip12::definition::Ip12Definition;
     use se_machine::indigo::ip12::plan::ScsiDevice;
-    use se_machine::output::VideoOutput;
     use se_machine::resource::{
         PrepareResourcesError, PreparedResource, ResourceKind, ResourceRequirement,
     };
@@ -428,9 +427,12 @@ mod tests {
         );
         let prepared = prepare_ip12(plan).unwrap();
         let machine = build(prepared).unwrap();
-        assert!(!matches!(
-            machine.video_output(),
-            VideoOutput::NoGraphicsBoard
-        ));
+        assert!(
+            machine
+                .endpoint_catalog()
+                .endpoints()
+                .iter()
+                .any(|endpoint| { endpoint.kind() == se_machine::endpoint::EndpointKind::Video })
+        );
     }
 }
