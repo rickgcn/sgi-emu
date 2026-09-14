@@ -1,12 +1,17 @@
 use super::{Ip12Error, PROM_BYTES};
 
-pub(super) fn normalize_u56_prom(mut bytes: Vec<u8>) -> Result<Vec<u8>, Ip12Error> {
-    if bytes.len() != PROM_BYTES {
+pub(super) fn validate_u56_prom_size(actual: usize) -> Result<(), Ip12Error> {
+    if actual != PROM_BYTES {
         return Err(Ip12Error::InvalidPromSize {
             expected: PROM_BYTES,
-            actual: bytes.len(),
+            actual,
         });
     }
+    Ok(())
+}
+
+pub(super) fn normalize_u56_prom(mut bytes: Vec<u8>) -> Result<Vec<u8>, Ip12Error> {
+    validate_u56_prom_size(bytes.len())?;
 
     for halfword in bytes.chunks_exact_mut(2) {
         halfword.swap(0, 1);

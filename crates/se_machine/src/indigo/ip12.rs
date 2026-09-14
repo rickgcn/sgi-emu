@@ -1,5 +1,6 @@
 //! SGI Indigo IP12 hardware composition.
 
+pub mod builder;
 mod bus;
 pub mod debug;
 pub mod definition;
@@ -37,7 +38,7 @@ use se_float::backend::Backend;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use self::bus::Ip12Bus;
-use self::prom::normalize_u56_prom;
+use self::prom::{normalize_u56_prom, validate_u56_prom_size};
 use crate::output::{MachineOutput, VideoOutput};
 use crate::serial::SerialPort;
 
@@ -437,7 +438,7 @@ impl Ip12 {
         disk_storage: Option<Box<dyn BlockStorage>>,
         cdrom_storage: Option<Box<dyn BlockStorage>>,
     ) -> Result<Self, Ip12Error> {
-        let prom = Rom::new(normalize_u56_prom(raw_prom)?);
+        validate_u56_prom_size(raw_prom.len())?;
         let mut scsi_bus = ScsiBus::new();
         if let Some(storage) = disk_storage {
             let bytes = storage.size_bytes();
@@ -455,6 +456,17 @@ impl Ip12 {
                 .attach(4, 0, Box::new(target), storage)
                 .map_err(Ip12Error::ScsiAttachment)?;
         }
+        Self::new_with_buses(raw_prom, floating_point_backend, memory, gio, scsi_bus)
+    }
+
+    fn new_with_buses(
+        raw_prom: Vec<u8>,
+        floating_point_backend: Backend,
+        memory: Ip12MemoryConfiguration,
+        gio: GioBus,
+        scsi_bus: ScsiBus,
+    ) -> Result<Self, Ip12Error> {
+        let prom = Rom::new(normalize_u56_prom(raw_prom)?);
         let mut machine = Self {
             cpu: R3000::new(cpu_config(floating_point_backend)),
             bus: Ip12Bus::new(
@@ -727,6 +739,24 @@ mod tests {
                 Backend::SoftFloat,
                 GioBus::new(),
                 None,
+                None,
+            ),
+            Err(Ip12Error::InvalidPromSize {
+                expected: PROM_BYTES,
+                actual
+            }) if actual == PROM_BYTES - 1
+        ));
+    }
+
+    #[test]
+    fn legacy_constructor_prioritizes_prom_error_over_disk_error() {
+        assert!(matches!(
+            Ip12::new_with_memory(
+                vec![0; PROM_BYTES - 1],
+                Backend::SoftFloat,
+                Ip12MemoryConfiguration::default(),
+                GioBus::new(),
+                Some(Box::new(SizedStorage(513))),
                 None,
             ),
             Err(Ip12Error::InvalidPromSize {
