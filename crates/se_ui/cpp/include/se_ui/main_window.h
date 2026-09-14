@@ -83,8 +83,8 @@ private:
     void update_machine_status();
 
     const UiSession& session_;
-    MachineSettings settings_;
-    std::unique_ptr<MachineSettings> pending_settings_;
+    NetworkSettings network_settings_;
+    std::unique_ptr<NetworkSettings> pending_network_settings_;
 
     QAction* run_action_;
     QAction* run_with_record_action_;

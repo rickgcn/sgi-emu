@@ -9,40 +9,36 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use se_cli::Arguments;
+use se_config::draft::MachineDraft;
+use se_config::id::{NodeId, PropertyId};
+use se_config::value::PropertyValue;
 use se_core::storage::StorageMedium;
 use se_device::gio::{GioBus, GioSlot};
 use se_device::lg1::Lg1;
-use se_float::backend::Backend;
 use se_machine::indigo::GraphicsBoard;
 use se_machine::indigo::ip12::Ip12;
-use se_machine::indigo::ip12::Ip12MemoryConfiguration;
+use se_machine::indigo::ip12::builder;
+use se_machine::indigo::ip12::definition::Ip12Definition;
+use se_machine::indigo::ip12::plan::{Ip12BuildPlan, ScsiDevice};
 use se_machine::machine::{Machine, MachineStartupConfiguration};
+use se_machine::resource::ResourceRequirement;
 use se_runtime::record::{MediaIdentity, RecordManifest, Recorder, Replayer};
 use se_runtime::runtime::{Runtime, RuntimeConfiguration};
-use se_ui::bridge::ffi::MachineConfiguration;
-use se_ui::session::{MachineBuildRequest, UiSession};
+use se_session::normal::prepare_ip12;
+use se_ui::bridge::ffi::NetworkConfiguration;
+use se_ui::session::{LegacyBuildRequest, UiSession};
+use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let arguments = Arguments::parse_process();
     let config_path = config::config_path()?;
     let mut application_config = config::load(&config_path)?;
-    application_config.apply_environment();
-    application_config.apply_arguments(&arguments);
-
-    let machine_configuration = application_config.machine_configuration();
-    if arguments.headless() && machine_configuration.prom_path.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "headless mode requires an Indigo IP12 PROM; use --prom or SE_INDIGO_IP12_PROM",
-        )
-        .into());
-    }
+    let machine_draft = application_config.machine_draft();
+    let network = application_config.network_configuration();
     let runtime = Runtime::new_unconfigured()?;
-    let startup_error = if machine_configuration.prom_path.is_empty() {
+    let startup_error = if firmware_unconfigured(&machine_draft) {
         String::new()
     } else {
-        build_runtime_configuration(&machine_configuration, MachineBuildRequest::Normal)
+        build_normal_configuration(machine_draft.clone(), &network)
             .and_then(|configuration| {
                 runtime
                     .configure_with(configuration)
@@ -53,24 +49,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or_default()
     };
 
-    if arguments.headless() {
-        if !startup_error.is_empty() {
-            return Err(io::Error::other(startup_error).into());
-        }
-        let frontend_result = se_cli::headless::run(&runtime);
-        if let Some(state) = runtime.shutdown()? {
-            persistence::save(&state)?;
-        }
-        return frontend_result.map_err(|error| Box::new(error) as Box<dyn Error>);
-    }
-
     let startup = application_config.ui_startup_state(startup_error);
     let session = UiSession::new(
         runtime,
-        Box::new(build_runtime_configuration),
+        machine_draft,
+        Arc::new(Ip12Definition),
+        Box::new(build_normal_configuration),
+        Box::new(build_legacy_configuration),
         Box::new(|configuration| config::parse_network_configuration(configuration).map(|_| ())),
     );
     let exit = session.run(&startup);
+    let committed = session.machine_draft_snapshot();
     if let Some(state) = session.shutdown()? {
         persistence::save(&state)?;
     }
@@ -78,54 +67,140 @@ fn main() -> Result<(), Box<dyn Error>> {
     application_config
         .apply_ui_exit_state(exit)
         .map_err(io::Error::other)?;
+    application_config.set_machine_draft(committed);
     config::save(&config_path, &application_config)?;
 
     Ok(())
 }
 
-fn build_normal_machine(configuration: &MachineConfiguration) -> Result<Machine, String> {
-    let startup_configuration = machine_startup_configuration(configuration)?;
-    let mut machine = build_machine(
-        startup_configuration,
-        Path::new(&configuration.prom_path),
-        optional_path(&configuration.disk_path),
-        optional_path(&configuration.cdrom_path),
-    )?;
-    restore_persisted_state(&mut machine, &configuration.machine_model)?;
-    Ok(machine)
+fn firmware_path(draft: &MachineDraft) -> &str {
+    match draft
+        .properties
+        .get(&PropertyId(String::from("firmware.0.image-path")))
+    {
+        Some(PropertyValue::Text(path)) => path,
+        _ => "",
+    }
 }
 
-fn build_runtime_configuration(
-    configuration: &MachineConfiguration,
-    request: MachineBuildRequest,
+fn firmware_unconfigured(draft: &MachineDraft) -> bool {
+    matches!(
+        draft
+            .properties
+            .get(&PropertyId(String::from("firmware.0.image-path"))),
+        Some(PropertyValue::Text(path)) if path.is_empty()
+    )
+}
+
+fn build_normal_configuration(
+    draft: MachineDraft,
+    network: &NetworkConfiguration,
+) -> Result<RuntimeConfiguration, String> {
+    let network = config::parse_network_configuration(network)?;
+    let plan = Ip12Definition.compile(&draft).map_err(|error| {
+        error
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
+    let prepared = prepare_ip12(plan).map_err(|error| error.to_string())?;
+    let mut machine =
+        Machine::IndigoIp12(builder::build(prepared).map_err(|error| error.to_string())?);
+    restore_persisted_state(&mut machine, &draft.model.0)?;
+    Ok(RuntimeConfiguration::normal_with_network(machine, network))
+}
+
+fn build_legacy_configuration(
+    draft: MachineDraft,
+    request: LegacyBuildRequest,
+    network: Option<&NetworkConfiguration>,
 ) -> Result<RuntimeConfiguration, String> {
     match request {
-        MachineBuildRequest::Normal => {
-            let network = config::parse_network_configuration(&configuration.network)?;
-            build_normal_machine(configuration)
-                .map(|machine| RuntimeConfiguration::normal_with_network(machine, network))
+        LegacyBuildRequest::Recording(path) => {
+            let network = network.ok_or("Recording network settings are unavailable")?;
+            build_recording_configuration(&legacy_recording_projection(&draft)?, network, path)
         }
-        MachineBuildRequest::Recording(path) => build_recording_configuration(configuration, path),
-        MachineBuildRequest::Replaying { path, snapshot_id } => {
-            build_replay_configuration(configuration, path, snapshot_id.as_deref())
+        LegacyBuildRequest::Replaying { path, snapshot_id } => {
+            build_replay_configuration(&draft, path, snapshot_id.as_deref())
         }
     }
 }
 
+struct LegacyRecordingProjection {
+    machine_model: String,
+    startup: MachineStartupConfiguration,
+    prom_path: PathBuf,
+    disk_path: Option<PathBuf>,
+    cdrom_path: Option<PathBuf>,
+}
+
+fn legacy_recording_projection(draft: &MachineDraft) -> Result<LegacyRecordingProjection, String> {
+    let plan = Ip12Definition.compile(draft).map_err(|error| {
+        error
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
+    let mut disk_path = None;
+    let mut cdrom_path = None;
+    for attachment in plan.scsi() {
+        let path = required_path(&plan, &attachment.medium)?;
+        match (attachment.target, attachment.lun, attachment.device) {
+            (1, 0, ScsiDevice::Disk) => disk_path = Some(path),
+            (4, 0, ScsiDevice::Cdrom) => cdrom_path = Some(path),
+            _ => {
+                return Err(String::from(
+                    "current Record format does not support this machine topology",
+                ));
+            }
+        }
+    }
+    let graphics = if plan.gio().is_empty() {
+        None
+    } else {
+        Some(GraphicsBoard::Lg1)
+    };
+    Ok(LegacyRecordingProjection {
+        machine_model: draft.model.0.clone(),
+        startup: MachineStartupConfiguration::IndigoIp12 {
+            floating_point_backend: plan.floating_point_backend(),
+            memory: *plan.memory(),
+            graphics,
+        },
+        prom_path: required_path(&plan, plan.firmware())?,
+        disk_path,
+        cdrom_path,
+    })
+}
+
+fn required_path(
+    plan: &Ip12BuildPlan,
+    id: &se_machine::resource::ResourceId,
+) -> Result<PathBuf, String> {
+    plan.resources()
+        .get(id)
+        .map(|ResourceRequirement { path, .. }| path.clone())
+        .ok_or_else(|| format!("missing resource requirement {}", id.as_str()))
+}
+
 fn build_recording_configuration(
-    configuration: &MachineConfiguration,
+    configuration: &LegacyRecordingProjection,
+    network: &NetworkConfiguration,
     path: PathBuf,
 ) -> Result<RuntimeConfiguration, String> {
-    let network = config::parse_network_configuration(&configuration.network)?;
-    let startup_configuration = machine_startup_configuration(configuration)?;
-    let prom_path = Path::new(&configuration.prom_path);
+    let network = config::parse_network_configuration(network)?;
+    let startup_configuration = configuration.startup;
+    let prom_path = configuration.prom_path.as_path();
     let raw_prom = read_prom(prom_path)?;
     let prom_identity = MediaIdentity::from_bytes(prom_path, &raw_prom);
-    let mut disk = open_optional_storage(optional_path(&configuration.disk_path), true)?;
-    let mut cdrom = open_optional_storage(optional_path(&configuration.cdrom_path), true)?;
-    let disk_identity = identity_for_storage(&mut disk, optional_path(&configuration.disk_path))?;
-    let cdrom_identity =
-        identity_for_storage(&mut cdrom, optional_path(&configuration.cdrom_path))?;
+    let mut disk = open_optional_storage(configuration.disk_path.as_deref())?;
+    let mut cdrom = open_optional_storage(configuration.cdrom_path.as_deref())?;
+    let disk_identity = identity_for_storage(&mut disk, configuration.disk_path.as_deref())?;
+    let cdrom_identity = identity_for_storage(&mut cdrom, configuration.cdrom_path.as_deref())?;
     let recorder = Recorder::create_or_replace(path).map_err(|error| error.to_string())?;
     let disk = disk.map(|storage| storage.recording(recorder.disk()).boxed());
     let cdrom = cdrom.map(storage::FileBlockStorage::boxed);
@@ -148,7 +223,7 @@ fn build_recording_configuration(
 }
 
 fn build_replay_configuration(
-    configuration: &MachineConfiguration,
+    draft: &MachineDraft,
     path: PathBuf,
     snapshot_id: Option<&str>,
 ) -> Result<RuntimeConfiguration, String> {
@@ -161,7 +236,7 @@ fn build_replay_configuration(
     let manifest = replayer.manifest().clone();
     let startup_configuration = *manifest.machine();
     let nonvolatile_state = manifest.nonvolatile_state().clone();
-    let prom_path = selected_or_hint(&configuration.prom_path, &manifest.prom().path_hint);
+    let prom_path = selected_or_hint(firmware_path(draft), &manifest.prom().path_hint);
     let raw_prom = read_prom(&prom_path)?;
     ensure_identity(
         "PROM",
@@ -172,7 +247,10 @@ fn build_replay_configuration(
     let disk = match manifest.disk() {
         None => None,
         Some(expected) => {
-            let path = selected_or_hint(&configuration.disk_path, &expected.path_hint);
+            let path = selected_or_hint(
+                legacy_medium_hint(draft, 1, 0, "scsi.disk"),
+                &expected.path_hint,
+            );
             let mut storage =
                 storage::FileBlockStorage::open_read_only(&path).map_err(|error| {
                     format!("failed to open Replay disk '{}': {error}", path.display())
@@ -190,7 +268,10 @@ fn build_replay_configuration(
     let cdrom = match manifest.cdrom() {
         None => None,
         Some(expected) => {
-            let path = selected_or_hint(&configuration.cdrom_path, &expected.path_hint);
+            let path = selected_or_hint(
+                legacy_medium_hint(draft, 4, 0, "scsi.cdrom"),
+                &expected.path_hint,
+            );
             let mut storage =
                 storage::FileBlockStorage::open_read_only(&path).map_err(|error| {
                     format!("failed to open Replay CD-ROM '{}': {error}", path.display())
@@ -208,18 +289,6 @@ fn build_replay_configuration(
     let mut machine = build_machine_from_parts(startup_configuration, raw_prom, disk, cdrom)?;
     machine.restore_nonvolatile_state(nonvolatile_state, 0);
     Ok(RuntimeConfiguration::replaying(machine, replayer))
-}
-
-fn build_machine(
-    startup_configuration: MachineStartupConfiguration,
-    prom_path: &Path,
-    disk_path: Option<&Path>,
-    cdrom_path: Option<&Path>,
-) -> Result<Machine, String> {
-    let raw_prom = read_prom(prom_path)?;
-    let disk = open_optional_storage(disk_path, false)?.map(storage::FileBlockStorage::boxed);
-    let cdrom = open_optional_storage(cdrom_path, true)?.map(storage::FileBlockStorage::boxed);
-    build_machine_from_parts(startup_configuration, raw_prom, disk, cdrom)
 }
 
 fn build_machine_from_parts(
@@ -246,51 +315,20 @@ fn build_machine_from_parts(
     }
 }
 
-fn machine_startup_configuration(
-    configuration: &MachineConfiguration,
-) -> Result<MachineStartupConfiguration, String> {
-    validate_machine_and_backend(&configuration.machine_model, &configuration.float_backend)?;
-    let backend = match configuration.float_backend.as_str() {
-        "softfloat" => Backend::SoftFloat,
-        "native" => Backend::Native,
-        _ => unreachable!("backend was validated"),
-    };
-    let memory = Ip12MemoryConfiguration::try_from_simm_mib(memory_bank_simm_mib(configuration))
-        .map_err(|error| error.to_string())?;
-    let graphics = graphics_configuration(&configuration.graphics_board)?;
-    Ok(MachineStartupConfiguration::IndigoIp12 {
-        floating_point_backend: backend,
-        memory,
-        graphics,
-    })
-}
-
-fn graphics_configuration(identifier: &str) -> Result<Option<GraphicsBoard>, String> {
-    match identifier {
-        "none" => Ok(None),
-        "lg1" => Ok(Some(GraphicsBoard::Lg1)),
-        _ => Err(format!("unsupported graphics board: {identifier}")),
+fn legacy_medium_hint<'a>(draft: &'a MachineDraft, target: u8, lun: u8, device: &str) -> &'a str {
+    let slot = NodeId(format!("scsi.0.target.{target}.lun.{lun}"));
+    if draft
+        .attachments
+        .get(&slot)
+        .is_none_or(|attached| attached.0 != device)
+    {
+        return "";
     }
-}
-
-const fn memory_bank_simm_mib(configuration: &MachineConfiguration) -> [u8; 3] {
-    [
-        configuration.memory_bank_a_simm_mib,
-        configuration.memory_bank_b_simm_mib,
-        configuration.memory_bank_c_simm_mib,
-    ]
-}
-
-fn validate_machine_and_backend(machine_model: &str, float_backend: &str) -> Result<(), String> {
-    if machine_model != "indigo-ip12" {
-        return Err(format!("unsupported machine model: {machine_model}"));
+    let id = PropertyId(format!("scsi.0.target.{target}.lun.{lun}.medium-path"));
+    match draft.properties.get(&id) {
+        Some(PropertyValue::Text(path)) => path,
+        _ => "",
     }
-    if !matches!(float_backend, "softfloat" | "native") {
-        return Err(format!(
-            "unsupported floating-point backend: {float_backend}"
-        ));
-    }
-    Ok(())
 }
 
 fn read_prom(path: &Path) -> Result<Vec<u8>, String> {
@@ -298,19 +336,11 @@ fn read_prom(path: &Path) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("failed to read PROM image '{}': {error}", path.display()))
 }
 
-fn open_optional_storage(
-    path: Option<&Path>,
-    read_only: bool,
-) -> Result<Option<storage::FileBlockStorage>, String> {
+fn open_optional_storage(path: Option<&Path>) -> Result<Option<storage::FileBlockStorage>, String> {
     let Some(path) = path else {
         return Ok(None);
     };
-    let result = if read_only {
-        storage::FileBlockStorage::open_read_only(path)
-    } else {
-        storage::FileBlockStorage::open_read_write(path)
-    };
-    result
+    storage::FileBlockStorage::open_read_only(path)
         .map(Some)
         .map_err(|error| format!("failed to open storage image '{}': {error}", path.display()))
 }
@@ -351,10 +381,6 @@ fn ensure_identity(
     }
 }
 
-fn optional_path(path: &str) -> Option<&Path> {
-    (!path.is_empty()).then(|| Path::new(path))
-}
-
 fn selected_or_hint(selected: &str, hint: &str) -> PathBuf {
     if selected.is_empty() {
         PathBuf::from(hint)
@@ -365,13 +391,22 @@ fn selected_or_hint(selected: &str, hint: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use se_config::definition::MachineDefinition;
+    use se_config::draft::Edit;
+    use se_config::id::{DeviceKindId, NodeId, PropertyId};
+    use se_config::value::PropertyValue;
+    use se_float::backend::Backend;
+    use se_machine::indigo::ip12::Ip12MemoryConfiguration;
     use se_machine::indigo::ip12::Ip12SnapshotError;
+    use se_machine::indigo::ip12::definition::Ip12Definition;
     use se_machine::machine::MachineSnapshotError;
     use se_machine::output::VideoOutput;
 
     use super::{
-        Backend, GraphicsBoard, Ip12MemoryConfiguration, MachineStartupConfiguration,
-        build_machine_from_parts,
+        GraphicsBoard, MachineStartupConfiguration, build_machine_from_parts,
+        build_normal_configuration, config, firmware_unconfigured, legacy_recording_projection,
     };
 
     const PROM_BYTES: usize = 0x40000;
@@ -393,13 +428,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let headless =
+        let graphics_free =
             build_machine_from_parts(startup_configuration(None), vec![0; PROM_BYTES], None, None)
                 .unwrap();
 
         assert!(matches!(lg1.video_output(), VideoOutput::NoSignal));
         assert!(matches!(
-            headless.video_output(),
+            graphics_free.video_output(),
             VideoOutput::NoGraphicsBoard
         ));
     }
@@ -414,17 +449,92 @@ mod tests {
         )
         .unwrap();
         let snapshot = lg1.snapshot().unwrap();
-        let mut headless =
+        let mut graphics_free =
             build_machine_from_parts(startup_configuration(None), vec![0; PROM_BYTES], None, None)
                 .unwrap();
 
         assert!(matches!(
-            headless.restore_snapshot(snapshot),
+            graphics_free.restore_snapshot(snapshot),
             Err(MachineSnapshotError::IndigoIp12(Ip12SnapshotError::Gio(_)))
         ));
         assert!(matches!(
-            headless.video_output(),
+            graphics_free.video_output(),
             VideoOutput::NoGraphicsBoard
         ));
+    }
+
+    #[test]
+    fn normal_builder_accepts_arbitrary_scsi_targets_and_luns() {
+        let directory =
+            std::env::temp_dir().join(format!("sgi-emu-normal-build-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let prom = directory.join("prom.bin");
+        fs::write(&prom, vec![0; PROM_BYTES]).unwrap();
+        let mut draft = Ip12Definition.default_draft();
+        draft.apply(Edit::SetProperty {
+            property: PropertyId(String::from("firmware.0.image-path")),
+            value: PropertyValue::Text(prom.to_string_lossy().into_owned()),
+        });
+        for (target, lun, kind, name) in [
+            (2, 3, "scsi.disk", "disk-a.img"),
+            (5, 1, "scsi.disk", "disk-b.img"),
+            (6, 4, "scsi.cdrom", "disc.iso"),
+        ] {
+            let path = directory.join(name);
+            fs::write(&path, vec![0; 8192]).unwrap();
+            draft.apply(Edit::SetAttachment {
+                slot: NodeId(format!("scsi.0.target.{target}.lun.{lun}")),
+                device: Some(DeviceKindId(String::from(kind))),
+            });
+            draft.apply(Edit::SetProperty {
+                property: PropertyId(format!("scsi.0.target.{target}.lun.{lun}.medium-path")),
+                value: PropertyValue::Text(path.to_string_lossy().into_owned()),
+            });
+        }
+        if let Err(error) = build_normal_configuration(
+            draft,
+            &config::ApplicationConfig::default().network_configuration(),
+        ) {
+            panic!("{error}");
+        }
+        for name in ["prom.bin", "disk-a.img", "disk-b.img", "disc.iso"] {
+            fs::remove_file(directory.join(name)).unwrap();
+        }
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_recording_rejects_unrepresentable_scsi_topology() {
+        let mut draft = Ip12Definition.default_draft();
+        draft.apply(Edit::SetProperty {
+            property: PropertyId(String::from("firmware.0.image-path")),
+            value: PropertyValue::Text(String::from("prom.bin")),
+        });
+        draft.apply(Edit::SetAttachment {
+            slot: NodeId(String::from("scsi.0.target.2.lun.0")),
+            device: Some(DeviceKindId(String::from("scsi.disk"))),
+        });
+        draft.apply(Edit::SetProperty {
+            property: PropertyId(String::from("scsi.0.target.2.lun.0.medium-path")),
+            value: PropertyValue::Text(String::from("disk.img")),
+        });
+        assert_eq!(
+            legacy_recording_projection(&draft).err().as_deref(),
+            Some("current Record format does not support this machine topology")
+        );
+    }
+
+    #[test]
+    fn only_explicitly_empty_firmware_skips_initial_build() {
+        let mut draft = Ip12Definition.default_draft();
+        assert!(firmware_unconfigured(&draft));
+        let firmware = PropertyId(String::from("firmware.0.image-path"));
+        draft.properties.remove(&firmware);
+        assert!(!firmware_unconfigured(&draft));
+        draft.apply(Edit::SetProperty {
+            property: firmware,
+            value: PropertyValue::Integer(0),
+        });
+        assert!(!firmware_unconfigured(&draft));
     }
 }

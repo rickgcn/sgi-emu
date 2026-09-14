@@ -5,14 +5,20 @@
 #include <QVector>
 
 #include <cstdint>
+#include <memory>
 
 class QComboBox;
+class QFormLayout;
+class QLabel;
 class QLineEdit;
 class QTableWidget;
+class QTreeWidget;
+class QTreeWidgetItem;
 
 namespace se_ui {
 
 struct NetworkConfiguration;
+struct MachineConfigurationViewDto;
 struct UiSession;
 
 struct ForwardSettings {
@@ -36,41 +42,27 @@ struct NetworkSettings {
 NetworkSettings from_network_configuration(const NetworkConfiguration& configuration);
 NetworkConfiguration to_network_configuration(const NetworkSettings& settings);
 
-struct MachineSettings {
-    QString machine_model;
-    std::uint8_t memory_bank_a_simm_mib;
-    std::uint8_t memory_bank_b_simm_mib;
-    std::uint8_t memory_bank_c_simm_mib;
-    QString prom_path;
-    QString disk_path;
-    QString cdrom_path;
-    QString graphics_board;
-    QString float_backend;
-    NetworkSettings network;
-};
-
 class SettingsDialog final : public QDialog {
 public:
-    explicit SettingsDialog(const UiSession& session, const MachineSettings& settings, QWidget* parent = nullptr);
+    explicit SettingsDialog(const UiSession& session, const NetworkSettings& settings, QWidget* parent = nullptr);
+    ~SettingsDialog() override;
 
-    [[nodiscard]] MachineSettings settings() const;
+    [[nodiscard]] NetworkSettings settings() const;
 
 private:
-    void select_prom();
-    void select_disk();
-    void select_cdrom();
+    void rebuild_machine_view();
+    void show_node_properties(const QString& node_id);
+    void apply_text_edit(const QString& property_id, const QString& text);
+    void apply_property_edit(const QString& property_id, std::uint8_t kind,
+        bool bool_value, std::int64_t integer_value, const QString& text_value);
+    void apply_attachment_edit(const QString& node_id, const QString& device_id);
     void add_forward(const ForwardSettings& rule);
 
     const UiSession& session_;
-    QComboBox* machine_combo_;
-    QComboBox* memory_bank_a_combo_;
-    QComboBox* memory_bank_b_combo_;
-    QComboBox* memory_bank_c_combo_;
-    QLineEdit* prom_edit_;
-    QLineEdit* disk_edit_;
-    QLineEdit* cdrom_edit_;
-    QComboBox* graphics_board_combo_;
-    QComboBox* float_backend_combo_;
+    std::unique_ptr<MachineConfigurationViewDto> machine_view_;
+    QTreeWidget* machine_tree_;
+    QFormLayout* property_form_;
+    QLabel* diagnostics_;
     QLineEdit* subnet_edit_;
     QLineEdit* gateway_edit_;
     QLineEdit* dns_edit_;
