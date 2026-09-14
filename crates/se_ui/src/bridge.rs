@@ -134,36 +134,92 @@ pub mod ffi {
         pub forwards: Vec<NetworkForwardRule>,
     }
 
-    /// Machine settings shared by the application and Qt frontend.
+    /// A primitive configuration value tagged for the C++ boundary.
     #[derive(Debug)]
-    pub struct MachineConfiguration {
-        /// Stable machine identifier.
-        pub machine_model: String,
-        /// Per-SIMM capacity for IP12 memory bank A, or zero when empty.
-        pub memory_bank_a_simm_mib: u8,
-        /// Per-SIMM capacity for IP12 memory bank B, or zero when empty.
-        pub memory_bank_b_simm_mib: u8,
-        /// Per-SIMM capacity for IP12 memory bank C, or zero when empty.
-        pub memory_bank_c_simm_mib: u8,
-        /// Path to the selected PROM image.
-        pub prom_path: String,
-        /// Path to the optional disk image.
-        pub disk_path: String,
-        /// Path to the optional CD-ROM image.
-        pub cdrom_path: String,
-        /// Stable graphics board identifier.
-        pub graphics_board: String,
-        /// Stable floating-point backend identifier.
-        pub float_backend: String,
-        /// Host NAT configuration for Normal and Recording sessions.
-        pub network: NetworkConfiguration,
+    pub struct MachinePropertyValueDto {
+        pub kind: u8,
+        pub bool_value: bool,
+        pub integer_value: i64,
+        pub text_value: String,
+    }
+
+    /// One choice supplied by the machine definition.
+    #[derive(Debug)]
+    pub struct MachineChoiceDto {
+        pub value: MachinePropertyValueDto,
+        pub label: String,
+    }
+
+    /// An editable property and its editor metadata.
+    #[derive(Debug)]
+    pub struct MachinePropertyDto {
+        pub id: String,
+        pub label: String,
+        pub value: MachinePropertyValueDto,
+        pub editor: u8,
+        pub minimum: i64,
+        pub maximum: i64,
+        pub step: i64,
+        pub unit: String,
+        pub path_kind: u8,
+        pub choices: Vec<MachineChoiceDto>,
+    }
+
+    /// A device kind available to an attachment slot.
+    #[derive(Debug)]
+    pub struct MachineDeviceChoiceDto {
+        pub id: String,
+        pub label: String,
+    }
+
+    /// One resolved topology node.
+    #[derive(Debug)]
+    pub struct MachineNodeDto {
+        pub id: String,
+        pub parent_id: String,
+        pub role: u8,
+        pub label: String,
+        pub properties: Vec<MachinePropertyDto>,
+        pub has_attachment: bool,
+        pub allow_empty: bool,
+        pub current_device: String,
+        pub device_choices: Vec<MachineDeviceChoiceDto>,
+    }
+
+    /// A diagnostic emitted by the Rust machine definition.
+    #[derive(Debug)]
+    pub struct MachineDiagnosticDto {
+        pub severity: u8,
+        pub target_kind: u8,
+        pub target_id: String,
+        pub code: String,
+        pub message: String,
+    }
+
+    /// A resolved machine view, or a bridge lifecycle error.
+    #[derive(Debug)]
+    pub struct MachineConfigurationViewDto {
+        pub success: bool,
+        pub error: String,
+        pub display_name: String,
+        pub nodes: Vec<MachineNodeDto>,
+        pub diagnostics: Vec<MachineDiagnosticDto>,
+    }
+
+    /// An edit intent sent by Qt to the Rust draft owner.
+    #[derive(Debug)]
+    pub struct MachineConfigurationEditDto {
+        pub kind: u8,
+        pub target_id: String,
+        pub value: MachinePropertyValueDto,
+        pub device_id: String,
     }
 
     /// Values used to initialize the Qt user interface.
     #[derive(Debug)]
     pub struct UiStartupState {
-        /// Machine settings displayed by the frontend.
-        pub machine: MachineConfiguration,
+        /// Host network settings displayed by the frontend.
+        pub network: NetworkConfiguration,
         /// Base64-encoded `QWidget::saveGeometry()` bytes.
         pub window_geometry: String,
         /// Base64-encoded `QMainWindow::saveState()` bytes.
@@ -175,8 +231,8 @@ pub mod ffi {
     /// Values returned after the Qt event loop exits normally.
     #[derive(Debug)]
     pub struct UiExitState {
-        /// Machine settings selected by the frontend.
-        pub machine: MachineConfiguration,
+        /// Host network settings selected by the frontend.
+        pub network: NetworkConfiguration,
         /// Base64-encoded `QWidget::saveGeometry()` bytes.
         pub window_geometry: String,
         /// Base64-encoded `QMainWindow::saveState()` bytes.
@@ -392,10 +448,18 @@ pub mod ffi {
         fn normalize_terminal_paste(text: &str) -> Vec<u8>;
 
         fn runtime_status(self: &UiSession) -> RuntimeStatusDto;
-        fn configure_machine(
+        fn begin_machine_edit(self: &UiSession) -> MachineConfigurationViewDto;
+        fn apply_machine_edit(
             self: &UiSession,
-            configuration: &MachineConfiguration,
+            edit: &MachineConfigurationEditDto,
+        ) -> MachineConfigurationViewDto;
+        fn cancel_machine_edit(self: &UiSession);
+        fn machine_edit_changed(self: &UiSession) -> bool;
+        fn configure_edited_machine(
+            self: &UiSession,
+            network: &NetworkConfiguration,
         ) -> RuntimeStatusDto;
+        fn machine_display_name(self: &UiSession) -> String;
         fn validate_network_configuration(
             self: &UiSession,
             configuration: &NetworkConfiguration,
@@ -406,19 +470,14 @@ pub mod ffi {
         fn step_machine(self: &UiSession) -> RuntimeStatusDto;
         fn run_with_record(
             self: &UiSession,
-            configuration: &MachineConfiguration,
+            network: &NetworkConfiguration,
             path: &str,
         ) -> RuntimeStatusDto;
         fn stop_recording(self: &UiSession) -> RuntimeStatusDto;
-        fn open_replay(
-            self: &UiSession,
-            configuration: &MachineConfiguration,
-            path: &str,
-            snapshot_id: &str,
-        ) -> RuntimeStatusDto;
+        fn open_replay(self: &UiSession, path: &str, snapshot_id: &str) -> RuntimeStatusDto;
         fn replay_snapshot_catalog(self: &UiSession, path: &str) -> ReplaySnapshotCatalogDto;
         fn create_replay_snapshot(self: &UiSession) -> RuntimeStatusDto;
-        fn stop_replay(self: &UiSession, configuration: &MachineConfiguration) -> RuntimeStatusDto;
+        fn stop_replay(self: &UiSession, network: &NetworkConfiguration) -> RuntimeStatusDto;
         fn registers(self: &UiSession) -> RegistersDto;
         fn tlb(self: &UiSession, instruction_view: bool) -> TlbDto;
         fn cache(self: &UiSession, instruction_cache: bool) -> CacheDto;

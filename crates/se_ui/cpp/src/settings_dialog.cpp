@@ -1,21 +1,30 @@
 #include "se_ui/settings_dialog.h"
 #include "se_ui/src/bridge.rs.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFormLayout>
+#include <QHash>
+#include <QHeaderView>
 #include <QHBoxLayout>
+#include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
-#include <QToolButton>
-#include <QVariant>
-#include <QWidget>
-#include <QHeaderView>
 #include <QPushButton>
+#include <QSet>
+#include <QSpinBox>
 #include <QTableWidget>
 #include <QTabWidget>
+#include <QToolButton>
+#include <QTreeWidget>
+#include <QTreeWidgetItemIterator>
+#include <QTimer>
 #include <QVBoxLayout>
+
+#include <algorithm>
+#include <limits>
 
 namespace se_ui {
 namespace {
@@ -29,17 +38,23 @@ rust::String to_rust(const QString& value) {
     return rust::String(utf8.constData(), static_cast<std::size_t>(utf8.size()));
 }
 
-void populate_memory_bank(QComboBox* combo, std::uint8_t selected_simm_mib) {
-    combo->addItem(QStringLiteral("Not installed"), 0);
-    combo->addItem(QStringLiteral("4 x 2 MiB"), 2);
-    combo->addItem(QStringLiteral("4 x 4 MiB"), 4);
-    combo->addItem(QStringLiteral("4 x 8 MiB"), 8);
-    const auto index = combo->findData(static_cast<int>(selected_simm_mib));
-    combo->setCurrentIndex(index >= 0 ? index : 0);
+bool same_value(const MachinePropertyValueDto& a, const MachinePropertyValueDto& b) {
+    if (a.kind != b.kind) { return false; }
+    switch (a.kind) {
+    case 0: return a.bool_value == b.bool_value;
+    case 1: return a.integer_value == b.integer_value;
+    case 2: return a.text_value == b.text_value;
+    default: return false;
+    }
 }
 
-std::uint8_t selected_simm_mib(const QComboBox* combo) {
-    return static_cast<std::uint8_t>(combo->currentData().toUInt());
+QString display_value(const MachinePropertyValueDto& value) {
+    switch (value.kind) {
+    case 0: return value.bool_value ? QStringLiteral("true") : QStringLiteral("false");
+    case 1: return QString::number(value.integer_value);
+    case 2: return from_rust(value.text_value);
+    default: return QStringLiteral("Unknown value type");
+    }
 }
 
 } // namespace
@@ -64,110 +79,40 @@ NetworkConfiguration to_network_configuration(const NetworkSettings& settings) {
     return result;
 }
 
-SettingsDialog::SettingsDialog(const UiSession& session, const MachineSettings& settings, QWidget* parent)
+SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& settings, QWidget* parent)
     : QDialog(parent)
     , session_(session)
-    , machine_combo_(new QComboBox(this))
-    , memory_bank_a_combo_(new QComboBox(this))
-    , memory_bank_b_combo_(new QComboBox(this))
-    , memory_bank_c_combo_(new QComboBox(this))
-    , prom_edit_(new QLineEdit(this))
-    , disk_edit_(new QLineEdit(this))
-    , cdrom_edit_(new QLineEdit(this))
-    , graphics_board_combo_(new QComboBox(this))
-    , float_backend_combo_(new QComboBox(this))
-    , subnet_edit_(new QLineEdit(settings.network.subnet, this))
-    , gateway_edit_(new QLineEdit(settings.network.gateway, this))
-    , dns_edit_(new QLineEdit(settings.network.dns, this))
-    , dhcp_start_edit_(new QLineEdit(settings.network.dhcp_start, this))
+    , machine_view_(std::make_unique<MachineConfigurationViewDto>(session_.begin_machine_edit()))
+    , machine_tree_(new QTreeWidget(this))
+    , property_form_(new QFormLayout)
+    , diagnostics_(new QLabel(this))
+    , subnet_edit_(new QLineEdit(settings.subnet, this))
+    , gateway_edit_(new QLineEdit(settings.gateway, this))
+    , dns_edit_(new QLineEdit(settings.dns, this))
+    , dhcp_start_edit_(new QLineEdit(settings.dhcp_start, this))
     , forwards_table_(new QTableWidget(0, 5, this)) {
     setWindowTitle(QStringLiteral("Settings"));
     setModal(true);
 
-    machine_combo_->addItem(QStringLiteral("Indigo IP12"), QStringLiteral("indigo-ip12"));
-    const auto machine_index = machine_combo_->findData(settings.machine_model);
-    machine_combo_->setCurrentIndex(machine_index >= 0 ? machine_index : 0);
-
-    populate_memory_bank(memory_bank_a_combo_, settings.memory_bank_a_simm_mib);
-    populate_memory_bank(memory_bank_b_combo_, settings.memory_bank_b_simm_mib);
-    populate_memory_bank(memory_bank_c_combo_, settings.memory_bank_c_simm_mib);
-
-    prom_edit_->setText(settings.prom_path);
-    disk_edit_->setText(settings.disk_path);
-    cdrom_edit_->setText(settings.cdrom_path);
-
-    graphics_board_combo_->addItem(QStringLiteral("LG1"), QStringLiteral("lg1"));
-    graphics_board_combo_->addItem(QStringLiteral("None"), QStringLiteral("none"));
-    const auto graphics_index = graphics_board_combo_->findData(settings.graphics_board);
-    graphics_board_combo_->setCurrentIndex(graphics_index >= 0 ? graphics_index : 0);
-
-    float_backend_combo_->addItem(QStringLiteral("SoftFloat"), QStringLiteral("softfloat"));
-    float_backend_combo_->addItem(QStringLiteral("Native"), QStringLiteral("native"));
-    const auto backend_index = float_backend_combo_->findData(settings.float_backend);
-    float_backend_combo_->setCurrentIndex(backend_index >= 0 ? backend_index : 0);
-
-    auto* browse_button = new QToolButton(this);
-    browse_button->setText(QStringLiteral("..."));
-    connect(browse_button, &QToolButton::clicked, this, &SettingsDialog::select_prom);
-
-    auto* disk_browse_button = new QToolButton(this);
-    disk_browse_button->setText(QStringLiteral("..."));
-    connect(disk_browse_button, &QToolButton::clicked, this, &SettingsDialog::select_disk);
-
-    auto* cdrom_browse_button = new QToolButton(this);
-    cdrom_browse_button->setText(QStringLiteral("..."));
-    connect(cdrom_browse_button, &QToolButton::clicked, this, &SettingsDialog::select_cdrom);
-
-    auto* prom_widget = new QWidget(this);
-    auto* prom_layout = new QHBoxLayout(prom_widget);
-    prom_layout->setContentsMargins(0, 0, 0, 0);
-    prom_layout->addWidget(prom_edit_);
-    prom_layout->addWidget(browse_button);
-
-    auto* disk_widget = new QWidget(this);
-    auto* disk_layout = new QHBoxLayout(disk_widget);
-    disk_layout->setContentsMargins(0, 0, 0, 0);
-    disk_layout->addWidget(disk_edit_);
-    disk_layout->addWidget(disk_browse_button);
-
-    auto* cdrom_widget = new QWidget(this);
-    auto* cdrom_layout = new QHBoxLayout(cdrom_widget);
-    cdrom_layout->setContentsMargins(0, 0, 0, 0);
-    cdrom_layout->addWidget(cdrom_edit_);
-    cdrom_layout->addWidget(cdrom_browse_button);
-
-    auto* button_box = new QDialogButtonBox(
-        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    connect(button_box, &QDialogButtonBox::accepted, this, [this] {
-        const auto selected = this->settings();
-        if (selected.memory_bank_a_simm_mib == 0 && selected.memory_bank_b_simm_mib == 0
-            && selected.memory_bank_c_simm_mib == 0) {
-            QMessageBox::warning(
-                this,
-                QStringLiteral("Memory configuration"),
-                QStringLiteral("At least one memory bank must be installed."));
-            return;
-        }
-        const auto error = session_.validate_network_configuration(to_network_configuration(selected.network));
-        if (!error.empty()) {
-            QMessageBox::warning(this, QStringLiteral("Network configuration"), from_rust(error));
-            return;
-        }
-        accept();
-    });
-    connect(button_box, &QDialogButtonBox::rejected, this, &QDialog::reject);
-
     auto* machine_tab = new QWidget(this);
-    auto* layout = new QFormLayout(machine_tab);
-    layout->addRow(QStringLiteral("Machine"), machine_combo_);
-    layout->addRow(QStringLiteral("Memory bank A"), memory_bank_a_combo_);
-    layout->addRow(QStringLiteral("Memory bank B"), memory_bank_b_combo_);
-    layout->addRow(QStringLiteral("Memory bank C"), memory_bank_c_combo_);
-    layout->addRow(QStringLiteral("PROM"), prom_widget);
-    layout->addRow(QStringLiteral("Disk image"), disk_widget);
-    layout->addRow(QStringLiteral("CD-ROM image"), cdrom_widget);
-    layout->addRow(QStringLiteral("Graphics board"), graphics_board_combo_);
-    layout->addRow(QStringLiteral("Float backend"), float_backend_combo_);
+    auto* machine_layout = new QVBoxLayout(machine_tab);
+    auto* machine_columns = new QHBoxLayout;
+    machine_tree_->setHeaderHidden(true);
+    machine_columns->addWidget(machine_tree_, 1);
+    auto* property_panel = new QWidget(machine_tab);
+    property_panel->setLayout(property_form_);
+    machine_columns->addWidget(property_panel, 1);
+    machine_layout->addLayout(machine_columns, 1);
+    diagnostics_->setWordWrap(true);
+    diagnostics_->setMinimumHeight(65);
+    machine_layout->addWidget(diagnostics_);
+    connect(machine_tree_, &QTreeWidget::currentItemChanged, this,
+        [this](QTreeWidgetItem* current, QTreeWidgetItem*) {
+            if (current != nullptr) {
+                show_node_properties(current->data(0, Qt::UserRole).toString());
+            }
+        });
+
     auto* network_tab = new QWidget(this);
     auto* network_layout = new QVBoxLayout(network_tab);
     auto* network_form = new QFormLayout;
@@ -180,7 +125,7 @@ SettingsDialog::SettingsDialog(const UiSession& session, const MachineSettings& 
         QStringLiteral("Host port"), QStringLiteral("Guest address"), QStringLiteral("Guest port")});
     forwards_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     forwards_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    for (const auto& rule : settings.network.forwards) { add_forward(rule); }
+    for (const auto& rule : settings.forwards) { add_forward(rule); }
     network_layout->addWidget(forwards_table_);
     auto* forward_buttons = new QHBoxLayout;
     auto* add = new QPushButton(QStringLiteral("Add forwarding rule"), this);
@@ -200,34 +145,250 @@ SettingsDialog::SettingsDialog(const UiSession& session, const MachineSettings& 
     forward_buttons->addWidget(remove);
     forward_buttons->addStretch();
     network_layout->addLayout(forward_buttons);
+
     auto* tabs = new QTabWidget(this);
     tabs->addTab(machine_tab, QStringLiteral("Machine"));
     tabs->addTab(network_tab, QStringLiteral("Network"));
+    auto* button_box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(button_box, &QDialogButtonBox::accepted, this, [this] {
+        if (!machine_view_->success) {
+            QMessageBox::warning(this, QStringLiteral("Machine configuration"), from_rust(machine_view_->error));
+            return;
+        }
+        for (const auto& diagnostic : machine_view_->diagnostics) {
+            if (diagnostic.severity == 1) {
+                QMessageBox::warning(this, QStringLiteral("Machine configuration"), from_rust(diagnostic.message));
+                return;
+            }
+        }
+        const auto error = session_.validate_network_configuration(to_network_configuration(this->settings()));
+        if (!error.empty()) {
+            QMessageBox::warning(this, QStringLiteral("Network configuration"), from_rust(error));
+            return;
+        }
+        accept();
+    });
+    connect(button_box, &QDialogButtonBox::rejected, this, &QDialog::reject);
     auto* root = new QVBoxLayout(this);
     root->addWidget(tabs);
     root->addWidget(button_box);
-    resize(720, 440);
+    rebuild_machine_view();
+    resize(820, 550);
 }
 
-MachineSettings SettingsDialog::settings() const {
+SettingsDialog::~SettingsDialog() = default;
+
+NetworkSettings SettingsDialog::settings() const {
     NetworkSettings network {subnet_edit_->text(), gateway_edit_->text(), dns_edit_->text(), dhcp_start_edit_->text(), {}};
     for (int row = 0; row < forwards_table_->rowCount(); ++row) {
         const auto* protocol = qobject_cast<QComboBox*>(forwards_table_->cellWidget(row, 0));
         network.forwards.append({protocol->currentData().toString(), forwards_table_->item(row, 1)->text(),
             forwards_table_->item(row, 2)->text(), forwards_table_->item(row, 3)->text(), forwards_table_->item(row, 4)->text()});
     }
-    return {
-        machine_combo_->currentData().toString(),
-        selected_simm_mib(memory_bank_a_combo_),
-        selected_simm_mib(memory_bank_b_combo_),
-        selected_simm_mib(memory_bank_c_combo_),
-        prom_edit_->text(),
-        disk_edit_->text(),
-        cdrom_edit_->text(),
-        graphics_board_combo_->currentData().toString(),
-        float_backend_combo_->currentData().toString(),
-        network,
-    };
+    return network;
+}
+
+void SettingsDialog::rebuild_machine_view() {
+    QString selected;
+    QSet<QString> expanded;
+    const bool first_render = machine_tree_->topLevelItemCount() == 0;
+    if (machine_tree_->currentItem() != nullptr) {
+        selected = machine_tree_->currentItem()->data(0, Qt::UserRole).toString();
+    }
+    for (QTreeWidgetItemIterator it(machine_tree_); *it != nullptr; ++it) {
+        if ((*it)->isExpanded()) { expanded.insert((*it)->data(0, Qt::UserRole).toString()); }
+    }
+    machine_tree_->clear();
+    QHash<QString, QTreeWidgetItem*> items;
+    for (const auto& node : machine_view_->nodes) {
+        const auto id = from_rust(node.id);
+        const auto parent_id = from_rust(node.parent_id);
+        auto* parent = items.value(parent_id, nullptr);
+        auto* item = parent == nullptr ? new QTreeWidgetItem(machine_tree_) : new QTreeWidgetItem(parent);
+        item->setText(0, from_rust(node.label));
+        item->setData(0, Qt::UserRole, id);
+        items.insert(id, item);
+        if (first_render || expanded.contains(id)) { item->setExpanded(true); }
+    }
+    auto* current = items.value(selected, nullptr);
+    if (current == nullptr && machine_tree_->topLevelItemCount() > 0) {
+        current = machine_tree_->topLevelItem(0);
+    }
+    machine_tree_->setCurrentItem(current);
+    if (current != nullptr) { show_node_properties(current->data(0, Qt::UserRole).toString()); }
+
+    QStringList messages;
+    for (const auto& diagnostic : machine_view_->diagnostics) {
+        messages.append(QStringLiteral("%1: %2").arg(
+            diagnostic.severity == 1 ? QStringLiteral("Error") : QStringLiteral("Warning"),
+            from_rust(diagnostic.message)));
+    }
+    if (!machine_view_->success) { messages.append(from_rust(machine_view_->error)); }
+    diagnostics_->setText(messages.isEmpty() ? QStringLiteral("No configuration issues") : messages.join(QLatin1Char('\n')));
+}
+
+void SettingsDialog::show_node_properties(const QString& node_id) {
+    while (property_form_->rowCount() > 0) { property_form_->removeRow(0); }
+    for (const auto& node : machine_view_->nodes) {
+        if (from_rust(node.id) != node_id) { continue; }
+        if (node.has_attachment) {
+            auto* combo = new QComboBox(this);
+            if (node.allow_empty) { combo->addItem(QStringLiteral("Empty"), QString()); }
+            for (const auto& choice : node.device_choices) {
+                combo->addItem(from_rust(choice.label), from_rust(choice.id));
+            }
+            const auto current_device = from_rust(node.current_device);
+            const auto selected = combo->findData(current_device);
+            if (selected < 0 && !current_device.isEmpty()) {
+                property_form_->addRow(QStringLiteral("Current device"),
+                    new QLabel(current_device, this));
+            }
+            combo->setCurrentIndex(selected);
+            connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [this, node_id, combo](int index) {
+                    if (index >= 0) { apply_attachment_edit(node_id, combo->itemData(index).toString()); }
+                });
+            property_form_->addRow(QStringLiteral("Device"), combo);
+        }
+        for (const auto& property : node.properties) {
+            const auto id = from_rust(property.id);
+            const auto label = from_rust(property.label);
+            bool editable_value = true;
+            switch (property.editor) {
+            case 0: editable_value = property.value.kind == 0; break;
+            case 1: editable_value = property.value.kind == 1
+                && property.value.integer_value >= property.minimum
+                && property.value.integer_value <= property.maximum
+                && property.value.integer_value >= std::numeric_limits<int>::min()
+                && property.value.integer_value <= std::numeric_limits<int>::max(); break;
+            case 2:
+            case 3: editable_value = property.value.kind == 2; break;
+            case 4:
+                editable_value = std::any_of(property.choices.begin(), property.choices.end(),
+                    [&property](const MachineChoiceDto& choice) {
+                        return same_value(choice.value, property.value);
+                    });
+                break;
+            default: break;
+            }
+            if (!editable_value) {
+                property_form_->addRow(QStringLiteral("Current value"),
+                    new QLabel(display_value(property.value), this));
+            }
+            switch (property.editor) {
+            case 0: {
+                auto* checkbox = new QCheckBox(this);
+                checkbox->setChecked(property.value.bool_value);
+                connect(checkbox, &QCheckBox::toggled, this,
+                    [this, id](bool checked) { apply_property_edit(id, 0, checked, 0, QString()); });
+                property_form_->addRow(label, checkbox);
+                break;
+            }
+            case 1: {
+                auto* spin = new QSpinBox(this);
+                const auto low = static_cast<int>(std::clamp(property.minimum,
+                    static_cast<std::int64_t>(std::numeric_limits<int>::min()),
+                    static_cast<std::int64_t>(std::numeric_limits<int>::max())));
+                const auto high = static_cast<int>(std::clamp(property.maximum,
+                    static_cast<std::int64_t>(std::numeric_limits<int>::min()),
+                    static_cast<std::int64_t>(std::numeric_limits<int>::max())));
+                spin->setRange(low, high);
+                spin->setSingleStep(static_cast<int>(std::clamp(property.step,
+                    std::int64_t(1), static_cast<std::int64_t>(std::numeric_limits<int>::max()))));
+                spin->setValue(static_cast<int>(std::clamp(property.value.integer_value,
+                    static_cast<std::int64_t>(low), static_cast<std::int64_t>(high))));
+                spin->setSuffix(from_rust(property.unit));
+                connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                    [this, id](int value) { apply_property_edit(id, 1, false, value, QString()); });
+                property_form_->addRow(label, spin);
+                break;
+            }
+            case 2:
+            case 3: {
+                auto* line = new QLineEdit(from_rust(property.value.text_value), this);
+                connect(line, &QLineEdit::editingFinished, this,
+                    [this, id, line] { apply_text_edit(id, line->text()); });
+                if (property.editor == 3) {
+                    auto* row = new QWidget(this);
+                    auto* layout = new QHBoxLayout(row);
+                    layout->setContentsMargins(0, 0, 0, 0);
+                    auto* browse = new QToolButton(row);
+                    browse->setText(QStringLiteral("..."));
+                    browse->setFocusPolicy(Qt::NoFocus);
+                    layout->addWidget(line);
+                    layout->addWidget(browse);
+                    const auto directory = property.path_kind == 1;
+                    connect(browse, &QToolButton::clicked, this, [this, id, line, directory] {
+                        const auto path = directory
+                            ? QFileDialog::getExistingDirectory(this, QStringLiteral("Select directory"), line->text())
+                            : QFileDialog::getOpenFileName(this, QStringLiteral("Select file"), line->text());
+                        if (!path.isEmpty()) { apply_text_edit(id, path); }
+                    });
+                    property_form_->addRow(label, row);
+                } else {
+                    property_form_->addRow(label, line);
+                }
+                break;
+            }
+            case 4: {
+                auto* combo = new QComboBox(this);
+                int selected = -1;
+                for (const auto& choice : property.choices) {
+                    if (same_value(choice.value, property.value)) { selected = combo->count(); }
+                    combo->addItem(from_rust(choice.label));
+                }
+                combo->setCurrentIndex(selected);
+                connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                    [this, id](int index) {
+                        if (index < 0) { return; }
+                        for (const auto& current_node : machine_view_->nodes) {
+                            for (const auto& current_property : current_node.properties) {
+                                if (from_rust(current_property.id) != id
+                                    || static_cast<std::size_t>(index) >= current_property.choices.size()) { continue; }
+                                const auto& value = current_property.choices[static_cast<std::size_t>(index)].value;
+                                apply_property_edit(id, value.kind, value.bool_value,
+                                    value.integer_value, from_rust(value.text_value));
+                                return;
+                            }
+                        }
+                    });
+                property_form_->addRow(label, combo);
+                break;
+            }
+            default: break;
+            }
+        }
+        return;
+    }
+}
+
+void SettingsDialog::apply_text_edit(const QString& property_id, const QString& text) {
+    apply_property_edit(property_id, 2, false, 0, text);
+}
+
+void SettingsDialog::apply_property_edit(const QString& property_id, std::uint8_t kind,
+    bool bool_value, std::int64_t integer_value, const QString& text_value) {
+    MachineConfigurationEditDto edit {0, to_rust(property_id),
+        {kind, bool_value, integer_value, to_rust(text_value)}, rust::String()};
+    auto next = session_.apply_machine_edit(edit);
+    if (!next.success) {
+        QMessageBox::warning(this, QStringLiteral("Machine configuration"), from_rust(next.error));
+        return;
+    }
+    machine_view_ = std::make_unique<MachineConfigurationViewDto>(std::move(next));
+    QTimer::singleShot(0, this, [this] { rebuild_machine_view(); });
+}
+
+void SettingsDialog::apply_attachment_edit(const QString& node_id, const QString& device_id) {
+    MachineConfigurationEditDto edit {1, to_rust(node_id),
+        {0, false, 0, rust::String()}, to_rust(device_id)};
+    auto next = session_.apply_machine_edit(edit);
+    if (!next.success) {
+        QMessageBox::warning(this, QStringLiteral("Machine configuration"), from_rust(next.error));
+        return;
+    }
+    machine_view_ = std::make_unique<MachineConfigurationViewDto>(std::move(next));
+    QTimer::singleShot(0, this, [this] { rebuild_machine_view(); });
 }
 
 void SettingsDialog::add_forward(const ForwardSettings& rule) {
@@ -242,30 +403,6 @@ void SettingsDialog::add_forward(const ForwardSettings& rule) {
     forwards_table_->setItem(row, 2, new QTableWidgetItem(rule.host_port));
     forwards_table_->setItem(row, 3, new QTableWidgetItem(rule.guest_address));
     forwards_table_->setItem(row, 4, new QTableWidgetItem(rule.guest_port));
-}
-
-void SettingsDialog::select_prom() {
-    const auto selected_path = QFileDialog::getOpenFileName(
-        this, QStringLiteral("Select PROM"), prom_edit_->text());
-    if (!selected_path.isEmpty()) {
-        prom_edit_->setText(selected_path);
-    }
-}
-
-void SettingsDialog::select_disk() {
-    const auto selected_path = QFileDialog::getOpenFileName(
-        this, QStringLiteral("Select disk image"), disk_edit_->text());
-    if (!selected_path.isEmpty()) {
-        disk_edit_->setText(selected_path);
-    }
-}
-
-void SettingsDialog::select_cdrom() {
-    const auto selected_path = QFileDialog::getOpenFileName(
-        this, QStringLiteral("Select CD-ROM image"), cdrom_edit_->text());
-    if (!selected_path.isEmpty()) {
-        cdrom_edit_->setText(selected_path);
-    }
 }
 
 } // namespace se_ui

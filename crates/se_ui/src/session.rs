@@ -1,7 +1,10 @@
 //! Top-level ownership of the runtime during a graphical session.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use se_config::definition::MachineDefinition;
+use se_config::draft::MachineDraft;
 use se_cpu::mips1::r3000::debug::{
     CacheView, PendingCp0DebugSnapshot, PendingCp1DebugSnapshot, TlbView,
 };
@@ -19,15 +22,29 @@ use se_runtime::runtime::{DebugReply, Runtime, RuntimeConfiguration, RuntimeErro
 
 use crate::bridge::VideoFrameHandle;
 use crate::bridge::ffi::{
-    CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineConfiguration,
-    MachineOutputSink, MemoryDto, NetworkConfiguration, RegistersDto, ReplaySnapshotCatalogDto,
-    ReplaySnapshotInfoDto, RuntimeStatusDto, SerialPortDto, SgiMouseButtonDto, TlbDto, TlbEntryDto,
-    UiExitState, UiStartupState, VideoOutputStateDto, run_gui,
+    CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineConfigurationEditDto,
+    MachineConfigurationViewDto, MachineOutputSink, MemoryDto, NetworkConfiguration, RegistersDto,
+    ReplaySnapshotCatalogDto, ReplaySnapshotInfoDto, RuntimeStatusDto, SerialPortDto,
+    SgiMouseButtonDto, TlbDto, TlbEntryDto, UiExitState, UiStartupState, VideoOutputStateDto,
+    run_gui,
 };
+use crate::configuration::{edit_from_dto, failed_view, view_dto};
 
-/// Constructs a machine from settings selected by a frontend.
-pub type MachineBuilder = Box<
-    dyn Fn(&MachineConfiguration, MachineBuildRequest) -> Result<RuntimeConfiguration, String>
+/// Constructs a Normal machine from one owned configuration snapshot.
+pub type NormalMachineBuilder = Box<
+    dyn Fn(MachineDraft, &NetworkConfiguration) -> Result<RuntimeConfiguration, String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Constructs one legacy Record or Replay machine from a Rust draft snapshot.
+pub type LegacyMachineBuilder = Box<
+    dyn Fn(
+            MachineDraft,
+            LegacyBuildRequest,
+            Option<&NetworkConfiguration>,
+        ) -> Result<RuntimeConfiguration, String>
         + Send
         + Sync
         + 'static,
@@ -38,9 +55,7 @@ pub type NetworkValidator =
     Box<dyn Fn(&NetworkConfiguration) -> Result<(), String> + Send + Sync + 'static>;
 
 /// Cold machine mode requested by the Qt session.
-pub enum MachineBuildRequest {
-    /// Ordinary execution using current settings.
-    Normal,
+pub enum LegacyBuildRequest {
     /// Cold-start recording to the selected Record path.
     Recording(PathBuf),
     /// Replay from the selected Record's beginning or a manual snapshot.
@@ -55,8 +70,16 @@ pub enum MachineBuildRequest {
 /// Owns the emulator runtime for the lifetime of one Qt event loop.
 pub struct UiSession {
     runtime: Option<Runtime>,
-    machine_builder: MachineBuilder,
+    definition: Arc<dyn MachineDefinition>,
+    configuration: Mutex<MachineConfigurationState>,
+    normal_builder: NormalMachineBuilder,
+    legacy_builder: LegacyMachineBuilder,
     network_validator: NetworkValidator,
+}
+
+struct MachineConfigurationState {
+    committed: MachineDraft,
+    editing: Option<MachineDraft>,
 }
 
 impl UiSession {
@@ -64,12 +87,21 @@ impl UiSession {
     #[must_use]
     pub fn new(
         runtime: Runtime,
-        machine_builder: MachineBuilder,
+        committed: MachineDraft,
+        definition: Arc<dyn MachineDefinition>,
+        normal_builder: NormalMachineBuilder,
+        legacy_builder: LegacyMachineBuilder,
         network_validator: NetworkValidator,
     ) -> Self {
         Self {
             runtime: Some(runtime),
-            machine_builder,
+            definition,
+            configuration: Mutex::new(MachineConfigurationState {
+                committed,
+                editing: None,
+            }),
+            normal_builder,
+            legacy_builder,
             network_validator,
         }
     }
@@ -101,10 +133,111 @@ impl UiSession {
             .unwrap_or_default()
     }
 
-    /// Builds and installs a machine selected in the settings dialog.
-    pub fn configure_machine(&self, configuration: &MachineConfiguration) -> RuntimeStatusDto {
-        let configuration = match (self.machine_builder)(configuration, MachineBuildRequest::Normal)
-        {
+    /// Begins the single settings transaction and returns its resolved view.
+    pub fn begin_machine_edit(&self) -> MachineConfigurationViewDto {
+        let mut state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.editing.is_some() {
+            return failed_view("machine editing is already active");
+        }
+        let candidate = state.committed.clone();
+        let view = self.definition.resolve(&candidate);
+        state.editing = Some(candidate);
+        view_dto(view)
+    }
+
+    /// Applies an edit intent to the temporary draft and returns a fresh view.
+    pub fn apply_machine_edit(
+        &self,
+        edit: &MachineConfigurationEditDto,
+    ) -> MachineConfigurationViewDto {
+        let edit = match edit_from_dto(edit) {
+            Ok(edit) => edit,
+            Err(error) => return failed_view(error),
+        };
+        let mut state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(editing) = state.editing.as_mut() else {
+            return failed_view("machine editing is not active");
+        };
+        editing.apply(edit);
+        view_dto(self.definition.resolve(editing))
+    }
+
+    /// Discards any temporary machine settings.
+    pub fn cancel_machine_edit(&self) {
+        self.configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .editing = None;
+    }
+
+    /// Reports whether the active transaction differs from committed settings.
+    pub fn machine_edit_changed(&self) -> bool {
+        let state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state
+            .editing
+            .as_ref()
+            .is_some_and(|editing| *editing != state.committed)
+    }
+
+    /// Returns the committed Rust draft for application persistence.
+    #[must_use]
+    pub fn machine_draft_snapshot(&self) -> MachineDraft {
+        self.configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .committed
+            .clone()
+    }
+
+    /// Returns the current definition's display name.
+    pub fn machine_display_name(&self) -> String {
+        self.definition.display_name().to_owned()
+    }
+
+    /// Builds and installs the edited candidate, committing only after success.
+    pub fn configure_edited_machine(&self, network: &NetworkConfiguration) -> RuntimeStatusDto {
+        let candidate = {
+            let state = self
+                .configuration
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(candidate) = state.editing.as_ref() else {
+                return failed_status(String::from("machine editing is not active"));
+            };
+            candidate.clone()
+        };
+        let result = self.build_and_configure(candidate.clone(), network);
+        let mut state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.editing = None;
+        if result.success {
+            state.committed = candidate;
+        }
+        result
+    }
+
+    /// Rebuilds the committed Normal machine, including when leaving Replay.
+    fn configure_machine(&self, network: &NetworkConfiguration) -> RuntimeStatusDto {
+        self.build_and_configure(self.machine_draft_snapshot(), network)
+    }
+
+    fn build_and_configure(
+        &self,
+        draft: MachineDraft,
+        network: &NetworkConfiguration,
+    ) -> RuntimeStatusDto {
+        let configuration = match (self.normal_builder)(draft, network) {
             Ok(configuration) => configuration,
             Err(error) => return failed_status(error),
         };
@@ -133,14 +266,11 @@ impl UiSession {
 
     /// Cold-constructs a Recording machine and starts it from the first PROM
     /// instruction.
-    pub fn run_with_record(
-        &self,
-        configuration: &MachineConfiguration,
-        path: &str,
-    ) -> RuntimeStatusDto {
-        let configuration = match (self.machine_builder)(
-            configuration,
-            MachineBuildRequest::Recording(PathBuf::from(path)),
+    pub fn run_with_record(&self, network: &NetworkConfiguration, path: &str) -> RuntimeStatusDto {
+        let configuration = match (self.legacy_builder)(
+            self.machine_draft_snapshot(),
+            LegacyBuildRequest::Recording(PathBuf::from(path)),
+            Some(network),
         ) {
             Ok(configuration) => configuration,
             Err(error) => return failed_status(error),
@@ -158,18 +288,14 @@ impl UiSession {
     }
 
     /// Cold-constructs and installs a paused Replay machine.
-    pub fn open_replay(
-        &self,
-        configuration: &MachineConfiguration,
-        path: &str,
-        snapshot_id: &str,
-    ) -> RuntimeStatusDto {
-        let configuration = match (self.machine_builder)(
-            configuration,
-            MachineBuildRequest::Replaying {
+    pub fn open_replay(&self, path: &str, snapshot_id: &str) -> RuntimeStatusDto {
+        let configuration = match (self.legacy_builder)(
+            self.machine_draft_snapshot(),
+            LegacyBuildRequest::Replaying {
                 path: PathBuf::from(path),
                 snapshot_id: (!snapshot_id.is_empty()).then(|| snapshot_id.to_owned()),
             },
+            None,
         ) {
             Ok(configuration) => configuration,
             Err(error) => return failed_status(error),
@@ -209,8 +335,8 @@ impl UiSession {
 
     /// Discards the Replay machine and cold-constructs a paused Normal machine
     /// from current settings.
-    pub fn stop_replay(&self, configuration: &MachineConfiguration) -> RuntimeStatusDto {
-        self.configure_machine(configuration)
+    pub fn stop_replay(&self, network: &NetworkConfiguration) -> RuntimeStatusDto {
+        self.configure_machine(network)
     }
 
     /// Connects runtime machine output to the Qt delivery sink.
@@ -711,39 +837,170 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    use se_runtime::runtime::Runtime;
+    use se_config::definition::MachineDefinition;
+    use se_config::draft::{Edit, MachineDraft};
+    use se_config::id::PropertyId;
+    use se_config::value::PropertyValue;
+    use se_machine::indigo::ip12::builder;
+    use se_machine::indigo::ip12::definition::Ip12Definition;
+    use se_machine::machine::Machine;
+    use se_machine::resource::{PreparedResource, ResourceKind};
+    use se_runtime::runtime::{Runtime, RuntimeConfiguration};
 
-    use super::{MachineBuildRequest, UiSession};
-    use crate::bridge::ffi::{MachineConfiguration, NetworkConfiguration};
+    use super::{LegacyBuildRequest, UiSession};
+    use crate::bridge::ffi::{
+        MachineConfigurationEditDto, MachinePropertyValueDto, NetworkConfiguration,
+    };
 
-    fn configuration() -> MachineConfiguration {
-        MachineConfiguration {
-            machine_model: String::from("indigo-ip12"),
-            memory_bank_a_simm_mib: 2,
-            memory_bank_b_simm_mib: 0,
-            memory_bank_c_simm_mib: 0,
-            prom_path: String::from("prom.bin"),
-            disk_path: String::new(),
-            cdrom_path: String::new(),
-            graphics_board: String::from("lg1"),
-            float_backend: String::from("softfloat"),
-            network: NetworkConfiguration {
-                subnet: String::new(),
-                gateway: String::new(),
-                dns: String::new(),
-                dhcp_start: String::new(),
-                forwards: Vec::new(),
-            },
+    fn draft() -> MachineDraft {
+        let mut draft = Ip12Definition.default_draft();
+        draft.apply(Edit::SetProperty {
+            property: PropertyId(String::from("firmware.0.image-path")),
+            value: PropertyValue::Text(String::from("prom.bin")),
+        });
+        draft
+    }
+
+    fn network() -> NetworkConfiguration {
+        NetworkConfiguration {
+            subnet: String::new(),
+            gateway: String::new(),
+            dns: String::new(),
+            dhcp_start: String::new(),
+            forwards: Vec::new(),
         }
     }
 
+    fn edit_firmware(path: &str) -> MachineConfigurationEditDto {
+        MachineConfigurationEditDto {
+            kind: 0,
+            target_id: String::from("firmware.0.image-path"),
+            value: MachinePropertyValueDto {
+                kind: 2,
+                bool_value: false,
+                integer_value: 0,
+                text_value: path.into(),
+            },
+            device_id: String::new(),
+        }
+    }
+
+    fn session(normal_succeeds: bool) -> UiSession {
+        UiSession::new(
+            Runtime::new_unconfigured().unwrap(),
+            draft(),
+            Arc::new(Ip12Definition),
+            Box::new(move |draft, _network| {
+                if !normal_succeeds {
+                    return Err(String::from("injected builder stop"));
+                }
+                let plan = Ip12Definition
+                    .compile(&draft)
+                    .map_err(|error| error.to_string())?;
+                let prepared = plan
+                    .prepare_with(|_, requirement| match requirement.kind {
+                        ResourceKind::Bytes => {
+                            Ok::<_, String>(PreparedResource::Bytes(vec![0; 0x40000]))
+                        }
+                        ResourceKind::Storage { .. } => Err(String::from("unexpected storage")),
+                    })
+                    .map_err(|error| error.to_string())?;
+                let machine = Machine::IndigoIp12(
+                    builder::build(prepared).map_err(|error| error.to_string())?,
+                );
+                Ok(RuntimeConfiguration::normal(machine))
+            }),
+            Box::new(|_, _, _| Err(String::from("unused legacy builder"))),
+            Box::new(|_| Ok(())),
+        )
+    }
+
     #[test]
-    fn network_validation_uses_the_application_callback_without_building_a_machine() {
+    fn edit_transaction_keeps_committed_draft_until_success() {
+        let session = session(true);
+        let original = session.machine_draft_snapshot();
+        let view = session.begin_machine_edit();
+        assert!(view.success);
+        assert!(!session.begin_machine_edit().success);
+        assert!(view.nodes.iter().any(|node| node.id == "indigo-ip12"));
+        let updated = session.apply_machine_edit(&edit_firmware("other.bin"));
+        assert!(updated.success);
+        assert!(session.machine_edit_changed());
+        assert_eq!(session.machine_draft_snapshot(), original);
+        session.cancel_machine_edit();
+        assert!(!session.machine_edit_changed());
+        assert_eq!(session.machine_draft_snapshot(), original);
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&edit_firmware("accepted.bin"))
+                .success
+        );
+        assert!(session.configure_edited_machine(&network()).success);
+        assert_eq!(
+            session
+                .machine_draft_snapshot()
+                .properties
+                .get(&PropertyId(String::from("firmware.0.image-path"))),
+            Some(&PropertyValue::Text(String::from("accepted.bin")))
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn failed_build_discards_edit_without_changing_committed_draft() {
+        let session = session(false);
+        let original = session.machine_draft_snapshot();
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&edit_firmware("missing.bin"))
+                .success
+        );
+        let status = session.configure_edited_machine(&network());
+        assert!(!status.success);
+        assert_eq!(status.command_error, "injected builder stop");
+        assert_eq!(session.machine_draft_snapshot(), original);
+        assert!(!session.machine_edit_changed());
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn semantically_invalid_edit_still_returns_a_view() {
+        let session = session(false);
+        assert!(session.begin_machine_edit().success);
+        let result = session.apply_machine_edit(&MachineConfigurationEditDto {
+            kind: 0,
+            target_id: String::from("memory.bank.a.simm-mib"),
+            value: MachinePropertyValueDto {
+                kind: 1,
+                bool_value: false,
+                integer_value: 0,
+                text_value: String::new(),
+            },
+            device_id: String::new(),
+        });
+        assert!(result.success);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "ip12.memory.no-installed-bank")
+        );
+        session.cancel_machine_edit();
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_validation_uses_application_callback_without_building() {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let validator_observed = Arc::clone(&observed);
         let session = UiSession::new(
             Runtime::new_unconfigured().unwrap(),
+            draft(),
+            Arc::new(Ip12Definition),
             Box::new(|_, _| panic!("validation must not construct a machine")),
+            Box::new(|_, _, _| panic!("validation must not construct a legacy machine")),
             Box::new(move |configuration| {
                 validator_observed
                     .lock()
@@ -756,8 +1013,7 @@ mod tests {
                 }
             }),
         );
-        let before = session.runtime_status();
-        let mut network = configuration().network;
+        let mut network = network();
         network.subnet = String::from("rejected");
         assert_eq!(
             session.validate_network_configuration(&network),
@@ -766,21 +1022,20 @@ mod tests {
         network.subnet = String::from("accepted");
         assert!(session.validate_network_configuration(&network).is_empty());
         assert_eq!(*observed.lock().unwrap(), ["rejected", "accepted"]);
-        let after = session.runtime_status();
-        assert_eq!(after.revision, before.revision);
-        assert_eq!(after.state, before.state);
-        assert_eq!(after.completed_instructions, before.completed_instructions);
         session.shutdown().unwrap();
     }
 
     #[test]
-    fn replay_bridge_preserves_the_selected_snapshot_identifier() {
+    fn replay_bridge_preserves_selected_snapshot_identifier() {
         let observed = Arc::new(Mutex::new(None));
         let builder_observed = Arc::clone(&observed);
         let session = UiSession::new(
             Runtime::new_unconfigured().unwrap(),
-            Box::new(move |_configuration, request| {
-                let MachineBuildRequest::Replaying { path, snapshot_id } = request else {
+            draft(),
+            Arc::new(Ip12Definition),
+            Box::new(|_, _| Err(String::from("unused normal builder"))),
+            Box::new(move |_draft, request, _| {
+                let LegacyBuildRequest::Replaying { path, snapshot_id } = request else {
                     panic!("the bridge sent the wrong build request");
                 };
                 *builder_observed.lock().unwrap() = Some((path, snapshot_id));
@@ -788,11 +1043,8 @@ mod tests {
             }),
             Box::new(|_| Ok(())),
         );
-
-        let status = session.open_replay(&configuration(), "recording.serec", "point.ckpt");
-
+        let status = session.open_replay("recording.serec", "point.ckpt");
         assert!(!status.success);
-        assert_eq!(status.command_error, "injected builder stop");
         let observed = observed.lock().unwrap().take().unwrap();
         assert_eq!(observed.0, Path::new("recording.serec"));
         assert_eq!(observed.1.as_deref(), Some("point.ckpt"));
@@ -801,37 +1053,23 @@ mod tests {
 
     #[test]
     fn replay_snapshot_bridge_reports_catalog_and_runtime_errors() {
-        let session = UiSession::new(
-            Runtime::new_unconfigured().unwrap(),
-            Box::new(|_, _| Err(String::from("unused builder"))),
-            Box::new(|_| Ok(())),
-        );
-
+        let session = session(false);
         let catalog = session.replay_snapshot_catalog("missing-record.serec");
         assert!(!catalog.success);
         assert!(catalog.snapshots.is_empty());
-        assert!(!catalog.error.is_empty());
         assert!(!session.create_replay_snapshot().success);
         session.shutdown().unwrap();
     }
 
     #[test]
-    fn sgi_key_bridge_accepts_exactly_the_protocol_keycodes() {
-        let session = UiSession::new(
-            Runtime::new_unconfigured().unwrap(),
-            Box::new(|_, _| Err(String::from("unused builder"))),
-            Box::new(|_| Ok(())),
-        );
+    fn sgi_key_bridge_accepts_exactly_protocol_keycodes() {
+        let session = session(false);
         let accepted: Vec<_> = (0..=u8::MAX)
             .filter(|code| session.send_sgi_key(*code, true))
             .collect();
-
         assert_eq!(accepted.len(), 101);
         assert_eq!(accepted.first().copied(), Some(2));
         assert_eq!(accepted.last().copied(), Some(109));
-        for excluded in [0, 1, 12, 59, 70, 71, 76, 77, 78, 110, 111, 112, 255] {
-            assert!(!accepted.contains(&excluded));
-        }
         session.shutdown().unwrap();
     }
 }

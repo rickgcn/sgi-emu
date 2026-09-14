@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 cxx.workspace = true
+se_config.workspace = true
 se_cpu.workspace = true
 se_machine.workspace = true
 se_runtime.workspace = true
