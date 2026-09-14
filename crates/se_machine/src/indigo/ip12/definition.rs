@@ -621,7 +621,7 @@ impl<'a> Projection<'a> {
             node_id("ethernet.0"),
             Some(node_id(MODEL)),
             NodeRole::Component,
-            "SEEQ 8003 Ethernet Controller",
+            "Ethernet Controller",
         ));
         self.view.nodes.push(node(
             node_id("ethernet.0.port.0"),
