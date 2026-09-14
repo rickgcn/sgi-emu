@@ -1,4 +1,4 @@
-//! Top-level ownership of the runtime during a graphical session.
+//! Graphical control of an application-owned runtime.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -13,12 +13,11 @@ use se_machine::indigo::ip12::debug::{
     DebugRequest as Ip12DebugRequest, DebugResponse as Ip12DebugResponse, MemoryAddressSpace,
 };
 use se_machine::input::MachineInput;
-use se_machine::machine::MachineNonvolatileState;
 use se_machine::output::VideoOutput;
 use se_machine::serial::SerialPort;
 use se_runtime::control::{RuntimeMode, RuntimeState, RuntimeStatus};
 use se_runtime::record::Replayer;
-use se_runtime::runtime::{DebugReply, Runtime, RuntimeConfiguration, RuntimeError, ShutdownError};
+use se_runtime::runtime::{DebugReply, RuntimeConfiguration, RuntimeError, RuntimeHandle};
 
 use crate::bridge::VideoFrameHandle;
 use crate::bridge::ffi::{
@@ -38,13 +37,17 @@ pub type NormalMachineBuilder = Box<
         + 'static,
 >;
 
-/// Constructs one legacy Record or Replay machine from a Rust draft snapshot.
-pub type LegacyMachineBuilder = Box<
-    dyn Fn(
-            MachineDraft,
-            LegacyBuildRequest,
-            Option<&NetworkConfiguration>,
-        ) -> Result<RuntimeConfiguration, String>
+/// Constructs a cold Recording machine from one committed draft snapshot.
+pub type RecordingMachineBuilder = Box<
+    dyn Fn(MachineDraft, &NetworkConfiguration, PathBuf) -> Result<RuntimeConfiguration, String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Constructs a Replay machine using the current draft only for resource paths.
+pub type ReplayMachineBuilder = Box<
+    dyn Fn(MachineDraft, PathBuf, Option<String>) -> Result<RuntimeConfiguration, String>
         + Send
         + Sync
         + 'static,
@@ -54,26 +57,14 @@ pub type LegacyMachineBuilder = Box<
 pub type NetworkValidator =
     Box<dyn Fn(&NetworkConfiguration) -> Result<(), String> + Send + Sync + 'static>;
 
-/// Cold machine mode requested by the Qt session.
-pub enum LegacyBuildRequest {
-    /// Cold-start recording to the selected Record path.
-    Recording(PathBuf),
-    /// Replay from the selected Record's beginning or a manual snapshot.
-    Replaying {
-        /// Complete Record path.
-        path: PathBuf,
-        /// Opaque snapshot identifier, or `None` for cold Replay.
-        snapshot_id: Option<String>,
-    },
-}
-
-/// Owns the emulator runtime for the lifetime of one Qt event loop.
+/// Controls the runtime during one Qt event loop.
 pub struct UiSession {
-    runtime: Option<Runtime>,
+    runtime: RuntimeHandle,
     definition: Arc<dyn MachineDefinition>,
     configuration: Mutex<MachineConfigurationState>,
     normal_builder: NormalMachineBuilder,
-    legacy_builder: LegacyMachineBuilder,
+    recording_builder: RecordingMachineBuilder,
+    replay_builder: ReplayMachineBuilder,
     network_validator: NetworkValidator,
 }
 
@@ -86,22 +77,24 @@ impl UiSession {
     /// Creates a session with application-provided construction and validation callbacks.
     #[must_use]
     pub fn new(
-        runtime: Runtime,
+        runtime: RuntimeHandle,
         committed: MachineDraft,
         definition: Arc<dyn MachineDefinition>,
         normal_builder: NormalMachineBuilder,
-        legacy_builder: LegacyMachineBuilder,
+        recording_builder: RecordingMachineBuilder,
+        replay_builder: ReplayMachineBuilder,
         network_validator: NetworkValidator,
     ) -> Self {
         Self {
-            runtime: Some(runtime),
+            runtime,
             definition,
             configuration: Mutex::new(MachineConfigurationState {
                 committed,
                 editing: None,
             }),
             normal_builder,
-            legacy_builder,
+            recording_builder,
+            replay_builder,
             network_validator,
         }
     }
@@ -111,17 +104,9 @@ impl UiSession {
         run_gui(self, startup)
     }
 
-    /// Stops the runtime worker and waits for it to exit.
-    pub fn shutdown(mut self) -> Result<Option<MachineNonvolatileState>, ShutdownError> {
-        match self.runtime.take() {
-            Some(runtime) => runtime.shutdown(),
-            None => Ok(None),
-        }
-    }
-
     /// Samples current runtime status for Qt.
     pub fn runtime_status(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::status)
+        self.runtime_command(RuntimeHandle::status)
     }
 
     /// Validates network settings through the application without changing runtime state.
@@ -246,31 +231,31 @@ impl UiSession {
 
     /// Starts continuous machine execution.
     pub fn run_machine(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::run)
+        self.runtime_command(RuntimeHandle::run)
     }
 
     /// Resets and pauses the configured machine.
     pub fn reset_machine(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::reset)
+        self.runtime_command(RuntimeHandle::reset)
     }
 
     /// Pauses continuous machine execution.
     pub fn pause_machine(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::pause)
+        self.runtime_command(RuntimeHandle::pause)
     }
 
     /// Executes one instruction while paused.
     pub fn step_machine(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::step)
+        self.runtime_command(RuntimeHandle::step)
     }
 
     /// Cold-constructs a Recording machine and starts it from the first PROM
     /// instruction.
     pub fn run_with_record(&self, network: &NetworkConfiguration, path: &str) -> RuntimeStatusDto {
-        let configuration = match (self.legacy_builder)(
+        let configuration = match (self.recording_builder)(
             self.machine_draft_snapshot(),
-            LegacyBuildRequest::Recording(PathBuf::from(path)),
-            Some(network),
+            network,
+            PathBuf::from(path),
         ) {
             Ok(configuration) => configuration,
             Err(error) => return failed_status(error),
@@ -279,23 +264,20 @@ impl UiSession {
         if !status.success {
             return status;
         }
-        self.runtime_command(Runtime::run)
+        self.runtime_command(RuntimeHandle::run)
     }
 
     /// Finalizes the active Record without changing Running or Paused state.
     pub fn stop_recording(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::stop_recording)
+        self.runtime_command(RuntimeHandle::stop_recording)
     }
 
     /// Cold-constructs and installs a paused Replay machine.
     pub fn open_replay(&self, path: &str, snapshot_id: &str) -> RuntimeStatusDto {
-        let configuration = match (self.legacy_builder)(
+        let configuration = match (self.replay_builder)(
             self.machine_draft_snapshot(),
-            LegacyBuildRequest::Replaying {
-                path: PathBuf::from(path),
-                snapshot_id: (!snapshot_id.is_empty()).then(|| snapshot_id.to_owned()),
-            },
-            None,
+            PathBuf::from(path),
+            (!snapshot_id.is_empty()).then(|| snapshot_id.to_owned()),
         ) {
             Ok(configuration) => configuration,
             Err(error) => return failed_status(error),
@@ -330,7 +312,7 @@ impl UiSession {
 
     /// Creates a manual snapshot of the active paused Replay.
     pub fn create_replay_snapshot(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::create_replay_snapshot)
+        self.runtime_command(RuntimeHandle::create_replay_snapshot)
     }
 
     /// Discards the Replay machine and cold-constructs a paused Normal machine
@@ -377,9 +359,7 @@ impl UiSession {
 
     /// Disconnects the Qt delivery sink from the runtime worker.
     pub fn detach_machine_output(&self) {
-        if let Some(runtime) = self.runtime.as_ref() {
-            let _ = runtime.clear_output_handler();
-        }
+        let _ = self.runtime.clear_output_handler();
     }
 
     /// Samples processor registers and pending effects.
@@ -594,10 +574,7 @@ impl UiSession {
 
     /// Adds or removes one virtual execution breakpoint.
     pub fn toggle_breakpoint(&self, address: u32) -> RuntimeStatusDto {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return failed_status(String::from("runtime is unavailable"));
-        };
-        match runtime.toggle_breakpoint(address) {
+        match self.runtime.toggle_breakpoint(address) {
             Ok(status) => status_dto(status),
             Err(error) => failed_status(error.to_string()),
         }
@@ -610,18 +587,15 @@ impl UiSession {
             SerialPortDto::B => SerialPort::B,
             _ => return failed_status(String::from("unsupported serial port")),
         };
-        let Some(runtime) = self.runtime.as_ref() else {
-            return failed_status(String::from("runtime is unavailable"));
-        };
         for value in bytes {
-            if let Err(error) = runtime.send_input(MachineInput::SerialByte {
+            if let Err(error) = self.runtime.send_input(MachineInput::SerialByte {
                 port,
                 value: *value,
             }) {
                 return failed_status(error.to_string());
             }
         }
-        self.runtime_command(Runtime::status)
+        self.runtime_command(RuntimeHandle::status)
     }
 
     /// Enqueues one validated physical SGI keyboard transition.
@@ -629,18 +603,14 @@ impl UiSession {
         let Some(input) = MachineInput::sgi_keyboard(code, pressed) else {
             return false;
         };
-        self.runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.send_input(input).is_ok())
+        self.runtime.send_input(input).is_ok()
     }
 
     /// Enqueues normalized relative SGI mouse motion.
     pub fn send_sgi_mouse_motion(&self, delta_x: i32, delta_y: i32) -> bool {
-        self.runtime.as_ref().is_some_and(|runtime| {
-            runtime
-                .send_input(MachineInput::SgiMouseMotion { delta_x, delta_y })
-                .is_ok()
-        })
+        self.runtime
+            .send_input(MachineInput::SgiMouseMotion { delta_x, delta_y })
+            .is_ok()
     }
 
     /// Enqueues one physical SGI mouse button transition.
@@ -654,29 +624,21 @@ impl UiSession {
         let Some(input) = MachineInput::sgi_mouse_button(code, pressed) else {
             return false;
         };
-        self.runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.send_input(input).is_ok())
+        self.runtime.send_input(input).is_ok()
     }
 
     fn runtime_command(
         &self,
-        command: impl FnOnce(&Runtime) -> Result<RuntimeStatus, RuntimeError>,
+        command: impl FnOnce(&RuntimeHandle) -> Result<RuntimeStatus, RuntimeError>,
     ) -> RuntimeStatusDto {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return failed_status(String::from("runtime is unavailable"));
-        };
-        match command(runtime) {
+        match command(&self.runtime) {
             Ok(status) => status_dto(status),
             Err(error) => failed_status(error.to_string()),
         }
     }
 
     fn debug(&self, request: Ip12DebugRequest) -> Result<DebugReply, RuntimeError> {
-        self.runtime
-            .as_ref()
-            .ok_or(RuntimeError::WorkerUnavailable)?
-            .debug(DebugRequest::IndigoIp12(request))
+        self.runtime.debug(DebugRequest::IndigoIp12(request))
     }
 }
 
@@ -847,7 +809,7 @@ mod tests {
     use se_machine::resource::{PreparedResource, ResourceKind};
     use se_runtime::runtime::{Runtime, RuntimeConfiguration};
 
-    use super::{LegacyBuildRequest, UiSession};
+    use super::UiSession;
     use crate::bridge::ffi::{
         MachineConfigurationEditDto, MachinePropertyValueDto, NetworkConfiguration,
     };
@@ -885,9 +847,10 @@ mod tests {
         }
     }
 
-    fn session(normal_succeeds: bool) -> UiSession {
-        UiSession::new(
-            Runtime::new_unconfigured().unwrap(),
+    fn session(normal_succeeds: bool) -> (Runtime, UiSession) {
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let session = UiSession::new(
+            runtime.handle(),
             draft(),
             Arc::new(Ip12Definition),
             Box::new(move |draft, _network| {
@@ -910,14 +873,16 @@ mod tests {
                 );
                 Ok(RuntimeConfiguration::normal(machine))
             }),
-            Box::new(|_, _, _| Err(String::from("unused legacy builder"))),
+            Box::new(|_, _, _| Err(String::from("unused recording builder"))),
+            Box::new(|_, _, _| Err(String::from("unused replay builder"))),
             Box::new(|_| Ok(())),
-        )
+        );
+        (runtime, session)
     }
 
     #[test]
     fn edit_transaction_keeps_committed_draft_until_success() {
-        let session = session(true);
+        let (runtime, session) = session(true);
         let original = session.machine_draft_snapshot();
         let view = session.begin_machine_edit();
         assert!(view.success);
@@ -944,12 +909,13 @@ mod tests {
                 .get(&PropertyId(String::from("firmware.0.image-path"))),
             Some(&PropertyValue::Text(String::from("accepted.bin")))
         );
-        session.shutdown().unwrap();
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
     fn failed_build_discards_edit_without_changing_committed_draft() {
-        let session = session(false);
+        let (runtime, session) = session(false);
         let original = session.machine_draft_snapshot();
         assert!(session.begin_machine_edit().success);
         assert!(
@@ -962,12 +928,13 @@ mod tests {
         assert_eq!(status.command_error, "injected builder stop");
         assert_eq!(session.machine_draft_snapshot(), original);
         assert!(!session.machine_edit_changed());
-        session.shutdown().unwrap();
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
     fn semantically_invalid_edit_still_returns_a_view() {
-        let session = session(false);
+        let (runtime, session) = session(false);
         assert!(session.begin_machine_edit().success);
         let result = session.apply_machine_edit(&MachineConfigurationEditDto {
             kind: 0,
@@ -988,19 +955,22 @@ mod tests {
                 .any(|diagnostic| diagnostic.code == "ip12.memory.no-installed-bank")
         );
         session.cancel_machine_edit();
-        session.shutdown().unwrap();
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
     fn network_validation_uses_application_callback_without_building() {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let validator_observed = Arc::clone(&observed);
+        let runtime = Runtime::new_unconfigured().unwrap();
         let session = UiSession::new(
-            Runtime::new_unconfigured().unwrap(),
+            runtime.handle(),
             draft(),
             Arc::new(Ip12Definition),
             Box::new(|_, _| panic!("validation must not construct a machine")),
-            Box::new(|_, _, _| panic!("validation must not construct a legacy machine")),
+            Box::new(|_, _, _| panic!("validation must not construct a Recording machine")),
+            Box::new(|_, _, _| panic!("validation must not construct a Replay machine")),
             Box::new(move |configuration| {
                 validator_observed
                     .lock()
@@ -1022,22 +992,22 @@ mod tests {
         network.subnet = String::from("accepted");
         assert!(session.validate_network_configuration(&network).is_empty());
         assert_eq!(*observed.lock().unwrap(), ["rejected", "accepted"]);
-        session.shutdown().unwrap();
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
     fn replay_bridge_preserves_selected_snapshot_identifier() {
         let observed = Arc::new(Mutex::new(None));
         let builder_observed = Arc::clone(&observed);
+        let runtime = Runtime::new_unconfigured().unwrap();
         let session = UiSession::new(
-            Runtime::new_unconfigured().unwrap(),
+            runtime.handle(),
             draft(),
             Arc::new(Ip12Definition),
             Box::new(|_, _| Err(String::from("unused normal builder"))),
-            Box::new(move |_draft, request, _| {
-                let LegacyBuildRequest::Replaying { path, snapshot_id } = request else {
-                    panic!("the bridge sent the wrong build request");
-                };
+            Box::new(|_, _, _| Err(String::from("unused recording builder"))),
+            Box::new(move |_draft, path, snapshot_id| {
                 *builder_observed.lock().unwrap() = Some((path, snapshot_id));
                 Err(String::from("injected builder stop"))
             }),
@@ -1048,28 +1018,40 @@ mod tests {
         let observed = observed.lock().unwrap().take().unwrap();
         assert_eq!(observed.0, Path::new("recording.serec"));
         assert_eq!(observed.1.as_deref(), Some("point.ckpt"));
-        session.shutdown().unwrap();
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
     fn replay_snapshot_bridge_reports_catalog_and_runtime_errors() {
-        let session = session(false);
+        let (runtime, session) = session(false);
         let catalog = session.replay_snapshot_catalog("missing-record.serec");
         assert!(!catalog.success);
         assert!(catalog.snapshots.is_empty());
         assert!(!session.create_replay_snapshot().success);
-        session.shutdown().unwrap();
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
     fn sgi_key_bridge_accepts_exactly_protocol_keycodes() {
-        let session = session(false);
+        let (runtime, session) = session(false);
         let accepted: Vec<_> = (0..=u8::MAX)
             .filter(|code| session.send_sgi_key(*code, true))
             .collect();
         assert_eq!(accepted.len(), 101);
         assert_eq!(accepted.first().copied(), Some(2));
         assert_eq!(accepted.last().copied(), Some(109));
-        session.shutdown().unwrap();
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn dropping_ui_session_keeps_the_application_runtime_alive() {
+        let (runtime, session) = session(true);
+        assert!(session.configure_machine(&network()).success);
+        drop(session);
+        assert!(runtime.handle().status().is_ok());
+        assert!(runtime.shutdown().unwrap().is_some());
     }
 }

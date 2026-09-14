@@ -6,13 +6,86 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use se_config::draft::MachineDraft;
 use se_core::storage::StorageAccess;
+use se_machine::indigo::ip12::builder::{self, Ip12AssemblyError};
+use se_machine::indigo::ip12::definition::Ip12Definition;
+use se_machine::indigo::ip12::plan::Ip12CompileError;
 use se_machine::indigo::ip12::plan::{Ip12BuildPlan, PreparedIp12Build};
+use se_machine::machine::Machine;
 use se_machine::resource::{
     PrepareResourcesError, PreparedResource, ResourceKind, ResourceRequirement,
 };
+use se_network::config::NatConfig;
+use se_runtime::runtime::RuntimeConfiguration;
 
 use crate::file_storage::HostFileStorage;
+use crate::persistence;
+
+/// Failure to construct an ordinary machine session.
+#[derive(Debug)]
+pub enum NormalBuildError {
+    /// The draft has semantic errors.
+    Compile(Ip12CompileError),
+    /// A host resource could not be prepared.
+    Prepare(NormalPreparationError),
+    /// Validated resources could not be assembled.
+    Assemble(Ip12AssemblyError),
+    /// Retained machine state could not be loaded.
+    Persistence(Box<dyn Error>),
+}
+
+impl fmt::Display for NormalBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Compile(error) => formatter.write_str(
+                &error
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            Self::Prepare(error) => error.fmt(formatter),
+            Self::Assemble(error) => error.fmt(formatter),
+            Self::Persistence(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for NormalBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Compile(error) => Some(error),
+            Self::Prepare(error) => Some(error),
+            Self::Assemble(error) => Some(error),
+            Self::Persistence(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+/// Compiles, prepares, assembles, and restores one Normal machine.
+///
+/// # Errors
+///
+/// Returns the failing semantic, resource, assembly, or persistence error.
+pub fn build_configuration(
+    draft: MachineDraft,
+    network: NatConfig,
+) -> Result<RuntimeConfiguration, NormalBuildError> {
+    let plan = Ip12Definition
+        .compile(&draft)
+        .map_err(NormalBuildError::Compile)?;
+    let prepared = prepare_ip12(plan).map_err(NormalBuildError::Prepare)?;
+    let mut machine =
+        Machine::IndigoIp12(builder::build(prepared).map_err(NormalBuildError::Assemble)?);
+    if let Some(restored) =
+        persistence::load(&draft.model.0).map_err(NormalBuildError::Persistence)?
+    {
+        machine.restore_nonvolatile_state(restored.state, restored.offline_milliseconds);
+    }
+    Ok(RuntimeConfiguration::normal_with_network(machine, network))
+}
 
 /// A host file could not be read or opened with the requested access.
 #[derive(Debug)]
@@ -30,6 +103,13 @@ pub enum HostResourceError {
         path: PathBuf,
         /// The requested host file access.
         access: StorageAccess,
+        /// The underlying host I/O error.
+        source: io::Error,
+    },
+    /// Hashing a fixed-capacity storage medium failed.
+    HashStorage {
+        /// The path supplied by the build plan.
+        path: PathBuf,
         /// The underlying host I/O error.
         source: io::Error,
     },
@@ -54,6 +134,13 @@ impl fmt::Display for HostResourceError {
                 "failed to open {access} storage '{}': {source}",
                 path.display()
             ),
+            Self::HashStorage { path, source } => {
+                write!(
+                    formatter,
+                    "failed to hash storage '{}': {source}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -61,7 +148,9 @@ impl fmt::Display for HostResourceError {
 impl Error for HostResourceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ReadBytes { source, .. } | Self::OpenStorage { source, .. } => Some(source),
+            Self::ReadBytes { source, .. }
+            | Self::OpenStorage { source, .. }
+            | Self::HashStorage { source, .. } => Some(source),
         }
     }
 }
