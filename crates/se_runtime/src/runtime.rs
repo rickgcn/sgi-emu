@@ -1691,7 +1691,21 @@ impl Worker {
 
     /// Records an input before the machine performs MAC filtering or DMA checks.
     /// Host queue drops and sockets never become replay machine state.
+    #[inline]
     fn process_network_boundary(&mut self) {
+        if self.pending_network_frame.is_none()
+            && !self
+                .network
+                .as_ref()
+                .is_some_and(NetworkSession::has_pending_work)
+        {
+            return;
+        }
+        self.process_pending_network_boundary();
+    }
+
+    #[inline(never)]
+    fn process_pending_network_boundary(&mut self) {
         if self.pending_network_frame.is_none() {
             self.pending_network_frame = self
                 .network
@@ -2955,6 +2969,17 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             }
         }
         remove_record_artifacts(&path);
+    }
+
+    #[test]
+    fn local_network_frame_is_processed_without_host_pending_work() {
+        let mut worker = super::Worker::new(Some(machine_with_instructions(&[0])));
+        worker.pending_network_frame = Some(vec![0xff; 60]);
+
+        worker.process_network_boundary();
+
+        assert!(worker.pending_network_frame.is_none());
+        assert!(worker.session_error.is_none());
     }
 
     #[test]
