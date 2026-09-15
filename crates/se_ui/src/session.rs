@@ -646,11 +646,11 @@ impl UiSession {
         }
     }
 
-    /// Supplies one byte batch to an exact live serial endpoint.
-    pub fn send_serial(&self, handle: &EndpointHandleDto, bytes: &[u8]) -> RuntimeStatusDto {
+    /// Supplies one character to an exact live serial endpoint.
+    pub fn send_serial(&self, handle: &EndpointHandleDto, value: u8) -> RuntimeStatusDto {
         match self
             .resolve_endpoint_handle(handle)
-            .and_then(|handle| self.runtime.send_serial(handle, bytes))
+            .and_then(|handle| self.runtime.send_serial(handle, value))
         {
             Ok(status) => status_dto(status),
             Err(error) => failed_status(error.to_string()),

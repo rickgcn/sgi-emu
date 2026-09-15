@@ -74,11 +74,6 @@ enum Command {
         request: DebugRequest,
         reply: CommandReply<DebugReply>,
     },
-    SendSerial {
-        handle: EndpointHandle,
-        bytes: Vec<u8>,
-        reply: CommandReply<RuntimeStatus>,
-    },
     MachineInput {
         handle: EndpointHandle,
         payload: MachineInputPayload,
@@ -459,7 +454,7 @@ impl RuntimeHandle {
         self.request(|reply| Command::Debug { request, reply })
     }
 
-    /// Supplies host bytes to one live serial endpoint.
+    /// Supplies one host character to a live serial endpoint.
     ///
     /// # Errors
     ///
@@ -467,13 +462,9 @@ impl RuntimeHandle {
     pub fn send_serial(
         &self,
         handle: EndpointHandle,
-        bytes: &[u8],
+        value: u8,
     ) -> Result<RuntimeStatus, RuntimeError> {
-        self.request(|reply| Command::SendSerial {
-            handle,
-            bytes: bytes.to_vec(),
-            reply,
-        })
+        self.send_typed_input(handle, MachineInputPayload::SerialByte(value))
     }
 
     /// Sends one keyboard transition to a live keyboard endpoint.
@@ -855,27 +846,6 @@ impl Worker {
                     || Err(rejection("no machine is configured")),
                     |machine| Ok(self.debug_reply(machine.debug(request))),
                 );
-                send_reply(reply, result);
-            }
-            Command::SendSerial {
-                handle,
-                bytes,
-                reply,
-            } => {
-                let result = self.require_live_input().and_then(|()| {
-                    self.validate_handle(&handle, EndpointKind::Serial)?;
-                    let endpoint = handle.key().clone();
-                    for value in bytes {
-                        let input = MachineInput::new(
-                            endpoint.clone(),
-                            MachineInputPayload::SerialByte(value),
-                        );
-                        self.accept_live_input_at_boundary(&input)?;
-                    }
-                    self.advance_revision();
-                    Ok(self.status())
-                });
-                self.check_record_failure();
                 send_reply(reply, result);
             }
             Command::MachineInput {
@@ -2357,23 +2327,23 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         let serial = endpoint_handle(&runtime, EndpointKind::Serial, 0);
         let keyboard = endpoint_handle(&runtime, EndpointKind::Keyboard, 0);
         assert_eq!(
-            runtime.send_serial(keyboard, b"wrong kind"),
+            runtime.send_serial(keyboard, b'w'),
             Err(RuntimeError::EndpointKindMismatch)
         );
 
         let reset = runtime.reset().unwrap();
         assert_eq!(reset.machine_generation, installed.machine_generation);
-        assert!(runtime.send_serial(serial.clone(), b"live").is_ok());
+        assert!(runtime.send_serial(serial.clone(), b'l').is_ok());
 
         let replaced = runtime.configure(machine_with_instructions(&[0])).unwrap();
         assert_eq!(replaced.machine_generation, 2);
         assert_eq!(
-            runtime.send_serial(serial, b"stale"),
+            runtime.send_serial(serial, b's'),
             Err(RuntimeError::StaleEndpoint)
         );
         assert!(
             runtime
-                .send_serial(endpoint_handle(&runtime, EndpointKind::Serial, 0), b"new")
+                .send_serial(endpoint_handle(&runtime, EndpointKind::Serial, 0), b'n')
                 .is_ok()
         );
         runtime.shutdown().unwrap();
@@ -2512,7 +2482,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
                     EndpointKind::Serial,
                     0
                 ),
-                &[1]
+                1
             ),
             Err(RuntimeError::WorkerUnavailable)
         );
@@ -2601,9 +2571,10 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             runtime.step().unwrap();
         }
         let bytes: Vec<u8> = (0..9).collect();
-        runtime
-            .send_serial(endpoint_handle(&runtime, EndpointKind::Serial, 0), &bytes)
-            .unwrap();
+        let serial = endpoint_handle(&runtime, EndpointKind::Serial, 0);
+        for value in &bytes {
+            runtime.send_serial(serial.clone(), *value).unwrap();
+        }
         runtime.stop_recording().unwrap();
         runtime.shutdown().unwrap();
 
@@ -2822,10 +2793,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             .unwrap();
         assert_eq!(status.mode, RuntimeMode::Recording);
         runtime
-            .send_serial(
-                endpoint_handle(&runtime, EndpointKind::Serial, 0),
-                b"before reset",
-            )
+            .send_serial(endpoint_handle(&runtime, EndpointKind::Serial, 0), b'b')
             .unwrap();
         runtime.step().unwrap();
         runtime.step().unwrap();
@@ -2833,10 +2801,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         assert_eq!(reset.position.epoch, 1);
         assert_eq!(reset.position.completed_instructions, 0);
         runtime
-            .send_serial(
-                endpoint_handle(&runtime, EndpointKind::Serial, 1),
-                b"after reset",
-            )
+            .send_serial(endpoint_handle(&runtime, EndpointKind::Serial, 1), b'a')
             .unwrap();
         runtime.step().unwrap();
         let stopped = runtime.stop_recording().unwrap();
@@ -2862,7 +2827,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         assert_eq!(opened.mode, RuntimeMode::Replaying);
         assert!(
             runtime
-                .send_serial(endpoint_handle(&runtime, EndpointKind::Serial, 0), b"live")
+                .send_serial(endpoint_handle(&runtime, EndpointKind::Serial, 0), b'l')
                 .is_err()
         );
         assert!(runtime.reset().is_err());
@@ -3131,8 +3096,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             ))
             .unwrap();
         let serial_a = endpoint_handle(&runtime, EndpointKind::Serial, 0);
-        runtime.send_serial(serial_a.clone(), b"").unwrap();
-        runtime.send_serial(serial_a, b"input").unwrap();
+        runtime.send_serial(serial_a, b'i').unwrap();
         runtime.stop_recording().unwrap();
         runtime.shutdown().unwrap();
 
@@ -4239,7 +4203,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         assert!(matches!(
             runtime.send_serial(
                 endpoint_handle_from_machine(&reset_machine(), EndpointKind::Serial, 0),
-                b"A"
+                b'A'
             ),
             Err(RuntimeError::CommandRejected { .. })
         ));

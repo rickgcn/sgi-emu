@@ -17,7 +17,7 @@ namespace se_ui {
 
 class Vt100Widget final : public QAbstractScrollArea {
 public:
-    using InputHandler = std::function<void(const std::vector<std::uint8_t>&)>;
+    using InputHandler = std::function<void(std::uint8_t)>;
 
     explicit Vt100Widget(QWidget* parent = nullptr);
     ~Vt100Widget() override;
@@ -25,6 +25,7 @@ public:
     void set_input_handler(InputHandler handler);
     void feed(const std::vector<std::uint8_t>& bytes);
     void clear_terminal();
+    void discard_pending_input();
 
 protected:
     void contextMenuEvent(QContextMenuEvent* event) override;

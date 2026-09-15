@@ -42,7 +42,7 @@ void SerialConsoleDock::rebuild(const EndpointCatalogDto& catalog) {
         }
         const auto identity = endpoint_identity(descriptor.handle);
         auto* terminal = new Vt100Widget(tabs_);
-        terminal->set_input_handler([this, identity](const auto& bytes) { send_serial(identity, bytes); });
+        terminal->set_input_handler([this, identity](std::uint8_t value) { send_serial(identity, value); });
         tabs_->addTab(terminal, QString::fromUtf8(descriptor.label.data(), static_cast<qsizetype>(descriptor.label.size())));
         terminals_.emplace_back(identity, terminal);
     }
@@ -51,6 +51,11 @@ void SerialConsoleDock::rebuild(const EndpointCatalogDto& catalog) {
 
 void SerialConsoleDock::set_input_enabled(bool enabled) {
     input_enabled_ = enabled;
+    if (!enabled) {
+        for (const auto& terminal : terminals_) {
+            terminal.second->discard_pending_input();
+        }
+    }
 }
 
 void SerialConsoleDock::append_serial(std::uint64_t generation, rust::Str key, const std::vector<std::uint8_t>& bytes) {
@@ -63,12 +68,12 @@ void SerialConsoleDock::append_serial(std::uint64_t generation, rust::Str key, c
     }
 }
 
-void SerialConsoleDock::send_serial(const EndpointIdentity& identity, const std::vector<std::uint8_t>& bytes) const {
-    if (bytes.empty() || !input_enabled_) {
+void SerialConsoleDock::send_serial(const EndpointIdentity& identity, std::uint8_t value) const {
+    if (!input_enabled_) {
         return;
     }
     const auto handle = endpoint_handle_dto(identity);
-    const auto status = session_.send_serial(handle, rust::Slice<const std::uint8_t>(bytes.data(), bytes.size()));
+    const auto status = session_.send_serial(handle, value);
     if (status_handler_) {
         status_handler_(status);
     }

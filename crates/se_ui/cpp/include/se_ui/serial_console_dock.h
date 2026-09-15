@@ -31,7 +31,7 @@ public:
     void set_input_enabled(bool enabled);
 
 private:
-    void send_serial(const EndpointIdentity& identity, const std::vector<std::uint8_t>& bytes) const;
+    void send_serial(const EndpointIdentity& identity, std::uint8_t value) const;
 
     const UiSession& session_;
     StatusHandler status_handler_;
