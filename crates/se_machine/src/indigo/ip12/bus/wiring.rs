@@ -929,7 +929,7 @@ mod tests {
         write_serial_register(&mut bus, SERIAL_1_BASE, 9, 1 << 3);
         bus.write(PhysAddr::new(INT2_BASE + 7), &[1 << 5]).unwrap();
 
-        assert_eq!(bus.receive_serial(Channel::A, b"A"), 1);
+        bus.receive_serial_character(Channel::A, b'A');
         assert_eq!(
             read_word(&mut bus, INT2_BASE),
             Ok(u32::from((1 << 5) | SCSI_INTERRUPT))

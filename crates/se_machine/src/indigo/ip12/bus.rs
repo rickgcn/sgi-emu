@@ -295,10 +295,9 @@ impl Ip12Bus {
         self.int2.timer_1_interrupt_asserted()
     }
 
-    pub(super) fn receive_serial(&mut self, channel: Channel, bytes: &[u8]) -> usize {
-        let consumed = self.serial[1].receive(channel, bytes);
+    pub(super) fn receive_serial_character(&mut self, channel: Channel, value: u8) {
+        self.serial[1].receive_character(channel, value);
         self.synchronize_serial_interrupt();
-        consumed
     }
 
     pub(super) fn set_sgi_key_state(&mut self, key: SgiKey, pressed: bool) {
