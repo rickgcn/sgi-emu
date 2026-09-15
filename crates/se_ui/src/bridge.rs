@@ -594,11 +594,8 @@ pub mod ffi {
             length: u32,
         ) -> MemoryDto;
         fn toggle_breakpoint(self: &UiSession, address: u32) -> RuntimeStatusDto;
-        fn send_serial(
-            self: &UiSession,
-            handle: &EndpointHandleDto,
-            bytes: &[u8],
-        ) -> RuntimeStatusDto;
+        fn send_serial(self: &UiSession, handle: &EndpointHandleDto, value: u8)
+        -> RuntimeStatusDto;
         fn send_keyboard(
             self: &UiSession,
             handle: &EndpointHandleDto,

@@ -15,8 +15,10 @@
 #include <QResizeEvent>
 #include <QScrollBar>
 #include <QSignalBlocker>
+#include <QTimer>
 
 #include <algorithm>
+#include <deque>
 #include <iterator>
 #include <optional>
 #include <utility>
@@ -137,6 +139,10 @@ public:
         has_selection_ = false;
         update_scrollbars(true);
         owner_.viewport()->update();
+    }
+
+    void discard_pending_input() {
+        pending_input_.clear();
     }
 
     void paint() {
@@ -374,13 +380,34 @@ private:
         return copy_bytes(model_->terminal_encode_key(key, value));
     }
 
-    void send_input(const std::vector<std::uint8_t>& bytes) const {
-        if (!bytes.empty() && input_handler_) {
-            input_handler_(bytes);
+    void send_input(const std::vector<std::uint8_t>& bytes) {
+        if (bytes.empty() || !input_handler_) {
+            return;
         }
+        pending_input_.insert(pending_input_.end(), bytes.begin(), bytes.end());
+        schedule_input_delivery();
     }
 
-    void paste_clipboard() const {
+    void schedule_input_delivery() {
+        if (input_delivery_scheduled_ || pending_input_.empty()) {
+            return;
+        }
+        input_delivery_scheduled_ = true;
+        QTimer::singleShot(0, &owner_, [this] { deliver_next_input(); });
+    }
+
+    void deliver_next_input() {
+        input_delivery_scheduled_ = false;
+        if (pending_input_.empty() || !input_handler_) {
+            return;
+        }
+        const auto value = pending_input_.front();
+        pending_input_.pop_front();
+        input_handler_(value);
+        schedule_input_delivery();
+    }
+
+    void paste_clipboard() {
         const auto text = QApplication::clipboard()->text();
         const auto utf8 = text.toUtf8();
         const auto bytes = normalize_terminal_paste(rust::Str(
@@ -501,6 +528,8 @@ private:
     int cell_height_;
     int ascent_;
     InputHandler input_handler_;
+    std::deque<std::uint8_t> pending_input_;
+    bool input_delivery_scheduled_ = false;
     bool selecting_;
     bool has_selection_;
     SelectionPoint selection_anchor_ {};
@@ -524,6 +553,10 @@ void Vt100Widget::feed(const std::vector<std::uint8_t>& bytes) {
 
 void Vt100Widget::clear_terminal() {
     implementation_->clear_terminal();
+}
+
+void Vt100Widget::discard_pending_input() {
+    implementation_->discard_pending_input();
 }
 
 void Vt100Widget::contextMenuEvent(QContextMenuEvent* event) {
