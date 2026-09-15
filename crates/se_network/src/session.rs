@@ -168,6 +168,7 @@ impl NetworkSession {
     /// runtime checks again at the next instruction boundary. Link readiness
     /// and machine filtering are deliberately not part of this host signal.
     #[must_use]
+    #[inline]
     pub fn has_pending_work(&self) -> bool {
         self.shared.pending.load(Ordering::Acquire) != 0
     }
