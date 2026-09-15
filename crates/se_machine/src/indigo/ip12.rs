@@ -436,12 +436,14 @@ impl Ip12 {
             MachineInputPayload::SerialByte(value)
                 if endpoint == &Ip12Port::SerialA.endpoint_key() =>
             {
-                self.receive_serial(Channel::A, &[*value]) == 1
+                self.receive_serial_character(Channel::A, *value);
+                true
             }
             MachineInputPayload::SerialByte(value)
                 if endpoint == &Ip12Port::SerialB.endpoint_key() =>
             {
-                self.receive_serial(Channel::B, &[*value]) == 1
+                self.receive_serial_character(Channel::B, *value);
+                true
             }
             MachineInputPayload::Keyboard { key, pressed }
                 if endpoint == &Ip12Port::Keyboard.endpoint_key() =>
@@ -709,13 +711,10 @@ impl Ip12 {
         }
     }
 
-    /// Supplies host bytes to one external serial receiver.
-    ///
-    /// Returns the number of bytes consumed by the machine.
-    pub(crate) fn receive_serial(&mut self, channel: Channel, bytes: &[u8]) -> usize {
-        let consumed = self.bus.receive_serial(channel, bytes);
+    /// Signals one character arriving at an external serial receiver.
+    pub(crate) fn receive_serial_character(&mut self, channel: Channel, value: u8) {
+        self.bus.receive_serial_character(channel, value);
         self.update_interrupt_lines();
-        consumed
     }
 
     /// Applies one physical SGI keyboard key state.
@@ -880,8 +879,8 @@ mod tests {
 
     use super::{
         CPU_FREQUENCY_HZ, Ip12, Ip12Error, Ip12MemoryConfiguration, Ip12MemoryConfigurationError,
-        Ip12NonvolatileState, Ip12NonvolatileStateParts, Ip12SimmSize, PROM_BYTES, RAM_BYTES,
-        cpu_config,
+        Ip12NonvolatileState, Ip12NonvolatileStateParts, Ip12Port, Ip12SimmSize, PROM_BYTES,
+        RAM_BYTES, cpu_config,
     };
 
     const MEMORY_CONFIGURATION_INSTRUCTION_BUDGET: usize = 300_000;
@@ -1073,6 +1072,46 @@ mod tests {
             let mut received = [0];
             ip12.bus
                 .read(PhysAddr::new(SERIAL_BASE + data), &mut received)
+                .unwrap();
+            assert_eq!(received, [expected]);
+        }
+    }
+
+    #[test]
+    fn external_serial_arrivals_are_consumed_when_the_receive_fifo_overruns() {
+        const SERIAL_BASE: u64 = 0x1fb8_0d10;
+        let mut ip12 = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        ip12.bus
+            .write(PhysAddr::new(SERIAL_BASE + 0x0b), &[3])
+            .unwrap();
+        ip12.bus
+            .write(PhysAddr::new(SERIAL_BASE + 0x0b), &[1])
+            .unwrap();
+        let mut machine = Machine::IndigoIp12(ip12);
+        let endpoint = Ip12Port::SerialA.endpoint_key();
+
+        for value in 0..10 {
+            assert_eq!(
+                machine.try_receive_input(&MachineInput::new(
+                    endpoint.clone(),
+                    MachineInputPayload::SerialByte(value)
+                )),
+                Ok(MachineInputResult::Consumed)
+            );
+        }
+
+        let Machine::IndigoIp12(mut ip12) = machine;
+        for expected in [0, 1, 2, 3, 4, 5, 6, 9] {
+            let mut received = [0];
+            ip12.bus
+                .read(PhysAddr::new(SERIAL_BASE + 0x0f), &mut received)
                 .unwrap();
             assert_eq!(received, [expected]);
         }
@@ -1767,7 +1806,7 @@ mod tests {
             .write(PhysAddr::new(0x1fb8_01c7), &[1 << 5])
             .unwrap();
 
-        assert_eq!(machine.receive_serial(Channel::A, b"A"), 1);
+        machine.receive_serial_character(Channel::A, b'A');
         advance_machine_interrupt_inputs(&mut machine);
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 11),

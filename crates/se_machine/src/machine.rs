@@ -253,8 +253,8 @@ impl Machine {
     /// boundary.
     ///
     /// Keyboard and mouse inputs are accepted even when they describe a
-    /// duplicate state or zero motion. Serial and Ethernet inputs report the
-    /// readiness of their respective external interfaces.
+    /// duplicate state or zero motion. Serial character arrivals are handled
+    /// immediately, while Ethernet inputs report link readiness.
     pub fn try_receive_input(
         &mut self,
         input: &MachineInput,

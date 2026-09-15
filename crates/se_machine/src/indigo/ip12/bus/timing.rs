@@ -184,12 +184,12 @@ impl Ip12Bus {
                 let serial = &mut self.serial[0];
                 if let Some(keyboard) = keyboard.as_mut() {
                     keyboard.advance_time(elapsed, |value| {
-                        let _ = serial.receive(Channel::A, &[value]);
+                        serial.receive_character(Channel::A, value);
                     });
                 }
                 if let Some(mouse) = mouse.as_mut() {
                     mouse.advance_time(elapsed, |value| {
-                        let _ = serial.receive(Channel::B, &[value]);
+                        serial.receive_character(Channel::B, value);
                     });
                 }
                 serial.advance_time(elapsed, |channel, value| {
@@ -1114,19 +1114,22 @@ mod tests {
     }
 
     #[test]
-    fn scc_zero_full_receive_fifo_drops_a_completed_keyboard_character() {
+    fn scc_zero_full_receive_fifo_overwrites_its_entry_with_keyboard_overrun() {
         let mut bus = bus();
         write_serial_register(&mut bus, SERIAL_0_BASE, 3, 1);
-        assert_eq!(bus.serial[0].receive(Channel::A, &[0x55; 8]), 8);
+        for _ in 0..8 {
+            bus.serial[0].receive_character(Channel::A, 0x55);
+        }
         bus.set_sgi_key_state(SgiKey::KeyA, true);
         bus.advance_time(
             VirtualDuration::from_attoseconds(KEYBOARD_CHARACTER_TIME + 1),
             &mut MachineOutput::default(),
         );
 
-        for _ in 0..8 {
+        for _ in 0..7 {
             assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(0x55));
         }
+        assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(10));
         assert_eq!(read_byte(&mut bus, SERIAL_0_BASE + 0x0f), Ok(0));
     }
 

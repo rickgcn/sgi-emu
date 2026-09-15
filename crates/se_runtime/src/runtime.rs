@@ -10,7 +10,7 @@
 //! at the final boundary, while execution errors are verified only after the
 //! expected failing instruction and its machine-visible side effects recur.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -604,7 +604,6 @@ struct Worker {
     virtual_instant: VirtualInstant,
     frontend_output: MachineOutput,
     output_handler: Option<Box<dyn FnMut(Vec<RuntimeOutput>) + Send + 'static>>,
-    pending_serial: Vec<(EndpointKey, VecDeque<u8>)>,
     machine_generation: u64,
     state: RuntimeState,
     mode: ActiveMode,
@@ -680,7 +679,6 @@ impl ActiveMode {
 
 impl Worker {
     fn new(machine: Option<Machine>) -> Self {
-        let pending_serial = machine.as_ref().map_or_else(Vec::new, serial_queues);
         let network_endpoint = machine.as_ref().and_then(single_ethernet_endpoint);
         let machine_generation = u64::from(machine.is_some());
         let state = if machine.is_some() {
@@ -704,7 +702,6 @@ impl Worker {
             virtual_instant: VirtualInstant::ZERO,
             frontend_output: MachineOutput::default(),
             output_handler: None,
-            pending_serial,
             machine_generation,
             state,
             mode: ActiveMode::Normal,
@@ -867,13 +864,14 @@ impl Worker {
             } => {
                 let result = self.require_live_input().and_then(|()| {
                     self.validate_handle(&handle, EndpointKind::Serial)?;
-                    self.pending_serial
-                        .iter_mut()
-                        .find(|(key, _)| key == handle.key())
-                        .expect("every serial endpoint has a pending queue")
-                        .1
-                        .extend(bytes);
-                    self.refill_serial_input()?;
+                    let endpoint = handle.key().clone();
+                    for value in bytes {
+                        let input = MachineInput::new(
+                            endpoint.clone(),
+                            MachineInputPayload::SerialByte(value),
+                        );
+                        self.accept_live_input_at_boundary(&input)?;
+                    }
                     self.advance_revision();
                     Ok(self.status())
                 });
@@ -1004,7 +1002,6 @@ impl Worker {
             completed_instructions = restore.completed_instructions;
         }
         self.replace_network(next_network.clone())?;
-        let next_pending_serial = serial_queues(&machine);
         let next_machine_generation = self
             .machine_generation
             .checked_add(1)
@@ -1017,7 +1014,6 @@ impl Worker {
         self.machine = Some(machine);
         self.virtual_instant = virtual_instant;
         self.frontend_output = MachineOutput::default();
-        self.pending_serial = next_pending_serial;
         self.machine_generation = next_machine_generation;
         self.state = RuntimeState::Paused;
         self.mode = next_mode;
@@ -1391,9 +1387,6 @@ impl Worker {
         self.virtual_instant = VirtualInstant::ZERO;
         self.pending_network_frame = None;
         self.frontend_output = MachineOutput::default();
-        for (_, pending) in &mut self.pending_serial {
-            pending.clear();
-        }
         self.last_error = None;
         self.ignore_breakpoint_once = None;
         self.queue_current_outputs();
@@ -1505,9 +1498,6 @@ impl Worker {
     fn execute_normal_instruction(&mut self) -> Result<(), ExecutionError> {
         self.execute_machine_instruction()?;
         self.drain_network_output();
-        if let Err(error) = self.refill_serial_input() {
-            unreachable!("Normal serial input cannot write a Record: {}", error);
-        }
         self.process_network_boundary();
         self.deliver_output();
         Ok(())
@@ -1519,11 +1509,6 @@ impl Worker {
             return Ok(());
         }
         self.drain_network_output();
-        if let Err(error) = self.refill_serial_input() {
-            self.fail_session(error.to_string());
-            self.deliver_output();
-            return Ok(());
-        }
         self.process_network_boundary();
         self.check_record_failure();
         if let Err(error) = self.record_checkpoint_if_due() {
@@ -1619,70 +1604,29 @@ impl Worker {
         }
     }
 
-    fn refill_serial_input(&mut self) -> Result<(), CommandRejection> {
-        if self
-            .pending_serial
-            .iter()
-            .all(|(_, pending)| pending.is_empty())
-        {
-            return Ok(());
-        }
-
-        let recorder = match &self.mode {
-            ActiveMode::Recording(session) => Some(session.recorder.clone()),
-            _ => None,
-        };
-        for (key, pending) in &mut self.pending_serial {
-            while let Some(value) = pending.front().copied() {
-                let input = MachineInput::new(key.clone(), MachineInputPayload::SerialByte(value));
-                match self
-                    .machine
-                    .as_mut()
-                    .expect("serial input requires a configured machine")
-                    .try_receive_input(&input)
-                {
-                    Ok(MachineInputResult::Consumed) => {
-                        if let Some(recorder) = &recorder {
-                            recorder
-                                .record_machine_input(self.position, &input)
-                                .map_err(|error| rejection_owned(error.to_string()))?;
-                        }
-                        pending.pop_front();
-                    }
-                    Ok(MachineInputResult::WouldBlock) => break,
-                    Err(error) => return Err(rejection_owned(error.to_string())),
-                }
-            }
-        }
+    fn accept_live_input(&mut self, input: MachineInput) -> Result<(), CommandRejection> {
+        self.accept_live_input_at_boundary(&input)?;
+        self.advance_revision();
         Ok(())
     }
 
-    fn accept_live_input(&mut self, input: MachineInput) -> Result<(), CommandRejection> {
-        if let MachineInputPayload::SerialByte(value) = input.payload() {
-            self.pending_serial
-                .iter_mut()
-                .find(|(key, _)| key == input.endpoint())
-                .ok_or(CommandRejection::UnknownEndpoint)?
-                .1
-                .push_back(*value);
-            self.refill_serial_input()?;
-            self.advance_revision();
-            return Ok(());
-        }
+    fn accept_live_input_at_boundary(
+        &mut self,
+        input: &MachineInput,
+    ) -> Result<(), CommandRejection> {
         let accepted = self
             .machine
             .as_mut()
             .expect("live input requires a configured machine")
-            .try_receive_input(&input)
+            .try_receive_input(input)
             .map_err(|error| rejection_owned(error.to_string()))?;
         if accepted == MachineInputResult::Consumed {
             if let ActiveMode::Recording(session) = &self.mode {
                 session
                     .recorder
-                    .record_machine_input(self.position, &input)
+                    .record_machine_input(self.position, input)
                     .map_err(|error| rejection_owned(error.to_string()))?;
             }
-            self.advance_revision();
         } else {
             return Err(rejection("machine input would block"));
         }
@@ -2065,16 +2009,6 @@ fn rejection(reason: &str) -> CommandRejection {
 
 fn rejection_owned(reason: String) -> CommandRejection {
     CommandRejection::General(reason)
-}
-
-fn serial_queues(machine: &Machine) -> Vec<(EndpointKey, VecDeque<u8>)> {
-    machine
-        .endpoint_catalog()
-        .endpoints()
-        .iter()
-        .filter(|descriptor| descriptor.kind() == EndpointKind::Serial)
-        .map(|descriptor| (descriptor.key().clone(), VecDeque::new()))
-        .collect()
 }
 
 fn single_ethernet_endpoint(machine: &Machine) -> Option<EndpointKey> {
@@ -2642,7 +2576,7 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
     }
 
     #[test]
-    fn serial_input_waits_in_the_runtime_until_the_guest_frees_fifo_space() {
+    fn serial_input_records_fifo_overrun_arrival_without_a_guest_retry() {
         let instructions = [
             0x3c08_bfb8,
             0x3508_0d1b,
@@ -2654,59 +2588,49 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             0x1000_fffe,
             0,
         ];
-        let mut worker = super::Worker::new(Some(machine_with_instructions(&instructions)));
-        execute_instructions(&mut worker, 6);
+        let path = record_path("serial-overrun-arrival");
+        remove_record_artifacts(&path);
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_instructions(&instructions),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        for _ in 0..6 {
+            runtime.step().unwrap();
+        }
+        let bytes: Vec<u8> = (0..9).collect();
+        runtime
+            .send_serial(endpoint_handle(&runtime, EndpointKind::Serial, 0), &bytes)
+            .unwrap();
+        runtime.stop_recording().unwrap();
+        runtime.shutdown().unwrap();
 
-        let (reply, response) = mpsc::channel();
-        assert!(!worker.handle_command(crate::runtime::Command::SendSerial {
-            handle: EndpointHandle::new(
-                worker.machine_generation,
-                worker.pending_serial[0].0.clone()
-            ),
-            bytes: (0..9).collect(),
-            reply,
-        }));
-        response.recv().unwrap().unwrap();
-        assert_eq!(worker.pending_serial[0].1.len(), 1);
+        let recorded: Vec<_> = recorded_inputs(&path)
+            .into_iter()
+            .filter_map(|input| match input.payload() {
+                MachineInputPayload::SerialByte(value) => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded, bytes);
 
-        worker.execute_timed_instruction().unwrap();
-        assert!(worker.pending_serial[0].1.is_empty());
-    }
-
-    #[test]
-    fn reset_and_successful_configuration_discard_pending_serial_input() {
-        let mut worker = super::Worker::new(Some(machine_with_instructions(&[0])));
-        worker.execute_timed_instruction().unwrap();
-        worker.pending_serial[0].1.extend(b"first");
-        worker.pending_serial[1].1.extend(b"second");
-
-        let (reset_reply, reset_response) = mpsc::channel();
-        assert!(!worker.handle_command(crate::runtime::Command::Reset(reset_reply)));
-        let reset_status = reset_response.recv().unwrap().unwrap();
-        assert!(
-            worker
-                .pending_serial
-                .iter()
-                .all(|pending| pending.1.is_empty())
-        );
-        assert_eq!(reset_status.completed_instructions, 1);
-
-        worker.pending_serial[0].1.extend(b"third");
-        let (configure_reply, configure_response) = mpsc::channel();
-        assert!(!worker.handle_command(crate::runtime::Command::Configure {
-            configuration: Box::new(super::RuntimeConfiguration::normal(
-                machine_with_instructions(&[0]),
-            )),
-            reply: configure_reply,
-        }));
-        let configure_status = configure_response.recv().unwrap().unwrap();
-        assert!(
-            worker
-                .pending_serial
-                .iter()
-                .all(|pending| pending.1.is_empty())
-        );
-        assert_eq!(configure_status.completed_instructions, 1);
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let opened = runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_instructions(&instructions),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(opened.mode, RuntimeMode::Replaying);
+        for _ in 0..5 {
+            runtime.step().unwrap();
+        }
+        let completed = runtime.step().unwrap();
+        assert_eq!(completed.mode, RuntimeMode::ReplayCompleted);
+        runtime.shutdown().unwrap();
+        remove_record_artifacts(&path);
     }
 
     #[test]
@@ -3959,6 +3883,15 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         let captured_video = Arc::clone(&video_capture);
         let captured_video_instruction = Arc::clone(&video_instruction);
         let captured_non_uniform_video_frame = Arc::clone(&non_uniform_video_frame);
+        let serial_b_endpoint = machine
+            .endpoint_catalog()
+            .endpoints()
+            .iter()
+            .filter(|descriptor| descriptor.kind() == EndpointKind::Serial)
+            .nth(1)
+            .expect("the IP12 fixture has serial channel B")
+            .key()
+            .clone();
         let mut worker = super::Worker::new(Some(machine));
         worker.output_handler = Some(Box::new(move |output| {
             for entry in output {
@@ -4036,14 +3969,26 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             {
                 prompt_completed_at = Some(executed);
                 if stop == ExternalPromStop::VolumeHeaderValidation {
-                    worker.pending_serial[1].1.push_back(b'\r');
+                    worker
+                        .accept_live_input(MachineInput::new(
+                            serial_b_endpoint.clone(),
+                            MachineInputPayload::SerialByte(b'\r'),
+                        ))
+                        .unwrap();
                 }
             }
             if stop == ExternalPromStop::VolumeHeaderValidation
                 && !system_start_requested
                 && serial_b.lock().unwrap().ends_with(b"Option? ")
             {
-                worker.pending_serial[1].1.extend(b"1\r");
+                for value in b"1\r" {
+                    worker
+                        .accept_live_input(MachineInput::new(
+                            serial_b_endpoint.clone(),
+                            MachineInputPayload::SerialByte(*value),
+                        ))
+                        .unwrap();
+                }
                 system_start_requested = true;
             }
             stop_reached = match stop {
