@@ -8,6 +8,7 @@ use se_device::gio::GioSlot;
 use se_float::backend::Backend;
 
 use super::Ip12MemoryConfiguration;
+use crate::endpoint::EndpointKey;
 use crate::resource::{
     PrepareResourcesError, PreparedResource, PreparedResources, ResourceId, ResourceRequirement,
     ResourceRequirements,
@@ -24,6 +25,7 @@ pub struct Ip12BuildPlan {
     firmware: ResourceId,
     gio: Vec<GioAttachment>,
     scsi: Vec<ScsiAttachment>,
+    port_attachments: Vec<Ip12PortAttachment>,
     resources: ResourceRequirements,
 }
 
@@ -34,14 +36,22 @@ impl Ip12BuildPlan {
         firmware: ResourceId,
         gio: Vec<GioAttachment>,
         scsi: Vec<ScsiAttachment>,
+        port_attachments: Vec<Ip12PortAttachment>,
         resources: ResourceRequirements,
     ) -> Self {
+        assert!(
+            port_attachments
+                .windows(2)
+                .all(|pair| pair[0].port < pair[1].port),
+            "IP12 port attachments must be unique and canonically ordered"
+        );
         Self {
             floating_point_backend,
             memory,
             firmware,
             gio,
             scsi,
+            port_attachments,
             resources,
         }
     }
@@ -95,6 +105,12 @@ impl Ip12BuildPlan {
     #[must_use]
     pub fn scsi(&self) -> &[ScsiAttachment] {
         &self.scsi
+    }
+
+    /// Returns attached port peripherals in canonical physical port order.
+    #[must_use]
+    pub fn port_attachments(&self) -> &[Ip12PortAttachment] {
+        &self.port_attachments
     }
 
     /// Returns host resources required for assembly.
@@ -154,6 +170,80 @@ pub enum ScsiDevice {
     Disk,
     /// Read-only SCSI CD-ROM.
     Cdrom,
+}
+
+/// One configurable peripheral port on an Indigo IP12.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Ip12Port {
+    /// SCC0 channel A keyboard port.
+    Keyboard,
+    /// SCC0 channel B mouse port.
+    Mouse,
+    /// SCC1 channel A external serial port.
+    SerialA,
+    /// SCC1 channel B external serial port.
+    SerialB,
+}
+
+impl Ip12Port {
+    /// Returns the stable runtime interface identity associated with this port.
+    #[must_use]
+    pub fn endpoint_key(self) -> EndpointKey {
+        EndpointKey::new(match self {
+            Self::Keyboard => "keyboard.0",
+            Self::Mouse => "pointer.0",
+            Self::SerialA => "serial.external.a",
+            Self::SerialB => "serial.external.b",
+        })
+    }
+}
+
+/// A peripheral supported by one configurable IP12 port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ip12Peripheral {
+    /// SGI keyboard connected to SCC0 channel A.
+    SgiKeyboard,
+    /// SGI mouse connected to SCC0 channel B.
+    SgiMouse,
+    /// Frontend-provided VT100 terminal connected to an external serial port.
+    Vt100Terminal,
+}
+
+/// One validated IP12 port-to-peripheral attachment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ip12PortAttachment {
+    port: Ip12Port,
+    peripheral: Ip12Peripheral,
+}
+
+impl Ip12PortAttachment {
+    pub(super) fn new(port: Ip12Port, peripheral: Ip12Peripheral) -> Self {
+        assert!(
+            matches!(
+                (port, peripheral),
+                (Ip12Port::Keyboard, Ip12Peripheral::SgiKeyboard)
+                    | (Ip12Port::Mouse, Ip12Peripheral::SgiMouse)
+                    | (
+                        Ip12Port::SerialA | Ip12Port::SerialB,
+                        Ip12Peripheral::Vt100Terminal
+                    )
+            ),
+            "an IP12 build plan cannot contain an incompatible port peripheral"
+        );
+        Self { port, peripheral }
+    }
+
+    /// Returns the physical port receiving the peripheral.
+    #[must_use]
+    pub const fn port(&self) -> Ip12Port {
+        self.port
+    }
+
+    /// Returns the peripheral attached to the port.
+    #[must_use]
+    pub const fn peripheral(&self) -> Ip12Peripheral {
+        self.peripheral
+    }
 }
 
 /// Semantic errors that prevent an IP12 draft from compiling.

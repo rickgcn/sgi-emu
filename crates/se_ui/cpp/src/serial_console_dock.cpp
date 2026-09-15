@@ -17,7 +17,7 @@ SerialConsoleDock::SerialConsoleDock(const UiSession& session, StatusHandler sta
     , session_(session)
     , status_handler_(std::move(status_handler))
     , stack_(new QStackedWidget(this))
-    , empty_(new QLabel(QStringLiteral("No serial ports"), stack_))
+    , empty_(new QLabel(QStringLiteral("No serial terminals"), stack_))
     , tabs_(new QTabWidget(stack_))
     , terminals_()
     , input_enabled_(true) {
@@ -37,7 +37,7 @@ void SerialConsoleDock::rebuild(const EndpointCatalogDto& catalog) {
     }
     terminals_.clear();
     for (const auto& descriptor : catalog.endpoints) {
-        if (descriptor.kind != EndpointKindDto::Serial) {
+        if (descriptor.kind != EndpointKindDto::Serial || !descriptor.serial_console_attached) {
             continue;
         }
         const auto identity = endpoint_identity(descriptor.handle);

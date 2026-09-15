@@ -38,6 +38,7 @@ use se_float::backend::Backend;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use self::bus::Ip12Bus;
+use self::plan::Ip12Port;
 use self::prom::{normalize_u56_prom, validate_u56_prom_size};
 use crate::endpoint::{
     EndpointCatalog, EndpointDescriptor, EndpointDirection, EndpointKey, EndpointKind,
@@ -278,6 +279,15 @@ pub enum Ip12SnapshotError {
     Scsi(ScsiSnapshotError),
     /// The GIO snapshot differs from the configured device topology.
     Gio(GioSnapshotError),
+    /// A snapshot and machine disagree about a configurable port peripheral.
+    PortAttachmentMismatch {
+        /// Port whose machine-side peripheral presence differs.
+        port: Ip12Port,
+        /// Whether the snapshot contains the peripheral.
+        snapshot_attached: bool,
+        /// Whether the target machine contains the peripheral.
+        machine_attached: bool,
+    },
 }
 
 impl fmt::Display for Ip12SnapshotError {
@@ -285,6 +295,14 @@ impl fmt::Display for Ip12SnapshotError {
         match self {
             Self::Scsi(error) => error.fmt(formatter),
             Self::Gio(error) => error.fmt(formatter),
+            Self::PortAttachmentMismatch {
+                port,
+                snapshot_attached,
+                machine_attached,
+            } => write!(
+                formatter,
+                "IP12 snapshot attachment at {port:?} differs: snapshot attached={snapshot_attached}, machine attached={machine_attached}"
+            ),
         }
     }
 }
@@ -294,6 +312,7 @@ impl Error for Ip12SnapshotError {
         match self {
             Self::Scsi(error) => Some(error),
             Self::Gio(error) => Some(error),
+            Self::PortAttachmentMismatch { .. } => None,
         }
     }
 }
@@ -412,24 +431,35 @@ impl Ip12 {
         &mut self,
         input: &MachineInput,
     ) -> Result<MachineInputResult, MachineInputError> {
-        let consumed = match (input.endpoint().as_str(), input.payload()) {
-            ("serial.external.a", MachineInputPayload::SerialByte(value)) => {
+        let endpoint = input.endpoint();
+        let consumed = match input.payload() {
+            MachineInputPayload::SerialByte(value)
+                if endpoint == &Ip12Port::SerialA.endpoint_key() =>
+            {
                 self.receive_serial(Channel::A, &[*value]) == 1
             }
-            ("serial.external.b", MachineInputPayload::SerialByte(value)) => {
+            MachineInputPayload::SerialByte(value)
+                if endpoint == &Ip12Port::SerialB.endpoint_key() =>
+            {
                 self.receive_serial(Channel::B, &[*value]) == 1
             }
-            ("keyboard.0", MachineInputPayload::Keyboard { key, pressed }) => {
+            MachineInputPayload::Keyboard { key, pressed }
+                if endpoint == &Ip12Port::Keyboard.endpoint_key() =>
+            {
                 let key = translate_keyboard_key(*key)
                     .ok_or(MachineInputError::UnsupportedKeyboardKey)?;
                 self.set_sgi_key_state(key, *pressed);
                 true
             }
-            ("pointer.0", MachineInputPayload::PointerMotion { delta_x, delta_y }) => {
+            MachineInputPayload::PointerMotion { delta_x, delta_y }
+                if endpoint == &Ip12Port::Mouse.endpoint_key() =>
+            {
                 self.move_sgi_mouse(*delta_x, *delta_y);
                 true
             }
-            ("pointer.0", MachineInputPayload::PointerButton { button, pressed }) => {
+            MachineInputPayload::PointerButton { button, pressed }
+                if endpoint == &Ip12Port::Mouse.endpoint_key() =>
+            {
                 let button = match button {
                     PointerButton::Left => SgiMouseButton::Left,
                     PointerButton::Middle => SgiMouseButton::Middle,
@@ -438,7 +468,7 @@ impl Ip12 {
                 self.set_sgi_mouse_button_state(button, *pressed);
                 true
             }
-            ("ethernet.0", MachineInputPayload::EthernetFrame { bytes }) => {
+            MachineInputPayload::EthernetFrame { bytes } if endpoint.as_str() == "ethernet.0" => {
                 self.receive_ethernet(bytes)
             }
             _ => unreachable!("IP12 endpoint catalog and input routing must agree"),
@@ -456,22 +486,32 @@ impl Ip12 {
         use EndpointDirection::{Bidirectional, Input, Output};
         use EndpointKind::{Ethernet, Keyboard, Pointer, Serial, Video};
 
-        let mut endpoints = vec![
-            EndpointDescriptor::new(
-                EndpointKey::new("keyboard.0"),
+        let mut endpoints = Vec::new();
+        if self.bus.has_sgi_keyboard() {
+            endpoints.push(EndpointDescriptor::new(
+                Ip12Port::Keyboard.endpoint_key(),
                 "SGI Keyboard",
                 Keyboard,
                 Input,
-            ),
-            EndpointDescriptor::new(EndpointKey::new("pointer.0"), "SGI Mouse", Pointer, Input),
+            ));
+        }
+        if self.bus.has_sgi_mouse() {
+            endpoints.push(EndpointDescriptor::new(
+                Ip12Port::Mouse.endpoint_key(),
+                "SGI Mouse",
+                Pointer,
+                Input,
+            ));
+        }
+        endpoints.extend([
             EndpointDescriptor::new(
-                EndpointKey::new("serial.external.a"),
+                Ip12Port::SerialA.endpoint_key(),
                 "Serial Port A",
                 Serial,
                 Bidirectional,
             ),
             EndpointDescriptor::new(
-                EndpointKey::new("serial.external.b"),
+                Ip12Port::SerialB.endpoint_key(),
                 "Serial Port B",
                 Serial,
                 Bidirectional,
@@ -482,7 +522,7 @@ impl Ip12 {
                 Ethernet,
                 Bidirectional,
             ),
-        ];
+        ]);
         if self.bus.has_video_output() {
             endpoints.push(EndpointDescriptor::new(
                 EndpointKey::new("video.0"),
@@ -549,7 +589,15 @@ impl Ip12 {
                 .attach(4, 0, Box::new(target), storage)
                 .map_err(Ip12Error::ScsiAttachment)?;
         }
-        Self::new_with_buses(raw_prom, floating_point_backend, memory, gio, scsi_bus)
+        Self::new_with_buses(
+            raw_prom,
+            floating_point_backend,
+            memory,
+            gio,
+            scsi_bus,
+            Some(SgiKeyboard::new()),
+            Some(SgiMouse::new()),
+        )
     }
 
     fn new_with_buses(
@@ -558,6 +606,8 @@ impl Ip12 {
         memory: Ip12MemoryConfiguration,
         gio: GioBus,
         scsi_bus: ScsiBus,
+        sgi_keyboard: Option<SgiKeyboard>,
+        sgi_mouse: Option<SgiMouse>,
     ) -> Result<Self, Ip12Error> {
         let prom = Rom::new(normalize_u56_prom(raw_prom)?);
         let mut machine = Self {
@@ -572,8 +622,8 @@ impl Ip12 {
                 Wd33c93b::new(SCSI_CLOCK_HZ),
                 scsi_bus,
                 [Z85230::new(SERIAL_CLOCK_HZ), Z85230::new(SERIAL_CLOCK_HZ)],
-                SgiKeyboard::new(),
-                SgiMouse::new(),
+                sgi_keyboard,
+                sgi_mouse,
                 Dp8573a::new(),
                 Mdac::new(),
                 Nmc93cs46::new(),

@@ -72,6 +72,7 @@ pub mod ffi {
         pub label: String,
         pub kind: EndpointKindDto,
         pub direction: EndpointDirectionDto,
+        pub serial_console_attached: bool,
     }
 
     /// Coherent active runtime endpoint snapshot.

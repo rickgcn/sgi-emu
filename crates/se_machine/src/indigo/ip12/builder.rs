@@ -8,8 +8,10 @@ use se_device::lg1::Lg1;
 use se_device::scsi::{ScsiAttachError, ScsiBus, ScsiStorageSizeError, ScsiTarget};
 use se_device::scsi_cdrom::ScsiCdrom;
 use se_device::scsi_disk::ScsiDisk;
+use se_device::sgi_keyboard::SgiKeyboard;
+use se_device::sgi_mouse::SgiMouse;
 
-use super::plan::{GioDevice, PreparedIp12Build, ScsiDevice};
+use super::plan::{GioDevice, Ip12Peripheral, Ip12Port, PreparedIp12Build, ScsiDevice};
 use super::{Ip12, Ip12Error};
 
 /// An error encountered while assembling validated IP12 hardware.
@@ -151,12 +153,41 @@ pub fn build(prepared: PreparedIp12Build) -> Result<Ip12, Ip12AssemblyError> {
             })?;
     }
 
+    let mut keyboard = None;
+    let mut mouse = None;
+    for attachment in plan.port_attachments() {
+        match attachment.peripheral() {
+            Ip12Peripheral::SgiKeyboard => {
+                assert_eq!(attachment.port(), Ip12Port::Keyboard);
+                assert!(
+                    keyboard.replace(SgiKeyboard::new()).is_none(),
+                    "an IP12 build plan cannot attach the keyboard port twice"
+                );
+            }
+            Ip12Peripheral::SgiMouse => {
+                assert_eq!(attachment.port(), Ip12Port::Mouse);
+                assert!(
+                    mouse.replace(SgiMouse::new()).is_none(),
+                    "an IP12 build plan cannot attach the mouse port twice"
+                );
+            }
+            Ip12Peripheral::Vt100Terminal => {
+                assert!(matches!(
+                    attachment.port(),
+                    Ip12Port::SerialA | Ip12Port::SerialB
+                ));
+            }
+        }
+    }
+
     let machine = Ip12::new_with_buses(
         raw_prom,
         plan.floating_point_backend(),
         *plan.memory(),
         gio,
         scsi,
+        keyboard,
+        mouse,
     )
     .map_err(Ip12AssemblyError::BoardConstruction)?;
     assert!(
@@ -179,9 +210,12 @@ mod tests {
     use se_core::storage::StorageMedium;
 
     use super::super::definition::Ip12Definition;
-    use super::super::plan::{Ip12BuildPlan, PreparedIp12Build, ScsiDevice};
-    use super::super::{Ip12Error, Ip12SnapshotError, PROM_BYTES};
+    use super::super::plan::{Ip12BuildPlan, Ip12Port, PreparedIp12Build, ScsiDevice};
+    use super::super::{Ip12, Ip12Error, Ip12SnapshotError, PROM_BYTES};
     use super::{Ip12AssemblyError, build};
+    use crate::endpoint::EndpointKind;
+    use crate::input::{KeyboardKey, MachineInput, MachineInputPayload};
+    use crate::machine::{Machine, MachineInputError};
     use crate::resource::{PreparedResource, ResourceKind};
 
     struct MemoryStorage {
@@ -284,6 +318,26 @@ mod tests {
         .expect("memory capabilities must prepare")
     }
 
+    fn detach_port(draft: &mut MachineDraft, port: Ip12Port) {
+        let slot = match port {
+            Ip12Port::Keyboard => "serial.0.channel.a.port",
+            Ip12Port::Mouse => "serial.0.channel.b.port",
+            Ip12Port::SerialA => "serial.1.channel.a.port",
+            Ip12Port::SerialB => "serial.1.channel.b.port",
+        };
+        draft.apply(Edit::SetAttachment {
+            slot: NodeId(String::from(slot)),
+            device: None,
+        });
+    }
+
+    fn build_draft(configuration: &MachineDraft) -> Ip12 {
+        let plan = Ip12Definition
+            .compile(configuration)
+            .expect("the draft is valid");
+        build(prepare(plan, PROM_BYTES, &BTreeMap::new())).expect("the machine assembles")
+    }
+
     #[test]
     fn firmware_capability_constructs_an_ip12() {
         let plan = Ip12Definition
@@ -302,6 +356,94 @@ mod tests {
         let prepared = prepare(plan, PROM_BYTES, &BTreeMap::new());
         let machine = build(prepared).expect("an empty graphics slot is valid");
         assert_eq!(machine.video_output(), None);
+    }
+
+    #[test]
+    fn optional_keyboard_and_mouse_control_hardware_endpoints() {
+        for (port, kind) in [
+            (Ip12Port::Keyboard, EndpointKind::Keyboard),
+            (Ip12Port::Mouse, EndpointKind::Pointer),
+        ] {
+            let mut configuration = draft(&[], true);
+            detach_port(&mut configuration, port);
+            let machine = build_draft(&configuration);
+            assert!(
+                machine
+                    .endpoint_catalog()
+                    .endpoints()
+                    .iter()
+                    .all(|endpoint| endpoint.kind() != kind)
+            );
+            let payload = match port {
+                Ip12Port::Keyboard => MachineInputPayload::Keyboard {
+                    key: KeyboardKey::Letter(b'A'),
+                    pressed: true,
+                },
+                Ip12Port::Mouse => MachineInputPayload::PointerMotion {
+                    delta_x: 1,
+                    delta_y: 1,
+                },
+                Ip12Port::SerialA | Ip12Port::SerialB => unreachable!(),
+            };
+            let input = MachineInput::new(port.endpoint_key(), payload);
+            let mut machine = Machine::IndigoIp12(machine);
+            assert!(matches!(
+                machine.try_receive_input(&input),
+                Err(MachineInputError::UnknownEndpoint)
+            ));
+        }
+    }
+
+    #[test]
+    fn serial_interfaces_exist_without_vt100_peripherals() {
+        let mut configuration = draft(&[], true);
+        detach_port(&mut configuration, Ip12Port::SerialA);
+        detach_port(&mut configuration, Ip12Port::SerialB);
+        let machine = build_draft(&configuration);
+        assert_eq!(
+            machine
+                .endpoint_catalog()
+                .endpoints()
+                .iter()
+                .filter(|endpoint| endpoint.kind() == EndpointKind::Serial)
+                .map(|endpoint| endpoint.key().as_str())
+                .collect::<Vec<_>>(),
+            ["serial.external.a", "serial.external.b"]
+        );
+    }
+
+    #[test]
+    fn snapshots_reject_keyboard_and_mouse_presence_mismatches() {
+        for port in [Ip12Port::Keyboard, Ip12Port::Mouse] {
+            let attached_configuration = draft(&[], true);
+            let attached = build_draft(&attached_configuration);
+            let attached_snapshot = attached.snapshot().unwrap();
+
+            let mut detached_configuration = attached_configuration.clone();
+            detach_port(&mut detached_configuration, port);
+            let detached = build_draft(&detached_configuration);
+            let detached_snapshot = detached.snapshot().unwrap();
+
+            let mut detached_target = build_draft(&detached_configuration);
+            assert!(matches!(
+                detached_target.restore_snapshot(attached_snapshot),
+                Err(Ip12SnapshotError::PortAttachmentMismatch {
+                    port: failed_port,
+                    snapshot_attached: true,
+                    machine_attached: false,
+                }) if failed_port == port
+            ));
+
+            let mut attached_target = build_draft(&attached_configuration);
+            assert!(matches!(
+                attached_target.restore_snapshot(detached_snapshot),
+                Err(Ip12SnapshotError::PortAttachmentMismatch {
+                    port: failed_port,
+                    snapshot_attached: false,
+                    machine_attached: true,
+                }) if failed_port == port
+            ));
+        }
     }
 
     #[test]

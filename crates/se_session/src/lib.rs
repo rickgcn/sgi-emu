@@ -1,6 +1,7 @@
-//! Host resource preparation for validated machine build plans.
+//! Composition of runtime machines and matching frontend peripherals from validated plans.
 
 mod file_storage;
+pub mod frontend;
 pub mod machine;
 pub mod normal;
 pub mod persistence;

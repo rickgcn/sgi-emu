@@ -17,25 +17,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     let network = application_config.network_configuration();
     let runtime = Runtime::new_unconfigured()?;
     let handle = runtime.handle();
-    let startup_error = if startup_readiness(&machine_draft) == StartupReadiness::Unconfigured {
-        String::new()
-    } else {
-        build_normal_configuration(machine_draft.clone(), &network)
-            .and_then(|configuration| {
-                handle
-                    .configure_with(configuration)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            })
-            .err()
-            .unwrap_or_default()
-    };
+    let (startup_error, active_frontend) =
+        if startup_readiness(&machine_draft) == StartupReadiness::Unconfigured {
+            (String::new(), se_session::frontend::FrontendPlan::default())
+        } else {
+            match build_normal_configuration(machine_draft.clone(), &network) {
+                Ok(build) => {
+                    let (configuration, frontend) = build.into_parts();
+                    match handle.configure_with(configuration) {
+                        Ok(_) => (String::new(), frontend),
+                        Err(error) => (
+                            error.to_string(),
+                            se_session::frontend::FrontendPlan::default(),
+                        ),
+                    }
+                }
+                Err(error) => (error, se_session::frontend::FrontendPlan::default()),
+            }
+        };
 
     let startup = application_config.ui_startup_state(startup_error);
     let session = UiSession::new(
         handle,
         machine_draft,
         machine_definition(),
+        active_frontend,
         Box::new(build_normal_configuration),
         Box::new(|draft, network, path| {
             let network = config::parse_network_configuration(network)?;
@@ -66,7 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn build_normal_configuration(
     draft: se_config::draft::MachineDraft,
     network: &NetworkConfiguration,
-) -> Result<se_runtime::runtime::RuntimeConfiguration, String> {
+) -> Result<se_session::frontend::SessionBuild, String> {
     let network = config::parse_network_configuration(network)?;
     se_session::normal::build_configuration(draft, network).map_err(|error| error.to_string())
 }

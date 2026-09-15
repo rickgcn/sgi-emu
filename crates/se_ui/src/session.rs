@@ -18,7 +18,8 @@ use se_machine::output::VideoOutput;
 use se_runtime::control::{RuntimeMode, RuntimeState, RuntimeStatus};
 use se_runtime::endpoint::{EndpointHandle, RuntimeOutputPayload};
 use se_runtime::record::Replayer;
-use se_runtime::runtime::{DebugReply, RuntimeConfiguration, RuntimeError, RuntimeHandle};
+use se_runtime::runtime::{DebugReply, RuntimeError, RuntimeHandle};
+use se_session::frontend::{FrontendPlan, SessionBuild};
 
 use crate::bridge::VideoFrameHandle;
 use crate::bridge::ffi::{
@@ -33,7 +34,7 @@ use crate::configuration::{edit_from_dto, failed_view, view_dto};
 
 /// Constructs a Normal machine from one owned configuration snapshot.
 pub type NormalMachineBuilder = Box<
-    dyn Fn(MachineDraft, &NetworkConfiguration) -> Result<RuntimeConfiguration, String>
+    dyn Fn(MachineDraft, &NetworkConfiguration) -> Result<SessionBuild, String>
         + Send
         + Sync
         + 'static,
@@ -41,7 +42,7 @@ pub type NormalMachineBuilder = Box<
 
 /// Constructs a cold Recording machine from one committed draft snapshot.
 pub type RecordingMachineBuilder = Box<
-    dyn Fn(MachineDraft, &NetworkConfiguration, PathBuf) -> Result<RuntimeConfiguration, String>
+    dyn Fn(MachineDraft, &NetworkConfiguration, PathBuf) -> Result<SessionBuild, String>
         + Send
         + Sync
         + 'static,
@@ -49,7 +50,7 @@ pub type RecordingMachineBuilder = Box<
 
 /// Constructs a Replay machine using the current draft only for resource paths.
 pub type ReplayMachineBuilder = Box<
-    dyn Fn(MachineDraft, PathBuf, Option<String>) -> Result<RuntimeConfiguration, String>
+    dyn Fn(MachineDraft, PathBuf, Option<String>) -> Result<SessionBuild, String>
         + Send
         + Sync
         + 'static,
@@ -73,15 +74,21 @@ pub struct UiSession {
 struct MachineConfigurationState {
     committed: MachineDraft,
     editing: Option<MachineDraft>,
+    active_frontend: FrontendPlan,
 }
 
 impl UiSession {
     /// Creates a session with application-provided construction and validation callbacks.
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the UI session receives distinct lifecycle capabilities from the application"
+    )]
     pub fn new(
         runtime: RuntimeHandle,
         committed: MachineDraft,
         definition: Arc<dyn MachineDefinition>,
+        active_frontend: FrontendPlan,
         normal_builder: NormalMachineBuilder,
         recording_builder: RecordingMachineBuilder,
         replay_builder: ReplayMachineBuilder,
@@ -93,6 +100,7 @@ impl UiSession {
             configuration: Mutex::new(MachineConfigurationState {
                 committed,
                 editing: None,
+                active_frontend,
             }),
             normal_builder,
             recording_builder,
@@ -113,6 +121,11 @@ impl UiSession {
 
     /// Samples the current endpoint catalog for Qt.
     pub fn endpoint_catalog(&self) -> EndpointCatalogDto {
+        let state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let frontend = &state.active_frontend;
         match self.runtime.endpoint_catalog() {
             Ok(catalog) => EndpointCatalogDto {
                 success: true,
@@ -126,6 +139,9 @@ impl UiSession {
                         label: descriptor.label().into(),
                         kind: endpoint_kind_dto(descriptor.kind()),
                         direction: endpoint_direction_dto(descriptor.direction()),
+                        serial_console_attached: frontend
+                            .serial_console_endpoints()
+                            .contains(descriptor.handle().key()),
                     })
                     .collect(),
             },
@@ -256,11 +272,24 @@ impl UiSession {
         draft: MachineDraft,
         network: &NetworkConfiguration,
     ) -> RuntimeStatusDto {
-        let configuration = match (self.normal_builder)(draft, network) {
-            Ok(configuration) => configuration,
+        let build = match (self.normal_builder)(draft, network) {
+            Ok(build) => build,
             Err(error) => return failed_status(error),
         };
-        self.runtime_command(|runtime| runtime.configure_with(configuration))
+        self.install(build)
+    }
+
+    fn install(&self, build: SessionBuild) -> RuntimeStatusDto {
+        let (configuration, frontend) = build.into_parts();
+        let mut state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let status = self.runtime_command(|runtime| runtime.configure_with(configuration));
+        if status.success {
+            state.active_frontend = frontend;
+        }
+        status
     }
 
     /// Starts continuous machine execution.
@@ -286,15 +315,15 @@ impl UiSession {
     /// Cold-constructs a Recording machine and starts it from the first PROM
     /// instruction.
     pub fn run_with_record(&self, network: &NetworkConfiguration, path: &str) -> RuntimeStatusDto {
-        let configuration = match (self.recording_builder)(
+        let build = match (self.recording_builder)(
             self.machine_draft_snapshot(),
             network,
             PathBuf::from(path),
         ) {
-            Ok(configuration) => configuration,
+            Ok(build) => build,
             Err(error) => return failed_status(error),
         };
-        let status = self.runtime_command(|runtime| runtime.configure_with(configuration));
+        let status = self.install(build);
         if !status.success {
             return status;
         }
@@ -308,15 +337,15 @@ impl UiSession {
 
     /// Cold-constructs and installs a paused Replay machine.
     pub fn open_replay(&self, path: &str, snapshot_id: &str) -> RuntimeStatusDto {
-        let configuration = match (self.replay_builder)(
+        let build = match (self.replay_builder)(
             self.machine_draft_snapshot(),
             PathBuf::from(path),
             (!snapshot_id.is_empty()).then(|| snapshot_id.to_owned()),
         ) {
-            Ok(configuration) => configuration,
+            Ok(build) => build,
             Err(error) => return failed_status(error),
         };
-        self.runtime_command(|runtime| runtime.configure_with(configuration))
+        self.install(build)
     }
 
     /// Loads or rebuilds the manual snapshot catalog for one complete Record.
@@ -951,7 +980,9 @@ fn format_pending_cp1(pending: Option<PendingCp1DebugSnapshot>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use se_config::definition::MachineDefinition;
@@ -962,13 +993,39 @@ mod tests {
     use se_machine::indigo::ip12::definition::Ip12Definition;
     use se_machine::machine::Machine;
     use se_machine::resource::{PreparedResource, ResourceKind};
-    use se_runtime::runtime::{Runtime, RuntimeConfiguration};
+    use se_network::config::NatConfig;
+    use se_runtime::runtime::Runtime;
+    use se_session::frontend::FrontendPlan;
 
     use super::UiSession;
     use crate::bridge::ffi::{
         EndpointKindDto, KeyboardKeyDto, KeyboardKeyKindDto, MachineConfigurationEditDto,
         MachinePropertyValueDto, NetworkConfiguration,
     };
+
+    static NEXT_FIRMWARE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestFirmware {
+        path: std::path::PathBuf,
+    }
+
+    impl TestFirmware {
+        fn new() -> Self {
+            let id = NEXT_FIRMWARE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "sgi-emu-ui-session-prom-{}-{id}.bin",
+                std::process::id()
+            ));
+            fs::write(&path, vec![0; 0x40000]).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestFirmware {
+        fn drop(&mut self) {
+            fs::remove_file(&self.path).unwrap();
+        }
+    }
 
     fn draft() -> MachineDraft {
         let mut draft = Ip12Definition.default_draft();
@@ -1003,37 +1060,71 @@ mod tests {
         }
     }
 
+    fn detach_port(port: &str) -> MachineConfigurationEditDto {
+        set_port(port, "")
+    }
+
+    fn set_port(port: &str, device: &str) -> MachineConfigurationEditDto {
+        MachineConfigurationEditDto {
+            kind: 1,
+            target_id: String::from(port),
+            value: MachinePropertyValueDto {
+                kind: 0,
+                bool_value: false,
+                integer_value: 0,
+                text_value: String::new(),
+            },
+            device_id: String::from(device),
+        }
+    }
+
+    fn attached_serial_keys(session: &UiSession) -> Vec<String> {
+        session
+            .endpoint_catalog()
+            .endpoints
+            .into_iter()
+            .filter(|endpoint| {
+                endpoint.kind == EndpointKindDto::Serial && endpoint.serial_console_attached
+            })
+            .map(|endpoint| endpoint.handle.key)
+            .collect()
+    }
+
     fn session(normal_succeeds: bool) -> (Runtime, UiSession) {
+        let (runtime, session, _) = controlled_session(normal_succeeds);
+        (runtime, session)
+    }
+
+    fn controlled_session(normal_succeeds: bool) -> (Runtime, UiSession, Arc<AtomicBool>) {
         let runtime = Runtime::new_unconfigured().unwrap();
+        let firmware = Arc::new(TestFirmware::new());
+        let builder_firmware = Arc::clone(&firmware);
+        let succeeds = Arc::new(AtomicBool::new(normal_succeeds));
+        let builder_succeeds = Arc::clone(&succeeds);
         let session = UiSession::new(
             runtime.handle(),
             draft(),
             Arc::new(Ip12Definition),
+            FrontendPlan::default(),
             Box::new(move |draft, _network| {
-                if !normal_succeeds {
+                if !builder_succeeds.load(Ordering::Relaxed) {
                     return Err(String::from("injected builder stop"));
                 }
-                let plan = Ip12Definition
-                    .compile(&draft)
-                    .map_err(|error| error.to_string())?;
-                let prepared = plan
-                    .prepare_with(|_, requirement| match requirement.kind {
-                        ResourceKind::Bytes => {
-                            Ok::<_, String>(PreparedResource::Bytes(vec![0; 0x40000]))
-                        }
-                        ResourceKind::Storage { .. } => Err(String::from("unexpected storage")),
-                    })
-                    .map_err(|error| error.to_string())?;
-                let machine = Machine::IndigoIp12(
-                    builder::build(prepared).map_err(|error| error.to_string())?,
-                );
-                Ok(RuntimeConfiguration::normal(machine))
+                let mut build_draft = draft;
+                build_draft.apply(Edit::SetProperty {
+                    property: PropertyId(String::from("firmware.0.image-path")),
+                    value: PropertyValue::Text(
+                        builder_firmware.path.to_string_lossy().into_owned(),
+                    ),
+                });
+                se_session::normal::build_configuration(build_draft, NatConfig::default())
+                    .map_err(|error| error.to_string())
             }),
             Box::new(|_, _, _| Err(String::from("unused recording builder"))),
             Box::new(|_, _, _| Err(String::from("unused replay builder"))),
             Box::new(|_| Ok(())),
         );
-        (runtime, session)
+        (runtime, session, succeeds)
     }
 
     #[test]
@@ -1089,6 +1180,124 @@ mod tests {
     }
 
     #[test]
+    fn frontend_plan_changes_only_after_successful_machine_installation() {
+        let (runtime, session, succeeds) = controlled_session(true);
+        assert!(session.configure_machine(&network()).success);
+        let attached_count = |session: &UiSession| {
+            session
+                .endpoint_catalog()
+                .endpoints
+                .iter()
+                .filter(|endpoint| {
+                    endpoint.kind == EndpointKindDto::Serial && endpoint.serial_console_attached
+                })
+                .count()
+        };
+        assert_eq!(attached_count(&session), 2);
+
+        succeeds.store(false, Ordering::Relaxed);
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&detach_port("serial.1.channel.b.port"))
+                .success
+        );
+        assert!(!session.configure_edited_machine(&network()).success);
+        assert_eq!(attached_count(&session), 2);
+
+        succeeds.store(true, Ordering::Relaxed);
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&detach_port("serial.1.channel.b.port"))
+                .success
+        );
+        assert!(session.configure_edited_machine(&network()).success);
+        let catalog = session.endpoint_catalog();
+        assert_eq!(attached_count(&session), 1);
+        assert!(catalog.endpoints.iter().any(|endpoint| {
+            endpoint.handle.key == "serial.external.a" && endpoint.serial_console_attached
+        }));
+        assert!(catalog.endpoints.iter().any(|endpoint| {
+            endpoint.handle.key == "serial.external.b" && !endpoint.serial_console_attached
+        }));
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recording_and_replay_transitions_install_matching_frontend_plans() {
+        let firmware = TestFirmware::new();
+        let record_path = firmware.path.with_extension("serec");
+        let mut committed = draft();
+        committed.apply(Edit::SetProperty {
+            property: PropertyId(String::from("firmware.0.image-path")),
+            value: PropertyValue::Text(firmware.path.to_string_lossy().into_owned()),
+        });
+        committed.apply(Edit::SetAttachment {
+            slot: NodeId(String::from("serial.1.channel.b.port")),
+            device: None,
+        });
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let session = UiSession::new(
+            runtime.handle(),
+            committed,
+            Arc::new(Ip12Definition),
+            FrontendPlan::default(),
+            Box::new(|draft, _| {
+                se_session::normal::build_configuration(draft, NatConfig::default())
+                    .map_err(|error| error.to_string())
+            }),
+            Box::new(|draft, _, path| {
+                se_session::recording::build_configuration(draft, NatConfig::default(), path)
+                    .map_err(|error| error.to_string())
+            }),
+            Box::new(|draft, path, snapshot| {
+                se_session::replay::build_configuration(draft, path, snapshot)
+                    .map_err(|error| error.to_string())
+            }),
+            Box::new(|_| Ok(())),
+        );
+
+        assert!(session.configure_machine(&network()).success);
+        assert_eq!(attached_serial_keys(&session), ["serial.external.a"]);
+        assert!(
+            session
+                .run_with_record(&network(), record_path.to_str().unwrap())
+                .success
+        );
+        assert_eq!(attached_serial_keys(&session), ["serial.external.a"]);
+        assert!(session.stop_recording().success);
+
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&detach_port("serial.1.channel.a.port"))
+                .success
+        );
+        assert!(
+            session
+                .apply_machine_edit(&set_port("serial.1.channel.b.port", "terminal.vt100"))
+                .success
+        );
+        assert!(session.configure_edited_machine(&network()).success);
+        assert_eq!(attached_serial_keys(&session), ["serial.external.b"]);
+
+        assert!(
+            session
+                .open_replay(record_path.to_str().unwrap(), "")
+                .success
+        );
+        assert_eq!(attached_serial_keys(&session), ["serial.external.a"]);
+        assert!(session.stop_replay(&network()).success);
+        assert_eq!(attached_serial_keys(&session), ["serial.external.b"]);
+
+        drop(session);
+        runtime.shutdown().unwrap();
+        fs::remove_file(record_path).unwrap();
+    }
+
+    #[test]
     fn semantically_invalid_edit_still_returns_a_view() {
         let (runtime, session) = session(false);
         assert!(session.begin_machine_edit().success);
@@ -1124,6 +1333,7 @@ mod tests {
             runtime.handle(),
             draft(),
             Arc::new(Ip12Definition),
+            FrontendPlan::default(),
             Box::new(|_, _| panic!("validation must not construct a machine")),
             Box::new(|_, _, _| panic!("validation must not construct a Recording machine")),
             Box::new(|_, _, _| panic!("validation must not construct a Replay machine")),
@@ -1161,6 +1371,7 @@ mod tests {
             runtime.handle(),
             draft(),
             Arc::new(Ip12Definition),
+            FrontendPlan::default(),
             Box::new(|_, _| Err(String::from("unused normal builder"))),
             Box::new(|_, _, _| Err(String::from("unused recording builder"))),
             Box::new(move |_draft, path, snapshot_id| {

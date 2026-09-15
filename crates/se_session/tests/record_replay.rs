@@ -70,6 +70,13 @@ fn attach(draft: &mut MachineDraft, target: u8, lun: u8, kind: &str, path: &Path
     );
 }
 
+fn set_vt100(draft: &mut MachineDraft, port: &str, attached: bool) {
+    draft.apply(Edit::SetAttachment {
+        slot: NodeId(String::from(port)),
+        device: attached.then(|| DeviceKindId(String::from("terminal.vt100"))),
+    });
+}
+
 fn multi_scsi_draft(files: &TemporaryFiles) -> MachineDraft {
     let prom = files.write("prom.bin", vec![0; PROM_BYTES]);
     let mut draft = Ip12Definition.default_draft();
@@ -87,7 +94,9 @@ fn multi_scsi_draft(files: &TemporaryFiles) -> MachineDraft {
 }
 
 fn complete_record(draft: MachineDraft, path: PathBuf) {
-    let configuration = recording::build_configuration(draft, NatConfig::default(), path).unwrap();
+    let (configuration, _) = recording::build_configuration(draft, NatConfig::default(), path)
+        .unwrap()
+        .into_parts();
     let runtime = Runtime::new_unconfigured().unwrap();
     runtime.configure_with(configuration).unwrap();
     assert_eq!(runtime.step().unwrap().mode, RuntimeMode::Recording);
@@ -168,7 +177,9 @@ fn multi_scsi_record_replays_recorded_topology_and_relocated_resource() {
         slot: NodeId(String::from("scsi.0.target.5.lun.1")),
         device: None,
     });
-    let configuration = replay::build_configuration(current, path, None).unwrap();
+    let (configuration, _) = replay::build_configuration(current, path, None)
+        .unwrap()
+        .into_parts();
     let runtime = Runtime::new_unconfigured().unwrap();
     runtime.configure_with(configuration).unwrap();
     assert_eq!(runtime.step().unwrap().mode, RuntimeMode::ReplayCompleted);
@@ -213,7 +224,9 @@ fn invalid_current_draft_does_not_override_recorded_machine() {
         slot: NodeId(String::from("scsi.0.target.2.lun.0")),
         device: None,
     });
-    let configuration = replay::build_configuration(current, path, None).unwrap();
+    let (configuration, _) = replay::build_configuration(current, path, None)
+        .unwrap()
+        .into_parts();
     let runtime = Runtime::new_unconfigured().unwrap();
     runtime.configure_with(configuration).unwrap();
     assert_eq!(runtime.step().unwrap().mode, RuntimeMode::ReplayCompleted);
@@ -229,9 +242,62 @@ fn current_resource_with_same_id_but_wrong_kind_is_not_a_replay_hint() {
     let different_medium = files.write("current-disc.iso", vec![0xff; 2048]);
     let mut current = draft;
     attach(&mut current, 2, 0, "scsi.cdrom", &different_medium);
-    let configuration = replay::build_configuration(current, path, None).unwrap();
+    let (configuration, _) = replay::build_configuration(current, path, None)
+        .unwrap()
+        .into_parts();
     let runtime = Runtime::new_unconfigured().unwrap();
     runtime.configure_with(configuration).unwrap();
     assert_eq!(runtime.step().unwrap().mode, RuntimeMode::ReplayCompleted);
     runtime.shutdown().unwrap();
+}
+
+#[test]
+fn recording_and_replay_frontend_plans_follow_the_recorded_machine() {
+    let files = TemporaryFiles::new("frontend-authority");
+    let mut recorded_draft = multi_scsi_draft(&files);
+    set_vt100(&mut recorded_draft, "serial.1.channel.b.port", false);
+    let path = files.path("frontend.serec");
+
+    let (recording_configuration, recording_frontend) =
+        recording::build_configuration(recorded_draft.clone(), NatConfig::default(), path.clone())
+            .unwrap()
+            .into_parts();
+    assert_eq!(
+        recording_frontend
+            .serial_console_endpoints()
+            .iter()
+            .map(|endpoint| endpoint.as_str())
+            .collect::<Vec<_>>(),
+        ["serial.external.a"]
+    );
+    let recording_runtime = Runtime::new_unconfigured().unwrap();
+    recording_runtime
+        .configure_with(recording_configuration)
+        .unwrap();
+    recording_runtime.step().unwrap();
+    recording_runtime.stop_recording().unwrap();
+    recording_runtime.shutdown().unwrap();
+
+    let mut current_draft = recorded_draft;
+    set_vt100(&mut current_draft, "serial.1.channel.a.port", false);
+    set_vt100(&mut current_draft, "serial.1.channel.b.port", true);
+    let (replay_configuration, replay_frontend) =
+        replay::build_configuration(current_draft, path, None)
+            .unwrap()
+            .into_parts();
+    assert_eq!(
+        replay_frontend
+            .serial_console_endpoints()
+            .iter()
+            .map(|endpoint| endpoint.as_str())
+            .collect::<Vec<_>>(),
+        ["serial.external.a"]
+    );
+    let replay_runtime = Runtime::new_unconfigured().unwrap();
+    replay_runtime.configure_with(replay_configuration).unwrap();
+    assert_eq!(
+        replay_runtime.step().unwrap().mode,
+        RuntimeMode::ReplayCompleted
+    );
+    replay_runtime.shutdown().unwrap();
 }

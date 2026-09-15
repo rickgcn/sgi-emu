@@ -147,9 +147,10 @@ mod tests {
             });
         }
         let record_path = files.0.join("record.serec");
-        let configuration =
+        let (configuration, _) =
             recording::build_configuration(draft, NatConfig::default(), record_path.clone())
-                .unwrap();
+                .unwrap()
+                .into_parts();
         let runtime = Runtime::new_unconfigured().unwrap();
         runtime.configure_with(configuration).unwrap();
         runtime.step().unwrap();

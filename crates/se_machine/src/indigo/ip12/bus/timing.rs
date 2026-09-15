@@ -1,10 +1,13 @@
 use se_core::time::VirtualDuration;
+use se_device::sgi_keyboard::SgiKeyboard;
+use se_device::sgi_mouse::SgiMouse;
 use se_device::z85230::Channel;
 
 use crate::endpoint::EndpointKey;
 use crate::output::MachineOutput;
 
 use super::super::events::EventKind;
+use super::super::plan::Ip12Port;
 use super::Ip12Bus;
 
 impl Ip12Bus {
@@ -31,8 +34,8 @@ impl Ip12Bus {
                 EventKind::Serial1 => {
                     self.synchronize_serial_time(1, |channel, value| {
                         let key = match channel {
-                            Channel::A => EndpointKey::new("serial.external.a"),
-                            Channel::B => EndpointKey::new("serial.external.b"),
+                            Channel::A => Ip12Port::SerialA.endpoint_key(),
+                            Channel::B => Ip12Port::SerialB.endpoint_key(),
                         };
                         output.push_serial(key, value);
                     });
@@ -162,8 +165,10 @@ impl Ip12Bus {
             let mut remaining = elapsed.as_attoseconds();
             while remaining != 0 {
                 let next = [
-                    self.sgi_keyboard.time_until_event(),
-                    self.sgi_mouse.time_until_event(),
+                    self.sgi_keyboard
+                        .as_ref()
+                        .and_then(SgiKeyboard::time_until_event),
+                    self.sgi_mouse.as_ref().and_then(SgiMouse::time_until_event),
                     self.serial[0].time_until_event(),
                 ]
                 .into_iter()
@@ -177,14 +182,20 @@ impl Ip12Bus {
                 let keyboard = &mut self.sgi_keyboard;
                 let mouse = &mut self.sgi_mouse;
                 let serial = &mut self.serial[0];
-                keyboard.advance_time(elapsed, |value| {
-                    let _ = serial.receive(Channel::A, &[value]);
-                });
-                mouse.advance_time(elapsed, |value| {
-                    let _ = serial.receive(Channel::B, &[value]);
-                });
+                if let Some(keyboard) = keyboard.as_mut() {
+                    keyboard.advance_time(elapsed, |value| {
+                        let _ = serial.receive(Channel::A, &[value]);
+                    });
+                }
+                if let Some(mouse) = mouse.as_mut() {
+                    mouse.advance_time(elapsed, |value| {
+                        let _ = serial.receive(Channel::B, &[value]);
+                    });
+                }
                 serial.advance_time(elapsed, |channel, value| {
-                    if channel == Channel::A {
+                    if channel == Channel::A
+                        && let Some(keyboard) = keyboard.as_mut()
+                    {
                         keyboard.receive_command(value);
                     }
                 });
@@ -209,8 +220,10 @@ impl Ip12Bus {
     pub(super) fn reschedule_serial(&mut self, index: usize) {
         let after = if index == 0 {
             [
-                self.sgi_keyboard.time_until_event(),
-                self.sgi_mouse.time_until_event(),
+                self.sgi_keyboard
+                    .as_ref()
+                    .and_then(SgiKeyboard::time_until_event),
+                self.sgi_mouse.as_ref().and_then(SgiMouse::time_until_event),
                 self.serial[0].time_until_event(),
             ]
             .into_iter()
