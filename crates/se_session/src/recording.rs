@@ -17,9 +17,9 @@ use se_machine::resource::{
 };
 use se_network::config::NatConfig;
 use se_runtime::record::{MediaIdentity, RecordError, RecordManifest, RecordedResource, Recorder};
-use se_runtime::runtime::RuntimeConfiguration;
 
 use crate::file_storage::HostFileStorage;
+use crate::frontend::{FrontendPlan, SessionBuild};
 use crate::normal::HostResourceError;
 use crate::persistence;
 use crate::recording_storage::RecordingStorageMedium;
@@ -95,10 +95,11 @@ pub fn build_configuration(
     draft: MachineDraft,
     network: NatConfig,
     record_path: PathBuf,
-) -> Result<RuntimeConfiguration, RecordingBuildError> {
+) -> Result<SessionBuild, RecordingBuildError> {
     let plan = Ip12Definition
         .compile(&draft)
         .map_err(RecordingBuildError::Compile)?;
+    let frontend = FrontendPlan::from_ip12(&plan);
     let recorder = Recorder::create_or_replace(record_path).map_err(RecordingBuildError::Create)?;
     let machine = (|| {
         let mut resources = BTreeMap::new();
@@ -121,8 +122,11 @@ pub fn build_configuration(
         Ok(machine)
     })();
     match machine {
-        Ok(machine) => Ok(RuntimeConfiguration::recording_with_network(
-            machine, recorder, network,
+        Ok(machine) => Ok(SessionBuild::new(
+            se_runtime::runtime::RuntimeConfiguration::recording_with_network(
+                machine, recorder, network,
+            ),
+            frontend,
         )),
         Err(build) => match recorder.discard_unstarted() {
             Ok(()) => Err(build),

@@ -15,9 +15,9 @@ use se_machine::resource::{
     PrepareResourcesError, PreparedResource, ResourceId, ResourceKind, ResourceRequirements,
 };
 use se_runtime::record::{MediaIdentity, RecordError, RecordedResource, Replayer};
-use se_runtime::runtime::RuntimeConfiguration;
 
 use crate::file_storage::HostFileStorage;
+use crate::frontend::{FrontendPlan, SessionBuild};
 use crate::normal::HostResourceError;
 use crate::replay_storage::ReplayStorageMedium;
 
@@ -114,7 +114,7 @@ pub fn build_configuration(
     current_draft: MachineDraft,
     record_path: PathBuf,
     snapshot_id: Option<String>,
-) -> Result<RuntimeConfiguration, ReplayBuildError> {
+) -> Result<SessionBuild, ReplayBuildError> {
     let replayer = match snapshot_id.as_deref() {
         Some(id) => Replayer::open_snapshot(record_path, id),
         None => Replayer::open(record_path),
@@ -124,6 +124,7 @@ pub fn build_configuration(
     let plan = Ip12Definition
         .compile(manifest.machine())
         .map_err(ReplayBuildError::RecordedMachine)?;
+    let frontend = FrontendPlan::from_ip12(&plan);
     validate_contract(plan.resources(), manifest.resources())?;
     let current = Ip12Definition
         .compile(&current_draft)
@@ -146,7 +147,10 @@ pub fn build_configuration(
     let mut machine =
         Machine::IndigoIp12(builder::build(prepared).map_err(ReplayBuildError::Assemble)?);
     machine.restore_nonvolatile_state(manifest.nonvolatile_state().clone(), 0);
-    Ok(RuntimeConfiguration::replaying(machine, replayer))
+    Ok(SessionBuild::new(
+        se_runtime::runtime::RuntimeConfiguration::replaying(machine, replayer),
+        frontend,
+    ))
 }
 
 fn validate_contract(

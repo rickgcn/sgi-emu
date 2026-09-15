@@ -1,4 +1,4 @@
-//! Synchronous preparation of host files for validated IP12 build plans.
+//! Normal session composition from a validated draft and host resources.
 
 use std::error::Error;
 use std::fmt;
@@ -17,9 +17,9 @@ use se_machine::resource::{
     PrepareResourcesError, PreparedResource, ResourceKind, ResourceRequirement,
 };
 use se_network::config::NatConfig;
-use se_runtime::runtime::RuntimeConfiguration;
 
 use crate::file_storage::HostFileStorage;
+use crate::frontend::{FrontendPlan, SessionBuild};
 use crate::persistence;
 
 /// Failure to construct an ordinary machine session.
@@ -72,10 +72,11 @@ impl Error for NormalBuildError {
 pub fn build_configuration(
     draft: MachineDraft,
     network: NatConfig,
-) -> Result<RuntimeConfiguration, NormalBuildError> {
+) -> Result<SessionBuild, NormalBuildError> {
     let plan = Ip12Definition
         .compile(&draft)
         .map_err(NormalBuildError::Compile)?;
+    let frontend = FrontendPlan::from_ip12(&plan);
     let prepared = prepare_ip12(plan).map_err(NormalBuildError::Prepare)?;
     let mut machine =
         Machine::IndigoIp12(builder::build(prepared).map_err(NormalBuildError::Assemble)?);
@@ -84,7 +85,10 @@ pub fn build_configuration(
     {
         machine.restore_nonvolatile_state(restored.state, restored.offline_milliseconds);
     }
-    Ok(RuntimeConfiguration::normal_with_network(machine, network))
+    Ok(SessionBuild::new(
+        se_runtime::runtime::RuntimeConfiguration::normal_with_network(machine, network),
+        frontend,
+    ))
 }
 
 /// A host file could not be read or opened with the requested access.
@@ -218,8 +222,10 @@ mod tests {
     use se_machine::resource::{
         PrepareResourcesError, PreparedResource, ResourceKind, ResourceRequirement,
     };
+    use se_network::config::NatConfig;
+    use se_runtime::runtime::Runtime;
 
-    use super::{HostResourceError, prepare_ip12, prepare_requirement};
+    use super::{HostResourceError, build_configuration, prepare_ip12, prepare_requirement};
 
     const PROM_BYTES: usize = 0x40000;
     static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -434,5 +440,44 @@ mod tests {
                 .iter()
                 .any(|endpoint| { endpoint.kind() == se_machine::endpoint::EndpointKind::Video })
         );
+    }
+
+    #[test]
+    fn normal_session_build_keeps_runtime_and_frontend_from_one_plan() {
+        let files = TemporaryFiles::new("normal-frontend");
+        let firmware = files.write("prom.bin", vec![0; PROM_BYTES]);
+        let mut draft = draft_with_firmware(&firmware);
+        draft.apply(Edit::SetAttachment {
+            slot: NodeId(String::from("serial.1.channel.b.port")),
+            device: None,
+        });
+
+        let (configuration, frontend) = build_configuration(draft, NatConfig::default())
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            frontend
+                .serial_console_endpoints()
+                .iter()
+                .map(|endpoint| endpoint.as_str())
+                .collect::<Vec<_>>(),
+            ["serial.external.a"]
+        );
+
+        let runtime = Runtime::new_unconfigured().unwrap();
+        runtime.configure_with(configuration).unwrap();
+        assert_eq!(
+            runtime
+                .endpoint_catalog()
+                .unwrap()
+                .endpoints()
+                .iter()
+                .filter(|endpoint| {
+                    endpoint.kind() == se_machine::endpoint::EndpointKind::Serial
+                })
+                .count(),
+            2
+        );
+        runtime.shutdown().unwrap();
     }
 }

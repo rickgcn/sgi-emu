@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 
 use super::Ip12SnapshotError;
 use super::events::{EventKind, Ip12Events};
+use super::plan::Ip12Port;
 use crate::output::{VideoFrame, VideoOutput};
 
 const BOARD_REVISION: u32 = 0x0000_8000;
@@ -50,8 +51,8 @@ pub(super) struct Ip12Bus {
     scsi_bus: ScsiBus,
     pending_scsi: Option<WdRequest>,
     serial: [Z85230; 2],
-    sgi_keyboard: SgiKeyboard,
-    sgi_mouse: SgiMouse,
+    sgi_keyboard: Option<SgiKeyboard>,
+    sgi_mouse: Option<SgiMouse>,
     rtc: Dp8573a,
     mdac: Mdac,
     nvram: Nmc93cs46,
@@ -77,8 +78,8 @@ pub(super) struct Ip12BusSnapshot {
     scsi_bus: ScsiBusSnapshot,
     pending_scsi: Option<WdRequest>,
     serial: [Z85230; 2],
-    sgi_keyboard: SgiKeyboard,
-    sgi_mouse: SgiMouse,
+    sgi_keyboard: Option<SgiKeyboard>,
+    sgi_mouse: Option<SgiMouse>,
     rtc: Dp8573a,
     mdac: Mdac,
     nvram: Nmc93cs46,
@@ -100,8 +101,8 @@ impl Ip12Bus {
         wd33c93b: Wd33c93b,
         scsi_bus: ScsiBus,
         serial: [Z85230; 2],
-        sgi_keyboard: SgiKeyboard,
-        sgi_mouse: SgiMouse,
+        sgi_keyboard: Option<SgiKeyboard>,
+        sgi_mouse: Option<SgiMouse>,
         rtc: Dp8573a,
         mdac: Mdac,
         nvram: Nmc93cs46,
@@ -171,6 +172,26 @@ impl Ip12Bus {
         &mut self,
         snapshot: Ip12BusSnapshot,
     ) -> Result<(), Ip12SnapshotError> {
+        for (port, snapshot_attached, machine_attached) in [
+            (
+                Ip12Port::Keyboard,
+                snapshot.sgi_keyboard.is_some(),
+                self.sgi_keyboard.is_some(),
+            ),
+            (
+                Ip12Port::Mouse,
+                snapshot.sgi_mouse.is_some(),
+                self.sgi_mouse.is_some(),
+            ),
+        ] {
+            if snapshot_attached != machine_attached {
+                return Err(Ip12SnapshotError::PortAttachmentMismatch {
+                    port,
+                    snapshot_attached,
+                    machine_attached,
+                });
+            }
+        }
         if !self.gio.accepts_snapshot(&snapshot.gio) {
             return Err(GioSnapshotError.into());
         }
@@ -213,8 +234,12 @@ impl Ip12Bus {
         for serial in &mut self.serial {
             serial.reset();
         }
-        self.sgi_keyboard.reset();
-        self.sgi_mouse.reset();
+        if let Some(keyboard) = &mut self.sgi_keyboard {
+            keyboard.reset();
+        }
+        if let Some(mouse) = &mut self.sgi_mouse {
+            mouse.reset();
+        }
         self.int2.reset();
         self.gio.reset();
         self.events.reset();
@@ -278,19 +303,28 @@ impl Ip12Bus {
 
     pub(super) fn set_sgi_key_state(&mut self, key: SgiKey, pressed: bool) {
         self.synchronize_serial_for_mmio(0);
-        self.sgi_keyboard.set_key_state(key, pressed);
+        self.sgi_keyboard
+            .as_mut()
+            .expect("the keyboard endpoint requires an attached SGI keyboard")
+            .set_key_state(key, pressed);
         self.reschedule_serial(0);
     }
 
     pub(super) fn move_sgi_mouse(&mut self, delta_x: i32, delta_y: i32) {
         self.synchronize_serial_for_mmio(0);
-        self.sgi_mouse.move_relative(delta_x, delta_y);
+        self.sgi_mouse
+            .as_mut()
+            .expect("the pointer endpoint requires an attached SGI mouse")
+            .move_relative(delta_x, delta_y);
         self.reschedule_serial(0);
     }
 
     pub(super) fn set_sgi_mouse_button_state(&mut self, button: SgiMouseButton, pressed: bool) {
         self.synchronize_serial_for_mmio(0);
-        self.sgi_mouse.set_button_state(button, pressed);
+        self.sgi_mouse
+            .as_mut()
+            .expect("the pointer endpoint requires an attached SGI mouse")
+            .set_button_state(button, pressed);
         self.reschedule_serial(0);
     }
 
@@ -324,6 +358,14 @@ impl Ip12Bus {
         )
         .expect("machine SGI input state is serializable");
         hasher.update(bytes);
+    }
+
+    pub(super) const fn has_sgi_keyboard(&self) -> bool {
+        self.sgi_keyboard.is_some()
+    }
+
+    pub(super) const fn has_sgi_mouse(&self) -> bool {
+        self.sgi_mouse.is_some()
     }
 
     /// Returns what the primary graphics slot currently drives to the display.

@@ -524,7 +524,9 @@ dependencies = [
  "se_config",
  "se_cpu",
  "se_machine",
+ "se_network",
  "se_runtime",
+ "se_session",
  "vt100",
 ]
 

@@ -18,7 +18,8 @@ use se_float::backend::Backend;
 
 use super::Ip12MemoryConfiguration;
 use super::plan::{
-    GioAttachment, GioDevice, Ip12BuildPlan, Ip12CompileError, ScsiAttachment, ScsiDevice,
+    GioAttachment, GioDevice, Ip12BuildPlan, Ip12CompileError, Ip12Peripheral, Ip12Port,
+    Ip12PortAttachment, ScsiAttachment, ScsiDevice,
 };
 use crate::resource::{ResourceId, ResourceKind, ResourceRequirement, ResourceRequirements};
 
@@ -27,6 +28,9 @@ const GRAPHICS_SLOT: &str = "gio.0.slot.graphics";
 const LG1: &str = "sgi.gio.lg1";
 const SCSI_DISK: &str = "scsi.disk";
 const SCSI_CDROM: &str = "scsi.cdrom";
+const SGI_KEYBOARD: &str = "sgi.serial.keyboard";
+const SGI_MOUSE: &str = "sgi.serial.mouse";
+const VT100_TERMINAL: &str = "terminal.vt100";
 const FPU_BACKEND: &str = "cpu.0.fpu.0.backend";
 const FIRMWARE_PATH: &str = "firmware.0.image-path";
 
@@ -50,6 +54,7 @@ impl Ip12Definition {
             memory,
             gio,
             scsi,
+            port_attachments,
             resources,
         } = analysis;
         let errors: Vec<_> = view
@@ -71,6 +76,7 @@ impl Ip12Definition {
             ResourceId::new("firmware.0.image"),
             gio,
             scsi,
+            port_attachments,
             resources,
         ))
     }
@@ -113,7 +119,13 @@ impl MachineDefinition for Ip12Definition {
                     PropertyValue::Text(String::new()),
                 ),
             ]),
-            attachments: BTreeMap::from([(node_id(GRAPHICS_SLOT), device_kind(LG1))]),
+            attachments: BTreeMap::from([
+                (node_id(GRAPHICS_SLOT), device_kind(LG1)),
+                (port_node(Ip12Port::Keyboard), device_kind(SGI_KEYBOARD)),
+                (port_node(Ip12Port::Mouse), device_kind(SGI_MOUSE)),
+                (port_node(Ip12Port::SerialA), device_kind(VT100_TERMINAL)),
+                (port_node(Ip12Port::SerialB), device_kind(VT100_TERMINAL)),
+            ]),
         }
     }
 
@@ -128,6 +140,7 @@ struct Analysis {
     memory: Option<Ip12MemoryConfiguration>,
     gio: Vec<GioAttachment>,
     scsi: Vec<ScsiAttachment>,
+    port_attachments: Vec<Ip12PortAttachment>,
     resources: ResourceRequirements,
 }
 
@@ -140,6 +153,7 @@ struct Projection<'a> {
     memory: Option<Ip12MemoryConfiguration>,
     gio: Vec<GioAttachment>,
     scsi: Vec<ScsiAttachment>,
+    port_attachments: Vec<Ip12PortAttachment>,
     resources: ResourceRequirements,
 }
 
@@ -167,6 +181,7 @@ impl<'a> Projection<'a> {
             memory: None,
             gio: Vec::new(),
             scsi: Vec::new(),
+            port_attachments: Vec::new(),
             resources: ResourceRequirements::default(),
         }
     }
@@ -196,6 +211,7 @@ impl<'a> Projection<'a> {
             memory: self.memory,
             gio: self.gio,
             scsi: self.scsi,
+            port_attachments: self.port_attachments,
             resources: self.resources,
         }
     }
@@ -556,34 +572,36 @@ impl<'a> Projection<'a> {
                 NodeRole::Component,
                 format!("Serial Controller {controller}"),
             ));
-            for (channel, port_label, device_label) in [
-                (
-                    "a",
-                    if controller == 0 {
-                        "Keyboard Port"
-                    } else {
-                        "Serial Port A"
-                    },
-                    if controller == 0 {
-                        Some("SGI Keyboard")
-                    } else {
-                        None
-                    },
-                ),
-                (
-                    "b",
-                    if controller == 0 {
-                        "Mouse Port"
-                    } else {
-                        "Serial Port B"
-                    },
-                    if controller == 0 {
-                        Some("SGI Mouse")
-                    } else {
-                        None
-                    },
-                ),
-            ] {
+            let ports = if controller == 0 {
+                [
+                    (
+                        "a",
+                        Ip12Port::Keyboard,
+                        "Keyboard Port",
+                        SGI_KEYBOARD,
+                        "SGI Keyboard",
+                    ),
+                    ("b", Ip12Port::Mouse, "Mouse Port", SGI_MOUSE, "SGI Mouse"),
+                ]
+            } else {
+                [
+                    (
+                        "a",
+                        Ip12Port::SerialA,
+                        "Serial Port A",
+                        VT100_TERMINAL,
+                        "VT100 Terminal",
+                    ),
+                    (
+                        "b",
+                        Ip12Port::SerialB,
+                        "Serial Port B",
+                        VT100_TERMINAL,
+                        "VT100 Terminal",
+                    ),
+                ]
+            };
+            for (channel, port, port_label, device_kind_id, device_label) in ports {
                 let channel_id = node_id(&format!("serial.{controller}.channel.{channel}"));
                 self.view.nodes.push(node(
                     channel_id.clone(),
@@ -591,20 +609,45 @@ impl<'a> Projection<'a> {
                     NodeRole::Component,
                     format!("Channel {}", channel.to_ascii_uppercase()),
                 ));
-                let port_id = node_id(&format!("serial.{controller}.channel.{channel}.port"));
-                self.view.nodes.push(node(
+                let port_id = port_node(port);
+                self.known_slots.insert(port_id.clone());
+                let current = self.draft.attachments.get(&port_id).cloned();
+                let mut port_view = node(
                     port_id.clone(),
                     Some(channel_id),
                     NodeRole::Endpoint,
                     port_label,
-                ));
-                if let Some(device_label) = device_label {
+                );
+                port_view.attachment = Some(AttachmentView {
+                    allow_empty: true,
+                    current: current.clone(),
+                    choices: vec![device_choice(device_kind_id, device_label)],
+                });
+                self.view.nodes.push(port_view);
+                if let Some(device) = current {
+                    let supported = device == device_kind(device_kind_id);
+                    if !supported {
+                        self.unsupported_attachment(&port_id);
+                    }
                     self.view.nodes.push(node(
-                        node_id(&format!("serial.{controller}.channel.{channel}.device")),
-                        Some(port_id),
+                        port_device_node(port),
+                        Some(port_id.clone()),
                         NodeRole::Device,
-                        device_label,
+                        if supported {
+                            device_label.into()
+                        } else {
+                            unsupported_label(&device)
+                        },
                     ));
+                    if supported {
+                        let peripheral = match port {
+                            Ip12Port::Keyboard => Ip12Peripheral::SgiKeyboard,
+                            Ip12Port::Mouse => Ip12Peripheral::SgiMouse,
+                            Ip12Port::SerialA | Ip12Port::SerialB => Ip12Peripheral::Vt100Terminal,
+                        };
+                        self.port_attachments
+                            .push(Ip12PortAttachment::new(port, peripheral));
+                    }
                 }
             }
         }
@@ -691,6 +734,22 @@ fn property_id(value: &str) -> PropertyId {
 }
 fn device_kind(value: &str) -> DeviceKindId {
     DeviceKindId(value.into())
+}
+fn port_node(port: Ip12Port) -> NodeId {
+    node_id(match port {
+        Ip12Port::Keyboard => "serial.0.channel.a.port",
+        Ip12Port::Mouse => "serial.0.channel.b.port",
+        Ip12Port::SerialA => "serial.1.channel.a.port",
+        Ip12Port::SerialB => "serial.1.channel.b.port",
+    })
+}
+fn port_device_node(port: Ip12Port) -> NodeId {
+    node_id(match port {
+        Ip12Port::Keyboard => "serial.0.channel.a.device",
+        Ip12Port::Mouse => "serial.0.channel.b.device",
+        Ip12Port::SerialA => "serial.1.channel.a.device",
+        Ip12Port::SerialB => "serial.1.channel.b.device",
+    })
 }
 fn memory_bank(bank: char) -> NodeId {
     node_id(&format!("memory.bank.{bank}"))
@@ -786,13 +845,14 @@ mod tests {
     use se_device::gio::GioSlot;
     use se_float::backend::Backend;
 
-    use crate::indigo::ip12::plan::{GioDevice, ScsiDevice};
+    use crate::indigo::ip12::plan::{GioDevice, Ip12Peripheral, Ip12Port, ScsiDevice};
     use crate::resource::{ResourceId, ResourceKind};
 
     use super::{
         FIRMWARE_PATH, FPU_BACKEND, GRAPHICS_SLOT, Ip12Definition, LG1, MODEL, SCSI_CDROM,
-        SCSI_DISK, device_kind, memory_bank, memory_module, memory_property, memory_socket,
-        node_id, property_id, scsi_device, scsi_lun, scsi_medium, scsi_target,
+        SCSI_DISK, SGI_KEYBOARD, SGI_MOUSE, VT100_TERMINAL, device_kind, memory_bank,
+        memory_module, memory_property, memory_socket, node_id, port_device_node, port_node,
+        property_id, scsi_device, scsi_lun, scsi_medium, scsi_target,
     };
 
     fn node<'a>(view: &'a ConfigurationView, id: &NodeId) -> &'a TopologyNode {
@@ -891,6 +951,18 @@ mod tests {
         assert_eq!(plan.gio()[0].slot, GioSlot::Graphics);
         assert_eq!(plan.gio()[0].device, GioDevice::Lg1);
         assert!(plan.scsi().is_empty());
+        assert_eq!(
+            plan.port_attachments()
+                .iter()
+                .map(|attachment| (attachment.port(), attachment.peripheral()))
+                .collect::<Vec<_>>(),
+            [
+                (Ip12Port::Keyboard, Ip12Peripheral::SgiKeyboard),
+                (Ip12Port::Mouse, Ip12Peripheral::SgiMouse),
+                (Ip12Port::SerialA, Ip12Peripheral::Vt100Terminal),
+                (Ip12Port::SerialB, Ip12Peripheral::Vt100Terminal),
+            ]
+        );
     }
 
     #[test]
@@ -1154,7 +1226,7 @@ mod tests {
         let view = definition.resolve(&draft);
         assert_eq!(draft.model, MachineModelId(MODEL.into()));
         assert_eq!(view.model, draft.model);
-        assert_eq!(draft.attachments.len(), 1);
+        assert_eq!(draft.attachments.len(), 5);
         assert_eq!(
             draft.attachments.get(&node_id(GRAPHICS_SLOT)),
             Some(&device_kind(LG1))
@@ -1236,11 +1308,39 @@ mod tests {
         }
         assert!(!contains(&view, &scsi_lun(0, 0)));
 
-        for (controller, channel, port_label, device_label) in [
-            (0, "a", "Keyboard Port", Some("SGI Keyboard")),
-            (0, "b", "Mouse Port", Some("SGI Mouse")),
-            (1, "a", "Serial Port A", None),
-            (1, "b", "Serial Port B", None),
+        for (controller, channel, port, port_label, kind, device_label) in [
+            (
+                0,
+                "a",
+                Ip12Port::Keyboard,
+                "Keyboard Port",
+                SGI_KEYBOARD,
+                "SGI Keyboard",
+            ),
+            (
+                0,
+                "b",
+                Ip12Port::Mouse,
+                "Mouse Port",
+                SGI_MOUSE,
+                "SGI Mouse",
+            ),
+            (
+                1,
+                "a",
+                Ip12Port::SerialA,
+                "Serial Port A",
+                VT100_TERMINAL,
+                "VT100 Terminal",
+            ),
+            (
+                1,
+                "b",
+                Ip12Port::SerialB,
+                "Serial Port B",
+                VT100_TERMINAL,
+                "VT100 Terminal",
+            ),
         ] {
             let id = node_id(&format!("serial.{controller}.channel.{channel}"));
             let channel_node = node(&view, &id);
@@ -1253,22 +1353,25 @@ mod tests {
                 channel_node.label,
                 format!("Channel {}", channel.to_ascii_uppercase())
             );
-            let port = node(
+            let port_view = node(
                 &view,
                 &node_id(&format!("serial.{controller}.channel.{channel}.port")),
             );
-            assert_eq!(port.parent, Some(id.clone()));
-            assert_eq!(port.role, NodeRole::Endpoint);
-            assert_eq!(port.label, port_label);
-            if let Some(label) = device_label {
-                let device = node(
-                    &view,
-                    &node_id(&format!("serial.{controller}.channel.{channel}.device")),
-                );
-                assert_eq!(device.parent, Some(port.id.clone()));
-                assert_eq!(device.role, NodeRole::Device);
-                assert_eq!(device.label, label);
-            }
+            assert_eq!(port_view.parent, Some(id.clone()));
+            assert_eq!(port_view.role, NodeRole::Endpoint);
+            assert_eq!(port_view.label, port_label);
+            let attachment = port_view
+                .attachment
+                .as_ref()
+                .expect("port must be editable");
+            assert!(attachment.allow_empty);
+            assert_eq!(attachment.current, Some(device_kind(kind)));
+            assert_eq!(attachment.choices.len(), 1);
+            assert_eq!(attachment.choices[0].id, device_kind(kind));
+            let device = node(&view, &port_device_node(port));
+            assert_eq!(device.parent, Some(port_node(port)));
+            assert_eq!(device.role, NodeRole::Device);
+            assert_eq!(device.label, device_label);
         }
         assert_eq!(node(&view, &node_id("parallel.0")).role, NodeRole::Endpoint);
         assert_eq!(
@@ -1534,6 +1637,65 @@ mod tests {
             "ip12.attachment.unsupported-device",
             DiagnosticTarget::Node(node_id(GRAPHICS_SLOT))
         ));
+    }
+
+    #[test]
+    fn each_port_keeps_its_interface_when_its_peripheral_is_detached() {
+        for port in [
+            Ip12Port::Keyboard,
+            Ip12Port::Mouse,
+            Ip12Port::SerialA,
+            Ip12Port::SerialB,
+        ] {
+            let mut draft = valid_draft();
+            attach(&mut draft, port_node(port), None);
+            let view = Ip12Definition.resolve(&draft);
+            let port_view = node(&view, &port_node(port));
+            assert!(
+                port_view
+                    .attachment
+                    .as_ref()
+                    .expect("port must stay editable")
+                    .current
+                    .is_none()
+            );
+            assert!(!contains(&view, &port_device_node(port)));
+            let plan = Ip12Definition
+                .compile(&draft)
+                .expect("an empty port is valid");
+            assert!(
+                plan.port_attachments()
+                    .iter()
+                    .all(|attachment| attachment.port() != port)
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_port_peripherals_stay_visible_and_fail_compilation() {
+        for (port, device) in [
+            (Ip12Port::Keyboard, VT100_TERMINAL),
+            (Ip12Port::SerialA, SGI_MOUSE),
+        ] {
+            let mut draft = valid_draft();
+            attach(&mut draft, port_node(port), Some(device));
+            let view = Ip12Definition.resolve(&draft);
+            assert_eq!(
+                node(&view, &port_node(port))
+                    .attachment
+                    .as_ref()
+                    .expect("port must be editable")
+                    .current,
+                Some(device_kind(device))
+            );
+            assert!(node(&view, &port_device_node(port)).label.contains(device));
+            assert!(error(
+                &view,
+                "ip12.attachment.unsupported-device",
+                DiagnosticTarget::Node(port_node(port))
+            ));
+            assert_compile_matches_resolution(&draft);
+        }
     }
 
     #[test]
