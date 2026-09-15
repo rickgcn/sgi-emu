@@ -213,7 +213,7 @@ impl State {
         virtual_address: u32,
         access: AccessType,
     ) -> Result<Translation, TranslationFault> {
-        self.mmu.translate(
+        self.mmu.translate_readonly(
             virtual_address,
             self.cp0.current_asid(),
             self.cp0.is_kernel_mode(),
