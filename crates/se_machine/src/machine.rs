@@ -5,38 +5,14 @@ use std::fmt;
 
 use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::StepError;
-use se_float::backend::Backend;
 use serde::{Deserialize, Serialize};
 
 use crate::debug::{DebugRequest, DebugResponse};
-use crate::indigo::GraphicsBoard;
+use crate::endpoint::{EndpointCatalog, EndpointKind};
 use crate::indigo::ip12::snapshot::Ip12Snapshot;
-use crate::indigo::ip12::{Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12SnapshotError};
+use crate::indigo::ip12::{Ip12, Ip12NonvolatileState, Ip12SnapshotError};
 use crate::input::MachineInput;
-use crate::output::{MachineOutput, VideoOutput};
-use crate::serial::SerialPort;
-
-/// Construction-time configuration for a supported machine model.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum MachineStartupConfiguration {
-    /// Configuration for an SGI Indigo IP12.
-    IndigoIp12 {
-        /// Floating-point implementation selected for the R3010.
-        #[serde(with = "BackendDefinition")]
-        floating_point_backend: Backend,
-        /// Installed IP12 memory banks.
-        memory: Ip12MemoryConfiguration,
-        /// Installed IP12 graphics board.
-        graphics: Option<GraphicsBoard>,
-    },
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(remote = "Backend")]
-enum BackendDefinition {
-    SoftFloat,
-    Native,
-}
+use crate::output::MachineOutput;
 
 /// A configured emulated machine.
 pub enum Machine {
@@ -108,6 +84,47 @@ pub enum ExecutionError {
     IndigoIp12(StepError),
 }
 
+/// Result of one valid machine input at the current execution boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineInputResult {
+    /// The machine accepted the complete input.
+    Consumed,
+    /// The destination cannot accept the input at this boundary.
+    WouldBlock,
+}
+
+/// An invalid endpoint or payload in a machine input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineInputError {
+    /// The endpoint is not present in this machine topology.
+    UnknownEndpoint,
+    /// The endpoint does not accept host input.
+    OutputOnlyEndpoint,
+    /// The payload type does not match the endpoint kind.
+    PayloadKindMismatch,
+    /// The semantic keyboard key is outside the supported frontend set.
+    UnsupportedKeyboardKey,
+}
+
+impl fmt::Display for MachineInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownEndpoint => formatter.write_str("unknown machine input endpoint"),
+            Self::OutputOnlyEndpoint => {
+                formatter.write_str("machine endpoint does not accept input")
+            }
+            Self::PayloadKindMismatch => {
+                formatter.write_str("machine input payload does not match endpoint kind")
+            }
+            Self::UnsupportedKeyboardKey => {
+                formatter.write_str("unsupported frontend keyboard key")
+            }
+        }
+    }
+}
+
+impl Error for MachineInputError {}
+
 impl fmt::Display for ExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -125,6 +142,14 @@ impl Error for ExecutionError {
 }
 
 impl Machine {
+    /// Returns the configured machine's frontend I/O capabilities.
+    #[must_use]
+    pub fn endpoint_catalog(&self) -> EndpointCatalog {
+        match self {
+            Self::IndigoIp12(machine) => machine.endpoint_catalog(),
+        }
+    }
+
     /// Captures complete execution state without construction-time resources.
     ///
     /// # Errors
@@ -217,47 +242,10 @@ impl Machine {
         }
     }
 
-    /// Returns what the machine currently drives onto its display.
-    ///
-    /// The query has no side effects and does not advance virtual time, so a
-    /// frontend can ask a paused machine what to present.
-    #[must_use]
-    pub fn video_output(&self) -> VideoOutput {
+    /// Publishes current-state outputs without advancing virtual time.
+    pub fn publish_current_outputs(&self, output: &mut MachineOutput) {
         match self {
-            Self::IndigoIp12(machine) => machine.video_output(),
-        }
-    }
-
-    /// Publishes the machine's current display state without advancing time.
-    ///
-    /// This lets a runtime present a cold, reset, or restored machine even
-    /// when no new device event has occurred.
-    pub fn publish_video_output(&self, output: &mut MachineOutput) {
-        output.publish_video(self.video_output());
-    }
-
-    /// Supplies host bytes to one external serial receiver.
-    ///
-    /// Returns the number of bytes consumed by the selected machine.
-    pub fn receive_serial(&mut self, port: SerialPort, bytes: &[u8]) -> usize {
-        match self {
-            Self::IndigoIp12(machine) => machine.receive_serial(port, bytes),
-        }
-    }
-
-    /// Reports whether virtual link spacing permits the next Ethernet input.
-    #[must_use]
-    pub fn ethernet_receive_ready(&self) -> bool {
-        match self {
-            Self::IndigoIp12(machine) => machine.ethernet_receive_ready(),
-        }
-    }
-
-    /// Supplies a frame before MAC filtering and DMA availability checks.
-    /// Returns false for an occupied link or an excessive frame allocation.
-    pub fn receive_ethernet(&mut self, bytes: &[u8]) -> bool {
-        match self {
-            Self::IndigoIp12(machine) => machine.receive_ethernet(bytes),
+            Self::IndigoIp12(machine) => machine.publish_current_outputs(output),
         }
     }
 
@@ -265,28 +253,25 @@ impl Machine {
     /// boundary.
     ///
     /// Keyboard and mouse inputs are accepted even when they describe a
-    /// duplicate state or zero motion. Serial and Ethernet inputs report the
-    /// readiness of their respective external interfaces.
-    pub fn try_receive_input(&mut self, input: &MachineInput) -> bool {
-        match (self, input) {
-            (Self::IndigoIp12(machine), MachineInput::SerialByte { port, value }) => {
-                machine.receive_serial(*port, &[*value]) == 1
-            }
-            (Self::IndigoIp12(machine), MachineInput::EthernetFrame { bytes }) => {
-                machine.receive_ethernet(bytes)
-            }
-            (Self::IndigoIp12(machine), MachineInput::SgiKeyboard { key, pressed }) => {
-                machine.set_sgi_key_state(*key, *pressed);
-                true
-            }
-            (Self::IndigoIp12(machine), MachineInput::SgiMouseMotion { delta_x, delta_y }) => {
-                machine.move_sgi_mouse(*delta_x, *delta_y);
-                true
-            }
-            (Self::IndigoIp12(machine), MachineInput::SgiMouseButton { button, pressed }) => {
-                machine.set_sgi_mouse_button_state(*button, *pressed);
-                true
-            }
+    /// duplicate state or zero motion. Serial character arrivals are handled
+    /// immediately, while Ethernet inputs report link readiness.
+    pub fn try_receive_input(
+        &mut self,
+        input: &MachineInput,
+    ) -> Result<MachineInputResult, MachineInputError> {
+        let catalog = self.endpoint_catalog();
+        let descriptor = catalog
+            .get(input.endpoint())
+            .ok_or(MachineInputError::UnknownEndpoint)?;
+        if !descriptor.direction().accepts_input() {
+            return Err(MachineInputError::OutputOnlyEndpoint);
+        }
+        if descriptor.kind() != input.payload().kind() {
+            return Err(MachineInputError::PayloadKindMismatch);
+        }
+        debug_assert_ne!(descriptor.kind(), EndpointKind::Video);
+        match self {
+            Self::IndigoIp12(machine) => machine.try_receive_input(input),
         }
     }
 

@@ -21,8 +21,8 @@ use sha2::{Digest, Sha256};
 
 use super::Ip12SnapshotError;
 use super::events::{EventKind, Ip12Events};
+use super::plan::Ip12Port;
 use crate::output::{VideoFrame, VideoOutput};
-use crate::serial::SerialPort;
 
 const BOARD_REVISION: u32 = 0x0000_8000;
 
@@ -51,8 +51,8 @@ pub(super) struct Ip12Bus {
     scsi_bus: ScsiBus,
     pending_scsi: Option<WdRequest>,
     serial: [Z85230; 2],
-    sgi_keyboard: SgiKeyboard,
-    sgi_mouse: SgiMouse,
+    sgi_keyboard: Option<SgiKeyboard>,
+    sgi_mouse: Option<SgiMouse>,
     rtc: Dp8573a,
     mdac: Mdac,
     nvram: Nmc93cs46,
@@ -78,8 +78,8 @@ pub(super) struct Ip12BusSnapshot {
     scsi_bus: ScsiBusSnapshot,
     pending_scsi: Option<WdRequest>,
     serial: [Z85230; 2],
-    sgi_keyboard: SgiKeyboard,
-    sgi_mouse: SgiMouse,
+    sgi_keyboard: Option<SgiKeyboard>,
+    sgi_mouse: Option<SgiMouse>,
     rtc: Dp8573a,
     mdac: Mdac,
     nvram: Nmc93cs46,
@@ -101,8 +101,8 @@ impl Ip12Bus {
         wd33c93b: Wd33c93b,
         scsi_bus: ScsiBus,
         serial: [Z85230; 2],
-        sgi_keyboard: SgiKeyboard,
-        sgi_mouse: SgiMouse,
+        sgi_keyboard: Option<SgiKeyboard>,
+        sgi_mouse: Option<SgiMouse>,
         rtc: Dp8573a,
         mdac: Mdac,
         nvram: Nmc93cs46,
@@ -172,6 +172,26 @@ impl Ip12Bus {
         &mut self,
         snapshot: Ip12BusSnapshot,
     ) -> Result<(), Ip12SnapshotError> {
+        for (port, snapshot_attached, machine_attached) in [
+            (
+                Ip12Port::Keyboard,
+                snapshot.sgi_keyboard.is_some(),
+                self.sgi_keyboard.is_some(),
+            ),
+            (
+                Ip12Port::Mouse,
+                snapshot.sgi_mouse.is_some(),
+                self.sgi_mouse.is_some(),
+            ),
+        ] {
+            if snapshot_attached != machine_attached {
+                return Err(Ip12SnapshotError::PortAttachmentMismatch {
+                    port,
+                    snapshot_attached,
+                    machine_attached,
+                });
+            }
+        }
         if !self.gio.accepts_snapshot(&snapshot.gio) {
             return Err(GioSnapshotError.into());
         }
@@ -214,8 +234,12 @@ impl Ip12Bus {
         for serial in &mut self.serial {
             serial.reset();
         }
-        self.sgi_keyboard.reset();
-        self.sgi_mouse.reset();
+        if let Some(keyboard) = &mut self.sgi_keyboard {
+            keyboard.reset();
+        }
+        if let Some(mouse) = &mut self.sgi_mouse {
+            mouse.reset();
+        }
         self.int2.reset();
         self.gio.reset();
         self.events.reset();
@@ -271,36 +295,36 @@ impl Ip12Bus {
         self.int2.timer_1_interrupt_asserted()
     }
 
-    pub(super) fn receive_serial(&mut self, port: SerialPort, bytes: &[u8]) -> usize {
-        let channel = match port {
-            SerialPort::A => Channel::A,
-            SerialPort::B => Channel::B,
-        };
-        let consumed = self.serial[1].receive(channel, bytes);
+    pub(super) fn receive_serial_character(&mut self, channel: Channel, value: u8) {
+        self.serial[1].receive_character(channel, value);
         self.synchronize_serial_interrupt();
-        consumed
     }
 
     pub(super) fn set_sgi_key_state(&mut self, key: SgiKey, pressed: bool) {
         self.synchronize_serial_for_mmio(0);
-        self.sgi_keyboard.set_key_state(key, pressed);
+        self.sgi_keyboard
+            .as_mut()
+            .expect("the keyboard endpoint requires an attached SGI keyboard")
+            .set_key_state(key, pressed);
         self.reschedule_serial(0);
     }
 
     pub(super) fn move_sgi_mouse(&mut self, delta_x: i32, delta_y: i32) {
         self.synchronize_serial_for_mmio(0);
-        self.sgi_mouse.move_relative(delta_x, delta_y);
+        self.sgi_mouse
+            .as_mut()
+            .expect("the pointer endpoint requires an attached SGI mouse")
+            .move_relative(delta_x, delta_y);
         self.reschedule_serial(0);
     }
 
     pub(super) fn set_sgi_mouse_button_state(&mut self, button: SgiMouseButton, pressed: bool) {
         self.synchronize_serial_for_mmio(0);
-        self.sgi_mouse.set_button_state(button, pressed);
+        self.sgi_mouse
+            .as_mut()
+            .expect("the pointer endpoint requires an attached SGI mouse")
+            .set_button_state(button, pressed);
         self.reschedule_serial(0);
-    }
-
-    pub(super) fn ethernet_receive_ready(&self) -> bool {
-        self.seeq8003.receive_ready()
     }
 
     pub(super) fn receive_ethernet(&mut self, bytes: &[u8]) -> bool {
@@ -335,20 +359,32 @@ impl Ip12Bus {
         hasher.update(bytes);
     }
 
+    pub(super) const fn has_sgi_keyboard(&self) -> bool {
+        self.sgi_keyboard.is_some()
+    }
+
+    pub(super) const fn has_sgi_mouse(&self) -> bool {
+        self.sgi_mouse.is_some()
+    }
+
     /// Returns what the primary graphics slot currently drives to the display.
+    pub(super) fn has_video_output(&self) -> bool {
+        self.gio.display_state(GioSlot::Graphics).is_some()
+    }
+
     #[must_use]
-    pub(in super::super) fn video_output(&self) -> VideoOutput {
+    pub(in super::super) fn video_output(&self) -> Option<VideoOutput> {
         match self.gio.display_state(GioSlot::Graphics) {
-            None => VideoOutput::NoGraphicsBoard,
-            Some(GioDisplayState::NoSignal) => VideoOutput::NoSignal,
-            Some(GioDisplayState::Blank) => VideoOutput::Active { frame: None },
+            None => None,
+            Some(GioDisplayState::NoSignal) => Some(VideoOutput::NoSignal),
+            Some(GioDisplayState::Blank) => Some(VideoOutput::Active { frame: None }),
             Some(GioDisplayState::Active {
                 width,
                 height,
                 pixels,
-            }) => VideoOutput::Active {
+            }) => Some(VideoOutput::Active {
                 frame: VideoFrame::new(width, height, pixels),
-            },
+            }),
         }
     }
 
@@ -357,6 +393,7 @@ impl Ip12Bus {
         self.gio
             .take_display_update(GioSlot::Graphics)
             .then(|| self.video_output())
+            .flatten()
     }
 
     pub(super) fn debug_read(&self, address: PhysAddr, data: &mut [u8]) -> Result<(), BusError> {

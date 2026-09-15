@@ -10,11 +10,11 @@
 use std::error::Error;
 use std::fmt;
 
+use se_core::storage::StorageMedium;
 use serde::{Deserialize, Serialize};
 
 use crate::scsi_cdrom::ScsiCdrom;
 use crate::scsi_disk::ScsiDisk;
-use crate::storage::BlockStorage;
 
 const FIXED_SENSE_BYTES: usize = 18;
 const TARGET_COUNT: usize = 8;
@@ -349,7 +349,7 @@ pub enum ScsiTransferResult {
 
 struct TargetAttachment {
     target: Box<dyn ScsiTarget>,
-    storage: Box<dyn BlockStorage>,
+    storage: Box<dyn StorageMedium>,
 }
 
 type TargetRegistry = [Option<TargetAttachment>; TARGET_SLOT_COUNT];
@@ -790,7 +790,7 @@ impl ScsiBus {
         target_id: u8,
         lun: u8,
         target: Box<dyn ScsiTarget>,
-        storage: Box<dyn BlockStorage>,
+        storage: Box<dyn StorageMedium>,
     ) -> Result<(), ScsiAttachError> {
         let slot = target_slot(target_id, lun)
             .ok_or(ScsiAttachError::InvalidAddress { target_id, lun })?;
@@ -1244,7 +1244,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::scsi_disk::ScsiDisk;
-    use crate::storage::BlockStorage;
+    use se_core::storage::StorageMedium;
 
     use super::{
         ScsiAttachError, ScsiBus, ScsiBusError, ScsiCommandPlan, ScsiCommandStart,
@@ -1312,7 +1312,7 @@ mod tests {
         fail_writes: bool,
     }
 
-    impl BlockStorage for TestStorage {
+    impl StorageMedium for TestStorage {
         fn size_bytes(&self) -> u64 {
             self.bytes.lock().unwrap().len() as u64
         }
@@ -1381,7 +1381,7 @@ mod tests {
                 bytes: Arc::new(Mutex::new(vec![0; len])),
                 fail_reads: false,
                 fail_writes: false,
-            }) as Box<dyn BlockStorage>
+            }) as Box<dyn StorageMedium>
         };
 
         assert_eq!(

@@ -9,20 +9,16 @@ namespace se_ui {
 
 enum class VideoOutputStateDto : std::uint8_t;
 struct VideoFrameHandle;
-class DisplayWidget;
+class DisplayWorkspace;
 class SerialConsoleDock;
 
 class MachineOutputSink final : public std::enable_shared_from_this<MachineOutputSink> {
 public:
-    MachineOutputSink(SerialConsoleDock* console, DisplayWidget* display);
+    MachineOutputSink(SerialConsoleDock* console, DisplayWorkspace* workspace);
     ~MachineOutputSink();
 
-    void publish_serial(
-        rust::Slice<const std::uint8_t> serial_a,
-        rust::Slice<const std::uint8_t> serial_b) const;
-    void publish_video(
-        VideoOutputStateDto state,
-        rust::Box<VideoFrameHandle> frame) const;
+    void publish_serial(std::uint64_t generation, rust::Str key, rust::Slice<const std::uint8_t> bytes) const;
+    void publish_video(std::uint64_t generation, rust::Str key, VideoOutputStateDto state, rust::Box<VideoFrameHandle> frame) const;
 
 private:
     struct PendingOutput;
@@ -31,7 +27,7 @@ private:
     void drain() const;
 
     SerialConsoleDock* console_;
-    DisplayWidget* display_;
+    DisplayWorkspace* workspace_;
     std::unique_ptr<PendingOutput> pending_;
 };
 

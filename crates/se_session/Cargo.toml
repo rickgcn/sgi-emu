@@ -1,5 +1,5 @@
 [package]
-name = "se_cli"
+name = "se_session"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,12 +7,11 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-clap.workspace = true
+directories.workspace = true
+serde.workspace = true
+se_config.workspace = true
+se_core.workspace = true
 se_machine.workspace = true
+se_network.workspace = true
 se_runtime.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-rustix.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+toml.workspace = true
