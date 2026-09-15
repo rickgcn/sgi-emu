@@ -486,9 +486,10 @@ pub(super) fn write_cpu_aux_control(
 mod tests {
     use se_core::bus::{BusError, DeviceAddr, PhysAddr, PhysicalBus};
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
+    use se_device::z85230::Channel;
 
+    use crate::endpoint::EndpointKey;
     use crate::output::MachineOutput;
-    use crate::serial::SerialPort;
 
     use super::{Ip12Bus, SCSI_INTERRUPT, drive_hpc1_interrupt_inputs};
 
@@ -928,7 +929,7 @@ mod tests {
         write_serial_register(&mut bus, SERIAL_1_BASE, 9, 1 << 3);
         bus.write(PhysAddr::new(INT2_BASE + 7), &[1 << 5]).unwrap();
 
-        assert_eq!(bus.receive_serial(SerialPort::A, b"A"), 1);
+        bus.receive_serial_character(Channel::A, b'A');
         assert_eq!(
             read_word(&mut bus, INT2_BASE),
             Ok(u32::from((1 << 5) | SCSI_INTERRUPT))
@@ -988,7 +989,10 @@ mod tests {
             &mut output,
         );
 
-        assert_eq!(output.serial(SerialPort::A), [0xa5]);
+        assert_eq!(
+            output.serial(&EndpointKey::new("serial.external.a")),
+            [0xa5]
+        );
         assert!(bus.local_interrupt_0_asserted());
         assert_eq!(
             read_word(&mut bus, INT2_BASE),
@@ -1017,7 +1021,7 @@ mod tests {
             VirtualDuration::from_attoseconds(2 * ATTOSECONDS_PER_SECOND / 960),
             &mut output,
         );
-        assert_eq!(output.serial(SerialPort::A), b"Th");
+        assert_eq!(output.serial(&EndpointKey::new("serial.external.a")), b"Th");
         assert!(!bus.local_interrupt_0_asserted());
 
         bus.advance_time(
@@ -1026,7 +1030,10 @@ mod tests {
             ),
             &mut output,
         );
-        assert_eq!(output.serial(SerialPort::A), b"The");
+        assert_eq!(
+            output.serial(&EndpointKey::new("serial.external.a")),
+            b"The"
+        );
         assert!(bus.local_interrupt_0_asserted());
         assert_eq!(
             read_word(&mut bus, INT2_BASE),

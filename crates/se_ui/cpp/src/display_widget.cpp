@@ -17,6 +17,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <utility>
@@ -24,267 +25,118 @@
 namespace se_ui {
 namespace {
 
-std::optional<std::uint8_t> keypad_key(const QKeyEvent& event) {
+KeyboardKeyDto named(KeyboardNamedKeyDto key) {
+    return {KeyboardKeyKindDto::Named, static_cast<std::uint8_t>(key)};
+}
+
+KeyboardKeyDto letter(char key) {
+    return {KeyboardKeyKindDto::Letter, static_cast<std::uint8_t>(key)};
+}
+
+KeyboardKeyDto digit(std::uint8_t key) {
+    return {KeyboardKeyKindDto::Digit, key};
+}
+
+KeyboardKeyDto keypad_digit(std::uint8_t key) {
+    return {KeyboardKeyKindDto::KeypadDigit, key};
+}
+
+std::optional<KeyboardKeyDto> keypad_key(const QKeyEvent& event) {
     if (!event.modifiers().testFlag(Qt::KeypadModifier)) {
         return std::nullopt;
     }
     switch (event.key()) {
-    case Qt::Key_0:
-    case Qt::Key_Insert:
-        return 58;
-    case Qt::Key_1:
-    case Qt::Key_End:
-        return 57;
-    case Qt::Key_2:
-    case Qt::Key_Down:
-        return 63;
-    case Qt::Key_3:
-    case Qt::Key_PageDown:
-        return 64;
-    case Qt::Key_4:
-    case Qt::Key_Left:
-        return 62;
-    case Qt::Key_5:
-    case Qt::Key_Clear:
-        return 68;
-    case Qt::Key_6:
-    case Qt::Key_Right:
-        return 69;
-    case Qt::Key_7:
-    case Qt::Key_Home:
-        return 66;
-    case Qt::Key_8:
-    case Qt::Key_Up:
-        return 67;
-    case Qt::Key_9:
-    case Qt::Key_PageUp:
-        return 74;
-    case Qt::Key_Period:
-    case Qt::Key_Comma:
-    case Qt::Key_Delete:
-        return 65;
-    case Qt::Key_Slash:
-        return 107;
-    case Qt::Key_Asterisk:
-        return 108;
-    case Qt::Key_Minus:
-        return 75;
-    case Qt::Key_Plus:
-        return 109;
-    case Qt::Key_Enter:
-    case Qt::Key_Return:
-        return 81;
-    default:
-        return std::nullopt;
+    case Qt::Key_0: case Qt::Key_Insert: return keypad_digit(0);
+    case Qt::Key_1: case Qt::Key_End: return keypad_digit(1);
+    case Qt::Key_2: case Qt::Key_Down: return keypad_digit(2);
+    case Qt::Key_3: case Qt::Key_PageDown: return keypad_digit(3);
+    case Qt::Key_4: case Qt::Key_Left: return keypad_digit(4);
+    case Qt::Key_5: case Qt::Key_Clear: return keypad_digit(5);
+    case Qt::Key_6: case Qt::Key_Right: return keypad_digit(6);
+    case Qt::Key_7: case Qt::Key_Home: return keypad_digit(7);
+    case Qt::Key_8: case Qt::Key_Up: return keypad_digit(8);
+    case Qt::Key_9: case Qt::Key_PageUp: return keypad_digit(9);
+    case Qt::Key_Period: case Qt::Key_Comma: case Qt::Key_Delete:
+        return named(KeyboardNamedKeyDto::KeypadPeriod);
+    case Qt::Key_Slash: return named(KeyboardNamedKeyDto::KeypadSlash);
+    case Qt::Key_Asterisk: return named(KeyboardNamedKeyDto::KeypadAsterisk);
+    case Qt::Key_Minus: return named(KeyboardNamedKeyDto::KeypadMinus);
+    case Qt::Key_Plus: return named(KeyboardNamedKeyDto::KeypadPlus);
+    case Qt::Key_Enter: case Qt::Key_Return:
+        return named(KeyboardNamedKeyDto::KeypadEnter);
+    default: return std::nullopt;
     }
 }
 
-std::optional<std::uint8_t> mapped_key(const QKeyEvent& event) {
+std::optional<KeyboardKeyDto> mapped_key(const QKeyEvent& event) {
     if (const auto keypad = keypad_key(event); keypad.has_value()) {
         return keypad;
     }
+    if (event.key() >= Qt::Key_A && event.key() <= Qt::Key_Z) {
+        return letter(static_cast<char>(event.key()));
+    }
+    if (event.key() >= Qt::Key_0 && event.key() <= Qt::Key_9) {
+        return digit(static_cast<std::uint8_t>(event.key() - Qt::Key_0));
+    }
+    if (event.key() >= Qt::Key_F1 && event.key() <= Qt::Key_F12) {
+        return KeyboardKeyDto{KeyboardKeyKindDto::Function,
+                              static_cast<std::uint8_t>(event.key() - Qt::Key_F1 + 1)};
+    }
+    using K = KeyboardNamedKeyDto;
     switch (event.key()) {
-    case Qt::Key_Shift:
-        return 5;
+    case Qt::Key_Shift: return named(K::LeftShift);
 #ifdef Q_OS_MACOS
-    case Qt::Key_Meta:
-        return 2;
-    case Qt::Key_Control:
-        return std::nullopt;
+    case Qt::Key_Meta: return named(K::LeftControl);
+    case Qt::Key_Control: return std::nullopt;
 #else
-    case Qt::Key_Control:
-        return 2;
+    case Qt::Key_Control: return named(K::LeftControl);
 #endif
-    case Qt::Key_Alt:
-        return 83;
-    case Qt::Key_AltGr:
-        return 84;
-    case Qt::Key_CapsLock:
-        return 3;
-    case Qt::Key_Escape:
-        return 6;
-    case Qt::Key_1:
-    case Qt::Key_Exclam:
-        return 7;
-    case Qt::Key_Tab:
-    case Qt::Key_Backtab:
-        return 8;
-    case Qt::Key_Q:
-        return 9;
-    case Qt::Key_A:
-        return 10;
-    case Qt::Key_S:
-        return 11;
-    case Qt::Key_2:
-    case Qt::Key_At:
-        return 13;
-    case Qt::Key_3:
-    case Qt::Key_NumberSign:
-        return 14;
-    case Qt::Key_W:
-        return 15;
-    case Qt::Key_E:
-        return 16;
-    case Qt::Key_D:
-        return 17;
-    case Qt::Key_F:
-        return 18;
-    case Qt::Key_Z:
-        return 19;
-    case Qt::Key_X:
-        return 20;
-    case Qt::Key_4:
-    case Qt::Key_Dollar:
-        return 21;
-    case Qt::Key_5:
-    case Qt::Key_Percent:
-        return 22;
-    case Qt::Key_R:
-        return 23;
-    case Qt::Key_T:
-        return 24;
-    case Qt::Key_G:
-        return 25;
-    case Qt::Key_H:
-        return 26;
-    case Qt::Key_C:
-        return 27;
-    case Qt::Key_V:
-        return 28;
-    case Qt::Key_6:
-    case Qt::Key_AsciiCircum:
-        return 29;
-    case Qt::Key_7:
-    case Qt::Key_Ampersand:
-        return 30;
-    case Qt::Key_Y:
-        return 31;
-    case Qt::Key_U:
-        return 32;
-    case Qt::Key_J:
-        return 33;
-    case Qt::Key_K:
-        return 34;
-    case Qt::Key_B:
-        return 35;
-    case Qt::Key_N:
-        return 36;
-    case Qt::Key_8:
-    case Qt::Key_Asterisk:
-        return 37;
-    case Qt::Key_9:
-    case Qt::Key_ParenLeft:
-        return 38;
-    case Qt::Key_I:
-        return 39;
-    case Qt::Key_O:
-        return 40;
-    case Qt::Key_L:
-        return 41;
-    case Qt::Key_Semicolon:
-    case Qt::Key_Colon:
-        return 42;
-    case Qt::Key_M:
-        return 43;
-    case Qt::Key_Comma:
-    case Qt::Key_Less:
-        return 44;
-    case Qt::Key_0:
-    case Qt::Key_ParenRight:
-        return 45;
-    case Qt::Key_Minus:
-    case Qt::Key_Underscore:
-        return 46;
-    case Qt::Key_P:
-        return 47;
-    case Qt::Key_BracketLeft:
-    case Qt::Key_BraceLeft:
-        return 48;
-    case Qt::Key_Apostrophe:
-    case Qt::Key_QuoteDbl:
-        return 49;
-    case Qt::Key_Return:
-        return 50;
-    case Qt::Key_Period:
-    case Qt::Key_Greater:
-        return 51;
-    case Qt::Key_Slash:
-    case Qt::Key_Question:
-        return 52;
-    case Qt::Key_Equal:
-    case Qt::Key_Plus:
-        return 53;
-    case Qt::Key_QuoteLeft:
-    case Qt::Key_AsciiTilde:
-        return 54;
-    case Qt::Key_BracketRight:
-    case Qt::Key_BraceRight:
-        return 55;
-    case Qt::Key_Backslash:
-    case Qt::Key_Bar:
-        return 56;
-    case Qt::Key_Backspace:
-        return 60;
-    case Qt::Key_Delete:
-        return 61;
-    case Qt::Key_Left:
-        return 72;
-    case Qt::Key_Down:
-        return 73;
-    case Qt::Key_Right:
-        return 79;
-    case Qt::Key_Up:
-        return 80;
-    case Qt::Key_Space:
-        return 82;
-    case Qt::Key_F1:
-        return 86;
-    case Qt::Key_F2:
-        return 87;
-    case Qt::Key_F3:
-        return 88;
-    case Qt::Key_F4:
-        return 89;
-    case Qt::Key_F5:
-        return 90;
-    case Qt::Key_F6:
-        return 91;
-    case Qt::Key_F7:
-        return 92;
-    case Qt::Key_F8:
-        return 93;
-    case Qt::Key_F9:
-        return 94;
-    case Qt::Key_F10:
-        return 95;
-    case Qt::Key_F11:
-        return 96;
-    case Qt::Key_F12:
-        return 97;
-    case Qt::Key_Print:
-    case Qt::Key_SysReq:
-        return 98;
-    case Qt::Key_ScrollLock:
-        return 99;
-    case Qt::Key_Pause:
-        return 100;
-    case Qt::Key_Insert:
-        return 101;
-    case Qt::Key_Home:
-        return 102;
-    case Qt::Key_PageUp:
-        return 103;
-    case Qt::Key_End:
-        return 104;
-    case Qt::Key_PageDown:
-        return 105;
-    case Qt::Key_NumLock:
-        return 106;
-    default:
-        return std::nullopt;
+    case Qt::Key_Alt: return named(K::LeftAlt);
+    case Qt::Key_AltGr: return named(K::RightAlt);
+    case Qt::Key_CapsLock: return named(K::CapsLock);
+    case Qt::Key_Escape: return named(K::Escape);
+    case Qt::Key_Tab: case Qt::Key_Backtab: return named(K::Tab);
+    case Qt::Key_Return: return named(K::Enter);
+    case Qt::Key_Backspace: return named(K::Backspace);
+    case Qt::Key_Delete: return named(K::Delete);
+    case Qt::Key_Space: return named(K::Space);
+    case Qt::Key_Left: return named(K::ArrowLeft);
+    case Qt::Key_Right: return named(K::ArrowRight);
+    case Qt::Key_Up: return named(K::ArrowUp);
+    case Qt::Key_Down: return named(K::ArrowDown);
+    case Qt::Key_Insert: return named(K::Insert);
+    case Qt::Key_Home: return named(K::Home);
+    case Qt::Key_End: return named(K::End);
+    case Qt::Key_PageUp: return named(K::PageUp);
+    case Qt::Key_PageDown: return named(K::PageDown);
+    case Qt::Key_Print: case Qt::Key_SysReq: return named(K::PrintScreen);
+    case Qt::Key_ScrollLock: return named(K::ScrollLock);
+    case Qt::Key_Pause: return named(K::Pause);
+    case Qt::Key_NumLock: return named(K::NumLock);
+    case Qt::Key_Exclam: return digit(1);
+    case Qt::Key_At: return digit(2);
+    case Qt::Key_NumberSign: return digit(3);
+    case Qt::Key_Dollar: return digit(4);
+    case Qt::Key_Percent: return digit(5);
+    case Qt::Key_AsciiCircum: return digit(6);
+    case Qt::Key_Ampersand: return digit(7);
+    case Qt::Key_Asterisk: return digit(8);
+    case Qt::Key_ParenLeft: return digit(9);
+    case Qt::Key_ParenRight: return digit(0);
+    case Qt::Key_Semicolon: case Qt::Key_Colon: return named(K::Semicolon);
+    case Qt::Key_Comma: case Qt::Key_Less: return named(K::Comma);
+    case Qt::Key_Minus: case Qt::Key_Underscore: return named(K::Minus);
+    case Qt::Key_BracketLeft: case Qt::Key_BraceLeft: return named(K::LeftBracket);
+    case Qt::Key_BracketRight: case Qt::Key_BraceRight: return named(K::RightBracket);
+    case Qt::Key_Apostrophe: case Qt::Key_QuoteDbl: return named(K::Apostrophe);
+    case Qt::Key_Period: case Qt::Key_Greater: return named(K::Period);
+    case Qt::Key_Slash: case Qt::Key_Question: return named(K::Slash);
+    case Qt::Key_Equal: case Qt::Key_Plus: return named(K::Equal);
+    case Qt::Key_QuoteLeft: case Qt::Key_AsciiTilde: return named(K::Grave);
+    case Qt::Key_Backslash: case Qt::Key_Bar: return named(K::Backslash);
+    default: return std::nullopt;
     }
 }
-
 bool release_chord(const QKeyEvent& event) {
     if (event.key() != Qt::Key_G || !event.modifiers().testFlag(Qt::AltModifier)) {
         return false;
@@ -294,6 +146,10 @@ bool release_chord(const QKeyEvent& event) {
 #else
     return event.modifiers().testFlag(Qt::ControlModifier);
 #endif
+}
+
+std::uint16_t key_identity(KeyboardKeyDto key) {
+    return static_cast<std::uint16_t>(static_cast<std::uint8_t>(key.kind)) << 8 | key.value;
 }
 
 std::int32_t clamp_i32(std::int64_t value) {
@@ -311,15 +167,17 @@ struct DisplayWidget::State {
     }
 
     const UiSession& session;
-    VideoOutputStateDto output = VideoOutputStateDto::NoGraphicsBoard;
+    VideoOutputStateDto output = VideoOutputStateDto::NoSignal;
     std::optional<rust::Box<VideoFrameHandle>> frame;
     QImage image;
     bool input_enabled = false;
     bool captured = false;
     bool capture_click_armed = false;
     bool motion_delivery_scheduled = false;
-    std::unordered_map<std::uint32_t, std::uint8_t> scan_keys;
-    std::array<std::uint32_t, 128> key_counts{};
+    std::unordered_map<std::uint32_t, KeyboardKeyDto> scan_keys;
+    std::map<std::uint16_t, std::uint32_t> key_counts;
+    std::optional<EndpointIdentity> keyboard_endpoint;
+    std::optional<EndpointIdentity> pointer_endpoint;
     std::array<bool, 3> mouse_buttons{};
     std::int64_t pending_x = 0;
     std::int64_t pending_y = 0;
@@ -380,6 +238,12 @@ void DisplayWidget::set_input_enabled(bool enabled) {
     state_->input_enabled = enabled;
 }
 
+void DisplayWidget::set_input_endpoints(std::optional<EndpointIdentity> keyboard, std::optional<EndpointIdentity> pointer) {
+    release_guest_inputs();
+    state_->keyboard_endpoint = std::move(keyboard);
+    state_->pointer_endpoint = std::move(pointer);
+}
+
 void DisplayWidget::release_input() {
     release_guest_inputs();
 }
@@ -421,7 +285,7 @@ void DisplayWidget::keyReleaseEvent(QKeyEvent* event) {
 }
 
 void DisplayWidget::handle_key(QKeyEvent* event, bool pressed) {
-    if (!state_->input_enabled || event->isAutoRepeat()) {
+    if (!state_->input_enabled || !state_->keyboard_endpoint.has_value() || event->isAutoRepeat()) {
         event->accept();
         return;
     }
@@ -444,9 +308,9 @@ void DisplayWidget::handle_key(QKeyEvent* event, bool pressed) {
                 event->accept();
                 return;
             }
-            auto& count = state_->key_counts[*key];
+            auto& count = state_->key_counts[key_identity(*key)];
             if (count++ == 0) {
-                if (!drain_motion() || !state_->session.send_sgi_key(*key, true)) {
+                if (!drain_motion() || !send_keyboard(*key, true)) {
                     abort_input();
                 }
             }
@@ -458,23 +322,23 @@ void DisplayWidget::handle_key(QKeyEvent* event, bool pressed) {
             }
             const auto saved_key = found->second;
             state_->scan_keys.erase(found);
-            auto& count = state_->key_counts[saved_key];
+            auto& count = state_->key_counts[key_identity(saved_key)];
             if (count != 0 && --count == 0) {
-                if (!drain_motion() || !state_->session.send_sgi_key(saved_key, false)) {
+                if (!drain_motion() || !send_keyboard(saved_key, false)) {
                     abort_input();
                 }
             }
         }
     } else {
-        auto& count = state_->key_counts[*key];
+        auto& count = state_->key_counts[key_identity(*key)];
         if (pressed) {
             if (count++ == 0) {
-                if (!drain_motion() || !state_->session.send_sgi_key(*key, true)) {
+                if (!drain_motion() || !send_keyboard(*key, true)) {
                     abort_input();
                 }
             }
         } else if (count != 0 && --count == 0) {
-            if (!drain_motion() || !state_->session.send_sgi_key(*key, false)) {
+            if (!drain_motion() || !send_keyboard(*key, false)) {
                 abort_input();
             }
         }
@@ -483,7 +347,7 @@ void DisplayWidget::handle_key(QKeyEvent* event, bool pressed) {
 }
 
 void DisplayWidget::mousePressEvent(QMouseEvent* event) {
-    if (!state_->input_enabled) {
+    if (!state_->input_enabled || !state_->pointer_endpoint.has_value()) {
         event->ignore();
         return;
     }
@@ -495,18 +359,18 @@ void DisplayWidget::mousePressEvent(QMouseEvent* event) {
     }
 
     std::optional<std::size_t> index;
-    SgiMouseButtonDto button = SgiMouseButtonDto::Left;
+    PointerButtonDto button = PointerButtonDto::Left;
     if (event->button() == Qt::LeftButton) {
         index = 0;
     } else if (event->button() == Qt::MiddleButton) {
         index = 1;
-        button = SgiMouseButtonDto::Middle;
+        button = PointerButtonDto::Middle;
     } else if (event->button() == Qt::RightButton) {
         index = 2;
-        button = SgiMouseButtonDto::Right;
+        button = PointerButtonDto::Right;
     }
     if (index.has_value() && !state_->mouse_buttons[*index]) {
-        if (!drain_motion() || !state_->session.send_sgi_mouse_button(button, true)) {
+        if (!drain_motion() || !send_pointer_button(button, true)) {
             abort_input();
         } else {
             state_->mouse_buttons[*index] = true;
@@ -516,7 +380,7 @@ void DisplayWidget::mousePressEvent(QMouseEvent* event) {
 }
 
 void DisplayWidget::mouseReleaseEvent(QMouseEvent* event) {
-    if (!state_->input_enabled) {
+    if (!state_->input_enabled || !state_->pointer_endpoint.has_value()) {
         event->ignore();
         return;
     }
@@ -532,18 +396,18 @@ void DisplayWidget::mouseReleaseEvent(QMouseEvent* event) {
     }
 
     std::optional<std::size_t> index;
-    SgiMouseButtonDto button = SgiMouseButtonDto::Left;
+    PointerButtonDto button = PointerButtonDto::Left;
     if (event->button() == Qt::LeftButton) {
         index = 0;
     } else if (event->button() == Qt::MiddleButton) {
         index = 1;
-        button = SgiMouseButtonDto::Middle;
+        button = PointerButtonDto::Middle;
     } else if (event->button() == Qt::RightButton) {
         index = 2;
-        button = SgiMouseButtonDto::Right;
+        button = PointerButtonDto::Right;
     }
     if (index.has_value() && state_->mouse_buttons[*index]) {
-        if (!drain_motion() || !state_->session.send_sgi_mouse_button(button, false)) {
+        if (!drain_motion() || !send_pointer_button(button, false)) {
             abort_input();
         } else {
             state_->mouse_buttons[*index] = false;
@@ -567,7 +431,7 @@ void DisplayWidget::mouseMoveEvent(QMouseEvent* event) {
 }
 
 void DisplayWidget::begin_pointer_capture() {
-    if (state_->captured || !state_->input_enabled) {
+    if (state_->captured || !state_->input_enabled || !state_->pointer_endpoint.has_value()) {
         return;
     }
     state_->captured = true;
@@ -582,11 +446,11 @@ void DisplayWidget::begin_pointer_capture() {
     QCursor::setPos(mapToGlobal(rect().center()));
 
     for (const auto button : {
-             SgiMouseButtonDto::Left,
-             SgiMouseButtonDto::Middle,
-             SgiMouseButtonDto::Right,
+             PointerButtonDto::Left,
+             PointerButtonDto::Middle,
+             PointerButtonDto::Right,
          }) {
-        if (!state_->session.send_sgi_mouse_button(button, false)) {
+        if (!send_pointer_button(button, false)) {
             abort_input();
             return;
         }
@@ -609,7 +473,7 @@ void DisplayWidget::end_pointer_capture() {
 
 void DisplayWidget::abort_input() {
     state_->scan_keys.clear();
-    state_->key_counts.fill(0);
+    state_->key_counts.clear();
     state_->mouse_buttons.fill(false);
     end_pointer_capture();
 }
@@ -619,27 +483,30 @@ void DisplayWidget::release_guest_inputs() {
         abort_input();
         return;
     }
-    for (std::size_t code = 0; code < state_->key_counts.size(); ++code) {
-        if (state_->key_counts[code] != 0
-            && !state_->session.send_sgi_key(static_cast<std::uint8_t>(code), false)) {
+    for (const auto& [identity, count] : state_->key_counts) {
+        const KeyboardKeyDto key{
+            static_cast<KeyboardKeyKindDto>(identity >> 8),
+            static_cast<std::uint8_t>(identity & 0xff),
+        };
+        if (count != 0 && !send_keyboard(key, false)) {
             abort_input();
             return;
         }
     }
-    const std::array<SgiMouseButtonDto, 3> buttons{
-        SgiMouseButtonDto::Left,
-        SgiMouseButtonDto::Middle,
-        SgiMouseButtonDto::Right,
+    const std::array<PointerButtonDto, 3> buttons{
+        PointerButtonDto::Left,
+        PointerButtonDto::Middle,
+        PointerButtonDto::Right,
     };
     for (std::size_t index = 0; index < buttons.size(); ++index) {
         if (state_->mouse_buttons[index]
-            && !state_->session.send_sgi_mouse_button(buttons[index], false)) {
+            && !send_pointer_button(buttons[index], false)) {
             abort_input();
             return;
         }
     }
     state_->scan_keys.clear();
-    state_->key_counts.fill(0);
+    state_->key_counts.clear();
     state_->mouse_buttons.fill(false);
     end_pointer_capture();
 }
@@ -699,13 +566,37 @@ bool DisplayWidget::drain_motion() {
     while (state_->pending_x != 0 || state_->pending_y != 0) {
         const auto delta_x = clamp_i32(state_->pending_x);
         const auto delta_y = clamp_i32(state_->pending_y);
-        if (!state_->session.send_sgi_mouse_motion(delta_x, delta_y)) {
+        if (!send_pointer_motion(delta_x, delta_y)) {
             return false;
         }
         state_->pending_x -= delta_x;
         state_->pending_y -= delta_y;
     }
     return true;
+}
+
+bool DisplayWidget::send_keyboard(const KeyboardKeyDto& key, bool pressed) const {
+    if (!state_->keyboard_endpoint.has_value()) {
+        return true;
+    }
+    const auto handle = endpoint_handle_dto(*state_->keyboard_endpoint);
+    return state_->session.send_keyboard(handle, key, pressed);
+}
+
+bool DisplayWidget::send_pointer_motion(std::int32_t delta_x, std::int32_t delta_y) const {
+    if (!state_->pointer_endpoint.has_value()) {
+        return true;
+    }
+    const auto handle = endpoint_handle_dto(*state_->pointer_endpoint);
+    return state_->session.send_pointer_motion(handle, delta_x, delta_y);
+}
+
+bool DisplayWidget::send_pointer_button(PointerButtonDto button, bool pressed) const {
+    if (!state_->pointer_endpoint.has_value()) {
+        return true;
+    }
+    const auto handle = endpoint_handle_dto(*state_->pointer_endpoint);
+    return state_->session.send_pointer_button(handle, button, pressed);
 }
 
 void DisplayWidget::paintEvent(QPaintEvent* event) {
@@ -723,9 +614,7 @@ void DisplayWidget::paintEvent(QPaintEvent* event) {
     }
 
     QString message;
-    if (state_->output == VideoOutputStateDto::NoGraphicsBoard) {
-        message = QStringLiteral("No graphics board");
-    } else if (state_->output == VideoOutputStateDto::NoSignal) {
+    if (state_->output == VideoOutputStateDto::NoSignal) {
         message = QStringLiteral("No signal");
     }
     if (!message.isEmpty()) {

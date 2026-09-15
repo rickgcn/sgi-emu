@@ -5,7 +5,7 @@
 #include "se_ui/debugger/memory_dock.h"
 #include "se_ui/debugger/registers_dock.h"
 #include "se_ui/debugger/tlb_dock.h"
-#include "se_ui/display_widget.h"
+#include "se_ui/display_workspace.h"
 #include "se_ui/machine_output_sink.h"
 #include "se_ui/serial_console_dock.h"
 #include "se_ui/src/bridge.rs.h"
@@ -34,6 +34,7 @@
 #include <chrono>
 #include <functional>
 #include <future>
+#include <limits>
 
 namespace se_ui {
 namespace {
@@ -55,36 +56,6 @@ rust::String encoded_bytes(const QByteArray& value) {
 QByteArray decoded_bytes(const rust::String& value) {
     return QByteArray::fromBase64(
         QByteArray(value.data(), static_cast<qsizetype>(value.size())));
-}
-
-MachineSettings from_machine_configuration(const MachineConfiguration& configuration) {
-    return {
-        from_rust_string(configuration.machine_model),
-        configuration.memory_bank_a_simm_mib,
-        configuration.memory_bank_b_simm_mib,
-        configuration.memory_bank_c_simm_mib,
-        from_rust_string(configuration.prom_path),
-        from_rust_string(configuration.disk_path),
-        from_rust_string(configuration.cdrom_path),
-        from_rust_string(configuration.graphics_board),
-        from_rust_string(configuration.float_backend),
-        from_network_configuration(configuration.network),
-    };
-}
-
-MachineConfiguration to_machine_configuration(const MachineSettings& settings) {
-    return {
-        to_rust_string(settings.machine_model),
-        settings.memory_bank_a_simm_mib,
-        settings.memory_bank_b_simm_mib,
-        settings.memory_bank_c_simm_mib,
-        to_rust_string(settings.prom_path),
-        to_rust_string(settings.disk_path),
-        to_rust_string(settings.cdrom_path),
-        to_rust_string(settings.graphics_board),
-        to_rust_string(settings.float_backend),
-        to_network_configuration(settings.network),
-    };
 }
 
 } // namespace
@@ -109,7 +80,7 @@ public:
 
 MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     : session_(session)
-    , settings_(from_machine_configuration(startup.machine))
+    , network_settings_(from_network_configuration(startup.network))
     , run_action_(nullptr)
     , run_with_record_action_(nullptr)
     , reset_action_(nullptr)
@@ -126,7 +97,8 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , cache_dock_(nullptr)
     , memory_dock_(nullptr)
     , serial_console_dock_(nullptr)
-    , display_widget_(new DisplayWidget(session, this))
+    , display_workspace_(new DisplayWorkspace(session, this))
+    , last_endpoint_generation_(std::numeric_limits<std::uint64_t>::max())
     , machine_output_sink_()
     , update_timer_(new QTimer(this))
     , notification_timer_(new QTimer(this))
@@ -147,7 +119,7 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , runtime_status_(new QLabel(this)) {
     setObjectName(QStringLiteral("MainWindow"));
     setWindowTitle(QStringLiteral("sgi-emu"));
-    setCentralWidget(display_widget_);
+    setCentralWidget(display_workspace_);
     resize(1100, 720);
 
     create_actions();
@@ -159,7 +131,7 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     restore_window_state(startup);
 
     machine_output_sink_ =
-        std::make_shared<MachineOutputSink>(serial_console_dock_, display_widget_);
+        std::make_shared<MachineOutputSink>(serial_console_dock_, display_workspace_);
     apply_runtime_status(session_.attach_machine_output(machine_output_sink_), true);
 
     connect(update_timer_, &QTimer::timeout, this, &MainWindow::update_runtime);
@@ -181,15 +153,15 @@ MainWindow::~MainWindow() {
 
 UiExitState MainWindow::exit_state() const {
     return {
-        to_machine_configuration(settings_),
+        to_network_configuration(network_settings_),
         encoded_bytes(saveGeometry()),
         encoded_bytes(saveState()),
     };
 }
 
 bool MainWindow::event(QEvent* event) {
-    if (event->type() == QEvent::WindowDeactivate && display_widget_ != nullptr) {
-        display_widget_->release_input();
+    if (event->type() == QEvent::WindowDeactivate && display_workspace_ != nullptr) {
+        display_workspace_->release_input();
     }
     return QMainWindow::event(event);
 }
@@ -353,7 +325,7 @@ void MainWindow::begin_preparation(
         session_.pause_machine();
     }
     serial_console_dock_->set_input_enabled(false);
-    display_widget_->set_input_enabled(false);
+    display_workspace_->set_input_enabled(false);
     preparation_state_ = state;
     preparation_stops_replay_ = stops_replay;
     preparation_task_ = std::make_unique<PreparationTask>(std::move(command));
@@ -423,17 +395,14 @@ void MainWindow::poll_preparation() {
             }
         }
 
-        auto configuration =
-            std::make_shared<MachineConfiguration>(to_machine_configuration(settings_));
         auto path = std::make_shared<rust::String>(to_rust_string(replay_path));
         auto snapshot_id =
             std::make_shared<rust::String>(to_rust_string(selected_snapshot_id));
         begin_preparation(
             PreparationState::Replay,
             false,
-            [this, configuration, path, snapshot_id] {
-                return session_.open_replay(
-                    *configuration, rust::Str(*path), rust::Str(*snapshot_id));
+            [this, path, snapshot_id] {
+                return session_.open_replay(rust::Str(*path), rust::Str(*snapshot_id));
             });
         preparation_resume_running_ = resume_running;
         return;
@@ -455,7 +424,7 @@ void MainWindow::poll_preparation() {
     preparation_stops_replay_ = false;
     apply_runtime_status(status, false);
     if (!status.success) {
-        pending_settings_.reset();
+        pending_network_settings_.reset();
         const auto current = session_.runtime_status();
         if (resume_running && current.can_execute) {
             apply_runtime_status(session_.run_machine(), false);
@@ -463,9 +432,9 @@ void MainWindow::poll_preparation() {
         return;
     }
 
-    if (completed_state == PreparationState::Settings && pending_settings_ != nullptr) {
-        settings_ = *pending_settings_;
-        pending_settings_.reset();
+    if (completed_state == PreparationState::Settings && pending_network_settings_ != nullptr) {
+        network_settings_ = *pending_network_settings_;
+        pending_network_settings_.reset();
         update_machine_status();
     }
 
@@ -507,7 +476,7 @@ void MainWindow::apply_preparation_state() {
     disassembly_dock_->setEnabled(false);
     memory_dock_->setEnabled(false);
     serial_console_dock_->set_input_enabled(false);
-    display_widget_->set_input_enabled(false);
+    display_workspace_->set_input_enabled(false);
     if (preparation_state_ == PreparationState::Recording) {
         session_status_->setText(QStringLiteral("Preparing recording..."));
     } else if (preparation_state_ == PreparationState::ReplaySnapshot) {
@@ -572,14 +541,13 @@ void MainWindow::run_with_record() {
         return;
     }
 
-    auto configuration =
-        std::make_shared<MachineConfiguration>(to_machine_configuration(settings_));
+    auto network = std::make_shared<NetworkConfiguration>(to_network_configuration(network_settings_));
     auto record_path = std::make_shared<rust::String>(to_rust_string(path));
     begin_preparation(
         PreparationState::Recording,
         false,
-        [this, configuration, record_path] {
-            return session_.run_with_record(*configuration, rust::Str(*record_path));
+        [this, network, record_path] {
+            return session_.run_with_record(*network, rust::Str(*record_path));
         });
 }
 
@@ -626,30 +594,22 @@ void MainWindow::create_replay_snapshot() {
 }
 
 void MainWindow::stop_replay() {
-    auto configuration =
-        std::make_shared<MachineConfiguration>(to_machine_configuration(settings_));
-    begin_preparation(PreparationState::Replay, true, [this, configuration] {
-        return session_.stop_replay(*configuration);
+    auto network = std::make_shared<NetworkConfiguration>(to_network_configuration(network_settings_));
+    begin_preparation(PreparationState::Replay, true, [this, network] {
+        return session_.stop_replay(*network);
     });
 }
 
 void MainWindow::show_settings() {
-    SettingsDialog dialog(session_, settings_, this);
+    SettingsDialog dialog(session_, network_settings_, this);
     if (dialog.exec() != QDialog::Accepted) {
+        session_.cancel_machine_edit();
         return;
     }
 
     const auto selected = dialog.settings();
-    if (selected.machine_model == settings_.machine_model
-        && selected.memory_bank_a_simm_mib == settings_.memory_bank_a_simm_mib
-        && selected.memory_bank_b_simm_mib == settings_.memory_bank_b_simm_mib
-        && selected.memory_bank_c_simm_mib == settings_.memory_bank_c_simm_mib
-        && selected.prom_path == settings_.prom_path
-        && selected.disk_path == settings_.disk_path
-        && selected.cdrom_path == settings_.cdrom_path
-        && selected.graphics_board == settings_.graphics_board
-        && selected.float_backend == settings_.float_backend
-        && selected.network == settings_.network) {
+    if (!session_.machine_edit_changed() && selected == network_settings_) {
+        session_.cancel_machine_edit();
         return;
     }
     if (QMessageBox::question(
@@ -657,13 +617,14 @@ void MainWindow::show_settings() {
             QStringLiteral("Reset machine"),
             QStringLiteral("Changing these settings will reset the emulated machine. Continue?"))
         != QMessageBox::Yes) {
+        session_.cancel_machine_edit();
         return;
     }
 
-    auto configuration = std::make_shared<MachineConfiguration>(to_machine_configuration(selected));
-    pending_settings_ = std::make_unique<MachineSettings>(selected);
+    auto network = std::make_shared<NetworkConfiguration>(to_network_configuration(selected));
+    pending_network_settings_ = std::make_unique<NetworkSettings>(selected);
     begin_preparation(PreparationState::Settings, false,
-        [this, configuration] { return session_.configure_machine(*configuration); });
+        [this, network] { return session_.configure_edited_machine(*network); });
 }
 
 void MainWindow::update_runtime() {
@@ -714,6 +675,21 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
 
     update_performance_status(status);
 
+    if (status.machine_generation != last_endpoint_generation_) {
+        const auto catalog = session_.endpoint_catalog();
+        if (catalog.success) {
+            serial_console_dock_->rebuild(catalog);
+            display_workspace_->rebuild(catalog);
+            last_endpoint_generation_ = catalog.generation;
+            const auto refreshed = session_.refresh_outputs();
+            if (!refreshed.success) {
+                show_notification(QStringLiteral("Error: %1").arg(from_rust_string(refreshed.command_error)), 5000);
+            }
+        } else {
+            show_notification(QStringLiteral("Error: %1").arg(from_rust_string(catalog.error)), 5000);
+        }
+    }
+
     const bool configured = status.state != 0;
     const bool paused = status.state == 1;
     const bool running = status.state == 2;
@@ -734,7 +710,7 @@ void MainWindow::apply_runtime_status(const RuntimeStatusDto& status, bool repor
     stop_replay_action_->setEnabled(replay_session);
     settings_action_->setEnabled(normal_session);
     serial_console_dock_->set_input_enabled(!replay_session);
-    display_widget_->set_input_enabled(configured && !replay_session);
+    display_workspace_->set_input_enabled(configured && !replay_session);
 
     const auto session_error = from_rust_string(status.session_error);
     const auto session_error_utf8 = session_error.toUtf8();
@@ -824,10 +800,7 @@ void MainWindow::update_performance_status(const RuntimeStatusDto& status) {
 }
 
 void MainWindow::update_machine_status() {
-    const auto machine = settings_.machine_model == QStringLiteral("indigo-ip12")
-        ? QStringLiteral("Indigo IP12")
-        : settings_.machine_model;
-    machine_status_->setText(machine);
+    machine_status_->setText(from_rust_string(session_.machine_display_name()));
 }
 
 UiExitState run_gui(const UiSession& session, const UiStartupState& startup) {

@@ -1,33 +1,56 @@
-//! Top-level ownership of the runtime during a graphical session.
+//! Graphical control of an application-owned runtime.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use se_config::definition::MachineDefinition;
+use se_config::draft::MachineDraft;
 use se_cpu::mips1::r3000::debug::{
     CacheView, PendingCp0DebugSnapshot, PendingCp1DebugSnapshot, TlbView,
 };
 use se_machine::debug::{DebugRequest, DebugResponse};
+use se_machine::endpoint::{EndpointDirection, EndpointKind};
 use se_machine::indigo::ip12::debug::{
     DebugRequest as Ip12DebugRequest, DebugResponse as Ip12DebugResponse, MemoryAddressSpace,
 };
-use se_machine::input::MachineInput;
-use se_machine::machine::MachineNonvolatileState;
+use se_machine::input::{KeyboardKey, KeyboardNamedKey, PointerButton};
 use se_machine::output::VideoOutput;
-use se_machine::serial::SerialPort;
 use se_runtime::control::{RuntimeMode, RuntimeState, RuntimeStatus};
+use se_runtime::endpoint::{EndpointHandle, RuntimeOutputPayload};
 use se_runtime::record::Replayer;
-use se_runtime::runtime::{DebugReply, Runtime, RuntimeConfiguration, RuntimeError, ShutdownError};
+use se_runtime::runtime::{DebugReply, RuntimeError, RuntimeHandle};
+use se_session::frontend::{FrontendPlan, SessionBuild};
 
 use crate::bridge::VideoFrameHandle;
 use crate::bridge::ffi::{
-    CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, MachineConfiguration,
-    MachineOutputSink, MemoryDto, NetworkConfiguration, RegistersDto, ReplaySnapshotCatalogDto,
-    ReplaySnapshotInfoDto, RuntimeStatusDto, SerialPortDto, SgiMouseButtonDto, TlbDto, TlbEntryDto,
+    CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, EndpointCatalogDto,
+    EndpointDescriptorDto, EndpointDirectionDto, EndpointHandleDto, EndpointKindDto,
+    KeyboardKeyDto, KeyboardKeyKindDto, MachineConfigurationEditDto, MachineConfigurationViewDto,
+    MachineOutputSink, MemoryDto, NetworkConfiguration, PointerButtonDto, RegistersDto,
+    ReplaySnapshotCatalogDto, ReplaySnapshotInfoDto, RuntimeStatusDto, TlbDto, TlbEntryDto,
     UiExitState, UiStartupState, VideoOutputStateDto, run_gui,
 };
+use crate::configuration::{edit_from_dto, failed_view, view_dto};
 
-/// Constructs a machine from settings selected by a frontend.
-pub type MachineBuilder = Box<
-    dyn Fn(&MachineConfiguration, MachineBuildRequest) -> Result<RuntimeConfiguration, String>
+/// Constructs a Normal machine from one owned configuration snapshot.
+pub type NormalMachineBuilder = Box<
+    dyn Fn(MachineDraft, &NetworkConfiguration) -> Result<SessionBuild, String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Constructs a cold Recording machine from one committed draft snapshot.
+pub type RecordingMachineBuilder = Box<
+    dyn Fn(MachineDraft, &NetworkConfiguration, PathBuf) -> Result<SessionBuild, String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Constructs a Replay machine using the current draft only for resource paths.
+pub type ReplayMachineBuilder = Box<
+    dyn Fn(MachineDraft, PathBuf, Option<String>) -> Result<SessionBuild, String>
         + Send
         + Sync
         + 'static,
@@ -37,39 +60,51 @@ pub type MachineBuilder = Box<
 pub type NetworkValidator =
     Box<dyn Fn(&NetworkConfiguration) -> Result<(), String> + Send + Sync + 'static>;
 
-/// Cold machine mode requested by the Qt session.
-pub enum MachineBuildRequest {
-    /// Ordinary execution using current settings.
-    Normal,
-    /// Cold-start recording to the selected Record path.
-    Recording(PathBuf),
-    /// Replay from the selected Record's beginning or a manual snapshot.
-    Replaying {
-        /// Complete Record path.
-        path: PathBuf,
-        /// Opaque snapshot identifier, or `None` for cold Replay.
-        snapshot_id: Option<String>,
-    },
+/// Controls the runtime during one Qt event loop.
+pub struct UiSession {
+    runtime: RuntimeHandle,
+    definition: Arc<dyn MachineDefinition>,
+    configuration: Mutex<MachineConfigurationState>,
+    normal_builder: NormalMachineBuilder,
+    recording_builder: RecordingMachineBuilder,
+    replay_builder: ReplayMachineBuilder,
+    network_validator: NetworkValidator,
 }
 
-/// Owns the emulator runtime for the lifetime of one Qt event loop.
-pub struct UiSession {
-    runtime: Option<Runtime>,
-    machine_builder: MachineBuilder,
-    network_validator: NetworkValidator,
+struct MachineConfigurationState {
+    committed: MachineDraft,
+    editing: Option<MachineDraft>,
+    active_frontend: FrontendPlan,
 }
 
 impl UiSession {
     /// Creates a session with application-provided construction and validation callbacks.
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the UI session receives distinct lifecycle capabilities from the application"
+    )]
     pub fn new(
-        runtime: Runtime,
-        machine_builder: MachineBuilder,
+        runtime: RuntimeHandle,
+        committed: MachineDraft,
+        definition: Arc<dyn MachineDefinition>,
+        active_frontend: FrontendPlan,
+        normal_builder: NormalMachineBuilder,
+        recording_builder: RecordingMachineBuilder,
+        replay_builder: ReplayMachineBuilder,
         network_validator: NetworkValidator,
     ) -> Self {
         Self {
-            runtime: Some(runtime),
-            machine_builder,
+            runtime,
+            definition,
+            configuration: Mutex::new(MachineConfigurationState {
+                committed,
+                editing: None,
+                active_frontend,
+            }),
+            normal_builder,
+            recording_builder,
+            replay_builder,
             network_validator,
         }
     }
@@ -79,17 +114,49 @@ impl UiSession {
         run_gui(self, startup)
     }
 
-    /// Stops the runtime worker and waits for it to exit.
-    pub fn shutdown(mut self) -> Result<Option<MachineNonvolatileState>, ShutdownError> {
-        match self.runtime.take() {
-            Some(runtime) => runtime.shutdown(),
-            None => Ok(None),
+    /// Samples current runtime status for Qt.
+    pub fn runtime_status(&self) -> RuntimeStatusDto {
+        self.runtime_command(RuntimeHandle::status)
+    }
+
+    /// Samples the current endpoint catalog for Qt.
+    pub fn endpoint_catalog(&self) -> EndpointCatalogDto {
+        let state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let frontend = &state.active_frontend;
+        match self.runtime.endpoint_catalog() {
+            Ok(catalog) => EndpointCatalogDto {
+                success: true,
+                error: String::new(),
+                generation: catalog.generation(),
+                endpoints: catalog
+                    .endpoints()
+                    .iter()
+                    .map(|descriptor| EndpointDescriptorDto {
+                        handle: endpoint_handle_dto(descriptor.handle()),
+                        label: descriptor.label().into(),
+                        kind: endpoint_kind_dto(descriptor.kind()),
+                        direction: endpoint_direction_dto(descriptor.direction()),
+                        serial_console_attached: frontend
+                            .serial_console_endpoints()
+                            .contains(descriptor.handle().key()),
+                    })
+                    .collect(),
+            },
+            Err(error) => EndpointCatalogDto {
+                success: false,
+                error: error.to_string(),
+                generation: 0,
+                endpoints: Vec::new(),
+            },
         }
     }
 
-    /// Samples current runtime status for Qt.
-    pub fn runtime_status(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::status)
+    /// Republishes current video states after endpoint widgets are rebuilt.
+    pub fn refresh_outputs(&self) -> RuntimeStatusDto {
+        self.runtime_command(RuntimeHandle::refresh_outputs)
     }
 
     /// Validates network settings through the application without changing runtime state.
@@ -101,80 +168,184 @@ impl UiSession {
             .unwrap_or_default()
     }
 
-    /// Builds and installs a machine selected in the settings dialog.
-    pub fn configure_machine(&self, configuration: &MachineConfiguration) -> RuntimeStatusDto {
-        let configuration = match (self.machine_builder)(configuration, MachineBuildRequest::Normal)
-        {
-            Ok(configuration) => configuration,
+    /// Begins the single settings transaction and returns its resolved view.
+    pub fn begin_machine_edit(&self) -> MachineConfigurationViewDto {
+        let mut state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.editing.is_some() {
+            return failed_view("machine editing is already active");
+        }
+        let candidate = state.committed.clone();
+        let view = self.definition.resolve(&candidate);
+        state.editing = Some(candidate);
+        view_dto(view)
+    }
+
+    /// Applies an edit intent to the temporary draft and returns a fresh view.
+    pub fn apply_machine_edit(
+        &self,
+        edit: &MachineConfigurationEditDto,
+    ) -> MachineConfigurationViewDto {
+        let edit = match edit_from_dto(edit) {
+            Ok(edit) => edit,
+            Err(error) => return failed_view(error),
+        };
+        let mut state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(editing) = state.editing.as_mut() else {
+            return failed_view("machine editing is not active");
+        };
+        editing.apply(edit);
+        view_dto(self.definition.resolve(editing))
+    }
+
+    /// Discards any temporary machine settings.
+    pub fn cancel_machine_edit(&self) {
+        self.configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .editing = None;
+    }
+
+    /// Reports whether the active transaction differs from committed settings.
+    pub fn machine_edit_changed(&self) -> bool {
+        let state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state
+            .editing
+            .as_ref()
+            .is_some_and(|editing| *editing != state.committed)
+    }
+
+    /// Returns the committed Rust draft for application persistence.
+    #[must_use]
+    pub fn machine_draft_snapshot(&self) -> MachineDraft {
+        self.configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .committed
+            .clone()
+    }
+
+    /// Returns the current definition's display name.
+    pub fn machine_display_name(&self) -> String {
+        self.definition.display_name().to_owned()
+    }
+
+    /// Builds and installs the edited candidate, committing only after success.
+    pub fn configure_edited_machine(&self, network: &NetworkConfiguration) -> RuntimeStatusDto {
+        let candidate = {
+            let state = self
+                .configuration
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(candidate) = state.editing.as_ref() else {
+                return failed_status(String::from("machine editing is not active"));
+            };
+            candidate.clone()
+        };
+        let result = self.build_and_configure(candidate.clone(), network);
+        let mut state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.editing = None;
+        if result.success {
+            state.committed = candidate;
+        }
+        result
+    }
+
+    /// Rebuilds the committed Normal machine, including when leaving Replay.
+    fn configure_machine(&self, network: &NetworkConfiguration) -> RuntimeStatusDto {
+        self.build_and_configure(self.machine_draft_snapshot(), network)
+    }
+
+    fn build_and_configure(
+        &self,
+        draft: MachineDraft,
+        network: &NetworkConfiguration,
+    ) -> RuntimeStatusDto {
+        let build = match (self.normal_builder)(draft, network) {
+            Ok(build) => build,
             Err(error) => return failed_status(error),
         };
-        self.runtime_command(|runtime| runtime.configure_with(configuration))
+        self.install(build)
+    }
+
+    fn install(&self, build: SessionBuild) -> RuntimeStatusDto {
+        let (configuration, frontend) = build.into_parts();
+        let mut state = self
+            .configuration
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let status = self.runtime_command(|runtime| runtime.configure_with(configuration));
+        if status.success {
+            state.active_frontend = frontend;
+        }
+        status
     }
 
     /// Starts continuous machine execution.
     pub fn run_machine(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::run)
+        self.runtime_command(RuntimeHandle::run)
     }
 
     /// Resets and pauses the configured machine.
     pub fn reset_machine(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::reset)
+        self.runtime_command(RuntimeHandle::reset)
     }
 
     /// Pauses continuous machine execution.
     pub fn pause_machine(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::pause)
+        self.runtime_command(RuntimeHandle::pause)
     }
 
     /// Executes one instruction while paused.
     pub fn step_machine(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::step)
+        self.runtime_command(RuntimeHandle::step)
     }
 
     /// Cold-constructs a Recording machine and starts it from the first PROM
     /// instruction.
-    pub fn run_with_record(
-        &self,
-        configuration: &MachineConfiguration,
-        path: &str,
-    ) -> RuntimeStatusDto {
-        let configuration = match (self.machine_builder)(
-            configuration,
-            MachineBuildRequest::Recording(PathBuf::from(path)),
+    pub fn run_with_record(&self, network: &NetworkConfiguration, path: &str) -> RuntimeStatusDto {
+        let build = match (self.recording_builder)(
+            self.machine_draft_snapshot(),
+            network,
+            PathBuf::from(path),
         ) {
-            Ok(configuration) => configuration,
+            Ok(build) => build,
             Err(error) => return failed_status(error),
         };
-        let status = self.runtime_command(|runtime| runtime.configure_with(configuration));
+        let status = self.install(build);
         if !status.success {
             return status;
         }
-        self.runtime_command(Runtime::run)
+        self.runtime_command(RuntimeHandle::run)
     }
 
     /// Finalizes the active Record without changing Running or Paused state.
     pub fn stop_recording(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::stop_recording)
+        self.runtime_command(RuntimeHandle::stop_recording)
     }
 
     /// Cold-constructs and installs a paused Replay machine.
-    pub fn open_replay(
-        &self,
-        configuration: &MachineConfiguration,
-        path: &str,
-        snapshot_id: &str,
-    ) -> RuntimeStatusDto {
-        let configuration = match (self.machine_builder)(
-            configuration,
-            MachineBuildRequest::Replaying {
-                path: PathBuf::from(path),
-                snapshot_id: (!snapshot_id.is_empty()).then(|| snapshot_id.to_owned()),
-            },
+    pub fn open_replay(&self, path: &str, snapshot_id: &str) -> RuntimeStatusDto {
+        let build = match (self.replay_builder)(
+            self.machine_draft_snapshot(),
+            PathBuf::from(path),
+            (!snapshot_id.is_empty()).then(|| snapshot_id.to_owned()),
         ) {
-            Ok(configuration) => configuration,
+            Ok(build) => build,
             Err(error) => return failed_status(error),
         };
-        self.runtime_command(|runtime| runtime.configure_with(configuration))
+        self.install(build)
     }
 
     /// Loads or rebuilds the manual snapshot catalog for one complete Record.
@@ -204,13 +375,13 @@ impl UiSession {
 
     /// Creates a manual snapshot of the active paused Replay.
     pub fn create_replay_snapshot(&self) -> RuntimeStatusDto {
-        self.runtime_command(Runtime::create_replay_snapshot)
+        self.runtime_command(RuntimeHandle::create_replay_snapshot)
     }
 
     /// Discards the Replay machine and cold-constructs a paused Normal machine
     /// from current settings.
-    pub fn stop_replay(&self, configuration: &MachineConfiguration) -> RuntimeStatusDto {
-        self.configure_machine(configuration)
+    pub fn stop_replay(&self, network: &NetworkConfiguration) -> RuntimeStatusDto {
+        self.configure_machine(network)
     }
 
     /// Connects runtime machine output to the Qt delivery sink.
@@ -224,36 +395,37 @@ impl UiSession {
 
         self.runtime_command(|runtime| {
             runtime.set_output_handler(Box::new(move |output| {
-                sink.publish_serial(output.serial(SerialPort::A), output.serial(SerialPort::B));
-                let Some(video) = output.video() else {
-                    return;
-                };
-                let (state, frame) = match video {
-                    VideoOutput::NoGraphicsBoard => (
-                        VideoOutputStateDto::NoGraphicsBoard,
-                        VideoFrameHandle::empty(),
-                    ),
-                    VideoOutput::NoSignal => {
-                        (VideoOutputStateDto::NoSignal, VideoFrameHandle::empty())
+                for item in output {
+                    let generation = item.handle().generation();
+                    let key = item.handle().key().as_str();
+                    match item.payload() {
+                        RuntimeOutputPayload::Serial(bytes) => {
+                            sink.publish_serial(generation, key, bytes)
+                        }
+                        RuntimeOutputPayload::Video(video) => {
+                            let (state, frame) = match video {
+                                VideoOutput::NoSignal => {
+                                    (VideoOutputStateDto::NoSignal, VideoFrameHandle::empty())
+                                }
+                                VideoOutput::Active { frame: None } => {
+                                    (VideoOutputStateDto::Blank, VideoFrameHandle::empty())
+                                }
+                                VideoOutput::Active { frame: Some(frame) } => (
+                                    VideoOutputStateDto::Frame,
+                                    VideoFrameHandle::new(frame.clone()),
+                                ),
+                            };
+                            sink.publish_video(generation, key, state, Box::new(frame));
+                        }
                     }
-                    VideoOutput::Active { frame: None } => {
-                        (VideoOutputStateDto::Blank, VideoFrameHandle::empty())
-                    }
-                    VideoOutput::Active { frame: Some(frame) } => (
-                        VideoOutputStateDto::Frame,
-                        VideoFrameHandle::new(frame.clone()),
-                    ),
-                };
-                sink.publish_video(state, Box::new(frame));
+                }
             }))
         })
     }
 
     /// Disconnects the Qt delivery sink from the runtime worker.
     pub fn detach_machine_output(&self) {
-        if let Some(runtime) = self.runtime.as_ref() {
-            let _ = runtime.clear_output_handler();
-        }
+        let _ = self.runtime.clear_output_handler();
     }
 
     /// Samples processor registers and pending effects.
@@ -468,89 +640,187 @@ impl UiSession {
 
     /// Adds or removes one virtual execution breakpoint.
     pub fn toggle_breakpoint(&self, address: u32) -> RuntimeStatusDto {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return failed_status(String::from("runtime is unavailable"));
-        };
-        match runtime.toggle_breakpoint(address) {
+        match self.runtime.toggle_breakpoint(address) {
             Ok(status) => status_dto(status),
             Err(error) => failed_status(error.to_string()),
         }
     }
 
-    /// Supplies one byte batch to an external serial port.
-    pub fn send_serial(&self, port: SerialPortDto, bytes: &[u8]) -> RuntimeStatusDto {
-        let port = match port {
-            SerialPortDto::A => SerialPort::A,
-            SerialPortDto::B => SerialPort::B,
-            _ => return failed_status(String::from("unsupported serial port")),
-        };
-        let Some(runtime) = self.runtime.as_ref() else {
-            return failed_status(String::from("runtime is unavailable"));
-        };
-        for value in bytes {
-            if let Err(error) = runtime.send_input(MachineInput::SerialByte {
-                port,
-                value: *value,
-            }) {
-                return failed_status(error.to_string());
-            }
+    /// Supplies one character to an exact live serial endpoint.
+    pub fn send_serial(&self, handle: &EndpointHandleDto, value: u8) -> RuntimeStatusDto {
+        match self
+            .resolve_endpoint_handle(handle)
+            .and_then(|handle| self.runtime.send_serial(handle, value))
+        {
+            Ok(status) => status_dto(status),
+            Err(error) => failed_status(error.to_string()),
         }
-        self.runtime_command(Runtime::status)
     }
 
-    /// Enqueues one validated physical SGI keyboard transition.
-    pub fn send_sgi_key(&self, code: u8, pressed: bool) -> bool {
-        let Some(input) = MachineInput::sgi_keyboard(code, pressed) else {
+    /// Sends one frontend-neutral keyboard transition.
+    pub fn send_keyboard(
+        &self,
+        handle: &EndpointHandleDto,
+        key: KeyboardKeyDto,
+        pressed: bool,
+    ) -> bool {
+        let Some(key) = keyboard_key_from_dto(key) else {
             return false;
         };
-        self.runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.send_input(input).is_ok())
+        self.resolve_endpoint_handle(handle)
+            .and_then(|handle| self.runtime.send_keyboard(handle, key, pressed))
+            .is_ok()
     }
 
-    /// Enqueues normalized relative SGI mouse motion.
-    pub fn send_sgi_mouse_motion(&self, delta_x: i32, delta_y: i32) -> bool {
-        self.runtime.as_ref().is_some_and(|runtime| {
-            runtime
-                .send_input(MachineInput::SgiMouseMotion { delta_x, delta_y })
-                .is_ok()
-        })
+    /// Sends normalized relative pointer motion.
+    pub fn send_pointer_motion(
+        &self,
+        handle: &EndpointHandleDto,
+        delta_x: i32,
+        delta_y: i32,
+    ) -> bool {
+        self.resolve_endpoint_handle(handle)
+            .and_then(|handle| self.runtime.send_pointer_motion(handle, delta_x, delta_y))
+            .is_ok()
     }
 
-    /// Enqueues one physical SGI mouse button transition.
-    pub fn send_sgi_mouse_button(&self, button: SgiMouseButtonDto, pressed: bool) -> bool {
-        let code = match button {
-            SgiMouseButtonDto::Left => 0,
-            SgiMouseButtonDto::Middle => 1,
-            SgiMouseButtonDto::Right => 2,
+    /// Sends one frontend-neutral pointer button transition.
+    pub fn send_pointer_button(
+        &self,
+        handle: &EndpointHandleDto,
+        button: PointerButtonDto,
+        pressed: bool,
+    ) -> bool {
+        let button = match button {
+            PointerButtonDto::Left => PointerButton::Left,
+            PointerButtonDto::Middle => PointerButton::Middle,
+            PointerButtonDto::Right => PointerButton::Right,
             _ => return false,
         };
-        let Some(input) = MachineInput::sgi_mouse_button(code, pressed) else {
-            return false;
-        };
-        self.runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.send_input(input).is_ok())
+        self.resolve_endpoint_handle(handle)
+            .and_then(|handle| self.runtime.send_pointer_button(handle, button, pressed))
+            .is_ok()
+    }
+
+    fn resolve_endpoint_handle(
+        &self,
+        handle: &EndpointHandleDto,
+    ) -> Result<EndpointHandle, RuntimeError> {
+        let catalog = self.runtime.endpoint_catalog()?;
+        if handle.generation != catalog.generation() {
+            return Err(RuntimeError::StaleEndpoint);
+        }
+        catalog
+            .endpoints()
+            .iter()
+            .find(|descriptor| descriptor.handle().key().as_str() == handle.key)
+            .map(|descriptor| descriptor.handle().clone())
+            .ok_or(RuntimeError::UnknownEndpoint)
     }
 
     fn runtime_command(
         &self,
-        command: impl FnOnce(&Runtime) -> Result<RuntimeStatus, RuntimeError>,
+        command: impl FnOnce(&RuntimeHandle) -> Result<RuntimeStatus, RuntimeError>,
     ) -> RuntimeStatusDto {
-        let Some(runtime) = self.runtime.as_ref() else {
-            return failed_status(String::from("runtime is unavailable"));
-        };
-        match command(runtime) {
+        match command(&self.runtime) {
             Ok(status) => status_dto(status),
             Err(error) => failed_status(error.to_string()),
         }
     }
 
     fn debug(&self, request: Ip12DebugRequest) -> Result<DebugReply, RuntimeError> {
-        self.runtime
-            .as_ref()
-            .ok_or(RuntimeError::WorkerUnavailable)?
-            .debug(DebugRequest::IndigoIp12(request))
+        self.runtime.debug(DebugRequest::IndigoIp12(request))
+    }
+}
+
+fn endpoint_handle_dto(handle: &EndpointHandle) -> EndpointHandleDto {
+    EndpointHandleDto {
+        generation: handle.generation(),
+        key: handle.key().as_str().into(),
+    }
+}
+
+const fn endpoint_kind_dto(kind: EndpointKind) -> EndpointKindDto {
+    match kind {
+        EndpointKind::Serial => EndpointKindDto::Serial,
+        EndpointKind::Keyboard => EndpointKindDto::Keyboard,
+        EndpointKind::Pointer => EndpointKindDto::Pointer,
+        EndpointKind::Ethernet => EndpointKindDto::Ethernet,
+        EndpointKind::Video => EndpointKindDto::Video,
+    }
+}
+
+const fn endpoint_direction_dto(direction: EndpointDirection) -> EndpointDirectionDto {
+    match direction {
+        EndpointDirection::Input => EndpointDirectionDto::Input,
+        EndpointDirection::Output => EndpointDirectionDto::Output,
+        EndpointDirection::Bidirectional => EndpointDirectionDto::Bidirectional,
+    }
+}
+
+fn keyboard_key_from_dto(key: KeyboardKeyDto) -> Option<KeyboardKey> {
+    match key.kind {
+        KeyboardKeyKindDto::Letter if key.value.is_ascii_uppercase() => {
+            Some(KeyboardKey::Letter(key.value))
+        }
+        KeyboardKeyKindDto::Digit if key.value <= 9 => Some(KeyboardKey::Digit(key.value)),
+        KeyboardKeyKindDto::KeypadDigit if key.value <= 9 => {
+            Some(KeyboardKey::KeypadDigit(key.value))
+        }
+        KeyboardKeyKindDto::Function if (1..=12).contains(&key.value) => {
+            Some(KeyboardKey::Function(key.value))
+        }
+        KeyboardKeyKindDto::Named => {
+            use KeyboardNamedKey as K;
+            let named = match key.value {
+                0 => K::LeftControl,
+                1 => K::RightControl,
+                2 => K::LeftShift,
+                3 => K::RightShift,
+                4 => K::LeftAlt,
+                5 => K::RightAlt,
+                6 => K::CapsLock,
+                7 => K::Escape,
+                8 => K::Tab,
+                9 => K::Enter,
+                10 => K::Backspace,
+                11 => K::Delete,
+                12 => K::Space,
+                13 => K::ArrowLeft,
+                14 => K::ArrowRight,
+                15 => K::ArrowUp,
+                16 => K::ArrowDown,
+                17 => K::Insert,
+                18 => K::Home,
+                19 => K::End,
+                20 => K::PageUp,
+                21 => K::PageDown,
+                22 => K::PrintScreen,
+                23 => K::ScrollLock,
+                24 => K::Pause,
+                25 => K::NumLock,
+                26 => K::Semicolon,
+                27 => K::Comma,
+                28 => K::Minus,
+                29 => K::LeftBracket,
+                30 => K::RightBracket,
+                31 => K::Apostrophe,
+                32 => K::Period,
+                33 => K::Slash,
+                34 => K::Equal,
+                35 => K::Grave,
+                36 => K::Backslash,
+                37 => K::KeypadPeriod,
+                38 => K::KeypadMinus,
+                39 => K::KeypadPlus,
+                40 => K::KeypadSlash,
+                41 => K::KeypadAsterisk,
+                42 => K::KeypadEnter,
+                _ => return None,
+            };
+            Some(KeyboardKey::Named(named))
+        }
+        _ => None,
     }
 }
 
@@ -561,6 +831,7 @@ fn status_dto(status: RuntimeStatus) -> RuntimeStatusDto {
         success: true,
         state: state_identifier(status.state),
         revision: status.revision,
+        machine_generation: status.machine_generation,
         completed_instructions: status.completed_instructions,
         mode: mode_identifier(status.mode),
         epoch: status.position.epoch,
@@ -599,6 +870,7 @@ fn failed_status(error: String) -> RuntimeStatusDto {
         success: false,
         state: 0,
         revision: 0,
+        machine_generation: 0,
         completed_instructions: 0,
         mode: 0,
         epoch: 0,
@@ -708,42 +980,363 @@ fn format_pending_cp1(pending: Option<PendingCp1DebugSnapshot>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use se_config::definition::MachineDefinition;
+    use se_config::draft::{Edit, MachineDraft};
+    use se_config::id::{NodeId, PropertyId};
+    use se_config::value::PropertyValue;
+    use se_machine::indigo::ip12::builder;
+    use se_machine::indigo::ip12::definition::Ip12Definition;
+    use se_machine::machine::Machine;
+    use se_machine::resource::{PreparedResource, ResourceKind};
+    use se_network::config::NatConfig;
     use se_runtime::runtime::Runtime;
+    use se_session::frontend::FrontendPlan;
 
-    use super::{MachineBuildRequest, UiSession};
-    use crate::bridge::ffi::{MachineConfiguration, NetworkConfiguration};
+    use super::UiSession;
+    use crate::bridge::ffi::{
+        EndpointKindDto, KeyboardKeyDto, KeyboardKeyKindDto, MachineConfigurationEditDto,
+        MachinePropertyValueDto, NetworkConfiguration,
+    };
 
-    fn configuration() -> MachineConfiguration {
-        MachineConfiguration {
-            machine_model: String::from("indigo-ip12"),
-            memory_bank_a_simm_mib: 2,
-            memory_bank_b_simm_mib: 0,
-            memory_bank_c_simm_mib: 0,
-            prom_path: String::from("prom.bin"),
-            disk_path: String::new(),
-            cdrom_path: String::new(),
-            graphics_board: String::from("lg1"),
-            float_backend: String::from("softfloat"),
-            network: NetworkConfiguration {
-                subnet: String::new(),
-                gateway: String::new(),
-                dns: String::new(),
-                dhcp_start: String::new(),
-                forwards: Vec::new(),
-            },
+    static NEXT_FIRMWARE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestFirmware {
+        path: std::path::PathBuf,
+    }
+
+    impl TestFirmware {
+        fn new() -> Self {
+            let id = NEXT_FIRMWARE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "sgi-emu-ui-session-prom-{}-{id}.bin",
+                std::process::id()
+            ));
+            fs::write(&path, vec![0; 0x40000]).unwrap();
+            Self { path }
         }
     }
 
+    impl Drop for TestFirmware {
+        fn drop(&mut self) {
+            fs::remove_file(&self.path).unwrap();
+        }
+    }
+
+    fn draft() -> MachineDraft {
+        let mut draft = Ip12Definition.default_draft();
+        draft.apply(Edit::SetProperty {
+            property: PropertyId(String::from("firmware.0.image-path")),
+            value: PropertyValue::Text(String::from("prom.bin")),
+        });
+        draft
+    }
+
+    fn network() -> NetworkConfiguration {
+        NetworkConfiguration {
+            subnet: String::new(),
+            gateway: String::new(),
+            dns: String::new(),
+            dhcp_start: String::new(),
+            forwards: Vec::new(),
+        }
+    }
+
+    fn edit_firmware(path: &str) -> MachineConfigurationEditDto {
+        MachineConfigurationEditDto {
+            kind: 0,
+            target_id: String::from("firmware.0.image-path"),
+            value: MachinePropertyValueDto {
+                kind: 2,
+                bool_value: false,
+                integer_value: 0,
+                text_value: path.into(),
+            },
+            device_id: String::new(),
+        }
+    }
+
+    fn detach_port(port: &str) -> MachineConfigurationEditDto {
+        set_port(port, "")
+    }
+
+    fn set_port(port: &str, device: &str) -> MachineConfigurationEditDto {
+        MachineConfigurationEditDto {
+            kind: 1,
+            target_id: String::from(port),
+            value: MachinePropertyValueDto {
+                kind: 0,
+                bool_value: false,
+                integer_value: 0,
+                text_value: String::new(),
+            },
+            device_id: String::from(device),
+        }
+    }
+
+    fn attached_serial_keys(session: &UiSession) -> Vec<String> {
+        session
+            .endpoint_catalog()
+            .endpoints
+            .into_iter()
+            .filter(|endpoint| {
+                endpoint.kind == EndpointKindDto::Serial && endpoint.serial_console_attached
+            })
+            .map(|endpoint| endpoint.handle.key)
+            .collect()
+    }
+
+    fn session(normal_succeeds: bool) -> (Runtime, UiSession) {
+        let (runtime, session, _) = controlled_session(normal_succeeds);
+        (runtime, session)
+    }
+
+    fn controlled_session(normal_succeeds: bool) -> (Runtime, UiSession, Arc<AtomicBool>) {
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let firmware = Arc::new(TestFirmware::new());
+        let builder_firmware = Arc::clone(&firmware);
+        let succeeds = Arc::new(AtomicBool::new(normal_succeeds));
+        let builder_succeeds = Arc::clone(&succeeds);
+        let session = UiSession::new(
+            runtime.handle(),
+            draft(),
+            Arc::new(Ip12Definition),
+            FrontendPlan::default(),
+            Box::new(move |draft, _network| {
+                if !builder_succeeds.load(Ordering::Relaxed) {
+                    return Err(String::from("injected builder stop"));
+                }
+                let mut build_draft = draft;
+                build_draft.apply(Edit::SetProperty {
+                    property: PropertyId(String::from("firmware.0.image-path")),
+                    value: PropertyValue::Text(
+                        builder_firmware.path.to_string_lossy().into_owned(),
+                    ),
+                });
+                se_session::normal::build_configuration(build_draft, NatConfig::default())
+                    .map_err(|error| error.to_string())
+            }),
+            Box::new(|_, _, _| Err(String::from("unused recording builder"))),
+            Box::new(|_, _, _| Err(String::from("unused replay builder"))),
+            Box::new(|_| Ok(())),
+        );
+        (runtime, session, succeeds)
+    }
+
     #[test]
-    fn network_validation_uses_the_application_callback_without_building_a_machine() {
+    fn edit_transaction_keeps_committed_draft_until_success() {
+        let (runtime, session) = session(true);
+        let original = session.machine_draft_snapshot();
+        let view = session.begin_machine_edit();
+        assert!(view.success);
+        assert!(!session.begin_machine_edit().success);
+        assert!(view.nodes.iter().any(|node| node.id == "indigo-ip12"));
+        let updated = session.apply_machine_edit(&edit_firmware("other.bin"));
+        assert!(updated.success);
+        assert!(session.machine_edit_changed());
+        assert_eq!(session.machine_draft_snapshot(), original);
+        session.cancel_machine_edit();
+        assert!(!session.machine_edit_changed());
+        assert_eq!(session.machine_draft_snapshot(), original);
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&edit_firmware("accepted.bin"))
+                .success
+        );
+        assert!(session.configure_edited_machine(&network()).success);
+        assert_eq!(
+            session
+                .machine_draft_snapshot()
+                .properties
+                .get(&PropertyId(String::from("firmware.0.image-path"))),
+            Some(&PropertyValue::Text(String::from("accepted.bin")))
+        );
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn failed_build_discards_edit_without_changing_committed_draft() {
+        let (runtime, session) = session(false);
+        let original = session.machine_draft_snapshot();
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&edit_firmware("missing.bin"))
+                .success
+        );
+        let status = session.configure_edited_machine(&network());
+        assert!(!status.success);
+        assert_eq!(status.command_error, "injected builder stop");
+        assert_eq!(session.machine_draft_snapshot(), original);
+        assert!(!session.machine_edit_changed());
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn frontend_plan_changes_only_after_successful_machine_installation() {
+        let (runtime, session, succeeds) = controlled_session(true);
+        assert!(session.configure_machine(&network()).success);
+        let attached_count = |session: &UiSession| {
+            session
+                .endpoint_catalog()
+                .endpoints
+                .iter()
+                .filter(|endpoint| {
+                    endpoint.kind == EndpointKindDto::Serial && endpoint.serial_console_attached
+                })
+                .count()
+        };
+        assert_eq!(attached_count(&session), 2);
+
+        succeeds.store(false, Ordering::Relaxed);
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&detach_port("serial.1.channel.b.port"))
+                .success
+        );
+        assert!(!session.configure_edited_machine(&network()).success);
+        assert_eq!(attached_count(&session), 2);
+
+        succeeds.store(true, Ordering::Relaxed);
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&detach_port("serial.1.channel.b.port"))
+                .success
+        );
+        assert!(session.configure_edited_machine(&network()).success);
+        let catalog = session.endpoint_catalog();
+        assert_eq!(attached_count(&session), 1);
+        assert!(catalog.endpoints.iter().any(|endpoint| {
+            endpoint.handle.key == "serial.external.a" && endpoint.serial_console_attached
+        }));
+        assert!(catalog.endpoints.iter().any(|endpoint| {
+            endpoint.handle.key == "serial.external.b" && !endpoint.serial_console_attached
+        }));
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recording_and_replay_transitions_install_matching_frontend_plans() {
+        let firmware = TestFirmware::new();
+        let record_path = firmware.path.with_extension("serec");
+        let mut committed = draft();
+        committed.apply(Edit::SetProperty {
+            property: PropertyId(String::from("firmware.0.image-path")),
+            value: PropertyValue::Text(firmware.path.to_string_lossy().into_owned()),
+        });
+        committed.apply(Edit::SetAttachment {
+            slot: NodeId(String::from("serial.1.channel.b.port")),
+            device: None,
+        });
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let session = UiSession::new(
+            runtime.handle(),
+            committed,
+            Arc::new(Ip12Definition),
+            FrontendPlan::default(),
+            Box::new(|draft, _| {
+                se_session::normal::build_configuration(draft, NatConfig::default())
+                    .map_err(|error| error.to_string())
+            }),
+            Box::new(|draft, _, path| {
+                se_session::recording::build_configuration(draft, NatConfig::default(), path)
+                    .map_err(|error| error.to_string())
+            }),
+            Box::new(|draft, path, snapshot| {
+                se_session::replay::build_configuration(draft, path, snapshot)
+                    .map_err(|error| error.to_string())
+            }),
+            Box::new(|_| Ok(())),
+        );
+
+        assert!(session.configure_machine(&network()).success);
+        assert_eq!(attached_serial_keys(&session), ["serial.external.a"]);
+        assert!(
+            session
+                .run_with_record(&network(), record_path.to_str().unwrap())
+                .success
+        );
+        assert_eq!(attached_serial_keys(&session), ["serial.external.a"]);
+        assert!(session.stop_recording().success);
+
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&detach_port("serial.1.channel.a.port"))
+                .success
+        );
+        assert!(
+            session
+                .apply_machine_edit(&set_port("serial.1.channel.b.port", "terminal.vt100"))
+                .success
+        );
+        assert!(session.configure_edited_machine(&network()).success);
+        assert_eq!(attached_serial_keys(&session), ["serial.external.b"]);
+
+        assert!(
+            session
+                .open_replay(record_path.to_str().unwrap(), "")
+                .success
+        );
+        assert_eq!(attached_serial_keys(&session), ["serial.external.a"]);
+        assert!(session.stop_replay(&network()).success);
+        assert_eq!(attached_serial_keys(&session), ["serial.external.b"]);
+
+        drop(session);
+        runtime.shutdown().unwrap();
+        fs::remove_file(record_path).unwrap();
+    }
+
+    #[test]
+    fn semantically_invalid_edit_still_returns_a_view() {
+        let (runtime, session) = session(false);
+        assert!(session.begin_machine_edit().success);
+        let result = session.apply_machine_edit(&MachineConfigurationEditDto {
+            kind: 0,
+            target_id: String::from("memory.bank.a.simm-mib"),
+            value: MachinePropertyValueDto {
+                kind: 1,
+                bool_value: false,
+                integer_value: 0,
+                text_value: String::new(),
+            },
+            device_id: String::new(),
+        });
+        assert!(result.success);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "ip12.memory.no-installed-bank")
+        );
+        session.cancel_machine_edit();
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_validation_uses_application_callback_without_building() {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let validator_observed = Arc::clone(&observed);
+        let runtime = Runtime::new_unconfigured().unwrap();
         let session = UiSession::new(
-            Runtime::new_unconfigured().unwrap(),
+            runtime.handle(),
+            draft(),
+            Arc::new(Ip12Definition),
+            FrontendPlan::default(),
             Box::new(|_, _| panic!("validation must not construct a machine")),
+            Box::new(|_, _, _| panic!("validation must not construct a Recording machine")),
+            Box::new(|_, _, _| panic!("validation must not construct a Replay machine")),
             Box::new(move |configuration| {
                 validator_observed
                     .lock()
@@ -756,8 +1349,7 @@ mod tests {
                 }
             }),
         );
-        let before = session.runtime_status();
-        let mut network = configuration().network;
+        let mut network = network();
         network.subnet = String::from("rejected");
         assert_eq!(
             session.validate_network_configuration(&network),
@@ -766,72 +1358,179 @@ mod tests {
         network.subnet = String::from("accepted");
         assert!(session.validate_network_configuration(&network).is_empty());
         assert_eq!(*observed.lock().unwrap(), ["rejected", "accepted"]);
-        let after = session.runtime_status();
-        assert_eq!(after.revision, before.revision);
-        assert_eq!(after.state, before.state);
-        assert_eq!(after.completed_instructions, before.completed_instructions);
-        session.shutdown().unwrap();
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
-    fn replay_bridge_preserves_the_selected_snapshot_identifier() {
+    fn replay_bridge_preserves_selected_snapshot_identifier() {
         let observed = Arc::new(Mutex::new(None));
         let builder_observed = Arc::clone(&observed);
+        let runtime = Runtime::new_unconfigured().unwrap();
         let session = UiSession::new(
-            Runtime::new_unconfigured().unwrap(),
-            Box::new(move |_configuration, request| {
-                let MachineBuildRequest::Replaying { path, snapshot_id } = request else {
-                    panic!("the bridge sent the wrong build request");
-                };
+            runtime.handle(),
+            draft(),
+            Arc::new(Ip12Definition),
+            FrontendPlan::default(),
+            Box::new(|_, _| Err(String::from("unused normal builder"))),
+            Box::new(|_, _, _| Err(String::from("unused recording builder"))),
+            Box::new(move |_draft, path, snapshot_id| {
                 *builder_observed.lock().unwrap() = Some((path, snapshot_id));
                 Err(String::from("injected builder stop"))
             }),
             Box::new(|_| Ok(())),
         );
-
-        let status = session.open_replay(&configuration(), "recording.serec", "point.ckpt");
-
+        let status = session.open_replay("recording.serec", "point.ckpt");
         assert!(!status.success);
-        assert_eq!(status.command_error, "injected builder stop");
         let observed = observed.lock().unwrap().take().unwrap();
         assert_eq!(observed.0, Path::new("recording.serec"));
         assert_eq!(observed.1.as_deref(), Some("point.ckpt"));
-        session.shutdown().unwrap();
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
     fn replay_snapshot_bridge_reports_catalog_and_runtime_errors() {
-        let session = UiSession::new(
-            Runtime::new_unconfigured().unwrap(),
-            Box::new(|_, _| Err(String::from("unused builder"))),
-            Box::new(|_| Ok(())),
-        );
-
+        let (runtime, session) = session(false);
         let catalog = session.replay_snapshot_catalog("missing-record.serec");
         assert!(!catalog.success);
         assert!(catalog.snapshots.is_empty());
-        assert!(!catalog.error.is_empty());
         assert!(!session.create_replay_snapshot().success);
-        session.shutdown().unwrap();
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
-    fn sgi_key_bridge_accepts_exactly_the_protocol_keycodes() {
-        let session = UiSession::new(
-            Runtime::new_unconfigured().unwrap(),
-            Box::new(|_, _| Err(String::from("unused builder"))),
-            Box::new(|_| Ok(())),
-        );
-        let accepted: Vec<_> = (0..=u8::MAX)
-            .filter(|code| session.send_sgi_key(*code, true))
-            .collect();
+    fn keyboard_bridge_accepts_semantic_keys_for_the_live_endpoint() {
+        let (runtime, session) = session(true);
+        assert!(session.configure_machine(&network()).success);
+        let catalog = session.endpoint_catalog();
+        let keyboard = &catalog
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == EndpointKindDto::Keyboard)
+            .unwrap()
+            .handle;
+        assert!(session.send_keyboard(
+            keyboard,
+            KeyboardKeyDto {
+                kind: KeyboardKeyKindDto::Letter,
+                value: b'A',
+            },
+            true
+        ));
+        assert!(!session.send_keyboard(
+            keyboard,
+            KeyboardKeyDto {
+                kind: KeyboardKeyKindDto::Letter,
+                value: b'a',
+            },
+            true
+        ));
+        assert!(!session.send_keyboard(
+            keyboard,
+            KeyboardKeyDto {
+                kind: KeyboardKeyKindDto::Function,
+                value: 13,
+            },
+            true
+        ));
+        assert!(!session.send_keyboard(
+            keyboard,
+            KeyboardKeyDto {
+                kind: KeyboardKeyKindDto::Named,
+                value: 255,
+            },
+            true
+        ));
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
 
-        assert_eq!(accepted.len(), 101);
-        assert_eq!(accepted.first().copied(), Some(2));
-        assert_eq!(accepted.last().copied(), Some(109));
-        for excluded in [0, 1, 12, 59, 70, 71, 76, 77, 78, 110, 111, 112, 255] {
-            assert!(!accepted.contains(&excluded));
-        }
-        session.shutdown().unwrap();
+    #[test]
+    fn endpoint_bridge_reflects_replacement_and_rejects_stale_handles() {
+        let (runtime, session) = session(true);
+        let empty = session.endpoint_catalog();
+        assert!(empty.success);
+        assert_eq!(empty.generation, 0);
+        assert!(empty.endpoints.is_empty());
+
+        assert!(session.configure_machine(&network()).success);
+        let graphics = session.endpoint_catalog();
+        let count = |kind| {
+            graphics
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == kind)
+                .count()
+        };
+        assert_eq!(count(EndpointKindDto::Keyboard), 1);
+        assert_eq!(count(EndpointKindDto::Pointer), 1);
+        assert_eq!(count(EndpointKindDto::Serial), 2);
+        assert_eq!(count(EndpointKindDto::Ethernet), 1);
+        assert_eq!(count(EndpointKindDto::Video), 1);
+        assert!(
+            graphics
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.handle.generation == graphics.generation)
+        );
+        let old_keyboard = &graphics
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == EndpointKindDto::Keyboard)
+            .unwrap()
+            .handle;
+
+        let mut headless_draft = draft();
+        headless_draft.apply(Edit::SetAttachment {
+            slot: NodeId(String::from("gio.0.slot.graphics")),
+            device: None,
+        });
+        let plan = Ip12Definition.compile(&headless_draft).unwrap();
+        let prepared = plan
+            .prepare_with(|_, requirement| match requirement.kind {
+                ResourceKind::Bytes => Ok::<_, String>(PreparedResource::Bytes(vec![0; 0x40000])),
+                ResourceKind::Storage { .. } => Err(String::from("unexpected storage")),
+            })
+            .unwrap();
+        runtime
+            .configure(Machine::IndigoIp12(builder::build(prepared).unwrap()))
+            .unwrap();
+        let headless = session.endpoint_catalog();
+        assert_eq!(headless.generation, graphics.generation + 1);
+        assert_eq!(
+            headless
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.kind == EndpointKindDto::Serial)
+                .count(),
+            2
+        );
+        assert!(
+            !headless
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.kind == EndpointKindDto::Video)
+        );
+        assert!(!session.send_keyboard(
+            old_keyboard,
+            KeyboardKeyDto {
+                kind: KeyboardKeyKindDto::Letter,
+                value: b'A',
+            },
+            true
+        ));
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn dropping_ui_session_keeps_the_application_runtime_alive() {
+        let (runtime, session) = session(true);
+        assert!(session.configure_machine(&network()).success);
+        drop(session);
+        assert!(runtime.handle().status().is_ok());
+        assert!(runtime.shutdown().unwrap().is_some());
     }
 }

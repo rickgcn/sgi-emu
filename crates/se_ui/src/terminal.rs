@@ -165,7 +165,7 @@ impl TerminalModel {
     }
 }
 
-/// Normalizes host clipboard text into one ASCII serial byte batch.
+/// Normalizes host clipboard text into ASCII bytes for serial transmission.
 #[must_use]
 pub fn normalize_terminal_paste(text: &str) -> Vec<u8> {
     let mut result = Vec::with_capacity(text.len());

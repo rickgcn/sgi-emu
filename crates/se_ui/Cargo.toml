@@ -8,11 +8,16 @@ authors.workspace = true
 
 [dependencies]
 cxx.workspace = true
+se_config.workspace = true
 se_cpu.workspace = true
 se_machine.workspace = true
 se_runtime.workspace = true
+se_session.workspace = true
 vt100.workspace = true
 
 [build-dependencies]
 cxx-build.workspace = true
 qt-build-utils.workspace = true
+
+[dev-dependencies]
+se_network.workspace = true

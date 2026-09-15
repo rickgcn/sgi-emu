@@ -2,7 +2,7 @@
 //!
 //! A record stores the cold machine configuration, machine inputs accepted at
 //! instruction boundaries, and sparse machine-defined checkpoints. Writable
-//! disks remain isolated behind an in-memory copy-on-write view for the entire
+//! storage resources remain isolated behind in-memory copy-on-write views for the entire
 //! lifetime of the Recording machine. Replay normally constructs a new machine
 //! at the first PROM instruction; an explicitly created Replay snapshot may
 //! instead restore one paused execution boundary. These machine-specific
@@ -27,9 +27,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crc32fast::hash as crc32;
+use se_config::draft::MachineDraft;
+use se_core::storage::{StorageAccess, StorageMedium};
 use se_core::time::VirtualInstant;
-use se_machine::input::MachineInput;
-use se_machine::machine::{MachineNonvolatileState, MachineSnapshot, MachineStartupConfiguration};
+use se_machine::input::{MachineInput, MachineInputPayload};
+use se_machine::machine::{MachineNonvolatileState, MachineSnapshot};
+use se_machine::resource::{ResourceId, ResourceKind};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,8 +56,11 @@ const SNAPSHOT_MAGIC: [u8; 8] = *b"SGICKPT\0";
 const INDEX_MAGIC: [u8; 8] = *b"SGISIDX\0";
 const CACHE_SCHEMA: u32 = 1;
 
-/// Granularity used for writable-disk COW pages.
-pub const DISK_PAGE_BYTES: usize = 4096;
+/// Granularity used for writable-storage COW pages.
+pub const STORAGE_PAGE_BYTES: usize = 4096;
+
+type CowPages = BTreeMap<ResourceId, BTreeMap<u64, Vec<u8>>>;
+type RecordingCowHandle = Arc<Mutex<CowPages>>;
 
 /// Deterministic boundary immediately before the next guest instruction.
 ///
@@ -81,37 +87,28 @@ pub struct MediaIdentity {
 }
 
 impl MediaIdentity {
-    /// Hashes an already-open host file and restores its original seek
-    /// position.
+    /// Hashes the complete contents of one storage capability.
     ///
     /// # Errors
     ///
-    /// Returns the host I/O error when metadata, seeking, or reading fails.
-    pub fn from_file(path_hint: &Path, file: &mut File) -> io::Result<Self> {
-        let original_position = file.stream_position()?;
-        let result = (|| {
-            let size_bytes = file.metadata()?.len();
-            file.seek(SeekFrom::Start(0))?;
-            let mut hasher = Sha256::new();
-            let mut buffer = [0; 128 * 1024];
-            loop {
-                let read = file.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-            }
-            Ok(Self {
-                path_hint: path_hint.to_string_lossy().into_owned(),
-                size_bytes,
-                sha256: hasher.finalize().into(),
-            })
-        })();
-        let restore_result = file.seek(SeekFrom::Start(original_position));
-        match (result, restore_result) {
-            (Ok(identity), Ok(_)) => Ok(identity),
-            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    /// Returns an I/O error when a storage range cannot be read.
+    pub fn from_storage(path_hint: &Path, storage: &mut dyn StorageMedium) -> io::Result<Self> {
+        let size_bytes = storage.size_bytes();
+        let mut hasher = Sha256::new();
+        let mut buffer = [0; 128 * 1024];
+        let mut offset = 0;
+        while offset < size_bytes {
+            let length = usize::try_from((size_bytes - offset).min(buffer.len() as u64))
+                .map_err(|_| io::Error::other("storage hash length does not fit usize"))?;
+            storage.read_exact_at(offset, &mut buffer[..length])?;
+            hasher.update(&buffer[..length]);
+            offset += length as u64;
         }
+        Ok(Self {
+            path_hint: path_hint.to_string_lossy().into_owned(),
+            size_bytes,
+            sha256: hasher.finalize().into(),
+        })
     }
 
     /// Computes an identity for an in-memory read-only medium.
@@ -188,7 +185,7 @@ struct ReplaySnapshot {
     last_verified_checkpoint: Option<ExecutionPosition>,
     machine_fingerprint: [u8; 32],
     machine: MachineSnapshot,
-    cow_pages: BTreeMap<u64, CowPageData>,
+    cow_pages: BTreeMap<ResourceId, BTreeMap<u64, CowPageData>>,
     pc: u32,
 }
 
@@ -206,54 +203,45 @@ pub(crate) struct ReplayRestoreState {
 /// Machine-specific nonvolatile state remains owned by the machine layer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RecordManifest {
-    machine: MachineStartupConfiguration,
-    prom: MediaIdentity,
-    disk: Option<MediaIdentity>,
-    cdrom: Option<MediaIdentity>,
+    machine: MachineDraft,
+    resources: BTreeMap<ResourceId, RecordedResource>,
     nonvolatile_state: MachineNonvolatileState,
+}
+
+/// Recorded resource contract and content identity for one logical role.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecordedResource {
+    /// The capability form required during machine assembly.
+    pub kind: ResourceKind,
+    /// Complete content identity of the recorded host medium.
+    pub identity: MediaIdentity,
 }
 
 impl RecordManifest {
     /// Creates a complete cold-start manifest.
     #[must_use]
     pub fn new(
-        machine: MachineStartupConfiguration,
-        prom: MediaIdentity,
-        disk: Option<MediaIdentity>,
-        cdrom: Option<MediaIdentity>,
+        machine: MachineDraft,
+        resources: BTreeMap<ResourceId, RecordedResource>,
         nonvolatile_state: MachineNonvolatileState,
     ) -> Self {
         Self {
             machine,
-            prom,
-            disk,
-            cdrom,
+            resources,
             nonvolatile_state,
         }
     }
 
     /// Returns the recorded construction-time machine configuration.
     #[must_use]
-    pub const fn machine(&self) -> &MachineStartupConfiguration {
+    pub const fn machine(&self) -> &MachineDraft {
         &self.machine
     }
 
-    /// Returns the recorded PROM identity.
+    /// Returns the exact recorded resource contract in ID order.
     #[must_use]
-    pub const fn prom(&self) -> &MediaIdentity {
-        &self.prom
-    }
-
-    /// Returns the recorded writable-disk identity, when one was attached.
-    #[must_use]
-    pub const fn disk(&self) -> Option<&MediaIdentity> {
-        self.disk.as_ref()
-    }
-
-    /// Returns the recorded CD-ROM identity, when one was attached.
-    #[must_use]
-    pub const fn cdrom(&self) -> Option<&MediaIdentity> {
-        self.cdrom.as_ref()
+    pub const fn resources(&self) -> &BTreeMap<ResourceId, RecordedResource> {
+        &self.resources
     }
 
     /// Returns the exact cold-start nonvolatile machine state.
@@ -296,12 +284,12 @@ impl From<io::Error> for RecordError {
     }
 }
 
-/// Shared append-only writer used by the runtime and writable-disk adapter.
+/// Shared append-only writer used by the runtime and writable-storage adapters.
 #[derive(Clone)]
 pub struct Recorder {
     inner: Arc<Mutex<RecorderInner>>,
     failed: Arc<AtomicBool>,
-    disk_storage: Arc<Mutex<BTreeMap<u64, Vec<u8>>>>,
+    storage_pages: RecordingCowHandle,
 }
 
 impl Recorder {
@@ -327,6 +315,30 @@ impl Recorder {
     /// writer cannot be created and initialized.
     pub fn create_or_replace(path: impl AsRef<Path>) -> Result<Self, RecordError> {
         Self::create_inner(path.as_ref(), true)
+    }
+
+    /// Discards a newly created partial Record before its manifest starts.
+    ///
+    /// The writer must have no other live owners. A Record with a started
+    /// manifest remains available for recovery after an interrupted run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError`] when the Record has started, another owner is
+    /// still alive, or the partial file cannot be removed.
+    pub fn discard_unstarted(self) -> Result<(), RecordError> {
+        let mut inner = lock_unpoisoned(&self.inner);
+        if inner.started || !inner.active {
+            return Err(invalid_record(
+                "only an unstarted active record can be discarded",
+            ));
+        }
+        if Arc::strong_count(&self.inner) != 1 {
+            return Err(invalid_record("record still has live storage capabilities"));
+        }
+        inner.active = false;
+        inner.writer.take();
+        fs::remove_file(&inner.partial_path).map_err(RecordError::Io)
     }
 
     fn create_inner(path: &Path, replace_existing: bool) -> Result<Self, RecordError> {
@@ -366,7 +378,7 @@ impl Recorder {
                 failure: None,
             })),
             failed: Arc::new(AtomicBool::new(false)),
-            disk_storage: Arc::new(Mutex::new(BTreeMap::new())),
+            storage_pages: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -387,12 +399,13 @@ impl Recorder {
         })
     }
 
-    /// Creates the capability used by the writable-disk host adapter.
+    /// Creates the COW capability for one writable storage resource.
     #[must_use]
-    pub fn disk(&self) -> RecordDisk {
-        RecordDisk {
+    pub fn storage(&self, resource: ResourceId) -> RecordStorage {
+        RecordStorage {
+            resource,
             recorder: self.clone(),
-            storage: Arc::clone(&self.disk_storage),
+            pages: Arc::clone(&self.storage_pages),
         }
     }
 
@@ -408,7 +421,7 @@ impl Recorder {
         position: ExecutionPosition,
         input: &MachineInput,
     ) -> Result<(), RecordError> {
-        if matches!(input, MachineInput::EthernetFrame { bytes } if bytes.len() > MAX_ETHERNET_FRAME_BYTES)
+        if matches!(input.payload(), MachineInputPayload::EthernetFrame { bytes } if bytes.len() > MAX_ETHERNET_FRAME_BYTES)
         {
             return Err(invalid_record(
                 "Ethernet frame exceeds its allocation bound",
@@ -512,25 +525,26 @@ impl Recorder {
     }
 }
 
-/// Capability used by the application-owned writable-disk adapter.
+/// Resource-specific COW capability for a Recording storage medium.
 #[derive(Clone)]
-pub struct RecordDisk {
+pub struct RecordStorage {
+    resource: ResourceId,
     recorder: Recorder,
-    storage: Arc<Mutex<BTreeMap<u64, Vec<u8>>>>,
+    pages: RecordingCowHandle,
 }
 
 /// Parsed complete Record and optional manual restore point.
 ///
 /// Mutable Timeline state moves into the runtime worker. Opening a snapshot
 /// still validates the authoritative Record, its catalog identity, Timeline
-/// cursor, and Replay disk COW before exposing the session.
+/// cursor, and Replay storage COW before exposing the session.
 pub struct Replayer {
     record_path: PathBuf,
     record_identity: RecordIdentity,
     manifest: RecordManifest,
     timeline: Vec<TimelineEntry>,
     footer: RecordFooter,
-    storage: ReplayStorageHandle,
+    storage: ReplayCowHandle,
     initial_cursor: usize,
     restore_state: Option<ReplayRestoreState>,
 }
@@ -593,10 +607,11 @@ impl Replayer {
         &self.manifest
     }
 
-    /// Creates the capability used by the Replay disk adapter.
+    /// Creates the COW capability for one writable Replay resource.
     #[must_use]
-    pub fn disk(&self) -> ReplayDisk {
-        ReplayDisk {
+    pub fn storage(&self, resource: ResourceId) -> ReplayStorage {
+        ReplayStorage {
+            resource,
             storage: Arc::clone(&self.storage),
         }
     }
@@ -645,7 +660,15 @@ impl Replayer {
         let cow_pages = snapshot
             .cow_pages
             .into_iter()
-            .map(|(page_index, data)| decode_cow_page(data).map(|bytes| (page_index, bytes)))
+            .map(|(resource, pages)| {
+                pages
+                    .into_iter()
+                    .map(|(page_index, data)| {
+                        decode_cow_page(data).map(|bytes| (page_index, bytes))
+                    })
+                    .collect::<Result<_, _>>()
+                    .map(|pages| (resource, pages))
+            })
             .collect::<Result<_, _>>()?;
         lock_unpoisoned(&self.storage.state).cow_pages = cow_pages;
         self.initial_cursor = snapshot.timeline_cursor;
@@ -673,10 +696,11 @@ fn snapshot_infos(catalog: SnapshotCatalog) -> Vec<ReplaySnapshotInfo> {
         .collect()
 }
 
-/// Capability providing the initial disk overlay and ephemeral Replay COW.
+/// Resource-specific capability providing ephemeral Replay COW.
 #[derive(Clone)]
-pub struct ReplayDisk {
-    storage: ReplayStorageHandle,
+pub struct ReplayStorage {
+    resource: ResourceId,
+    storage: ReplayCowHandle,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -729,7 +753,7 @@ pub(crate) struct ReplaySession {
     timeline: Vec<TimelineEntry>,
     cursor: usize,
     footer: RecordFooter,
-    storage: ReplayStorageHandle,
+    storage: ReplayCowHandle,
 }
 
 impl ReplaySession {
@@ -799,8 +823,14 @@ impl ReplaySession {
         let cow_pages = lock_unpoisoned(&self.storage.state)
             .cow_pages
             .iter()
-            .map(|(&page_index, bytes)| {
-                encode_cow_page(bytes.clone()).map(|data| (page_index, data))
+            .map(|(resource, pages)| {
+                pages
+                    .iter()
+                    .map(|(&page_index, bytes)| {
+                        encode_cow_page(bytes.clone()).map(|data| (page_index, data))
+                    })
+                    .collect::<Result<_, _>>()
+                    .map(|pages| (resource.clone(), pages))
             })
             .collect::<Result<_, _>>()?;
         let snapshot = ReplaySnapshot {
@@ -852,15 +882,15 @@ struct RecorderInner {
     failure: Option<String>,
 }
 
-type ReplayStorageHandle = Arc<ReplayStorage>;
+type ReplayCowHandle = Arc<ReplayCowState>;
 
-struct ReplayStorage {
+struct ReplayCowState {
     state: Mutex<ReplayStorageState>,
     failed: AtomicBool,
 }
 
 struct ReplayStorageState {
-    cow_pages: BTreeMap<u64, Vec<u8>>,
+    cow_pages: CowPages,
     failure: Option<String>,
 }
 
@@ -955,7 +985,7 @@ fn parse_record(
         manifest,
         timeline,
         footer,
-        storage: Arc::new(ReplayStorage {
+        storage: Arc::new(ReplayCowState {
             state: Mutex::new(ReplayStorageState {
                 cow_pages: BTreeMap::new(),
                 failure: None,
@@ -1011,8 +1041,8 @@ fn decode_value<T: DeserializeOwned>(bytes: &[u8], name: &str) -> Result<T, Reco
 }
 
 fn encode_cow_page(bytes: Vec<u8>) -> Result<CowPageData, RecordError> {
-    if bytes.is_empty() || bytes.len() > DISK_PAGE_BYTES {
-        return Err(invalid_record("invalid disk COW page length"));
+    if bytes.is_empty() || bytes.len() > STORAGE_PAGE_BYTES {
+        return Err(invalid_record("invalid storage COW page length"));
     }
     if bytes.iter().all(|&byte| byte == 0) {
         Ok(CowPageData::Zero(bytes.len()))
@@ -1026,8 +1056,8 @@ fn cow_page_length(data: &CowPageData) -> Result<usize, RecordError> {
         CowPageData::Raw(bytes) => bytes.len(),
         CowPageData::Zero(length) => *length,
     };
-    if length == 0 || length > DISK_PAGE_BYTES {
-        Err(invalid_record("invalid disk COW page length"))
+    if length == 0 || length > STORAGE_PAGE_BYTES {
+        Err(invalid_record("invalid storage COW page length"))
     } else {
         Ok(length)
     }
@@ -1303,33 +1333,45 @@ fn validate_replay_snapshot(
         ));
     }
 
-    match replayer.manifest.disk() {
-        Some(disk) => {
-            for (&page_index, page) in &snapshot.cow_pages {
-                validate_cow_page(page_index, cow_page_length(page)?, disk.size_bytes)?;
-            }
+    for (resource, pages) in &snapshot.cow_pages {
+        let Some(recorded) = replayer.manifest.resources().get(resource) else {
+            return Err(invalid_record(format!(
+                "Replay snapshot references unknown storage resource {}",
+                resource.as_str()
+            )));
+        };
+        if recorded.kind
+            != (ResourceKind::Storage {
+                access: StorageAccess::ReadWrite,
+            })
+        {
+            return Err(invalid_record(format!(
+                "Replay snapshot COW resource {} is not writable storage",
+                resource.as_str()
+            )));
         }
-        None if snapshot.cow_pages.is_empty() => {}
-        None => {
-            return Err(invalid_record(
-                "Replay snapshot has COW pages without a disk",
-            ));
+        for (&page_index, page) in pages {
+            validate_cow_page(
+                page_index,
+                cow_page_length(page)?,
+                recorded.identity.size_bytes,
+            )?;
         }
     }
     Ok(())
 }
 
-fn validate_cow_page(page_index: u64, length: usize, disk_size: u64) -> Result<(), RecordError> {
+fn validate_cow_page(page_index: u64, length: usize, storage_size: u64) -> Result<(), RecordError> {
     let page_offset = page_index
-        .checked_mul(DISK_PAGE_BYTES as u64)
-        .ok_or_else(|| invalid_record("disk COW page offset overflow"))?;
-    if page_offset >= disk_size {
-        return Err(invalid_record("disk COW page is out of range"));
+        .checked_mul(STORAGE_PAGE_BYTES as u64)
+        .ok_or_else(|| invalid_record("storage COW page offset overflow"))?;
+    if page_offset >= storage_size {
+        return Err(invalid_record("storage COW page is out of range"));
     }
-    let expected = usize::try_from((disk_size - page_offset).min(DISK_PAGE_BYTES as u64))
-        .map_err(|_| invalid_record("disk COW page length does not fit usize"))?;
+    let expected = usize::try_from((storage_size - page_offset).min(STORAGE_PAGE_BYTES as u64))
+        .map_err(|_| invalid_record("storage COW page length does not fit usize"))?;
     if length != expected {
-        return Err(invalid_record("disk COW page has the wrong length"));
+        return Err(invalid_record("storage COW page has the wrong length"));
     }
     Ok(())
 }
@@ -1412,23 +1454,26 @@ fn wide_path(path: &Path) -> Vec<u16> {
         .collect()
 }
 
-impl RecordDisk {
+impl RecordStorage {
     /// Applies the Recording machine's in-memory COW pages to a completed base
     /// read.
     ///
     /// The COW remains live after the Record footer is finalized so continued
-    /// execution cannot modify the selected host disk image.
+    /// execution cannot modify the selected host storage image.
     ///
     /// # Errors
     ///
     /// Returns an error when the requested range overflows.
     pub fn overlay_read(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
-        let pages = lock_unpoisoned(&self.storage);
-        overlay_cow_pages(&pages, offset, buffer)
+        let all_pages = lock_unpoisoned(&self.pages);
+        match all_pages.get(&self.resource) {
+            Some(pages) => overlay_cow_pages(pages, offset, buffer),
+            None => overlay_cow_pages(&BTreeMap::new(), offset, buffer),
+        }
     }
 
     /// Writes into the Recording machine's in-memory COW without modifying the
-    /// base disk.
+    /// base storage image.
     ///
     /// The callback supplies one complete base page when Recording first
     /// writes that page. COW contents remain available after Recording stops
@@ -1448,15 +1493,16 @@ impl RecordDisk {
         if data.is_empty() {
             return Ok(());
         }
-        let mut pages = lock_unpoisoned(&self.storage);
+        let mut all_pages = lock_unpoisoned(&self.pages);
+        let pages = all_pages.entry(self.resource.clone()).or_default();
         let end = offset + data.len() as u64;
-        let first_page = offset / DISK_PAGE_BYTES as u64;
-        let last_page = (end - 1) / DISK_PAGE_BYTES as u64;
+        let first_page = offset / STORAGE_PAGE_BYTES as u64;
+        let last_page = (end - 1) / STORAGE_PAGE_BYTES as u64;
         for page_index in first_page..=last_page {
-            let page_offset = page_index * DISK_PAGE_BYTES as u64;
+            let page_offset = page_index * STORAGE_PAGE_BYTES as u64;
             let page_length =
-                usize::try_from((size_bytes - page_offset).min(DISK_PAGE_BYTES as u64))
-                    .map_err(|_| io::Error::other("disk page length does not fit usize"))?;
+                usize::try_from((size_bytes - page_offset).min(STORAGE_PAGE_BYTES as u64))
+                    .map_err(|_| io::Error::other("storage page length does not fit usize"))?;
             let page = match pages.entry(page_index) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
@@ -1500,13 +1546,13 @@ fn overlay_cow_pages(
     let end = offset
         .checked_add(buffer.len() as u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "COW read range overflow"))?;
-    let first_page = offset / DISK_PAGE_BYTES as u64;
-    let last_page = (end - 1) / DISK_PAGE_BYTES as u64;
+    let first_page = offset / STORAGE_PAGE_BYTES as u64;
+    let last_page = (end - 1) / STORAGE_PAGE_BYTES as u64;
     for page_index in first_page..=last_page {
         let Some(page) = pages.get(&page_index) else {
             continue;
         };
-        let page_offset = page_index * DISK_PAGE_BYTES as u64;
+        let page_offset = page_index * STORAGE_PAGE_BYTES as u64;
         let start = offset.max(page_offset);
         let finish = end.min(page_offset + page.len() as u64);
         let target_start = usize::try_from(start - offset)
@@ -1521,7 +1567,7 @@ fn overlay_cow_pages(
     Ok(())
 }
 
-impl ReplayDisk {
+impl ReplayStorage {
     /// Applies Replay COW pages to a completed base read.
     ///
     /// # Errors
@@ -1530,10 +1576,13 @@ impl ReplayDisk {
     pub fn overlay_read(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
         let state = lock_unpoisoned(&self.storage.state);
         ensure_replay_storage_healthy(&state)?;
-        overlay_cow_pages(&state.cow_pages, offset, buffer)
+        match state.cow_pages.get(&self.resource) {
+            Some(pages) => overlay_cow_pages(pages, offset, buffer),
+            None => overlay_cow_pages(&BTreeMap::new(), offset, buffer),
+        }
     }
 
-    /// Writes into an in-memory page COW without modifying the base disk.
+    /// Writes into an in-memory page COW without modifying the base storage image.
     ///
     /// The callback supplies one complete current base page when Replay first
     /// writes that page.
@@ -1555,14 +1604,15 @@ impl ReplayDisk {
         let mut state = lock_unpoisoned(&self.storage.state);
         ensure_replay_storage_healthy(&state)?;
         let end = offset + data.len() as u64;
-        let first_page = offset / DISK_PAGE_BYTES as u64;
-        let last_page = (end - 1) / DISK_PAGE_BYTES as u64;
+        let first_page = offset / STORAGE_PAGE_BYTES as u64;
+        let last_page = (end - 1) / STORAGE_PAGE_BYTES as u64;
+        let pages = state.cow_pages.entry(self.resource.clone()).or_default();
         for page_index in first_page..=last_page {
-            let page_offset = page_index * DISK_PAGE_BYTES as u64;
+            let page_offset = page_index * STORAGE_PAGE_BYTES as u64;
             let page_length =
-                usize::try_from((size_bytes - page_offset).min(DISK_PAGE_BYTES as u64))
-                    .map_err(|_| io::Error::other("disk page length does not fit usize"))?;
-            let page = match state.cow_pages.entry(page_index) {
+                usize::try_from((size_bytes - page_offset).min(STORAGE_PAGE_BYTES as u64))
+                    .map_err(|_| io::Error::other("storage page length does not fit usize"))?;
+            let page = match pages.entry(page_index) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     let mut page = vec![0; page_length];
@@ -1620,22 +1670,26 @@ fn check_range(offset: u64, length: usize, size_bytes: u64) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use se_config::definition::MachineDefinition;
+    use se_config::draft::MachineDraft;
+    use se_core::storage::StorageAccess;
     use se_core::time::VirtualInstant;
     use se_device::gio::GioBus;
     use se_float::backend::Backend;
-    use se_machine::indigo::GraphicsBoard;
-    use se_machine::indigo::ip12::{
-        Ip12, Ip12MemoryConfiguration, Ip12NonvolatileState, Ip12NonvolatileStateParts,
-    };
-    use se_machine::input::MachineInput;
-    use se_machine::machine::{Machine, MachineNonvolatileState, MachineStartupConfiguration};
+    use se_machine::endpoint::EndpointKind;
+    use se_machine::indigo::ip12::definition::Ip12Definition;
+    use se_machine::indigo::ip12::{Ip12, Ip12NonvolatileState, Ip12NonvolatileStateParts};
+    use se_machine::input::{MachineInput, MachineInputPayload};
+    use se_machine::machine::{Machine, MachineNonvolatileState};
+    use se_machine::resource::{ResourceId, ResourceKind};
 
     use super::{
-        DISK_PAGE_BYTES, ExecutionPosition, FILE_HEADER_BYTES, FRAME_HEADER_BYTES, MediaIdentity,
-        RecordManifest, RecordOutcome, Recorder, Replayer,
+        ExecutionPosition, FILE_HEADER_BYTES, FRAME_HEADER_BYTES, MediaIdentity, RecordManifest,
+        RecordOutcome, RecordedResource, Recorder, Replayer, STORAGE_PAGE_BYTES,
     };
 
     fn temporary_path(name: &str) -> PathBuf {
@@ -1647,14 +1701,38 @@ mod tests {
 
     #[test]
     fn ethernet_timeline_rejects_oversize_length_before_allocating() {
-        let frame = super::TimelineAction::MachineInput(MachineInput::EthernetFrame {
-            bytes: vec![0; super::MAX_ETHERNET_FRAME_BYTES + 1],
-        });
+        let machine = Machine::IndigoIp12(
+            Ip12::new(
+                vec![0; 0x40000],
+                Backend::SoftFloat,
+                GioBus::new(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let ethernet = machine
+            .endpoint_catalog()
+            .endpoints()
+            .iter()
+            .find(|descriptor| descriptor.kind() == EndpointKind::Ethernet)
+            .unwrap()
+            .key()
+            .clone();
+        let frame = super::TimelineAction::MachineInput(MachineInput::new(
+            ethernet.clone(),
+            MachineInputPayload::EthernetFrame {
+                bytes: vec![0; super::MAX_ETHERNET_FRAME_BYTES + 1],
+            },
+        ));
         let encoded = super::encode_value(&frame, "Ethernet input").unwrap();
         assert!(super::decode_value::<super::TimelineAction>(&encoded, "Ethernet input").is_err());
-        let frame = super::TimelineAction::MachineInput(MachineInput::EthernetFrame {
-            bytes: vec![0xff; 60],
-        });
+        let frame = super::TimelineAction::MachineInput(MachineInput::new(
+            ethernet,
+            MachineInputPayload::EthernetFrame {
+                bytes: vec![0xff; 60],
+            },
+        ));
         let encoded = super::encode_value(&frame, "Ethernet input").unwrap();
         assert_eq!(
             super::decode_value::<super::TimelineAction>(&encoded, "Ethernet input").unwrap(),
@@ -1665,19 +1743,13 @@ mod tests {
     fn manifest() -> RecordManifest {
         RecordManifest::new(
             startup_configuration(),
-            MediaIdentity::from_bytes(Path::new("prom.bin"), &[1, 2, 3]),
-            None,
-            None,
+            BTreeMap::new(),
             nonvolatile_state(),
         )
     }
 
-    fn startup_configuration() -> MachineStartupConfiguration {
-        MachineStartupConfiguration::IndigoIp12 {
-            floating_point_backend: Backend::SoftFloat,
-            memory: Ip12MemoryConfiguration::try_from_simm_mib([2, 0, 8]).unwrap(),
-            graphics: Some(GraphicsBoard::Lg1),
-        }
+    fn startup_configuration() -> MachineDraft {
+        Ip12Definition.default_draft()
     }
 
     fn nonvolatile_state() -> MachineNonvolatileState {
@@ -1922,23 +1994,121 @@ mod tests {
     }
 
     fn disk_manifest(disk: &[u8]) -> RecordManifest {
-        RecordManifest::new(
-            startup_configuration(),
-            MediaIdentity::from_bytes(Path::new("prom.bin"), &[1, 2, 3]),
-            Some(MediaIdentity::from_bytes(Path::new("disk.img"), disk)),
-            None,
-            nonvolatile_state(),
-        )
+        let mut resources = BTreeMap::new();
+        resources.insert(
+            ResourceId::new("test.disk"),
+            RecordedResource {
+                kind: ResourceKind::Storage {
+                    access: StorageAccess::ReadWrite,
+                },
+                identity: MediaIdentity::from_bytes(Path::new("disk.img"), disk),
+            },
+        );
+        RecordManifest::new(startup_configuration(), resources, nonvolatile_state())
+    }
+
+    fn two_storage_manifest(first: &[u8], second: &[u8]) -> RecordManifest {
+        let mut manifest = disk_manifest(first);
+        manifest.resources.insert(
+            ResourceId::new("test.disk.b"),
+            RecordedResource {
+                kind: ResourceKind::Storage {
+                    access: StorageAccess::ReadWrite,
+                },
+                identity: MediaIdentity::from_bytes(Path::new("disk-b.img"), second),
+            },
+        );
+        manifest.resources.insert(
+            ResourceId::new("test.readonly"),
+            RecordedResource {
+                kind: ResourceKind::Storage {
+                    access: StorageAccess::ReadOnly,
+                },
+                identity: MediaIdentity::from_bytes(Path::new("disc.iso"), first),
+            },
+        );
+        manifest.resources.insert(
+            ResourceId::new("test.bytes"),
+            RecordedResource {
+                kind: ResourceKind::Bytes,
+                identity: MediaIdentity::from_bytes(Path::new("prom.bin"), first),
+            },
+        );
+        manifest
+    }
+
+    #[test]
+    fn recording_and_replay_cow_isolate_equal_page_offsets_by_resource() {
+        let path = temporary_path("two-storage-cow");
+        let _ = fs::remove_file(&path);
+        let base_a = vec![1; STORAGE_PAGE_BYTES];
+        let base_b = vec![2; STORAGE_PAGE_BYTES];
+        let recorder = Recorder::create(&path).unwrap();
+        recorder
+            .start(&two_storage_manifest(&base_a, &base_b))
+            .unwrap();
+        let a = recorder.storage(ResourceId::new("test.disk"));
+        let b = recorder.storage(ResourceId::new("test.disk.b"));
+        a.write_all_at(7, &[0xa1], base_a.len() as u64, |_, page| {
+            page.copy_from_slice(&base_a);
+            Ok(())
+        })
+        .unwrap();
+        b.write_all_at(7, &[0xb2], base_b.len() as u64, |_, page| {
+            page.copy_from_slice(&base_b);
+            Ok(())
+        })
+        .unwrap();
+        let mut a_visible = base_a.clone();
+        let mut b_visible = base_b.clone();
+        a.overlay_read(0, &mut a_visible).unwrap();
+        b.overlay_read(0, &mut b_visible).unwrap();
+        assert_eq!(a_visible[7], 0xa1);
+        assert_eq!(b_visible[7], 0xb2);
+        assert_eq!(base_a[7], 1);
+        assert_eq!(base_b[7], 2);
+        recorder
+            .finalize(
+                ExecutionPosition::default(),
+                &RecordOutcome::UserStopped,
+                [0; 32],
+            )
+            .unwrap();
+
+        let replayer = Replayer::open(&path).unwrap();
+        let replay_a = replayer.storage(ResourceId::new("test.disk"));
+        let replay_b = replayer.storage(ResourceId::new("test.disk.b"));
+        replay_a
+            .write_all_at(7, &[0xc3], base_a.len() as u64, |_, page| {
+                page.copy_from_slice(&base_a);
+                Ok(())
+            })
+            .unwrap();
+        replay_b
+            .write_all_at(7, &[0xd4], base_b.len() as u64, |_, page| {
+                page.copy_from_slice(&base_b);
+                Ok(())
+            })
+            .unwrap();
+        let mut a_visible = base_a.clone();
+        let mut b_visible = base_b.clone();
+        replay_a.overlay_read(0, &mut a_visible).unwrap();
+        replay_b.overlay_read(0, &mut b_visible).unwrap();
+        assert_eq!(a_visible[7], 0xc3);
+        assert_eq!(b_visible[7], 0xd4);
+        assert_eq!(base_a[7], 1);
+        assert_eq!(base_b[7], 2);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn recording_cow_survives_finalize_without_modifying_the_base() {
         let path = temporary_path("recording-cow");
         let _ = fs::remove_file(&path);
-        let initial = vec![1; DISK_PAGE_BYTES * 2];
+        let initial = vec![1; STORAGE_PAGE_BYTES * 2];
         let recorder = Recorder::create(&path).unwrap();
         recorder.start(&disk_manifest(&initial)).unwrap();
-        let disk = recorder.disk();
+        let disk = recorder.storage(ResourceId::new("test.disk"));
         let mut base_reads = 0;
         disk.write_all_at(10, &[7, 8], initial.len() as u64, |offset, page| {
             base_reads += 1;
@@ -1960,7 +2130,7 @@ mod tests {
             )
             .unwrap();
         disk.write_all_at(
-            DISK_PAGE_BYTES as u64 + 1,
+            STORAGE_PAGE_BYTES as u64 + 1,
             &[5],
             initial.len() as u64,
             |offset, page| {
@@ -1974,13 +2144,13 @@ mod tests {
         let mut visible = initial.clone();
         disk.overlay_read(0, &mut visible).unwrap();
         assert_eq!(&visible[10..13], &[7, 8, 6]);
-        assert_eq!(visible[DISK_PAGE_BYTES + 1], 5);
+        assert_eq!(visible[STORAGE_PAGE_BYTES + 1], 5);
         assert!(initial.iter().all(|&byte| byte == 1));
 
         let replayer = Replayer::open(&path).unwrap();
         let mut replay_initial = initial.clone();
         replayer
-            .disk()
+            .storage(ResourceId::new("test.disk"))
             .overlay_read(0, &mut replay_initial)
             .unwrap();
         assert_eq!(replay_initial, initial);
@@ -1994,9 +2164,12 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{}.idx", path.display()));
         let _ = fs::remove_dir_all(format!("{}.ckpt", path.display()));
-        let initial = vec![1; DISK_PAGE_BYTES];
+        let initial = vec![1; STORAGE_PAGE_BYTES];
+        let second = vec![2; STORAGE_PAGE_BYTES];
         let recorder = Recorder::create(&path).unwrap();
-        recorder.start(&disk_manifest(&initial)).unwrap();
+        recorder
+            .start(&two_storage_manifest(&initial, &second))
+            .unwrap();
         recorder
             .finalize(
                 ExecutionPosition::default(),
@@ -2007,9 +2180,16 @@ mod tests {
 
         let replayer = Replayer::open(&path).unwrap();
         replayer
-            .disk()
-            .write_all_at(10, &[7, 8], DISK_PAGE_BYTES as u64, |_offset, page| {
+            .storage(ResourceId::new("test.disk"))
+            .write_all_at(10, &[7, 8], STORAGE_PAGE_BYTES as u64, |_offset, page| {
                 page.copy_from_slice(&initial);
+                Ok(())
+            })
+            .unwrap();
+        replayer
+            .storage(ResourceId::new("test.disk.b"))
+            .write_all_at(10, &[9, 8], STORAGE_PAGE_BYTES as u64, |_offset, page| {
+                page.copy_from_slice(&second);
                 Ok(())
             })
             .unwrap();
@@ -2037,13 +2217,38 @@ mod tests {
             )
             .unwrap();
 
+        let snapshot_path = super::checkpoint_directory(&path).join(info.id());
+        let (mut snapshot, _, _): (super::ReplaySnapshot, _, _) =
+            super::read_cache_file_with_identity(&snapshot_path, super::SNAPSHOT_MAGIC, "snapshot")
+                .unwrap();
+        let validation_replayer = Replayer::open(&path).unwrap();
+        let sample_page = snapshot.cow_pages[&ResourceId::new("test.disk")].clone();
+        for invalid in ["unknown", "test.readonly", "test.bytes"] {
+            let id = ResourceId::new(invalid);
+            snapshot.cow_pages.insert(id.clone(), sample_page.clone());
+            assert!(super::validate_replay_snapshot(&validation_replayer, &snapshot).is_err());
+            snapshot.cow_pages.remove(&id);
+        }
+        snapshot
+            .cow_pages
+            .get_mut(&ResourceId::new("test.disk"))
+            .unwrap()
+            .insert(1, super::CowPageData::Raw(vec![1; STORAGE_PAGE_BYTES]));
+        assert!(super::validate_replay_snapshot(&validation_replayer, &snapshot).is_err());
+
         let restored = Replayer::open_snapshot(&path, info.id()).unwrap();
-        let restored_disk = restored.disk();
+        let restored_disk = restored.storage(ResourceId::new("test.disk"));
         let mut bytes = initial.clone();
         restored_disk.overlay_read(0, &mut bytes).unwrap();
         assert_eq!(&bytes[..10], &initial[..10]);
         assert_eq!(&bytes[10..12], &[7, 8]);
         assert_eq!(&bytes[12..], &initial[12..]);
+        let mut second_visible = second.clone();
+        restored
+            .storage(ResourceId::new("test.disk.b"))
+            .overlay_read(0, &mut second_visible)
+            .unwrap();
+        assert_eq!(&second_visible[10..12], &[9, 8]);
 
         drop(restored_disk);
         drop(restored);

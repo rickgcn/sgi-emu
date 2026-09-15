@@ -25,7 +25,7 @@ struct RuntimeStatusDto;
 struct UiSession;
 
 class CacheDock;
-class DisplayWidget;
+class DisplayWorkspace;
 class DisassemblyDock;
 class MemoryDock;
 class PreparationTask;
@@ -83,8 +83,8 @@ private:
     void update_machine_status();
 
     const UiSession& session_;
-    MachineSettings settings_;
-    std::unique_ptr<MachineSettings> pending_settings_;
+    NetworkSettings network_settings_;
+    std::unique_ptr<NetworkSettings> pending_network_settings_;
 
     QAction* run_action_;
     QAction* run_with_record_action_;
@@ -103,7 +103,8 @@ private:
     CacheDock* cache_dock_;
     MemoryDock* memory_dock_;
     SerialConsoleDock* serial_console_dock_;
-    DisplayWidget* display_widget_;
+    DisplayWorkspace* display_workspace_;
+    std::uint64_t last_endpoint_generation_;
     std::shared_ptr<MachineOutputSink> machine_output_sink_;
     QTimer* update_timer_;
     QTimer* notification_timer_;

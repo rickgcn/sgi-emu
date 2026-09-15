@@ -40,6 +40,8 @@ pub struct RuntimeStatus {
     pub state: RuntimeState,
     /// Monotonic debugger-visible state revision.
     pub revision: u64,
+    /// Identity of the currently installed machine instance.
+    pub machine_generation: u64,
     /// Instructions completed during this runtime's lifetime.
     pub completed_instructions: u64,
     /// Deterministic session mode.

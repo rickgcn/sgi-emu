@@ -1,14 +1,18 @@
 //! SGI Indigo IP12 hardware composition.
 
+pub mod builder;
 mod bus;
 pub mod debug;
+pub mod definition;
 mod events;
+pub mod plan;
 mod prom;
 pub(crate) mod snapshot;
 
 use std::error::Error;
 use std::fmt;
 
+use se_core::storage::StorageMedium;
 use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::{R3000, R3000Config, StepError};
 use se_device::centronics::CentronicsPort;
@@ -28,16 +32,23 @@ use se_device::scsi_disk::ScsiDisk;
 use se_device::seeq8003::Seeq8003;
 use se_device::sgi_keyboard::{SgiKey, SgiKeyboard};
 use se_device::sgi_mouse::{SgiMouse, SgiMouseButton};
-use se_device::storage::BlockStorage;
 use se_device::wd33c93b::Wd33c93b;
 use se_device::z85230::Z85230;
 use se_float::backend::Backend;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use self::bus::Ip12Bus;
-use self::prom::normalize_u56_prom;
+use self::plan::Ip12Port;
+use self::prom::{normalize_u56_prom, validate_u56_prom_size};
+use crate::endpoint::{
+    EndpointCatalog, EndpointDescriptor, EndpointDirection, EndpointKey, EndpointKind,
+};
+use crate::input::{
+    KeyboardKey, KeyboardNamedKey, MachineInput, MachineInputPayload, PointerButton,
+};
+use crate::machine::{MachineInputError, MachineInputResult};
 use crate::output::{MachineOutput, VideoOutput};
-use crate::serial::SerialPort;
+use se_device::z85230::Channel;
 
 const PROM_BYTES: usize = 0x40000;
 #[cfg(test)]
@@ -268,6 +279,15 @@ pub enum Ip12SnapshotError {
     Scsi(ScsiSnapshotError),
     /// The GIO snapshot differs from the configured device topology.
     Gio(GioSnapshotError),
+    /// A snapshot and machine disagree about a configurable port peripheral.
+    PortAttachmentMismatch {
+        /// Port whose machine-side peripheral presence differs.
+        port: Ip12Port,
+        /// Whether the snapshot contains the peripheral.
+        snapshot_attached: bool,
+        /// Whether the target machine contains the peripheral.
+        machine_attached: bool,
+    },
 }
 
 impl fmt::Display for Ip12SnapshotError {
@@ -275,6 +295,14 @@ impl fmt::Display for Ip12SnapshotError {
         match self {
             Self::Scsi(error) => error.fmt(formatter),
             Self::Gio(error) => error.fmt(formatter),
+            Self::PortAttachmentMismatch {
+                port,
+                snapshot_attached,
+                machine_attached,
+            } => write!(
+                formatter,
+                "IP12 snapshot attachment at {port:?} differs: snapshot attached={snapshot_attached}, machine attached={machine_attached}"
+            ),
         }
     }
 }
@@ -284,6 +312,7 @@ impl Error for Ip12SnapshotError {
         match self {
             Self::Scsi(error) => Some(error),
             Self::Gio(error) => Some(error),
+            Self::PortAttachmentMismatch { .. } => None,
         }
     }
 }
@@ -398,6 +427,115 @@ pub struct Ip12 {
 }
 
 impl Ip12 {
+    pub(crate) fn try_receive_input(
+        &mut self,
+        input: &MachineInput,
+    ) -> Result<MachineInputResult, MachineInputError> {
+        let endpoint = input.endpoint();
+        let consumed = match input.payload() {
+            MachineInputPayload::SerialByte(value)
+                if endpoint == &Ip12Port::SerialA.endpoint_key() =>
+            {
+                self.receive_serial_character(Channel::A, *value);
+                true
+            }
+            MachineInputPayload::SerialByte(value)
+                if endpoint == &Ip12Port::SerialB.endpoint_key() =>
+            {
+                self.receive_serial_character(Channel::B, *value);
+                true
+            }
+            MachineInputPayload::Keyboard { key, pressed }
+                if endpoint == &Ip12Port::Keyboard.endpoint_key() =>
+            {
+                let key = translate_keyboard_key(*key)
+                    .ok_or(MachineInputError::UnsupportedKeyboardKey)?;
+                self.set_sgi_key_state(key, *pressed);
+                true
+            }
+            MachineInputPayload::PointerMotion { delta_x, delta_y }
+                if endpoint == &Ip12Port::Mouse.endpoint_key() =>
+            {
+                self.move_sgi_mouse(*delta_x, *delta_y);
+                true
+            }
+            MachineInputPayload::PointerButton { button, pressed }
+                if endpoint == &Ip12Port::Mouse.endpoint_key() =>
+            {
+                let button = match button {
+                    PointerButton::Left => SgiMouseButton::Left,
+                    PointerButton::Middle => SgiMouseButton::Middle,
+                    PointerButton::Right => SgiMouseButton::Right,
+                };
+                self.set_sgi_mouse_button_state(button, *pressed);
+                true
+            }
+            MachineInputPayload::EthernetFrame { bytes } if endpoint.as_str() == "ethernet.0" => {
+                self.receive_ethernet(bytes)
+            }
+            _ => unreachable!("IP12 endpoint catalog and input routing must agree"),
+        };
+        Ok(if consumed {
+            MachineInputResult::Consumed
+        } else {
+            MachineInputResult::WouldBlock
+        })
+    }
+
+    /// Returns the active machine's frontend I/O endpoints in service order.
+    #[must_use]
+    pub fn endpoint_catalog(&self) -> EndpointCatalog {
+        use EndpointDirection::{Bidirectional, Input, Output};
+        use EndpointKind::{Ethernet, Keyboard, Pointer, Serial, Video};
+
+        let mut endpoints = Vec::new();
+        if self.bus.has_sgi_keyboard() {
+            endpoints.push(EndpointDescriptor::new(
+                Ip12Port::Keyboard.endpoint_key(),
+                "SGI Keyboard",
+                Keyboard,
+                Input,
+            ));
+        }
+        if self.bus.has_sgi_mouse() {
+            endpoints.push(EndpointDescriptor::new(
+                Ip12Port::Mouse.endpoint_key(),
+                "SGI Mouse",
+                Pointer,
+                Input,
+            ));
+        }
+        endpoints.extend([
+            EndpointDescriptor::new(
+                Ip12Port::SerialA.endpoint_key(),
+                "Serial Port A",
+                Serial,
+                Bidirectional,
+            ),
+            EndpointDescriptor::new(
+                Ip12Port::SerialB.endpoint_key(),
+                "Serial Port B",
+                Serial,
+                Bidirectional,
+            ),
+            EndpointDescriptor::new(
+                EndpointKey::new("ethernet.0"),
+                "Ethernet Port 0",
+                Ethernet,
+                Bidirectional,
+            ),
+        ]);
+        if self.bus.has_video_output() {
+            endpoints.push(EndpointDescriptor::new(
+                EndpointKey::new("video.0"),
+                "LG1 Video Output",
+                Video,
+                Output,
+            ));
+        }
+        EndpointCatalog::try_new(endpoints).expect("IP12 endpoint identities must be unique")
+    }
+
     /// Constructs an IP12 from a raw U56 PROM dump and optional storage.
     ///
     /// # Errors
@@ -408,8 +546,8 @@ impl Ip12 {
         raw_prom: Vec<u8>,
         floating_point_backend: Backend,
         gio: GioBus,
-        disk_storage: Option<Box<dyn BlockStorage>>,
-        cdrom_storage: Option<Box<dyn BlockStorage>>,
+        disk_storage: Option<Box<dyn StorageMedium>>,
+        cdrom_storage: Option<Box<dyn StorageMedium>>,
     ) -> Result<Self, Ip12Error> {
         Self::new_with_memory(
             raw_prom,
@@ -432,10 +570,10 @@ impl Ip12 {
         floating_point_backend: Backend,
         memory: Ip12MemoryConfiguration,
         gio: GioBus,
-        disk_storage: Option<Box<dyn BlockStorage>>,
-        cdrom_storage: Option<Box<dyn BlockStorage>>,
+        disk_storage: Option<Box<dyn StorageMedium>>,
+        cdrom_storage: Option<Box<dyn StorageMedium>>,
     ) -> Result<Self, Ip12Error> {
-        let prom = Rom::new(normalize_u56_prom(raw_prom)?);
+        validate_u56_prom_size(raw_prom.len())?;
         let mut scsi_bus = ScsiBus::new();
         if let Some(storage) = disk_storage {
             let bytes = storage.size_bytes();
@@ -453,6 +591,27 @@ impl Ip12 {
                 .attach(4, 0, Box::new(target), storage)
                 .map_err(Ip12Error::ScsiAttachment)?;
         }
+        Self::new_with_buses(
+            raw_prom,
+            floating_point_backend,
+            memory,
+            gio,
+            scsi_bus,
+            Some(SgiKeyboard::new()),
+            Some(SgiMouse::new()),
+        )
+    }
+
+    fn new_with_buses(
+        raw_prom: Vec<u8>,
+        floating_point_backend: Backend,
+        memory: Ip12MemoryConfiguration,
+        gio: GioBus,
+        scsi_bus: ScsiBus,
+        sgi_keyboard: Option<SgiKeyboard>,
+        sgi_mouse: Option<SgiMouse>,
+    ) -> Result<Self, Ip12Error> {
+        let prom = Rom::new(normalize_u56_prom(raw_prom)?);
         let mut machine = Self {
             cpu: R3000::new(cpu_config(floating_point_backend)),
             bus: Ip12Bus::new(
@@ -465,8 +624,8 @@ impl Ip12 {
                 Wd33c93b::new(SCSI_CLOCK_HZ),
                 scsi_bus,
                 [Z85230::new(SERIAL_CLOCK_HZ), Z85230::new(SERIAL_CLOCK_HZ)],
-                SgiKeyboard::new(),
-                SgiMouse::new(),
+                sgi_keyboard,
+                sgi_mouse,
                 Dp8573a::new(),
                 Mdac::new(),
                 Nmc93cs46::new(),
@@ -542,45 +701,42 @@ impl Ip12 {
     /// The query has no side effects and does not advance virtual time, so a
     /// paused machine can be asked what to present.
     #[must_use]
-    pub fn video_output(&self) -> VideoOutput {
+    pub(crate) fn video_output(&self) -> Option<VideoOutput> {
         self.bus.video_output()
     }
 
-    /// Supplies host bytes to one external serial receiver.
-    ///
-    /// Returns the number of bytes consumed by the machine.
-    pub fn receive_serial(&mut self, port: SerialPort, bytes: &[u8]) -> usize {
-        let consumed = self.bus.receive_serial(port, bytes);
+    pub(crate) fn publish_current_outputs(&self, output: &mut MachineOutput) {
+        if let Some(video) = self.video_output() {
+            output.publish_video(EndpointKey::new("video.0"), video);
+        }
+    }
+
+    /// Signals one character arriving at an external serial receiver.
+    pub(crate) fn receive_serial_character(&mut self, channel: Channel, value: u8) {
+        self.bus.receive_serial_character(channel, value);
         self.update_interrupt_lines();
-        consumed
     }
 
     /// Applies one physical SGI keyboard key state.
-    pub fn set_sgi_key_state(&mut self, key: SgiKey, pressed: bool) {
+    pub(crate) fn set_sgi_key_state(&mut self, key: SgiKey, pressed: bool) {
         self.bus.set_sgi_key_state(key, pressed);
         self.update_interrupt_lines();
     }
 
     /// Queues relative SGI mouse motion in guest coordinates.
-    pub fn move_sgi_mouse(&mut self, delta_x: i32, delta_y: i32) {
+    pub(crate) fn move_sgi_mouse(&mut self, delta_x: i32, delta_y: i32) {
         self.bus.move_sgi_mouse(delta_x, delta_y);
         self.update_interrupt_lines();
     }
 
     /// Applies one physical SGI mouse button state.
-    pub fn set_sgi_mouse_button_state(&mut self, button: SgiMouseButton, pressed: bool) {
+    pub(crate) fn set_sgi_mouse_button_state(&mut self, button: SgiMouseButton, pressed: bool) {
         self.bus.set_sgi_mouse_button_state(button, pressed);
         self.update_interrupt_lines();
     }
 
-    /// Reports whether the virtual Ethernet link can accept the next frame.
-    #[must_use]
-    pub fn ethernet_receive_ready(&self) -> bool {
-        self.bus.ethernet_receive_ready()
-    }
-
     /// Supplies one external Ethernet frame before device filtering.
-    pub fn receive_ethernet(&mut self, bytes: &[u8]) -> bool {
+    pub(crate) fn receive_ethernet(&mut self, bytes: &[u8]) -> bool {
         self.bus.receive_ethernet(bytes)
     }
 
@@ -609,6 +765,72 @@ impl Ip12 {
     pub fn execution_address(&self) -> u32 {
         self.cpu.program_counter()
     }
+}
+
+fn translate_keyboard_key(key: KeyboardKey) -> Option<SgiKey> {
+    let code = match key {
+        KeyboardKey::Letter(letter @ b'A'..=b'Z') => [
+            10, 35, 27, 17, 16, 18, 25, 26, 39, 33, 34, 41, 43, 36, 40, 47, 9, 23, 11, 24, 32, 28,
+            15, 20, 31, 19,
+        ][usize::from(letter - b'A')],
+        KeyboardKey::Digit(digit @ 0..=9) => {
+            [45, 7, 13, 14, 21, 22, 29, 30, 37, 38][usize::from(digit)]
+        }
+        KeyboardKey::KeypadDigit(digit @ 0..=9) => {
+            [58, 57, 63, 64, 62, 68, 69, 66, 67, 74][usize::from(digit)]
+        }
+        KeyboardKey::Function(number @ 1..=12) => 85 + number,
+        KeyboardKey::Named(named) => {
+            use KeyboardNamedKey as K;
+            match named {
+                K::LeftControl => 2,
+                K::RightControl => 85,
+                K::LeftShift => 5,
+                K::RightShift => 4,
+                K::LeftAlt => 83,
+                K::RightAlt => 84,
+                K::CapsLock => 3,
+                K::Escape => 6,
+                K::Tab => 8,
+                K::Enter => 50,
+                K::Backspace => 60,
+                K::Delete => 61,
+                K::Space => 82,
+                K::ArrowLeft => 72,
+                K::ArrowRight => 79,
+                K::ArrowUp => 80,
+                K::ArrowDown => 73,
+                K::Insert => 101,
+                K::Home => 102,
+                K::End => 104,
+                K::PageUp => 103,
+                K::PageDown => 105,
+                K::PrintScreen => 98,
+                K::ScrollLock => 99,
+                K::Pause => 100,
+                K::NumLock => 106,
+                K::Semicolon => 42,
+                K::Comma => 44,
+                K::Minus => 46,
+                K::LeftBracket => 48,
+                K::RightBracket => 55,
+                K::Apostrophe => 49,
+                K::Period => 51,
+                K::Slash => 52,
+                K::Equal => 53,
+                K::Grave => 54,
+                K::Backslash => 56,
+                K::KeypadPeriod => 65,
+                K::KeypadMinus => 75,
+                K::KeypadPlus => 109,
+                K::KeypadSlash => 107,
+                K::KeypadAsterisk => 108,
+                K::KeypadEnter => 81,
+            }
+        }
+        _ => return None,
+    };
+    SgiKey::try_from(code).ok()
 }
 
 fn memory_modules(configuration: Ip12MemoryConfiguration) -> [Option<Ram>; 4] {
@@ -643,26 +865,315 @@ mod tests {
     use std::fs;
     use std::io;
 
-    use crate::output::MachineOutput;
-    use crate::serial::SerialPort;
+    use crate::endpoint::{EndpointDirection, EndpointKey, EndpointKind};
+    use crate::input::{KeyboardKey, MachineInput, MachineInputPayload, PointerButton};
+    use crate::machine::{Machine, MachineInputError, MachineInputResult};
+    use crate::output::{EndpointOutput, MachineOutput, VideoOutput};
     use se_core::bus::{PhysAddr, PhysicalBus};
-    use se_core::time::VirtualDuration;
-    use se_device::gio::GioBus;
-    use se_device::storage::BlockStorage;
+    use se_core::storage::StorageMedium;
+    use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
+    use se_device::gio::{GioBus, GioSlot};
+    use se_device::lg1::Lg1;
+    use se_device::z85230::Channel;
     use se_float::backend::Backend;
 
     use super::{
         CPU_FREQUENCY_HZ, Ip12, Ip12Error, Ip12MemoryConfiguration, Ip12MemoryConfigurationError,
-        Ip12NonvolatileState, Ip12NonvolatileStateParts, Ip12SimmSize, PROM_BYTES, RAM_BYTES,
-        cpu_config,
+        Ip12NonvolatileState, Ip12NonvolatileStateParts, Ip12Port, Ip12SimmSize, PROM_BYTES,
+        RAM_BYTES, cpu_config,
     };
 
     const MEMORY_CONFIGURATION_INSTRUCTION_BUDGET: usize = 300_000;
     const STACK_SETUP_INSTRUCTION_BUDGET: usize = 30_000;
 
+    #[test]
+    fn endpoint_catalog_is_ordered_and_video_requires_graphics() {
+        let headless = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let headless_catalog = headless.endpoint_catalog();
+        let headless_summary: Vec<_> = headless_catalog
+            .endpoints()
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.key().as_str(),
+                    endpoint.label(),
+                    endpoint.kind(),
+                    endpoint.direction(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            headless_summary,
+            [
+                (
+                    "keyboard.0",
+                    "SGI Keyboard",
+                    EndpointKind::Keyboard,
+                    EndpointDirection::Input
+                ),
+                (
+                    "pointer.0",
+                    "SGI Mouse",
+                    EndpointKind::Pointer,
+                    EndpointDirection::Input
+                ),
+                (
+                    "serial.external.a",
+                    "Serial Port A",
+                    EndpointKind::Serial,
+                    EndpointDirection::Bidirectional
+                ),
+                (
+                    "serial.external.b",
+                    "Serial Port B",
+                    EndpointKind::Serial,
+                    EndpointDirection::Bidirectional
+                ),
+                (
+                    "ethernet.0",
+                    "Ethernet Port 0",
+                    EndpointKind::Ethernet,
+                    EndpointDirection::Bidirectional
+                ),
+            ]
+        );
+        let mut output = MachineOutput::default();
+        headless.publish_current_outputs(&mut output);
+        assert!(output.is_empty());
+
+        let mut gio = GioBus::new();
+        gio.attach(GioSlot::Graphics, Box::new(Lg1::new())).unwrap();
+        let graphics = Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, gio, None, None).unwrap();
+        let catalog = graphics.endpoint_catalog();
+        assert_eq!(&catalog.endpoints()[..5], headless_catalog.endpoints());
+        let video = &catalog.endpoints()[5];
+        assert_eq!(
+            (
+                video.key().as_str(),
+                video.label(),
+                video.kind(),
+                video.direction()
+            ),
+            (
+                "video.0",
+                "LG1 Video Output",
+                EndpointKind::Video,
+                EndpointDirection::Output
+            )
+        );
+        let mut output = MachineOutput::default();
+        graphics.publish_current_outputs(&mut output);
+        assert!(matches!(
+            output.entries(),
+            [(_, EndpointOutput::Video(VideoOutput::NoSignal))]
+        ));
+    }
+
+    #[test]
+    fn endpoint_input_validates_identity_kind_and_direction() {
+        let mut gio = GioBus::new();
+        gio.attach(GioSlot::Graphics, Box::new(Lg1::new())).unwrap();
+        let mut machine = Machine::IndigoIp12(
+            Ip12::new(vec![0; PROM_BYTES], Backend::SoftFloat, gio, None, None).unwrap(),
+        );
+        let input = |key, payload| MachineInput::new(EndpointKey::new(key), payload);
+        assert_eq!(
+            machine.try_receive_input(&input("unknown", MachineInputPayload::SerialByte(1))),
+            Err(MachineInputError::UnknownEndpoint)
+        );
+        assert_eq!(
+            machine.try_receive_input(&input("video.0", MachineInputPayload::SerialByte(1))),
+            Err(MachineInputError::OutputOnlyEndpoint)
+        );
+        assert_eq!(
+            machine.try_receive_input(&input("keyboard.0", MachineInputPayload::SerialByte(1))),
+            Err(MachineInputError::PayloadKindMismatch)
+        );
+        assert_eq!(
+            machine.try_receive_input(&input(
+                "keyboard.0",
+                MachineInputPayload::Keyboard {
+                    key: KeyboardKey::Letter(b'a'),
+                    pressed: true
+                }
+            )),
+            Err(MachineInputError::UnsupportedKeyboardKey)
+        );
+        assert_eq!(
+            machine.try_receive_input(&input(
+                "keyboard.0",
+                MachineInputPayload::Keyboard {
+                    key: KeyboardKey::Letter(b'A'),
+                    pressed: true
+                }
+            )),
+            Ok(MachineInputResult::Consumed)
+        );
+        assert_eq!(
+            machine.try_receive_input(&input(
+                "pointer.0",
+                MachineInputPayload::PointerMotion {
+                    delta_x: 3,
+                    delta_y: -2
+                }
+            )),
+            Ok(MachineInputResult::Consumed)
+        );
+        assert_eq!(
+            machine.try_receive_input(&input(
+                "pointer.0",
+                MachineInputPayload::PointerButton {
+                    button: PointerButton::Left,
+                    pressed: true
+                }
+            )),
+            Ok(MachineInputResult::Consumed)
+        );
+    }
+
+    #[test]
+    fn external_serial_endpoints_route_to_distinct_scc_channels() {
+        const SERIAL_BASE: u64 = 0x1fb8_0d10;
+        let mut ip12 = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        for control in [0x0b, 0x03] {
+            ip12.bus
+                .write(PhysAddr::new(SERIAL_BASE + control), &[3])
+                .unwrap();
+            ip12.bus
+                .write(PhysAddr::new(SERIAL_BASE + control), &[1])
+                .unwrap();
+        }
+        let mut machine = Machine::IndigoIp12(ip12);
+        for (key, value) in [("serial.external.a", b'A'), ("serial.external.b", b'B')] {
+            assert_eq!(
+                machine.try_receive_input(&MachineInput::new(
+                    EndpointKey::new(key),
+                    MachineInputPayload::SerialByte(value)
+                )),
+                Ok(MachineInputResult::Consumed)
+            );
+        }
+        let Machine::IndigoIp12(mut ip12) = machine;
+        for (data, expected) in [(0x0f, b'A'), (0x07, b'B')] {
+            let mut received = [0];
+            ip12.bus
+                .read(PhysAddr::new(SERIAL_BASE + data), &mut received)
+                .unwrap();
+            assert_eq!(received, [expected]);
+        }
+    }
+
+    #[test]
+    fn external_serial_arrivals_are_consumed_when_the_receive_fifo_overruns() {
+        const SERIAL_BASE: u64 = 0x1fb8_0d10;
+        let mut ip12 = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        ip12.bus
+            .write(PhysAddr::new(SERIAL_BASE + 0x0b), &[3])
+            .unwrap();
+        ip12.bus
+            .write(PhysAddr::new(SERIAL_BASE + 0x0b), &[1])
+            .unwrap();
+        let mut machine = Machine::IndigoIp12(ip12);
+        let endpoint = Ip12Port::SerialA.endpoint_key();
+
+        for value in 0..10 {
+            assert_eq!(
+                machine.try_receive_input(&MachineInput::new(
+                    endpoint.clone(),
+                    MachineInputPayload::SerialByte(value)
+                )),
+                Ok(MachineInputResult::Consumed)
+            );
+        }
+
+        let Machine::IndigoIp12(mut ip12) = machine;
+        for expected in [0, 1, 2, 3, 4, 5, 6, 9] {
+            let mut received = [0];
+            ip12.bus
+                .read(PhysAddr::new(SERIAL_BASE + 0x0f), &mut received)
+                .unwrap();
+            assert_eq!(received, [expected]);
+        }
+    }
+
+    #[test]
+    fn keyboard_and_pointer_endpoints_reach_scc_zero_protocol_channels() {
+        const SERIAL_BASE: u64 = 0x1fb8_0d00;
+        let mut ip12 = Ip12::new(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            GioBus::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        for control in [0x0b, 0x03] {
+            ip12.bus
+                .write(PhysAddr::new(SERIAL_BASE + control), &[3])
+                .unwrap();
+            ip12.bus
+                .write(PhysAddr::new(SERIAL_BASE + control), &[1])
+                .unwrap();
+        }
+        let mut machine = Machine::IndigoIp12(ip12);
+        assert_eq!(
+            machine.try_receive_input(&MachineInput::new(
+                EndpointKey::new("keyboard.0"),
+                MachineInputPayload::Keyboard {
+                    key: KeyboardKey::Letter(b'A'),
+                    pressed: true
+                }
+            )),
+            Ok(MachineInputResult::Consumed)
+        );
+        assert_eq!(
+            machine.try_receive_input(&MachineInput::new(
+                EndpointKey::new("pointer.0"),
+                MachineInputPayload::PointerButton {
+                    button: PointerButton::Left,
+                    pressed: true
+                }
+            )),
+            Ok(MachineInputResult::Consumed)
+        );
+        machine.advance_time(
+            VirtualDuration::from_attoseconds(20 * ATTOSECONDS_PER_SECOND / 1000),
+            &mut MachineOutput::default(),
+        );
+        let Machine::IndigoIp12(mut ip12) = machine;
+        for (data, expected) in [(0x0f, 10), (0x07, 0x83)] {
+            let mut received = [0];
+            ip12.bus
+                .read(PhysAddr::new(SERIAL_BASE + data), &mut received)
+                .unwrap();
+            assert_eq!(received, [expected]);
+        }
+    }
+
     struct SizedStorage(u64);
 
-    impl BlockStorage for SizedStorage {
+    impl StorageMedium for SizedStorage {
         fn size_bytes(&self) -> u64 {
             self.0
         }
@@ -725,6 +1236,24 @@ mod tests {
                 Backend::SoftFloat,
                 GioBus::new(),
                 None,
+                None,
+            ),
+            Err(Ip12Error::InvalidPromSize {
+                expected: PROM_BYTES,
+                actual
+            }) if actual == PROM_BYTES - 1
+        ));
+    }
+
+    #[test]
+    fn legacy_constructor_prioritizes_prom_error_over_disk_error() {
+        assert!(matches!(
+            Ip12::new_with_memory(
+                vec![0; PROM_BYTES - 1],
+                Backend::SoftFloat,
+                Ip12MemoryConfiguration::default(),
+                GioBus::new(),
+                Some(Box::new(SizedStorage(513))),
                 None,
             ),
             Err(Ip12Error::InvalidPromSize {
@@ -1277,7 +1806,7 @@ mod tests {
             .write(PhysAddr::new(0x1fb8_01c7), &[1 << 5])
             .unwrap();
 
-        assert_eq!(machine.receive_serial(SerialPort::A, b"A"), 1);
+        machine.receive_serial_character(Channel::A, b'A');
         advance_machine_interrupt_inputs(&mut machine);
         assert_ne!(
             machine.cpu.debug_snapshot().cp0.registers[13] & (1 << 11),

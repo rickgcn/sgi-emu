@@ -1,103 +1,30 @@
 //! Persistent application configuration.
 
-use std::env;
 use std::error::Error;
-use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
-use se_cli::Arguments;
+use se_config::draft::MachineDraft;
 use se_network::config::{NatConfig, PortForwardRule, TransportProtocol};
-use se_ui::bridge::ffi::{
-    MachineConfiguration, NetworkConfiguration, NetworkForwardRule, UiExitState, UiStartupState,
-};
+use se_session::machine::default_machine_draft;
+use se_ui::bridge::ffi::{NetworkConfiguration, NetworkForwardRule, UiExitState, UiStartupState};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ApplicationConfig {
-    machine: MachineConfig,
+    machine: MachineDraft,
     network: NatConfig,
     ui: UiConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct MachineConfig {
-    model: String,
-    memory_bank_a_simm_mib: u8,
-    memory_bank_b_simm_mib: u8,
-    memory_bank_c_simm_mib: u8,
-    prom_path: String,
-    disk_path: String,
-    cdrom_path: String,
-    graphics_board: GraphicsBoard,
-    float_backend: FloatBackend,
-}
-
-impl Default for MachineConfig {
+impl Default for ApplicationConfig {
     fn default() -> Self {
         Self {
-            model: String::from("indigo-ip12"),
-            memory_bank_a_simm_mib: 2,
-            memory_bank_b_simm_mib: 0,
-            memory_bank_c_simm_mib: 0,
-            prom_path: String::new(),
-            disk_path: String::new(),
-            cdrom_path: String::new(),
-            graphics_board: GraphicsBoard::Lg1,
-            float_backend: FloatBackend::SoftFloat,
-        }
-    }
-}
-
-/// The graphics board a new configuration installs.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum GraphicsBoard {
-    /// No graphics board occupies the slot.
-    None,
-    /// An LG1 entry graphics board.
-    #[default]
-    Lg1,
-}
-
-impl GraphicsBoard {
-    const fn identifier(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Lg1 => "lg1",
-        }
-    }
-
-    fn from_identifier(identifier: &str) -> Self {
-        match identifier {
-            "none" => Self::None,
-            _ => Self::Lg1,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum FloatBackend {
-    #[default]
-    SoftFloat,
-    Native,
-}
-
-impl FloatBackend {
-    const fn identifier(self) -> &'static str {
-        match self {
-            Self::SoftFloat => "softfloat",
-            Self::Native => "native",
-        }
-    }
-
-    fn from_identifier(identifier: &str) -> Self {
-        match identifier {
-            "native" => Self::Native,
-            _ => Self::SoftFloat,
+            machine: default_machine_draft(),
+            network: NatConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
@@ -109,47 +36,21 @@ struct UiConfig {
 }
 
 impl ApplicationConfig {
-    pub fn apply_environment(&mut self) {
-        let prom_path = env::var_os("SE_INDIGO_IP12_PROM");
-        self.apply_environment_prom(prom_path.as_deref());
+    pub fn machine_draft(&self) -> MachineDraft {
+        self.machine.clone()
     }
 
-    fn apply_environment_prom(&mut self, prom_path: Option<&OsStr>) {
-        if let Some(prom_path) = prom_path {
-            self.machine.prom_path = prom_path.to_string_lossy().into_owned();
-        }
+    pub fn set_machine_draft(&mut self, machine: MachineDraft) {
+        self.machine = machine;
     }
 
-    pub fn apply_arguments(&mut self, arguments: &Arguments) {
-        if let Some(model) = arguments.machine() {
-            self.machine.model = String::from(model);
-        }
-        if let Some(prom_path) = arguments.prom() {
-            self.machine.prom_path = prom_path.to_string_lossy().into_owned();
-        }
-        if let Some(float_backend) = arguments.float_backend() {
-            self.machine.float_backend = FloatBackend::from_identifier(float_backend);
-        }
-    }
-
-    pub fn machine_configuration(&self) -> MachineConfiguration {
-        MachineConfiguration {
-            machine_model: self.machine.model.clone(),
-            memory_bank_a_simm_mib: self.machine.memory_bank_a_simm_mib,
-            memory_bank_b_simm_mib: self.machine.memory_bank_b_simm_mib,
-            memory_bank_c_simm_mib: self.machine.memory_bank_c_simm_mib,
-            prom_path: self.machine.prom_path.clone(),
-            disk_path: self.machine.disk_path.clone(),
-            cdrom_path: self.machine.cdrom_path.clone(),
-            graphics_board: String::from(self.machine.graphics_board.identifier()),
-            float_backend: String::from(self.machine.float_backend.identifier()),
-            network: network_configuration_dto(&self.network),
-        }
+    pub fn network_configuration(&self) -> NetworkConfiguration {
+        network_configuration_dto(&self.network)
     }
 
     pub fn ui_startup_state(&self, startup_error: String) -> UiStartupState {
         UiStartupState {
-            machine: self.machine_configuration(),
+            network: self.network_configuration(),
             window_geometry: self.ui.window_geometry.clone(),
             window_state: self.ui.window_state.clone(),
             startup_error,
@@ -157,17 +58,8 @@ impl ApplicationConfig {
     }
 
     pub fn apply_ui_exit_state(&mut self, exit: UiExitState) -> Result<(), String> {
-        let network = parse_network_configuration(&exit.machine.network)?;
+        let network = parse_network_configuration(&exit.network)?;
         self.network = network;
-        self.machine.model = exit.machine.machine_model;
-        self.machine.memory_bank_a_simm_mib = exit.machine.memory_bank_a_simm_mib;
-        self.machine.memory_bank_b_simm_mib = exit.machine.memory_bank_b_simm_mib;
-        self.machine.memory_bank_c_simm_mib = exit.machine.memory_bank_c_simm_mib;
-        self.machine.prom_path = exit.machine.prom_path;
-        self.machine.disk_path = exit.machine.disk_path;
-        self.machine.cdrom_path = exit.machine.cdrom_path;
-        self.machine.graphics_board = GraphicsBoard::from_identifier(&exit.machine.graphics_board);
-        self.machine.float_backend = FloatBackend::from_identifier(&exit.machine.float_backend);
         self.ui.window_geometry = exit.window_geometry;
         self.ui.window_state = exit.window_state;
         Ok(())
@@ -280,19 +172,55 @@ pub fn save(path: &Path, config: &ApplicationConfig) -> Result<(), Box<dyn Error
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::fs;
 
-    use clap::Parser;
-    use se_cli::Arguments;
-
+    use se_config::draft::Edit;
+    use se_config::id::PropertyId;
+    use se_config::value::PropertyValue;
     use se_network::config::NatConfig;
     use se_ui::bridge::ffi::{NetworkForwardRule, UiExitState};
 
     use super::{
-        ApplicationConfig, FloatBackend, GraphicsBoard, MachineConfig, load,
-        network_configuration_dto, parse_network_configuration, save,
+        ApplicationConfig, load, network_configuration_dto, parse_network_configuration, save,
     };
+
+    #[test]
+    fn default_configuration_uses_the_session_draft() {
+        let config = ApplicationConfig::default();
+        assert_eq!(config.machine, se_session::machine::default_machine_draft());
+    }
+
+    #[test]
+    fn machine_draft_round_trips_without_a_ui_projection() {
+        let mut config = ApplicationConfig::default();
+        config.machine.apply(Edit::SetProperty {
+            property: PropertyId(String::from("test.opaque")),
+            value: PropertyValue::Text(String::from("prom.bin")),
+        });
+        let serialized = toml::to_string(&config).unwrap();
+        let restored: ApplicationConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.machine, config.machine);
+    }
+
+    #[test]
+    fn old_machine_schema_is_rejected_without_migration() {
+        let old = r#"
+            [machine]
+            model = "indigo-ip12"
+            memory_bank_a_simm_mib = 2
+            prom_path = "prom.bin"
+            [network]
+            subnet = "10.0.2.0/24"
+            gateway = "10.0.2.2"
+            dns = "10.0.2.3"
+            dhcp_start = "10.0.2.15"
+            forwards = []
+            [ui]
+            window_geometry = ""
+            window_state = ""
+        "#;
+        assert!(toml::from_str::<ApplicationConfig>(old).is_err());
+    }
 
     #[test]
     fn editable_invalid_ports_and_subnets_are_not_silently_changed() {
@@ -312,164 +240,20 @@ mod tests {
     }
 
     #[test]
-    fn default_configuration_uses_indigo_lg1_and_softfloat() {
-        let config = ApplicationConfig::default();
-
-        assert_eq!(config.machine.model, "indigo-ip12");
-        assert_eq!(config.machine.memory_bank_a_simm_mib, 2);
-        assert_eq!(config.machine.memory_bank_b_simm_mib, 0);
-        assert_eq!(config.machine.memory_bank_c_simm_mib, 0);
-        assert!(config.machine.prom_path.is_empty());
-        assert!(config.machine.disk_path.is_empty());
-        assert!(config.machine.cdrom_path.is_empty());
-        assert!(matches!(config.machine.graphics_board, GraphicsBoard::Lg1));
-        assert!(matches!(
-            config.machine.float_backend,
-            FloatBackend::SoftFloat
-        ));
-    }
-
-    #[test]
-    fn network_settings_round_trip_through_toml_and_ui() {
-        let mut config = ApplicationConfig::default();
-        config
-            .network
-            .forwards
-            .push(se_network::config::PortForwardRule {
-                protocol: se_network::config::TransportProtocol::Udp,
-                host_address: "127.0.0.1".parse().unwrap(),
-                host_port: 5300,
-                guest_address: "10.0.2.20".parse().unwrap(),
-                guest_port: 53,
-            });
-        let serialized = toml::to_string(&config).unwrap();
-        assert!(serialized.contains("[[network.forwards]]"));
-        let loaded: ApplicationConfig = toml::from_str(&serialized).unwrap();
-        let mut applied = ApplicationConfig::default();
-        applied
-            .apply_ui_exit_state(se_ui::bridge::ffi::UiExitState {
-                machine: loaded.machine_configuration(),
-                window_geometry: String::new(),
-                window_state: String::new(),
-            })
-            .unwrap();
-        assert_eq!(applied.network, config.network);
-    }
-
-    #[test]
-    fn invalid_exit_network_reports_an_error_without_partially_updating_settings() {
+    fn invalid_exit_network_does_not_partially_update_settings() {
         let mut config = ApplicationConfig::default();
         let original = toml::to_string(&config).unwrap();
-        let mut machine = config.machine_configuration();
-        machine.prom_path = String::from("replacement.bin");
-        machine.network.gateway = String::from("invalid-address");
-
+        let mut network = config.network_configuration();
+        network.gateway = String::from("invalid-address");
         let error = config
             .apply_ui_exit_state(UiExitState {
-                machine,
+                network,
                 window_geometry: String::from("replacement-geometry"),
                 window_state: String::from("replacement-state"),
             })
             .unwrap_err();
-
         assert_eq!(error, "Gateway must be an IPv4 address");
         assert_eq!(toml::to_string(&config).unwrap(), original);
-    }
-
-    #[test]
-    fn unknown_fields_do_not_prevent_loading() {
-        let config: ApplicationConfig = toml::from_str(
-            r#"
-                future_value = true
-
-                [machine]
-                model = "indigo-ip12"
-                memory_bank_a_simm_mib = 8
-                memory_bank_b_simm_mib = 0
-                memory_bank_c_simm_mib = 4
-                prom_path = "prom.bin"
-                disk_path = "disk.img"
-                cdrom_path = "disc.iso"
-                graphics_board = "lg1"
-                float_backend = "native"
-                another_future_value = 7
-
-                [network]
-                subnet = "10.0.2.0/24"
-                gateway = "10.0.2.2"
-                dns = "10.0.2.3"
-                dhcp_start = "10.0.2.15"
-                forwards = []
-
-                [ui]
-                window_geometry = ""
-                window_state = ""
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(config.machine.memory_bank_a_simm_mib, 8);
-        assert_eq!(config.machine.memory_bank_b_simm_mib, 0);
-        assert_eq!(config.machine.memory_bank_c_simm_mib, 4);
-        assert_eq!(config.machine.prom_path, "prom.bin");
-        assert_eq!(config.machine.disk_path, "disk.img");
-        assert_eq!(config.machine.cdrom_path, "disc.iso");
-        assert!(matches!(config.machine.graphics_board, GraphicsBoard::Lg1));
-        assert!(matches!(config.machine.float_backend, FloatBackend::Native));
-    }
-
-    #[test]
-    fn configuration_without_graphics_board_is_rejected() {
-        let error = toml::from_str::<MachineConfig>(
-            r#"
-                model = "indigo-ip12"
-                memory_bank_a_simm_mib = 2
-                memory_bank_b_simm_mib = 0
-                memory_bank_c_simm_mib = 0
-                prom_path = "prom.bin"
-                disk_path = "disk.img"
-                cdrom_path = ""
-                float_backend = "native"
-            "#,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("missing field `graphics_board`"));
-    }
-
-    #[test]
-    fn environment_and_arguments_override_saved_machine_configuration_in_order() {
-        let mut config = ApplicationConfig::default();
-        config.machine.prom_path = String::from("saved.bin");
-        config.apply_environment_prom(Some(OsStr::new("environment.bin")));
-        assert_eq!(config.machine.prom_path, "environment.bin");
-
-        let arguments = Arguments::try_parse_from([
-            "sgi-emu",
-            "--prom",
-            "command-line.bin",
-            "--float-backend",
-            "native",
-        ])
-        .unwrap();
-        config.apply_arguments(&arguments);
-
-        assert_eq!(config.machine.prom_path, "command-line.bin");
-        assert!(matches!(config.machine.float_backend, FloatBackend::Native));
-    }
-
-    #[test]
-    fn an_existing_empty_configuration_is_rejected() {
-        let directory =
-            std::env::temp_dir().join(format!("sgi-emu-empty-config-test-{}", std::process::id()));
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("config.toml");
-        fs::write(&path, []).unwrap();
-
-        assert!(load(&path).is_err());
-
-        fs::remove_file(path).unwrap();
-        fs::remove_dir(directory).unwrap();
     }
 
     #[test]
@@ -478,27 +262,14 @@ mod tests {
             std::env::temp_dir().join(format!("sgi-emu-config-test-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("config.toml");
-
         let mut config = ApplicationConfig::default();
         save(&path, &config).unwrap();
-        config.machine.prom_path = String::from("replacement.bin");
-        config.machine.disk_path = String::from("disk.img");
-        config.machine.cdrom_path = String::from("disc.iso");
-        config.machine.memory_bank_a_simm_mib = 0;
-        config.machine.memory_bank_b_simm_mib = 8;
-        config.machine.memory_bank_c_simm_mib = 4;
-        config.machine.graphics_board = GraphicsBoard::None;
+        config.machine.apply(Edit::SetProperty {
+            property: PropertyId(String::from("test.opaque")),
+            value: PropertyValue::Text(String::from("replacement.bin")),
+        });
         save(&path, &config).unwrap();
-
-        let loaded = load(&path).unwrap();
-        assert_eq!(loaded.machine.prom_path, "replacement.bin");
-        assert_eq!(loaded.machine.disk_path, "disk.img");
-        assert_eq!(loaded.machine.cdrom_path, "disc.iso");
-        assert_eq!(loaded.machine.memory_bank_a_simm_mib, 0);
-        assert_eq!(loaded.machine.memory_bank_b_simm_mib, 8);
-        assert_eq!(loaded.machine.memory_bank_c_simm_mib, 4);
-        assert!(matches!(loaded.machine.graphics_board, GraphicsBoard::None));
-
+        assert_eq!(load(&path).unwrap().machine, config.machine);
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
     }
