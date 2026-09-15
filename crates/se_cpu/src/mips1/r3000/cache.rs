@@ -43,30 +43,30 @@ impl Cache {
     ) -> Result<(), BusError> {
         let access = self.access(address, data.len());
         let entry = self.entries[access.index];
-        if entry.valid && entry.page_frame == access.page_frame {
-            data.copy_from_slice(&entry.data[access.offset..access.offset + data.len()]);
-            return Ok(());
-        }
+        let word = if entry.valid && entry.page_frame == access.page_frame {
+            entry.data
+        } else {
+            let refill_base = access.word_address & !((self.refill_bytes as u32) - 1);
+            let mut refill = vec![0; self.refill_bytes];
+            for (word_index, word) in refill.chunks_exact_mut(WORD_BYTES).enumerate() {
+                let word_address = refill_base + (word_index * WORD_BYTES) as u32;
+                bus.read(PhysAddr::new(u64::from(word_address)), word)?;
+            }
 
-        let refill_base = access.word_address & !((self.refill_bytes as u32) - 1);
-        let mut refill = vec![0; self.refill_bytes];
-        for (word_index, word) in refill.chunks_exact_mut(WORD_BYTES).enumerate() {
-            let word_address = refill_base + (word_index * WORD_BYTES) as u32;
-            bus.read(PhysAddr::new(u64::from(word_address)), word)?;
-        }
+            for (word_index, word) in refill.chunks_exact(WORD_BYTES).enumerate() {
+                let word_address = refill_base + (word_index * WORD_BYTES) as u32;
+                let index = self.index(word_address);
+                self.entries[index] = CacheEntry {
+                    page_frame: page_frame(word_address),
+                    data: word.try_into().expect("a cache word has four bytes"),
+                    valid: true,
+                };
+            }
 
-        for (word_index, word) in refill.chunks_exact(WORD_BYTES).enumerate() {
-            let word_address = refill_base + (word_index * WORD_BYTES) as u32;
-            let index = self.index(word_address);
-            self.entries[index] = CacheEntry {
-                page_frame: page_frame(word_address),
-                data: word.try_into().expect("a cache word has four bytes"),
-                valid: true,
-            };
-        }
+            self.entries[access.index].data
+        };
 
-        let entry = self.entries[access.index];
-        data.copy_from_slice(&entry.data[access.offset..access.offset + data.len()]);
+        copy_word_fragment(data, &word, access.offset);
         Ok(())
     }
 
@@ -109,7 +109,7 @@ impl Cache {
     fn read_isolated(&self, address: PhysAddr, data: &mut [u8]) -> bool {
         let access = self.access(address, data.len());
         let entry = self.entries[access.index];
-        data.copy_from_slice(&entry.data[access.offset..access.offset + data.len()]);
+        copy_word_fragment(data, &entry.data, access.offset);
         !(entry.valid && entry.page_frame == access.page_frame)
     }
 
@@ -154,6 +154,32 @@ struct CacheAccess {
     offset: usize,
     index: usize,
     page_frame: u32,
+}
+
+#[inline(always)]
+fn copy_word_fragment(destination: &mut [u8], word: &[u8; WORD_BYTES], offset: usize) {
+    let source = &word[offset..];
+    match (destination, source) {
+        ([byte0], [source0, ..]) => {
+            *byte0 = *source0;
+        }
+        ([byte0, byte1], [source0, source1, ..]) => {
+            *byte0 = *source0;
+            *byte1 = *source1;
+        }
+        ([byte0, byte1, byte2], [source0, source1, source2, ..]) => {
+            *byte0 = *source0;
+            *byte1 = *source1;
+            *byte2 = *source2;
+        }
+        ([byte0, byte1, byte2, byte3], [source0, source1, source2, source3, ..]) => {
+            *byte0 = *source0;
+            *byte1 = *source1;
+            *byte2 = *source2;
+            *byte3 = *source3;
+        }
+        _ => unreachable!("a cache access must remain within one word"),
+    }
 }
 
 const fn page_frame(word_address: u32) -> u32 {
@@ -480,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_hits_return_every_supported_access_width_without_bus_reads() {
+    fn cache_hits_return_every_valid_word_window_without_bus_reads() {
         let mut caches = Caches::new(CONFIG);
         caches.write_isolated(
             CacheBank::Instruction,
@@ -491,8 +517,14 @@ mod tests {
         bus.read_fault_address = Some(PhysAddr::new(0x300));
 
         for (offset, length, expected) in [
+            (0, 1, &[10][..]),
+            (1, 1, &[11][..]),
+            (2, 1, &[12][..]),
             (3, 1, &[13][..]),
+            (0, 2, &[10, 11][..]),
+            (1, 2, &[11, 12][..]),
             (2, 2, &[12, 13][..]),
+            (0, 3, &[10, 11, 12][..]),
             (1, 3, &[11, 12, 13][..]),
             (0, 4, &[10, 11, 12, 13][..]),
         ] {
