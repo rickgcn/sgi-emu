@@ -16,7 +16,9 @@ se_session.workspace = true
 vt100.workspace = true
 
 [build-dependencies]
+cc.workspace = true
 cxx-build.workspace = true
+pkg-config = "0.3"
 qt-build-utils.workspace = true
 
 [dev-dependencies]
