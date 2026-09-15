@@ -1,8 +1,8 @@
 #include "se_ui/display_widget.h"
 
+#include "se_ui/frontend/host_mouse_capture.h"
 #include "se_ui/src/bridge.rs.h"
 
-#include <QCursor>
 #include <QEvent>
 #include <QFocusEvent>
 #include <QHideEvent>
@@ -183,6 +183,7 @@ struct DisplayWidget::State {
     std::int64_t pending_y = 0;
     double fractional_x = 0.0;
     double fractional_y = 0.0;
+    std::unique_ptr<frontend::HostMouseCapture> mouse_capture;
 };
 
 DisplayWidget::DisplayWidget(const UiSession& session, QWidget* parent)
@@ -194,6 +195,10 @@ DisplayWidget::DisplayWidget(const UiSession& session, QWidget* parent)
     setAttribute(Qt::WA_KeyCompression, false);
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
+    state_->mouse_capture = std::make_unique<frontend::HostMouseCapture>(
+        [this](double delta_x, double delta_y) {
+            handle_host_motion(delta_x, delta_y);
+        });
 }
 
 DisplayWidget::~DisplayWidget() {
@@ -417,16 +422,6 @@ void DisplayWidget::mouseReleaseEvent(QMouseEvent* event) {
 }
 
 void DisplayWidget::mouseMoveEvent(QMouseEvent* event) {
-    if (!state_->captured) {
-        event->accept();
-        return;
-    }
-    const QPoint center = mapToGlobal(rect().center());
-    const QPoint current = event->globalPosition().toPoint();
-    if (current != center) {
-        handle_host_motion(current.x() - center.x(), current.y() - center.y());
-        QCursor::setPos(center);
-    }
     event->accept();
 }
 
@@ -434,16 +429,18 @@ void DisplayWidget::begin_pointer_capture() {
     if (state_->captured || !state_->input_enabled || !state_->pointer_endpoint.has_value()) {
         return;
     }
-    state_->captured = true;
     state_->capture_click_armed = false;
     state_->pending_x = 0;
     state_->pending_y = 0;
     state_->fractional_x = 0;
     state_->fractional_y = 0;
     state_->mouse_buttons.fill(false);
-    grabMouse(Qt::BlankCursor);
+    auto* target = window() == nullptr ? nullptr : window()->windowHandle();
+    if (!state_->mouse_capture->capture(target)) {
+        return;
+    }
+    state_->captured = true;
     setFocus(Qt::MouseFocusReason);
-    QCursor::setPos(mapToGlobal(rect().center()));
 
     for (const auto button : {
              PointerButtonDto::Left,
@@ -467,8 +464,7 @@ void DisplayWidget::end_pointer_capture() {
     state_->pending_y = 0;
     state_->fractional_x = 0;
     state_->fractional_y = 0;
-    releaseMouse();
-    unsetCursor();
+    state_->mouse_capture->release();
 }
 
 void DisplayWidget::abort_input() {
