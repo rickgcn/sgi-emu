@@ -429,6 +429,27 @@ def package_linux(
     return archive
 
 
+def sign_macos_bundle(app: Path) -> None:
+    frameworks = sorted((app / "Contents/Frameworks").glob("*.framework"))
+    plugins = sorted((app / "Contents/PlugIns").rglob("*.dylib"))
+    if not frameworks:
+        fail("packaged macOS application contains no Qt frameworks")
+    if not plugins:
+        fail("packaged macOS application contains no Qt plugins")
+
+    for nested_code in [*frameworks, *plugins]:
+        run(["codesign", "--force", "--sign", "-", nested_code])
+    run(["codesign", "--force", "--sign", "-", app])
+    run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", app])
+
+
+def ensure_macos_framework_rpath(executable: Path) -> None:
+    framework_rpath = "@executable_path/../Frameworks"
+    load_commands = run(["otool", "-l", executable], capture=True).stdout
+    if framework_rpath not in load_commands:
+        run(["install_name_tool", "-add_rpath", framework_rpath, executable])
+
+
 def package_macos(
     binary: Path,
     package_root: Path,
@@ -460,8 +481,9 @@ def package_macos(
         plistlib.dump(info, plist, sort_keys=True)
 
     deploy_tool = require_file(qt_root / "bin/macdeployqt")
-    run([deploy_tool, app, "-always-overwrite", "-codesign=-", "-verbose=2"])
-    run(["codesign", "--verify", "--deep", "--strict", app])
+    run([deploy_tool, app, "-always-overwrite", "-verbose=2"])
+    ensure_macos_framework_rpath(executable)
+    sign_macos_bundle(app)
     dependencies = run(["otool", "-L", executable], capture=True).stdout
     if str(qt_root) in dependencies:
         fail("packaged macOS application still references the build Qt tree")
