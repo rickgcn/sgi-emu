@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(test)),
+    windows_subsystem = "windows"
+)]
+
 //! Application entry point and runtime lifetime owner.
 
 mod config;
