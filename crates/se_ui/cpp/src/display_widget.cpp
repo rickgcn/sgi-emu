@@ -254,6 +254,11 @@ void DisplayWidget::release_input() {
 }
 
 bool DisplayWidget::event(QEvent* event) {
+    if (event->type() == QEvent::UngrabMouse && state_->captured) {
+        release_guest_inputs();
+        event->accept();
+        return true;
+    }
     if (event->type() == QEvent::ShortcutOverride && state_->input_enabled) {
         const auto* key_event = static_cast<QKeyEvent*>(event);
         if (release_chord(*key_event) || mapped_key(*key_event).has_value()) {
@@ -435,8 +440,7 @@ void DisplayWidget::begin_pointer_capture() {
     state_->fractional_x = 0;
     state_->fractional_y = 0;
     state_->mouse_buttons.fill(false);
-    auto* target = window() == nullptr ? nullptr : window()->windowHandle();
-    if (!state_->mouse_capture->capture(target)) {
+    if (!state_->mouse_capture->capture(this)) {
         return;
     }
     state_->captured = true;

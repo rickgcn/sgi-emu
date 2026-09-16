@@ -7,6 +7,7 @@
 #include <QMetaObject>
 #include <QPointer>
 #include <QString>
+#include <QWidget>
 
 #include <utility>
 
@@ -59,11 +60,30 @@ struct HostMouseCapture::Implementation {
         : backend(make_backend(std::move(motion_handler))) {
     }
 
-    bool capture(QWindow* capture_target) {
+    bool capture(QWidget* capture_target) {
         release();
-        if (capture_target == nullptr || capture_target->handle() == nullptr
-            || !capture_target->isVisible()
-            || !backend->capture(capture_target)) {
+        if (capture_target == nullptr || !capture_target->isVisible()) {
+            return false;
+        }
+
+        auto* window_widget = capture_target->window();
+        auto* capture_window = window_widget == nullptr
+            ? nullptr
+            : window_widget->windowHandle();
+        if (capture_window == nullptr || capture_window->handle() == nullptr) {
+            return false;
+        }
+
+        capture_target->grabMouse();
+        if (QWidget::mouseGrabber() != capture_target) {
+            return false;
+        }
+        if (!backend->capture(capture_window)
+            || QWidget::mouseGrabber() != capture_target) {
+            backend->release();
+            if (QWidget::mouseGrabber() == capture_target) {
+                capture_target->releaseMouse();
+            }
             return false;
         }
 
@@ -87,6 +107,9 @@ struct HostMouseCapture::Implementation {
             QObject::disconnect(target_destroyed);
             target_destroyed = {};
         }
+        if (target != nullptr && QWidget::mouseGrabber() == target) {
+            target->releaseMouse();
+        }
         backend->release();
         restore_cursor();
         target = nullptr;
@@ -100,7 +123,7 @@ struct HostMouseCapture::Implementation {
     }
 
     std::unique_ptr<HostMouseCaptureBackend> backend;
-    QPointer<QWindow> target;
+    QPointer<QWidget> target;
     QMetaObject::Connection target_destroyed;
     bool cursor_override_active = false;
 };
@@ -114,7 +137,7 @@ HostMouseCapture::~HostMouseCapture() {
     implementation_->release();
 }
 
-bool HostMouseCapture::capture(QWindow* target) {
+bool HostMouseCapture::capture(QWidget* target) {
     return implementation_->capture(target);
 }
 
@@ -123,7 +146,9 @@ void HostMouseCapture::release() {
 }
 
 bool HostMouseCapture::captured() const {
-    return implementation_->backend->captured();
+    return implementation_->target != nullptr
+        && QWidget::mouseGrabber() == implementation_->target
+        && implementation_->backend->captured();
 }
 
 } // namespace se_ui::frontend

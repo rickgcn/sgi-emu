@@ -34,21 +34,31 @@ public:
         }
 
         const auto window = static_cast<Window>(target->winId());
-        const int status = XGrabPointer(
-            qt_display_,
-            window,
-            True,
-            ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
-            GrabModeAsync,
-            GrabModeAsync,
-            window,
-            None,
-            CurrentTime);
-        XFlush(qt_display_);
-        if (status != GrabSuccess) {
+        Window root = None;
+        Window child = None;
+        int root_x = 0;
+        int root_y = 0;
+        int window_x = 0;
+        int window_y = 0;
+        unsigned int mask = 0;
+        if (window == None
+            || XQueryPointer(
+                   qt_display_,
+                   window,
+                   &root,
+                   &child,
+                   &root_x,
+                   &root_y,
+                   &window_x,
+                   &window_y,
+                   &mask)
+                == False) {
             return false;
         }
 
+        window_ = window;
+        anchor_x_ = window_x;
+        anchor_y_ = window_y;
         captured_ = true;
         return true;
     }
@@ -58,8 +68,7 @@ public:
             return;
         }
         captured_ = false;
-        XUngrabPointer(qt_display_, CurrentTime);
-        XFlush(qt_display_);
+        window_ = None;
     }
 
     bool captured() const override {
@@ -129,6 +138,7 @@ private:
 
             if (captured_ && cookie.evtype == XI_RawMotion) {
                 handle_motion(*static_cast<XIRawEvent*>(cookie.data));
+                pin_pointer();
             }
             XFreeEventData(raw_display_, &cookie);
         }
@@ -155,11 +165,31 @@ private:
         }
     }
 
+    void pin_pointer() const {
+        if (window_ == None) {
+            return;
+        }
+        XWarpPointer(
+            qt_display_,
+            None,
+            window_,
+            0,
+            0,
+            0,
+            0,
+            anchor_x_,
+            anchor_y_);
+        XFlush(qt_display_);
+    }
+
     RelativeMotionHandler motion_handler_;
     Display* qt_display_ = nullptr;
     Display* raw_display_ = nullptr;
     std::unique_ptr<QSocketNotifier> notifier_;
+    Window window_ = None;
     int xi_opcode_ = 0;
+    int anchor_x_ = 0;
+    int anchor_y_ = 0;
     bool available_ = false;
     bool captured_ = false;
 };

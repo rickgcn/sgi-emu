@@ -3,7 +3,7 @@
 #include <functional>
 #include <memory>
 
-class QWindow;
+class QWidget;
 
 namespace se_ui::frontend {
 
@@ -17,7 +17,7 @@ public:
     HostMouseCapture(const HostMouseCapture&) = delete;
     HostMouseCapture& operator=(const HostMouseCapture&) = delete;
 
-    bool capture(QWindow* target);
+    bool capture(QWidget* target);
     void release();
     bool captured() const;
 

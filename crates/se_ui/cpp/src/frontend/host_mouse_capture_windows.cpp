@@ -44,16 +44,17 @@ public:
             return false;
         }
 
-        SetCapture(window);
-        if (GetCapture() != window || !clip_to_window(window)) {
-            if (GetCapture() == window) {
-                ReleaseCapture();
-            }
+        POINT anchor{};
+        if (GetCapture() != window || !GetCursorPos(&anchor)
+            || !ScreenToClient(window, &anchor)
+            || !clip_to_anchor(window, anchor)) {
+            ClipCursor(nullptr);
             unregister_raw_input();
             return false;
         }
 
         window_ = window;
+        anchor_ = anchor;
         captured_ = true;
         absolute_position_.reset();
         return true;
@@ -66,9 +67,6 @@ public:
 
         captured_ = false;
         ClipCursor(nullptr);
-        if (GetCapture() == window_) {
-            ReleaseCapture();
-        }
         unregister_raw_input();
         absolute_position_.reset();
         window_ = nullptr;
@@ -92,27 +90,21 @@ public:
             handle_raw_input(reinterpret_cast<HRAWINPUT>(native_message->lParam));
         } else if (native_message->hwnd == window_
                    && native_message->message == WM_WINDOWPOSCHANGED) {
-            clip_to_window(window_);
+            clip_to_anchor(window_, anchor_);
         }
         return false;
     }
 
 private:
-    static bool clip_to_window(HWND window) {
-        RECT client{};
-        if (!GetClientRect(window, &client)) {
+    static bool clip_to_anchor(HWND window, POINT anchor) {
+        if (!ClientToScreen(window, &anchor)) {
             return false;
         }
-        POINT corners[2]{
-            {client.left, client.top},
-            {client.right, client.bottom},
-        };
-        MapWindowPoints(window, nullptr, corners, 2);
         const RECT screen{
-            corners[0].x,
-            corners[0].y,
-            corners[1].x,
-            corners[1].y,
+            anchor.x,
+            anchor.y,
+            anchor.x + 1,
+            anchor.y + 1,
         };
         return ClipCursor(&screen) != FALSE;
     }
@@ -187,6 +179,7 @@ private:
 
     RelativeMotionHandler motion_handler_;
     HWND window_ = nullptr;
+    POINT anchor_{};
     bool captured_ = false;
     std::optional<POINT> absolute_position_;
 };
