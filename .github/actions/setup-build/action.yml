@@ -21,6 +21,39 @@ runs:
       with:
         python-version: "3.14"
 
+    - name: Install Rust toolchain
+      shell: bash
+      run: |
+        python - <<'PY'
+        import subprocess
+        import tomllib
+        from pathlib import Path
+
+        with Path("rust-toolchain.toml").open("rb") as toolchain_file:
+            toolchain = tomllib.load(toolchain_file)["toolchain"]
+
+        command = [
+            "rustup",
+            "toolchain",
+            "install",
+            toolchain["channel"],
+            "--profile",
+            toolchain.get("profile", "default"),
+        ]
+        for component in toolchain.get("components", []):
+            command.extend(["--component", component])
+        for target in toolchain.get("targets", []):
+            command.extend(["--target", target])
+
+        subprocess.run(command, check=True)
+        PY
+        echo "RUSTUP_AUTO_INSTALL=0" >> "$GITHUB_ENV"
+        RUSTUP_AUTO_INSTALL=0 rustc --version --verbose
+        RUSTUP_AUTO_INSTALL=0 cargo --version
+        RUSTUP_AUTO_INSTALL=0 rustdoc --version
+        RUSTUP_AUTO_INSTALL=0 cargo clippy --version
+        RUSTUP_AUTO_INSTALL=0 cargo fmt --version
+
     - name: Install native build tools
       shell: bash
       run: python -m pip install -r .github/requirements-native.txt
@@ -64,7 +97,3 @@ runs:
         modules: ${{ inputs.qt-modules }}
         cache: true
         setup-python: false
-
-    - name: Show Rust toolchain
-      shell: bash
-      run: rustc --version --verbose
