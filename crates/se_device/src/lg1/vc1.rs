@@ -52,6 +52,12 @@ const SYS_CTRL_DID: u8 = 1 << 3;
 /// System control bit that displays the hardware cursor, active high.
 pub(super) const SYS_CTRL_CURSOR_DISPLAY: u8 = 1 << 5;
 
+/// System control bits consumed by active-frame composition.
+///
+/// Timing and data-path enable changes are signal transitions handled by the
+/// board without rebuilding an otherwise unchanged frame.
+const SYS_CTRL_COMPOSITION_MASK: u8 = SYS_CTRL_DID | SYS_CTRL_CURSOR_DISPLAY;
+
 /// Control bank address of the cursor bitmap entry pointer.
 const CUR_EP: u16 = 0x20;
 /// Control bank address of the cursor horizontal position.
@@ -377,37 +383,56 @@ impl Vc1 {
     }
 
     /// Writes one byte to the selected VC1 function.
-    pub(super) fn write(&mut self, selector: Selector, value: u8) {
+    ///
+    /// Returns whether the write changed state consumed by frame composition.
+    /// Host addressing, timing-only control, and test-register writes return
+    /// `false`.
+    pub(super) fn write(&mut self, selector: Selector, value: u8) -> bool {
         match selector {
             Selector::AddressLow => {
                 self.address = (self.address & 0xff00) | u16::from(value);
+                false
             }
             Selector::AddressHigh => {
                 self.address = (self.address & 0x00ff) | (u16::from(value) << 8);
+                false
             }
-            Selector::SystemControl => self.system_control = value,
+            Selector::SystemControl => {
+                let changed = (self.system_control ^ value) & SYS_CTRL_COMPOSITION_MASK != 0;
+                self.system_control = value;
+                changed
+            }
             Selector::Control => {
                 let index = usize::from(self.address) % CONTROL_BYTES;
                 let address = self.address % CONTROL_BYTES as u16;
-                self.control[index] = control_byte_value(address, value);
+                let updated = control_byte_value(address, value);
+                let changed =
+                    self.control[index] != updated && control_byte_affects_composition(address);
+                self.control[index] = updated;
                 self.advance_address();
                 self.reload_frame_total_lines();
+                changed
             }
             Selector::XmapMode => {
                 let index = usize::from(self.address) % XMAP_BYTES;
+                let changed = self.xmap[index] != value;
                 self.xmap[index] = value;
                 self.advance_address();
+                changed
             }
             Selector::Sram => {
                 let index = usize::from(self.address) % SRAM_BYTES;
+                let changed = self.sram[index] != value;
                 self.sram[index] = value;
                 self.advance_address();
                 self.reload_frame_total_lines();
+                changed
             }
             Selector::Test => {
                 let index = usize::from(self.address) % TEST_BYTES;
                 self.test[index] = value;
                 self.advance_address();
+                false
             }
         }
     }
@@ -498,6 +523,11 @@ const fn control_byte_value(address: u16, value: u8) -> u8 {
     }
 }
 
+/// Reports whether one control-bank byte is consumed by frame composition.
+const fn control_byte_affects_composition(address: u16) -> bool {
+    (address >= CUR_EP && address <= CUR_MODE + 1) || address == DID_EP || address == DID_EP + 1
+}
+
 /// Decodes the total line count from a video frame table.
 ///
 /// The table holds a leading byte followed by entries containing one line
@@ -583,6 +613,38 @@ mod tests {
         assert_eq!(Selector::from_bits(4), Selector::AddressLow);
         assert_eq!(Selector::from_bits(5), Selector::AddressHigh);
         assert_eq!(Selector::from_bits(6), Selector::SystemControl);
+    }
+
+    #[test]
+    fn writes_report_only_state_consumed_by_frame_composition() {
+        let mut vc1 = Vc1::new();
+
+        assert!(!vc1.write(Selector::SystemControl, SYS_CTRL_VTG));
+        assert!(!vc1.write(Selector::SystemControl, SYS_CTRL_VC1));
+        assert!(!vc1.write(Selector::SystemControl, SYS_CTRL_VC1));
+        assert!(vc1.write(Selector::SystemControl, SYS_CTRL_VC1 | SYS_CTRL_DID));
+
+        set_address(&mut vc1, 0);
+        assert!(!vc1.write(Selector::XmapMode, 0));
+        set_address(&mut vc1, 0);
+        assert!(vc1.write(Selector::XmapMode, 1));
+        set_address(&mut vc1, 0);
+        assert!(!vc1.write(Selector::XmapMode, 1));
+
+        set_address(&mut vc1, CUR_XL);
+        assert!(vc1.write(Selector::Control, 1));
+        set_address(&mut vc1, DID_EP);
+        assert!(vc1.write(Selector::Control, 1));
+        set_address(&mut vc1, VID_EP);
+        assert!(!vc1.write(Selector::Control, 1));
+
+        set_address(&mut vc1, 0x1234);
+        assert!(!vc1.write(Selector::Sram, 0));
+        set_address(&mut vc1, 0x1234);
+        assert!(vc1.write(Selector::Sram, 1));
+
+        set_address(&mut vc1, CHIP_REVISION);
+        assert!(!vc1.write(Selector::Test, 3));
     }
 
     #[test]

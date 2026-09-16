@@ -129,33 +129,47 @@ impl Bt479 {
     }
 
     /// Writes one byte to the selected interface port.
-    pub(super) fn write(&mut self, selector: Selector, value: u8) {
+    ///
+    /// Returns whether the write changed a palette entry used by the display
+    /// path. Address, staging, and host-only control changes return `false`.
+    pub(super) fn write(&mut self, selector: Selector, value: u8) -> bool {
         match selector {
             Selector::WriteAddress => {
                 self.address = value;
                 self.component = 0;
+                false
             }
             Selector::ReadAddress => {
                 self.address = value;
                 self.component = 0;
                 self.prefetch();
+                false
             }
             Selector::PaletteData => self.write_color(value),
-            Selector::PixelReadMask => self.pixel_read_mask = value,
+            Selector::PixelReadMask => {
+                self.pixel_read_mask = value;
+                false
+            }
             Selector::ControlData => {
                 self.control[usize::from(self.address)] = value;
                 self.address = self.address.wrapping_add(1);
+                false
             }
             Selector::OverlayWriteAddress => {
                 self.overlay_address = value;
                 self.overlay_component = 0;
+                false
             }
             Selector::OverlayReadAddress => {
                 self.overlay_address = value;
                 self.overlay_component = 0;
                 self.prefetch_overlay();
+                false
             }
-            Selector::OverlayData => self.write_overlay_color(value),
+            Selector::OverlayData => {
+                self.write_overlay_color(value);
+                false
+            }
         }
     }
 
@@ -186,17 +200,21 @@ impl Bt479 {
     }
 
     /// Accepts one color component, committing the entry after blue.
-    fn write_color(&mut self, value: u8) {
+    fn write_color(&mut self, value: u8) -> bool {
         match self.component {
             0 | 1 => {
                 self.staged[usize::from(self.component)] = value;
                 self.component += 1;
+                false
             }
             _ => {
                 let entry = self.host_entry();
-                self.palette[entry] = [self.staged[0], self.staged[1], value];
+                let color = [self.staged[0], self.staged[1], value];
+                let changed = self.palette[entry] != color;
+                self.palette[entry] = color;
                 self.address = self.address.wrapping_add(1);
                 self.component = 0;
+                changed
             }
         }
     }
@@ -308,6 +326,26 @@ mod tests {
 
         assert_eq!(dac.color(4), [0x11, 0x22, 0x33]);
         assert_eq!(dac.read(Selector::WriteAddress), 5);
+    }
+
+    #[test]
+    fn only_an_effective_palette_commit_reports_a_display_change() {
+        let mut dac = Bt479::new();
+
+        assert!(!dac.write(Selector::WriteAddress, 4));
+        assert!(!dac.write(Selector::PaletteData, 0x11));
+        assert!(!dac.write(Selector::PaletteData, 0x22));
+        assert!(dac.write(Selector::PaletteData, 0x33));
+
+        assert!(!dac.write(Selector::WriteAddress, 4));
+        assert!(!dac.write(Selector::PaletteData, 0x11));
+        assert!(!dac.write(Selector::PaletteData, 0x22));
+        assert!(!dac.write(Selector::PaletteData, 0x33));
+
+        assert!(!dac.write(Selector::OverlayWriteAddress, 0));
+        assert!(!dac.write(Selector::OverlayData, 1));
+        assert!(!dac.write(Selector::OverlayData, 2));
+        assert!(!dac.write(Selector::OverlayData, 3));
     }
 
     #[test]
