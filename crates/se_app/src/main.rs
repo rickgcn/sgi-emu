@@ -9,13 +9,24 @@ mod config;
 
 use std::error::Error;
 use std::io;
+use std::process::ExitCode;
 
 use se_runtime::runtime::Runtime;
 use se_session::machine::{StartupReadiness, machine_definition, startup_readiness};
 use se_ui::bridge::ffi::NetworkConfiguration;
 use se_ui::session::UiSession;
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            report_fatal_error(error.as_ref());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let config_path = config::config_path()?;
     let mut application_config = config::load(&config_path)?;
     let machine_draft = application_config.machine_draft();
@@ -73,6 +84,48 @@ fn main() -> Result<(), Box<dyn Error>> {
     application_config.set_machine_draft(committed);
     config::save(&config_path, &application_config)?;
     Ok(())
+}
+
+fn format_error(error: &dyn Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        message.push_str("\n\nCaused by:\n");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    message
+}
+
+#[cfg(all(windows, not(debug_assertions), not(test)))]
+fn report_fatal_error(error: &dyn Error) {
+    use std::iter;
+    use std::ptr;
+
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+    };
+
+    let message: Vec<u16> = format_error(error)
+        .encode_utf16()
+        .chain(iter::once(0))
+        .collect();
+    let title: Vec<u16> = "Fatal error".encode_utf16().chain(iter::once(0)).collect();
+
+    // SAFETY: Both strings are NUL-terminated and remain alive for the duration of the call.
+    unsafe {
+        MessageBoxW(
+            ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions), not(test))))]
+fn report_fatal_error(error: &dyn Error) {
+    eprintln!("Error: {}", format_error(error));
 }
 
 fn build_normal_configuration(

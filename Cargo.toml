@@ -46,7 +46,11 @@ se_session = { path = "crates/se_session" }
 se_ui = { path = "crates/se_ui" }
 toml = "1"
 vt100 = "=0.16.2"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 lto = "thin"

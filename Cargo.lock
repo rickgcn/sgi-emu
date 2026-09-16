@@ -421,6 +421,7 @@ dependencies = [
  "se_ui",
  "serde",
  "toml",
+ "windows-sys",
 ]
 
 [[package]]
