@@ -35,6 +35,7 @@
 #include <functional>
 #include <future>
 #include <limits>
+#include <utility>
 
 namespace se_ui {
 namespace {
@@ -422,9 +423,12 @@ void MainWindow::poll_preparation() {
     preparation_state_ = PreparationState::None;
     preparation_resume_running_ = false;
     preparation_stops_replay_ = false;
-    apply_runtime_status(status, false);
     if (!status.success) {
+        apply_runtime_status(status, false);
         pending_network_settings_.reset();
+        if (completed_state == PreparationState::Settings && settings_dialog_ != nullptr) {
+            settings_dialog_->show_apply_failure(from_rust_string(status.command_error));
+        }
         const auto current = session_.runtime_status();
         if (resume_running && current.can_execute) {
             apply_runtime_status(session_.run_machine(), false);
@@ -436,6 +440,10 @@ void MainWindow::poll_preparation() {
         network_settings_ = *pending_network_settings_;
         pending_network_settings_.reset();
         update_machine_status();
+    }
+    apply_runtime_status(status, false);
+    if (completed_state == PreparationState::Settings && settings_dialog_ != nullptr) {
+        settings_dialog_->finish_apply_success();
     }
 
     if (completed_state == PreparationState::Recording) {
@@ -601,28 +609,43 @@ void MainWindow::stop_replay() {
 }
 
 void MainWindow::show_settings() {
-    SettingsDialog dialog(session_, network_settings_, this);
-    if (dialog.exec() != QDialog::Accepted) {
-        session_.cancel_machine_edit();
+    if (settings_dialog_ != nullptr) {
+        settings_dialog_->raise();
+        settings_dialog_->activateWindow();
         return;
     }
 
-    const auto selected = dialog.settings();
-    if (!session_.machine_edit_changed() && selected == network_settings_) {
+    auto* dialog = new SettingsDialog(
+        session_,
+        network_settings_,
+        [this](NetworkSettings selected) { apply_settings(std::move(selected)); },
+        this);
+    settings_dialog_ = dialog;
+    connect(dialog, &QDialog::rejected, this, [this] {
+        pending_network_settings_.reset();
         session_.cancel_machine_edit();
+    });
+    dialog->open();
+}
+
+void MainWindow::apply_settings(NetworkSettings selected) {
+    if (settings_dialog_ == nullptr) {
         return;
     }
-    if (QMessageBox::question(
-            this,
-            QStringLiteral("Reset machine"),
-            QStringLiteral("Changing these settings will reset the emulated machine. Continue?"))
-        != QMessageBox::Yes) {
+    if (!session_.machine_edit_changed() && selected == network_settings_) {
+        pending_network_settings_.reset();
         session_.cancel_machine_edit();
+        settings_dialog_->finish_apply_success();
+        return;
+    }
+    if (preparation_state_ != PreparationState::None) {
+        settings_dialog_->show_apply_failure(QStringLiteral("another operation is in progress"));
         return;
     }
 
     auto network = std::make_shared<NetworkConfiguration>(to_network_configuration(selected));
     pending_network_settings_ = std::make_unique<NetworkSettings>(selected);
+    settings_dialog_->set_applying(true);
     begin_preparation(PreparationState::Settings, false,
         [this, network] { return session_.configure_edited_machine(*network); });
 }

@@ -2,6 +2,7 @@
 #include "se_ui/src/bridge.rs.h"
 
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
@@ -25,6 +26,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <utility>
 
 namespace se_ui {
 namespace {
@@ -79,10 +81,13 @@ NetworkConfiguration to_network_configuration(const NetworkSettings& settings) {
     return result;
 }
 
-SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& settings, QWidget* parent)
+SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& settings,
+    ApplyHandler apply_handler, QWidget* parent)
     : QDialog(parent)
     , session_(session)
+    , apply_handler_(std::move(apply_handler))
     , machine_view_(std::make_unique<MachineConfigurationViewDto>(session_.begin_machine_edit()))
+    , tabs_(new QTabWidget(this))
     , machine_tree_(new QTreeWidget(this))
     , property_form_(new QFormLayout)
     , diagnostics_(new QLabel(this))
@@ -90,9 +95,14 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     , gateway_edit_(new QLineEdit(settings.gateway, this))
     , dns_edit_(new QLineEdit(settings.dns, this))
     , dhcp_start_edit_(new QLineEdit(settings.dhcp_start, this))
-    , forwards_table_(new QTableWidget(0, 5, this)) {
+    , forwards_table_(new QTableWidget(0, 5, this))
+    , apply_status_(new QLabel(this))
+    , apply_button_(nullptr)
+    , cancel_button_(nullptr)
+    , applying_(false) {
     setWindowTitle(QStringLiteral("Settings"));
     setModal(true);
+    setAttribute(Qt::WA_DeleteOnClose);
 
     auto* machine_tab = new QWidget(this);
     auto* machine_layout = new QVBoxLayout(machine_tab);
@@ -146,11 +156,13 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     forward_buttons->addStretch();
     network_layout->addLayout(forward_buttons);
 
-    auto* tabs = new QTabWidget(this);
-    tabs->addTab(machine_tab, QStringLiteral("Machine"));
-    tabs->addTab(network_tab, QStringLiteral("Network"));
+    tabs_->addTab(machine_tab, QStringLiteral("Machine"));
+    tabs_->addTab(network_tab, QStringLiteral("Network"));
     auto* button_box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    connect(button_box, &QDialogButtonBox::accepted, this, [this] {
+    apply_button_ = button_box->button(QDialogButtonBox::Ok);
+    cancel_button_ = button_box->button(QDialogButtonBox::Cancel);
+    apply_button_->setText(QStringLiteral("Apply & Reset"));
+    connect(apply_button_, &QPushButton::clicked, this, [this] {
         if (!machine_view_->success) {
             QMessageBox::warning(this, QStringLiteral("Machine configuration"), from_rust(machine_view_->error));
             return;
@@ -166,11 +178,15 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
             QMessageBox::warning(this, QStringLiteral("Network configuration"), from_rust(error));
             return;
         }
-        accept();
+        auto apply_handler = apply_handler_;
+        apply_handler(this->settings());
     });
-    connect(button_box, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    connect(cancel_button_, &QPushButton::clicked, this, &SettingsDialog::reject);
     auto* root = new QVBoxLayout(this);
-    root->addWidget(tabs);
+    root->addWidget(tabs_);
+    apply_status_->setWordWrap(true);
+    apply_status_->hide();
+    root->addWidget(apply_status_);
     root->addWidget(button_box);
     rebuild_machine_view();
     resize(820, 550);
@@ -186,6 +202,42 @@ NetworkSettings SettingsDialog::settings() const {
             forwards_table_->item(row, 2)->text(), forwards_table_->item(row, 3)->text(), forwards_table_->item(row, 4)->text()});
     }
     return network;
+}
+
+void SettingsDialog::set_applying(bool applying) {
+    applying_ = applying;
+    tabs_->setEnabled(!applying);
+    apply_button_->setEnabled(!applying);
+    cancel_button_->setEnabled(!applying);
+    apply_button_->setText(
+        applying ? QStringLiteral("Applying...") : QStringLiteral("Apply & Reset"));
+    apply_status_->setText(applying ? QStringLiteral("Applying settings...") : QString());
+    apply_status_->setVisible(applying);
+}
+
+void SettingsDialog::show_apply_failure(const QString& message) {
+    set_applying(false);
+    apply_status_->setText(QStringLiteral("Could not apply settings: %1").arg(message));
+    apply_status_->show();
+}
+
+void SettingsDialog::finish_apply_success() {
+    applying_ = false;
+    QDialog::accept();
+}
+
+void SettingsDialog::reject() {
+    if (!applying_) {
+        QDialog::reject();
+    }
+}
+
+void SettingsDialog::closeEvent(QCloseEvent* event) {
+    if (applying_) {
+        event->ignore();
+        return;
+    }
+    QDialog::closeEvent(event);
 }
 
 void SettingsDialog::rebuild_machine_view() {

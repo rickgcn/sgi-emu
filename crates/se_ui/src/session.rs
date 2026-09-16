@@ -73,8 +73,19 @@ pub struct UiSession {
 
 struct MachineConfigurationState {
     committed: MachineDraft,
-    editing: Option<MachineDraft>,
+    editing: Option<MachineEditState>,
     active_frontend: FrontendPlan,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MachineEditPhase {
+    Editing,
+    Applying,
+}
+
+struct MachineEditState {
+    draft: MachineDraft,
+    phase: MachineEditPhase,
 }
 
 impl UiSession {
@@ -177,9 +188,12 @@ impl UiSession {
         if state.editing.is_some() {
             return failed_view("machine editing is already active");
         }
-        let candidate = state.committed.clone();
-        let view = self.definition.resolve(&candidate);
-        state.editing = Some(candidate);
+        let draft = state.committed.clone();
+        let view = self.definition.resolve(&draft);
+        state.editing = Some(MachineEditState {
+            draft,
+            phase: MachineEditPhase::Editing,
+        });
         view_dto(view)
     }
 
@@ -199,16 +213,26 @@ impl UiSession {
         let Some(editing) = state.editing.as_mut() else {
             return failed_view("machine editing is not active");
         };
-        editing.apply(edit);
-        view_dto(self.definition.resolve(editing))
+        if editing.phase == MachineEditPhase::Applying {
+            return failed_view("machine settings are being applied");
+        }
+        editing.draft.apply(edit);
+        view_dto(self.definition.resolve(&editing.draft))
     }
 
-    /// Discards any temporary machine settings.
+    /// Discards temporary machine settings when they are not being applied.
     pub fn cancel_machine_edit(&self) {
-        self.configuration
+        let mut state = self
+            .configuration
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .editing = None;
+            .unwrap_or_else(|error| error.into_inner());
+        if state
+            .editing
+            .as_ref()
+            .is_some_and(|editing| editing.phase == MachineEditPhase::Editing)
+        {
+            state.editing = None;
+        }
     }
 
     /// Reports whether the active transaction differs from committed settings.
@@ -220,7 +244,7 @@ impl UiSession {
         state
             .editing
             .as_ref()
-            .is_some_and(|editing| *editing != state.committed)
+            .is_some_and(|editing| editing.draft != state.committed)
     }
 
     /// Returns the committed Rust draft for application persistence.
@@ -241,23 +265,29 @@ impl UiSession {
     /// Builds and installs the edited candidate, committing only after success.
     pub fn configure_edited_machine(&self, network: &NetworkConfiguration) -> RuntimeStatusDto {
         let candidate = {
-            let state = self
+            let mut state = self
                 .configuration
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let Some(candidate) = state.editing.as_ref() else {
+            let Some(editing) = state.editing.as_mut() else {
                 return failed_status(String::from("machine editing is not active"));
             };
-            candidate.clone()
+            if editing.phase == MachineEditPhase::Applying {
+                return failed_status(String::from("machine settings are being applied"));
+            }
+            editing.phase = MachineEditPhase::Applying;
+            editing.draft.clone()
         };
         let result = self.build_and_configure(candidate.clone(), network);
         let mut state = self
             .configuration
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.editing = None;
         if result.success {
             state.committed = candidate;
+            state.editing = None;
+        } else if let Some(editing) = state.editing.as_mut() {
+            editing.phase = MachineEditPhase::Editing;
         }
         result
     }
@@ -983,7 +1013,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
 
     use se_config::definition::MachineDefinition;
     use se_config::draft::{Edit, MachineDraft};
@@ -1161,8 +1191,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_build_discards_edit_without_changing_committed_draft() {
-        let (runtime, session) = session(false);
+    fn failed_build_preserves_edit_without_changing_committed_draft() {
+        let (runtime, session, succeeds) = controlled_session(false);
         let original = session.machine_draft_snapshot();
         assert!(session.begin_machine_edit().success);
         assert!(
@@ -1174,7 +1204,83 @@ mod tests {
         assert!(!status.success);
         assert_eq!(status.command_error, "injected builder stop");
         assert_eq!(session.machine_draft_snapshot(), original);
+        assert!(session.machine_edit_changed());
+        assert!(!session.begin_machine_edit().success);
+
+        succeeds.store(true, Ordering::Relaxed);
+        assert!(session.configure_edited_machine(&network()).success);
+        assert_eq!(
+            session
+                .machine_draft_snapshot()
+                .properties
+                .get(&PropertyId(String::from("firmware.0.image-path"))),
+            Some(&PropertyValue::Text(String::from("missing.bin")))
+        );
+        assert!(session.begin_machine_edit().success);
+        session.cancel_machine_edit();
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn applying_edit_rejects_changes_and_cancellation() {
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let builder_started = Arc::new(Barrier::new(2));
+        let (builder_release, builder_release_callback) = std::sync::mpsc::channel::<()>();
+        let builder_started_callback = Arc::clone(&builder_started);
+        let builder_release_callback = Mutex::new(builder_release_callback);
+        let session = UiSession::new(
+            runtime.handle(),
+            draft(),
+            Arc::new(Ip12Definition),
+            FrontendPlan::default(),
+            Box::new(move |_, _| {
+                builder_started_callback.wait();
+                let _ = builder_release_callback
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv();
+                Err(String::from("injected builder stop"))
+            }),
+            Box::new(|_, _, _| Err(String::from("unused recording builder"))),
+            Box::new(|_, _, _| Err(String::from("unused replay builder"))),
+            Box::new(|_| Ok(())),
+        );
+        assert!(session.begin_machine_edit().success);
+        assert!(
+            session
+                .apply_machine_edit(&edit_firmware("candidate.bin"))
+                .success
+        );
+
+        std::thread::scope(|scope| {
+            let release_on_scope_exit = builder_release;
+            let configure = scope.spawn(|| session.configure_edited_machine(&network()));
+            builder_started.wait();
+
+            let edit = session.apply_machine_edit(&edit_firmware("replacement.bin"));
+            assert!(!edit.success);
+            assert_eq!(edit.error, "machine settings are being applied");
+            session.cancel_machine_edit();
+            assert!(session.machine_edit_changed());
+            assert!(!session.begin_machine_edit().success);
+
+            drop(release_on_scope_exit);
+            let status = configure.join().unwrap();
+            assert!(!status.success);
+            assert_eq!(status.command_error, "injected builder stop");
+        });
+
+        assert!(session.machine_edit_changed());
+        assert!(
+            session
+                .apply_machine_edit(&edit_firmware("replacement.bin"))
+                .success
+        );
+        session.cancel_machine_edit();
         assert!(!session.machine_edit_changed());
+        assert!(session.begin_machine_edit().success);
+        session.cancel_machine_edit();
         drop(session);
         runtime.shutdown().unwrap();
     }
@@ -1206,12 +1312,6 @@ mod tests {
         assert_eq!(attached_count(&session), 2);
 
         succeeds.store(true, Ordering::Relaxed);
-        assert!(session.begin_machine_edit().success);
-        assert!(
-            session
-                .apply_machine_edit(&detach_port("serial.1.channel.b.port"))
-                .success
-        );
         assert!(session.configure_edited_machine(&network()).success);
         let catalog = session.endpoint_catalog();
         assert_eq!(attached_count(&session), 1);

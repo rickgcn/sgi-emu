@@ -4,6 +4,7 @@
 
 #include <QElapsedTimer>
 #include <QMainWindow>
+#include <QPointer>
 
 #include <cstdint>
 #include <functional>
@@ -76,6 +77,7 @@ private:
     void create_replay_snapshot();
     void stop_replay();
     void show_settings();
+    void apply_settings(NetworkSettings selected);
     void update_runtime();
     void refresh_debuggers();
     void apply_runtime_status(const RuntimeStatusDto& status, bool report_error);
@@ -85,6 +87,7 @@ private:
     const UiSession& session_;
     NetworkSettings network_settings_;
     std::unique_ptr<NetworkSettings> pending_network_settings_;
+    QPointer<SettingsDialog> settings_dialog_;
 
     QAction* run_action_;
     QAction* run_with_record_action_;

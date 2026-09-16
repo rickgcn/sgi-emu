@@ -5,13 +5,17 @@
 #include <QVector>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 
+class QCloseEvent;
 class QComboBox;
 class QFormLayout;
 class QLabel;
 class QLineEdit;
+class QPushButton;
 class QTableWidget;
+class QTabWidget;
 class QTreeWidget;
 class QTreeWidgetItem;
 
@@ -44,10 +48,20 @@ NetworkConfiguration to_network_configuration(const NetworkSettings& settings);
 
 class SettingsDialog final : public QDialog {
 public:
-    explicit SettingsDialog(const UiSession& session, const NetworkSettings& settings, QWidget* parent = nullptr);
+    using ApplyHandler = std::function<void(NetworkSettings)>;
+
+    explicit SettingsDialog(const UiSession& session, const NetworkSettings& settings,
+        ApplyHandler apply_handler, QWidget* parent = nullptr);
     ~SettingsDialog() override;
 
     [[nodiscard]] NetworkSettings settings() const;
+    void set_applying(bool applying);
+    void show_apply_failure(const QString& message);
+    void finish_apply_success();
+
+protected:
+    void reject() override;
+    void closeEvent(QCloseEvent* event) override;
 
 private:
     void rebuild_machine_view();
@@ -59,7 +73,9 @@ private:
     void add_forward(const ForwardSettings& rule);
 
     const UiSession& session_;
+    ApplyHandler apply_handler_;
     std::unique_ptr<MachineConfigurationViewDto> machine_view_;
+    QTabWidget* tabs_;
     QTreeWidget* machine_tree_;
     QFormLayout* property_form_;
     QLabel* diagnostics_;
@@ -68,6 +84,10 @@ private:
     QLineEdit* dns_edit_;
     QLineEdit* dhcp_start_edit_;
     QTableWidget* forwards_table_;
+    QLabel* apply_status_;
+    QPushButton* apply_button_;
+    QPushButton* cancel_button_;
+    bool applying_;
 };
 
 } // namespace se_ui
