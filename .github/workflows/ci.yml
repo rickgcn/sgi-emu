@@ -5,16 +5,24 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflows/**"
+      - ".github/**"
+      - ".gitmodules"
+      - "Cargo.lock"
+      - "Cargo.toml"
       - "crates/**"
       - "3rdparty/**"
+      - "rust-toolchain.toml"
   pull_request:
     branches:
       - main
     paths:
-      - ".github/workflows/**"
+      - ".github/**"
+      - ".gitmodules"
+      - "Cargo.lock"
+      - "Cargo.toml"
       - "crates/**"
       - "3rdparty/**"
+      - "rust-toolchain.toml"
 
 permissions:
   contents: read
@@ -34,41 +42,16 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Set up build environment
+        uses: ./.github/actions/setup-build
         with:
-          python-version: "3.14"
-
-      - name: Install native build tools
-        run: python -m pip install -r .github/requirements-native.txt
-
-      - name: Install Linux mouse capture dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends \
-            pkg-config \
-            libwayland-dev \
-            wayland-protocols \
-            libx11-dev \
-            libxi-dev
-
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.8.3"
-          host: linux
-          target: desktop
-          arch: linux_gcc_64
-          cache: true
-
-      - name: Show Rust toolchain
-        run: rustc --version --verbose
+          qt-host: linux
+          qt-arch: linux_gcc_64
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -106,47 +89,16 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Set up build environment
+        uses: ./.github/actions/setup-build
         with:
-          python-version: "3.14"
-
-      - name: Install native build tools
-        run: python -m pip install -r .github/requirements-native.txt
-
-      - name: Install Linux mouse capture dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends \
-            pkg-config \
-            libwayland-dev \
-            wayland-protocols \
-            libx11-dev \
-            libxi-dev
-
-      - name: Set up MSVC
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.8.3"
-          host: ${{ matrix.qt_host }}
-          target: desktop
-          arch: ${{ matrix.qt_arch }}
-          cache: true
-
-      - name: Show Rust toolchain
-        run: rustc --version --verbose
+          qt-host: ${{ matrix.qt_host }}
+          qt-arch: ${{ matrix.qt_arch }}
 
       - name: Build workspace
         run: cargo build --release --workspace --all-features --locked

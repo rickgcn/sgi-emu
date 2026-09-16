@@ -1,0 +1,269 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Validate release metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      artifact-version: ${{ steps.metadata.outputs.artifact-version }}
+      is-prerelease: ${{ steps.metadata.outputs.is-prerelease }}
+      is-release: ${{ steps.metadata.outputs.is-release }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Validate version and tag
+        id: metadata
+        run: >-
+          python .github/scripts/release.py metadata
+          --event-name "${{ github.event_name }}"
+          --ref-name "${{ github.ref_name }}"
+          --sha "${{ github.sha }}"
+
+  quality:
+    name: Quality
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up build environment
+        uses: ./.github/actions/setup-build
+        with:
+          qt-host: linux
+          qt-arch: linux_gcc_64
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --release --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Check Rustdoc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --release --workspace --all-features --no-deps --locked
+
+  package:
+    name: Package (${{ matrix.platform }})
+    needs: gate
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux x86_64
+            runner: ubuntu-24.04
+            release_platform: linux
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/sgi-emu
+            qt_host: linux
+            qt_arch: linux_gcc_64
+            qt_modules: qtwaylandcompositor
+            artifact: package-linux-x86_64
+          - platform: Windows x86_64
+            runner: windows-2025
+            release_platform: windows
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/sgi-emu.exe
+            qt_host: windows
+            qt_arch: win64_msvc2022_64
+            qt_modules: ""
+            artifact: package-windows-x86_64
+          - platform: macOS aarch64
+            runner: macos-15
+            release_platform: macos
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/sgi-emu
+            qt_host: mac
+            qt_arch: clang_64
+            qt_modules: ""
+            artifact: package-macos-aarch64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up build environment
+        uses: ./.github/actions/setup-build
+        with:
+          qt-host: ${{ matrix.qt_host }}
+          qt-arch: ${{ matrix.qt_arch }}
+          qt-modules: ${{ matrix.qt_modules }}
+
+      - name: Run tests
+        env:
+          DYLD_FRAMEWORK_PATH: ${{ env.QT_ROOT_DIR }}/lib
+        run: cargo test --release --target "${{ matrix.target }}" --workspace --all-features --locked
+
+      - name: Build application
+        run: cargo build --release --target "${{ matrix.target }}" -p se_app --bin sgi-emu --locked
+
+      - name: Package application
+        id: package
+        run: >-
+          python .github/scripts/release.py package
+          --platform "${{ matrix.release_platform }}"
+          --target "${{ matrix.target }}"
+          --binary "${{ matrix.binary }}"
+          --qt-root "${{ env.QT_ROOT_DIR }}"
+          --app-version "${{ needs.gate.outputs.version }}"
+          --artifact-version "${{ needs.gate.outputs.artifact-version }}"
+          --work-directory "${{ runner.temp }}/release-work"
+          --output-directory "${{ runner.temp }}/release-output"
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  assemble:
+    name: Assemble release assets
+    needs:
+      - gate
+      - quality
+      - package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Download platform packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: package-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify assets and create checksums
+        run: >-
+          python .github/scripts/release.py assemble
+          --directory release-assets
+          --artifact-version "${{ needs.gate.outputs.artifact-version }}"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  attest:
+    name: Attest release assets
+    if: needs.gate.outputs.is-release == 'true'
+    needs:
+      - gate
+      - assemble
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Attest packages
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: release-assets/SHA256SUMS
+
+  publish:
+    name: Create draft release
+    if: needs.gate.outputs.is-release == 'true'
+    needs:
+      - gate
+      - assemble
+      - attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IS_PRERELEASE: ${{ needs.gate.outputs.is-prerelease }}
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$draft" != "true" ]]; then
+              echo "Release $RELEASE_TAG is already published; refusing to replace its assets." >&2
+              exit 1
+            fi
+          else
+            flags=(--draft --generate-notes --verify-tag --title "sgi-emu $RELEASE_TAG")
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${flags[@]}"
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber

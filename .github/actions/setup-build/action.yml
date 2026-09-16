@@ -1,0 +1,70 @@
+name: Set up build environment
+description: Install the native build toolchain and Qt used by sgi-emu.
+
+inputs:
+  qt-host:
+    description: Qt host platform passed to install-qt-action.
+    required: true
+  qt-arch:
+    description: Qt target architecture passed to install-qt-action.
+    required: true
+  qt-modules:
+    description: Additional whitespace-delimited Qt modules.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: "3.14"
+
+    - name: Install native build tools
+      shell: bash
+      run: python -m pip install -r .github/requirements-native.txt
+
+    - name: Install Linux native dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends \
+          libwayland-dev \
+          libx11-dev \
+          libxi-dev \
+          pkg-config \
+          wayland-protocols \
+          xvfb
+
+    - name: Set up MSVC
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@7defe9254715b088f12dddd9942945a3d75cdad5 # v1.9.0
+      with:
+        arch: x64
+
+    - name: Restore Meson package cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/meson-package-cache
+        key: meson-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('3rdparty/glib/subprojects/*.wrap', '3rdparty/glib/subprojects/packagefiles/**') }}
+
+    - name: Configure Meson package cache
+      shell: bash
+      run: echo "MESON_PACKAGE_CACHE_DIR=${{ runner.temp }}/meson-package-cache" >> "$GITHUB_ENV"
+
+    - name: Install Qt
+      uses: jurplel/install-qt-action@bcb88e3bed2e992f5f9e24c0f9e364a231d278eb # v4.4.0
+      with:
+        version: "6.8.3"
+        host: ${{ inputs.qt-host }}
+        target: desktop
+        arch: ${{ inputs.qt-arch }}
+        modules: ${{ inputs.qt-modules }}
+        cache: true
+        setup-python: false
+
+    - name: Show Rust toolchain
+      shell: bash
+      run: rustc --version --verbose
