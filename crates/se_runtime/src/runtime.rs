@@ -529,6 +529,11 @@ impl RuntimeHandle {
 
     /// Installs the frontend-neutral machine-output handler.
     ///
+    /// Continuous execution coalesces output until the current execution batch
+    /// ends. Serial byte order is preserved, while video output retains only
+    /// the newest state published during the batch. Single-step execution and
+    /// explicit output refreshes deliver output immediately.
+    ///
     /// # Errors
     ///
     /// Returns [`RuntimeError`] when the worker is unavailable.
@@ -1385,6 +1390,7 @@ impl Worker {
             RuntimeMode::Replaying => self.execute_replay_batch(),
             RuntimeMode::ReplayCompleted | RuntimeMode::ReplayDiverged => {}
         }
+        self.flush_machine_output();
     }
 
     fn execute_normal_batch(&mut self) {
@@ -1457,19 +1463,19 @@ impl Worker {
     }
 
     fn execute_timed_instruction(&mut self) -> Result<(), ExecutionError> {
-        match self.mode.public_mode() {
+        let result = match self.mode.public_mode() {
             RuntimeMode::Normal | RuntimeMode::RecordCompleted => self.execute_normal_instruction(),
             RuntimeMode::Recording => self.execute_recording_instruction(),
             RuntimeMode::Replaying => self.execute_replay_instruction(),
             RuntimeMode::ReplayCompleted | RuntimeMode::ReplayDiverged => Ok(()),
-        }
+        };
+        self.flush_machine_output();
+        result
     }
 
     fn execute_normal_instruction(&mut self) -> Result<(), ExecutionError> {
         self.execute_machine_instruction()?;
-        self.drain_network_output();
         self.process_network_boundary();
-        self.deliver_output();
         Ok(())
     }
 
@@ -1478,13 +1484,11 @@ impl Worker {
         if !self.advance_session_position() {
             return Ok(());
         }
-        self.drain_network_output();
         self.process_network_boundary();
         self.check_record_failure();
         if let Err(error) = self.record_checkpoint_if_due() {
             self.fail_session(error.to_string());
         }
-        self.deliver_output();
         Ok(())
     }
 
@@ -1513,14 +1517,12 @@ impl Worker {
         if !self.advance_session_position() {
             return Ok(());
         }
-        self.drain_network_output();
         self.check_replay_storage_failure();
         if self.replay_boundary_due()
             && let Err(reason) = self.process_replay_boundary()
         {
             self.set_replay_divergence(reason);
         }
-        self.deliver_output();
         Ok(())
     }
 
@@ -1691,7 +1693,21 @@ impl Worker {
 
     /// Records an input before the machine performs MAC filtering or DMA checks.
     /// Host queue drops and sockets never become replay machine state.
+    #[inline]
     fn process_network_boundary(&mut self) {
+        if self.pending_network_frame.is_none()
+            && !self
+                .network
+                .as_ref()
+                .is_some_and(NetworkSession::has_pending_work)
+        {
+            return;
+        }
+        self.process_pending_network_boundary();
+    }
+
+    #[inline(never)]
+    fn process_pending_network_boundary(&mut self) {
         if self.pending_network_frame.is_none() {
             self.pending_network_frame = self
                 .network
@@ -1740,6 +1756,11 @@ impl Worker {
                 .map_err(io::Error::other)?;
         }
         Ok(accepted)
+    }
+
+    fn flush_machine_output(&mut self) {
+        self.drain_network_output();
+        self.deliver_output();
     }
 
     fn deliver_output(&mut self) {
@@ -2722,6 +2743,50 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
     }
 
     #[test]
+    fn continuous_execution_defers_frontend_output_until_the_batch_boundary() {
+        let mut worker = super::Worker::new(Some(machine_with_graphics()));
+        worker.state = RuntimeState::Running;
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let handler_deliveries = Arc::clone(&deliveries);
+        worker.output_handler = Some(Box::new(move |output| {
+            assert_eq!(output.len(), 1);
+            handler_deliveries.fetch_add(1, Ordering::Relaxed);
+        }));
+        worker.queue_current_outputs();
+
+        worker.execute_normal_instruction().unwrap();
+
+        assert_eq!(deliveries.load(Ordering::Relaxed), 0);
+        assert!(!worker.frontend_output.is_empty());
+
+        worker.execute_batch();
+
+        assert_eq!(deliveries.load(Ordering::Relaxed), 1);
+        assert!(worker.frontend_output.is_empty());
+    }
+
+    #[test]
+    fn execution_batch_flushes_output_when_a_breakpoint_stops_it() {
+        let mut worker = super::Worker::new(Some(machine_with_graphics()));
+        worker.state = RuntimeState::Running;
+        let address = worker.machine.as_ref().unwrap().execution_address();
+        worker.breakpoints.insert(address);
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let handler_deliveries = Arc::clone(&deliveries);
+        worker.output_handler = Some(Box::new(move |_| {
+            handler_deliveries.fetch_add(1, Ordering::Relaxed);
+        }));
+        worker.queue_current_outputs();
+
+        worker.execute_batch();
+
+        assert_eq!(worker.state, RuntimeState::Paused);
+        assert_eq!(worker.completed_instructions, 0);
+        assert_eq!(deliveries.load(Ordering::Relaxed), 1);
+        assert!(worker.frontend_output.is_empty());
+    }
+
+    #[test]
     fn machine_output_handler_has_no_backlog_and_can_be_cleared() {
         const INSTRUCTIONS_PER_CHARACTER_INTERVAL: usize = 35_000;
 
@@ -2955,6 +3020,17 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
             }
         }
         remove_record_artifacts(&path);
+    }
+
+    #[test]
+    fn local_network_frame_is_processed_without_host_pending_work() {
+        let mut worker = super::Worker::new(Some(machine_with_instructions(&[0])));
+        worker.pending_network_frame = Some(vec![0xff; 60]);
+
+        worker.process_network_boundary();
+
+        assert!(worker.pending_network_frame.is_none());
+        assert!(worker.session_error.is_none());
     }
 
     #[test]

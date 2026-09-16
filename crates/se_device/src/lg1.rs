@@ -47,6 +47,58 @@ const MONITOR_CODE: u8 = 0;
 /// Selector value that reads the board revision through the clock port.
 const CLOCK_SELECTOR_REVISION: u8 = 4;
 
+/// Maximum number of superseded frames retained while the frontend uses them.
+const RETIRED_FRAME_LIMIT: usize = 2;
+
+/// Host-only storage for frame allocations that may become reusable.
+#[derive(Default)]
+struct FrameRecycler {
+    retired: Vec<Arc<Vec<u8>>>,
+}
+
+impl Clone for FrameRecycler {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl FrameRecycler {
+    /// Returns an exclusively owned frame buffer, reusing an allocation when
+    /// the frontend has released it.
+    fn acquire(&mut self, current: Option<Arc<Vec<u8>>>) -> Vec<u8> {
+        let shared = match current {
+            Some(frame) => match Arc::try_unwrap(frame) {
+                Ok(pixels) => return pixels,
+                Err(shared) => Some(shared),
+            },
+            None => None,
+        };
+        let pixels = self.take_released();
+        if let Some(shared) = shared {
+            self.retire(shared);
+        }
+        pixels.unwrap_or_else(|| vec![0; display::FRAME_BYTES])
+    }
+
+    /// Retains one frame that may still be owned by the frontend.
+    fn retire(&mut self, frame: Arc<Vec<u8>>) {
+        if self.retired.len() == RETIRED_FRAME_LIMIT {
+            self.retired.remove(0);
+        }
+        self.retired.push(frame);
+    }
+
+    /// Takes one allocation whose external owners have all released it.
+    fn take_released(&mut self) -> Option<Vec<u8>> {
+        let index = self
+            .retired
+            .iter()
+            .position(|frame| Arc::strong_count(frame) == 1)?;
+        let frame = self.retired.swap_remove(index);
+        Arc::try_unwrap(frame).ok()
+    }
+}
+
 /// The LG1 graphics board.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Lg1 {
@@ -60,6 +112,14 @@ pub struct Lg1 {
     /// restore establishes fresh ownership rather than reviving the handles
     /// the frontend held.
     frame: Option<Arc<Vec<u8>>>,
+    /// Frame allocations retained only for host-side reuse.
+    #[serde(skip)]
+    frame_recycler: FrameRecycler,
+    /// Set when non-VRAM input to frame composition changes.
+    ///
+    /// The flag is serialized so a restored machine publishes its next frame
+    /// at the same virtual frame boundary as uninterrupted execution.
+    composition_dirty: bool,
     /// Set when the displayed picture changed since the last query.
     ///
     /// This is guest-visible progress rather than host delivery state: two
@@ -82,6 +142,8 @@ impl Lg1 {
             dac: Bt479::new(),
             vram: Vram::new(),
             frame: None,
+            frame_recycler: FrameRecycler::default(),
+            composition_dirty: false,
             display_changed: false,
         }
     }
@@ -95,6 +157,8 @@ impl GioDevice for Lg1 {
         self.dac.reset();
         self.vram.reset();
         self.frame = None;
+        self.frame_recycler = FrameRecycler::default();
+        self.composition_dirty = false;
         self.display_changed = false;
     }
 
@@ -138,8 +202,13 @@ impl GioDevice for Lg1 {
         if self.vc1.advance_time(elapsed) == 0 {
             return;
         }
+        if !matches!(self.vc1.signal_state(), SignalState::Active) {
+            return;
+        }
+        if self.frame.is_some() && !self.composition_dirty && !self.vram.display_dirty() {
+            return;
+        }
         self.compose_frame();
-        self.display_changed = true;
     }
 
     /// Returns the duration until the next display timing boundary.
@@ -307,14 +376,15 @@ impl Lg1 {
     fn write_peripheral(&mut self, port: PeripheralPort, value: u8) {
         let selector = self.rex.config.configsel as u8;
         let before = self.vc1.signal_state();
-        match port {
+        let composition_changed = match port {
             PeripheralPort::Dac => self.dac.write(bt479::Selector::from_bits(selector), value),
             PeripheralPort::Vc1 => self.vc1.write(vc1::Selector::from_bits(selector), value),
             // The clock generator byte stream is accepted and stored by the
             // register itself. Which device it programs, and how the bytes
             // encode a pixel rate, is not established.
-            PeripheralPort::Clock => {}
-        }
+            PeripheralPort::Clock => false,
+        };
+        self.composition_dirty |= composition_changed;
 
         // Losing or regaining the video signal changes what the monitor shows
         // without waiting for a frame to complete.
@@ -322,8 +392,10 @@ impl Lg1 {
         if before == after {
             return;
         }
-        if matches!(after, SignalState::NoSignal) {
-            self.frame = None;
+        if matches!(after, SignalState::NoSignal)
+            && let Some(frame) = self.frame.take()
+        {
+            self.frame_recycler.retire(frame);
         }
         self.display_changed = true;
     }
@@ -352,24 +424,13 @@ impl Lg1 {
 
     /// Builds the frame the display path currently produces.
     fn compose_frame(&mut self) {
-        let mut pixels = match self.frame.take() {
-            // Reuse the previous allocation when no one else holds it.
-            Some(shared) => match Arc::try_unwrap(shared) {
-                Ok(pixels) => pixels,
-                Err(_) => vec![0; display::FRAME_BYTES],
-            },
-            None => vec![0; display::FRAME_BYTES],
-        };
-
-        match self.vc1.signal_state() {
-            SignalState::NoSignal => {
-                self.frame = None;
-                return;
-            }
-            SignalState::Blanked => display::compose_blank(&mut pixels),
-            SignalState::Active => display::compose(&self.vram, &self.vc1, &self.dac, &mut pixels),
-        }
+        debug_assert!(matches!(self.vc1.signal_state(), SignalState::Active));
+        let mut pixels = self.frame_recycler.acquire(self.frame.take());
+        display::compose(&self.vram, &self.vc1, &self.dac, &mut pixels);
         self.frame = Some(Arc::new(pixels));
+        self.vram.clear_display_dirty();
+        self.composition_dirty = false;
+        self.display_changed = true;
     }
 }
 
@@ -434,10 +495,14 @@ fn register_offset(address: DeviceAddr, length: usize) -> Result<Option<u64>, Bu
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use se_core::bus::{BusError, DeviceAddr};
 
     use super::vram::PlaneGroup;
-    use super::{GIO_PIO_BASE, GIO_PIO_END, GRAPHICS_DMA_PORT, Lg1};
+    use super::{
+        FrameRecycler, GIO_PIO_BASE, GIO_PIO_END, GRAPHICS_DMA_PORT, Lg1, RETIRED_FRAME_LIMIT,
+    };
     use crate::gio::{GioDevice, GioDisplayState, GioInterrupt};
 
     /// Offset of the drawing command register in the SET window.
@@ -623,6 +688,47 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_frames_do_not_publish_display_updates() {
+        let mut board = Lg1::new();
+        start_video(&mut board);
+        assert!(board.take_display_update());
+
+        advance_one_frame(&mut board);
+        assert!(board.take_display_update());
+        let Some(GioDisplayState::Active { pixels: first, .. }) = board.display_state() else {
+            panic!("valid timing must produce a frame");
+        };
+
+        advance_one_frame(&mut board);
+
+        assert!(!board.take_display_update());
+        let Some(GioDisplayState::Active { pixels: second, .. }) = board.display_state() else {
+            panic!("valid timing must preserve the frame");
+        };
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn only_effective_visible_vram_writes_publish_a_new_frame() {
+        let mut board = Lg1::new();
+        start_video(&mut board);
+        advance_one_frame(&mut board);
+        assert!(board.take_display_update());
+
+        board.vram.write_masked(PlaneGroup::Pixel, 4, 5, 0, 0xff);
+        board.vram.write_masked(PlaneGroup::Cid, 4, 5, 3, 0xff);
+        board
+            .vram
+            .write_masked(PlaneGroup::Overlay, 4, 768, 3, 0xff);
+        advance_one_frame(&mut board);
+        assert!(!board.take_display_update());
+
+        board.vram.write_masked(PlaneGroup::Overlay, 4, 5, 3, 0xff);
+        advance_one_frame(&mut board);
+        assert!(board.take_display_update());
+    }
+
+    #[test]
     fn drawn_pixels_reach_the_composed_frame() {
         let mut board = Lg1::new();
         start_video(&mut board);
@@ -697,6 +803,7 @@ mod tests {
         let mut board = Lg1::new();
         start_video(&mut board);
         advance_one_frame(&mut board);
+        assert!(board.take_display_update());
         assert!(matches!(
             board.display_state(),
             Some(GioDisplayState::Active { .. })
@@ -707,6 +814,10 @@ mod tests {
 
         assert_eq!(board.display_state(), Some(GioDisplayState::NoSignal));
         assert!(!board.interrupt_asserted(GioInterrupt::Interrupt2));
+        assert!(board.take_display_update());
+
+        write_peripheral(&mut board, RWVC1, 6, 0x02);
+        assert!(!board.take_display_update());
     }
 
     #[test]
@@ -714,26 +825,87 @@ mod tests {
         let mut board = Lg1::new();
         start_video(&mut board);
         advance_one_frame(&mut board);
+        assert!(board.take_display_update());
+        let Some(GioDisplayState::Active { pixels, .. }) = board.display_state() else {
+            panic!("valid timing must produce a frame");
+        };
 
         // Clear only the data path enable, leaving the generator running.
         write_peripheral(&mut board, RWVC1, 6, 0x19);
 
         assert_eq!(board.display_state(), Some(GioDisplayState::Blank));
         assert!(board.time_until_event().is_some());
+        assert!(board.take_display_update());
+
+        advance_one_frame(&mut board);
+
+        assert!(!board.take_display_update());
+        assert!(Arc::ptr_eq(board.frame.as_ref().unwrap(), &pixels));
+
+        // Re-enable the unchanged data path. The signal transition is
+        // immediate, but the retained complete frame needs no rebuild.
+        write_peripheral(&mut board, RWVC1, 6, 0x1d);
+        assert!(matches!(
+            board.display_state(),
+            Some(GioDisplayState::Active { .. })
+        ));
+        assert!(board.take_display_update());
+        advance_one_frame(&mut board);
+        assert!(!board.take_display_update());
+        assert!(Arc::ptr_eq(board.frame.as_ref().unwrap(), &pixels));
     }
 
     #[test]
-    fn a_shared_frame_survives_the_next_composition() {
+    fn a_published_frame_remains_immutable_after_the_next_composition() {
         let mut board = Lg1::new();
         start_video(&mut board);
         advance_one_frame(&mut board);
-        let Some(GioDisplayState::Active { pixels, .. }) = board.display_state() else {
+        let Some(GioDisplayState::Active { pixels: old, .. }) = board.display_state() else {
             panic!("valid timing must produce a frame");
         };
+        assert_eq!(&old[..4], [0, 0, 0, 0xff]);
+
+        write_peripheral(&mut board, RWDAC, 0, 1);
+        for component in [0x11, 0x22, 0x33] {
+            write_peripheral(&mut board, RWDAC, 1, component);
+        }
+        board.vram.write_masked(PlaneGroup::Pixel, 0, 0, 1, 0xff);
 
         advance_one_frame(&mut board);
 
-        assert_eq!(pixels.len(), 1024 * 768 * 4);
+        let Some(GioDisplayState::Active { pixels: new, .. }) = board.display_state() else {
+            panic!("the changed frame must remain active");
+        };
+        assert_eq!(&old[..4], [0, 0, 0, 0xff]);
+        assert_eq!(&new[..4], [0x11, 0x22, 0x33, 0xff]);
+        assert!(!Arc::ptr_eq(&old, &new));
+    }
+
+    #[test]
+    fn frame_recycler_is_bounded_and_reuses_released_allocations() {
+        let mut recycler = FrameRecycler::default();
+        let frame = Arc::new(vec![0; super::display::FRAME_BYTES]);
+        let pointer = frame.as_ptr();
+        let frontend = Arc::clone(&frame);
+        recycler.retire(frame);
+
+        let allocated = recycler.acquire(None);
+        assert_ne!(allocated.as_ptr(), pointer);
+        drop(allocated);
+        drop(frontend);
+
+        let reused = recycler.acquire(None);
+        assert_eq!(reused.as_ptr(), pointer);
+        drop(reused);
+
+        let mut frontend_frames = Vec::new();
+        for value in 0..=RETIRED_FRAME_LIMIT {
+            let frame = Arc::new(vec![value as u8; super::display::FRAME_BYTES]);
+            frontend_frames.push(Arc::clone(&frame));
+            recycler.retire(frame);
+        }
+        assert_eq!(recycler.retired.len(), RETIRED_FRAME_LIMIT);
+        assert!(recycler.clone().retired.is_empty());
     }
 
     #[test]
@@ -843,6 +1015,41 @@ mod tests {
         assert_eq!(restored.time_until_event(), board.time_until_event());
         assert!(restored.take_display_update());
         assert!(!restored.take_display_update());
+    }
+
+    #[test]
+    fn pending_composition_survives_a_snapshot_round_trip() {
+        let mut board = Lg1::new();
+        start_video(&mut board);
+        advance_one_frame(&mut board);
+        assert!(board.take_display_update());
+
+        board.vram.write_masked(PlaneGroup::Pixel, 0, 0, 1, 0xff);
+        write_peripheral(&mut board, RWDAC, 0, 1);
+        for component in [0x10, 0x20, 0x30] {
+            write_peripheral(&mut board, RWDAC, 1, component);
+        }
+        assert!(board.vram.display_dirty());
+        assert!(board.composition_dirty);
+
+        let encoded = bincode::serde::encode_to_vec(&board, bincode::config::standard()).unwrap();
+        let (mut restored, consumed): (Lg1, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert!(restored.vram.display_dirty());
+        assert!(restored.composition_dirty);
+        assert!(restored.frame_recycler.retired.is_empty());
+
+        advance_one_frame(&mut restored);
+
+        assert!(restored.take_display_update());
+        assert!(!restored.vram.display_dirty());
+        assert!(!restored.composition_dirty);
+        let Some(GioDisplayState::Active { pixels, .. }) = restored.display_state() else {
+            panic!("the restored frame must remain active");
+        };
+        assert_eq!(&pixels[..4], [0x10, 0x20, 0x30, 0xff]);
     }
 
     #[test]

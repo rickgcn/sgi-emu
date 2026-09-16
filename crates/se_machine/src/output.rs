@@ -82,7 +82,7 @@ pub enum VideoOutput {
     },
 }
 
-/// Output accumulated during one machine time advancement.
+/// Output accumulated across machine time advancements until the runtime drains it.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct MachineOutput {
     entries: Vec<(EndpointKey, EndpointOutput)>,

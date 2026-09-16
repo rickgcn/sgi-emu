@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::vc1::DISPLAY_HEIGHT;
+
 /// Frame buffer width in pixels.
 pub(super) const WIDTH: u32 = 1024;
 
@@ -57,6 +59,8 @@ pub(super) struct Vram {
     pixel: Box<[u8]>,
     overlay: Box<[u8]>,
     cid: Box<[u8]>,
+    /// Set when a visible pixel or overlay value changes.
+    display_dirty: bool,
 }
 
 impl Vram {
@@ -66,6 +70,7 @@ impl Vram {
             pixel: vec![0; PIXEL_COUNT].into_boxed_slice(),
             overlay: vec![0; PIXEL_COUNT].into_boxed_slice(),
             cid: vec![0; PIXEL_COUNT].into_boxed_slice(),
+            display_dirty: false,
         }
     }
 
@@ -74,6 +79,17 @@ impl Vram {
         self.pixel.fill(0);
         self.overlay.fill(0);
         self.cid.fill(0);
+        self.display_dirty = false;
+    }
+
+    /// Reports whether visible frame-buffer data changed after composition.
+    pub(super) const fn display_dirty(&self) -> bool {
+        self.display_dirty
+    }
+
+    /// Marks all current visible frame-buffer changes as composed.
+    pub(super) fn clear_display_dirty(&mut self) {
+        self.display_dirty = false;
     }
 
     /// Returns the pixel plane row for one displayed scan line.
@@ -126,7 +142,15 @@ impl Vram {
             PlaneGroup::Overlay => &mut self.overlay[index],
             PlaneGroup::Cid => &mut self.cid[index],
         };
-        *plane = (*plane & !mask) | (value & mask);
+        let previous = *plane;
+        let updated = (previous & !mask) | (value & mask);
+        *plane = updated;
+        if previous != updated
+            && y < DISPLAY_HEIGHT
+            && matches!(group, PlaneGroup::Pixel | PlaneGroup::Overlay)
+        {
+            self.display_dirty = true;
+        }
     }
 }
 
@@ -150,7 +174,7 @@ const fn row_start(y: u32) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEIGHT, PlaneGroup, Vram, WIDTH};
+    use super::{DISPLAY_HEIGHT, HEIGHT, PlaneGroup, Vram, WIDTH};
 
     #[test]
     fn aux2_selects_the_documented_plane_groups() {
@@ -181,6 +205,23 @@ mod tests {
         vram.write_masked(PlaneGroup::Pixel, 2, 3, 0x00, 0x0f);
 
         assert_eq!(vram.read(PlaneGroup::Pixel, 2, 3), 0xf0);
+    }
+
+    #[test]
+    fn only_visible_pixel_and_overlay_changes_dirty_the_display() {
+        let mut vram = Vram::new();
+
+        vram.write_masked(PlaneGroup::Pixel, 2, 3, 0x5a, 0xff);
+        assert!(vram.display_dirty());
+        vram.clear_display_dirty();
+
+        vram.write_masked(PlaneGroup::Pixel, 2, 3, 0x5a, 0xff);
+        vram.write_masked(PlaneGroup::Cid, 2, 3, 0x03, 0xff);
+        vram.write_masked(PlaneGroup::Overlay, 2, DISPLAY_HEIGHT, 0x03, 0xff);
+        assert!(!vram.display_dirty());
+
+        vram.write_masked(PlaneGroup::Overlay, 2, 3, 0x03, 0xff);
+        assert!(vram.display_dirty());
     }
 
     #[test]
@@ -232,5 +273,6 @@ mod tests {
         assert_eq!(vram.read(PlaneGroup::Pixel, 1, 1), 0);
         assert_eq!(vram.read(PlaneGroup::Overlay, 1, 1), 0);
         assert_eq!(vram.read(PlaneGroup::Cid, 1, 1), 0);
+        assert!(!vram.display_dirty());
     }
 }

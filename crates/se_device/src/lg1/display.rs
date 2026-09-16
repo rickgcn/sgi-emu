@@ -23,6 +23,24 @@ const CURSOR_ROW_BYTES: usize = 4;
 /// First palette entry reserved for the VC1 popup-plane submap.
 const OVERLAY_PALETTE_BASE: u16 = 0x310;
 
+/// Number of display identifiers addressable by the VC1 XMAP table.
+const DISPLAY_MODES: usize = 32;
+
+/// Number of values in one eight-bit frame-buffer plane.
+const PIXEL_VALUES: usize = 256;
+
+/// Number of values in the two-bit overlay plane.
+const OVERLAY_VALUES: usize = 4;
+
+/// One fully resolved display color.
+type Rgba = [u8; 4];
+
+/// Palette colors pre-resolved for every display mode and source value.
+struct ColorTables {
+    pixel: [[Rgba; PIXEL_VALUES]; DISPLAY_MODES],
+    overlay: [Rgba; OVERLAY_VALUES],
+}
+
 /// Composes one complete frame into `pixels`.
 ///
 /// The buffer must hold [`FRAME_BYTES`] bytes. Every pixel is written, so no
@@ -38,6 +56,11 @@ pub(super) fn compose(vram: &Vram, vc1: &Vc1, dac: &Bt479, pixels: &mut [u8]) {
         "composition target must hold one whole frame"
     );
 
+    let mut tables = ColorTables {
+        pixel: [[[0; 4]; PIXEL_VALUES]; DISPLAY_MODES],
+        overlay: [[0; 4]; OVERLAY_VALUES],
+    };
+    populate_color_tables(vc1, dac, &mut tables);
     let mut identifiers = [0; DISPLAY_WIDTH as usize];
 
     for y in 0..DISPLAY_HEIGHT {
@@ -46,45 +69,41 @@ pub(super) fn compose(vram: &Vram, vc1: &Vc1, dac: &Bt479, pixels: &mut [u8]) {
         let overlay = vram.overlay_row(y);
         let row = (y * DISPLAY_WIDTH) as usize * 4;
         for x in 0..DISPLAY_WIDTH {
-            let overlay = overlay[x as usize];
-            let index = if overlay == 0 {
-                color_index(
-                    vc1.display_mode(identifiers[x as usize]),
-                    source[x as usize],
-                )
+            let x = x as usize;
+            let overlay = overlay[x] & 0x03;
+            let color = if overlay == 0 {
+                tables.pixel[usize::from(identifiers[x] & 0x1f)][usize::from(source[x])]
             } else {
-                OVERLAY_PALETTE_BASE | u16::from(overlay)
+                tables.overlay[usize::from(overlay)]
             };
-            let [red, green, blue] = dac.color(index);
-            let offset = row + x as usize * 4;
+            let [red, green, blue, alpha] = color;
+            let offset = row + x * 4;
             pixels[offset] = red;
             pixels[offset + 1] = green;
             pixels[offset + 2] = blue;
-            pixels[offset + 3] = u8::MAX;
+            pixels[offset + 3] = alpha;
         }
     }
 
     compose_cursor(vc1, dac, pixels);
 }
 
-/// Fills the frame with black while video timing stays valid.
-///
-/// # Panics
-///
-/// Panics when `pixels` is not exactly [`FRAME_BYTES`] long.
-pub(super) fn compose_blank(pixels: &mut [u8]) {
-    assert_eq!(
-        pixels.len(),
-        FRAME_BYTES,
-        "composition target must hold one whole frame"
-    );
-
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel[0] = 0;
-        pixel[1] = 0;
-        pixel[2] = 0;
-        pixel[3] = u8::MAX;
+/// Fills lookup tables for the complete pixel and overlay palette paths.
+fn populate_color_tables(vc1: &Vc1, dac: &Bt479, tables: &mut ColorTables) {
+    for (identifier, colors) in tables.pixel.iter_mut().enumerate() {
+        let mode = vc1.display_mode(identifier as u8);
+        for (pixel, color) in colors.iter_mut().enumerate() {
+            *color = opaque(dac.color(color_index(mode, pixel as u8)));
+        }
     }
+    for (overlay, color) in tables.overlay.iter_mut().enumerate() {
+        *color = opaque(dac.color(OVERLAY_PALETTE_BASE | overlay as u16));
+    }
+}
+
+/// Adds the fixed alpha component to one DAC color.
+const fn opaque([red, green, blue]: [u8; 3]) -> Rgba {
+    [red, green, blue, u8::MAX]
 }
 
 /// Returns the palette index selected by one display mode and VRAM byte.
@@ -153,7 +172,10 @@ mod tests {
         DISPLAY_HEIGHT, DISPLAY_WIDTH, SYS_CTRL_CURSOR_DISPLAY, Selector as Vc1Selector, Vc1,
     };
     use super::super::vram::{PlaneGroup, Vram};
-    use super::{CURSOR_PLANE_BYTES, FRAME_BYTES, compose, compose_blank};
+    use super::{
+        CURSOR_PLANE_BYTES, ColorTables, DISPLAY_MODES, FRAME_BYTES, OVERLAY_PALETTE_BASE,
+        OVERLAY_VALUES, PIXEL_VALUES, color_index, compose, opaque, populate_color_tables,
+    };
 
     /// Writes one palette entry in the host bank currently selected.
     fn write_palette(dac: &mut Bt479, address: u8, color: [u8; 3]) {
@@ -323,6 +345,52 @@ mod tests {
     }
 
     #[test]
+    fn lookup_tables_match_scalar_palette_resolution() {
+        let mut vc1 = Vc1::new();
+        let mut dac = Bt479::new();
+        for bank in 0..4_u8 {
+            select_bank(&mut dac, bank);
+            for address in 0..=u8::MAX {
+                write_palette(
+                    &mut dac,
+                    address,
+                    [address, bank.wrapping_mul(0x55), address ^ bank],
+                );
+            }
+        }
+        for identifier in 0..DISPLAY_MODES {
+            let address = (identifier * 2) as u16;
+            let mode = (identifier as u16).wrapping_mul(0x49) & 0xff;
+            vc1.write(Vc1Selector::AddressHigh, (address >> 8) as u8);
+            vc1.write(Vc1Selector::AddressLow, address as u8);
+            vc1.write(Vc1Selector::XmapMode, (mode >> 8) as u8);
+            vc1.write(Vc1Selector::XmapMode, mode as u8);
+        }
+
+        let mut tables = ColorTables {
+            pixel: [[[0; 4]; PIXEL_VALUES]; DISPLAY_MODES],
+            overlay: [[0; 4]; OVERLAY_VALUES],
+        };
+        populate_color_tables(&vc1, &dac, &mut tables);
+
+        for identifier in 0..DISPLAY_MODES {
+            let mode = vc1.display_mode(identifier as u8);
+            for pixel in 0..PIXEL_VALUES {
+                assert_eq!(
+                    tables.pixel[identifier][pixel],
+                    opaque(dac.color(color_index(mode, pixel as u8)))
+                );
+            }
+        }
+        for overlay in 0..OVERLAY_VALUES {
+            assert_eq!(
+                tables.overlay[overlay],
+                opaque(dac.color(OVERLAY_PALETTE_BASE | overlay as u16))
+            );
+        }
+    }
+
+    #[test]
     fn display_identifiers_select_palette_banks_across_one_scan_line() {
         let mut vram = Vram::new();
         let mut vc1 = Vc1::new();
@@ -373,15 +441,6 @@ mod tests {
 
         assert_eq!(pixel_at(&pixels, 4, 5), [2, 2, 2, 0xff]);
         assert_eq!(pixel_at(&pixels, 5, 5), [0, 0, 0, 0xff]);
-    }
-
-    #[test]
-    fn a_blank_frame_is_black_and_opaque() {
-        let mut pixels = vec![0xa5; FRAME_BYTES];
-
-        compose_blank(&mut pixels);
-
-        assert!(pixels.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 0xff]));
     }
 
     #[test]
