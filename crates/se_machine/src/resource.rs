@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 
+use se_config::diagnostic::DiagnosticTarget;
 use se_core::storage::{StorageAccess, StorageMedium};
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +43,7 @@ pub enum ResourceKind {
     },
 }
 
-/// A resource path and the form in which it will be needed.
+/// A resource path, required form, and configuration provenance.
 ///
 /// The path is preserved from the draft; compilation does not inspect it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +52,8 @@ pub struct ResourceRequirement {
     pub path: PathBuf,
     /// The required resource form.
     pub kind: ResourceKind,
+    /// The configuration target from which this requirement originated.
+    pub origin: DiagnosticTarget,
 }
 
 /// Resource roles and requirements in deterministic ID order.
@@ -244,6 +247,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc::{self, Sender};
 
+    use se_config::diagnostic::DiagnosticTarget;
+    use se_config::id::PropertyId;
     use se_core::storage::{StorageAccess, StorageMedium};
 
     use super::{
@@ -281,6 +286,7 @@ mod tests {
         ResourceRequirement {
             path: PathBuf::from("unused-host-path"),
             kind,
+            origin: DiagnosticTarget::Global,
         }
     }
 
@@ -403,5 +409,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn provenance_preserves_requirement_equality_and_id_ordering() {
+        let mut requirements = ResourceRequirements::default();
+        requirements.insert(
+            ResourceId::new("b.storage"),
+            requirement(ResourceKind::Storage {
+                access: StorageAccess::ReadOnly,
+            }),
+        );
+        let mut bytes = requirement(ResourceKind::Bytes);
+        bytes.origin = DiagnosticTarget::Property(PropertyId(String::from("firmware.path")));
+        requirements.insert(ResourceId::new("a.bytes"), bytes);
+
+        assert_eq!(requirements, requirements.clone());
+        assert_eq!(
+            requirements
+                .iter()
+                .map(|(id, requirement)| (id.as_str(), requirement.origin.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "a.bytes",
+                    DiagnosticTarget::Property(PropertyId(String::from("firmware.path")))
+                ),
+                ("b.storage", DiagnosticTarget::Global),
+            ]
+        );
     }
 }

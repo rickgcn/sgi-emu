@@ -1,6 +1,6 @@
 //! Projection of generic machine views and edit intents across the Qt boundary.
 
-use se_config::diagnostic::{DiagnosticSeverity, DiagnosticTarget};
+use se_config::diagnostic::{Diagnostic, DiagnosticSeverity, DiagnosticTarget};
 use se_config::draft::Edit;
 use se_config::id::{DeviceKindId, NodeId, PropertyId};
 use se_config::value::PropertyValue;
@@ -12,10 +12,11 @@ use crate::bridge::ffi::{
     MachinePropertyValueDto,
 };
 
-pub(crate) fn view_dto(view: ConfigurationView) -> MachineConfigurationViewDto {
+pub(crate) fn view_dto(view: ConfigurationView, revision: u64) -> MachineConfigurationViewDto {
     MachineConfigurationViewDto {
         success: true,
         error: String::new(),
+        revision,
         display_name: view.display_name,
         nodes: view
             .nodes
@@ -118,34 +119,40 @@ pub(crate) fn view_dto(view: ConfigurationView) -> MachineConfigurationViewDto {
                 }
             })
             .collect(),
-        diagnostics: view
-            .diagnostics
-            .into_iter()
-            .map(|diagnostic| {
-                let (target_kind, target_id) = match diagnostic.target {
-                    DiagnosticTarget::Global => (0, String::new()),
-                    DiagnosticTarget::Node(id) => (1, id.0),
-                    DiagnosticTarget::Property(id) => (2, id.0),
-                };
-                MachineDiagnosticDto {
-                    severity: match diagnostic.severity {
-                        DiagnosticSeverity::Warning => 0,
-                        DiagnosticSeverity::Error => 1,
-                    },
-                    target_kind,
-                    target_id,
-                    code: diagnostic.code,
-                    message: diagnostic.message,
-                }
-            })
-            .collect(),
+        diagnostics: diagnostics_dto(view.diagnostics),
     }
+}
+
+pub(crate) fn diagnostics_dto(
+    diagnostics: impl IntoIterator<Item = Diagnostic>,
+) -> Vec<MachineDiagnosticDto> {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let (target_kind, target_id) = match diagnostic.target {
+                DiagnosticTarget::Global => (0, String::new()),
+                DiagnosticTarget::Node(id) => (1, id.0),
+                DiagnosticTarget::Property(id) => (2, id.0),
+            };
+            MachineDiagnosticDto {
+                severity: match diagnostic.severity {
+                    DiagnosticSeverity::Warning => 0,
+                    DiagnosticSeverity::Error => 1,
+                },
+                target_kind,
+                target_id,
+                code: diagnostic.code,
+                message: diagnostic.message,
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn failed_view(error: impl Into<String>) -> MachineConfigurationViewDto {
     MachineConfigurationViewDto {
         success: false,
         error: error.into(),
+        revision: 0,
         display_name: String::new(),
         nodes: Vec::new(),
         diagnostics: Vec::new(),
@@ -291,8 +298,9 @@ mod tests {
                 message: String::from("Missing image"),
             }],
         };
-        let dto = view_dto(view);
+        let dto = view_dto(view, 17);
         assert!(dto.success);
+        assert_eq!(dto.revision, 17);
         assert_eq!(dto.display_name, "Example Machine");
         let node = &dto.nodes[1];
         assert_eq!(node.parent_id, "root");

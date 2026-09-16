@@ -31,6 +31,7 @@ class DisassemblyDock;
 class MemoryDock;
 class PreparationTask;
 class ReplayCatalogTask;
+class SettingsPreflightTask;
 class RegistersDock;
 class MachineOutputSink;
 class SerialConsoleDock;
@@ -78,6 +79,8 @@ private:
     void stop_replay();
     void show_settings();
     void apply_settings(NetworkSettings selected);
+    void request_settings_preflight();
+    void poll_settings_preflight();
     void update_runtime();
     void refresh_debuggers();
     void apply_runtime_status(const RuntimeStatusDto& status, bool report_error);
@@ -88,6 +91,10 @@ private:
     NetworkSettings network_settings_;
     std::unique_ptr<NetworkSettings> pending_network_settings_;
     QPointer<SettingsDialog> settings_dialog_;
+    std::unique_ptr<SettingsPreflightTask> settings_preflight_task_;
+    bool settings_preflight_pending_;
+    std::uint64_t settings_preflight_pending_generation_;
+    std::uint64_t settings_dialog_generation_;
 
     QAction* run_action_;
     QAction* run_with_record_action_;

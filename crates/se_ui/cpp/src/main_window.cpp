@@ -79,9 +79,25 @@ public:
     std::future<ReplaySnapshotCatalogDto> future;
 };
 
+class SettingsPreflightTask final {
+public:
+    SettingsPreflightTask(
+        std::uint64_t dialog_generation, std::function<MachinePreflightDto()> command)
+        : generation(dialog_generation)
+        , future(std::async(std::launch::async, std::move(command))) {
+    }
+
+    std::uint64_t generation;
+    std::future<MachinePreflightDto> future;
+};
+
 MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     : session_(session)
     , network_settings_(from_network_configuration(startup.network))
+    , settings_preflight_task_()
+    , settings_preflight_pending_(false)
+    , settings_preflight_pending_generation_(0)
+    , settings_dialog_generation_(0)
     , run_action_(nullptr)
     , run_with_record_action_(nullptr)
     , reset_action_(nullptr)
@@ -615,13 +631,20 @@ void MainWindow::show_settings() {
         return;
     }
 
+    ++settings_dialog_generation_;
+    const auto generation = settings_dialog_generation_;
     auto* dialog = new SettingsDialog(
         session_,
         network_settings_,
         [this](NetworkSettings selected) { apply_settings(std::move(selected)); },
+        [this] { request_settings_preflight(); },
         this);
     settings_dialog_ = dialog;
-    connect(dialog, &QDialog::rejected, this, [this] {
+    connect(dialog, &QDialog::rejected, this, [this, dialog, generation] {
+        if (settings_dialog_ == dialog) { settings_dialog_ = nullptr; }
+        if (settings_preflight_pending_generation_ == generation) {
+            settings_preflight_pending_ = false;
+        }
         pending_network_settings_.reset();
         session_.cancel_machine_edit();
     });
@@ -632,7 +655,10 @@ void MainWindow::apply_settings(NetworkSettings selected) {
     if (settings_dialog_ == nullptr) {
         return;
     }
-    if (!session_.machine_edit_changed() && selected == network_settings_) {
+    const auto runtime = session_.runtime_status();
+    const bool runtime_configured = runtime.success && runtime.state != 0;
+    if (!session_.machine_edit_changed() && selected == network_settings_
+        && runtime_configured) {
         pending_network_settings_.reset();
         session_.cancel_machine_edit();
         settings_dialog_->finish_apply_success();
@@ -650,7 +676,41 @@ void MainWindow::apply_settings(NetworkSettings selected) {
         [this, network] { return session_.configure_edited_machine(*network); });
 }
 
+void MainWindow::request_settings_preflight() {
+    if (settings_dialog_ == nullptr) { return; }
+    if (settings_preflight_task_ != nullptr) {
+        settings_preflight_pending_ = true;
+        settings_preflight_pending_generation_ = settings_dialog_generation_;
+        return;
+    }
+    const auto* session = &session_;
+    settings_preflight_task_ = std::make_unique<SettingsPreflightTask>(
+        settings_dialog_generation_,
+        [session] { return session->preflight_edited_machine(); });
+}
+
+void MainWindow::poll_settings_preflight() {
+    if (settings_preflight_task_ == nullptr
+        || settings_preflight_task_->future.wait_for(std::chrono::seconds(0))
+            != std::future_status::ready) {
+        return;
+    }
+
+    const auto generation = settings_preflight_task_->generation;
+    auto result = settings_preflight_task_->future.get();
+    settings_preflight_task_.reset();
+    if (settings_dialog_ != nullptr && generation == settings_dialog_generation_) {
+        settings_dialog_->apply_preflight_result(std::move(result));
+    }
+
+    const bool restart = settings_preflight_pending_ && settings_dialog_ != nullptr
+        && settings_preflight_pending_generation_ == settings_dialog_generation_;
+    settings_preflight_pending_ = false;
+    if (restart) { request_settings_preflight(); }
+}
+
 void MainWindow::update_runtime() {
+    poll_settings_preflight();
     poll_preparation();
     if (preparation_state_ != PreparationState::None) {
         apply_preparation_state();

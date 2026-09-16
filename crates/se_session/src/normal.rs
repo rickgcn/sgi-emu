@@ -6,6 +6,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use se_config::diagnostic::{Diagnostic, DiagnosticSeverity};
 use se_config::draft::MachineDraft;
 use se_core::storage::StorageAccess;
 use se_machine::indigo::ip12::builder::{self, Ip12AssemblyError};
@@ -174,6 +175,26 @@ pub fn prepare_ip12(plan: Ip12BuildPlan) -> Result<PreparedIp12Build, NormalPrep
     plan.prepare_with(|_, requirement| prepare_requirement(requirement))
 }
 
+/// Checks every host resource required by a semantically valid draft.
+///
+/// The same host capability operations used by authoritative preparation are
+/// opened and immediately dropped. This function does not assemble a machine,
+/// load persistence, or mutate runtime state.
+#[must_use]
+pub fn preflight_configuration(draft: &MachineDraft) -> Vec<Diagnostic> {
+    let Ok(plan) = Ip12Definition.compile(draft) else {
+        return Vec::new();
+    };
+    plan.resources()
+        .iter()
+        .filter_map(|(_, requirement)| {
+            prepare_requirement(requirement)
+                .err()
+                .map(|error| host_resource_diagnostic(requirement, &error))
+        })
+        .collect()
+}
+
 fn prepare_requirement(
     requirement: &ResourceRequirement,
 ) -> Result<PreparedResource, HostResourceError> {
@@ -203,6 +224,60 @@ fn prepare_requirement(
     }
 }
 
+fn host_resource_diagnostic(
+    requirement: &ResourceRequirement,
+    error: &HostResourceError,
+) -> Diagnostic {
+    let source = match error {
+        HostResourceError::ReadBytes { source, .. }
+        | HostResourceError::OpenStorage { source, .. }
+        | HostResourceError::HashStorage { source, .. } => source,
+    };
+    let (code, message) = match source.kind() {
+        io::ErrorKind::NotFound => (
+            "host.resource.not-found",
+            String::from("File does not exist."),
+        ),
+        io::ErrorKind::PermissionDenied => (
+            "host.resource.permission-denied",
+            match error {
+                HostResourceError::OpenStorage {
+                    access: StorageAccess::ReadWrite,
+                    ..
+                } => String::from("File cannot be opened for read-write access."),
+                HostResourceError::ReadBytes { .. }
+                | HostResourceError::OpenStorage {
+                    access: StorageAccess::ReadOnly,
+                    ..
+                }
+                | HostResourceError::HashStorage { .. } => String::from("File cannot be read."),
+            },
+        ),
+        _ => (
+            "host.resource.unavailable",
+            match error {
+                HostResourceError::ReadBytes { .. } | HostResourceError::HashStorage { .. } => {
+                    format!("Could not read this file: {source}.")
+                }
+                HostResourceError::OpenStorage {
+                    access: StorageAccess::ReadOnly,
+                    ..
+                } => format!("Could not open this file for read access: {source}."),
+                HostResourceError::OpenStorage {
+                    access: StorageAccess::ReadWrite,
+                    ..
+                } => format!("Could not open this file for read-write access: {source}."),
+            },
+        ),
+    };
+    Diagnostic {
+        severity: DiagnosticSeverity::Error,
+        code: code.into(),
+        target: requirement.origin.clone(),
+        message,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -211,6 +286,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use se_config::definition::MachineDefinition;
+    use se_config::diagnostic::DiagnosticTarget;
     use se_config::draft::{Edit, MachineDraft};
     use se_config::id::{DeviceKindId, NodeId, PropertyId};
     use se_config::value::PropertyValue;
@@ -225,7 +301,10 @@ mod tests {
     use se_network::config::NatConfig;
     use se_runtime::runtime::Runtime;
 
-    use super::{HostResourceError, build_configuration, prepare_ip12, prepare_requirement};
+    use super::{
+        HostResourceError, build_configuration, host_resource_diagnostic, preflight_configuration,
+        prepare_ip12, prepare_requirement,
+    };
 
     const PROM_BYTES: usize = 0x40000;
     static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -304,6 +383,7 @@ mod tests {
         let requirement = ResourceRequirement {
             path,
             kind: ResourceKind::Bytes,
+            origin: DiagnosticTarget::Global,
         };
         let resource = prepare_requirement(&requirement).unwrap();
         assert!(matches!(resource, PreparedResource::Bytes(bytes) if bytes == [0, 1, 2, 3, 255]));
@@ -366,6 +446,95 @@ mod tests {
             ));
             assert!(error.source().unwrap().source().is_some());
         }
+    }
+
+    #[test]
+    fn preflight_accepts_valid_resources_without_mutating_or_retaining_storage() {
+        let files = TemporaryFiles::new("preflight-valid");
+        let firmware = files.write("prom.bin", [1, 2, 3, 4]);
+        let disk = files.write("disk.img", [5, 6, 7, 8]);
+        let moved_disk = files.path("moved.img");
+        let mut draft = draft_with_firmware(&firmware);
+        attach_medium(&mut draft, 2, 0, ScsiDevice::Disk, &disk);
+
+        assert!(preflight_configuration(&draft).is_empty());
+        assert_eq!(fs::read(&disk).unwrap(), [5, 6, 7, 8]);
+        fs::rename(&disk, &moved_disk).expect("preflight must release the storage handle");
+        assert_eq!(fs::read(moved_disk).unwrap(), [5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn preflight_targets_missing_firmware_and_scsi_media() {
+        let files = TemporaryFiles::new("preflight-targets");
+        let missing_firmware = files.path("missing.prom");
+        let missing_disk = files.path("missing.img");
+        let missing_cdrom = files.path("missing.iso");
+        let mut draft = draft_with_firmware(&missing_firmware);
+        attach_medium(&mut draft, 2, 0, ScsiDevice::Disk, &missing_disk);
+        attach_medium(&mut draft, 3, 4, ScsiDevice::Cdrom, &missing_cdrom);
+
+        let diagnostics = preflight_configuration(&draft);
+        assert_eq!(diagnostics.len(), 3);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.code == "host.resource.not-found"
+                && diagnostic.message == "File does not exist."
+        }));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.target.clone())
+                .collect::<Vec<_>>(),
+            [
+                DiagnosticTarget::Property(PropertyId(String::from("firmware.0.image-path"))),
+                DiagnosticTarget::Property(PropertyId(String::from(
+                    "scsi.0.target.2.lun.0.medium-path"
+                ))),
+                DiagnosticTarget::Property(PropertyId(String::from(
+                    "scsi.0.target.3.lun.4.medium-path"
+                ))),
+            ]
+        );
+    }
+
+    #[test]
+    fn preflight_skips_host_access_for_semantically_invalid_drafts() {
+        let draft = Ip12Definition.default_draft();
+        assert!(preflight_configuration(&draft).is_empty());
+    }
+
+    #[test]
+    fn permission_diagnostics_follow_requested_capability() {
+        let read_requirement = ResourceRequirement {
+            path: PathBuf::from("firmware.bin"),
+            kind: ResourceKind::Bytes,
+            origin: DiagnosticTarget::Global,
+        };
+        let read_error = HostResourceError::ReadBytes {
+            path: read_requirement.path.clone(),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        let read = host_resource_diagnostic(&read_requirement, &read_error);
+        assert_eq!(read.code, "host.resource.permission-denied");
+        assert_eq!(read.message, "File cannot be read.");
+
+        let write_requirement = ResourceRequirement {
+            path: PathBuf::from("disk.img"),
+            kind: ResourceKind::Storage {
+                access: StorageAccess::ReadWrite,
+            },
+            origin: DiagnosticTarget::Global,
+        };
+        let write_error = HostResourceError::OpenStorage {
+            path: write_requirement.path.clone(),
+            access: StorageAccess::ReadWrite,
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        let write = host_resource_diagnostic(&write_requirement, &write_error);
+        assert_eq!(write.code, "host.resource.permission-denied");
+        assert_eq!(
+            write.message,
+            "File cannot be opened for read-write access."
+        );
     }
 
     #[test]

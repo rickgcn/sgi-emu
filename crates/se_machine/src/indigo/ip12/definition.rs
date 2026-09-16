@@ -504,8 +504,12 @@ impl<'a> Projection<'a> {
                         label,
                     );
                     if supported {
-                        let value =
-                            self.required_value(&medium, PropertyValue::Text(String::new()));
+                        let value = self
+                            .draft
+                            .properties
+                            .get(&medium)
+                            .cloned()
+                            .unwrap_or_else(|| PropertyValue::Text(String::new()));
                         match &value {
                             PropertyValue::Text(path) if !path.trim().is_empty() => {
                                 let medium_id = ResourceId::new(format!(
@@ -522,6 +526,7 @@ impl<'a> Projection<'a> {
                                                 StorageAccess::ReadOnly
                                             },
                                         },
+                                        origin: DiagnosticTarget::Property(medium.clone()),
                                     },
                                 );
                                 self.scsi.push(ScsiAttachment {
@@ -538,20 +543,17 @@ impl<'a> Projection<'a> {
                             PropertyValue::Text(_) => self.report(
                                 "ip12.scsi.medium-required",
                                 DiagnosticTarget::Property(medium.clone()),
-                                "An attached SCSI device needs a medium path.",
+                                if device == device_kind(SCSI_DISK) {
+                                    "Select a disk image."
+                                } else {
+                                    "Select a CD-ROM image."
+                                },
                             ),
-                            _ => {
-                                self.report(
-                                    "ip12.property.invalid-type",
-                                    DiagnosticTarget::Property(medium.clone()),
-                                    "The medium path must be text.",
-                                );
-                                self.report(
-                                    "ip12.scsi.medium-required",
-                                    DiagnosticTarget::Property(medium.clone()),
-                                    "An attached SCSI device needs a medium path.",
-                                );
-                            }
+                            _ => self.report(
+                                "ip12.property.invalid-type",
+                                DiagnosticTarget::Property(medium.clone()),
+                                "The medium path must be text.",
+                            ),
                         }
                         device_node
                             .properties
@@ -676,7 +678,13 @@ impl<'a> Projection<'a> {
 
     fn firmware(&mut self) {
         let property = property_id(FIRMWARE_PATH);
-        let value = self.required_value(&property, PropertyValue::Text(String::new()));
+        self.known_properties.insert(property.clone());
+        let value = self
+            .draft
+            .properties
+            .get(&property)
+            .cloned()
+            .unwrap_or_else(|| PropertyValue::Text(String::new()));
         match &value {
             PropertyValue::Text(path) if !path.trim().is_empty() => {
                 self.resources.insert(
@@ -684,26 +692,20 @@ impl<'a> Projection<'a> {
                     ResourceRequirement {
                         path: PathBuf::from(path),
                         kind: ResourceKind::Bytes,
+                        origin: DiagnosticTarget::Property(property.clone()),
                     },
                 );
             }
             PropertyValue::Text(_) => self.report(
                 "ip12.firmware.image-required",
                 DiagnosticTarget::Property(property.clone()),
-                "The IP12 needs a PROM image path.",
+                "Select a PROM image.",
             ),
-            _ => {
-                self.report(
-                    "ip12.property.invalid-type",
-                    DiagnosticTarget::Property(property.clone()),
-                    "The PROM image path must be text.",
-                );
-                self.report(
-                    "ip12.firmware.image-required",
-                    DiagnosticTarget::Property(property.clone()),
-                    "The IP12 needs a PROM image path.",
-                );
-            }
+            _ => self.report(
+                "ip12.property.invalid-type",
+                DiagnosticTarget::Property(property.clone()),
+                "The PROM image path must be text.",
+            ),
         }
         let mut firmware = node(
             node_id("firmware.0"),
@@ -883,6 +885,16 @@ mod tests {
         })
     }
 
+    fn targeted_codes<'a>(view: &'a ConfigurationView, target: &DiagnosticTarget) -> Vec<&'a str> {
+        view.diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.severity == DiagnosticSeverity::Error && &diagnostic.target == target
+            })
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect()
+    }
+
     fn set(draft: &mut MachineDraft, property: PropertyId, value: PropertyValue) {
         draft.apply(Edit::SetProperty { property, value });
     }
@@ -938,14 +950,20 @@ mod tests {
         assert_eq!(plan.memory().simm_mib(), [2, 0, 0]);
         assert_eq!(plan.firmware().as_str(), "firmware.0.image");
         assert_eq!(plan.resources().len(), 1);
+        let firmware = plan
+            .resources()
+            .get(plan.firmware())
+            .expect("the firmware resource must exist");
         assert_eq!(
-            plan.resources()
-                .get(plan.firmware())
-                .map(|item| (&item.path, item.kind)),
-            Some((
+            (&firmware.path, firmware.kind),
+            (
                 &PathBuf::from("/definitely/not/a/real/prom.bin"),
                 ResourceKind::Bytes
-            ))
+            )
+        );
+        assert_eq!(
+            firmware.origin,
+            DiagnosticTarget::Property(property_id(FIRMWARE_PATH))
         );
         assert_eq!(plan.gio().len(), 1);
         assert_eq!(plan.gio()[0].slot, GioSlot::Graphics);
@@ -1085,6 +1103,10 @@ mod tests {
                         StorageAccess::ReadOnly
                     }
                 }
+            );
+            assert_eq!(
+                resource.origin,
+                DiagnosticTarget::Property(scsi_medium(target, lun))
             );
         }
         let roles: Vec<_> = plan.resources().iter().map(|(id, _)| id.as_str()).collect();
@@ -1764,45 +1786,55 @@ mod tests {
 
     #[test]
     fn medium_path_is_required_only_while_a_scsi_device_is_attached() {
-        let mut draft = Ip12Definition.default_draft();
         let slot = scsi_lun(2, 3);
         let medium = scsi_medium(2, 3);
+        let target = DiagnosticTarget::Property(medium.clone());
+        for (kind, message) in [
+            (SCSI_DISK, "Select a disk image."),
+            (SCSI_CDROM, "Select a CD-ROM image."),
+        ] {
+            let mut draft = Ip12Definition.default_draft();
+            attach(&mut draft, slot.clone(), Some(kind));
+            let missing = Ip12Definition.resolve(&draft);
+            assert_eq!(
+                value(&missing, &medium),
+                &PropertyValue::Text(String::new())
+            );
+            assert_eq!(
+                targeted_codes(&missing, &target),
+                ["ip12.scsi.medium-required"]
+            );
+            assert_eq!(
+                missing
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.target == target)
+                    .map(|diagnostic| diagnostic.message.as_str()),
+                Some(message)
+            );
+
+            set(
+                &mut draft,
+                medium.clone(),
+                PropertyValue::Text(String::new()),
+            );
+            let empty = Ip12Definition.resolve(&draft);
+            assert_eq!(
+                targeted_codes(&empty, &target),
+                ["ip12.scsi.medium-required"]
+            );
+
+            set(&mut draft, medium.clone(), PropertyValue::Integer(3));
+            let wrong_type = Ip12Definition.resolve(&draft);
+            assert_eq!(value(&wrong_type, &medium), &PropertyValue::Integer(3));
+            assert_eq!(
+                targeted_codes(&wrong_type, &target),
+                ["ip12.property.invalid-type"]
+            );
+        }
+
+        let mut draft = Ip12Definition.default_draft();
         attach(&mut draft, slot.clone(), Some(SCSI_DISK));
-        let missing = Ip12Definition.resolve(&draft);
-        assert_eq!(
-            value(&missing, &medium),
-            &PropertyValue::Text(String::new())
-        );
-        assert!(error(
-            &missing,
-            "ip12.property.missing",
-            DiagnosticTarget::Property(medium.clone())
-        ));
-        assert!(error(
-            &missing,
-            "ip12.scsi.medium-required",
-            DiagnosticTarget::Property(medium.clone())
-        ));
-
-        set(
-            &mut draft,
-            medium.clone(),
-            PropertyValue::Text(String::new()),
-        );
-        assert!(error(
-            &Ip12Definition.resolve(&draft),
-            "ip12.scsi.medium-required",
-            DiagnosticTarget::Property(medium.clone())
-        ));
-        set(&mut draft, medium.clone(), PropertyValue::Integer(3));
-        let wrong_type = Ip12Definition.resolve(&draft);
-        assert_eq!(value(&wrong_type, &medium), &PropertyValue::Integer(3));
-        assert!(error(
-            &wrong_type,
-            "ip12.property.invalid-type",
-            DiagnosticTarget::Property(medium.clone())
-        ));
-
         set(
             &mut draft,
             medium.clone(),
@@ -1914,21 +1946,28 @@ mod tests {
             "ip12.property.invalid-type",
             DiagnosticTarget::Property(property.clone())
         ));
+        assert_eq!(
+            targeted_codes(&wrong_type, &DiagnosticTarget::Property(property.clone())),
+            ["ip12.property.invalid-type"]
+        );
         draft.properties.remove(&property);
         let missing = Ip12Definition.resolve(&draft);
         assert_eq!(
             value(&missing, &property),
             &PropertyValue::Text(String::new())
         );
-        assert!(error(
-            &missing,
-            "ip12.property.missing",
-            DiagnosticTarget::Property(property.clone())
-        ));
-        assert!(error(
-            &missing,
-            "ip12.firmware.image-required",
-            DiagnosticTarget::Property(property)
-        ));
+        let target = DiagnosticTarget::Property(property);
+        assert_eq!(
+            targeted_codes(&missing, &target),
+            ["ip12.firmware.image-required"]
+        );
+        assert_eq!(
+            missing
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.target == target)
+                .map(|diagnostic| diagnostic.message.as_str()),
+            Some("Select a PROM image.")
+        );
     }
 }

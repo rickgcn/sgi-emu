@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         machine_draft,
         machine_definition(),
         active_frontend,
+        Box::new(|draft| Ok(se_session::normal::preflight_configuration(&draft))),
         Box::new(build_normal_configuration),
         Box::new(|draft, network, path| {
             let network = config::parse_network_configuration(network)?;

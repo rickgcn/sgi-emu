@@ -302,8 +302,18 @@ pub mod ffi {
     pub struct MachineConfigurationViewDto {
         pub success: bool,
         pub error: String,
+        pub revision: u64,
         pub display_name: String,
         pub nodes: Vec<MachineNodeDto>,
+        pub diagnostics: Vec<MachineDiagnosticDto>,
+    }
+
+    /// Result of checking host resources for one machine edit snapshot.
+    #[derive(Debug)]
+    pub struct MachinePreflightDto {
+        pub success: bool,
+        pub error: String,
+        pub revision: u64,
         pub diagnostics: Vec<MachineDiagnosticDto>,
     }
 
@@ -558,6 +568,7 @@ pub mod ffi {
             self: &UiSession,
             edit: &MachineConfigurationEditDto,
         ) -> MachineConfigurationViewDto;
+        fn preflight_edited_machine(self: &UiSession) -> MachinePreflightDto;
         fn cancel_machine_edit(self: &UiSession);
         fn machine_edit_changed(self: &UiSession) -> bool;
         fn configure_edited_machine(

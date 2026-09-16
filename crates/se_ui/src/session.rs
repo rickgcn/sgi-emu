@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use se_config::definition::MachineDefinition;
+use se_config::diagnostic::Diagnostic;
 use se_config::draft::MachineDraft;
 use se_cpu::mips1::r3000::debug::{
     CacheView, PendingCp0DebugSnapshot, PendingCp1DebugSnapshot, TlbView,
@@ -26,11 +27,11 @@ use crate::bridge::ffi::{
     CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, EndpointCatalogDto,
     EndpointDescriptorDto, EndpointDirectionDto, EndpointHandleDto, EndpointKindDto,
     KeyboardKeyDto, KeyboardKeyKindDto, MachineConfigurationEditDto, MachineConfigurationViewDto,
-    MachineOutputSink, MemoryDto, NetworkConfiguration, PointerButtonDto, RegistersDto,
-    ReplaySnapshotCatalogDto, ReplaySnapshotInfoDto, RuntimeStatusDto, TlbDto, TlbEntryDto,
-    UiExitState, UiStartupState, VideoOutputStateDto, run_gui,
+    MachineOutputSink, MachinePreflightDto, MemoryDto, NetworkConfiguration, PointerButtonDto,
+    RegistersDto, ReplaySnapshotCatalogDto, ReplaySnapshotInfoDto, RuntimeStatusDto, TlbDto,
+    TlbEntryDto, UiExitState, UiStartupState, VideoOutputStateDto, run_gui,
 };
-use crate::configuration::{edit_from_dto, failed_view, view_dto};
+use crate::configuration::{diagnostics_dto, edit_from_dto, failed_view, view_dto};
 
 /// Constructs a Normal machine from one owned configuration snapshot.
 pub type NormalMachineBuilder = Box<
@@ -56,6 +57,10 @@ pub type ReplayMachineBuilder = Box<
         + 'static,
 >;
 
+/// Checks host resources for one owned machine configuration snapshot.
+pub type MachinePreflight =
+    Box<dyn Fn(MachineDraft) -> Result<Vec<Diagnostic>, String> + Send + Sync + 'static>;
+
 /// Validates editable network settings without constructing a machine or opening host resources.
 pub type NetworkValidator =
     Box<dyn Fn(&NetworkConfiguration) -> Result<(), String> + Send + Sync + 'static>;
@@ -65,6 +70,7 @@ pub struct UiSession {
     runtime: RuntimeHandle,
     definition: Arc<dyn MachineDefinition>,
     configuration: Mutex<MachineConfigurationState>,
+    machine_preflight: MachinePreflight,
     normal_builder: NormalMachineBuilder,
     recording_builder: RecordingMachineBuilder,
     replay_builder: ReplayMachineBuilder,
@@ -86,6 +92,7 @@ enum MachineEditPhase {
 struct MachineEditState {
     draft: MachineDraft,
     phase: MachineEditPhase,
+    revision: u64,
 }
 
 impl UiSession {
@@ -100,6 +107,7 @@ impl UiSession {
         committed: MachineDraft,
         definition: Arc<dyn MachineDefinition>,
         active_frontend: FrontendPlan,
+        machine_preflight: MachinePreflight,
         normal_builder: NormalMachineBuilder,
         recording_builder: RecordingMachineBuilder,
         replay_builder: ReplayMachineBuilder,
@@ -113,6 +121,7 @@ impl UiSession {
                 editing: None,
                 active_frontend,
             }),
+            machine_preflight,
             normal_builder,
             recording_builder,
             replay_builder,
@@ -193,8 +202,9 @@ impl UiSession {
         state.editing = Some(MachineEditState {
             draft,
             phase: MachineEditPhase::Editing,
+            revision: 0,
         });
-        view_dto(view)
+        view_dto(view, 0)
     }
 
     /// Applies an edit intent to the temporary draft and returns a fresh view.
@@ -217,7 +227,37 @@ impl UiSession {
             return failed_view("machine settings are being applied");
         }
         editing.draft.apply(edit);
-        view_dto(self.definition.resolve(&editing.draft))
+        editing.revision = editing
+            .revision
+            .checked_add(1)
+            .expect("machine edit revision must not overflow");
+        view_dto(self.definition.resolve(&editing.draft), editing.revision)
+    }
+
+    /// Checks host resources for the current editing snapshot without mutating it.
+    pub fn preflight_edited_machine(&self) -> MachinePreflightDto {
+        let (draft, revision) = {
+            let state = self
+                .configuration
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(editing) = state.editing.as_ref() else {
+                return failed_preflight(String::from("machine editing is not active"), 0);
+            };
+            if editing.phase == MachineEditPhase::Applying {
+                return failed_preflight(String::from("machine settings are being applied"), 0);
+            }
+            (editing.draft.clone(), editing.revision)
+        };
+        match (self.machine_preflight)(draft) {
+            Ok(diagnostics) => MachinePreflightDto {
+                success: true,
+                error: String::new(),
+                revision,
+                diagnostics: diagnostics_dto(diagnostics),
+            },
+            Err(error) => failed_preflight(error, revision),
+        }
     }
 
     /// Discards temporary machine settings when they are not being applied.
@@ -914,6 +954,15 @@ fn failed_status(error: String) -> RuntimeStatusDto {
     }
 }
 
+fn failed_preflight(error: String, revision: u64) -> MachinePreflightDto {
+    MachinePreflightDto {
+        success: false,
+        error,
+        revision,
+        diagnostics: Vec::new(),
+    }
+}
+
 fn failed_registers(error: String) -> RegistersDto {
     RegistersDto {
         success: false,
@@ -1136,6 +1185,7 @@ mod tests {
             draft(),
             Arc::new(Ip12Definition),
             FrontendPlan::default(),
+            Box::new(|_| Ok(Vec::new())),
             Box::new(move |draft, _network| {
                 if !builder_succeeds.load(Ordering::Relaxed) {
                     return Err(String::from("injected builder stop"));
@@ -1155,6 +1205,152 @@ mod tests {
             Box::new(|_| Ok(())),
         );
         (runtime, session, succeeds)
+    }
+
+    #[test]
+    fn revision_tracks_edit_snapshots() {
+        let (runtime, session) = session(false);
+        let initial = session.begin_machine_edit();
+        assert_eq!(initial.revision, 0);
+        assert!(!session.machine_edit_changed());
+
+        let first = session.apply_machine_edit(&edit_firmware("other.bin"));
+        assert_eq!(first.revision, 1);
+        assert!(session.machine_edit_changed());
+
+        let second = session.apply_machine_edit(&edit_firmware("prom.bin"));
+        assert_eq!(second.revision, 2);
+        assert!(!session.machine_edit_changed());
+
+        session.cancel_machine_edit();
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preflight_reports_current_revision() {
+        let (runtime, session) = session(false);
+        assert_eq!(session.begin_machine_edit().revision, 0);
+        let edited = session.apply_machine_edit(&edit_firmware("other.bin"));
+        assert_eq!(edited.revision, 1);
+
+        let preflight = session.preflight_edited_machine();
+        assert!(preflight.success);
+        assert_eq!(preflight.revision, edited.revision);
+
+        session.cancel_machine_edit();
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preflight_does_not_change_transaction_phase() {
+        let (runtime, session) = session(false);
+        assert!(session.begin_machine_edit().success);
+        assert!(session.preflight_edited_machine().success);
+        assert!(
+            session
+                .apply_machine_edit(&edit_firmware("replacement.bin"))
+                .success
+        );
+        session.cancel_machine_edit();
+        assert!(!session.machine_edit_changed());
+
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preflight_provider_failure_preserves_revision_and_transaction() {
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let session = UiSession::new(
+            runtime.handle(),
+            draft(),
+            Arc::new(Ip12Definition),
+            FrontendPlan::default(),
+            Box::new(|_| Err(String::from("injected preflight failure"))),
+            Box::new(|_, _| Err(String::from("unused normal builder"))),
+            Box::new(|_, _, _| Err(String::from("unused recording builder"))),
+            Box::new(|_, _, _| Err(String::from("unused replay builder"))),
+            Box::new(|_| Ok(())),
+        );
+        assert!(session.begin_machine_edit().success);
+        let edited = session.apply_machine_edit(&edit_firmware("candidate.bin"));
+        let preflight = session.preflight_edited_machine();
+        assert!(!preflight.success);
+        assert_eq!(preflight.error, "injected preflight failure");
+        assert_eq!(preflight.revision, edited.revision);
+        assert!(
+            session
+                .apply_machine_edit(&edit_firmware("replacement.bin"))
+                .success
+        );
+        session.cancel_machine_edit();
+
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn stale_preflight_is_possible_and_safe() {
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let (preflight_started, preflight_started_observer) = std::sync::mpsc::channel::<()>();
+        let (preflight_release, preflight_release_callback) = std::sync::mpsc::channel::<()>();
+        let preflight_release_callback = Mutex::new(preflight_release_callback);
+        let session = UiSession::new(
+            runtime.handle(),
+            draft(),
+            Arc::new(Ip12Definition),
+            FrontendPlan::default(),
+            Box::new(move |_| {
+                preflight_started
+                    .send(())
+                    .expect("the preflight observer must still exist");
+                let _ = preflight_release_callback
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv();
+                Ok(Vec::new())
+            }),
+            Box::new(|_, _| Err(String::from("unused normal builder"))),
+            Box::new(|_, _, _| Err(String::from("unused recording builder"))),
+            Box::new(|_, _, _| Err(String::from("unused replay builder"))),
+            Box::new(|_| Ok(())),
+        );
+        assert_eq!(session.begin_machine_edit().revision, 0);
+        assert_eq!(
+            session
+                .apply_machine_edit(&edit_firmware("revision-one.bin"))
+                .revision,
+            1
+        );
+
+        std::thread::scope(|scope| {
+            let release_on_scope_exit = preflight_release;
+            let preflight = scope.spawn(|| session.preflight_edited_machine());
+            preflight_started_observer
+                .recv()
+                .expect("the preflight must capture its snapshot");
+
+            let current = session.apply_machine_edit(&edit_firmware("revision-two.bin"));
+            assert_eq!(current.revision, 2);
+            assert!(current.nodes.iter().any(|node| {
+                node.properties.iter().any(|property| {
+                    property.id == "firmware.0.image-path"
+                        && property.value.text_value == "revision-two.bin"
+                })
+            }));
+
+            drop(release_on_scope_exit);
+            let stale = preflight.join().unwrap();
+            assert!(stale.success);
+            assert_eq!(stale.revision, 1);
+        });
+
+        assert!(session.machine_edit_changed());
+        session.cancel_machine_edit();
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
@@ -1234,6 +1430,7 @@ mod tests {
             draft(),
             Arc::new(Ip12Definition),
             FrontendPlan::default(),
+            Box::new(|_| Ok(Vec::new())),
             Box::new(move |_, _| {
                 builder_started_callback.wait();
                 let _ = builder_release_callback
@@ -1261,6 +1458,9 @@ mod tests {
             let edit = session.apply_machine_edit(&edit_firmware("replacement.bin"));
             assert!(!edit.success);
             assert_eq!(edit.error, "machine settings are being applied");
+            let preflight = session.preflight_edited_machine();
+            assert!(!preflight.success);
+            assert_eq!(preflight.error, "machine settings are being applied");
             session.cancel_machine_edit();
             assert!(session.machine_edit_changed());
             assert!(!session.begin_machine_edit().success);
@@ -1344,6 +1544,7 @@ mod tests {
             committed,
             Arc::new(Ip12Definition),
             FrontendPlan::default(),
+            Box::new(|_| Ok(Vec::new())),
             Box::new(|draft, _| {
                 se_session::normal::build_configuration(draft, NatConfig::default())
                     .map_err(|error| error.to_string())
@@ -1434,6 +1635,7 @@ mod tests {
             draft(),
             Arc::new(Ip12Definition),
             FrontendPlan::default(),
+            Box::new(|_| Ok(Vec::new())),
             Box::new(|_, _| panic!("validation must not construct a machine")),
             Box::new(|_, _, _| panic!("validation must not construct a Recording machine")),
             Box::new(|_, _, _| panic!("validation must not construct a Replay machine")),
@@ -1472,6 +1674,7 @@ mod tests {
             draft(),
             Arc::new(Ip12Definition),
             FrontendPlan::default(),
+            Box::new(|_| Ok(Vec::new())),
             Box::new(|_, _| Err(String::from("unused normal builder"))),
             Box::new(|_, _, _| Err(String::from("unused recording builder"))),
             Box::new(move |_draft, path, snapshot_id| {
