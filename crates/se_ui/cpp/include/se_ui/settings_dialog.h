@@ -2,6 +2,7 @@
 
 #include <QDialog>
 #include <QHash>
+#include <QSet>
 #include <QString>
 #include <QVector>
 
@@ -16,6 +17,8 @@ class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
+class QScrollArea;
+class QShowEvent;
 class QTableWidget;
 class QTabWidget;
 class QTimer;
@@ -74,17 +77,31 @@ public:
 protected:
     void reject() override;
     void closeEvent(QCloseEvent* event) override;
+    void showEvent(QShowEvent* event) override;
 
 private:
     void rebuild_machine_view();
+    void build_domain_index();
+    void build_presentation_projection();
+    void rebuild_machine_tree(const QSet<QString>& expanded, bool initial_tree);
+    void clear_detail_panel();
     void refresh_diagnostics_presentation();
     void refresh_inline_diagnostics();
-    void show_node_properties(const QString& node_id);
+    void show_node_details(const QString& presentation_id);
+    void add_node_section(const QString& node_id, bool grouped);
+    void add_attachment_editor(QFormLayout* form, const QString& node_id,
+        const MachineNodeDto& node);
+    void add_property_editors(QFormLayout* form, const MachineNodeDto& node);
     void schedule_machine_preflight();
     void update_preflight_status();
     void update_apply_enabled();
+    void accept_machine_view(MachineConfigurationViewDto next);
+    void clear_apply_failure_status();
     [[nodiscard]] bool has_semantic_error() const;
     [[nodiscard]] bool has_host_error() const;
+    [[nodiscard]] QString presentation_anchor(const QString& node_id) const;
+    [[nodiscard]] QString presentation_breadcrumb(const QString& presentation_id) const;
+    [[nodiscard]] QString direct_device_label(const QString& node_id) const;
     [[nodiscard]] QString diagnostic_location(
         std::uint8_t target_kind, const QString& target_id) const;
     QWidget* diagnostic_row(const MachineDiagnosticDto& diagnostic);
@@ -103,21 +120,30 @@ private:
     std::unique_ptr<MachineConfigurationViewDto> machine_view_;
     std::unique_ptr<MachinePreflightDto> preflight_result_;
     QHash<QString, const MachineNodeDto*> nodes_by_id_;
-    QHash<QString, const MachinePropertyDto*> properties_by_id_;
     QHash<QString, QString> node_parents_;
     QHash<QString, QString> node_labels_;
+    QHash<QString, QVector<QString>> node_children_;
     QHash<QString, QString> property_owners_;
     QHash<QString, QString> property_labels_;
+    QHash<QString, QString> presentation_anchor_by_node_;
+    QHash<QString, QString> attached_device_by_owner_;
+    QHash<QString, QString> presentation_parent_;
+    QHash<QString, QString> presentation_labels_;
     QHash<QString, QTreeWidgetItem*> tree_items_;
     QHash<QString, QWidget*> property_editors_;
     QHash<QString, QWidget*> property_diagnostic_containers_;
     QHash<QString, QVBoxLayout*> property_diagnostic_layouts_;
-    QString current_node_id_;
-    QWidget* node_diagnostic_container_;
-    QVBoxLayout* node_diagnostic_layout_;
+    QHash<QString, QWidget*> node_section_widgets_;
+    QHash<QString, bool> node_section_has_content_;
+    QHash<QString, QWidget*> node_diagnostic_containers_;
+    QHash<QString, QVBoxLayout*> node_diagnostic_layouts_;
+    QString current_presentation_id_;
     QTabWidget* tabs_;
     QTreeWidget* machine_tree_;
-    QFormLayout* property_form_;
+    QScrollArea* detail_scroll_;
+    QWidget* detail_content_;
+    QVBoxLayout* detail_layout_;
+    QLabel* detail_empty_label_;
     QGroupBox* problems_group_;
     QTreeWidget* problems_tree_;
     QTimer* preflight_timer_;
@@ -127,9 +153,11 @@ private:
     QLineEdit* dns_edit_;
     QLineEdit* dhcp_start_edit_;
     QTableWidget* forwards_table_;
+    QLabel* reset_notice_;
     QLabel* apply_status_;
     QPushButton* apply_button_;
     QPushButton* cancel_button_;
+    bool machine_rebuild_pending_;
     bool preflight_pending_;
     bool applying_;
 };

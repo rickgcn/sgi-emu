@@ -8,8 +8,8 @@ use se_config::view::{ConfigurationView, NodeRole, PathKind, PropertyEditor};
 
 use crate::bridge::ffi::{
     MachineChoiceDto, MachineConfigurationEditDto, MachineConfigurationViewDto,
-    MachineDeviceChoiceDto, MachineDiagnosticDto, MachineNodeDto, MachinePropertyDto,
-    MachinePropertyValueDto,
+    MachineDeviceChoiceDto, MachineDiagnosticDto, MachineNodeDto, MachineNodeRoleDto,
+    MachinePropertyDto, MachinePropertyValueDto,
 };
 
 pub(crate) fn view_dto(view: ConfigurationView, revision: u64) -> MachineConfigurationViewDto {
@@ -42,13 +42,7 @@ pub(crate) fn view_dto(view: ConfigurationView, revision: u64) -> MachineConfigu
                 MachineNodeDto {
                     id: node.id.0,
                     parent_id: node.parent.map_or_else(String::new, |id| id.0),
-                    role: match node.role {
-                        NodeRole::Root => 0,
-                        NodeRole::Component => 1,
-                        NodeRole::Slot => 2,
-                        NodeRole::Device => 3,
-                        NodeRole::Endpoint => 4,
-                    },
+                    role: node_role_dto(node.role),
                     label: node.label,
                     properties: node
                         .properties
@@ -120,6 +114,16 @@ pub(crate) fn view_dto(view: ConfigurationView, revision: u64) -> MachineConfigu
             })
             .collect(),
         diagnostics: diagnostics_dto(view.diagnostics),
+    }
+}
+
+const fn node_role_dto(role: NodeRole) -> MachineNodeRoleDto {
+    match role {
+        NodeRole::Root => MachineNodeRoleDto::Root,
+        NodeRole::Component => MachineNodeRoleDto::Component,
+        NodeRole::Slot => MachineNodeRoleDto::Slot,
+        NodeRole::Device => MachineNodeRoleDto::Device,
+        NodeRole::Endpoint => MachineNodeRoleDto::Endpoint,
     }
 }
 
@@ -219,7 +223,9 @@ mod tests {
     };
 
     use super::{edit_from_dto, view_dto};
-    use crate::bridge::ffi::{MachineConfigurationEditDto, MachinePropertyValueDto};
+    use crate::bridge::ffi::{
+        MachineConfigurationEditDto, MachineNodeRoleDto, MachinePropertyValueDto,
+    };
 
     #[test]
     fn bridge_preserves_all_editor_metadata_and_diagnostics() {
@@ -304,7 +310,7 @@ mod tests {
         assert_eq!(dto.display_name, "Example Machine");
         let node = &dto.nodes[1];
         assert_eq!(node.parent_id, "root");
-        assert_eq!(node.role, 2);
+        assert_eq!(node.role, MachineNodeRoleDto::Slot);
         assert!(node.has_attachment && node.allow_empty);
         assert_eq!(node.current_device, "device");
         assert_eq!(node.device_choices[0].id, "device");
@@ -325,6 +331,49 @@ mod tests {
         assert_eq!(dto.diagnostics[0].severity, 1);
         assert_eq!(dto.diagnostics[0].target_kind, 2);
         assert_eq!(dto.diagnostics[0].target_id, "path");
+    }
+
+    #[test]
+    fn bridge_maps_every_node_role() {
+        let roles = [
+            NodeRole::Root,
+            NodeRole::Component,
+            NodeRole::Slot,
+            NodeRole::Device,
+            NodeRole::Endpoint,
+        ];
+        let view = ConfigurationView {
+            model: MachineModelId(String::from("example")),
+            display_name: String::from("Example Machine"),
+            nodes: roles
+                .into_iter()
+                .enumerate()
+                .map(|(index, role)| TopologyNode {
+                    id: NodeId(format!("node-{index}")),
+                    parent: (index > 0).then(|| NodeId(format!("node-{}", index - 1))),
+                    role,
+                    label: format!("Node {index}"),
+                    properties: Vec::new(),
+                    attachment: None,
+                })
+                .collect(),
+            diagnostics: Vec::new(),
+        };
+
+        assert_eq!(
+            view_dto(view, 1)
+                .nodes
+                .into_iter()
+                .map(|node| node.role)
+                .collect::<Vec<_>>(),
+            [
+                MachineNodeRoleDto::Root,
+                MachineNodeRoleDto::Component,
+                MachineNodeRoleDto::Slot,
+                MachineNodeRoleDto::Device,
+                MachineNodeRoleDto::Endpoint,
+            ]
+        );
     }
 
     #[test]

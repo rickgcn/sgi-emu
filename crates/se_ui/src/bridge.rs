@@ -273,12 +273,22 @@ pub mod ffi {
         pub label: String,
     }
 
+    /// Structural role of one machine topology node.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum MachineNodeRoleDto {
+        Root,
+        Component,
+        Slot,
+        Device,
+        Endpoint,
+    }
+
     /// One resolved topology node.
     #[derive(Debug)]
     pub struct MachineNodeDto {
         pub id: String,
         pub parent_id: String,
-        pub role: u8,
+        pub role: MachineNodeRoleDto,
         pub label: String,
         pub properties: Vec<MachinePropertyDto>,
         pub has_attachment: bool,

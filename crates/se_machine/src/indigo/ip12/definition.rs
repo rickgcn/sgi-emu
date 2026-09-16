@@ -449,11 +449,18 @@ impl<'a> Projection<'a> {
             NodeRole::Component,
             "SCSI Controller 0",
         ));
+        let host_target = scsi_target(0);
         self.view.nodes.push(node(
-            scsi_target(0),
+            host_target.clone(),
             Some(node_id("scsi.0")),
             NodeRole::Component,
-            "Target 0 — Host Adapter",
+            "Target 0",
+        ));
+        self.view.nodes.push(node(
+            scsi_host_adapter(),
+            Some(host_target),
+            NodeRole::Device,
+            "Host Adapter",
         ));
         for target in 1..8 {
             let target_id = scsi_target(target);
@@ -768,6 +775,9 @@ fn memory_module(bank: char, socket: usize) -> NodeId {
 fn scsi_target(target: usize) -> NodeId {
     node_id(&format!("scsi.0.target.{target}"))
 }
+fn scsi_host_adapter() -> NodeId {
+    node_id("scsi.0.target.0.host-adapter")
+}
 fn scsi_lun(target: usize, lun: usize) -> NodeId {
     node_id(&format!("scsi.0.target.{target}.lun.{lun}"))
 }
@@ -854,7 +864,7 @@ mod tests {
         FIRMWARE_PATH, FPU_BACKEND, GRAPHICS_SLOT, Ip12Definition, LG1, MODEL, SCSI_CDROM,
         SCSI_DISK, SGI_KEYBOARD, SGI_MOUSE, VT100_TERMINAL, device_kind, memory_bank,
         memory_module, memory_property, memory_socket, node_id, port_device_node, port_node,
-        property_id, scsi_device, scsi_lun, scsi_medium, scsi_target,
+        property_id, scsi_device, scsi_host_adapter, scsi_lun, scsi_medium, scsi_target,
     };
 
     fn node<'a>(view: &'a ConfigurationView, id: &NodeId) -> &'a TopologyNode {
@@ -1307,10 +1317,13 @@ mod tests {
         );
 
         assert_eq!(node(&view, &node_id("scsi.0")).role, NodeRole::Component);
-        assert_eq!(
-            node(&view, &scsi_target(0)).label,
-            "Target 0 — Host Adapter"
-        );
+        let host_target = node(&view, &scsi_target(0));
+        assert_eq!(host_target.label, "Target 0");
+        assert_eq!(host_target.role, NodeRole::Component);
+        let host_adapter = node(&view, &scsi_host_adapter());
+        assert_eq!(host_adapter.parent, Some(scsi_target(0)));
+        assert_eq!(host_adapter.role, NodeRole::Device);
+        assert_eq!(host_adapter.label, "Host Adapter");
         for target in 1..8 {
             for lun in 0..8 {
                 let slot = node(&view, &scsi_lun(target, lun));
