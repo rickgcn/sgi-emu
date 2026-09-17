@@ -65,6 +65,11 @@ pub enum ScsiCommandPlan {
         /// Number of bytes to receive from the initiator.
         byte_count: u64,
     },
+    /// The target must receive and interpret an initiator payload.
+    ReceiveDataOut {
+        /// Number of bytes to receive from the initiator.
+        byte_count: u64,
+    },
 }
 
 /// A functional SCSI target attached to [`ScsiBus`].
@@ -77,6 +82,11 @@ pub trait ScsiTarget: Send {
 
     /// Completes storage-backed I/O and returns its target status.
     fn complete_storage(&mut self, succeeded: bool) -> ScsiStatus;
+
+    /// Consumes a complete target-owned Data Out payload.
+    fn complete_data_out(&mut self, _cdb: &[u8], _data: &[u8]) -> ScsiStatus {
+        ScsiStatus::CheckCondition
+    }
 
     /// Captures target-local protocol state without its backing storage.
     fn snapshot(&self) -> Option<ScsiTargetSnapshot> {
@@ -375,6 +385,11 @@ enum ScsiTransfer {
         next_offset: u64,
         remaining: u64,
     },
+    TargetDataOut {
+        cdb: Vec<u8>,
+        data: Vec<u8>,
+        remaining: u64,
+    },
 }
 
 /// A functional SCSI bus with fixed target/LUN attachment slots.
@@ -564,13 +579,7 @@ impl ScsiBus {
                     return Err(ScsiBusError::InvalidPhase);
                 }
                 connection.cdb.push(value);
-                let length = match connection.cdb[0] >> 5 {
-                    0 => 6,
-                    1 | 2 => 10,
-                    4 => 16,
-                    5 => 12,
-                    _ => 6,
-                };
+                let length = cdb_length(connection.cdb[0]);
                 if connection.cdb.len() == length {
                     self.execute_connected_command()?;
                 }
@@ -853,6 +862,21 @@ impl ScsiBus {
             ScsiCommandPlan::WriteStorage { offset, byte_count } => {
                 Ok(self.start_storage_transfer(slot, offset, byte_count, ScsiDataDirection::Out))
             }
+            ScsiCommandPlan::ReceiveDataOut { byte_count } => {
+                if byte_count == 0 {
+                    let status = attachment.target.complete_data_out(cdb, &[]);
+                    return Ok(ScsiCommandStart::Complete { status });
+                }
+                self.active_transaction = Some(ScsiTransaction {
+                    target_slot: slot,
+                    transfer: ScsiTransfer::TargetDataOut {
+                        cdb: cdb.to_vec(),
+                        data: Vec::new(),
+                        remaining: byte_count,
+                    },
+                });
+                Ok(ScsiCommandStart::DataOut { byte_count })
+            }
         }
     }
 
@@ -913,7 +937,9 @@ impl ScsiBus {
                 ScsiTransfer::ImmediateDataIn { .. } | ScsiTransfer::StorageDataIn { .. } => {
                     ScsiDataDirection::In
                 }
-                ScsiTransfer::StorageDataOut { .. } => ScsiDataDirection::Out,
+                ScsiTransfer::StorageDataOut { .. } | ScsiTransfer::TargetDataOut { .. } => {
+                    ScsiDataDirection::Out
+                }
             })
     }
 
@@ -945,7 +971,9 @@ impl ScsiBus {
             ScsiTransfer::StorageDataIn { .. } => {
                 self.transfer_storage_data_in(maximum_bytes, accept)
             }
-            ScsiTransfer::StorageDataOut { .. } => Err(ScsiBusError::NoDataInTransaction),
+            ScsiTransfer::StorageDataOut { .. } | ScsiTransfer::TargetDataOut { .. } => {
+                Err(ScsiBusError::NoDataInTransaction)
+            }
         }
     }
 
@@ -967,6 +995,27 @@ impl ScsiBus {
         if maximum_bytes == 0 {
             return Err(ScsiBusError::EmptyDataBuffer);
         }
+        let Some(transaction) = self.active_transaction.as_ref() else {
+            return Err(ScsiBusError::NoDataOutTransaction);
+        };
+        match &transaction.transfer {
+            ScsiTransfer::StorageDataOut { .. } => {
+                self.transfer_storage_data_out(maximum_bytes, provide)
+            }
+            ScsiTransfer::TargetDataOut { .. } => {
+                self.transfer_target_data_out(maximum_bytes, provide)
+            }
+            ScsiTransfer::ImmediateDataIn { .. } | ScsiTransfer::StorageDataIn { .. } => {
+                Err(ScsiBusError::NoDataOutTransaction)
+            }
+        }
+    }
+
+    fn transfer_storage_data_out(
+        &mut self,
+        maximum_bytes: usize,
+        provide: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<ScsiTransferResult, ScsiBusError> {
         let Some(ScsiTransaction {
             target_slot,
             transfer:
@@ -1026,6 +1075,65 @@ impl ScsiBus {
         Ok(ScsiTransferResult::More {
             transferred: byte_count,
             remaining,
+        })
+    }
+
+    fn transfer_target_data_out(
+        &mut self,
+        maximum_bytes: usize,
+        provide: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<ScsiTransferResult, ScsiBusError> {
+        let Some(ScsiTransaction {
+            transfer: ScsiTransfer::TargetDataOut { remaining, .. },
+            ..
+        }) = self.active_transaction.as_ref()
+        else {
+            return Err(ScsiBusError::NoDataOutTransaction);
+        };
+        let active_remaining = *remaining;
+        let byte_count = maximum_bytes.min(usize::try_from(active_remaining).unwrap_or(usize::MAX));
+        let mut bytes = vec![0; byte_count];
+        if !provide(&mut bytes) {
+            return Ok(ScsiTransferResult::Rejected);
+        }
+
+        let remaining = active_remaining - byte_count as u64;
+        if remaining != 0 {
+            if let Some(ScsiTransaction {
+                transfer:
+                    ScsiTransfer::TargetDataOut {
+                        data,
+                        remaining: active_remaining,
+                        ..
+                    },
+                ..
+            }) = self.active_transaction.as_mut()
+            {
+                data.extend_from_slice(&bytes);
+                *active_remaining = remaining;
+            }
+            return Ok(ScsiTransferResult::More {
+                transferred: byte_count,
+                remaining,
+            });
+        }
+
+        let Some(ScsiTransaction {
+            target_slot,
+            transfer: ScsiTransfer::TargetDataOut { cdb, mut data, .. },
+        }) = self.active_transaction.take()
+        else {
+            return Err(ScsiBusError::NoDataOutTransaction);
+        };
+        data.extend_from_slice(&bytes);
+        let status = self.targets[target_slot]
+            .as_mut()
+            .map_or(ScsiStatus::CheckCondition, |attachment| {
+                attachment.target.complete_data_out(&cdb, &data)
+            });
+        Ok(ScsiTransferResult::Complete {
+            transferred: byte_count,
+            status,
         })
     }
 
@@ -1184,6 +1292,17 @@ fn validate_snapshot_transaction(
         {
             Ok(())
         }
+        ScsiTransfer::TargetDataOut {
+            cdb,
+            data,
+            remaining,
+        } if !cdb.is_empty()
+            && cdb.len() <= 16
+            && *remaining != 0
+            && (data.len() as u64).checked_add(*remaining).is_some() =>
+        {
+            Ok(())
+        }
         _ => Err(ScsiSnapshotError),
     }
 }
@@ -1206,6 +1325,16 @@ const fn address_for_slot(slot: usize) -> (u8, u8) {
     ((slot / LUN_COUNT) as u8, (slot % LUN_COUNT) as u8)
 }
 
+const fn cdb_length(opcode: u8) -> usize {
+    match opcode >> 5 {
+        0 => 6,
+        1 | 2 => 10,
+        4 => 16,
+        5 => 12,
+        _ => 6,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct SenseData {
     key: u8,
@@ -1217,6 +1346,7 @@ impl SenseData {
     pub(crate) const NONE: Self = Self::new(0, 0, 0);
     pub(crate) const UNSUPPORTED_OPCODE: Self = Self::new(5, 0x20, 0);
     pub(crate) const INVALID_CDB_FIELD: Self = Self::new(5, 0x24, 0);
+    pub(crate) const INVALID_PARAMETER_LIST: Self = Self::new(5, 0x26, 0);
     pub(crate) const LBA_OUT_OF_RANGE: Self = Self::new(5, 0x21, 0);
     pub(crate) const WRITE_PROTECTED: Self = Self::new(7, 0x27, 0);
     pub(crate) const HOST_IO_ERROR: Self = Self::new(4, 0x44, 0);
@@ -1243,12 +1373,13 @@ mod tests {
     use std::io;
     use std::sync::{Arc, Mutex};
 
+    use crate::scsi_cdrom::ScsiCdrom;
     use crate::scsi_disk::ScsiDisk;
     use se_core::storage::StorageMedium;
 
     use super::{
         ScsiAttachError, ScsiBus, ScsiBusError, ScsiCommandPlan, ScsiCommandStart,
-        ScsiDataDirection, ScsiStatus, ScsiTarget, ScsiTransferResult,
+        ScsiDataDirection, ScsiPhase, ScsiStatus, ScsiTarget, ScsiTransferResult,
     };
 
     struct TestTarget {
@@ -1303,6 +1434,35 @@ mod tests {
             } else {
                 ScsiStatus::CheckCondition
             }
+        }
+    }
+
+    type DataOutCompletions = Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
+
+    struct DataOutTarget {
+        storage_bytes: u64,
+        completion: DataOutCompletions,
+    }
+
+    impl ScsiTarget for DataOutTarget {
+        fn storage_size_bytes(&self) -> u64 {
+            self.storage_bytes
+        }
+
+        fn execute(&mut self, _cdb: &[u8]) -> ScsiCommandPlan {
+            ScsiCommandPlan::ReceiveDataOut { byte_count: 10 }
+        }
+
+        fn complete_storage(&mut self, _succeeded: bool) -> ScsiStatus {
+            panic!("target-owned Data Out must not complete storage")
+        }
+
+        fn complete_data_out(&mut self, cdb: &[u8], data: &[u8]) -> ScsiStatus {
+            self.completion
+                .lock()
+                .unwrap()
+                .push((cdb.to_vec(), data.to_vec()));
+            ScsiStatus::CheckCondition
         }
     }
 
@@ -1603,6 +1763,159 @@ mod tests {
         );
         assert_eq!(*bytes.lock().unwrap(), [0, 1, 9, 8, 7, 6, 6, 7]);
         assert_eq!(bus.active_data_direction(), None);
+    }
+
+    #[test]
+    fn target_data_out_buffers_chunks_and_completes_without_writing_storage() {
+        let bytes = Arc::new(Mutex::new((0..16).collect::<Vec<_>>()));
+        let completion = Arc::new(Mutex::new(Vec::new()));
+        let mut bus = ScsiBus::new();
+        bus.attach(
+            1,
+            0,
+            Box::new(DataOutTarget {
+                storage_bytes: 16,
+                completion: Arc::clone(&completion),
+            }),
+            Box::new(TestStorage {
+                bytes: Arc::clone(&bytes),
+                fail_reads: false,
+                fail_writes: false,
+            }),
+        )
+        .unwrap();
+        let cdb = [8, 1, 2, 3, 4, 5];
+        assert_eq!(
+            bus.start_command(1, 0, &cdb),
+            Ok(ScsiCommandStart::DataOut { byte_count: 10 })
+        );
+        assert_eq!(bus.active_data_direction(), Some(ScsiDataDirection::Out));
+
+        for (chunk, expected_remaining) in [(&[0, 1, 2][..], 7), (&[3, 4, 5, 6][..], 3)] {
+            assert_eq!(
+                bus.transfer_data_out(chunk.len(), |buffer| {
+                    buffer.copy_from_slice(chunk);
+                    true
+                }),
+                Ok(ScsiTransferResult::More {
+                    transferred: chunk.len(),
+                    remaining: expected_remaining,
+                })
+            );
+            assert!(completion.lock().unwrap().is_empty());
+        }
+
+        assert_eq!(
+            bus.transfer_data_out(8, |buffer| {
+                buffer.copy_from_slice(&[7, 8, 9]);
+                true
+            }),
+            Ok(ScsiTransferResult::Complete {
+                transferred: 3,
+                status: ScsiStatus::CheckCondition,
+            })
+        );
+        assert_eq!(
+            *completion.lock().unwrap(),
+            vec![(cdb.to_vec(), (0..10).collect())]
+        );
+        assert_eq!(*bytes.lock().unwrap(), (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn snapshot_restores_partial_target_data_out() {
+        let storage_bytes = Arc::new(Mutex::new(vec![0; 8192]));
+        let mut original = ScsiBus::new();
+        original
+            .attach(
+                4,
+                0,
+                Box::new(ScsiCdrom::try_new(8192).unwrap()),
+                Box::new(TestStorage {
+                    bytes: Arc::clone(&storage_bytes),
+                    fail_reads: false,
+                    fail_writes: false,
+                }),
+            )
+            .unwrap();
+        let cdb = [0x15, 0, 0, 0, 12, 0];
+        let payload = [0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 8, 0];
+        assert_eq!(
+            original.start_command(4, 0, &cdb),
+            Ok(ScsiCommandStart::DataOut { byte_count: 12 })
+        );
+        assert_eq!(
+            original.transfer_data_out(5, |buffer| {
+                buffer.copy_from_slice(&payload[..5]);
+                true
+            }),
+            Ok(ScsiTransferResult::More {
+                transferred: 5,
+                remaining: 7,
+            })
+        );
+        let snapshot = original.snapshot().unwrap();
+
+        let mut restored = ScsiBus::new();
+        restored
+            .attach(
+                4,
+                0,
+                Box::new(ScsiCdrom::try_new(8192).unwrap()),
+                Box::new(TestStorage {
+                    bytes: Arc::clone(&storage_bytes),
+                    fail_reads: false,
+                    fail_writes: false,
+                }),
+            )
+            .unwrap();
+        restored.restore_snapshot(snapshot).unwrap();
+        assert_eq!(
+            restored.active_data_direction(),
+            Some(ScsiDataDirection::Out)
+        );
+        assert_eq!(
+            restored.transfer_data_out(12, |buffer| {
+                buffer.copy_from_slice(&payload[5..]);
+                true
+            }),
+            Ok(ScsiTransferResult::Complete {
+                transferred: 7,
+                status: ScsiStatus::Good,
+            })
+        );
+
+        assert_eq!(
+            restored.start_command(4, 0, &[0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Ok(ScsiCommandStart::DataIn { byte_count: 8 })
+        );
+        let mut capacity = Vec::new();
+        assert_eq!(
+            restored.transfer_data_in(8, |data| {
+                capacity.extend_from_slice(data);
+                true
+            }),
+            Ok(ScsiTransferResult::Complete {
+                transferred: 8,
+                status: ScsiStatus::Good,
+            })
+        );
+        assert_eq!(capacity, [0, 0, 0, 3, 0, 0, 8, 0]);
+    }
+
+    #[test]
+    fn sgi_vendor_command_dispatches_after_six_cdb_bytes() {
+        let mut bus = ScsiBus::new();
+        attach_test_target(&mut bus, false, false);
+        assert_eq!(bus.select(1, false), Ok(true));
+
+        let cdb = [0xc9, 0, 0, 0, 0, 0];
+        for &byte in &cdb[..5] {
+            assert_eq!(bus.write_information(byte, false), Ok(true));
+            assert_eq!(bus.phase(), Some(ScsiPhase::Command));
+        }
+        assert_eq!(bus.write_information(cdb[5], false), Ok(true));
+        assert_eq!(bus.phase(), Some(ScsiPhase::Status));
     }
 
     #[test]
