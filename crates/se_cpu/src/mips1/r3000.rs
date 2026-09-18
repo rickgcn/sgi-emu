@@ -316,7 +316,9 @@ impl R3000 {
     /// translation buffer shutdown changes only the CP0 shutdown state.
     /// Instruction-address alignment is resolved after the shutdown guard. For
     /// aligned addresses, enabled interrupts are sampled after a successful
-    /// instruction fetch and before decoding or execution.
+    /// instruction fetch and before decoding or execution. A Status
+    /// cache-control transfer in flight advances by one instruction period at
+    /// the start of the step, before any interrupt is sampled.
     ///
     /// # Errors
     ///
@@ -329,6 +331,7 @@ impl R3000 {
         if self.state.is_tlb_shutdown() {
             return Err(StepError::TlbShutdown);
         }
+        self.state.advance_cache_transition();
         self.state.advance_machine_interrupt_inputs();
 
         let pc = self.state.pc();
@@ -467,7 +470,7 @@ mod tests {
     use super::{R3000, R3000Config, StepError, fetch_instruction};
     use super::{
         mmu::{AccessType, Cacheability, Translation},
-        state::{InstructionEffect, State, TranslationError},
+        state::{CACHE_TRANSITION_PERIODS, InstructionEffect, State, TranslationError},
     };
 
     const BOOT_GENERAL_EXCEPTION_VECTOR: u32 = 0xbfc0_0180;
@@ -698,12 +701,18 @@ mod tests {
         processor.state.complete_instruction(None, None);
     }
 
+    /// Programs one CP0 register over the two instruction boundaries a delayed
+    /// transfer needs, and lets a Status cache-control transfer reach the
+    /// datapath so the fixture observes the settled state.
     fn set_cp0_register(processor: &mut R3000, index: usize, value: u32) {
         processor.state.complete_instruction(
             None,
             Some(InstructionEffect::DelayedCp0Write { index, value }),
         );
         processor.state.complete_instruction(None, None);
+        for _ in 0..CACHE_TRANSITION_PERIODS {
+            processor.state.advance_cache_transition();
+        }
     }
 
     fn set_cp0_register_and_sync(processor: &mut R3000, index: usize, value: u32) {
@@ -2457,6 +2466,166 @@ mod tests {
                     .all(|&(address, _)| address.get() >= instruction_address)
             );
         }
+    }
+
+    #[test]
+    fn hazard_window_splits_status_readback_from_the_datapath() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        let mut bus = ByteBus::default();
+        let base = BOOT_PHYSICAL_ADDRESS;
+        bus.insert_word(base, encode_cp0_transfer(0x04, 2, 12));
+        bus.insert_word(base + 4, encode_cp0_transfer(0x00, 3, 12));
+        bus.insert_word(base + 8, encode_immediate(0x2b, 5, 4, 0));
+        bus.insert_word(base + 12, encode_immediate(0x2b, 5, 4, 0));
+        bus.insert_word(base + 16, encode_cp0_transfer(0x00, 6, 12));
+        bus.insert_word(base + 20, 0);
+
+        processor
+            .state
+            .write_gpr(2, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        processor.state.write_gpr(4, 0x1122_3344);
+        processor.state.write_gpr(5, 0xa000_0100);
+
+        processor.step(&mut bus).expect("MTC0 should succeed");
+        processor.step(&mut bus).expect("MFC0 should succeed");
+        processor
+            .step(&mut bus)
+            .expect("a store inside the hazard window should succeed");
+
+        assert_eq!(processor.state.read_gpr(3) & (STATUS_ISC | STATUS_SWC), 0);
+        assert_eq!(
+            bus.writes,
+            vec![(PhysAddr::new(0x100), vec![0x11, 0x22, 0x33, 0x44])]
+        );
+
+        processor
+            .step(&mut bus)
+            .expect("a store after the hazard window should succeed");
+        assert_eq!(bus.writes.len(), 1);
+
+        processor.step(&mut bus).expect("MFC0 should succeed");
+        processor.step(&mut bus).expect("NOP should succeed");
+        assert_eq!(
+            processor.state.read_gpr(6) & (STATUS_ISC | STATUS_SWC),
+            STATUS_ISC | STATUS_SWC
+        );
+    }
+
+    #[test]
+    fn interrupt_inside_the_hazard_window_enters_with_the_recognition_view() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        let mut bus = ByteBus::default();
+        let handler = u64::from(BOOT_GENERAL_EXCEPTION_VECTOR - 0xa000_0000);
+        bus.insert_word(handler, 0);
+
+        set_cp0_register(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor
+            .state
+            .write_gpr(2, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        let interrupted_pc = processor.state.pc();
+        let base = u64::from(interrupted_pc - 0xa000_0000);
+        bus.insert_word(base, encode_cp0_transfer(0x04, 2, 12));
+        bus.insert_word(base + 4, 0);
+
+        processor.set_hardware_interrupt_lines(1 << 1);
+        processor.step(&mut bus).expect("MTC0 should succeed");
+        processor
+            .step(&mut bus)
+            .expect("the interrupt should enter the general vector");
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), interrupted_pc + 4);
+        assert_eq!(
+            processor.state.read_cp0(13) & CAUSE_HARDWARE_IP_MASK,
+            STATUS_IM3
+        );
+        assert_eq!(processor.state.read_cp0(12) & (STATUS_ISC | STATUS_SWC), 0);
+
+        let cache = processor.debug_snapshot();
+        assert!(!cache.cache_mode.effective.isolated);
+        assert!(!cache.cache_mode.effective.swapped);
+        assert_eq!(cache.cache_mode.transition, None);
+        assert_eq!(cache.cache_mode_contexts.len(), 1);
+        assert_eq!(
+            cache.cache_mode_contexts[0]
+                .mode
+                .transition
+                .map(|transition| transition.age),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn handler_transfer_and_rfe_cross_the_exception_boundary() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        let mut bus = ByteBus::default();
+        let handler = u64::from(BOOT_GENERAL_EXCEPTION_VECTOR - 0xa000_0000);
+        bus.insert_word(handler, encode_cp0_transfer(0x04, 3, 12));
+        bus.insert_word(handler + 4, 0);
+        bus.insert_word(handler + 8, 0);
+        bus.insert_word(handler + 12, 0);
+        bus.insert_word(handler + 16, encode_cp0_transfer(0x00, 5, 14));
+        bus.insert_word(handler + 20, 0);
+        bus.insert_word(handler + 24, encode_register(5, 0, 0, 0x08));
+        bus.insert_word(handler + 28, 0x4200_0010);
+
+        set_cp0_register(&mut processor, 12, STATUS_BEV | STATUS_IM3 | STATUS_IEC);
+        processor
+            .state
+            .write_gpr(2, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        processor.state.write_gpr(3, STATUS_BEV | STATUS_SWC);
+        let interrupted_pc = processor.state.pc();
+        let base = u64::from(interrupted_pc - 0xa000_0000);
+        bus.insert_word(base, encode_cp0_transfer(0x04, 2, 12));
+        bus.insert_word(base + 4, 0);
+        bus.insert_word(base + 8, 0);
+
+        processor.set_hardware_interrupt_lines(1 << 1);
+        processor.step(&mut bus).expect("MTC0 should succeed");
+        processor
+            .step(&mut bus)
+            .expect("the interrupt should enter the general vector");
+        processor.set_hardware_interrupt_lines(0);
+
+        assert_eq!(processor.state.pc(), BOOT_GENERAL_EXCEPTION_VECTOR);
+        assert_eq!(processor.state.read_cp0(14), interrupted_pc + 4);
+        assert_eq!(processor.state.read_cp0(12) & (STATUS_ISC | STATUS_SWC), 0);
+
+        for _ in 0..4 {
+            processor
+                .step(&mut bus)
+                .expect("a handler instruction should succeed");
+        }
+        let handler_cache = processor.debug_snapshot().cache_mode;
+        assert!(!handler_cache.effective.isolated);
+        assert!(handler_cache.effective.swapped);
+        assert_eq!(handler_cache.transition, None);
+
+        for _ in 0..4 {
+            processor
+                .step(&mut bus)
+                .expect("a handler instruction should succeed");
+        }
+        assert_eq!(processor.state.pc(), interrupted_pc + 4);
+        assert_eq!(
+            processor.state.read_cp0(12) & (STATUS_ISC | STATUS_SWC),
+            STATUS_ISC | STATUS_SWC
+        );
+        let restored = processor.debug_snapshot().cache_mode;
+        assert!(!restored.effective.isolated);
+        assert!(!restored.effective.swapped);
+        assert_eq!(
+            restored.transition.map(|transition| transition.age),
+            Some(1)
+        );
+
+        processor.step(&mut bus).expect("NOP should succeed");
+        assert!(!processor.debug_snapshot().cache_mode.effective.isolated);
+        processor.step(&mut bus).expect("NOP should succeed");
+        let matured = processor.debug_snapshot().cache_mode;
+        assert!(matured.effective.isolated);
+        assert!(matured.effective.swapped);
+        assert_eq!(matured.transition, None);
     }
 
     #[test]

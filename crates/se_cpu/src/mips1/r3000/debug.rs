@@ -5,13 +5,14 @@ use se_float::backend::Backend;
 
 use super::R3000;
 use super::cache::CacheBank;
+use super::cp0::CacheControl;
 use super::decode::{
     AluInstruction, ControlInstruction, Cp0Instruction, Cp1BinaryOperation, Cp1Conversion,
     Cp1FloatFormat, Cp1Instruction, Cp1UnaryOperation, DecodeResult, Instruction,
     MemoryInstruction, decode,
 };
 use super::mmu::AccessType;
-use super::state::PendingCp1Write;
+use super::state::{CacheMode, PendingCp1Write};
 
 const GPR_NAMES: [&str; 32] = [
     "$zero", "$at", "$v0", "$v1", "$a0", "$a1", "$a2", "$a3", "$t0", "$t1", "$t2", "$t3", "$t4",
@@ -120,6 +121,42 @@ pub struct MachineInterruptInputDebugSnapshot {
     pub sampled: u8,
 }
 
+/// `IsC|SwC` bits of one Status cache-control view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheControlDebugSnapshot {
+    /// D-cache isolation.
+    pub isolated: bool,
+    /// Selection of the bank data accesses use.
+    pub swapped: bool,
+}
+
+/// A Status cache-control transfer that has not reached the cache datapath.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheTransitionDebugSnapshot {
+    /// `IsC|SwC` the transfer carries.
+    pub target: CacheControlDebugSnapshot,
+    /// Instruction periods the transfer has been in flight.
+    pub age: u8,
+}
+
+/// Functional cache-control mode of one execution context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheModeDebugSnapshot {
+    /// Effective view the cache datapath reads.
+    pub effective: CacheControlDebugSnapshot,
+    /// Transfer that has not reached the datapath yet, when one is in flight.
+    pub transition: Option<CacheTransitionDebugSnapshot>,
+}
+
+/// Cache-control mode saved for one interrupted execution context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheModeContextDebugSnapshot {
+    /// `IsC|SwC` bits the interrupted context's Status register held.
+    pub status_bits: CacheControlDebugSnapshot,
+    /// Mode the interrupted context was executing with.
+    pub mode: CacheModeDebugSnapshot,
+}
+
 /// Small R3000/R3010 state sampled at one instruction boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct R3000DebugSnapshot {
@@ -141,6 +178,11 @@ pub struct R3000DebugSnapshot {
     pub pending_cp1: Option<PendingCp1DebugSnapshot>,
     /// Machine-driven interrupt input synchronization state.
     pub interrupt_inputs: MachineInterruptInputDebugSnapshot,
+    /// Functional cache-control mode of the current execution context.
+    pub cache_mode: CacheModeDebugSnapshot,
+    /// Cache-control modes saved for interrupted contexts, the most recently
+    /// interrupted context first.
+    pub cache_mode_contexts: Vec<CacheModeContextDebugSnapshot>,
     /// CP0 state.
     pub cp0: Cp0DebugSnapshot,
     /// CP1 state.
@@ -286,6 +328,17 @@ impl R3000 {
             });
         let (effective, pending_functional) = self.state.debug_cp0_functional_state();
         let (interrupt_asserted, interrupt_sampled) = self.state.debug_machine_interrupt_inputs();
+        let cache_mode = cache_mode_snapshot(self.state.debug_cache_mode());
+        let cache_mode_contexts = self
+            .state
+            .debug_cache_mode_contexts()
+            .iter()
+            .flatten()
+            .map(|context| CacheModeContextDebugSnapshot {
+                status_bits: cache_control_snapshot(context.status_bits),
+                mode: cache_mode_snapshot(context.mode),
+            })
+            .collect();
         let cp1 = self.state.cp1();
 
         R3000DebugSnapshot {
@@ -301,6 +354,8 @@ impl R3000 {
                 asserted: interrupt_asserted,
                 sampled: interrupt_sampled,
             },
+            cache_mode,
+            cache_mode_contexts,
             cp0: Cp0DebugSnapshot {
                 registers: std::array::from_fn(|index| self.state.read_cp0(index)),
                 effective: functional_snapshot(effective),
@@ -402,6 +457,25 @@ fn functional_snapshot(
         coprocessor_usable,
         interrupt_control,
         software_interrupts,
+    }
+}
+
+fn cache_control_snapshot(control: CacheControl) -> CacheControlDebugSnapshot {
+    CacheControlDebugSnapshot {
+        isolated: control.is_isolated(),
+        swapped: control.is_swapped(),
+    }
+}
+
+fn cache_mode_snapshot(mode: CacheMode) -> CacheModeDebugSnapshot {
+    CacheModeDebugSnapshot {
+        effective: cache_control_snapshot(mode.effective),
+        transition: mode
+            .transition
+            .map(|transition| CacheTransitionDebugSnapshot {
+                target: cache_control_snapshot(transition.target),
+                age: transition.age,
+            }),
     }
 }
 
@@ -680,8 +754,13 @@ const fn comparison_name(condition: u8) -> &'static str {
 mod tests {
     use se_float::backend::Backend;
 
-    use super::{CacheView, R3000, TlbView, disassemble};
+    use super::{
+        CacheControlDebugSnapshot, CacheModeContextDebugSnapshot, CacheModeDebugSnapshot,
+        CacheTransitionDebugSnapshot, CacheView, R3000, TlbView, disassemble,
+    };
     use crate::mips1::r3000::R3000Config;
+    use crate::mips1::r3000::cp0::Exception;
+    use crate::mips1::r3000::state::InstructionEffect;
 
     const CONFIG: R3000Config =
         R3000Config::new(1, 4 * 1024, 4 * 1024, 4, 4, true, Backend::SoftFloat);
@@ -712,6 +791,58 @@ mod tests {
         let sampled = cpu.debug_snapshot();
         assert_eq!(sampled.interrupt_inputs.asserted, 1 << 3);
         assert_eq!(sampled.interrupt_inputs.sampled, 1 << 3);
+    }
+
+    #[test]
+    fn snapshot_reports_cache_control_transfers_and_interrupted_contexts() {
+        const STATUS_BEV: u32 = 1 << 22;
+        const STATUS_ISC: u32 = 1 << 16;
+        const STATUS_SWC: u32 = 1 << 17;
+
+        let mut cpu = R3000::new(CONFIG);
+        let untouched = cpu.debug_snapshot().cache_mode;
+        assert_eq!(untouched.transition, None);
+        assert!(!untouched.effective.isolated);
+        assert!(!untouched.effective.swapped);
+        assert_eq!(cpu.debug_snapshot().cache_mode_contexts, Vec::new());
+
+        cpu.state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp0Write {
+                index: 12,
+                value: STATUS_BEV | STATUS_ISC | STATUS_SWC,
+            }),
+        );
+        cpu.state.complete_instruction(None, None);
+        cpu.state.advance_cache_transition();
+        cpu.state.take_exception(Exception::Interrupt);
+
+        let snapshot = cpu.debug_snapshot();
+        assert_eq!(snapshot.cache_mode.transition, None);
+        assert!(!snapshot.cache_mode.effective.isolated);
+        assert!(!snapshot.cache_mode.effective.swapped);
+        assert_eq!(
+            snapshot.cache_mode_contexts,
+            vec![CacheModeContextDebugSnapshot {
+                status_bits: CacheControlDebugSnapshot {
+                    isolated: true,
+                    swapped: true,
+                },
+                mode: CacheModeDebugSnapshot {
+                    effective: CacheControlDebugSnapshot {
+                        isolated: false,
+                        swapped: false,
+                    },
+                    transition: Some(CacheTransitionDebugSnapshot {
+                        target: CacheControlDebugSnapshot {
+                            isolated: true,
+                            swapped: true,
+                        },
+                        age: 1,
+                    }),
+                },
+            }]
+        );
     }
 
     #[test]

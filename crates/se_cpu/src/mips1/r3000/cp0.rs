@@ -78,18 +78,25 @@ struct FunctionalState {
     software_interrupts: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// `IsC|SwC` cache-control bits of one Status view.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct CacheControl {
     isolated: bool,
     swapped: bool,
 }
 
 impl CacheControl {
+    /// Creates a cache-control view from its two bits.
+    pub(super) const fn new(isolated: bool, swapped: bool) -> Self {
+        Self { isolated, swapped }
+    }
+
     const fn from_status(status: u32) -> Self {
-        Self {
-            isolated: status & STATUS_ISC != 0,
-            swapped: status & STATUS_SWC != 0,
-        }
+        Self::new(status & STATUS_ISC != 0, status & STATUS_SWC != 0)
+    }
+
+    const fn status_bits(self) -> u32 {
+        (if self.isolated { STATUS_ISC } else { 0 }) | (if self.swapped { STATUS_SWC } else { 0 })
     }
 
     pub(super) const fn is_isolated(self) -> bool {
@@ -237,10 +244,24 @@ impl Cp0 {
         self.status & STATUS_TS != 0
     }
 
-    pub(super) fn cache_control(&self) -> CacheControl {
+    /// Returns the `IsC|SwC` bits the Status register holds.
+    ///
+    /// The bits are the architectural image of the execution context that owns
+    /// the register; the cache datapath reads its own effective view instead.
+    pub(super) fn status_cache_control(&self) -> CacheControl {
         CacheControl::from_status(self.status)
     }
 
+    /// Replaces the `IsC|SwC` bits of the Status register.
+    ///
+    /// Exception entry and `rfe` move the cache-control bits between execution
+    /// contexts; every other field of the register keeps its value.
+    pub(super) fn set_status_cache_control(&mut self, control: CacheControl) {
+        let mask = STATUS_ISC | STATUS_SWC;
+        self.status = (self.status & !mask) | control.status_bits();
+    }
+
+    /// Returns the `IsC|SwC` bits a transfer to one CP0 register would store.
     pub(super) fn cache_control_after_write(
         &self,
         index: usize,
@@ -1023,14 +1044,11 @@ mod tests {
         let mut cp0 = Cp0::new();
         cp0.write_register(12, STATUS_BEV | STATUS_PZ | STATUS_ISC | STATUS_SWC);
 
-        assert!(cp0.cache_control().is_isolated());
-        assert!(cp0.cache_control().is_swapped());
+        assert!(cp0.status_cache_control().is_isolated());
+        assert!(cp0.status_cache_control().is_swapped());
         assert_eq!(
             cp0.cache_control_after_write(12, 0),
-            Some(CacheControl {
-                isolated: false,
-                swapped: false,
-            })
+            Some(CacheControl::new(false, false))
         );
         assert_eq!(cp0.cache_control_after_write(14, 0), None);
         assert_eq!(cp0.read_register(12) & STATUS_PZ, STATUS_PZ);
@@ -1041,12 +1059,32 @@ mod tests {
         assert_eq!(cp0.read_register(12) & STATUS_CM, STATUS_CM);
 
         cp0.write_register(12, 0);
-        assert!(!cp0.cache_control().is_isolated());
-        assert!(!cp0.cache_control().is_swapped());
+        assert!(!cp0.status_cache_control().is_isolated());
+        assert!(!cp0.status_cache_control().is_swapped());
         assert_eq!(cp0.read_register(12) & STATUS_CM, STATUS_CM);
 
         cp0.set_cache_miss(false);
         assert_eq!(cp0.read_register(12) & STATUS_CM, 0);
+    }
+
+    #[test]
+    fn status_cache_control_replaces_only_the_cache_bits() {
+        let mut cp0 = Cp0::new();
+        cp0.status = STATUS_BEV | STATUS_TS | STATUS_CM | STATUS_KUC | STATUS_IEC | STATUS_PE;
+        let preserved = cp0.status & !(STATUS_ISC | STATUS_SWC);
+
+        cp0.set_status_cache_control(CacheControl::new(true, true));
+
+        assert_eq!(cp0.status, preserved | STATUS_ISC | STATUS_SWC);
+        assert_eq!(
+            cp0.read_register(12) & STATUS_VISIBLE_MASK,
+            (preserved | STATUS_ISC | STATUS_SWC) & STATUS_VISIBLE_MASK
+        );
+
+        cp0.set_status_cache_control(CacheControl::new(false, false));
+
+        assert_eq!(cp0.status, preserved);
+        assert_eq!(cp0.status_cache_control().status_bits(), 0);
     }
 
     #[test]

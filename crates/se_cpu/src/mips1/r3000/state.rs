@@ -108,6 +108,94 @@ enum LoadKind {
     Data,
 }
 
+/// Instruction periods a Status cache-control transfer stays in flight.
+///
+/// The R30xx manual bounds the propagation of a CP0 register side effect at
+/// three instruction periods but calls the timing within that window
+/// unpredictable, so the schedule here is a deterministic emulator policy: the
+/// cache datapath keeps the view the transfer started from until the third
+/// instruction that follows the transfer has executed.
+pub(super) const CACHE_TRANSITION_PERIODS: u8 = 3;
+
+/// Interrupted cache-state levels kept for exception nesting.
+///
+/// The Status mode stack holds three levels in total, and the current context
+/// is held by the processor itself, so two interrupted contexts can be saved.
+/// A third exception drops the oldest saved one, exactly as the mode stack
+/// shifts its oldest level out.
+const SAVED_CACHE_CONTEXT_LEVELS: usize = 2;
+
+/// A Status cache-control transfer that has not reached the cache datapath.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct CacheTransition {
+    /// `IsC|SwC` the transfer carries.
+    pub(super) target: CacheControl,
+    /// Instruction periods the transfer has been in flight.
+    pub(super) age: u8,
+}
+
+/// Functional cache-control mode of one execution context.
+///
+/// The effective view is the `IsC|SwC` the cache datapath reads, and it
+/// follows the Status register except while a transfer is in flight. Every
+/// mutation of the register's cache-control bits goes through a transfer, so
+/// the two images stay consistent outside those windows.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct CacheMode {
+    /// Effective `IsC|SwC` view the cache datapath reads.
+    pub(super) effective: CacheControl,
+    /// Transfer that has not reached the datapath yet, when one is in flight.
+    pub(super) transition: Option<CacheTransition>,
+}
+
+impl CacheMode {
+    /// Creates the mode of a context that has no transfer in flight.
+    const fn settled(effective: CacheControl) -> Self {
+        Self {
+            effective,
+            transition: None,
+        }
+    }
+}
+
+/// Cache-control mode saved for one interrupted execution context.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct CacheModeContext {
+    /// `IsC|SwC` bits the interrupted context's Status register held.
+    pub(super) status_bits: CacheControl,
+    /// Mode the interrupted context was executing with.
+    pub(super) mode: CacheMode,
+}
+
+/// Cache-control modes of the interrupted execution contexts.
+///
+/// The most recently interrupted context is at `levels[0]`. A push shifts the
+/// saved levels towards the older end and drops the oldest one, and a pop
+/// shifts them back, so an exception context restores exactly the mode its own
+/// entry saved and a nested exception leaves the outer level intact.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct CacheModeStack {
+    levels: [Option<CacheModeContext>; SAVED_CACHE_CONTEXT_LEVELS],
+}
+
+impl CacheModeStack {
+    const fn new() -> Self {
+        Self {
+            levels: [None; SAVED_CACHE_CONTEXT_LEVELS],
+        }
+    }
+
+    fn push(&mut self, context: CacheModeContext) {
+        self.levels = [Some(context), self.levels[0]];
+    }
+
+    fn pop(&mut self) -> Option<CacheModeContext> {
+        let popped = self.levels[0];
+        self.levels = [self.levels[1], None];
+        popped
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct State {
     gpr: [u32; 32],
@@ -123,17 +211,21 @@ pub(super) struct State {
     pending_cp0_write: Option<PendingCp0Write>,
     pending_cp1_write: Option<PendingCp1Write>,
     machine_interrupt_inputs: MachineInterruptInputs,
+    cache_mode: CacheMode,
+    cache_mode_contexts: CacheModeStack,
 }
 
 impl State {
     pub(super) fn new(config: R3000Config) -> Self {
+        let cp0 = Cp0::new();
         Self {
             gpr: [0; 32],
             hi: 0,
             lo: 0,
             pc: RESET_PC,
             delay_slot: None,
-            cp0: Cp0::new(),
+            cache_mode: CacheMode::settled(cp0.status_cache_control()),
+            cp0,
             cp1: Cp1::new(config.floating_point_backend()),
             mmu: Mmu::new(),
             caches: Caches::new(config),
@@ -141,6 +233,7 @@ impl State {
             pending_cp0_write: None,
             pending_cp1_write: None,
             machine_interrupt_inputs: MachineInterruptInputs::new(),
+            cache_mode_contexts: CacheModeStack::new(),
         }
     }
 
@@ -154,6 +247,8 @@ impl State {
         self.pending_gpr_write = None;
         self.pending_cp0_write = None;
         self.pending_cp1_write = None;
+        self.cache_mode = CacheMode::settled(self.cp0.status_cache_control());
+        self.cache_mode_contexts = CacheModeStack::new();
     }
 
     pub(super) const fn floating_point_backend(&self) -> Backend {
@@ -188,6 +283,16 @@ impl State {
         &self,
     ) -> (Cp0FunctionalState, Option<Cp0FunctionalState>) {
         self.cp0.debug_functional_state()
+    }
+
+    pub(super) fn debug_cache_mode(&self) -> CacheMode {
+        self.cache_mode
+    }
+
+    pub(super) fn debug_cache_mode_contexts(
+        &self,
+    ) -> [Option<CacheModeContext>; SAVED_CACHE_CONTEXT_LEVELS] {
+        self.cache_mode_contexts.levels
     }
 
     pub(super) fn debug_machine_interrupt_inputs(&self) -> (u8, u8) {
@@ -367,7 +472,7 @@ impl State {
         let mut data = [0; 4];
         match translation.cacheability {
             Cacheability::Cached => {
-                let bank = Self::cache_bank(LoadKind::Instruction, self.cp0.cache_control());
+                let bank = Self::cache_bank(LoadKind::Instruction, self.cache_mode.effective);
                 self.caches
                     .read(bank, translation.address, &mut data, bus)?;
             }
@@ -385,7 +490,7 @@ impl State {
     ) -> Result<(), BusError> {
         validate_memory_access(translation, data.len());
 
-        let cache_control = self.data_cache_control();
+        let cache_control = self.cache_mode.effective;
         if cache_control.is_isolated() {
             let bank = Self::cache_bank(LoadKind::Data, cache_control);
             let miss = self.caches.read_isolated(bank, translation.address, data);
@@ -415,7 +520,7 @@ impl State {
     ) -> Result<(), BusError> {
         validate_memory_access(translation, data.len());
 
-        let cache_control = self.data_cache_control();
+        let cache_control = self.cache_mode.effective;
         if cache_control.is_isolated() {
             let bank = Self::cache_bank(LoadKind::Data, cache_control);
             self.caches.write_isolated(bank, translation.address, data);
@@ -431,17 +536,48 @@ impl State {
         }
     }
 
-    fn data_cache_control(&self) -> CacheControl {
-        self.pending_cp0_write
-            .and_then(|write| self.cp0.cache_control_after_write(write.index, write.value))
-            .unwrap_or_else(|| self.cp0.cache_control())
-    }
-
     fn cache_bank(kind: LoadKind, control: CacheControl) -> CacheBank {
         match (kind, control.is_swapped()) {
             (LoadKind::Instruction, false) | (LoadKind::Data, true) => CacheBank::Instruction,
             (LoadKind::Instruction, true) | (LoadKind::Data, false) => CacheBank::Data,
         }
+    }
+
+    /// Starts the cache-control transfer a Status write puts in flight.
+    ///
+    /// A write that stores the `IsC|SwC` bits the register already holds
+    /// starts no transfer, so the datapath keeps executing with the view it
+    /// has. The transfer freezes that view until it has propagated, and it
+    /// replaces an older transfer, which the newer write supersedes. A write
+    /// an exception handler issues follows the same rule.
+    fn note_status_transfer(&mut self, index: usize, value: u32) {
+        let Some(target) = self.cp0.cache_control_after_write(index, value) else {
+            return;
+        };
+        if target == self.cp0.status_cache_control() {
+            return;
+        }
+
+        self.cache_mode.transition = Some(CacheTransition { target, age: 0 });
+    }
+
+    /// Advances the cache-control transfer in flight by one instruction period.
+    ///
+    /// The transfer reaches the datapath with the third instruction that
+    /// follows it. A transfer saved in an interrupted context does not age
+    /// while the exception context runs and resumes where it stopped.
+    pub(super) fn advance_cache_transition(&mut self) {
+        let Some(transition) = self.cache_mode.transition.as_mut() else {
+            return;
+        };
+        transition.age += 1;
+        if transition.age < CACHE_TRANSITION_PERIODS {
+            return;
+        }
+
+        let target = transition.target;
+        self.cache_mode.effective = target;
+        self.cache_mode.transition = None;
     }
 
     pub(super) fn tlbr_effect(&self) -> InstructionEffect {
@@ -505,6 +641,7 @@ impl State {
                 None
             }
             Some(InstructionEffect::DelayedCp0Write { index, value }) => {
+                self.note_status_transfer(index, value);
                 self.pending_cp0_write = Some(PendingCp0Write { index, value });
                 None
             }
@@ -535,6 +672,13 @@ impl State {
             }) => Some((index, entry_hi, entry_lo)),
             Some(InstructionEffect::RestoreStatus { value }) => {
                 self.cp0.restore_status(value);
+                // The exception context's own cache-control mode is discarded,
+                // and the interrupted context resumes with the Status bits and
+                // the transfer in flight it was holding.
+                if let Some(context) = self.cache_mode_contexts.pop() {
+                    self.cache_mode = context.mode;
+                    self.cp0.set_status_cache_control(context.status_bits);
+                }
                 None
             }
             None => None,
@@ -566,6 +710,20 @@ impl State {
         self.commit_pending_gpr_write();
         self.commit_pending_cp0_write();
         self.commit_pending_cp1_write();
+
+        // The manuals leave the cache-control bits an exception handler runs
+        // with unspecified, so this schedule is a deterministic emulator
+        // policy: the bits belong to the execution context. The exception
+        // context starts from the effective view the exception found, so a
+        // handler never inherits bits that a transfer of the interrupted
+        // stream was still propagating, and the interrupted context keeps its
+        // Status bits and its in-flight transfer until its `rfe`.
+        let recognition = self.cache_mode.effective;
+        self.cache_mode_contexts.push(CacheModeContext {
+            status_bits: self.cp0.status_cache_control(),
+            mode: std::mem::replace(&mut self.cache_mode, CacheMode::settled(recognition)),
+        });
+        self.cp0.set_status_cache_control(recognition);
 
         let (epc, in_delay_slot) = match self.delay_slot.take() {
             Some(delay_slot) => (delay_slot.origin_pc, true),
@@ -690,7 +848,8 @@ mod tests {
     use se_core::bus::{BusError, PhysAddr, PhysicalBus};
 
     use super::{
-        AccessType, Cacheability, Cp0, DelaySlot, Exception, InstructionEffect,
+        AccessType, CACHE_TRANSITION_PERIODS, CacheControl, CacheMode, CacheModeContext,
+        CacheTransition, Cacheability, Cp0, DelaySlot, Exception, InstructionEffect,
         MachineInterruptInputs, PendingCp0Write, PendingCp1Write, PendingGprWrite, RESET_PC, State,
         StepError, TlbFaultKind, Translation, TranslationError, TranslationFault,
     };
@@ -756,6 +915,39 @@ mod tests {
         }
     }
 
+    /// Advances the cache-control transfer until it reaches the datapath.
+    fn settle_cache_transition(state: &mut State) {
+        for _ in 0..CACHE_TRANSITION_PERIODS {
+            state.advance_cache_transition();
+        }
+    }
+
+    /// Programs Status through the transfer path, as `mtc0` does, and waits
+    /// for the cache-control side effect to reach the datapath.
+    fn set_status(state: &mut State, value: u32) {
+        issue_status_transfer(state, value);
+        settle_cache_transition(state);
+    }
+
+    /// Programs Status through the transfer path without waiting.
+    fn issue_status_transfer(state: &mut State, value: u32) {
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::DelayedCp0Write { index: 12, value }),
+        );
+        state.complete_instruction(None, None);
+    }
+
+    fn contexts(state: &State) -> Vec<CacheModeContext> {
+        state
+            .cache_mode_contexts
+            .levels
+            .iter()
+            .flatten()
+            .copied()
+            .collect()
+    }
+
     #[test]
     fn new_initializes_deterministic_state() {
         let state = State::new(crate::mips1::r3000::TEST_CONFIG);
@@ -773,6 +965,11 @@ mod tests {
             state.machine_interrupt_inputs,
             MachineInterruptInputs::new()
         );
+        assert_eq!(
+            state.cache_mode,
+            CacheMode::settled(CacheControl::new(false, false))
+        );
+        assert_eq!(state.cache_mode_contexts.levels, [None; 2]);
     }
 
     #[test]
@@ -825,6 +1022,11 @@ mod tests {
         assert_eq!(state.pending_gpr_write, None);
         assert_eq!(state.pending_cp0_write, None);
         assert_eq!(state.pending_cp1_write, None);
+        assert_eq!(
+            state.cache_mode,
+            CacheMode::settled(CacheControl::new(false, false))
+        );
+        assert_eq!(state.cache_mode_contexts.levels, [None; 2]);
         assert_eq!(state.read_cp1_general(5), preserved_cp1_general);
         assert_eq!(state.read_cp1_control(30), preserved_cp1_eir);
         assert_eq!(state.read_cp1_control(31), preserved_cp1_csr);
@@ -1862,76 +2064,348 @@ mod tests {
     }
 
     #[test]
-    fn pending_status_forwards_cache_control_to_data_access_only() {
+    fn status_transfer_reaches_the_datapath_after_the_hazard_window() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+
+        issue_status_transfer(&mut state, STATUS_BEV | STATUS_ISC);
+
+        assert_eq!(
+            state.cp0.status_cache_control(),
+            CacheControl::new(true, false)
+        );
+        assert_eq!(state.cache_mode.effective, CacheControl::new(false, false));
+        assert_eq!(
+            state.cache_mode.transition,
+            Some(CacheTransition {
+                target: CacheControl::new(true, false),
+                age: 0,
+            })
+        );
+
+        state.advance_cache_transition();
+        state.advance_cache_transition();
+        assert_eq!(state.cache_mode.effective, CacheControl::new(false, false));
+        assert_eq!(
+            state.cache_mode.transition,
+            Some(CacheTransition {
+                target: CacheControl::new(true, false),
+                age: 2,
+            })
+        );
+
+        state.advance_cache_transition();
+        assert_eq!(state.cache_mode.effective, CacheControl::new(true, false));
+        assert_eq!(state.cache_mode.transition, None);
+    }
+
+    #[test]
+    fn status_transfer_replaces_an_older_transfer_and_skips_unchanged_bits() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+
+        issue_status_transfer(&mut state, STATUS_BEV | STATUS_ISC);
+        state.advance_cache_transition();
+        issue_status_transfer(&mut state, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+
+        assert_eq!(
+            state.cache_mode.transition,
+            Some(CacheTransition {
+                target: CacheControl::new(true, true),
+                age: 0,
+            })
+        );
+
+        issue_status_transfer(&mut state, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        assert_eq!(
+            state.cache_mode.transition,
+            Some(CacheTransition {
+                target: CacheControl::new(true, true),
+                age: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn data_access_keeps_the_effective_view_until_the_transfer_matures() {
         let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
         let cached = translation(0x100, Cacheability::Cached);
         let uncached = translation(0x100, Cacheability::Uncached);
         let mut bus = TestBus::new([9, 8, 7, 6]);
 
-        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        issue_status_transfer(&mut state, STATUS_BEV | STATUS_ISC | STATUS_SWC);
         state
             .store_memory(uncached, &[1, 2, 3, 4], &mut bus)
-            .expect("isolated data-cache setup should succeed");
-        state
-            .cp0
-            .write_register(12, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+            .expect("a store during the hazard window should reach the bus");
+
+        assert_eq!(bus.writes, vec![(PhysAddr::new(0x100), vec![1, 2, 3, 4])]);
+
+        settle_cache_transition(&mut state);
         state
             .store_memory(uncached, &[5, 6, 7, 8], &mut bus)
-            .expect("isolated instruction-cache setup should succeed");
-        state.cp0.write_register(12, STATUS_BEV);
-
-        state.complete_instruction(
-            None,
-            Some(InstructionEffect::DelayedCp0Write {
-                index: 12,
-                value: STATUS_BEV | STATUS_ISC | STATUS_SWC,
-            }),
-        );
-
-        assert!(!state.cp0.cache_control().is_isolated());
-        assert!(!state.cp0.cache_control().is_swapped());
-        assert_eq!(
-            state
-                .read_instruction(cached, &mut bus)
-                .expect("instruction fetch should use committed cache control"),
-            [5, 6, 7, 8]
-        );
+            .expect("a store after the hazard window should be isolated");
         let mut data = [0; 4];
         state
-            .load_data(uncached, &mut data, &mut bus)
-            .expect("data load should use forwarded cache control");
-        assert_eq!(data, [5, 6, 7, 8]);
-        assert!(bus.reads.is_empty());
+            .load_data(cached, &mut data, &mut bus)
+            .expect("the isolated swapped view should read its own bank");
 
-        state.complete_instruction(None, None);
-        assert!(state.cp0.cache_control().is_isolated());
-        assert!(state.cp0.cache_control().is_swapped());
+        assert_eq!(data, [5, 6, 7, 8]);
+        assert_eq!(bus.writes, vec![(PhysAddr::new(0x100), vec![1, 2, 3, 4])]);
+        assert!(bus.reads.is_empty());
+    }
+
+    #[test]
+    fn instruction_fetch_keeps_the_effective_view_until_the_transfer_matures() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        let address = translation(0x100, Cacheability::Cached);
+        let mut bus = TestBus::new([9, 8, 7, 6]);
+
+        set_status(&mut state, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        state
+            .store_memory(
+                translation(0x100, Cacheability::Uncached),
+                &[5, 6, 7, 8],
+                &mut bus,
+            )
+            .expect("the swapped isolated store should seed the instruction bank");
+        set_status(&mut state, STATUS_BEV);
+
+        issue_status_transfer(&mut state, STATUS_BEV | STATUS_SWC);
+        assert_eq!(
+            state
+                .read_instruction(address, &mut bus)
+                .expect("a fetch inside the hazard window should succeed"),
+            [5, 6, 7, 8]
+        );
+
+        settle_cache_transition(&mut state);
+        assert_eq!(
+            state
+                .read_instruction(address, &mut bus)
+                .expect("a fetch after the hazard window should succeed"),
+            [9, 8, 7, 6]
+        );
+    }
+
+    #[test]
+    fn exception_entry_starts_from_the_recognition_view() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+
+        set_status(&mut state, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        issue_status_transfer(&mut state, STATUS_BEV);
+        state.advance_cache_transition();
+
+        state.take_exception(Exception::Syscall);
+
+        assert_eq!(
+            state.cache_mode,
+            CacheMode::settled(CacheControl::new(true, true))
+        );
+        assert_eq!(
+            state.cp0.status_cache_control(),
+            CacheControl::new(true, true)
+        );
+        assert_eq!(
+            contexts(&state),
+            vec![CacheModeContext {
+                status_bits: CacheControl::new(false, false),
+                mode: CacheMode {
+                    effective: CacheControl::new(true, true),
+                    transition: Some(CacheTransition {
+                        target: CacheControl::new(false, false),
+                        age: 1,
+                    }),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn exception_entry_inherits_a_matured_view() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+
+        set_status(&mut state, STATUS_BEV | STATUS_ISC);
+        state.take_exception(Exception::Syscall);
+
+        assert_eq!(
+            state.cache_mode,
+            CacheMode::settled(CacheControl::new(true, false))
+        );
+        assert_eq!(
+            state.cp0.status_cache_control(),
+            CacheControl::new(true, false)
+        );
+        assert_eq!(
+            contexts(&state),
+            vec![CacheModeContext {
+                status_bits: CacheControl::new(true, false),
+                mode: CacheMode::settled(CacheControl::new(true, false)),
+            }]
+        );
+    }
+
+    #[test]
+    fn handler_transfers_propagate_and_rfe_discards_them() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+
+        set_status(&mut state, STATUS_BEV | STATUS_ISC);
+        state.take_exception(Exception::Syscall);
+        issue_status_transfer(&mut state, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+
+        assert_eq!(state.cache_mode.effective, CacheControl::new(true, false));
+
+        settle_cache_transition(&mut state);
+        assert_eq!(state.cache_mode.effective, CacheControl::new(true, true));
 
         state.complete_instruction(
             None,
-            Some(InstructionEffect::DelayedCp0Write {
-                index: 12,
-                value: STATUS_BEV,
+            Some(InstructionEffect::RestoreStatus {
+                value: state.cp0.status(),
             }),
         );
 
         assert_eq!(
-            state
-                .read_instruction(cached, &mut bus)
-                .expect("instruction fetch should still use committed swapped control"),
-            [1, 2, 3, 4]
+            state.cache_mode,
+            CacheMode::settled(CacheControl::new(true, false))
         );
-        state
-            .load_data(uncached, &mut data, &mut bus)
-            .expect("data load should observe forwarded isolation clear");
-        assert_eq!(data, [9, 8, 7, 6]);
-        assert_eq!(bus.reads, vec![(PhysAddr::new(0x100), 4)]);
-        assert!(state.cp0.cache_control().is_isolated());
-        assert!(state.cp0.cache_control().is_swapped());
+        assert_eq!(
+            state.cp0.status_cache_control(),
+            CacheControl::new(true, false)
+        );
+        assert_eq!(contexts(&state), Vec::new());
+    }
 
-        state.complete_instruction(None, None);
-        assert!(!state.cp0.cache_control().is_isolated());
-        assert!(!state.cp0.cache_control().is_swapped());
+    #[test]
+    fn nested_exceptions_stack_and_restore_cache_modes() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        let interrupted = CacheMode::settled(CacheControl::new(true, false));
+        let handler = CacheMode::settled(CacheControl::new(false, true));
+
+        set_status(&mut state, STATUS_BEV | STATUS_ISC);
+        state.take_exception(Exception::Interrupt);
+        set_status(&mut state, STATUS_BEV | STATUS_SWC);
+        state.take_exception(Exception::Syscall);
+
+        assert_eq!(state.cache_mode, handler);
+        assert_eq!(
+            contexts(&state),
+            vec![
+                CacheModeContext {
+                    status_bits: CacheControl::new(false, true),
+                    mode: handler,
+                },
+                CacheModeContext {
+                    status_bits: CacheControl::new(true, false),
+                    mode: interrupted,
+                },
+            ]
+        );
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::RestoreStatus {
+                value: state.cp0.status(),
+            }),
+        );
+        assert_eq!(state.cache_mode, handler);
+        assert_eq!(
+            state.cp0.status_cache_control(),
+            CacheControl::new(false, true)
+        );
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::RestoreStatus {
+                value: state.cp0.status(),
+            }),
+        );
+        assert_eq!(state.cache_mode, interrupted);
+        assert_eq!(
+            state.cp0.status_cache_control(),
+            CacheControl::new(true, false)
+        );
+        assert_eq!(contexts(&state), Vec::new());
+    }
+
+    #[test]
+    fn a_third_exception_drops_the_oldest_saved_cache_mode() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+        let interrupted = CacheMode::settled(CacheControl::new(false, false));
+        let first = CacheMode::settled(CacheControl::new(true, false));
+        let second = CacheMode::settled(CacheControl::new(false, true));
+        let third = CacheMode::settled(CacheControl::new(true, true));
+
+        state.take_exception(Exception::Interrupt);
+        set_status(&mut state, STATUS_BEV | STATUS_ISC);
+        state.take_exception(Exception::Interrupt);
+        set_status(&mut state, STATUS_BEV | STATUS_SWC);
+        state.take_exception(Exception::Interrupt);
+        set_status(&mut state, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+
+        assert_eq!(state.cache_mode, third);
+        assert_eq!(
+            contexts(&state),
+            vec![
+                CacheModeContext {
+                    status_bits: CacheControl::new(false, true),
+                    mode: second,
+                },
+                CacheModeContext {
+                    status_bits: CacheControl::new(true, false),
+                    mode: first,
+                },
+            ]
+        );
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::RestoreStatus {
+                value: state.cp0.status(),
+            }),
+        );
+        assert_eq!(state.cache_mode, second);
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::RestoreStatus {
+                value: state.cp0.status(),
+            }),
+        );
+        assert_eq!(state.cache_mode, first);
+        assert_eq!(contexts(&state), Vec::new());
+
+        state.complete_instruction(
+            None,
+            Some(InstructionEffect::RestoreStatus {
+                value: state.cp0.status(),
+            }),
+        );
+        assert_eq!(state.cache_mode, first);
+        assert_ne!(state.cache_mode, interrupted);
+        assert_eq!(
+            state.cp0.status_cache_control(),
+            CacheControl::new(true, false)
+        );
+    }
+
+    #[test]
+    fn reset_clears_the_cache_mode_and_its_contexts() {
+        let mut state = State::new(crate::mips1::r3000::TEST_CONFIG);
+
+        issue_status_transfer(&mut state, STATUS_BEV | STATUS_ISC);
+        state.take_exception(Exception::Interrupt);
+
+        assert_eq!(
+            state.cache_mode,
+            CacheMode::settled(CacheControl::new(false, false))
+        );
+        assert_eq!(contexts(&state).len(), 1);
+
+        state.reset();
+
+        assert_eq!(
+            state.cache_mode,
+            CacheMode::settled(state.cp0.status_cache_control())
+        );
+        assert_eq!(state.cache_mode_contexts.levels, [None; 2]);
     }
 
     #[test]
@@ -1940,7 +2414,7 @@ mod tests {
         let address = translation(0x100, Cacheability::Cached);
         let mut bus = TestBus::new([9, 8, 7, 6]);
 
-        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        set_status(&mut state, STATUS_BEV | STATUS_ISC);
         state
             .store_memory(
                 translation(0x100, Cacheability::Uncached),
@@ -1948,15 +2422,13 @@ mod tests {
                 &mut bus,
             )
             .expect("isolated data-cache write should succeed");
-        state
-            .cp0
-            .write_register(12, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        set_status(&mut state, STATUS_BEV | STATUS_ISC | STATUS_SWC);
         state
             .store_memory(address, &[5, 6, 7, 8], &mut bus)
             .expect("isolated instruction-cache write should succeed");
         assert!(bus.writes.is_empty());
 
-        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        set_status(&mut state, STATUS_BEV | STATUS_ISC);
         state.cp0.set_cache_miss(true);
         let mut data = state
             .read_instruction(address, &mut bus)
@@ -1977,9 +2449,7 @@ mod tests {
         assert_eq!(data, [1, 2, 3, 4]);
         assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
 
-        state
-            .cp0
-            .write_register(12, STATUS_BEV | STATUS_ISC | STATUS_SWC);
+        set_status(&mut state, STATUS_BEV | STATUS_ISC | STATUS_SWC);
         state
             .load_data(address, &mut data, &mut bus)
             .expect("swapped isolated read should succeed");
@@ -1995,7 +2465,7 @@ mod tests {
         assert_eq!(bus.reads, vec![(PhysAddr::new(0x204), 4)]);
         assert_eq!(state.read_cp0(12) & STATUS_CM, STATUS_CM);
 
-        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        set_status(&mut state, STATUS_BEV | STATUS_ISC);
         state
             .load_data(instruction_address, &mut data, &mut bus)
             .expect("swapped instruction refill should reside in the data cache");
@@ -2046,7 +2516,7 @@ mod tests {
         assert_eq!(state.read_cp0(12), status);
         assert_eq!(state.read_cp0(1), random);
 
-        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        set_status(&mut state, STATUS_BEV | STATUS_ISC);
         let mut data = [0; 4];
         state
             .load_data(
@@ -2078,7 +2548,7 @@ mod tests {
             )
             .expect("uncached alias should bypass the cache");
 
-        state.cp0.write_register(12, STATUS_BEV | STATUS_ISC);
+        set_status(&mut state, STATUS_BEV | STATUS_ISC);
         let mut data = [0; 4];
         state
             .load_data(

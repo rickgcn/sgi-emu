@@ -2,8 +2,9 @@
 
 use se_core::bus::PhysAddr;
 use se_cpu::mips1::r3000::debug::{
-    CacheDebugSnapshot, CacheView, PendingCp1DebugSnapshot, R3000DebugSnapshot, TlbDebugSnapshot,
-    TlbView, VirtualAddressView, disassemble,
+    CacheControlDebugSnapshot, CacheDebugSnapshot, CacheModeContextDebugSnapshot,
+    CacheModeDebugSnapshot, CacheView, PendingCp1DebugSnapshot, R3000DebugSnapshot,
+    TlbDebugSnapshot, TlbView, VirtualAddressView, disassemble,
 };
 use sha2::{Digest, Sha256};
 
@@ -148,6 +149,11 @@ impl Ip12 {
         }
         hasher.update([cpu.interrupt_inputs.asserted]);
         hasher.update([cpu.interrupt_inputs.sampled]);
+        hash_cache_mode(&mut hasher, &cpu.cache_mode);
+        hash_usize(&mut hasher, cpu.cache_mode_contexts.len());
+        for context in &cpu.cache_mode_contexts {
+            hash_cache_mode_context(&mut hasher, context);
+        }
         for value in cpu.cp0.registers {
             hash_u32(&mut hasher, value);
         }
@@ -260,6 +266,28 @@ impl Ip12 {
 
 fn hash_u32(hasher: &mut Sha256, value: u32) {
     hasher.update(value.to_le_bytes());
+}
+
+fn hash_cache_control(hasher: &mut Sha256, control: CacheControlDebugSnapshot) {
+    hash_bool(hasher, control.isolated);
+    hash_bool(hasher, control.swapped);
+}
+
+fn hash_cache_mode(hasher: &mut Sha256, mode: &CacheModeDebugSnapshot) {
+    hash_cache_control(hasher, mode.effective);
+    match mode.transition {
+        None => hasher.update([0]),
+        Some(transition) => {
+            hasher.update([1]);
+            hash_cache_control(hasher, transition.target);
+            hasher.update([transition.age]);
+        }
+    }
+}
+
+fn hash_cache_mode_context(hasher: &mut Sha256, context: &CacheModeContextDebugSnapshot) {
+    hash_cache_control(hasher, context.status_bits);
+    hash_cache_mode(hasher, &context.mode);
 }
 
 fn hash_usize(hasher: &mut Sha256, value: usize) {

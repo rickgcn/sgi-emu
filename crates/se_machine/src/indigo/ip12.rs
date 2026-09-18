@@ -1577,6 +1577,51 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_restores_cache_control_transfers_and_contexts() {
+        let mut machine = machine_with_instructions(&[
+            0x3c03_0043, /* lui $3, 0x0043 */
+            0,
+            0x4083_6000, /* mtc0 $3, $12 */
+            0x0000_000c, /* syscall */
+            0,
+            0,
+        ]);
+
+        for _ in 0..4 {
+            machine.execute_instruction().unwrap();
+        }
+
+        assert_eq!(machine.execution_address(), 0xbfc0_0180);
+        let entered = machine.cpu.debug_snapshot();
+        assert!(!entered.cache_mode.effective.isolated);
+        assert!(!entered.cache_mode.effective.swapped);
+        assert_eq!(entered.cache_mode_contexts.len(), 1);
+        assert_eq!(
+            entered.cache_mode_contexts[0]
+                .mode
+                .transition
+                .map(|transition| transition.age),
+            Some(1)
+        );
+
+        let snapshot = machine.snapshot().unwrap();
+        let expected_fingerprint = machine.machine_state_fingerprint();
+        let expected = machine.cpu.debug_snapshot();
+
+        machine.execute_instruction().unwrap();
+        machine.execute_instruction().unwrap();
+        let continued_fingerprint = machine.machine_state_fingerprint();
+
+        machine.restore_snapshot(snapshot).unwrap();
+        assert_eq!(machine.cpu.debug_snapshot(), expected);
+        assert_eq!(machine.machine_state_fingerprint(), expected_fingerprint);
+
+        machine.execute_instruction().unwrap();
+        machine.execute_instruction().unwrap();
+        assert_eq!(machine.machine_state_fingerprint(), continued_fingerprint);
+    }
+
+    #[test]
     fn reset_restores_the_cpu_and_asic_front_end_without_changing_ram_or_prom() {
         let mut raw_prom = vec![0; PROM_BYTES];
         raw_prom[0x100..0x104].copy_from_slice(&[0x34, 0x12, 0x78, 0x56]);
