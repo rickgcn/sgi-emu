@@ -411,7 +411,7 @@ checksum = "d68f2ec51b097e4c1a75b681a8bec621909b5e91f15bb7b840c4f2f7b01148b2"
 
 [[package]]
 name = "se_app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "directories",
  "se_config",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "se_config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -434,14 +434,14 @@ dependencies = [
 
 [[package]]
 name = "se_core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "se_cpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "se_core",
  "se_float",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "se_device"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "se_core",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "se_float"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitflags",
  "cc",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "se_machine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "se_config",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "se_network"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc",
  "serde",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "se_runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "se_session"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "directories",
  "se_config",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "se_ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc",
  "cxx",
