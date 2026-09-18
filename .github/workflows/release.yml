@@ -260,7 +260,7 @@ jobs:
               exit 1
             fi
           else
-            flags=(--draft --generate-notes --verify-tag --title "sgi-emu $RELEASE_TAG")
+            flags=(--draft --generate-notes --verify-tag --title "$RELEASE_TAG")
             if [[ "$IS_PRERELEASE" == "true" ]]; then
               flags+=(--prerelease)
             fi
