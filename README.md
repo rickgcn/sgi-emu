@@ -7,16 +7,6 @@ The project is currently focused on the original **IRIS Indigo (IP12)** with a 3
 > [!IMPORTANT]
 > sgi-emu is under active development. Many hardware behaviors are still incomplete or under active validation.
 
-<p align="center">
-  <img src="assets/indigo-irix-5.3.png"
-       alt="IRIX 5.3 running on an emulated SGI Indigo IP12"
-       width="900">
-</p>
-
-<p align="center">
-  <em>IRIX 5.3 running on the emulated Indigo IP12 with LG1 graphics.</em>
-</p>
-
 ## Current status
 
 ### Software
@@ -51,10 +41,6 @@ In short:
 
 > **Emulate observables, not mechanisms.**
 
-Timing is modeled when it is architecturally or software-visible, such as timers, interrupts, timeouts, DMA completion, or required busy states.
-
-The global scheduler models time and externally observable events rather than device implementation details.
-
 ## Machines
 
 | Machine        | Platform | Status                 |
@@ -80,24 +66,12 @@ Other emulator implementations are treated as references, not as hardware specif
 
 When documentation and existing implementations disagree, preference is given to reproducible behavior and primary sources.
 
-## Getting started
+## Building
 
-### Requirements
+sgi-emu requires Rust 1.95+, Qt 6 (Core, Gui, Widgets), Git, and a C++17-capable compiler.
+The bundled native dependencies also require Python 3, Meson 1.4+, Ninja, and a C11-capable compiler.
 
-- Rust 1.95 or newer
-- Qt 6 (Core, Gui, and Widgets)
-- A C++17-capable compiler
-- Git
-- A C11-capable compiler, Python 3, Meson 1.4 or newer, and Ninja
-- On Linux: `pkg-config`, Wayland client/protocol development files, `wayland-scanner`, X11/XInput2 development files, and QtGui private headers matching the selected Qt version
-
-The Qt build must provide `qmake6` or `qmake`. If it is not available in `PATH`, set one of the following environment variables:
-
-- `QMAKE` — path to the Qt 6 qmake executable
-- `QT_DIR` — path to the Qt installation
-- `QT_ROOT_DIR` — path to the Qt installation
-
-### Building
+On Linux, additional Wayland/X11 development packages and matching QtGui private headers are required.
 
 ```bash
 git clone --recursive https://github.com/rickgcn/sgi-emu.git
@@ -105,11 +79,13 @@ cd sgi-emu
 cargo build --release
 ```
 
-### Running
+Run the emulator with:
 
 ```bash
 cargo run --release -p se_app --bin sgi-emu
 ```
+
+Qt must provide `qmake6` or `qmake`. If it is not in `PATH`, set `QMAKE`, `QT_DIR`, or `QT_ROOT_DIR` to the appropriate Qt installation.
 
 ## AI-assisted development
 
@@ -128,3 +104,88 @@ Original SGI firmware may be required for some machines. Users are responsible f
 ## License
 
 sgi-emu is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
+
+## Gallery
+
+Original IRIX software running on an emulated 33 MHz R3000 Indigo.
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="assets/gallery/irix-5.3-desktop.png">
+        <img src="assets/gallery/irix-5.3-desktop.png"
+             alt="IRIX 5.3 desktop running on sgi-emu">
+      </a>
+      <br>
+      <strong>IRIX 5.3 Desktop</strong>
+      <br>
+      <sub>
+        The Indigo Magic desktop running on an emulated 33 MHz R3000 Indigo.
+      </sub>
+    </td>
+    <td width="50%" valign="top">
+      <a href="assets/gallery/mathematica-2.2-plot3d-surface.png">
+        <img src="assets/gallery/mathematica-2.2-plot3d-surface.png"
+             alt="Mathematica 2.2 Plot3D on IRIX 5.3">
+      </a>
+      <br>
+      <strong>Mathematica 2.2 — Plot3D</strong>
+      <br>
+      <sub>
+        A 3D surface rendered through Mathematica's Motif graphics frontend.
+      </sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="assets/gallery/mathematica-2.2-parametric-torus.png">
+        <img src="assets/gallery/mathematica-2.2-parametric-torus.png"
+             alt="Mathematica 2.2 ParametricPlot3D torus">
+      </a>
+      <br>
+      <strong>Mathematica 2.2 — ParametricPlot3D</strong>
+      <br>
+      <sub>
+        A parametric torus rendered natively on the emulated Indigo.
+      </sub>
+    </td>
+    <td width="50%" valign="top">
+      <a href="assets/gallery/mathematica-2.2-complex-3d-spiky-surface.png">
+        <img src="assets/gallery/mathematica-2.2-complex-3d-spiky-surface.png"
+             alt="Mathematica 2.2 scientific visualization">
+      </a>
+      <br>
+      <strong>Mathematica 2.2 — Scientific Visualization</strong>
+      <br>
+      <sub>
+        A heavier 3D workload exercising the R3000, FPU, X11, and graphics subsystem.
+      </sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="assets/gallery/wordperfect-6.0-indigo-press-release.png">
+        <img src="assets/gallery/wordperfect-6.0-indigo-press-release.png"
+             alt="WordPerfect 6.0 on IRIX 5.3">
+      </a>
+      <br>
+      <strong>WordPerfect 6.0</strong>
+      <br>
+      <sub>
+        Editing and formatting SGI's original 1991 IRIS Indigo press release.
+      </sub>
+    </td>
+    <td width="50%" valign="top">
+      <a href="assets/gallery/coreldraw-3.5-hello-sgi.png">
+        <img src="assets/gallery/coreldraw-3.5-hello-sgi.png"
+             alt="CorelDRAW 3.5 on IRIX 5.3">
+      </a>
+      <br>
+      <strong>CorelDRAW 3.5</strong>
+      <br>
+      <sub>
+        CorelDRAW for UNIX running natively on IRIX 5.3 with vector text and graphics editing.
+      </sub>
+    </td>
+  </tr>
+</table>
