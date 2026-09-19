@@ -26,7 +26,9 @@ use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
-use se_device::scsi::{ScsiAttachError, ScsiBus, ScsiSnapshotError};
+use se_device::scsi::{
+    ScsiAttachError, ScsiBus, ScsiMediaError, ScsiRemovableMediaKind, ScsiSnapshotError,
+};
 use se_device::scsi_cdrom::ScsiCdrom;
 use se_device::scsi_disk::ScsiDisk;
 use se_device::seeq8003::Seeq8003;
@@ -47,6 +49,9 @@ use crate::input::{
     KeyboardKey, KeyboardNamedKey, MachineInput, MachineInputPayload, PointerButton,
 };
 use crate::machine::{MachineInputError, MachineInputResult};
+use crate::media::{
+    MachineMediaError, MediaCatalog, MediaKind, MediaSlotDescriptor, MediaSlotKey, MediaSlotState,
+};
 use crate::output::{MachineOutput, VideoOutput};
 use se_device::z85230::Channel;
 
@@ -536,6 +541,80 @@ impl Ip12 {
         EndpointCatalog::try_new(endpoints).expect("IP12 endpoint identities must be unique")
     }
 
+    /// Samples every removable-media slot of the configured SCSI topology.
+    ///
+    /// Each call reads the current device state, so a medium the guest ejected
+    /// with its own SCSI command disappears from the next catalog without any
+    /// machine rebuild.
+    #[must_use]
+    pub fn media_catalog(&self) -> MediaCatalog {
+        let slots = self
+            .bus
+            .removable_media_slots()
+            .into_iter()
+            .map(|slot| {
+                let state = slot.state();
+                MediaSlotDescriptor::new(
+                    media_slot_key(slot.target_id(), slot.lun()),
+                    &media_slot_label(slot.target_id(), slot.lun()),
+                    media_kind(state.kind()),
+                    MediaSlotState::new(state.medium_size_bytes(), state.removal_prevented()),
+                )
+            })
+            .collect();
+        MediaCatalog::try_new(slots).expect("IP12 media slot identities must be unique")
+    }
+
+    /// Installs one prepared medium in the addressed removable slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineMediaError`] when no removable slot carries this
+    /// identity, the slot already holds a medium, the medium does not satisfy
+    /// the slot's capacity contract, or the bus is busy.
+    pub fn insert_media(
+        &mut self,
+        slot: &MediaSlotKey,
+        medium: Box<dyn StorageMedium>,
+    ) -> Result<(), MachineMediaError> {
+        let (target_id, lun) = self.removable_media_address(slot)?;
+        self.bus
+            .insert_medium(target_id, lun, medium)
+            .map_err(machine_media_error)
+    }
+
+    /// Removes the medium from the addressed removable slot and releases it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineMediaError`] when no removable slot carries this
+    /// identity, the slot holds no medium, the guest prevented removal, or the
+    /// bus is busy.
+    pub fn eject_media(
+        &mut self,
+        slot: &MediaSlotKey,
+        force: bool,
+    ) -> Result<(), MachineMediaError> {
+        let (target_id, lun) = self.removable_media_address(slot)?;
+        self.bus
+            .eject_medium(target_id, lun, force)
+            .map(drop)
+            .map_err(machine_media_error)
+    }
+
+    /// Resolves one opaque slot identity to the SCSI address that owns it.
+    ///
+    /// The identity is never parsed: current slots generate canonical keys and
+    /// the lookup compares them for equality.
+    fn removable_media_address(&self, slot: &MediaSlotKey) -> Result<(u8, u8), MachineMediaError> {
+        self.bus
+            .removable_media_slots()
+            .into_iter()
+            .find(|candidate| media_slot_key(candidate.target_id(), candidate.lun()) == *slot)
+            .map(|candidate| (candidate.target_id(), candidate.lun()))
+            .ok_or(MachineMediaError::UnknownSlot)
+    }
+
     /// Constructs an IP12 from a raw U56 PROM dump and optional storage.
     ///
     /// # Errors
@@ -767,6 +846,39 @@ impl Ip12 {
     }
 }
 
+/// Returns the canonical media slot identity of one SCSI address.
+fn media_slot_key(target_id: u8, lun: u8) -> MediaSlotKey {
+    MediaSlotKey::new(&format!("scsi.0.target.{target_id}.lun.{lun}"))
+}
+
+/// Returns the frontend-visible name of one removable-media slot.
+fn media_slot_label(target_id: u8, lun: u8) -> String {
+    format!("SCSI CD-ROM {target_id}:{lun}")
+}
+
+/// Maps one device-level medium family onto its machine-visible family.
+const fn media_kind(kind: ScsiRemovableMediaKind) -> MediaKind {
+    match kind {
+        ScsiRemovableMediaKind::OpticalDisc => MediaKind::OpticalDisc,
+    }
+}
+
+/// Maps one device-level media outcome onto its machine-visible outcome.
+const fn machine_media_error(error: ScsiMediaError) -> MachineMediaError {
+    match error {
+        ScsiMediaError::MediumAlreadyPresent { .. } => MachineMediaError::MediumAlreadyPresent,
+        ScsiMediaError::MediumNotPresent { .. } => MachineMediaError::MediumNotPresent,
+        ScsiMediaError::MediumRemovalPrevented { .. } => MachineMediaError::MediumRemovalPrevented,
+        ScsiMediaError::InvalidMedium { .. } => MachineMediaError::InvalidMedium,
+        ScsiMediaError::BusBusy => MachineMediaError::Busy,
+        // A resolved slot identity never names an invalid, unattached, or
+        // fixed address.
+        ScsiMediaError::InvalidAddress { .. }
+        | ScsiMediaError::NoTarget { .. }
+        | ScsiMediaError::NotRemovable { .. } => MachineMediaError::UnknownSlot,
+    }
+}
+
 fn translate_keyboard_key(key: KeyboardKey) -> Option<SgiKey> {
     let code = match key {
         KeyboardKey::Letter(letter @ b'A'..=b'Z') => [
@@ -868,19 +980,23 @@ mod tests {
     use crate::endpoint::{EndpointDirection, EndpointKey, EndpointKind};
     use crate::input::{KeyboardKey, MachineInput, MachineInputPayload, PointerButton};
     use crate::machine::{Machine, MachineInputError, MachineInputResult};
+    use crate::media::{MachineMediaError, MediaKind, MediaSlotState};
     use crate::output::{EndpointOutput, MachineOutput, VideoOutput};
     use se_core::bus::{PhysAddr, PhysicalBus};
     use se_core::storage::StorageMedium;
     use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration};
     use se_device::gio::{GioBus, GioSlot};
     use se_device::lg1::Lg1;
+    use se_device::scsi::{ScsiBus, ScsiCommandStart, ScsiStatus, ScsiTransferResult};
+    use se_device::scsi_cdrom::ScsiCdrom;
+    use se_device::scsi_disk::ScsiDisk;
     use se_device::z85230::Channel;
     use se_float::backend::Backend;
 
     use super::{
         CPU_FREQUENCY_HZ, Ip12, Ip12Error, Ip12MemoryConfiguration, Ip12MemoryConfigurationError,
         Ip12NonvolatileState, Ip12NonvolatileStateParts, Ip12Port, Ip12SimmSize, PROM_BYTES,
-        RAM_BYTES, cpu_config,
+        RAM_BYTES, cpu_config, media_slot_key,
     };
 
     const MEMORY_CONFIGURATION_INSTRUCTION_BUDGET: usize = 300_000;
@@ -2115,6 +2231,429 @@ mod tests {
         let stack_pointer = machine.cpu.debug_snapshot().gpr[29];
         assert!((0xa038_0000..0xa040_0000).contains(&stack_pointer));
         assert!(!machine.bus.interrupt_asserted());
+    }
+
+    const CDROM_MEDIUM_BYTES: u64 = 4096;
+    const READ_TWO_BLOCKS_CDB: [u8; 10] = [0x28, 0, 0, 0, 0, 1, 0, 0, 2, 0];
+    const PREVENT_REMOVAL_CDB: [u8; 6] = [0x1e, 0, 0, 0, 0x01, 0];
+
+    fn machine_with_scsi(scsi_bus: ScsiBus) -> Ip12 {
+        Ip12::new_with_buses(
+            vec![0; PROM_BYTES],
+            Backend::SoftFloat,
+            Ip12MemoryConfiguration::default(),
+            GioBus::new(),
+            scsi_bus,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Builds one bus whose removable slots already hold the requested media,
+    /// which is how a cold machine receives configured storage.
+    fn cdrom_bus(slots: &[(u8, u8, Option<u64>)]) -> ScsiBus {
+        let mut scsi_bus = ScsiBus::new();
+        for &(target_id, lun, medium_bytes) in slots {
+            match medium_bytes {
+                Some(bytes) => scsi_bus
+                    .attach(
+                        target_id,
+                        lun,
+                        Box::new(ScsiCdrom::try_new(bytes).unwrap()),
+                        Box::new(SizedStorage(bytes)),
+                    )
+                    .unwrap(),
+                None => scsi_bus
+                    .attach_removable_empty(target_id, lun, Box::new(ScsiCdrom::new_empty()))
+                    .unwrap(),
+            }
+        }
+        scsi_bus
+    }
+
+    /// Locks one slot the way an initiator does.
+    fn lock_slot(scsi_bus: &mut ScsiBus, target_id: u8, lun: u8) {
+        assert!(matches!(
+            scsi_bus.start_command(target_id, lun, &PREVENT_REMOVAL_CDB),
+            Ok(ScsiCommandStart::Complete {
+                status: ScsiStatus::Good
+            })
+        ));
+    }
+
+    /// Leaves one two-block read unfinished, so the bus holds an active block
+    /// transfer.
+    fn start_partial_read(scsi_bus: &mut ScsiBus, target_id: u8, lun: u8) {
+        assert!(matches!(
+            scsi_bus.start_command(target_id, lun, &READ_TWO_BLOCKS_CDB),
+            Ok(ScsiCommandStart::DataIn { .. })
+        ));
+        assert!(matches!(
+            scsi_bus.transfer_data_in(512, |_| true),
+            Ok(ScsiTransferResult::More { .. })
+        ));
+        assert_eq!(scsi_bus.active_address(), Some((target_id, lun)));
+    }
+
+    /// Summarizes one catalog as `(key, present, capacity, locked)` rows.
+    fn catalog_rows(machine: &Ip12) -> Vec<(String, bool, Option<u64>, bool)> {
+        machine
+            .media_catalog()
+            .slots()
+            .iter()
+            .map(|slot| {
+                let state = slot.state();
+                (
+                    slot.key().as_str().to_owned(),
+                    state.medium_present(),
+                    state.medium_size_bytes(),
+                    state.removal_prevented(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn media_catalog_lists_only_removable_slots() {
+        let mut scsi_bus = ScsiBus::new();
+        scsi_bus
+            .attach(
+                1,
+                0,
+                Box::new(ScsiDisk::try_new(1024).unwrap()),
+                Box::new(SizedStorage(1024)),
+            )
+            .unwrap();
+        scsi_bus
+            .attach(
+                4,
+                0,
+                Box::new(ScsiCdrom::try_new(CDROM_MEDIUM_BYTES).unwrap()),
+                Box::new(SizedStorage(CDROM_MEDIUM_BYTES)),
+            )
+            .unwrap();
+        let machine = machine_with_scsi(scsi_bus);
+
+        let catalog = machine.media_catalog();
+        let summary: Vec<_> = catalog
+            .slots()
+            .iter()
+            .map(|slot| {
+                (
+                    slot.key().as_str().to_owned(),
+                    slot.label().to_owned(),
+                    slot.kind(),
+                    slot.state().medium_present(),
+                    slot.state().medium_size_bytes(),
+                    slot.state().removal_prevented(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [(
+                String::from("scsi.0.target.4.lun.0"),
+                String::from("SCSI CD-ROM 4:0"),
+                MediaKind::OpticalDisc,
+                true,
+                Some(CDROM_MEDIUM_BYTES),
+                false,
+            )]
+        );
+        assert!(catalog.get(&media_slot_key(1, 0)).is_none());
+    }
+
+    #[test]
+    fn media_catalog_orders_every_removable_slot_by_address() {
+        let mut machine = machine_with_scsi(cdrom_bus(&[(4, 3, None), (2, 0, None), (4, 0, None)]));
+
+        let keys = |machine: &Ip12| -> Vec<String> {
+            machine
+                .media_catalog()
+                .slots()
+                .iter()
+                .map(|slot| slot.key().as_str().to_owned())
+                .collect()
+        };
+
+        assert_eq!(
+            keys(&machine),
+            [
+                "scsi.0.target.2.lun.0",
+                "scsi.0.target.4.lun.0",
+                "scsi.0.target.4.lun.3",
+            ]
+        );
+        assert_eq!(keys(&machine), keys(&machine));
+        assert!(
+            machine
+                .media_catalog()
+                .slots()
+                .iter()
+                .all(|slot| !slot.state().medium_present())
+        );
+
+        let empty = media_slot_key(4, 3);
+        machine
+            .insert_media(&empty, Box::new(SizedStorage(CDROM_MEDIUM_BYTES)))
+            .unwrap();
+        assert_eq!(keys(&machine), keys(&machine));
+        assert_eq!(
+            machine.media_catalog().get(&empty).unwrap().state(),
+            MediaSlotState::new(Some(CDROM_MEDIUM_BYTES), false)
+        );
+    }
+
+    #[test]
+    fn media_catalog_projects_loaded_empty_and_locked_slots() {
+        let mut scsi_bus = cdrom_bus(&[
+            (2, 0, None),
+            (4, 0, Some(CDROM_MEDIUM_BYTES)),
+            (4, 3, Some(CDROM_MEDIUM_BYTES)),
+        ]);
+        lock_slot(&mut scsi_bus, 4, 3);
+        let machine = machine_with_scsi(scsi_bus);
+
+        assert_eq!(
+            catalog_rows(&machine),
+            [
+                (String::from("scsi.0.target.2.lun.0"), false, None, false),
+                (
+                    String::from("scsi.0.target.4.lun.0"),
+                    true,
+                    Some(CDROM_MEDIUM_BYTES),
+                    false
+                ),
+                (
+                    String::from("scsi.0.target.4.lun.3"),
+                    true,
+                    Some(CDROM_MEDIUM_BYTES),
+                    true
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn machine_media_changes_route_to_the_addressed_slot_only() {
+        let scsi_bus = cdrom_bus(&[(2, 0, None), (4, 0, Some(CDROM_MEDIUM_BYTES))]);
+        let mut machine = machine_with_scsi(scsi_bus);
+
+        let empty = media_slot_key(2, 0);
+        let loaded = media_slot_key(4, 0);
+        machine
+            .insert_media(&empty, Box::new(SizedStorage(CDROM_MEDIUM_BYTES)))
+            .unwrap();
+        assert_eq!(
+            catalog_rows(&machine),
+            [
+                (
+                    String::from("scsi.0.target.2.lun.0"),
+                    true,
+                    Some(CDROM_MEDIUM_BYTES),
+                    false
+                ),
+                (
+                    String::from("scsi.0.target.4.lun.0"),
+                    true,
+                    Some(CDROM_MEDIUM_BYTES),
+                    false
+                ),
+            ]
+        );
+
+        machine.eject_media(&loaded, false).unwrap();
+        assert_eq!(
+            catalog_rows(&machine),
+            [
+                (
+                    String::from("scsi.0.target.2.lun.0"),
+                    true,
+                    Some(CDROM_MEDIUM_BYTES),
+                    false
+                ),
+                (String::from("scsi.0.target.4.lun.0"), false, None, false),
+            ]
+        );
+        assert_eq!(
+            machine.eject_media(&loaded, false).unwrap_err(),
+            MachineMediaError::MediumNotPresent
+        );
+    }
+
+    #[test]
+    fn machine_ejection_respects_a_guest_removal_lock_until_it_is_forced() {
+        let mut scsi_bus = cdrom_bus(&[(4, 0, Some(CDROM_MEDIUM_BYTES))]);
+        lock_slot(&mut scsi_bus, 4, 0);
+        let mut machine = machine_with_scsi(scsi_bus);
+        let key = media_slot_key(4, 0);
+
+        assert_eq!(
+            machine.eject_media(&key, false).unwrap_err(),
+            MachineMediaError::MediumRemovalPrevented
+        );
+        assert!(
+            machine
+                .media_catalog()
+                .get(&key)
+                .unwrap()
+                .state()
+                .medium_present()
+        );
+
+        // A forced ejection clears the guest lock together with the medium.
+        machine.eject_media(&key, true).unwrap();
+        let state = machine.media_catalog().get(&key).unwrap().state();
+        assert!(!state.medium_present());
+        assert!(!state.removal_prevented());
+    }
+
+    #[test]
+    fn unknown_slot_identities_are_rejected_without_touching_any_medium() {
+        let mut scsi_bus = ScsiBus::new();
+        scsi_bus
+            .attach(
+                1,
+                0,
+                Box::new(ScsiDisk::try_new(1024).unwrap()),
+                Box::new(SizedStorage(1024)),
+            )
+            .unwrap();
+        scsi_bus
+            .attach(
+                4,
+                0,
+                Box::new(ScsiCdrom::try_new(CDROM_MEDIUM_BYTES).unwrap()),
+                Box::new(SizedStorage(CDROM_MEDIUM_BYTES)),
+            )
+            .unwrap();
+        let mut machine = machine_with_scsi(scsi_bus);
+
+        for unknown in [
+            media_slot_key(7, 7),
+            media_slot_key(4, 1),
+            media_slot_key(1, 0),
+        ] {
+            assert_eq!(
+                machine
+                    .insert_media(&unknown, Box::new(SizedStorage(CDROM_MEDIUM_BYTES)))
+                    .unwrap_err(),
+                MachineMediaError::UnknownSlot
+            );
+            assert_eq!(
+                machine.eject_media(&unknown, true).unwrap_err(),
+                MachineMediaError::UnknownSlot
+            );
+        }
+
+        let key = media_slot_key(4, 0);
+        assert!(
+            machine
+                .media_catalog()
+                .get(&key)
+                .unwrap()
+                .state()
+                .medium_present()
+        );
+    }
+
+    #[test]
+    fn invalid_mediums_leave_the_addressed_slot_unchanged() {
+        let mut machine = machine_with_scsi(cdrom_bus(&[(4, 0, None)]));
+        let key = media_slot_key(4, 0);
+
+        for bytes in [0, 512, 4097] {
+            assert_eq!(
+                machine
+                    .insert_media(&key, Box::new(SizedStorage(bytes)))
+                    .unwrap_err(),
+                MachineMediaError::InvalidMedium
+            );
+        }
+        assert!(
+            !machine
+                .media_catalog()
+                .get(&key)
+                .unwrap()
+                .state()
+                .medium_present()
+        );
+
+        machine
+            .insert_media(&key, Box::new(SizedStorage(CDROM_MEDIUM_BYTES)))
+            .unwrap();
+        assert_eq!(
+            machine
+                .insert_media(&key, Box::new(SizedStorage(CDROM_MEDIUM_BYTES)))
+                .unwrap_err(),
+            MachineMediaError::MediumAlreadyPresent
+        );
+        assert_eq!(
+            machine
+                .eject_media(&media_slot_key(4, 1), false)
+                .unwrap_err(),
+            MachineMediaError::UnknownSlot
+        );
+        machine.eject_media(&key, false).unwrap();
+        assert_eq!(
+            machine.eject_media(&key, false).unwrap_err(),
+            MachineMediaError::MediumNotPresent
+        );
+    }
+
+    #[test]
+    fn media_insertion_is_rejected_while_the_bus_transfers() {
+        let mut scsi_bus = ScsiBus::new();
+        scsi_bus
+            .attach(
+                1,
+                0,
+                Box::new(ScsiDisk::try_new(2048).unwrap()),
+                Box::new(SizedStorage(2048)),
+            )
+            .unwrap();
+        scsi_bus
+            .attach_removable_empty(4, 0, Box::new(ScsiCdrom::new_empty()))
+            .unwrap();
+        start_partial_read(&mut scsi_bus, 1, 0);
+        let mut machine = machine_with_scsi(scsi_bus);
+        let key = media_slot_key(4, 0);
+
+        assert_eq!(
+            machine
+                .insert_media(&key, Box::new(SizedStorage(CDROM_MEDIUM_BYTES)))
+                .unwrap_err(),
+            MachineMediaError::Busy
+        );
+
+        // Sampling the slot stays a pure observation of the busy bus.
+        assert_eq!(
+            catalog_rows(&machine),
+            [(String::from("scsi.0.target.4.lun.0"), false, None, false)]
+        );
+    }
+
+    #[test]
+    fn media_ejection_is_rejected_while_the_bus_transfers() {
+        let mut scsi_bus = cdrom_bus(&[(4, 0, Some(CDROM_MEDIUM_BYTES))]);
+        start_partial_read(&mut scsi_bus, 4, 0);
+        let mut machine = machine_with_scsi(scsi_bus);
+        let key = media_slot_key(4, 0);
+
+        assert_eq!(
+            machine.eject_media(&key, true).unwrap_err(),
+            MachineMediaError::Busy
+        );
+        assert_eq!(
+            catalog_rows(&machine),
+            [(
+                String::from("scsi.0.target.4.lun.0"),
+                true,
+                Some(CDROM_MEDIUM_BYTES),
+                false
+            )]
+        );
     }
 
     fn execute_until(machine: &mut Ip12, target: u32, budget: usize) {

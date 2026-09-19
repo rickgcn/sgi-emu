@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
+use se_core::storage::StorageMedium;
 use se_core::time::VirtualDuration;
 use se_cpu::mips1::r3000::StepError;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,7 @@ use crate::endpoint::{EndpointCatalog, EndpointKind};
 use crate::indigo::ip12::snapshot::Ip12Snapshot;
 use crate::indigo::ip12::{Ip12, Ip12NonvolatileState, Ip12SnapshotError};
 use crate::input::MachineInput;
+use crate::media::{MachineMediaError, MediaCatalog, MediaSlotKey};
 use crate::output::MachineOutput;
 
 /// A configured emulated machine.
@@ -147,6 +149,49 @@ impl Machine {
     pub fn endpoint_catalog(&self) -> EndpointCatalog {
         match self {
             Self::IndigoIp12(machine) => machine.endpoint_catalog(),
+        }
+    }
+
+    /// Samples the configured machine's removable-media slots.
+    ///
+    /// The sample is frontend-neutral: it never names a SCSI address, a host
+    /// path, or a device model.
+    #[must_use]
+    pub fn media_catalog(&self) -> MediaCatalog {
+        match self {
+            Self::IndigoIp12(machine) => machine.media_catalog(),
+        }
+    }
+
+    /// Installs one prepared medium in the addressed removable slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineMediaError`] when the active machine has no such slot
+    /// or the slot cannot accept the medium at this boundary.
+    pub fn insert_media(
+        &mut self,
+        slot: &MediaSlotKey,
+        medium: Box<dyn StorageMedium>,
+    ) -> Result<(), MachineMediaError> {
+        match self {
+            Self::IndigoIp12(machine) => machine.insert_media(slot, medium),
+        }
+    }
+
+    /// Removes the medium from the addressed removable slot and releases it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineMediaError`] when the active machine has no such slot
+    /// or the slot cannot release its medium at this boundary.
+    pub fn eject_media(
+        &mut self,
+        slot: &MediaSlotKey,
+        force: bool,
+    ) -> Result<(), MachineMediaError> {
+        match self {
+            Self::IndigoIp12(machine) => machine.eject_media(slot, force),
         }
     }
 

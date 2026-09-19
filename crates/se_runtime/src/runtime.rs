@@ -19,11 +19,13 @@ use std::ops::Deref;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 
+use se_core::storage::StorageMedium;
 use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration, VirtualInstant};
 use se_machine::debug::{DebugRequest, DebugResponse};
 use se_machine::endpoint::{EndpointKey, EndpointKind};
 use se_machine::input::{KeyboardKey, MachineInput, MachineInputPayload, PointerButton};
 use se_machine::machine::{ExecutionError, Machine, MachineInputResult, MachineNonvolatileState};
+use se_machine::media::MachineMediaError;
 use se_machine::output::{EndpointOutput, MachineOutput};
 use se_network::config::NatConfig;
 use se_network::session::NetworkSession;
@@ -32,6 +34,9 @@ use crate::control::{RuntimeMode, RuntimeState, RuntimeStatus};
 use crate::endpoint::{
     EndpointHandle, RuntimeEndpointCatalog, RuntimeEndpointDescriptor, RuntimeOutput,
     RuntimeOutputPayload,
+};
+use crate::media::{
+    RuntimeMediaCatalog, RuntimeMediaError, RuntimeMediaHandle, RuntimeMediaSlotDescriptor,
 };
 use crate::record::{
     ExecutionPosition, RecordOutcome, Recorder, ReplaySession, Replayer, TimelineAction,
@@ -77,6 +82,17 @@ enum Command {
     MachineInput {
         handle: EndpointHandle,
         payload: MachineInputPayload,
+        reply: CommandReply<RuntimeStatus>,
+    },
+    MediaCatalog(CommandReply<RuntimeMediaCatalog>),
+    InsertMedia {
+        handle: RuntimeMediaHandle,
+        medium: Box<dyn StorageMedium>,
+        reply: CommandReply<RuntimeStatus>,
+    },
+    EjectMedia {
+        handle: RuntimeMediaHandle,
+        force: bool,
         reply: CommandReply<RuntimeStatus>,
     },
     SetOutputHandler {
@@ -151,6 +167,7 @@ enum CommandRejection {
     UnknownEndpoint,
     EndpointKindMismatch,
     EndpointDirectionMismatch,
+    Media(RuntimeMediaError),
 }
 
 impl fmt::Display for CommandRejection {
@@ -163,6 +180,7 @@ impl fmt::Display for CommandRejection {
             Self::EndpointDirectionMismatch => {
                 formatter.write_str("runtime endpoint does not accept input")
             }
+            Self::Media(error) => error.fmt(formatter),
         }
     }
 }
@@ -198,6 +216,8 @@ pub enum RuntimeError {
     EndpointKindMismatch,
     /// The endpoint does not accept host input.
     EndpointDirectionMismatch,
+    /// The media command was rejected for a typed media reason.
+    Media(RuntimeMediaError),
 }
 
 impl fmt::Display for RuntimeError {
@@ -211,11 +231,19 @@ impl fmt::Display for RuntimeError {
             Self::EndpointDirectionMismatch => {
                 formatter.write_str("runtime endpoint does not accept input")
             }
+            Self::Media(error) => error.fmt(formatter),
         }
     }
 }
 
-impl Error for RuntimeError {}
+impl Error for RuntimeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Media(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Error returned when the runtime worker cannot be shut down cleanly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -427,6 +455,62 @@ impl RuntimeHandle {
         self.request(Command::EndpointCatalog)
     }
 
+    /// Samples the removable-media slots of the active machine generation.
+    ///
+    /// The worker reads the current device state of the live machine, so a
+    /// medium the guest ejected with its own SCSI command is already absent
+    /// from the next sample. The query is available in every runtime mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] if the worker is unavailable.
+    pub fn media_catalog(&self) -> Result<RuntimeMediaCatalog, RuntimeError> {
+        self.request(Command::MediaCatalog)
+    }
+
+    /// Installs one prepared medium in the addressed removable slot.
+    ///
+    /// The runtime takes ownership of the medium and hands it to the worker.
+    /// Host media changes are accepted only while the runtime is in Normal
+    /// mode, because no Record or Replay timeline can carry them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Media`] for a stale handle, an unknown slot, an
+    /// unavailable mode, an invalid medium, or a busy slot.
+    pub fn insert_media(
+        &self,
+        handle: RuntimeMediaHandle,
+        medium: Box<dyn StorageMedium>,
+    ) -> Result<RuntimeStatus, RuntimeError> {
+        self.request(|reply| Command::InsertMedia {
+            handle,
+            medium,
+            reply,
+        })
+    }
+
+    /// Removes the medium from the addressed removable slot and releases it.
+    ///
+    /// A force ejection overrides a guest removal lock. Host media changes are
+    /// accepted only while the runtime is in Normal mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Media`] for a stale handle, an unknown slot, an
+    /// unavailable mode, an empty or locked slot, or a busy slot.
+    pub fn eject_media(
+        &self,
+        handle: RuntimeMediaHandle,
+        force: bool,
+    ) -> Result<RuntimeStatus, RuntimeError> {
+        self.request(|reply| Command::EjectMedia {
+            handle,
+            force,
+            reply,
+        })
+    }
+
     /// Republishes current-state outputs of the active machine.
     ///
     /// # Errors
@@ -574,6 +658,7 @@ impl RuntimeHandle {
                 CommandRejection::EndpointDirectionMismatch => {
                     RuntimeError::EndpointDirectionMismatch
                 }
+                CommandRejection::Media(error) => RuntimeError::Media(error),
             })
     }
 }
@@ -866,6 +951,17 @@ impl Worker {
                 self.check_record_failure();
                 send_reply(reply, result);
             }
+            Command::MediaCatalog(reply) => send_reply(reply, Ok(self.media_catalog())),
+            Command::InsertMedia {
+                handle,
+                medium,
+                reply,
+            } => send_reply(reply, self.insert_media(&handle, medium)),
+            Command::EjectMedia {
+                handle,
+                force,
+                reply,
+            } => send_reply(reply, self.eject_media(&handle, force)),
             Command::SetOutputHandler { handler, reply } => {
                 self.output_handler = Some(handler);
                 send_reply(reply, Ok(self.status()));
@@ -1843,6 +1939,79 @@ impl Worker {
         RuntimeEndpointCatalog::new(self.machine_generation, endpoints)
     }
 
+    fn media_catalog(&self) -> RuntimeMediaCatalog {
+        let slots = self.machine.as_ref().map_or_else(Vec::new, |machine| {
+            machine
+                .media_catalog()
+                .slots()
+                .iter()
+                .map(|descriptor| {
+                    RuntimeMediaSlotDescriptor::new(
+                        RuntimeMediaHandle::new(self.machine_generation, descriptor.key().clone()),
+                        descriptor.label(),
+                        descriptor.kind(),
+                        descriptor.state(),
+                    )
+                })
+                .collect()
+        });
+        RuntimeMediaCatalog::new(self.machine_generation, slots)
+    }
+
+    fn insert_media(
+        &mut self,
+        handle: &RuntimeMediaHandle,
+        medium: Box<dyn StorageMedium>,
+    ) -> Result<RuntimeStatus, CommandRejection> {
+        let machine = self.require_media_change(handle)?;
+        machine
+            .insert_media(handle.key(), medium)
+            .map_err(media_rejection)?;
+        self.advance_revision();
+        Ok(self.status())
+    }
+
+    fn eject_media(
+        &mut self,
+        handle: &RuntimeMediaHandle,
+        force: bool,
+    ) -> Result<RuntimeStatus, CommandRejection> {
+        let machine = self.require_media_change(handle)?;
+        machine
+            .eject_media(handle.key(), force)
+            .map_err(media_rejection)?;
+        self.advance_revision();
+        Ok(self.status())
+    }
+
+    /// Validates one host media change and borrows the machine it addresses.
+    ///
+    /// The order is deliberate: an installed machine, then the handle
+    /// generation, then the slot identity, and only then the runtime mode, so
+    /// that a stale handle can never reach a same-named slot of a newer
+    /// machine and a rejected mode can never reach a machine mutation.
+    fn require_media_change(
+        &mut self,
+        handle: &RuntimeMediaHandle,
+    ) -> Result<&mut Machine, CommandRejection> {
+        let machine = self
+            .machine
+            .as_mut()
+            .ok_or(CommandRejection::Media(RuntimeMediaError::UnknownSlot))?;
+        if handle.generation() != self.machine_generation {
+            return Err(CommandRejection::Media(RuntimeMediaError::StaleHandle));
+        }
+        if machine.media_catalog().get(handle.key()).is_none() {
+            return Err(CommandRejection::Media(RuntimeMediaError::UnknownSlot));
+        }
+        if !matches!(self.mode, ActiveMode::Normal) {
+            return Err(CommandRejection::Media(
+                RuntimeMediaError::MutationUnavailable,
+            ));
+        }
+        Ok(machine)
+    }
+
     fn validate_handle(
         &self,
         handle: &EndpointHandle,
@@ -1994,6 +2163,17 @@ impl CpuClock {
     }
 }
 
+const fn media_rejection(error: MachineMediaError) -> CommandRejection {
+    CommandRejection::Media(match error {
+        MachineMediaError::UnknownSlot => RuntimeMediaError::UnknownSlot,
+        MachineMediaError::MediumAlreadyPresent => RuntimeMediaError::MediumAlreadyPresent,
+        MachineMediaError::MediumNotPresent => RuntimeMediaError::MediumNotPresent,
+        MachineMediaError::MediumRemovalPrevented => RuntimeMediaError::MediumRemovalPrevented,
+        MachineMediaError::InvalidMedium => RuntimeMediaError::InvalidMedium,
+        MachineMediaError::Busy => RuntimeMediaError::Busy,
+    })
+}
+
 fn rejection(reason: &str) -> CommandRejection {
     CommandRejection::General(String::from(reason))
 }
@@ -2040,6 +2220,7 @@ mod tests {
     };
     use se_machine::input::{KeyboardKey, MachineInput, MachineInputPayload, PointerButton};
     use se_machine::machine::{Machine, MachineNonvolatileState};
+    use se_machine::media::{MediaKind, MediaSlotState};
     use se_machine::output::{EndpointOutput, VideoFrame, VideoOutput};
     use se_machine::resource::ResourceId;
     use sha2::{Digest, Sha256};
@@ -2047,6 +2228,7 @@ mod tests {
     use super::{CpuClock, Runtime, RuntimeConfiguration, RuntimeError, checkpoint_digest};
     use crate::control::{RuntimeMode, RuntimeState};
     use crate::endpoint::{EndpointHandle, RuntimeOutputPayload};
+    use crate::media::{RuntimeMediaError, RuntimeMediaHandle};
     use crate::record::{
         ExecutionPosition, RecordManifest, RecordOutcome, Recorder, Replayer, TimelineAction,
     };
@@ -2293,6 +2475,19 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         )
     }
 
+    fn machine_with_cdrom() -> Machine {
+        Machine::IndigoIp12(
+            Ip12::new(
+                vec![0; PROM_BYTES],
+                Backend::SoftFloat,
+                GioBus::new(),
+                None,
+                Some(cdrom_storage()),
+            )
+            .unwrap(),
+        )
+    }
+
     fn machine_with_graphics() -> Machine {
         let mut gio = GioBus::new();
         gio.attach(GioSlot::Graphics, Box::new(Lg1::new())).unwrap();
@@ -2455,6 +2650,299 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         assert_ne!(video_handle, second_handle);
         assert_eq!(video_handle.key(), second_handle.key());
         runtime.shutdown().unwrap();
+    }
+
+    const CDROM_MEDIUM_BYTES: u64 = 4096;
+    const CDROM_SLOT_KEY: &str = "scsi.0.target.4.lun.0";
+    const CDROM_SLOT_LABEL: &str = "SCSI CD-ROM 4:0";
+
+    struct DroppableStorage {
+        size_bytes: u64,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl StorageMedium for DroppableStorage {
+        fn size_bytes(&self) -> u64 {
+            self.size_bytes
+        }
+
+        fn read_exact_at(&mut self, _offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+            buffer.fill(0);
+            Ok(())
+        }
+
+        fn write_all_at(&mut self, _offset: u64, _data: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for DroppableStorage {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn cdrom_storage() -> Box<dyn StorageMedium> {
+        Box::new(RecordingStorage {
+            bytes: vec![0; CDROM_MEDIUM_BYTES as usize],
+            reads: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    fn media_handle(runtime: &Runtime) -> RuntimeMediaHandle {
+        runtime
+            .media_catalog()
+            .unwrap()
+            .slots()
+            .first()
+            .expect("the fixture machine owns one CD-ROM slot")
+            .handle()
+            .clone()
+    }
+
+    fn media_state(runtime: &Runtime) -> MediaSlotState {
+        runtime.media_catalog().unwrap().slots()[0].state()
+    }
+
+    #[test]
+    fn media_catalog_samples_live_slots_with_generation_bound_handles() {
+        let runtime = Runtime::new(Some(machine_with_cdrom())).unwrap();
+        let installed = runtime.status().unwrap();
+        let catalog = runtime.media_catalog().unwrap();
+
+        assert_eq!(catalog.generation(), installed.machine_generation);
+        let slots = catalog.slots();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].handle().key().as_str(), CDROM_SLOT_KEY);
+        assert_eq!(slots[0].handle().generation(), installed.machine_generation);
+        assert_eq!(slots[0].label(), CDROM_SLOT_LABEL);
+        assert_eq!(slots[0].kind(), MediaKind::OpticalDisc);
+        assert_eq!(
+            slots[0].state().medium_size_bytes(),
+            Some(CDROM_MEDIUM_BYTES)
+        );
+        assert!(!slots[0].state().removal_prevented());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn normal_media_changes_round_trip_through_the_worker() {
+        let runtime = Runtime::new(Some(machine_with_cdrom())).unwrap();
+        let handle = media_handle(&runtime);
+
+        runtime.eject_media(handle.clone(), false).unwrap();
+        assert!(!media_state(&runtime).medium_present());
+
+        runtime
+            .insert_media(handle.clone(), cdrom_storage())
+            .unwrap();
+        assert_eq!(
+            media_state(&runtime).medium_size_bytes(),
+            Some(CDROM_MEDIUM_BYTES)
+        );
+        assert_eq!(
+            runtime.insert_media(handle.clone(), cdrom_storage()),
+            Err(RuntimeError::Media(RuntimeMediaError::MediumAlreadyPresent))
+        );
+
+        runtime.eject_media(handle.clone(), false).unwrap();
+        assert!(!media_state(&runtime).medium_present());
+        assert_eq!(
+            runtime.eject_media(handle, false),
+            Err(RuntimeError::Media(RuntimeMediaError::MediumNotPresent))
+        );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn running_and_paused_machines_accept_host_media_changes() {
+        let runtime = Runtime::new(Some(machine_with_cdrom())).unwrap();
+        let handle = media_handle(&runtime);
+
+        runtime.run().unwrap();
+        runtime.eject_media(handle.clone(), false).unwrap();
+        assert!(!media_state(&runtime).medium_present());
+
+        runtime.pause().unwrap();
+        runtime.insert_media(handle, cdrom_storage()).unwrap();
+        assert!(media_state(&runtime).medium_present());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn renamed_machine_generations_invalidate_media_handles() {
+        let runtime = Runtime::new(Some(machine_with_cdrom())).unwrap();
+        let stale = media_handle(&runtime);
+
+        let installed = runtime.configure(machine_with_cdrom()).unwrap();
+        let current = media_handle(&runtime);
+        assert_eq!(stale.key(), current.key());
+        assert_eq!(current.generation(), installed.machine_generation);
+        assert!(current.generation() > stale.generation());
+
+        assert_eq!(
+            runtime.insert_media(stale.clone(), cdrom_storage()),
+            Err(RuntimeError::Media(RuntimeMediaError::StaleHandle))
+        );
+        assert_eq!(
+            runtime.eject_media(stale, false),
+            Err(RuntimeError::Media(RuntimeMediaError::StaleHandle))
+        );
+
+        // A reset keeps the machine instance, so it keeps its handles valid.
+        let reset = runtime.reset().unwrap();
+        assert_eq!(reset.machine_generation, installed.machine_generation);
+        assert_eq!(
+            runtime.media_catalog().unwrap().generation(),
+            reset.machine_generation
+        );
+        runtime.eject_media(current, false).unwrap();
+        assert!(!media_state(&runtime).medium_present());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn media_catalog_resamples_the_live_worker_state() {
+        let runtime = Runtime::new(Some(machine_with_cdrom())).unwrap();
+        let handle = media_handle(&runtime);
+
+        // No sample survives a host media change, in either direction.
+        assert_eq!(
+            media_state(&runtime).medium_size_bytes(),
+            Some(CDROM_MEDIUM_BYTES)
+        );
+        runtime.eject_media(handle.clone(), false).unwrap();
+        assert!(!media_state(&runtime).medium_present());
+        assert!(!media_state(&runtime).medium_present());
+
+        runtime
+            .insert_media(handle.clone(), cdrom_storage())
+            .unwrap();
+        assert_eq!(
+            media_state(&runtime).medium_size_bytes(),
+            Some(CDROM_MEDIUM_BYTES)
+        );
+
+        runtime.eject_media(handle.clone(), true).unwrap();
+        assert!(!media_state(&runtime).medium_present());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn invalid_mediums_leave_the_runtime_slot_empty() {
+        let runtime = Runtime::new(Some(machine_with_cdrom())).unwrap();
+        let handle = media_handle(&runtime);
+
+        runtime.eject_media(handle.clone(), false).unwrap();
+        for bytes in [0, 1024, 2049] {
+            assert_eq!(
+                runtime.insert_media(
+                    handle.clone(),
+                    Box::new(DroppableStorage {
+                        size_bytes: bytes,
+                        dropped: Arc::new(AtomicBool::new(false)),
+                    }),
+                ),
+                Err(RuntimeError::Media(RuntimeMediaError::InvalidMedium))
+            );
+        }
+        assert!(!media_state(&runtime).medium_present());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn ejected_mediums_are_released_to_the_host() {
+        let runtime = Runtime::new(Some(machine_with_cdrom())).unwrap();
+        let handle = media_handle(&runtime);
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        runtime.eject_media(handle.clone(), false).unwrap();
+        runtime
+            .insert_media(
+                handle.clone(),
+                Box::new(DroppableStorage {
+                    size_bytes: CDROM_MEDIUM_BYTES,
+                    dropped: Arc::clone(&dropped),
+                }),
+            )
+            .unwrap();
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        runtime.eject_media(handle, false).unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        runtime.shutdown().unwrap();
+    }
+
+    /// Writes one replayable record of a CD-ROM machine that stays behind the
+    /// replay frontier.
+    fn recorded_cdrom_machine(name: &str) -> PathBuf {
+        let path = record_path(name);
+        remove_record_artifacts(&path);
+        let mut recorder = super::Worker::new(None);
+        recorder
+            .configure(RuntimeConfiguration::recording(
+                machine_with_cdrom(),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        execute_instructions(&mut recorder, 16);
+        recorder.stop_recording(RecordOutcome::UserStopped).unwrap();
+        drop(recorder);
+        path
+    }
+
+    /// Asserts that one installed mode refuses host media changes without
+    /// changing the machine, and still answers media queries.
+    fn assert_host_media_changes_are_unavailable(runtime: &Runtime) {
+        let handle = media_handle(runtime);
+
+        assert_eq!(
+            runtime.insert_media(handle.clone(), cdrom_storage()),
+            Err(RuntimeError::Media(RuntimeMediaError::MutationUnavailable))
+        );
+        assert_eq!(
+            runtime.eject_media(handle.clone(), true),
+            Err(RuntimeError::Media(RuntimeMediaError::MutationUnavailable))
+        );
+
+        let catalog = runtime.media_catalog().unwrap();
+        assert_eq!(catalog.generation(), handle.generation());
+        assert!(catalog.slots()[0].state().medium_present());
+    }
+
+    #[test]
+    fn recording_mode_rejects_host_media_changes() {
+        let path = record_path("media-mutation-recording");
+        remove_record_artifacts(&path);
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let installed = runtime
+            .configure_with(RuntimeConfiguration::recording(
+                machine_with_cdrom(),
+                started_recorder(&path),
+            ))
+            .unwrap();
+        assert_eq!(installed.mode, RuntimeMode::Recording);
+
+        assert_host_media_changes_are_unavailable(&runtime);
+        runtime.shutdown().unwrap();
+        remove_record_artifacts(&path);
+    }
+
+    #[test]
+    fn replaying_mode_rejects_host_media_changes() {
+        let path = recorded_cdrom_machine("media-mutation-replaying");
+        let runtime = Runtime::new_unconfigured().unwrap();
+        let installed = runtime
+            .configure_with(RuntimeConfiguration::replaying(
+                machine_with_cdrom(),
+                Replayer::open(&path).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(installed.mode, RuntimeMode::Replaying);
+
+        assert_host_media_changes_are_unavailable(&runtime);
+        runtime.shutdown().unwrap();
+        remove_record_artifacts(&path);
     }
 
     fn machine_that_transmits_serial_a(values: &[u8]) -> Machine {

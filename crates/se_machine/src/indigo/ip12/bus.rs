@@ -1,4 +1,5 @@
 use se_core::bus::{BusError, PhysAddr, PhysicalBus};
+use se_core::storage::StorageMedium;
 use se_device::centronics::CentronicsPort;
 use se_device::dp8573a::{Dp8573a, Dp8573aBatteryState};
 use se_device::dsp56001::Dsp56001;
@@ -10,7 +11,7 @@ use se_device::nmc93cs46::{Nmc93cs46, Nmc93cs46Contents};
 use se_device::pic1::Pic1;
 use se_device::ram::Ram;
 use se_device::rom::Rom;
-use se_device::scsi::{ScsiBus, ScsiBusSnapshot};
+use se_device::scsi::{ScsiBus, ScsiBusSnapshot, ScsiMediaError, ScsiRemovableMediaSlot};
 use se_device::seeq8003::Seeq8003;
 use se_device::sgi_keyboard::{SgiKey, SgiKeyboard};
 use se_device::sgi_mouse::{SgiMouse, SgiMouseButton};
@@ -365,6 +366,28 @@ impl Ip12Bus {
 
     pub(super) const fn has_sgi_mouse(&self) -> bool {
         self.sgi_mouse.is_some()
+    }
+
+    pub(super) fn removable_media_slots(&self) -> Vec<ScsiRemovableMediaSlot> {
+        self.scsi_bus.removable_media_slots()
+    }
+
+    pub(super) fn insert_medium(
+        &mut self,
+        target_id: u8,
+        lun: u8,
+        medium: Box<dyn StorageMedium>,
+    ) -> Result<(), ScsiMediaError> {
+        self.scsi_bus.insert_medium(target_id, lun, medium)
+    }
+
+    pub(super) fn eject_medium(
+        &mut self,
+        target_id: u8,
+        lun: u8,
+        force: bool,
+    ) -> Result<Option<Box<dyn StorageMedium>>, ScsiMediaError> {
+        self.scsi_bus.eject_medium(target_id, lun, force)
     }
 
     /// Returns what the primary graphics slot currently drives to the display.

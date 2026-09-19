@@ -101,6 +101,82 @@ pub enum ScsiMediaChangeOrigin {
     GuestCommand,
 }
 
+/// Frontend-visible medium family of one removable SCSI slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScsiRemovableMediaKind {
+    /// A read-only optical disc.
+    OpticalDisc,
+}
+
+/// Current hardware state of one removable SCSI slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScsiRemovableMediaState {
+    kind: ScsiRemovableMediaKind,
+    medium_size_bytes: Option<u64>,
+    removal_prevented: bool,
+}
+
+impl ScsiRemovableMediaState {
+    pub(crate) const fn new(
+        kind: ScsiRemovableMediaKind,
+        medium_size_bytes: Option<u64>,
+        removal_prevented: bool,
+    ) -> Self {
+        Self {
+            kind,
+            medium_size_bytes,
+            removal_prevented,
+        }
+    }
+
+    /// Returns the medium family this slot accepts.
+    #[must_use]
+    pub const fn kind(&self) -> ScsiRemovableMediaKind {
+        self.kind
+    }
+
+    /// Returns the capacity of the installed medium, or `None` when the slot
+    /// holds no medium.
+    #[must_use]
+    pub const fn medium_size_bytes(&self) -> Option<u64> {
+        self.medium_size_bytes
+    }
+
+    /// Reports whether the initiator locked the slot against removal.
+    #[must_use]
+    pub const fn removal_prevented(&self) -> bool {
+        self.removal_prevented
+    }
+}
+
+/// One removable slot of a target attached to [`ScsiBus`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScsiRemovableMediaSlot {
+    target_id: u8,
+    lun: u8,
+    state: ScsiRemovableMediaState,
+}
+
+impl ScsiRemovableMediaSlot {
+    /// Returns the target ID that owns the slot.
+    #[must_use]
+    pub const fn target_id(&self) -> u8 {
+        self.target_id
+    }
+
+    /// Returns the logical unit number that owns the slot.
+    #[must_use]
+    pub const fn lun(&self) -> u8 {
+        self.lun
+    }
+
+    /// Returns the current hardware state of the slot.
+    #[must_use]
+    pub const fn state(&self) -> ScsiRemovableMediaState {
+        self.state
+    }
+}
+
 /// Removable-slot hooks of a target whose medium can be replaced.
 ///
 /// [`ScsiBus`] owns the backing storage while the target owns the state the
@@ -135,6 +211,12 @@ pub trait ScsiTarget: Send {
     /// Returns the removable-slot hooks of a target that reports removable
     /// backing, and `None` for a fixed target.
     fn removable_media(&mut self) -> Option<&mut dyn ScsiRemovableTarget> {
+        None
+    }
+
+    /// Reports the current state of one removable slot without changing
+    /// protocol state, and `None` for a target with fixed backing.
+    fn removable_media_state(&self) -> Option<ScsiRemovableMediaState> {
         None
     }
 
@@ -1011,6 +1093,29 @@ impl ScsiBus {
         }
     }
 
+    /// Samples every attached removable slot in ascending target and LUN
+    /// order without changing protocol state.
+    ///
+    /// The query never consumes unit attention, updates sense data, or touches
+    /// an active connection or transaction.
+    #[must_use]
+    pub fn removable_media_slots(&self) -> Vec<ScsiRemovableMediaSlot> {
+        self.targets
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, attachment)| {
+                let attachment = attachment.as_ref()?;
+                let state = attachment.target.removable_media_state()?;
+                let (target_id, lun) = address_for_slot(slot);
+                Some(ScsiRemovableMediaSlot {
+                    target_id,
+                    lun,
+                    state,
+                })
+            })
+            .collect()
+    }
+
     /// Attaches one target and its backing storage.
     ///
     /// A removable target receives the storage as the medium it holds from
@@ -1819,8 +1924,8 @@ mod tests {
 
     use super::{
         ScsiAttachError, ScsiBackingRequirement, ScsiBus, ScsiBusError, ScsiCommandPlan,
-        ScsiCommandStart, ScsiDataDirection, ScsiMediaError, ScsiPhase, ScsiSnapshotError,
-        ScsiStatus, ScsiTarget, ScsiTargetSnapshot, ScsiTransferResult,
+        ScsiCommandStart, ScsiDataDirection, ScsiMediaError, ScsiPhase, ScsiRemovableMediaKind,
+        ScsiSnapshotError, ScsiStatus, ScsiTarget, ScsiTargetSnapshot, ScsiTransferResult,
     };
 
     struct TestTarget {
@@ -2711,6 +2816,68 @@ mod tests {
         );
         assert_eq!(read_sense_code(&mut bus), (6, 0x28, 0));
         assert_eq!(eject(&mut bus, CDROM_TARGET, false), Ok(Some(CDROM_BYTES)));
+    }
+
+    #[test]
+    fn removable_media_slots_report_live_state_without_touching_protocol_state() {
+        let mut bus = ScsiBus::new();
+        attach_test_target(&mut bus, false, false);
+        attach_empty_cdrom(&mut bus);
+
+        let slots = |bus: &ScsiBus| {
+            bus.removable_media_slots()
+                .into_iter()
+                .map(|slot| {
+                    let state = slot.state();
+                    (
+                        slot.target_id(),
+                        slot.lun(),
+                        state.kind(),
+                        state.medium_size_bytes(),
+                        state.removal_prevented(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = |medium_size_bytes: Option<u64>, removal_prevented: bool| {
+            [(
+                CDROM_TARGET,
+                0,
+                ScsiRemovableMediaKind::OpticalDisc,
+                medium_size_bytes,
+                removal_prevented,
+            )]
+        };
+
+        // The fixed disk at target 1 owns no removable slot.
+        assert_eq!(slots(&bus), expected(None, false));
+
+        bus.insert_medium(CDROM_TARGET, 0, medium_storage(CDROM_BYTES))
+            .unwrap();
+        assert_eq!(slots(&bus), expected(Some(CDROM_BYTES), false));
+
+        // Observing the slot must not consume the medium-changed attention or
+        // clear the sense data a later command reads.
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(slots(&bus), expected(Some(CDROM_BYTES), false));
+        assert_eq!(read_sense_code(&mut bus), (6, 0x28, 0));
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::Good
+        );
+
+        assert_eq!(cdrom_status(&mut bus, &PREVENT_CDB), ScsiStatus::Good);
+        assert_eq!(slots(&bus), expected(Some(CDROM_BYTES), true));
+        assert_eq!(cdrom_status(&mut bus, &ALLOW_CDB), ScsiStatus::Good);
+        assert_eq!(slots(&bus), expected(Some(CDROM_BYTES), false));
+
+        // A guest ejection reaches the observation without a host command.
+        assert_eq!(cdrom_status(&mut bus, &EJECT_CDB), ScsiStatus::Good);
+        assert_eq!(slots(&bus), expected(None, false));
+        assert!(bus.target_present(CDROM_TARGET));
     }
 
     #[test]

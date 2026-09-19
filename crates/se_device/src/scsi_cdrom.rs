@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::scsi::{
-    ScsiBackingRequirement, ScsiCommandPlan, ScsiMediaChangeOrigin, ScsiRemovableTarget,
-    ScsiStatus, ScsiStorageSizeError, ScsiTarget, ScsiTargetSnapshot, SenseData,
+    ScsiBackingRequirement, ScsiCommandPlan, ScsiMediaChangeOrigin, ScsiRemovableMediaKind,
+    ScsiRemovableMediaState, ScsiRemovableTarget, ScsiStatus, ScsiStorageSizeError, ScsiTarget,
+    ScsiTargetSnapshot, SenseData,
 };
 
 const INITIAL_LOGICAL_BLOCK_BYTES: u32 = 512;
@@ -284,6 +285,14 @@ impl ScsiTarget for ScsiCdrom {
 
     fn removable_media(&mut self) -> Option<&mut dyn ScsiRemovableTarget> {
         Some(self)
+    }
+
+    fn removable_media_state(&self) -> Option<ScsiRemovableMediaState> {
+        Some(ScsiRemovableMediaState::new(
+            ScsiRemovableMediaKind::OpticalDisc,
+            self.medium_bytes,
+            self.removal_prevented,
+        ))
     }
 
     fn snapshot(&self) -> Option<ScsiTargetSnapshot> {
