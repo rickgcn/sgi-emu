@@ -1454,6 +1454,22 @@ mod tests {
     }
 
     #[test]
+    fn guest_sgi_vendor_commands_complete_as_ten_byte_cdbs() {
+        for opcode in [0xc9, 0xc4] {
+            let mut bus = bus_with_cdrom(vec![0x44; 2048], false);
+            let mut cdb = [0; 10];
+            cdb[0] = opcode;
+            issue_scsi_command(&mut bus, 4, 0, 0, &cdb);
+            let mut output = MachineOutput::default();
+
+            bus.advance_time(VirtualDuration::ZERO, &mut output);
+
+            assert_eq!(read_scsi_register(&mut bus, 0x17), 0x16);
+            assert!(!bus.interrupt_asserted());
+        }
+    }
+
+    #[test]
     fn cdrom_read_ten_walks_a_full_prom_descriptor_array() {
         const BLOCK_COUNT: u16 = 512;
         const PAGE_COUNT: u32 = 64;

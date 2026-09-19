@@ -12,6 +12,19 @@ const INITIAL_LOGICAL_BLOCK_BYTES: u32 = 512;
 const SUPPORTED_LOGICAL_BLOCK_BYTES: [u32; 2] = [INITIAL_LOGICAL_BLOCK_BYTES, 2048];
 const STORAGE_ALIGNMENT_BYTES: u64 = 2048;
 
+/// The installed medium holds one data track, numbered 1 and starting at LBA 0.
+const TRACK_NUMBER: u8 = 1;
+/// Track descriptor ADR 1 (track position) and CONTROL 4 (data track).
+const TRACK_ADR_CONTROL: u8 = 0x14;
+/// Two header bytes, two track numbers, one eight-byte track descriptor.
+const TOC_RESPONSE_BYTES: usize = 12;
+/// Track start in MSF addressing: a CD-ROM counts from the 150-frame lead-in
+/// that precedes LBA 0, so the descriptor reads reserved `00`, then `00:02:00`.
+const TRACK_START_MSF: [u8; 4] = [0x00, 0x00, 0x02, 0x00];
+/// The same track start in LBA addressing: reserved `00`, then the 24-bit
+/// logical block address `0`.
+const TRACK_START_LBA: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+
 const TEST_UNIT_READY: u8 = 0x00;
 const REQUEST_SENSE: u8 = 0x03;
 const READ_6: u8 = 0x08;
@@ -23,6 +36,8 @@ const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1e;
 const READ_CAPACITY_10: u8 = 0x25;
 const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2a;
+const READ_TOC_PMA_ATIP: u8 = 0x43;
+const SGI_EJECT: u8 = 0xc4;
 const SGI_HD_TO_CDROM: u8 = 0xc9;
 
 /// Software-visible state of one read-only SCSI CD-ROM drive.
@@ -144,12 +159,55 @@ impl ScsiCdrom {
                 self.started = true;
                 complete_good(Vec::new())
             }
-            (true, false) if self.medium_bytes.is_none() => complete_good(Vec::new()),
-            (true, false) if self.removal_prevented => {
-                self.check_condition(SenseData::MEDIUM_REMOVAL_PREVENTED)
-            }
-            (true, false) => ScsiCommandPlan::EjectMedium,
+            (true, false) => self.request_ejection(),
         }
+    }
+
+    /// Requests removal of the installed medium. The bus owns the backing
+    /// storage, so this only reports the plan that removes it; both START STOP
+    /// UNIT with LOEJ and the SGI vendor eject command share these checks.
+    fn request_ejection(&mut self) -> ScsiCommandPlan {
+        if self.medium_bytes.is_none() {
+            return complete_good(Vec::new());
+        }
+        if self.removal_prevented {
+            return self.check_condition(SenseData::MEDIUM_REMOVAL_PREVENTED);
+        }
+        ScsiCommandPlan::EjectMedium
+    }
+
+    /// Builds the basic (format 0) table of contents of the installed medium.
+    ///
+    /// The emulated medium is a single-session disc with one data track, so
+    /// only that layout is reported: lead-in area contents, other track
+    /// numbering and every other TOC format are rejected instead of being
+    /// approximated.
+    fn read_toc(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
+        let format = cdb[2] & 0x0f;
+        let starting_track = cdb[6];
+        if format != 0 || !matches!(starting_track, 0 | TRACK_NUMBER) {
+            return self.check_condition(SenseData::INVALID_CDB_FIELD);
+        }
+        if let Err(plan) = self.ready_medium_bytes() {
+            return plan;
+        }
+
+        let mut data = vec![0; TOC_RESPONSE_BYTES];
+        // The length field counts the response bytes that follow it.
+        data[1] = u8::try_from(TOC_RESPONSE_BYTES - 2).unwrap();
+        data[2] = TRACK_NUMBER;
+        data[3] = TRACK_NUMBER;
+        data[5] = TRACK_ADR_CONTROL;
+        data[6] = TRACK_NUMBER;
+        data[8..].copy_from_slice(if cdb[1] & 0x02 != 0 {
+            &TRACK_START_MSF
+        } else {
+            &TRACK_START_LBA
+        });
+        // The initiator limits the transfer, and a shorter request truncates
+        // the response instead of failing it.
+        data.truncate(usize::from(u16::from_be_bytes([cdb[7], cdb[8]])));
+        complete_good(data)
     }
 
     fn prevent_allow(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
@@ -346,7 +404,9 @@ impl ScsiTarget for ScsiCdrom {
                 u16::from_be_bytes([cdb[7], cdb[8]]),
             ),
             WRITE_10 if cdb.len() >= 10 => self.check_condition(SenseData::WRITE_PROTECTED),
-            SGI_HD_TO_CDROM if cdb.len() >= 6 => complete_good(Vec::new()),
+            READ_TOC_PMA_ATIP if cdb.len() >= 10 => self.read_toc(cdb),
+            SGI_EJECT if cdb.len() >= 10 => self.request_ejection(),
+            SGI_HD_TO_CDROM if cdb.len() >= 10 => complete_good(Vec::new()),
             TEST_UNIT_READY
             | REQUEST_SENSE
             | INQUIRY
@@ -358,6 +418,8 @@ impl ScsiTarget for ScsiCdrom {
             | READ_6
             | READ_10
             | WRITE_10
+            | READ_TOC_PMA_ATIP
+            | SGI_EJECT
             | SGI_HD_TO_CDROM => self.check_condition(SenseData::INVALID_CDB_FIELD),
             _ => self.check_condition(SenseData::UNSUPPORTED_OPCODE),
         }
@@ -408,10 +470,46 @@ mod tests {
         ScsiTargetSnapshot,
     };
 
-    use super::{INITIAL_LOGICAL_BLOCK_BYTES, SUPPORTED_LOGICAL_BLOCK_BYTES, ScsiCdrom};
+    use super::{
+        INITIAL_LOGICAL_BLOCK_BYTES, SGI_EJECT, SGI_HD_TO_CDROM, SUPPORTED_LOGICAL_BLOCK_BYTES,
+        ScsiCdrom,
+    };
 
     fn cdrom(logical_block_count: u64) -> ScsiCdrom {
         ScsiCdrom::try_new(logical_block_count * u64::from(INITIAL_LOGICAL_BLOCK_BYTES)).unwrap()
+    }
+
+    fn sgi_cdb(opcode: u8) -> [u8; 10] {
+        let mut cdb = [0; 10];
+        cdb[0] = opcode;
+        cdb
+    }
+
+    fn read_toc_cdb(msf: bool, format: u8, starting_track: u8, allocation_length: u16) -> [u8; 10] {
+        let mut cdb = sgi_cdb(0x43);
+        cdb[1] = u8::from(msf) << 1;
+        cdb[2] = format;
+        cdb[6] = starting_track;
+        cdb[7..9].copy_from_slice(&allocation_length.to_be_bytes());
+        cdb
+    }
+
+    fn read_toc_response(cdrom: &mut ScsiCdrom, cdb: &[u8; 10]) -> Result<Vec<u8>, (u8, u8, u8)> {
+        let ScsiCommandPlan::Complete { status, data_in } = cdrom.execute(cdb) else {
+            panic!("READ TOC should complete immediately");
+        };
+        if status == ScsiStatus::Good {
+            return Ok(data_in);
+        }
+        let data = sense(cdrom, 18);
+        Err((data[2], data[12], data[13]))
+    }
+
+    fn expect_read_toc(cdrom: &mut ScsiCdrom, cdb: &[u8; 10]) -> Vec<u8> {
+        let Ok(data) = read_toc_response(cdrom, cdb) else {
+            panic!("a supported READ TOC should report GOOD status");
+        };
+        data
     }
 
     fn mode_select_payload(logical_block_bytes: u32) -> [u8; 12] {
@@ -562,13 +660,140 @@ mod tests {
     fn sgi_hd_to_cdrom_remains_a_no_op_success() {
         let mut cdrom = cdrom(4);
         assert_eq!(
-            cdrom.execute(&[0xc9, 0, 0, 0, 0, 0]),
+            cdrom.execute(&sgi_cdb(SGI_HD_TO_CDROM)),
             ScsiCommandPlan::Complete {
                 status: ScsiStatus::Good,
                 data_in: Vec::new(),
             }
         );
         assert_eq!(cdrom.medium_size_bytes(), Some(2048));
+    }
+
+    #[test]
+    fn read_toc_reports_the_single_data_track_in_msf_addressing() {
+        let mut cdrom = cdrom(4);
+
+        for starting_track in [0, 1] {
+            let data = expect_read_toc(&mut cdrom, &read_toc_cdb(true, 0, starting_track, 12));
+            assert_eq!(data.len(), 12);
+            assert_eq!(&data[..4], &[0, 10, 1, 1]);
+            assert_eq!(data[4], 0);
+            assert_eq!(data[5], 0x14);
+            assert_eq!(data[5] >> 4, 1);
+            assert_eq!(data[5] & 0x0f, 4);
+            assert_eq!(data[6], 1);
+            assert_eq!(data[7], 0);
+            assert_eq!(&data[8..], &[0, 0, 2, 0]);
+        }
+    }
+
+    #[test]
+    fn read_toc_reports_logical_block_addressing_when_msf_is_clear() {
+        let mut cdrom = cdrom(4);
+        let data = expect_read_toc(&mut cdrom, &read_toc_cdb(false, 0, 1, 12));
+        assert_eq!(&data[..4], &[0, 10, 1, 1]);
+        assert_eq!(data[5], 0x14);
+        assert_eq!(&data[8..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn read_toc_truncates_the_response_to_the_allocation_length() {
+        let mut cdrom = cdrom(4);
+        let full = expect_read_toc(&mut cdrom, &read_toc_cdb(true, 0, 0, 12));
+        assert_eq!(full.len(), 12);
+
+        for allocation_length in [0u16, 1, 4, 11, 12, 0xffff] {
+            let data = expect_read_toc(&mut cdrom, &read_toc_cdb(true, 0, 0, allocation_length));
+            let expected = usize::from(allocation_length).min(full.len());
+            assert_eq!(data, full[..expected]);
+        }
+    }
+
+    #[test]
+    fn read_toc_rejects_layouts_the_medium_model_cannot_describe() {
+        let mut cdrom = cdrom(4);
+        for format in 1..=0x0f {
+            assert_eq!(
+                read_toc_response(&mut cdrom, &read_toc_cdb(true, format, 0, 12)),
+                Err((5, 0x24, 0))
+            );
+        }
+        for starting_track in [2, 3, 0xaa] {
+            assert_eq!(
+                read_toc_response(&mut cdrom, &read_toc_cdb(true, 0, starting_track, 12)),
+                Err((5, 0x24, 0))
+            );
+        }
+    }
+
+    #[test]
+    fn read_toc_follows_the_medium_and_motor_state() {
+        let mut empty = ScsiCdrom::new_empty();
+        assert_eq!(
+            read_toc_response(&mut empty, &read_toc_cdb(true, 0, 0, 12)),
+            Err((2, 0x3a, 0))
+        );
+
+        let mut stopped = cdrom(4);
+        assert_eq!(
+            stopped.execute(&[0x1b, 0, 0, 0, 0, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                data_in: Vec::new(),
+            }
+        );
+        assert_eq!(
+            read_toc_response(&mut stopped, &read_toc_cdb(true, 0, 0, 12)),
+            Err((2, 4, 2))
+        );
+    }
+
+    #[test]
+    fn sgi_vendor_commands_require_a_ten_byte_cdb() {
+        let mut cdrom = cdrom(4);
+        for opcode in [0x43, SGI_EJECT, SGI_HD_TO_CDROM] {
+            let cdb = sgi_cdb(opcode);
+            for length in 6..10 {
+                let _ = cdrom.execute(&cdb[..length]);
+                let data = sense(&mut cdrom, 18);
+                assert_eq!((data[2], data[12], data[13]), (5, 0x24, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn sgi_eject_requests_removal_through_the_standard_eject_rules() {
+        let mut cdrom = cdrom(4);
+        assert_eq!(
+            cdrom.execute(&sgi_cdb(SGI_EJECT)),
+            ScsiCommandPlan::EjectMedium
+        );
+        assert_eq!(cdrom.medium_size_bytes(), Some(2048));
+
+        assert_eq!(
+            cdrom.execute(&[0x1e, 0, 0, 0, 1, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                data_in: Vec::new(),
+            }
+        );
+        let ScsiCommandPlan::Complete { status, data_in } = cdrom.execute(&sgi_cdb(SGI_EJECT))
+        else {
+            panic!("a locked slot still completes the command immediately");
+        };
+        assert_eq!(status, ScsiStatus::CheckCondition);
+        assert!(data_in.is_empty());
+        let data = sense(&mut cdrom, 18);
+        assert_eq!((data[2], data[12], data[13]), (5, 0x53, 0x02));
+
+        let mut empty = ScsiCdrom::new_empty();
+        assert_eq!(
+            empty.execute(&sgi_cdb(SGI_EJECT)),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                data_in: Vec::new(),
+            }
+        );
     }
 
     #[test]
@@ -758,12 +983,14 @@ mod tests {
             assert_eq!((data[2], data[12], data[13]), (2, 0x3a, 0));
         }
 
+        let (sgi_hd_to_cdrom, sgi_eject) = (sgi_cdb(SGI_HD_TO_CDROM), sgi_cdb(SGI_EJECT));
         for cdb in [
             &[0x12, 0, 0, 0, 36, 0][..],
             &[0x1a, 0, 0, 0, 12, 0][..],
             &[0x1b, 0, 0, 0, 1, 0][..],
             &[0x1e, 0, 0, 0, 1, 0][..],
-            &[0xc9, 0, 0, 0, 0, 0][..],
+            &sgi_hd_to_cdrom[..],
+            &sgi_eject[..],
         ] {
             assert!(matches!(
                 cdrom.execute(cdb),

@@ -889,11 +889,16 @@ const fn selector_advances(register: u8) -> bool {
 }
 
 const fn cdb_length(opcode: u8) -> u8 {
-    match opcode >> 5 {
-        0 => 6,
-        1 | 2 => 10,
-        5 => 12,
-        _ => 6,
+    match opcode {
+        // SGI IRIX drives use vendor-specific opcodes 0xC4 and 0xC9 as
+        // 10-byte CDBs, outside the standard opcode groups.
+        0xc4 | 0xc9 => 10,
+        _ => match opcode >> 5 {
+            0 => 6,
+            1 | 2 => 10,
+            5 => 12,
+            _ => 6,
+        },
     }
 }
 
@@ -1043,6 +1048,24 @@ mod tests {
         assert_eq!(request.transfer_count(), 0x01_2345);
         assert_eq!(request.cdb(), &[0x28, 0, 0, 0, 4, 0, 0, 0, 2, 0]);
         assert!(scsi.take_select_and_transfer_request().is_none());
+    }
+
+    #[test]
+    fn select_and_transfer_latches_the_sgi_vendor_cdb_lengths() {
+        for (opcode, cdb_length) in [(0x00, 6), (0x28, 10), (0xa0, 12), (0xc4, 10), (0xc9, 10)] {
+            let mut scsi = Wd33c93b::new(20_000_000);
+            write_register(&mut scsi, DESTINATION_ID, 1);
+            for offset in 0..12u8 {
+                let value = if offset == 0 { opcode } else { 0 };
+                write_register(&mut scsi, CDB_START + offset, value);
+            }
+
+            write_register(&mut scsi, COMMAND, SELECT_AND_TRANSFER);
+
+            let request = scsi.take_select_and_transfer_request().unwrap();
+            assert_eq!(request.cdb().len(), cdb_length);
+            assert_eq!(request.cdb()[0], opcode);
+        }
     }
 
     #[test]

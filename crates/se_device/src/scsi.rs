@@ -1898,12 +1898,17 @@ const fn address_for_slot(slot: usize) -> (u8, u8) {
 }
 
 const fn cdb_length(opcode: u8) -> usize {
-    match opcode >> 5 {
-        0 => 6,
-        1 | 2 => 10,
-        4 => 16,
-        5 => 12,
-        _ => 6,
+    match opcode {
+        // SGI IRIX drives use vendor-specific opcodes 0xC4 and 0xC9 as
+        // 10-byte CDBs, outside the standard opcode groups.
+        0xc4 | 0xc9 => 10,
+        _ => match opcode >> 5 {
+            0 => 6,
+            1 | 2 => 10,
+            4 => 16,
+            5 => 12,
+            _ => 6,
+        },
     }
 }
 
@@ -2648,18 +2653,69 @@ mod tests {
     }
 
     #[test]
-    fn sgi_vendor_command_dispatches_after_six_cdb_bytes() {
+    fn command_descriptor_lengths_follow_the_opcode_groups_and_the_sgi_exception() {
         let mut bus = ScsiBus::new();
         attach_test_target(&mut bus, false, false);
-        assert_eq!(bus.select(1, false), Ok(true));
 
-        let cdb = [0xc9, 0, 0, 0, 0, 0];
-        for &byte in &cdb[..5] {
-            assert_eq!(bus.write_information(byte, false), Ok(true));
-            assert_eq!(bus.phase(), Some(ScsiPhase::Command));
+        for (opcode, cdb_length) in [(0x00, 6), (0x28, 10), (0xa0, 12), (0xc4, 10), (0xc9, 10)] {
+            assert_eq!(bus.select(1, false), Ok(true));
+            let mut cdb = [0; 12];
+            cdb[0] = opcode;
+            for &byte in &cdb[..cdb_length - 1] {
+                assert_eq!(bus.write_information(byte, false), Ok(true));
+                assert_eq!(bus.phase(), Some(ScsiPhase::Command));
+            }
+            assert_eq!(bus.write_information(cdb[cdb_length - 1], false), Ok(true));
+            assert_eq!(bus.phase(), Some(ScsiPhase::Status));
+
+            assert_eq!(bus.read_information(), Ok(Some(0x00)));
+            assert_eq!(bus.read_information(), Ok(Some(0x00)));
+            bus.acknowledge_message(false);
+            assert_eq!(bus.phase(), None);
         }
-        assert_eq!(bus.write_information(cdb[5], false), Ok(true));
-        assert_eq!(bus.phase(), Some(ScsiPhase::Status));
+    }
+
+    #[test]
+    fn guest_sgi_eject_removes_the_removable_backing() {
+        let mut bus = ScsiBus::new();
+        attach_cdrom(&mut bus);
+        let mut eject_cdb = [0; 10];
+        eject_cdb[0] = 0xc4;
+
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::Good
+        );
+        assert_eq!(cdrom_status(&mut bus, &PREVENT_CDB), ScsiStatus::Good);
+        assert_eq!(
+            cdrom_status(&mut bus, &eject_cdb),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (5, 0x53, 0x02));
+
+        assert_eq!(cdrom_status(&mut bus, &ALLOW_CDB), ScsiStatus::Good);
+        assert_eq!(cdrom_status(&mut bus, &eject_cdb), ScsiStatus::Good);
+
+        assert!(bus.target_present(CDROM_TARGET));
+        let slots = bus.removable_media_slots();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].state().medium_size_bytes(), None);
+        assert!(!slots[0].state().removal_prevented());
+
+        // The initiator's own command raises no unit attention, and the bus no
+        // longer holds a medium to eject.
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (2, 0x3a, 0));
+        assert_eq!(
+            eject(&mut bus, CDROM_TARGET, false),
+            Err(ScsiMediaError::MediumNotPresent {
+                target_id: CDROM_TARGET,
+                lun: 0,
+            })
+        );
     }
 
     #[test]
