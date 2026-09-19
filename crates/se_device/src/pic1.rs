@@ -454,10 +454,13 @@ impl Pic1 {
     pub fn read(&self, address: DeviceAddr, data: &mut [u8]) -> Result<(), BusError> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
-        if let Some(index) = memory_configuration_index(start, end)? {
+        if let Some((index, offset)) = memory_configuration_register(start, end)? {
+            if !matches!((offset, data.len()), (0, 4) | (0, 2) | (2, 2)) {
+                return Err(BusError::UnimplementedAccess);
+            }
             let value = u32::from(self.memory_descriptors[index]) << 16
                 | u32::from(self.memory_descriptors[index + 1]);
-            data.copy_from_slice(&value.to_be_bytes());
+            read_register(value, offset, data);
             return Ok(());
         }
 
@@ -523,7 +526,10 @@ impl Pic1 {
     pub fn write(&mut self, address: DeviceAddr, data: &[u8]) -> Result<(), BusError> {
         let (start, end) = transaction_bounds(address, data.len())?;
 
-        if let Some(index) = memory_configuration_index(start, end)? {
+        if let Some((index, offset)) = memory_configuration_register(start, end)? {
+            if offset != 0 || data.len() != REGISTER_BYTES as usize {
+                return Err(BusError::UnimplementedAccess);
+            }
             let value =
                 u32::from_be_bytes(data.try_into().map_err(|_| BusError::InvalidTransaction)?);
             self.memory_descriptors[index] = (value >> 16) as u16 & MEMORY_DESCRIPTOR_MASK;
@@ -745,14 +751,15 @@ fn transaction_bounds(address: DeviceAddr, length: usize) -> Result<(u64, u64), 
     Ok((start, end))
 }
 
-fn memory_configuration_index(start: u64, end: u64) -> Result<Option<usize>, BusError> {
+fn memory_configuration_register(start: u64, end: u64) -> Result<Option<(usize, usize)>, BusError> {
     for (index, base) in [MEMORY_CONFIGURATION_0, MEMORY_CONFIGURATION_1]
         .into_iter()
         .enumerate()
     {
         let register_end = base + REGISTER_BYTES;
-        if start == base && end == register_end {
-            return Ok(Some(index * 2));
+        if start >= base && end <= register_end {
+            let offset = usize::try_from(start - base).map_err(|_| BusError::InvalidTransaction)?;
+            return Ok(Some((index * 2, offset)));
         }
         if start < register_end && end > base {
             return Err(BusError::UnimplementedAccess);
@@ -1099,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_configuration_requires_aligned_words_and_masks_reserved_bits() {
+    fn memory_configuration_supports_halfword_reads_and_word_writes() {
         let mut pic1 = pic1();
 
         assert_eq!(
@@ -1110,18 +1117,63 @@ mod tests {
             Ok(())
         );
         assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_0), Ok(0x0f3f_0f3f));
+
+        let mut upper = [0; 2];
+        let mut lower = [0; 2];
+        assert_eq!(
+            pic1.read(DeviceAddr::new(MEMORY_CONFIGURATION_0), &mut upper),
+            Ok(())
+        );
+        assert_eq!(
+            pic1.read(DeviceAddr::new(MEMORY_CONFIGURATION_0 + 2), &mut lower),
+            Ok(())
+        );
+        assert_eq!(u16::from_be_bytes(upper), 0x0f3f);
+        assert_eq!(u16::from_be_bytes(lower), 0x0f3f);
+
+        assert_eq!(
+            pic1.write(
+                DeviceAddr::new(MEMORY_CONFIGURATION_1),
+                &0x0100_023f_u32.to_be_bytes()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            pic1.read(DeviceAddr::new(MEMORY_CONFIGURATION_1), &mut upper),
+            Ok(())
+        );
+        assert_eq!(
+            pic1.read(DeviceAddr::new(MEMORY_CONFIGURATION_1 + 2), &mut lower),
+            Ok(())
+        );
+        assert_eq!(u16::from_be_bytes(upper), 0x0100);
+        assert_eq!(u16::from_be_bytes(lower), 0x023f);
+
         assert_eq!(
             pic1.read(DeviceAddr::new(MEMORY_CONFIGURATION_0), &mut [0]),
+            Err(BusError::UnimplementedAccess)
+        );
+        assert_eq!(
+            pic1.read(DeviceAddr::new(MEMORY_CONFIGURATION_0 + 1), &mut [0; 2]),
+            Err(BusError::UnimplementedAccess)
+        );
+        assert_eq!(
+            pic1.read(DeviceAddr::new(MEMORY_CONFIGURATION_0 + 3), &mut [0; 2]),
+            Err(BusError::UnimplementedAccess)
+        );
+        assert_eq!(
+            pic1.write(DeviceAddr::new(MEMORY_CONFIGURATION_0), &[0; 2]),
+            Err(BusError::UnimplementedAccess)
+        );
+        assert_eq!(
+            pic1.write(DeviceAddr::new(MEMORY_CONFIGURATION_0 + 2), &[0; 2]),
             Err(BusError::UnimplementedAccess)
         );
         assert_eq!(
             pic1.write(DeviceAddr::new(MEMORY_CONFIGURATION_0 + 1), &[0; 4]),
             Err(BusError::UnimplementedAccess)
         );
-        assert_eq!(
-            pic1.write(DeviceAddr::new(MEMORY_CONFIGURATION_1 - 1), &[0; 2]),
-            Err(BusError::UnimplementedAccess)
-        );
+        assert_eq!(read_word(&pic1, MEMORY_CONFIGURATION_0), Ok(0x0f3f_0f3f));
     }
 
     #[test]
