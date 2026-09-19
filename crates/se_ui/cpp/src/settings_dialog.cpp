@@ -219,7 +219,7 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     tftp_layout->addWidget(tftp_browse);
     network_form->addRow(QStringLiteral("TFTP root"), tftp_row);
     bootfile_edit_->setToolTip(
-        QStringLiteral("Optional file name advertised in BOOTP replies, e.g. stand/sa."));
+        QStringLiteral("Optional BOOTP file name override, e.g. stand/sa."));
     network_form->addRow(QStringLiteral("BOOTP boot filename"), bootfile_edit_);
     connect(tftp_browse, &QToolButton::clicked, this, &SettingsDialog::browse_tftp_root);
     network_layout->addLayout(network_form);

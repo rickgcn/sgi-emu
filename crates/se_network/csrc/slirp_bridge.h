@@ -15,7 +15,7 @@ typedef struct SeSlirpConfig {
     uint32_t dhcp_start;
     /* Host directory served by the built-in TFTP server; NULL disables it */
     const char *tftp_root;
-    /* Boot filename advertised in BOOTP replies; NULL leaves it empty */
+    /* BOOTP boot filename override; NULL permits a legacy request fallback */
     const char *bootfile;
 } SeSlirpConfig;
 

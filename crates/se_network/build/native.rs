@@ -7,7 +7,6 @@ use std::process::Command;
 
 const SLIRP_SOURCES: &[&str] = &[
     "arp_table",
-    "bootp",
     "cksum",
     "dhcpv6",
     "dnssearch",
@@ -38,11 +37,14 @@ const SLIRP_SOURCES: &[&str] = &[
     "vmstate",
 ];
 
-/// Pinned libslirp translation unit that [`adapted_tftp_source`] rewrites.
-const ADAPTED_SOURCE: &str = "tftp";
+/// Downstream BOOTP patch for legacy client compatibility.
+const BOOTP_PATCH: &str = "build/bootp-client-compat.patch";
 
-/// Downstream patch that routes the TFTP unit's host file access through GLib.
+/// Downstream TFTP patch that routes host file access through GLib.
 const TFTP_PATCH: &str = "build/tftp-host-path.patch";
+
+/// Pinned libslirp translation units replaced by reviewed downstream adaptations.
+const SLIRP_ADAPTATIONS: &[(&str, &str)] = &[("bootp", BOOTP_PATCH), ("tftp", TFTP_PATCH)];
 
 pub fn compile() {
     for variable in [
@@ -93,13 +95,18 @@ pub fn compile() {
     let native = out.join(format!("native-{:016x}", key.finish()));
     let source = native.join("source");
     let build = native.join("build");
-    assert!(
-        !SLIRP_SOURCES.contains(&ADAPTED_SOURCE),
-        "{ADAPTED_SOURCE} must only be compiled from the adapted source"
-    );
+    for (name, _) in SLIRP_ADAPTATIONS {
+        assert!(
+            !SLIRP_SOURCES.contains(name),
+            "{name} must only be compiled from the adapted source"
+        );
+    }
     // Adapting the pinned source first keeps a revision mismatch an immediate,
     // cheap failure instead of one after the fixed GLib build.
-    let tftp = adapted_tftp_source(&manifest, &slirp, &native);
+    let adapted_sources = SLIRP_ADAPTATIONS
+        .iter()
+        .map(|(name, patch)| adapted_slirp_source(&manifest, &slirp, &native, name, patch))
+        .collect::<Vec<_>>();
     if !source.join(".prepared").exists() {
         copy_tree(&glib, &source);
         fs::write(source.join(".prepared"), b"glib-2.88.3").unwrap();
@@ -219,8 +226,10 @@ pub fn compile() {
     for file in SLIRP_SOURCES {
         cc.file(slirp.join(format!("src/{file}.c")));
     }
-    cc.file(tftp)
-        .file(manifest.join("csrc/slirp_bridge.c"))
+    for source in adapted_sources {
+        cc.file(source);
+    }
+    cc.file(manifest.join("csrc/slirp_bridge.c"))
         .compile("se_network_slirp");
     for library in libraries {
         assert!(
@@ -265,22 +274,21 @@ pub fn compile() {
     }
 }
 
-/// Writes the adapted TFTP compilation unit and returns its generated path.
+/// Writes one adapted libslirp compilation unit and returns its generated path.
 ///
-/// Pinned libslirp opens and examines TFTP files with the narrow-character CRT
-/// `open` and `stat`. On Windows those calls interpret their argument in the
-/// process ANSI code page, so a UTF-8 root such as `C:\Users\张三\SGI资料`
-/// cannot be reached there. GLib's `g_open` and `g_stat` take UTF-8 file names
-/// and convert them for the Win32 API; on Unix they are the plain POSIX calls,
-/// so every other platform keeps its current behaviour.
-///
-/// The submodule is never edited: the change lives in [`TFTP_PATCH`] and is
-/// applied in memory. A hunk that no longer matches the pinned source fails the
-/// build, so a new revision cannot silently drop the adaptation, and the
+/// The submodule is never edited: each change lives in a downstream patch and
+/// is applied in memory. A hunk that no longer matches the pinned source fails
+/// the build, so a new revision cannot silently drop an adaptation, and the
 /// original translation unit is not compiled beside the generated one.
-fn adapted_tftp_source(manifest: &Path, slirp: &Path, native: &Path) -> PathBuf {
-    let origin = slirp.join(format!("src/{ADAPTED_SOURCE}.c"));
-    let patch = manifest.join(TFTP_PATCH);
+fn adapted_slirp_source(
+    manifest: &Path,
+    slirp: &Path,
+    native: &Path,
+    name: &str,
+    patch_name: &str,
+) -> PathBuf {
+    let origin = slirp.join(format!("src/{name}.c"));
+    let patch = manifest.join(patch_name);
     let source = fs::read_to_string(&origin).unwrap_or_else(|error| {
         panic!("cannot read {}: {error}", origin.display());
     });
@@ -288,8 +296,8 @@ fn adapted_tftp_source(manifest: &Path, slirp: &Path, native: &Path) -> PathBuf 
         panic!("cannot read {}: {error}", patch.display());
     });
     fs::create_dir_all(native).unwrap();
-    let generated = native.join(format!("{ADAPTED_SOURCE}.c"));
-    fs::write(&generated, apply_patch(&source, &diff, ADAPTED_SOURCE)).unwrap();
+    let generated = native.join(format!("{name}.c"));
+    fs::write(&generated, apply_patch(&source, &diff, name, patch_name)).unwrap();
     generated
 }
 
@@ -330,10 +338,10 @@ impl Hunk {
 /// Applies one unified diff to a pinned source file and returns the result.
 ///
 /// Only whole-line hunks with context are supported, which is everything the
-/// downstream TFTP patch needs. Each hunk must match the pinned source at its
+/// downstream patches need. Each hunk must match the pinned source at its
 /// recorded position, so an unexpected revision fails the build instead of
 /// producing a partially adapted compilation unit.
-fn apply_patch(source: &str, diff: &str, name: &str) -> String {
+fn apply_patch(source: &str, diff: &str, name: &str, patch_name: &str) -> String {
     assert!(
         source.ends_with('\n'),
         "pinned libslirp {name}.c must end with a newline"
@@ -341,10 +349,10 @@ fn apply_patch(source: &str, diff: &str, name: &str) -> String {
     let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
     let mut shift = 0isize;
     let mut applied = 0usize;
-    for hunk in parse_hunks(diff) {
+    for hunk in parse_hunks(diff, patch_name) {
         let start = usize::try_from(hunk.old_start as isize - 1 + shift).unwrap_or_else(|_| {
             panic!(
-                "{TFTP_PATCH} addresses line {} before the pinned libslirp {name}.c",
+                "{patch_name} addresses line {} before the pinned libslirp {name}.c",
                 hunk.old_start
             )
         });
@@ -353,7 +361,7 @@ fn apply_patch(source: &str, diff: &str, name: &str) -> String {
                 .get(start..start + hunk.old_len())
                 .is_some_and(|window| window.iter().map(String::as_str).eq(hunk.old_lines())),
             "pinned libslirp {name}.c does not match the hunk at line {}; \
-             review {TFTP_PATCH} against the pinned revision",
+             review {patch_name} against the pinned revision",
             hunk.old_start
         );
         let replacement = hunk.new_lines().map(str::to_owned).collect::<Vec<_>>();
@@ -361,14 +369,14 @@ fn apply_patch(source: &str, diff: &str, name: &str) -> String {
         lines.splice(start..start + hunk.old_len(), replacement);
         applied += 1;
     }
-    assert!(applied > 0, "the TFTP host path patch must contain a hunk");
+    assert!(applied > 0, "{patch_name} must contain a hunk");
     let mut result = lines.join("\n");
     result.push('\n');
     result
 }
 
 /// Parses the hunks of one unified diff, ignoring its file headers.
-fn parse_hunks(diff: &str) -> Vec<Hunk> {
+fn parse_hunks(diff: &str, patch_name: &str) -> Vec<Hunk> {
     let mut hunks: Vec<Hunk> = Vec::new();
     for line in diff.lines() {
         if let Some(header) = line.strip_prefix("@@ ") {
@@ -394,8 +402,8 @@ fn parse_hunks(diff: &str) -> Vec<Hunk> {
             Some(b'-') => ('-', &line[1..]),
             // Every hunk line carries its marker, so an empty context line is
             // written as a single space and a blank addition as a lone plus.
-            None => panic!("{TFTP_PATCH} has a zero-length line inside a hunk"),
-            Some(_) => panic!("{TFTP_PATCH} has an unsupported line {line:?}"),
+            None => panic!("{patch_name} has a zero-length line inside a hunk"),
+            Some(_) => panic!("{patch_name} has an unsupported line {line:?}"),
         };
         hunk.body.push((marker, content.to_owned()));
     }

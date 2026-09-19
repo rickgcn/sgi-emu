@@ -113,7 +113,10 @@ pub struct NatConfig {
     /// Host directory served by the built-in TFTP server; absent disables it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tftp_root: Option<String>,
-    /// Boot filename advertised in BOOTP replies; absent leaves the field empty.
+    /// Explicit boot filename advertised in BOOTP replies.
+    ///
+    /// When absent, a legacy BOOTP client may select a file from the configured
+    /// TFTP root by naming it in the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bootfile: Option<String>,
 }

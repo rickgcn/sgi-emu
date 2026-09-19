@@ -413,7 +413,13 @@ mod tests {
 
     /// Traditional BOOTP request broadcast from the unconfigured client 0.0.0.0:68.
     /// The request carries no DHCP magic cookie or DHCP options.
-    fn bootp_request(xid: u32, mac: [u8; 6], vendor: &[u8]) -> Vec<u8> {
+    fn bootp_request(
+        xid: u32,
+        mac: [u8; 6],
+        flags: u16,
+        requested_file: Option<&str>,
+        vendor: &[u8],
+    ) -> Vec<u8> {
         let payload = 236 + vendor.len().max(64);
         let mut frame = vec![0; 14 + 20 + 8 + payload];
         frame[..6].fill(255);
@@ -433,8 +439,12 @@ mod tests {
         let bootp = &mut frame[42..];
         bootp[..4].copy_from_slice(&[1, 1, 6, 0]);
         bootp[4..8].copy_from_slice(&xid.to_be_bytes());
-        bootp[10] = 0x80;
+        bootp[10..12].copy_from_slice(&flags.to_be_bytes());
         bootp[28..34].copy_from_slice(&mac);
+        if let Some(requested_file) = requested_file {
+            assert!(requested_file.len() < 128);
+            bootp[108..108 + requested_file.len()].copy_from_slice(requested_file.as_bytes());
+        }
         bootp[236..236 + vendor.len()].copy_from_slice(vendor);
         frame
     }
@@ -634,15 +644,20 @@ mod tests {
     #[test]
     fn native_dhcp_uses_configured_subnet_and_resolvers() {
         let session = NetworkSession::start(isolated_subnet_config(), |_| {}).unwrap();
+        let mac = [2, 0, 0, 0, 0, 2];
         let frame = bootp_request(
             0x0102_0304,
-            [2, 0, 0, 0, 0, 2],
+            mac,
+            0,
+            None,
             &[99, 130, 83, 99, 53, 1, 1, 55, 1, 6, 255],
         );
         assert!(session.try_send_frame(&frame));
         let reply = receive(&session, |frame| {
             frame.len() > 282 && frame[12..14] == [8, 0] && frame[23] == 17
         });
+        assert_eq!(&reply[..6], &mac);
+        assert_eq!(&reply[30..34], &[192, 168, 73, 40]);
         assert_eq!(&reply[58..62], &[192, 168, 73, 40]);
         assert!(
             reply[282..]
@@ -657,16 +672,36 @@ mod tests {
     }
 
     #[test]
+    fn native_dhcp_nak_remains_broadcast() {
+        let session = NetworkSession::start(isolated_subnet_config(), |_| {}).unwrap();
+        let request = bootp_request(
+            0x0102_0304,
+            [2, 0, 0, 0, 0, 2],
+            0,
+            None,
+            &[99, 130, 83, 99, 53, 1, 3, 50, 4, 192, 168, 74, 40, 255],
+        );
+        assert!(session.try_send_frame(&request));
+        let reply = receive(&session, |frame| {
+            frame.len() > 285
+                && frame[23] == 17
+                && frame[282..].windows(3).any(|option| option == [53, 1, 6])
+        });
+        assert_eq!(&reply[..6], &[255; 6]);
+        assert_eq!(&reply[30..34], &[255; 4]);
+    }
+
+    #[test]
     fn native_bootp_answers_legacy_clients() {
         let session = NetworkSession::start(isolated_subnet_config(), |_| {}).unwrap();
         let mac = [2, 0, 0, 0, 0, 2];
-        assert!(session.try_send_frame(&bootp_request(0x0bad_cafe, mac, &[])));
+        assert!(session.try_send_frame(&bootp_request(0x0bad_cafe, mac, 0, None, &[])));
         let reply = receive(&session, |frame| {
             frame.len() > 282 && frame[23] == 17 && frame[42] == 2
         });
-        assert_eq!(&reply[..6], &[255; 6]);
+        assert_eq!(&reply[..6], &mac);
         assert_eq!(&reply[26..30], &[192, 168, 73, 2]);
-        assert_eq!(&reply[30..34], &[255; 4]);
+        assert_eq!(&reply[30..34], &[192, 168, 73, 40]);
         assert_eq!(&reply[34..36], &67u16.to_be_bytes());
         assert_eq!(&reply[36..38], &68u16.to_be_bytes());
         assert_eq!(&reply[42..50], &[2, 1, 6, 0, 0x0b, 0xad, 0xca, 0xfe]);
@@ -677,18 +712,55 @@ mod tests {
     }
 
     #[test]
+    fn native_bootp_reply_honors_the_broadcast_flag() {
+        let session = NetworkSession::start(isolated_subnet_config(), |_| {}).unwrap();
+        let request = bootp_request(0x0bad_cafe, [2, 0, 0, 0, 0, 2], 0x8000, None, &[]);
+        assert!(session.try_send_frame(&request));
+        let reply = receive(&session, |frame| {
+            frame.len() > 282 && frame[23] == 17 && frame[42] == 2
+        });
+        assert_eq!(&reply[..6], &[255; 6]);
+        assert_eq!(&reply[30..34], &[255; 4]);
+    }
+
+    #[test]
     fn native_bootp_reply_carries_the_configured_bootfile() {
         let config = NatConfig {
             bootfile: Some("stand/sa".into()),
             ..NatConfig::default()
         };
         let session = NetworkSession::start(config, |_| {}).unwrap();
-        assert!(session.try_send_frame(&bootp_request(0x1234_5678, MAC, &[])));
+        assert!(session.try_send_frame(&bootp_request(0x1234_5678, MAC, 0, Some("sa"), &[],)));
         let reply = receive(&session, |frame| {
             frame.len() > 282 && frame[23] == 17 && frame[42] == 2
         });
         assert_eq!(&reply[150..158], b"stand/sa");
         assert!(reply[158..278].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn native_legacy_bootp_reply_uses_requested_file_with_built_in_tftp() {
+        let config = NatConfig {
+            tftp_root: Some("unused-test-root".into()),
+            ..NatConfig::default()
+        };
+        let session = NetworkSession::start(config, |_| {}).unwrap();
+        assert!(session.try_send_frame(&bootp_request(0x1234_5678, MAC, 0, Some("sa"), &[],)));
+        let reply = receive(&session, |frame| {
+            frame.len() > 282 && frame[23] == 17 && frame[42] == 2
+        });
+        assert_eq!(&reply[150..152], b"sa");
+        assert!(reply[152..278].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn native_legacy_bootp_reply_does_not_advertise_request_without_tftp() {
+        let session = NetworkSession::start(NatConfig::default(), |_| {}).unwrap();
+        assert!(session.try_send_frame(&bootp_request(0x1234_5678, MAC, 0, Some("sa"), &[],)));
+        let reply = receive(&session, |frame| {
+            frame.len() > 282 && frame[23] == 17 && frame[42] == 2
+        });
+        assert!(reply[150..278].iter().all(|byte| *byte == 0));
     }
 
     #[test]

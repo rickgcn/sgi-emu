@@ -1,0 +1,55 @@
+--- a/3rdparty/libslirp/src/bootp.c
++++ b/3rdparty/libslirp/src/bootp.c
+@@ -33,6 +33,7 @@
+ /* XXX: only DHCP is supported */
+ 
+ #define LEASE_TIME (24 * 3600)
++#define BOOTP_BROADCAST_FLAG 0x8000u
+ 
+ #define UEFI_HTTP_VENDOR_CLASS_ID "HTTPClient"
+ 
+@@ -156,13 +157,14 @@
+     struct bootp_t *rbp;
+     struct sockaddr_in saddr, daddr;
+     struct in_addr preq_addr;
+-    int dhcp_msg_type, val;
++    int dhcp_msg_type, val, legacy_bootp;
+     uint8_t *q;
+     uint8_t *end;
+     uint8_t client_ethaddr[ETH_ALEN];
+ 
+     /* extract exact DHCP msg type */
+     dhcp_decode(bp, bp_end, &dhcp_msg_type, &preq_addr);
++    legacy_bootp = dhcp_msg_type == 0;
+     DPRINTF("bootp packet op=%d msgtype=%d", bp->bp_op, dhcp_msg_type);
+     if (preq_addr.s_addr != htonl(0L))
+         DPRINTF(" req_addr=%08" PRIx32 "\n", ntohl(preq_addr.s_addr));
+@@ -263,6 +265,15 @@
+         if (slirp->bootp_filename) {
+             g_assert(strlen(slirp->bootp_filename) < sizeof(rbp->bp_file));
+             strcpy(rbp->bp_file, slirp->bootp_filename);
++        } else if (legacy_bootp && slirp->tftp_prefix) {
++            const char *request_file_end =
++                memchr(bp->bp_file, '\0', sizeof(bp->bp_file));
++
++            /* Map a legacy BOOTP filename directly into the built-in TFTP root. */
++            if (request_file_end && request_file_end != bp->bp_file) {
++                memcpy(rbp->bp_file, bp->bp_file,
++                       request_file_end - bp->bp_file);
++            }
+         }
+ 
+         *q++ = RFC2132_SRV_ID;
+@@ -399,6 +410,10 @@
+     assert(q < end);
+     *q++ = RFC1533_END;
+ 
+-    daddr.sin_addr.s_addr = 0xffffffffu;
++    /* Unicast successful replies unless the client requests broadcast.
++     * The rejected-address path selected broadcast before building the NAK. */
++    if (bc && (ntohs(bp->unused) & BOOTP_BROADCAST_FLAG)) {
++        daddr.sin_addr.s_addr = 0xffffffffu;
++    }
+ 
+     assert(q <= end);
+ 
