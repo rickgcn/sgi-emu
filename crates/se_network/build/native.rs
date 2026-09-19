@@ -40,8 +40,8 @@ const SLIRP_SOURCES: &[&str] = &[
 /// Downstream BOOTP patch for legacy client compatibility.
 const BOOTP_PATCH: &str = "build/bootp-client-compat.patch";
 
-/// Downstream TFTP patch that routes host file access through GLib.
-const TFTP_PATCH: &str = "build/tftp-host-path.patch";
+/// Downstream TFTP patch for legacy client and host path compatibility.
+const TFTP_PATCH: &str = "build/tftp-compat.patch";
 
 /// Pinned libslirp translation units replaced by reviewed downstream adaptations.
 const SLIRP_ADAPTATIONS: &[(&str, &str)] = &[("bootp", BOOTP_PATCH), ("tftp", TFTP_PATCH)];

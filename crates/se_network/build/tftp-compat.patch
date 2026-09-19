@@ -1,0 +1,138 @@
+--- a/3rdparty/libslirp/src/tftp.c
++++ b/3rdparty/libslirp/src/tftp.c
+@@ -28,12 +28,39 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <fcntl.h>
+ 
++/* Downstream adaptation: a TFTP file name is a UTF-8 host path, and GLib
++ * resolves it so that non-ASCII names also reach the Windows filesystem. */
++#include <glib/gstdio.h>
++
++#define TFTP_IP12_PROM_TRAILER_LEN 4
++
+ #if defined(_WIN32)
+ #include <io.h>
+ #include <share.h>
+ #endif
+ 
++static bool tftp_options_are_valid(const char *options, size_t length)
++{
++    const char *end = options + length;
++
++    while (options < end) {
++        const char *terminator = memchr(options, '\0', end - options);
++
++        if (!terminator || terminator == options) {
++            return false;
++        }
++        options = terminator + 1;
++        terminator = memchr(options, '\0', end - options);
++        if (!terminator || terminator == options) {
++            return false;
++        }
++        options = terminator + 1;
++    }
++
++    return true;
++}
++
+ static inline int tftp_session_in_use(struct tftp_session *spt)
+ {
+     return (spt->slirp != NULL);
+@@ -131,3 +158,3 @@
+     if (spt->fd < 0) {
+-        spt->fd = open(spt->filename, O_RDONLY | O_BINARY);
++        spt->fd = g_open(spt->filename, O_RDONLY | O_BINARY, 0);
+     }
+@@ -295,7 +322,8 @@
+     struct tftp_session *spt;
+     int s, k;
+-    size_t prefix_len;
++    size_t prefix_len, options_len;
+     char *req_fname;
++    const char *mode, *mode_end;
+     const char *option_name[2];
+     uint32_t option_value[2];
+     int nb_options = 0;
+@@ -336,28 +364,51 @@
+     while (1) {
+         if (k >= TFTP_FILENAME_MAX || k >= pktlen) {
+             tftp_send_error(spt, 2, "Access violation", tp);
+             return;
+         }
+         req_fname[k] = tp->x.tp_buf[k];
+         if (req_fname[k++] == '\0') {
+             break;
+         }
+     }
+ 
++    if (k == 1) {
++        tftp_send_error(spt, 2, "Access violation", tp);
++        return;
++    }
++
+     DEBUG_TFTP("tftp rrq file: %s", req_fname);
+ 
+     /* check mode */
+-    if ((pktlen - k) < 6) {
++    if (k >= pktlen) {
+         tftp_send_error(spt, 2, "Access violation", tp);
+         return;
+     }
+ 
+-    if (g_ascii_strcasecmp(&tp->x.tp_buf[k], "octet") != 0) {
++    mode = &tp->x.tp_buf[k];
++    mode_end = memchr(mode, '\0', (size_t)(pktlen - k));
++    if (!mode_end) {
++        tftp_send_error(spt, 2, "Access violation", tp);
++        return;
++    }
++
++    if (g_ascii_strcasecmp(mode, "octet") != 0) {
+         tftp_send_error(spt, 4, "Unsupported transfer mode", tp);
+         return;
+     }
+ 
+-    k += 6; /* skipping octet */
++    k = (int)(mode_end - tp->x.tp_buf) + 1;
++    options_len = (size_t)(pktlen - k);
++    if (!tftp_options_are_valid(&tp->x.tp_buf[k], options_len)) {
++        if (options_len != TFTP_IP12_PROM_TRAILER_LEN) {
++            tftp_send_error(spt, 2, "Access violation", tp);
++            return;
++        }
++
++        /* The IP12 PROM reports four bytes beyond the mode terminator. Accept
++         * only that exact malformed suffix; all other malformed options fail. */
++        pktlen = k;
++    }
+ 
+     /* do sanity checks on the filename */
+     if (
+@@ -374,14 +425,9 @@
+     /* check if the file exists */
+     if (tftp_read_data(spt, 0, NULL, 0) < 0) {
+         tftp_send_error(spt, 1, "File not found", tp);
+         return;
+     }
+ 
+-    if (tp->x.tp_buf[pktlen - 1] != 0) {
+-        tftp_send_error(spt, 2, "Access violation", tp);
+-        return;
+-    }
+-
+     while (k < pktlen && nb_options < G_N_ELEMENTS(option_name)) {
+         const char *key, *value;
+ 
+@@ -399,8 +445,8 @@
+         if (g_ascii_strcasecmp(key, "tsize") == 0) {
+             int tsize = atoi(value);
+-            struct stat stat_p;
++            GStatBuf stat_p;
+ 
+             if (tsize == 0) {
+-                if (stat(spt->filename, &stat_p) == 0)
++                if (g_stat(spt->filename, &stat_p) == 0)
+                     tsize = stat_p.st_size;
+                 else {

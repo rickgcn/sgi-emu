@@ -449,12 +449,17 @@ mod tests {
         frame
     }
 
-    fn tftp_rrq(name: &str) -> Vec<u8> {
+    fn tftp_rrq_with_tail(name: &str, tail: &[u8]) -> Vec<u8> {
         let mut request = vec![0, 1];
         request.extend_from_slice(name.as_bytes());
         request.push(0);
         request.extend_from_slice(b"octet\0");
+        request.extend_from_slice(tail);
         request
+    }
+
+    fn tftp_rrq(name: &str) -> Vec<u8> {
+        tftp_rrq_with_tail(name, &[])
     }
 
     fn tftp_ack(block: u16) -> Vec<u8> {
@@ -787,6 +792,78 @@ mod tests {
         assert_eq!(&reply[36..38], &2000u16.to_be_bytes());
         assert_eq!(&reply[44..46], &[0, 1]);
         assert_eq!(&reply[46..], content);
+        drop(session);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn native_tftp_accepts_the_ip12_prom_rrq_trailer() {
+        let content = b"sgi-emu IP12 PROM TFTP compatibility test";
+        let root = temporary_root();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("sa"), content).unwrap();
+        let config = NatConfig {
+            tftp_root: Some(root.to_str().unwrap().into()),
+            ..NatConfig::default()
+        };
+        let session = NetworkSession::start(config, |_| {}).unwrap();
+        learn_guest(&session);
+        let request = tftp_rrq_with_tail("sa", &[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(&request, b"\0\x01sa\0octet\0\xde\xad\xbe\xef");
+        assert!(session.try_send_frame(&udp(2000, 69, &request)));
+        let reply = receive(&session, |frame| {
+            frame.len() >= 46 && frame[23] == 17 && frame[42..46] == [0, 3, 0, 1]
+        });
+        assert_eq!(&reply[46..], content);
+        drop(session);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn native_tftp_rejects_other_malformed_rrq_tails() {
+        let root = temporary_root();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("sa"), b"unused").unwrap();
+        let config = NatConfig {
+            tftp_root: Some(root.to_str().unwrap().into()),
+            ..NatConfig::default()
+        };
+        let session = NetworkSession::start(config, |_| {}).unwrap();
+        learn_guest(&session);
+        let malformed_tails: [&[u8]; 2] = [&[0xde, 0xad, 0xbe], &[0xde, 0xad, 0xbe, 0xef, 0x01]];
+        for tail in malformed_tails {
+            let request = tftp_rrq_with_tail("sa", tail);
+            assert!(session.try_send_frame(&udp(2000, 69, &request)));
+            let reply = receive(&session, |frame| {
+                frame.len() >= 63 && frame[23] == 17 && frame[42..44] == [0, 5]
+            });
+            assert_eq!(&reply[44..46], &[0, 2]);
+            assert_eq!(&reply[46..63], b"Access violation\0");
+        }
+        drop(session);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn native_tftp_preserves_valid_option_negotiation() {
+        let root = temporary_root();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("sa"), b"unused").unwrap();
+        let config = NatConfig {
+            tftp_root: Some(root.to_str().unwrap().into()),
+            ..NatConfig::default()
+        };
+        let session = NetworkSession::start(config, |_| {}).unwrap();
+        learn_guest(&session);
+        let mut options = b"blksize\0".to_vec();
+        options.extend_from_slice(b"1024\0");
+        let request = tftp_rrq_with_tail("sa", &options);
+        assert!(session.try_send_frame(&udp(2000, 69, &request)));
+        let reply = receive(&session, |frame| {
+            frame.len() >= 57 && frame[23] == 17 && frame[42..44] == [0, 6]
+        });
+        assert_eq!(&reply[44..44 + options.len()], options);
+        assert!(reply[44 + options.len()..].iter().all(|byte| *byte == 0));
         drop(session);
         fs::remove_dir_all(&root).unwrap();
     }
