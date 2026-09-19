@@ -388,9 +388,9 @@ void MainWindow::rebuild_media_menu() {
 
         if (slot.medium_present) {
             QString state =
-                QStringLiteral("Loaded \x2014 %1").arg(format_capacity(slot.medium_size_bytes));
+                QStringLiteral("Loaded - %1").arg(format_capacity(slot.medium_size_bytes));
             if (slot.removal_prevented) {
-                state += QStringLiteral(" \x2014 Locked by guest");
+                state += QStringLiteral(" - Locked by guest");
             }
             auto* state_action = slot_menu->addAction(state);
             state_action->setEnabled(false);
