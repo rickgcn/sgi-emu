@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::scsi::{
-    ScsiBackingRequirement, ScsiCommandPlan, ScsiStatus, ScsiStorageSizeError, ScsiTarget,
-    ScsiTargetSnapshot, SenseData,
+    ScsiBackingRequirement, ScsiCommandPlan, ScsiRemovableMediaState, ScsiStatus,
+    ScsiStorageSizeError, ScsiTarget, ScsiTargetSnapshot, SenseData,
 };
 
 const BLOCK_BYTES: u32 = 512;
@@ -178,6 +178,10 @@ impl ScsiTarget for ScsiDisk {
         ScsiBackingRequirement::Fixed {
             size_bytes: self.storage_size_bytes(),
         }
+    }
+
+    fn removable_media_state(&self) -> Option<ScsiRemovableMediaState> {
+        None
     }
 
     fn snapshot(&self) -> Option<ScsiTargetSnapshot> {

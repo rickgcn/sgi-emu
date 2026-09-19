@@ -216,9 +216,16 @@ pub trait ScsiTarget: Send {
 
     /// Reports the current state of one removable slot without changing
     /// protocol state, and `None` for a target with fixed backing.
-    fn removable_media_state(&self) -> Option<ScsiRemovableMediaState> {
-        None
-    }
+    ///
+    /// The answer must agree with the backing the bus installed from
+    /// [`ScsiTarget::backing_requirement`]: a target that declares
+    /// [`ScsiBackingRequirement::Removable`] returns its live state, and a
+    /// fixed target returns `None`. Every target answers explicitly, so a new
+    /// target cannot lose its slot by inheriting an unrelated default, and
+    /// [`ScsiBus::removable_media_slots`] reports a disagreement with the
+    /// installed backing as a violated target contract instead of dropping the
+    /// slot.
+    fn removable_media_state(&self) -> Option<ScsiRemovableMediaState>;
 
     /// Decodes one command descriptor block.
     fn execute(&mut self, cdb: &[u8]) -> ScsiCommandPlan;
@@ -1096,6 +1103,13 @@ impl ScsiBus {
     /// Samples every attached removable slot in ascending target and LUN
     /// order without changing protocol state.
     ///
+    /// The backing installed by [`ScsiBus::attach`] decides which attachments
+    /// own a removable slot: an attachment holding a removable backing
+    /// contributes its live state, and a fixed attachment contributes nothing
+    /// even when its target reports removable state. A missing or unexpected
+    /// state means the target violated its contract with this bus, which is
+    /// reported as an assertion rather than a silently dropped slot.
+    ///
     /// The query never consumes unit attention, updates sense data, or touches
     /// an active connection or transaction.
     #[must_use]
@@ -1105,13 +1119,29 @@ impl ScsiBus {
             .enumerate()
             .filter_map(|(slot, attachment)| {
                 let attachment = attachment.as_ref()?;
-                let state = attachment.target.removable_media_state()?;
                 let (target_id, lun) = address_for_slot(slot);
-                Some(ScsiRemovableMediaSlot {
-                    target_id,
-                    lun,
-                    state,
-                })
+                let state = attachment.target.removable_media_state();
+                match &attachment.backing {
+                    ScsiBacking::Fixed(_) => {
+                        assert!(
+                            state.is_none(),
+                            "fixed SCSI target {target_id}:{lun} reports removable media state"
+                        );
+                        None
+                    }
+                    ScsiBacking::Removable(_) => {
+                        let Some(state) = state else {
+                            panic!(
+                                "removable SCSI target {target_id}:{lun} reports no media state"
+                            );
+                        };
+                        Some(ScsiRemovableMediaSlot {
+                            target_id,
+                            lun,
+                            state,
+                        })
+                    }
+                }
             })
             .collect()
     }
@@ -1924,8 +1954,9 @@ mod tests {
 
     use super::{
         ScsiAttachError, ScsiBackingRequirement, ScsiBus, ScsiBusError, ScsiCommandPlan,
-        ScsiCommandStart, ScsiDataDirection, ScsiMediaError, ScsiPhase, ScsiRemovableMediaKind,
-        ScsiSnapshotError, ScsiStatus, ScsiTarget, ScsiTargetSnapshot, ScsiTransferResult,
+        ScsiCommandStart, ScsiDataDirection, ScsiMediaChangeOrigin, ScsiMediaError, ScsiPhase,
+        ScsiRemovableMediaKind, ScsiRemovableMediaState, ScsiRemovableTarget, ScsiSnapshotError,
+        ScsiStatus, ScsiStorageSizeError, ScsiTarget, ScsiTargetSnapshot, ScsiTransferResult,
     };
 
     struct TestTarget {
@@ -1937,6 +1968,10 @@ mod tests {
             ScsiBackingRequirement::Fixed {
                 size_bytes: self.storage_bytes,
             }
+        }
+
+        fn removable_media_state(&self) -> Option<ScsiRemovableMediaState> {
+            None
         }
 
         fn execute(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
@@ -1999,6 +2034,10 @@ mod tests {
             }
         }
 
+        fn removable_media_state(&self) -> Option<ScsiRemovableMediaState> {
+            None
+        }
+
         fn execute(&mut self, _cdb: &[u8]) -> ScsiCommandPlan {
             ScsiCommandPlan::ReceiveDataOut { byte_count: 10 }
         }
@@ -2014,6 +2053,63 @@ mod tests {
                 .push((cdb.to_vec(), data.to_vec()));
             ScsiStatus::CheckCondition
         }
+    }
+
+    /// A target whose removable introspection contradicts the backing its
+    /// requirement made the bus install.
+    struct MismatchedTarget {
+        requirement: ScsiBackingRequirement,
+        state: Option<ScsiRemovableMediaState>,
+    }
+
+    impl ScsiTarget for MismatchedTarget {
+        fn backing_requirement(&self) -> ScsiBackingRequirement {
+            self.requirement
+        }
+
+        fn removable_media(&mut self) -> Option<&mut dyn ScsiRemovableTarget> {
+            if self.requirement == ScsiBackingRequirement::Removable {
+                let target: &mut dyn ScsiRemovableTarget = self;
+                Some(target)
+            } else {
+                None
+            }
+        }
+
+        fn removable_media_state(&self) -> Option<ScsiRemovableMediaState> {
+            self.state
+        }
+
+        fn execute(&mut self, _cdb: &[u8]) -> ScsiCommandPlan {
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                data_in: Vec::new(),
+            }
+        }
+
+        fn complete_storage(&mut self, succeeded: bool) -> ScsiStatus {
+            if succeeded {
+                ScsiStatus::Good
+            } else {
+                ScsiStatus::CheckCondition
+            }
+        }
+    }
+
+    impl ScsiRemovableTarget for MismatchedTarget {
+        fn validate_medium(&self, _size_bytes: u64) -> Result<(), ScsiStorageSizeError> {
+            Ok(())
+        }
+
+        fn medium_inserted(&mut self, _size_bytes: u64, _origin: ScsiMediaChangeOrigin) {}
+
+        fn medium_removed(&mut self, _origin: ScsiMediaChangeOrigin) {}
+
+        fn removal_prevented(&self) -> bool {
+            false
+        }
+
+        fn release_removal_prevention(&mut self) {}
     }
 
     struct TestStorage {
@@ -2878,6 +2974,48 @@ mod tests {
         assert_eq!(cdrom_status(&mut bus, &EJECT_CDB), ScsiStatus::Good);
         assert_eq!(slots(&bus), expected(None, false));
         assert!(bus.target_present(CDROM_TARGET));
+    }
+
+    #[test]
+    #[should_panic(expected = "removable SCSI target 4:0 reports no media state")]
+    fn a_removable_backing_requires_removable_introspection() {
+        let mut bus = ScsiBus::new();
+        bus.attach(
+            CDROM_TARGET,
+            0,
+            Box::new(MismatchedTarget {
+                requirement: ScsiBackingRequirement::Removable,
+                state: None,
+            }),
+            medium_storage(CDROM_BYTES),
+        )
+        .unwrap();
+
+        assert!(bus.removable_media_slots().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "fixed SCSI target 1:0 reports removable media state")]
+    fn a_fixed_backing_is_never_enumerated_as_a_removable_slot() {
+        let mut bus = ScsiBus::new();
+        bus.attach(
+            1,
+            0,
+            Box::new(MismatchedTarget {
+                requirement: ScsiBackingRequirement::Fixed {
+                    size_bytes: CDROM_BYTES,
+                },
+                state: Some(ScsiRemovableMediaState::new(
+                    ScsiRemovableMediaKind::OpticalDisc,
+                    Some(CDROM_BYTES),
+                    false,
+                )),
+            }),
+            medium_storage(CDROM_BYTES),
+        )
+        .unwrap();
+
+        assert!(bus.removable_media_slots().is_empty());
     }
 
     #[test]

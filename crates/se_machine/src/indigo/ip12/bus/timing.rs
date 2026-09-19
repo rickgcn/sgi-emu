@@ -263,11 +263,11 @@ mod tests {
 
     use super::super::address::{
         GIO_GRAPHICS_BASE, HPC1_COUNTER_BASE, HPC1_ETHERNET_TIMER_BASE, INT2_BASE, PIC1_BASE,
-        RTC_BASE, SERIAL_0_BASE, SERIAL_1_BASE,
+        RTC_BASE, SCSI_ADDRESS_PORT, SCSI_DATA_PORT, SERIAL_0_BASE, SERIAL_1_BASE,
     };
     use super::super::test_support::{
-        bus, bus_with_gio, configure_memory, configure_serial_a, read_byte, read_scsi_register,
-        read_word, write_serial_register,
+        bus, bus_with_gio, configure_memory, configure_serial_a, read_byte, read_word,
+        write_serial_register,
     };
 
     use super::EventKind;
@@ -1137,7 +1137,11 @@ mod tests {
     fn machine_time_advances_the_rtc_without_connecting_its_interrupt_to_int2() {
         let mut bus = bus();
         let mut output = MachineOutput::default();
-        assert_eq!(read_scsi_register(&mut bus, 0x17), 0);
+        // Reading SCSI Status acknowledges the WD33C93B reset-completion
+        // interrupt, so SCSI does not contribute to this test's INT2 baseline.
+        bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[0x17])
+            .unwrap();
+        assert_eq!(read_byte(&mut bus, SCSI_DATA_PORT), Ok(0));
         assert_eq!(read_word(&mut bus, INT2_BASE), Ok(0));
         bus.write(PhysAddr::new(RTC_BASE + 0x03), &[0x40]).unwrap();
         bus.write(PhysAddr::new(RTC_BASE + 0x0f), &[0x20]).unwrap();

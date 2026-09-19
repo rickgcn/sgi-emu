@@ -154,8 +154,10 @@ impl Machine {
 
     /// Samples the configured machine's removable-media slots.
     ///
-    /// The sample is frontend-neutral: it never names a SCSI address, a host
-    /// path, or a device model.
+    /// Slot identity is opaque to callers: it may be built from a machine's
+    /// own addressing information, but callers compare it for equality instead
+    /// of parsing or depending on that representation. The sample carries no
+    /// host resource or host path information, and it names no device model.
     #[must_use]
     pub fn media_catalog(&self) -> MediaCatalog {
         match self {

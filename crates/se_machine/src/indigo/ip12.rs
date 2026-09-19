@@ -556,7 +556,7 @@ impl Ip12 {
                 let state = slot.state();
                 MediaSlotDescriptor::new(
                     media_slot_key(slot.target_id(), slot.lun()),
-                    &media_slot_label(slot.target_id(), slot.lun()),
+                    &media_slot_label(state.kind(), slot.target_id(), slot.lun()),
                     media_kind(state.kind()),
                     MediaSlotState::new(state.medium_size_bytes(), state.removal_prevented()),
                 )
@@ -852,8 +852,10 @@ fn media_slot_key(target_id: u8, lun: u8) -> MediaSlotKey {
 }
 
 /// Returns the frontend-visible name of one removable-media slot.
-fn media_slot_label(target_id: u8, lun: u8) -> String {
-    format!("SCSI CD-ROM {target_id}:{lun}")
+fn media_slot_label(kind: ScsiRemovableMediaKind, target_id: u8, lun: u8) -> String {
+    match kind {
+        ScsiRemovableMediaKind::OpticalDisc => format!("SCSI CD-ROM {target_id}:{lun}"),
+    }
 }
 
 /// Maps one device-level medium family onto its machine-visible family.

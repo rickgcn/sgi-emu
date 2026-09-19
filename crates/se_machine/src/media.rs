@@ -11,8 +11,10 @@ use std::fmt;
 
 /// Stable identity of one removable-media slot in a machine topology.
 ///
-/// The identity is opaque: it carries no SCSI address, no host path, and no
-/// index into any collection that can be reordered.
+/// The identity is opaque: callers compare it for equality and never parse it
+/// or depend on its internal representation, which a machine may build from
+/// its own addressing information. It never carries a host path or an index
+/// into any collection that can be reordered.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MediaSlotKey(String);
 

@@ -24,9 +24,7 @@ use se_device::z85230::Z85230;
 
 use super::super::PROM_BYTES;
 use super::Ip12Bus;
-use super::address::{
-    CPU_AUX_CONTROL, HPC1_SCSI_REGISTERS_BASE, PIC1_BASE, SCSI_ADDRESS_PORT, SCSI_DATA_PORT,
-};
+use super::address::{CPU_AUX_CONTROL, PIC1_BASE};
 
 pub(super) fn bus() -> Ip12Bus {
     bus_with_memory([Some(Ram::new(8 * 1024 * 1024)), None, None, None])
@@ -286,134 +284,6 @@ pub(super) fn configure_serial_a(bus: &mut Ip12Bus, base: u64) {
     for (register, value) in [(4, 0x44), (11, 0x10), (12, 10), (13, 0), (14, 1), (5, 0x68)] {
         write_serial_register(bus, base, register, value);
     }
-}
-
-pub(super) fn write_scsi_register(bus: &mut Ip12Bus, register: u8, value: u8) {
-    bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[register])
-        .unwrap();
-    bus.write(PhysAddr::new(SCSI_DATA_PORT), &[value]).unwrap();
-}
-
-pub(super) fn read_scsi_register(bus: &mut Ip12Bus, register: u8) -> u8 {
-    bus.write(PhysAddr::new(SCSI_ADDRESS_PORT), &[register])
-        .unwrap();
-    read_byte(bus, SCSI_DATA_PORT).unwrap()
-}
-
-pub(super) fn configure_single_scsi_descriptor(bus: &mut Ip12Bus, buffer_address: u32) {
-    configure_scsi_descriptor_chain(bus, 0x1000, buffer_address, &[512]);
-}
-
-pub(super) fn configure_single_scsi_write_descriptor(bus: &mut Ip12Bus, buffer_address: u32) {
-    configure_scsi_write_descriptor_chain(bus, 0x1000, buffer_address, &[512]);
-}
-
-pub(super) fn configure_scsi_descriptor_chain(
-    bus: &mut Ip12Bus,
-    first_descriptor_address: u32,
-    first_buffer_address: u32,
-    byte_counts: &[u16],
-) {
-    configure_scsi_descriptor_chain_direction(
-        bus,
-        first_descriptor_address,
-        first_buffer_address,
-        byte_counts,
-        true,
-    );
-}
-
-pub(super) fn configure_scsi_write_descriptor_chain(
-    bus: &mut Ip12Bus,
-    first_descriptor_address: u32,
-    first_buffer_address: u32,
-    byte_counts: &[u16],
-) {
-    configure_scsi_descriptor_chain_direction(
-        bus,
-        first_descriptor_address,
-        first_buffer_address,
-        byte_counts,
-        false,
-    );
-}
-
-fn configure_scsi_descriptor_chain_direction(
-    bus: &mut Ip12Bus,
-    first_descriptor_address: u32,
-    first_buffer_address: u32,
-    byte_counts: &[u16],
-    to_memory: bool,
-) {
-    configure_memory(bus, 0x0100_023f, 0x023f_023f);
-    let mut descriptor_address = first_descriptor_address;
-    let mut buffer_address = first_buffer_address;
-    for (index, byte_count) in byte_counts.iter().copied().enumerate() {
-        let is_last = index + 1 == byte_counts.len();
-        let buffer_word = if is_last {
-            buffer_address | (1 << 31)
-        } else {
-            buffer_address
-        };
-        for (address, value) in [
-            (descriptor_address, u32::from(byte_count)),
-            (descriptor_address + 4, buffer_word),
-            (descriptor_address + 8, descriptor_address + 12),
-        ] {
-            bus.write(PhysAddr::new(u64::from(address)), &value.to_be_bytes())
-                .unwrap();
-        }
-        descriptor_address += 12;
-        buffer_address += u32::from(byte_count);
-    }
-    bus.write(
-        PhysAddr::new(HPC1_SCSI_REGISTERS_BASE + 8),
-        &first_descriptor_address.to_be_bytes(),
-    )
-    .unwrap();
-    let control = 0x80 | if to_memory { 0x10 } else { 0 };
-    bus.write(PhysAddr::new(HPC1_SCSI_REGISTERS_BASE + 0x0f), &[control])
-        .unwrap();
-}
-
-pub(super) fn issue_scsi_command(
-    bus: &mut Ip12Bus,
-    target: u8,
-    lun: u8,
-    transfer_count: u32,
-    cdb: &[u8],
-) {
-    write_scsi_register(bus, 0x15, target);
-    write_scsi_register(bus, 0x0f, lun);
-    write_scsi_register(bus, 0x01, 0x80);
-    write_scsi_register(bus, 0x02, 1);
-    for (register, value) in [
-        (0x12, (transfer_count >> 16) as u8),
-        (0x13, (transfer_count >> 8) as u8),
-        (0x14, transfer_count as u8),
-    ] {
-        write_scsi_register(bus, register, value);
-    }
-    for (offset, value) in cdb.iter().copied().enumerate() {
-        write_scsi_register(bus, 0x03 + offset as u8, value);
-    }
-    write_scsi_register(bus, 0x18, 0x08);
-}
-
-pub(super) fn issue_read_ten(bus: &mut Ip12Bus, target: u8, lba: u32) {
-    let mut cdb = [0; 10];
-    cdb[0] = 0x28;
-    cdb[2..6].copy_from_slice(&lba.to_be_bytes());
-    cdb[8] = 1;
-    issue_scsi_command(bus, target, 0, 512, &cdb);
-}
-
-pub(super) fn issue_write_ten(bus: &mut Ip12Bus, target: u8, lba: u32) {
-    let mut cdb = [0; 10];
-    cdb[0] = 0x2a;
-    cdb[2..6].copy_from_slice(&lba.to_be_bytes());
-    cdb[8] = 1;
-    issue_scsi_command(bus, target, 0, 512, &cdb);
 }
 
 pub(super) fn nvram_clock_bit(bus: &mut Ip12Bus, bit: bool) -> bool {
