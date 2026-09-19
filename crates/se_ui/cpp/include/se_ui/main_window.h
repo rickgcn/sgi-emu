@@ -15,6 +15,7 @@ class QAction;
 class QDockWidget;
 class QEvent;
 class QLabel;
+class QMenu;
 class QString;
 class QTimer;
 
@@ -66,6 +67,9 @@ private:
     void restore_window_state(const UiStartupState& startup);
     void set_default_dock_layout();
     void show_notification(const QString& message, int timeout);
+    void rebuild_media_menu();
+    void insert_image(std::uint64_t generation, const std::string& key);
+    void eject_medium(std::uint64_t generation, const std::string& key, bool force);
     void begin_preparation(
         PreparationState state,
         bool stops_replay,
@@ -106,6 +110,7 @@ private:
     QAction* create_replay_snapshot_action_;
     QAction* stop_replay_action_;
     QAction* settings_action_;
+    QMenu* media_menu_;
 
     DisassemblyDock* disassembly_dock_;
     RegistersDock* registers_dock_;

@@ -124,33 +124,45 @@ pub fn build(prepared: PreparedIp12Build) -> Result<Ip12, Ip12AssemblyError> {
 
     let mut scsi = ScsiBus::new();
     for attachment in plan.scsi() {
-        let storage = resources.take_storage(&attachment.medium);
-        let bytes = storage.size_bytes();
-        let target: Box<dyn ScsiTarget> = match attachment.device {
-            ScsiDevice::Disk => Box::new(ScsiDisk::try_new(bytes).map_err(|source| {
-                Ip12AssemblyError::InvalidScsiMedium {
-                    target: attachment.target,
-                    lun: attachment.lun,
-                    device: attachment.device,
-                    source,
-                }
-            })?),
-            ScsiDevice::Cdrom => Box::new(ScsiCdrom::try_new(bytes).map_err(|source| {
-                Ip12AssemblyError::InvalidScsiMedium {
-                    target: attachment.target,
-                    lun: attachment.lun,
-                    device: attachment.device,
-                    source,
-                }
-            })?),
+        let attach_error = |source| Ip12AssemblyError::ScsiAttachment {
+            target: attachment.target,
+            lun: attachment.lun,
+            device: attachment.device,
+            source,
         };
-        scsi.attach(attachment.target, attachment.lun, target, storage)
-            .map_err(|source| Ip12AssemblyError::ScsiAttachment {
-                target: attachment.target,
-                lun: attachment.lun,
-                device: attachment.device,
-                source,
-            })?;
+        match attachment.medium() {
+            Some(medium) => {
+                let storage = resources.take_storage(medium);
+                let bytes = storage.size_bytes();
+                let invalid_medium = |source| Ip12AssemblyError::InvalidScsiMedium {
+                    target: attachment.target,
+                    lun: attachment.lun,
+                    device: attachment.device,
+                    source,
+                };
+                let target: Box<dyn ScsiTarget> = match attachment.device {
+                    ScsiDevice::Disk => Box::new(ScsiDisk::try_new(bytes).map_err(invalid_medium)?),
+                    ScsiDevice::Cdrom => {
+                        Box::new(ScsiCdrom::try_new(bytes).map_err(invalid_medium)?)
+                    }
+                };
+                scsi.attach(attachment.target, attachment.lun, target, storage)
+                    .map_err(attach_error)?;
+            }
+            None => {
+                assert_eq!(
+                    attachment.device,
+                    ScsiDevice::Cdrom,
+                    "only a removable SCSI device may be planned with an empty slot"
+                );
+                scsi.attach_removable_empty(
+                    attachment.target,
+                    attachment.lun,
+                    Box::new(ScsiCdrom::new_empty()),
+                )
+                .map_err(attach_error)?;
+            }
+        }
     }
 
     let mut keyboard = None;
@@ -216,6 +228,7 @@ mod tests {
     use crate::endpoint::EndpointKind;
     use crate::input::{KeyboardKey, MachineInput, MachineInputPayload};
     use crate::machine::{Machine, MachineInputError};
+    use crate::media::MediaKind;
     use crate::resource::{PreparedResource, ResourceKind};
 
     struct MemoryStorage {
@@ -291,11 +304,11 @@ mod tests {
         let medium_addresses: BTreeMap<_, _> = plan
             .scsi()
             .iter()
-            .map(|attachment| {
-                (
-                    attachment.medium.clone(),
+            .filter_map(|attachment| {
+                Some((
+                    attachment.medium()?.clone(),
                     (attachment.target, attachment.lun),
-                )
+                ))
             })
             .collect();
         plan.prepare_with(|id, requirement| {
@@ -462,8 +475,8 @@ mod tests {
 
         let plan_a = Ip12Definition.compile(&draft_a).expect("old path is valid");
         let plan_b = Ip12Definition.compile(&draft_b).expect("new path is valid");
-        let role = plan_a.scsi()[0].medium.clone();
-        assert_eq!(plan_b.scsi()[0].medium, role);
+        let role = plan_a.scsi()[0].medium().unwrap().clone();
+        assert_eq!(plan_b.scsi()[0].medium(), Some(&role));
         assert_eq!(
             plan_a.resources().get(&role).map(|item| item.kind),
             plan_b.resources().get(&role).map(|item| item.kind)
@@ -560,6 +573,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_cdrom_without_an_initial_medium_assembles_an_empty_drive() {
+        let mut configuration = draft(&[(4, 0, ScsiDevice::Cdrom)], true);
+        configuration.apply(Edit::SetProperty {
+            property: PropertyId(String::from("scsi.0.target.4.lun.0.medium-path")),
+            value: PropertyValue::Text(String::new()),
+        });
+
+        let plan = Ip12Definition
+            .compile(&configuration)
+            .expect("an empty CD-ROM drive is a complete topology");
+        assert_eq!(plan.scsi()[0].medium(), None);
+        let machine = build(prepare(plan, PROM_BYTES, &BTreeMap::new()))
+            .expect("the empty drive attaches to the bus");
+
+        let catalog = machine.media_catalog();
+        assert_eq!(catalog.slots().len(), 1);
+        let slot = &catalog.slots()[0];
+        assert_eq!(slot.kind(), MediaKind::OpticalDisc);
+        assert_eq!(slot.state().medium_size_bytes(), None);
+        assert!(!slot.state().medium_present());
+        assert!(!slot.state().removal_prevented());
     }
 
     #[test]

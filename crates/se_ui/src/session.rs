@@ -15,9 +15,11 @@ use se_machine::indigo::ip12::debug::{
     DebugRequest as Ip12DebugRequest, DebugResponse as Ip12DebugResponse, MemoryAddressSpace,
 };
 use se_machine::input::{KeyboardKey, KeyboardNamedKey, PointerButton};
+use se_machine::media::MediaKind;
 use se_machine::output::VideoOutput;
 use se_runtime::control::{RuntimeMode, RuntimeState, RuntimeStatus};
 use se_runtime::endpoint::{EndpointHandle, RuntimeOutputPayload};
+use se_runtime::media::{RuntimeMediaError, RuntimeMediaHandle, RuntimeMediaSlotDescriptor};
 use se_runtime::record::Replayer;
 use se_runtime::runtime::{DebugReply, RuntimeError, RuntimeHandle};
 use se_session::frontend::{FrontendPlan, SessionBuild};
@@ -27,9 +29,10 @@ use crate::bridge::ffi::{
     CacheDto, CacheEntryDto, DisassemblyDto, DisassemblyLineDto, EndpointCatalogDto,
     EndpointDescriptorDto, EndpointDirectionDto, EndpointHandleDto, EndpointKindDto,
     KeyboardKeyDto, KeyboardKeyKindDto, MachineConfigurationEditDto, MachineConfigurationViewDto,
-    MachineOutputSink, MachinePreflightDto, MemoryDto, NetworkConfiguration, PointerButtonDto,
-    RegistersDto, ReplaySnapshotCatalogDto, ReplaySnapshotInfoDto, RuntimeStatusDto, TlbDto,
-    TlbEntryDto, UiExitState, UiStartupState, VideoOutputStateDto, run_gui,
+    MachineOutputSink, MachinePreflightDto, MediaCatalogDto, MediaHandleDto, MediaKindDto,
+    MediaSlotDto, MemoryDto, NetworkConfiguration, PointerButtonDto, RegistersDto,
+    ReplaySnapshotCatalogDto, ReplaySnapshotInfoDto, RuntimeStatusDto, TlbDto, TlbEntryDto,
+    UiExitState, UiStartupState, VideoOutputStateDto, run_gui,
 };
 use crate::configuration::{diagnostics_dto, edit_from_dto, failed_view, view_dto};
 
@@ -171,6 +174,73 @@ impl UiSession {
                 generation: 0,
                 endpoints: Vec::new(),
             },
+        }
+    }
+
+    /// Samples the current removable-media catalog for Qt.
+    pub fn media_catalog(&self) -> MediaCatalogDto {
+        match self.runtime.media_catalog() {
+            Ok(catalog) => MediaCatalogDto {
+                success: true,
+                error: String::new(),
+                generation: catalog.generation(),
+                media_slots: catalog
+                    .slots()
+                    .iter()
+                    .map(|descriptor| {
+                        let state = descriptor.state();
+                        MediaSlotDto {
+                            handle: media_handle_dto(descriptor.handle()),
+                            label: descriptor.label().into(),
+                            kind: media_kind_dto(descriptor.kind()),
+                            medium_present: state.medium_present(),
+                            medium_size_bytes: state.medium_size_bytes().unwrap_or(0),
+                            removal_prevented: state.removal_prevented(),
+                        }
+                    })
+                    .collect(),
+            },
+            Err(error) => MediaCatalogDto {
+                success: false,
+                error: error.to_string(),
+                generation: 0,
+                media_slots: Vec::new(),
+            },
+        }
+    }
+
+    /// Opens one host file as a live medium in the addressed slot.
+    ///
+    /// The session, not Qt, owns the host path: it resolves the frontend handle
+    /// back to a live runtime handle, uses the medium family the slot really
+    /// accepts, and transfers only the resulting capability.
+    pub fn insert_media(&self, handle: &MediaHandleDto, path: &str) -> RuntimeStatusDto {
+        let descriptor = match self.resolve_media_slot(handle) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return failed_status(error.to_string()),
+        };
+        match se_session::media::insert_media_from_path(
+            &self.runtime,
+            descriptor.handle().clone(),
+            descriptor.kind(),
+            path,
+        ) {
+            Ok(status) => status_dto(status),
+            Err(error) => failed_status(error.to_string()),
+        }
+    }
+
+    /// Removes the medium from the addressed slot.
+    ///
+    /// A force ejection overrides a guest removal lock, so Qt asks the user
+    /// before requesting one.
+    pub fn eject_media(&self, handle: &MediaHandleDto, force: bool) -> RuntimeStatusDto {
+        match self
+            .resolve_media_slot(handle)
+            .and_then(|descriptor| self.runtime.eject_media(descriptor.handle().clone(), force))
+        {
+            Ok(status) => status_dto(status),
+            Err(error) => failed_status(error.to_string()),
         }
     }
 
@@ -788,6 +858,26 @@ impl UiSession {
             .ok_or(RuntimeError::UnknownEndpoint)
     }
 
+    /// Resolves one frontend media handle against the live catalog.
+    ///
+    /// Qt holds an opaque identity, never a capability, so a handle from a
+    /// replaced machine or from a stale menu can never name a live slot.
+    fn resolve_media_slot(
+        &self,
+        handle: &MediaHandleDto,
+    ) -> Result<RuntimeMediaSlotDescriptor, RuntimeError> {
+        let catalog = self.runtime.media_catalog()?;
+        if handle.generation != catalog.generation() {
+            return Err(RuntimeError::Media(RuntimeMediaError::StaleHandle));
+        }
+        catalog
+            .slots()
+            .iter()
+            .find(|descriptor| descriptor.handle().key().as_str() == handle.key)
+            .cloned()
+            .ok_or(RuntimeError::Media(RuntimeMediaError::UnknownSlot))
+    }
+
     fn runtime_command(
         &self,
         command: impl FnOnce(&RuntimeHandle) -> Result<RuntimeStatus, RuntimeError>,
@@ -807,6 +897,19 @@ fn endpoint_handle_dto(handle: &EndpointHandle) -> EndpointHandleDto {
     EndpointHandleDto {
         generation: handle.generation(),
         key: handle.key().as_str().into(),
+    }
+}
+
+fn media_handle_dto(handle: &RuntimeMediaHandle) -> MediaHandleDto {
+    MediaHandleDto {
+        generation: handle.generation(),
+        key: handle.key().as_str().into(),
+    }
+}
+
+const fn media_kind_dto(kind: MediaKind) -> MediaKindDto {
+    match kind {
+        MediaKind::OpticalDisc => MediaKindDto::OpticalDisc,
     }
 }
 
@@ -1066,7 +1169,7 @@ mod tests {
 
     use se_config::definition::MachineDefinition;
     use se_config::draft::{Edit, MachineDraft};
-    use se_config::id::{NodeId, PropertyId};
+    use se_config::id::{DeviceKindId, NodeId, PropertyId};
     use se_config::value::PropertyValue;
     use se_machine::indigo::ip12::builder;
     use se_machine::indigo::ip12::definition::Ip12Definition;
@@ -1079,7 +1182,7 @@ mod tests {
     use super::UiSession;
     use crate::bridge::ffi::{
         EndpointKindDto, KeyboardKeyDto, KeyboardKeyKindDto, MachineConfigurationEditDto,
-        MachinePropertyValueDto, NetworkConfiguration,
+        MachinePropertyValueDto, MediaHandleDto, MediaKindDto, NetworkConfiguration,
     };
 
     static NEXT_FIRMWARE_ID: AtomicU64 = AtomicU64::new(0);
@@ -1113,6 +1216,46 @@ mod tests {
             value: PropertyValue::Text(String::from("prom.bin")),
         });
         draft
+    }
+
+    /// A committed draft whose machine holds one CD-ROM drive with no initial
+    /// medium, so every host medium in these tests is a live decision.
+    fn media_draft() -> MachineDraft {
+        let mut draft = draft();
+        draft.apply(Edit::SetAttachment {
+            slot: NodeId(String::from("scsi.0.target.4.lun.0")),
+            device: Some(DeviceKindId(String::from("scsi.cdrom"))),
+        });
+        draft
+    }
+
+    fn media_session() -> (Runtime, UiSession) {
+        let (runtime, session, _) = configured_session(media_draft(), true);
+        assert!(session.begin_machine_edit().success);
+        assert!(session.configure_edited_machine(&network()).success);
+        (runtime, session)
+    }
+
+    struct TestMedium {
+        path: std::path::PathBuf,
+    }
+
+    impl TestMedium {
+        fn new(bytes: usize) -> Self {
+            let id = NEXT_FIRMWARE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "sgi-emu-ui-session-medium-{}-{id}.iso",
+                std::process::id()
+            ));
+            fs::write(&path, vec![0; bytes]).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestMedium {
+        fn drop(&mut self) {
+            fs::remove_file(&self.path).unwrap();
+        }
     }
 
     fn network() -> NetworkConfiguration {
@@ -1175,6 +1318,13 @@ mod tests {
     }
 
     fn controlled_session(normal_succeeds: bool) -> (Runtime, UiSession, Arc<AtomicBool>) {
+        configured_session(draft(), normal_succeeds)
+    }
+
+    fn configured_session(
+        committed: MachineDraft,
+        normal_succeeds: bool,
+    ) -> (Runtime, UiSession, Arc<AtomicBool>) {
         let runtime = Runtime::new_unconfigured().unwrap();
         let firmware = Arc::new(TestFirmware::new());
         let builder_firmware = Arc::clone(&firmware);
@@ -1182,7 +1332,7 @@ mod tests {
         let builder_succeeds = Arc::clone(&succeeds);
         let session = UiSession::new(
             runtime.handle(),
-            draft(),
+            committed,
             Arc::new(Ip12Definition),
             FrontendPlan::default(),
             Box::new(|_| Ok(Vec::new())),
@@ -1835,5 +1985,187 @@ mod tests {
         drop(session);
         assert!(runtime.handle().status().is_ok());
         assert!(runtime.shutdown().unwrap().is_some());
+    }
+
+    #[test]
+    fn media_catalog_maps_live_slots_to_generation_bound_handles() {
+        let (runtime, session) = media_session();
+        let catalog = session.media_catalog();
+        assert!(catalog.success);
+        assert_eq!(
+            catalog.generation,
+            runtime.status().unwrap().machine_generation
+        );
+        assert_eq!(catalog.media_slots.len(), 1);
+        let slot = &catalog.media_slots[0];
+        assert_eq!(slot.label, "SCSI CD-ROM 4:0");
+        assert_eq!(slot.kind, MediaKindDto::OpticalDisc);
+        assert!(!slot.medium_present);
+        assert_eq!(slot.medium_size_bytes, 0);
+        assert!(!slot.removal_prevented);
+        assert_eq!(slot.handle.generation, catalog.generation);
+        assert!(!slot.handle.key.is_empty());
+
+        let other = session.machine_draft_snapshot();
+        assert_eq!(other, media_draft(), "sampling never edits the draft");
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn live_media_changes_never_touch_the_committed_draft() {
+        let (runtime, session) = media_session();
+        let committed = session.machine_draft_snapshot();
+        let medium = TestMedium::new(2048);
+        let path = medium.path.to_str().unwrap();
+
+        let catalog = session.media_catalog();
+        let insert = session.insert_media(&catalog.media_slots[0].handle, path);
+        assert!(insert.success, "{}", insert.command_error);
+
+        let loaded = session.media_catalog();
+        assert!(loaded.media_slots[0].medium_present);
+        assert_eq!(loaded.media_slots[0].medium_size_bytes, 2048);
+
+        let eject = session.eject_media(&loaded.media_slots[0].handle, false);
+        assert!(eject.success, "{}", eject.command_error);
+        assert!(!session.media_catalog().media_slots[0].medium_present);
+
+        assert_eq!(
+            session.machine_draft_snapshot(),
+            committed,
+            "live media is never written back into machine settings"
+        );
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_rejected_live_medium_reports_its_host_path() {
+        let (runtime, session) = media_session();
+        let catalog = session.media_catalog();
+        let handle = &catalog.media_slots[0].handle;
+
+        let missing = session.insert_media(handle, "/definitely/not/a/real/disc.iso");
+        assert!(!missing.success);
+        assert!(
+            missing
+                .command_error
+                .contains("/definitely/not/a/real/disc.iso")
+        );
+
+        let unaligned = TestMedium::new(1000);
+        let invalid = session.insert_media(handle, unaligned.path.to_str().unwrap());
+        assert!(!invalid.success);
+        assert_eq!(
+            invalid.command_error,
+            "invalid medium for runtime media slot"
+        );
+        assert!(!session.media_catalog().media_slots[0].medium_present);
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn stale_and_unknown_media_handles_never_reach_the_machine() {
+        let (runtime, session) = media_session();
+        let medium = TestMedium::new(2048);
+        let path = medium.path.to_str().unwrap();
+        let catalog = session.media_catalog();
+        let generation = catalog.media_slots[0].handle.generation;
+
+        let stale = MediaHandleDto {
+            generation: generation + 1,
+            key: catalog.media_slots[0].handle.key.clone(),
+        };
+        let stale_status = session.insert_media(&stale, path);
+        assert!(!stale_status.success);
+        assert_eq!(stale_status.command_error, "stale runtime media handle");
+
+        let unknown = MediaHandleDto {
+            generation,
+            key: String::from("scsi.0.target.7.lun.0"),
+        };
+        let unknown_status = session.eject_media(&unknown, false);
+        assert!(!unknown_status.success);
+        assert_eq!(unknown_status.command_error, "unknown runtime media slot");
+
+        assert!(!session.media_catalog().media_slots[0].medium_present);
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_cold_rebuild_restores_the_configured_initial_medium() {
+        let initial = TestMedium::new(2048);
+        let mut draft = media_draft();
+        draft.apply(Edit::SetProperty {
+            property: PropertyId(String::from("scsi.0.target.4.lun.0.medium-path")),
+            value: PropertyValue::Text(initial.path.to_string_lossy().into_owned()),
+        });
+
+        let (runtime, session, _) = configured_session(draft.clone(), true);
+        assert!(session.begin_machine_edit().success);
+        assert!(session.configure_edited_machine(&network()).success);
+        let loaded = session.media_catalog();
+        assert_eq!(loaded.media_slots[0].medium_size_bytes, 2048);
+
+        let live = TestMedium::new(4096);
+        assert!(
+            session
+                .eject_media(&loaded.media_slots[0].handle, false)
+                .success
+        );
+        let empty = session.media_catalog();
+        assert!(
+            session
+                .insert_media(&empty.media_slots[0].handle, live.path.to_str().unwrap())
+                .success
+        );
+        assert_eq!(
+            session.media_catalog().media_slots[0].medium_size_bytes,
+            4096
+        );
+        assert_eq!(
+            session.machine_draft_snapshot(),
+            draft,
+            "the live medium never becomes the configured initial medium"
+        );
+
+        assert!(session.begin_machine_edit().success);
+        assert!(session.configure_edited_machine(&network()).success);
+        assert_eq!(
+            session.media_catalog().media_slots[0].medium_size_bytes,
+            2048,
+            "a cold machine starts from the configured initial medium again"
+        );
+        drop(session);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_reconfigured_machine_invalidates_every_open_media_handle() {
+        let (runtime, session) = media_session();
+        let opened = session.media_catalog();
+        let stale = MediaHandleDto {
+            generation: opened.media_slots[0].handle.generation,
+            key: opened.media_slots[0].handle.key.clone(),
+        };
+        let medium = TestMedium::new(2048);
+
+        assert!(session.begin_machine_edit().success);
+        assert!(session.configure_edited_machine(&network()).success);
+
+        let current = session.media_catalog();
+        assert!(current.generation > stale.generation);
+        assert_eq!(current.media_slots.len(), 1);
+        assert_eq!(current.media_slots[0].handle.key, stale.key);
+
+        let status = session.insert_media(&stale, medium.path.to_str().unwrap());
+        assert!(!status.success);
+        assert_eq!(status.command_error, "stale runtime media handle");
+        assert!(!session.media_catalog().media_slots[0].medium_present);
+        drop(session);
+        runtime.shutdown().unwrap();
     }
 }

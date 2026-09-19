@@ -150,7 +150,12 @@ pub enum GioDevice {
     Lg1,
 }
 
-/// One independently addressed SCSI device and its medium role.
+/// One independently addressed SCSI device and its cold-start medium.
+///
+/// The medium role is private so that only `ScsiAttachment::disk` and
+/// `ScsiAttachment::cdrom` can pair a device with it. A planner therefore
+/// cannot express a fixed-capacity device without a medium: an empty cold
+/// start is a removable drive only.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScsiAttachment {
     /// SCSI target ID.
@@ -159,8 +164,38 @@ pub struct ScsiAttachment {
     pub lun: u8,
     /// Device to install.
     pub device: ScsiDevice,
-    /// Logical resource role for this device's medium.
-    pub medium: ResourceId,
+    medium: Option<ResourceId>,
+}
+
+impl ScsiAttachment {
+    /// Plans a fixed-capacity device, which cannot start without its medium.
+    pub(super) fn disk(target: u8, lun: u8, medium: ResourceId) -> Self {
+        Self {
+            target,
+            lun,
+            device: ScsiDevice::Disk,
+            medium: Some(medium),
+        }
+    }
+
+    /// Plans a removable device that may start with an empty slot.
+    pub(super) fn cdrom(target: u8, lun: u8, medium: Option<ResourceId>) -> Self {
+        Self {
+            target,
+            lun,
+            device: ScsiDevice::Cdrom,
+            medium,
+        }
+    }
+
+    /// Returns the logical resource role of the cold-start medium.
+    ///
+    /// This is `None` only for a removable device that starts empty; a
+    /// fixed-capacity device always requires a prepared medium.
+    #[must_use]
+    pub fn medium(&self) -> Option<&ResourceId> {
+        self.medium.as_ref()
+    }
 }
 
 /// A supported SCSI device selection.

@@ -511,6 +511,11 @@ impl<'a> Projection<'a> {
                         label,
                     );
                     if supported {
+                        let scsi_device = if device == device_kind(SCSI_DISK) {
+                            ScsiDevice::Disk
+                        } else {
+                            ScsiDevice::Cdrom
+                        };
                         let value = self
                             .draft
                             .properties
@@ -527,44 +532,46 @@ impl<'a> Projection<'a> {
                                     ResourceRequirement {
                                         path: PathBuf::from(path),
                                         kind: ResourceKind::Storage {
-                                            access: if device == device_kind(SCSI_DISK) {
-                                                StorageAccess::ReadWrite
-                                            } else {
-                                                StorageAccess::ReadOnly
-                                            },
+                                            access: scsi_storage_access(scsi_device),
                                         },
                                         origin: DiagnosticTarget::Property(medium.clone()),
                                     },
                                 );
-                                self.scsi.push(ScsiAttachment {
-                                    target: target as u8,
-                                    lun: lun as u8,
-                                    device: if device == device_kind(SCSI_DISK) {
-                                        ScsiDevice::Disk
-                                    } else {
-                                        ScsiDevice::Cdrom
-                                    },
-                                    medium: medium_id,
+                                self.scsi.push(match scsi_device {
+                                    ScsiDevice::Disk => {
+                                        ScsiAttachment::disk(target as u8, lun as u8, medium_id)
+                                    }
+                                    ScsiDevice::Cdrom => ScsiAttachment::cdrom(
+                                        target as u8,
+                                        lun as u8,
+                                        Some(medium_id),
+                                    ),
                                 });
                             }
-                            PropertyValue::Text(_) => self.report(
-                                "ip12.scsi.medium-required",
-                                DiagnosticTarget::Property(medium.clone()),
-                                if device == device_kind(SCSI_DISK) {
-                                    "Select a disk image."
-                                } else {
-                                    "Select a CD-ROM image."
-                                },
-                            ),
+                            // Only a removable drive may start without a medium.
+                            PropertyValue::Text(_) => match scsi_device {
+                                ScsiDevice::Disk => self.report(
+                                    "ip12.scsi.medium-required",
+                                    DiagnosticTarget::Property(medium.clone()),
+                                    "Select a disk image.",
+                                ),
+                                ScsiDevice::Cdrom => self.scsi.push(ScsiAttachment::cdrom(
+                                    target as u8,
+                                    lun as u8,
+                                    None,
+                                )),
+                            },
                             _ => self.report(
                                 "ip12.property.invalid-type",
                                 DiagnosticTarget::Property(medium.clone()),
                                 "The medium path must be text.",
                             ),
                         }
-                        device_node
-                            .properties
-                            .push(path_property(medium, "Medium path", value));
+                        device_node.properties.push(path_property(
+                            medium,
+                            scsi_medium_label(scsi_device),
+                            value,
+                        ));
                     }
                     self.view.nodes.push(device_node);
                 }
@@ -786,6 +793,22 @@ fn scsi_device(target: usize, lun: usize) -> NodeId {
 }
 fn scsi_medium(target: usize, lun: usize) -> PropertyId {
     property_id(&format!("scsi.0.target.{target}.lun.{lun}.medium-path"))
+}
+
+/// Returns the host access this device requires from its medium.
+const fn scsi_storage_access(device: ScsiDevice) -> StorageAccess {
+    match device {
+        ScsiDevice::Disk => StorageAccess::ReadWrite,
+        ScsiDevice::Cdrom => StorageAccess::ReadOnly,
+    }
+}
+
+/// Returns the settings label of this device's cold-start medium.
+const fn scsi_medium_label(device: ScsiDevice) -> &'static str {
+    match device {
+        ScsiDevice::Disk => "Disk image",
+        ScsiDevice::Cdrom => "Initial medium",
+    }
 }
 
 fn node(
@@ -1096,12 +1119,12 @@ mod tests {
                 }
             );
             assert_eq!(
-                attachment.medium.as_str(),
+                attachment.medium().unwrap().as_str(),
                 format!("scsi.0.target.{target}.lun.{lun}.medium")
             );
             let resource = plan
                 .resources()
-                .get(&attachment.medium)
+                .get(attachment.medium().unwrap())
                 .expect("each attachment needs a distinct medium role");
             assert_eq!(resource.path, PathBuf::from(path));
             assert_eq!(
@@ -1156,7 +1179,7 @@ mod tests {
             .compile(&draft)
             .expect("stale path is reused");
         assert_eq!(reattached.scsi().len(), 1);
-        assert_eq!(reattached.scsi()[0].medium, medium_id);
+        assert_eq!(reattached.scsi()[0].medium(), Some(&medium_id));
         assert_eq!(
             reattached
                 .resources()
@@ -1167,17 +1190,10 @@ mod tests {
     }
 
     #[test]
-    fn attached_scsi_medium_must_be_valid_text() {
+    fn attached_scsi_medium_must_be_text() {
         for kind in [SCSI_DISK, SCSI_CDROM] {
             let mut draft = valid_draft();
             attach(&mut draft, scsi_lun(1, 0), Some(kind));
-            assert_compile_matches_resolution(&draft);
-            set(
-                &mut draft,
-                scsi_medium(1, 0),
-                PropertyValue::Text("   ".into()),
-            );
-            assert_compile_matches_resolution(&draft);
             set(&mut draft, scsi_medium(1, 0), PropertyValue::Integer(3));
             assert_compile_matches_resolution(&draft);
         }
@@ -1197,11 +1213,11 @@ mod tests {
         let plan = Ip12Definition
             .compile(&draft)
             .expect("path collisions are checked later");
-        assert_ne!(plan.scsi()[0].medium, plan.scsi()[1].medium);
+        assert_ne!(plan.scsi()[0].medium(), plan.scsi()[1].medium());
         for attachment in plan.scsi() {
             assert_eq!(
                 plan.resources()
-                    .get(&attachment.medium)
+                    .get(attachment.medium().unwrap())
                     .map(|item| &item.path),
                 Some(&PathBuf::from("same.img"))
             );
@@ -1788,6 +1804,14 @@ mod tests {
                     kind: PathKind::File
                 }
             );
+            assert_eq!(
+                device.properties[0].label,
+                if kind == SCSI_DISK {
+                    "Disk image"
+                } else {
+                    "Initial medium"
+                }
+            );
         }
         assert!(
             !view
@@ -1802,41 +1826,48 @@ mod tests {
         let slot = scsi_lun(2, 3);
         let medium = scsi_medium(2, 3);
         let target = DiagnosticTarget::Property(medium.clone());
-        for (kind, message) in [
-            (SCSI_DISK, "Select a disk image."),
-            (SCSI_CDROM, "Select a CD-ROM image."),
-        ] {
-            let mut draft = Ip12Definition.default_draft();
-            attach(&mut draft, slot.clone(), Some(kind));
-            let missing = Ip12Definition.resolve(&draft);
+
+        let mut disk = valid_draft();
+        attach(&mut disk, slot.clone(), Some(SCSI_DISK));
+        for missing in [None, Some(""), Some("   ")] {
+            if let Some(path) = missing {
+                set(&mut disk, medium.clone(), PropertyValue::Text(path.into()));
+            }
+            let view = Ip12Definition.resolve(&disk);
             assert_eq!(
-                value(&missing, &medium),
-                &PropertyValue::Text(String::new())
-            );
-            assert_eq!(
-                targeted_codes(&missing, &target),
+                targeted_codes(&view, &target),
                 ["ip12.scsi.medium-required"]
             );
             assert_eq!(
-                missing
-                    .diagnostics
+                view.diagnostics
                     .iter()
                     .find(|diagnostic| diagnostic.target == target)
                     .map(|diagnostic| diagnostic.message.as_str()),
-                Some(message)
+                Some("Select a disk image.")
             );
+            assert!(Ip12Definition.compile(&disk).is_err());
+        }
 
-            set(
-                &mut draft,
-                medium.clone(),
-                PropertyValue::Text(String::new()),
-            );
-            let empty = Ip12Definition.resolve(&draft);
-            assert_eq!(
-                targeted_codes(&empty, &target),
-                ["ip12.scsi.medium-required"]
-            );
+        let mut cdrom = valid_draft();
+        attach(&mut cdrom, slot.clone(), Some(SCSI_CDROM));
+        for missing in [None, Some(""), Some("   ")] {
+            if let Some(path) = missing {
+                set(&mut cdrom, medium.clone(), PropertyValue::Text(path.into()));
+            }
+            let view = Ip12Definition.resolve(&cdrom);
+            assert!(targeted_codes(&view, &target).is_empty());
+            let plan = Ip12Definition
+                .compile(&cdrom)
+                .expect("an empty CD-ROM drive is complete");
+            assert_eq!(plan.scsi().len(), 1);
+            assert_eq!(plan.scsi()[0].device, ScsiDevice::Cdrom);
+            assert_eq!(plan.scsi()[0].medium(), None);
+            assert_eq!(plan.resources().len(), 1);
+        }
 
+        for kind in [SCSI_DISK, SCSI_CDROM] {
+            let mut draft = valid_draft();
+            attach(&mut draft, slot.clone(), Some(kind));
             set(&mut draft, medium.clone(), PropertyValue::Integer(3));
             let wrong_type = Ip12Definition.resolve(&draft);
             assert_eq!(value(&wrong_type, &medium), &PropertyValue::Integer(3));

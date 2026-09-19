@@ -59,6 +59,31 @@ QByteArray decoded_bytes(const rust::String& value) {
         QByteArray(value.data(), static_cast<qsizetype>(value.size())));
 }
 
+QString format_capacity(std::uint64_t bytes) {
+    constexpr std::uint64_t kib = 1024;
+    constexpr std::uint64_t mib = kib * 1024;
+    constexpr std::uint64_t gib = mib * 1024;
+    if (bytes >= gib) {
+        return QStringLiteral("%1 GiB").arg(
+            QString::number(static_cast<double>(bytes) / static_cast<double>(gib), 'f', 1));
+    }
+    if (bytes >= mib) {
+        return QStringLiteral("%1 MiB").arg(
+            QString::number(static_cast<double>(bytes) / static_cast<double>(mib), 'f', 1));
+    }
+    if (bytes >= kib) {
+        return QStringLiteral("%1 KiB").arg(bytes / kib);
+    }
+    return QStringLiteral("%1 bytes").arg(bytes);
+}
+
+bool media_mutations_enabled(PreparationState preparation, const RuntimeStatusDto& status) {
+    // A background preparation keeps driving the machine it is about to
+    // replace, so that machine can still report Normal and would accept a host
+    // media change that the pending configure or reset then discards.
+    return preparation == PreparationState::None && status.success && status.mode == 0;
+}
+
 } // namespace
 
 class PreparationTask final {
@@ -108,6 +133,7 @@ MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     , create_replay_snapshot_action_(nullptr)
     , stop_replay_action_(nullptr)
     , settings_action_(nullptr)
+    , media_menu_(nullptr)
     , disassembly_dock_(nullptr)
     , registers_dock_(nullptr)
     , tlb_dock_(nullptr)
@@ -268,6 +294,13 @@ void MainWindow::create_menus() {
     machine_menu->addSeparator();
     machine_menu->addAction(settings_action_);
 
+    media_menu_ = menuBar()->addMenu(QStringLiteral("Media"));
+    connect(media_menu_, &QMenu::aboutToShow, this, &MainWindow::rebuild_media_menu);
+    // A native macOS menu bar hides an empty menu, which would then never open
+    // and so would never reach its first aboutToShow. Every later open still
+    // re-samples the slot state.
+    rebuild_media_menu();
+
     auto* view_menu = menuBar()->addMenu(QStringLiteral("View"));
     view_menu->addAction(serial_console_dock_->toggleViewAction());
     view_menu->addSeparator();
@@ -327,6 +360,119 @@ void MainWindow::show_notification(const QString& message, int timeout) {
     if (!message.isEmpty() && timeout > 0) {
         notification_timer_->start(timeout);
     }
+}
+
+void MainWindow::rebuild_media_menu() {
+    media_menu_->clear();
+    const auto catalog = session_.media_catalog();
+    if (!catalog.success) {
+        auto* failed = media_menu_->addAction(from_rust_string(catalog.error));
+        failed->setEnabled(false);
+        return;
+    }
+    if (catalog.media_slots.empty()) {
+        auto* absent = media_menu_->addAction(QStringLiteral("No removable media"));
+        absent->setEnabled(false);
+        return;
+    }
+
+    // Media queries stay available in every state; the runtime remains the
+    // final authority for whatever this menu offers.
+    const auto status = session_.runtime_status();
+    const bool mutable_now = media_mutations_enabled(preparation_state_, status);
+
+    for (const auto& slot : catalog.media_slots) {
+        auto* slot_menu = media_menu_->addMenu(from_rust_string(slot.label));
+        const std::uint64_t generation = slot.handle.generation;
+        const std::string key(slot.handle.key.data(), slot.handle.key.size());
+
+        if (slot.medium_present) {
+            QString state =
+                QStringLiteral("Loaded \x2014 %1").arg(format_capacity(slot.medium_size_bytes));
+            if (slot.removal_prevented) {
+                state += QStringLiteral(" \x2014 Locked by guest");
+            }
+            auto* state_action = slot_menu->addAction(state);
+            state_action->setEnabled(false);
+            if (!mutable_now) {
+                auto* blocked =
+                    slot_menu->addAction(QStringLiteral("Host media changes unavailable"));
+                blocked->setEnabled(false);
+            }
+            slot_menu->addSeparator();
+            auto* eject = slot_menu->addAction(QStringLiteral("Eject"));
+            eject->setEnabled(mutable_now && !slot.removal_prevented);
+            connect(eject, &QAction::triggered, this, [this, generation, key] {
+                eject_medium(generation, key, false);
+            });
+            if (slot.removal_prevented) {
+                auto* force = slot_menu->addAction(QStringLiteral("Force Eject..."));
+                force->setEnabled(mutable_now);
+                connect(force, &QAction::triggered, this, [this, generation, key] {
+                    eject_medium(generation, key, true);
+                });
+            }
+        } else {
+            auto* state_action = slot_menu->addAction(QStringLiteral("Empty"));
+            state_action->setEnabled(false);
+            if (!mutable_now) {
+                auto* blocked =
+                    slot_menu->addAction(QStringLiteral("Host media changes unavailable"));
+                blocked->setEnabled(false);
+            }
+            slot_menu->addSeparator();
+            auto* insert = slot_menu->addAction(QStringLiteral("Insert Image..."));
+            insert->setEnabled(mutable_now);
+            connect(insert, &QAction::triggered, this, [this, generation, key] {
+                insert_image(generation, key);
+            });
+        }
+    }
+}
+
+void MainWindow::insert_image(std::uint64_t generation, const std::string& key) {
+    const auto path = QFileDialog::getOpenFileName(
+        this,
+        QStringLiteral("Insert CD-ROM Image"),
+        QString(),
+        QStringLiteral("CD-ROM image (*.iso);;All files (*)"));
+    if (path.isEmpty()) {
+        return;
+    }
+
+    MediaHandleDto handle;
+    handle.generation = generation;
+    handle.key = rust::String(key);
+    const auto status = session_.insert_media(handle, path.toStdString());
+    if (status.success) {
+        show_notification(QStringLiteral("Medium inserted"), 3000);
+    }
+    apply_runtime_status(status, true);
+}
+
+void MainWindow::eject_medium(std::uint64_t generation, const std::string& key, bool force) {
+    if (force) {
+        const auto confirmed = QMessageBox::warning(
+            this,
+            QStringLiteral("Force Eject"),
+            QStringLiteral(
+                "The guest has prevented removal of this medium.\n"
+                "Force eject anyway?"),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        if (confirmed != QMessageBox::Yes) {
+            return;
+        }
+    }
+
+    MediaHandleDto handle;
+    handle.generation = generation;
+    handle.key = rust::String(key);
+    const auto status = session_.eject_media(handle, force);
+    if (status.success) {
+        show_notification(QStringLiteral("Medium ejected"), 3000);
+    }
+    apply_runtime_status(status, true);
 }
 
 void MainWindow::begin_preparation(

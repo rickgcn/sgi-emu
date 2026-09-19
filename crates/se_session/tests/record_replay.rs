@@ -9,11 +9,14 @@ use se_config::draft::{Edit, MachineDraft};
 use se_config::id::{DeviceKindId, NodeId, PropertyId};
 use se_config::value::PropertyValue;
 use se_machine::indigo::ip12::definition::Ip12Definition;
+use se_machine::media::MediaKind;
 use se_machine::resource::ResourceId;
 use se_network::config::NatConfig;
 use se_runtime::control::RuntimeMode;
+use se_runtime::media::RuntimeMediaError;
 use se_runtime::record::Replayer;
-use se_runtime::runtime::Runtime;
+use se_runtime::runtime::{Runtime, RuntimeError};
+use se_session::media::{SessionMediaError, insert_media_from_path};
 use se_session::{recording, replay};
 
 const PROM_BYTES: usize = 0x40000;
@@ -183,6 +186,79 @@ fn multi_scsi_record_replays_recorded_topology_and_relocated_resource() {
     let runtime = Runtime::new_unconfigured().unwrap();
     runtime.configure_with(configuration).unwrap();
     assert_eq!(runtime.step().unwrap().mode, RuntimeMode::ReplayCompleted);
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn an_empty_cdrom_drive_records_and_replays_without_a_medium() {
+    let files = TemporaryFiles::new("record-empty-cdrom");
+    let prom = files.write("prom.bin", vec![0; PROM_BYTES]);
+    let mut draft = Ip12Definition.default_draft();
+    set_path(&mut draft, "firmware.0.image-path", &prom);
+    draft.apply(Edit::SetAttachment {
+        slot: NodeId(String::from("scsi.0.target.4.lun.0")),
+        device: Some(DeviceKindId(String::from("scsi.cdrom"))),
+    });
+
+    let record_path = files.path("empty-cdrom.serec");
+    let (configuration, _) =
+        recording::build_configuration(draft.clone(), NatConfig::default(), record_path.clone())
+            .unwrap()
+            .into_parts();
+    let runtime = Runtime::new_unconfigured().unwrap();
+    runtime.configure_with(configuration).unwrap();
+
+    let catalog = runtime.media_catalog().unwrap();
+    assert_eq!(catalog.slots().len(), 1);
+    assert!(!catalog.slots()[0].state().medium_present());
+    let handle = catalog.slots()[0].handle().clone();
+
+    // No Record or Replay timeline can carry a host media change.
+    let late_medium = files.write("late.iso", vec![0; 2048]);
+    assert!(matches!(
+        insert_media_from_path(
+            &runtime.handle(),
+            handle.clone(),
+            MediaKind::OpticalDisc,
+            &late_medium,
+        ),
+        Err(SessionMediaError::Runtime(RuntimeError::Media(
+            RuntimeMediaError::MutationUnavailable
+        )))
+    ));
+    assert!(matches!(
+        runtime.eject_media(handle, false),
+        Err(RuntimeError::Media(RuntimeMediaError::MutationUnavailable))
+    ));
+
+    assert_eq!(runtime.step().unwrap().mode, RuntimeMode::Recording);
+    assert_eq!(
+        runtime.stop_recording().unwrap().mode,
+        RuntimeMode::RecordCompleted
+    );
+    runtime.shutdown().unwrap();
+
+    let recorded = Replayer::open(&record_path).unwrap();
+    assert_eq!(recorded.manifest().machine(), &draft);
+    assert_eq!(
+        recorded.manifest().resources().len(),
+        1,
+        "an empty drive records no medium resource"
+    );
+    drop(recorded);
+
+    let (configuration, _) = replay::build_configuration(draft, record_path, None)
+        .unwrap()
+        .into_parts();
+    let runtime = Runtime::new_unconfigured().unwrap();
+    runtime.configure_with(configuration).unwrap();
+    let catalog = runtime.media_catalog().unwrap();
+    assert_eq!(catalog.slots().len(), 1);
+    assert!(!catalog.slots()[0].state().medium_present());
+    assert!(matches!(
+        runtime.eject_media(catalog.slots()[0].handle().clone(), false),
+        Err(RuntimeError::Media(RuntimeMediaError::MutationUnavailable))
+    ));
     runtime.shutdown().unwrap();
 }
 

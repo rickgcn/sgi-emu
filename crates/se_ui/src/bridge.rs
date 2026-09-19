@@ -84,6 +84,44 @@ pub mod ffi {
         pub endpoints: Vec<EndpointDescriptorDto>,
     }
 
+    /// Frontend-visible medium family of one removable slot.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum MediaKindDto {
+        OpticalDisc,
+    }
+
+    /// Opaque live media-slot identity.
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct MediaHandleDto {
+        pub generation: u64,
+        pub key: String,
+    }
+
+    /// One removable media slot in the active runtime catalog.
+    #[derive(Debug)]
+    pub struct MediaSlotDto {
+        pub handle: MediaHandleDto,
+        pub label: String,
+        pub kind: MediaKindDto,
+        /// Whether the slot holds a medium.
+        pub medium_present: bool,
+        /// Capacity of the installed medium, or zero when the slot is empty.
+        pub medium_size_bytes: u64,
+        /// Whether the guest locked the slot against removal.
+        pub removal_prevented: bool,
+    }
+
+    /// Coherent active runtime media snapshot.
+    #[derive(Debug)]
+    pub struct MediaCatalogDto {
+        pub success: bool,
+        pub error: String,
+        pub generation: u64,
+        /// Slots in stable machine order. The field avoids the name `slots`
+        /// because Qt defines it as a keyword macro for the C++ frontend.
+        pub media_slots: Vec<MediaSlotDto>,
+    }
+
     /// A generic keyboard key family.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum KeyboardKeyKindDto {
@@ -572,6 +610,9 @@ pub mod ffi {
 
         fn runtime_status(self: &UiSession) -> RuntimeStatusDto;
         fn endpoint_catalog(self: &UiSession) -> EndpointCatalogDto;
+        fn media_catalog(self: &UiSession) -> MediaCatalogDto;
+        fn insert_media(self: &UiSession, handle: &MediaHandleDto, path: &str) -> RuntimeStatusDto;
+        fn eject_media(self: &UiSession, handle: &MediaHandleDto, force: bool) -> RuntimeStatusDto;
         fn refresh_outputs(self: &UiSession) -> RuntimeStatusDto;
         fn begin_machine_edit(self: &UiSession) -> MachineConfigurationViewDto;
         fn apply_machine_edit(

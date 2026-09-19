@@ -354,13 +354,7 @@ mod tests {
         draft
     }
 
-    fn attach_medium(
-        draft: &mut MachineDraft,
-        target: u8,
-        lun: u8,
-        device: ScsiDevice,
-        path: &Path,
-    ) {
+    fn attach_device(draft: &mut MachineDraft, target: u8, lun: u8, device: ScsiDevice) {
         let kind = match device {
             ScsiDevice::Disk => "scsi.disk",
             ScsiDevice::Cdrom => "scsi.cdrom",
@@ -369,6 +363,23 @@ mod tests {
             slot: NodeId(format!("scsi.0.target.{target}.lun.{lun}")),
             device: Some(DeviceKindId(kind.into())),
         });
+    }
+
+    fn set_medium_path(draft: &mut MachineDraft, target: u8, lun: u8, value: &str) {
+        draft.apply(Edit::SetProperty {
+            property: PropertyId(format!("scsi.0.target.{target}.lun.{lun}.medium-path")),
+            value: PropertyValue::Text(value.into()),
+        });
+    }
+
+    fn attach_medium(
+        draft: &mut MachineDraft,
+        target: u8,
+        lun: u8,
+        device: ScsiDevice,
+        path: &Path,
+    ) {
+        attach_device(draft, target, lun, device);
         set_path(
             draft,
             format!("scsi.0.target.{target}.lun.{lun}.medium-path"),
@@ -500,6 +511,53 @@ mod tests {
     fn preflight_skips_host_access_for_semantically_invalid_drafts() {
         let draft = Ip12Definition.default_draft();
         assert!(preflight_configuration(&draft).is_empty());
+    }
+
+    #[test]
+    fn preflight_accepts_an_empty_cdrom_drive_without_opening_a_medium() {
+        let files = TemporaryFiles::new("preflight-empty-cdrom");
+        let firmware = files.write("prom.bin", vec![0; PROM_BYTES]);
+        let mut draft = draft_with_firmware(&firmware);
+        attach_device(&mut draft, 4, 0, ScsiDevice::Cdrom);
+        set_medium_path(&mut draft, 4, 0, "");
+
+        assert!(preflight_configuration(&draft).is_empty());
+
+        let plan = Ip12Definition
+            .compile(&draft)
+            .expect("an empty CD-ROM drive is a complete topology");
+        assert_eq!(plan.scsi().len(), 1);
+        assert_eq!(plan.scsi()[0].medium(), None);
+        assert_eq!(
+            plan.resources()
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["firmware.0.image"],
+            "an empty drive requires no host medium"
+        );
+    }
+
+    #[test]
+    fn an_empty_disk_path_stays_a_semantic_error() {
+        let files = TemporaryFiles::new("empty-disk");
+        let firmware = files.write("prom.bin", vec![0; PROM_BYTES]);
+        let mut draft = draft_with_firmware(&firmware);
+        attach_device(&mut draft, 2, 0, ScsiDevice::Disk);
+        set_medium_path(&mut draft, 2, 0, "");
+
+        assert!(
+            Ip12Definition
+                .resolve(&draft)
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "ip12.scsi.medium-required")
+        );
+        assert!(Ip12Definition.compile(&draft).is_err());
+        assert!(
+            preflight_configuration(&draft).is_empty(),
+            "an invalid draft opens no host file"
+        );
     }
 
     #[test]

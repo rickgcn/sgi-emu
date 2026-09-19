@@ -3,6 +3,7 @@
 mod file_storage;
 pub mod frontend;
 pub mod machine;
+pub mod media;
 pub mod normal;
 pub mod persistence;
 pub mod recording;
