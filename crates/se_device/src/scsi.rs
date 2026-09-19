@@ -70,12 +70,73 @@ pub enum ScsiCommandPlan {
         /// Number of bytes to receive from the initiator.
         byte_count: u64,
     },
+    /// The bus must remove the medium held by the selected removable target.
+    EjectMedium,
+}
+
+/// The backing storage a SCSI target requires from [`ScsiBus`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScsiBackingRequirement {
+    /// The target requires exactly one fixed-capacity storage object.
+    Fixed {
+        /// Required storage capacity in bytes.
+        size_bytes: u64,
+    },
+    /// The target requires a removable slot that may hold no medium.
+    Removable,
+}
+
+/// The source of one removable-medium state change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScsiMediaChangeOrigin {
+    /// Cold machine construction installed host-configured media. The
+    /// initiator configured this hardware before it started, so the change
+    /// carries no unit attention.
+    ColdAttach,
+    /// A host replaced the medium through [`ScsiBus`]. The initiator did not
+    /// request the change and observes a medium-changed unit attention.
+    External,
+    /// The initiator asked for the change with a SCSI command and expects no
+    /// unit attention for its own request.
+    GuestCommand,
+}
+
+/// Removable-slot hooks of a target whose medium can be replaced.
+///
+/// [`ScsiBus`] owns the backing storage while the target owns the state the
+/// initiator observes. Every hook keeps those two views synchronized.
+pub trait ScsiRemovableTarget {
+    /// Reports whether the target accepts a medium of this capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScsiStorageSizeError`] when no supported logical block size
+    /// can address the whole medium.
+    fn validate_medium(&self, size_bytes: u64) -> Result<(), ScsiStorageSizeError>;
+
+    /// Records that a medium of this capacity now occupies the slot.
+    fn medium_inserted(&mut self, size_bytes: u64, origin: ScsiMediaChangeOrigin);
+
+    /// Records that the slot no longer holds a medium.
+    fn medium_removed(&mut self, origin: ScsiMediaChangeOrigin);
+
+    /// Reports whether the initiator locked the slot against removal.
+    fn removal_prevented(&self) -> bool;
+
+    /// Clears the removal lock without an initiator command.
+    fn release_removal_prevention(&mut self);
 }
 
 /// A functional SCSI target attached to [`ScsiBus`].
 pub trait ScsiTarget: Send {
-    /// Returns the required backing-storage size in bytes.
-    fn storage_size_bytes(&self) -> u64;
+    /// Returns the backing storage this target requires from the bus.
+    fn backing_requirement(&self) -> ScsiBackingRequirement;
+
+    /// Returns the removable-slot hooks of a target that reports removable
+    /// backing, and `None` for a fixed target.
+    fn removable_media(&mut self) -> Option<&mut dyn ScsiRemovableTarget> {
+        None
+    }
 
     /// Decodes one command descriptor block.
     fn execute(&mut self, cdb: &[u8]) -> ScsiCommandPlan;
@@ -114,10 +175,17 @@ pub enum ScsiTargetSnapshot {
 }
 
 impl ScsiTargetSnapshot {
-    fn storage_size_bytes(&self) -> u64 {
+    fn backing_requirement(&self) -> ScsiBackingRequirement {
         match self {
-            Self::Disk(target) => target.storage_size_bytes(),
-            Self::Cdrom(target) => target.storage_size_bytes(),
+            Self::Disk(target) => target.backing_requirement(),
+            Self::Cdrom(target) => target.backing_requirement(),
+        }
+    }
+
+    fn medium_size_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Disk(_) => None,
+            Self::Cdrom(target) => target.medium_size_bytes(),
         }
     }
 }
@@ -176,6 +244,18 @@ pub enum ScsiAttachError {
         /// Capacity reported by the storage object.
         storage_bytes: u64,
     },
+    /// The attached storage object is not a valid medium for the target.
+    InvalidMedium {
+        /// Capacity reported by the storage object.
+        storage_bytes: u64,
+    },
+    /// The target does not use removable media.
+    NotRemovable {
+        /// Requested target ID.
+        target_id: u8,
+        /// Requested logical unit number.
+        lun: u8,
+    },
 }
 
 impl fmt::Display for ScsiAttachError {
@@ -200,11 +280,114 @@ impl fmt::Display for ScsiAttachError {
                 formatter,
                 "SCSI target requires {target_bytes} storage bytes, attached storage has {storage_bytes} bytes"
             ),
+            Self::InvalidMedium { storage_bytes } => write!(
+                formatter,
+                "SCSI target rejects a {storage_bytes}-byte medium"
+            ),
+            Self::NotRemovable { target_id, lun } => write!(
+                formatter,
+                "SCSI target {target_id}, LUN {lun} does not use removable media"
+            ),
         }
     }
 }
 
 impl Error for ScsiAttachError {}
+
+/// A caller error encountered while changing removable media.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScsiMediaError {
+    /// The target or LUN is outside the eight-by-eight address space.
+    InvalidAddress {
+        /// Requested target ID.
+        target_id: u8,
+        /// Requested logical unit number.
+        lun: u8,
+    },
+    /// No target is attached at the reported address.
+    NoTarget {
+        /// Requested target ID.
+        target_id: u8,
+        /// Requested logical unit number.
+        lun: u8,
+    },
+    /// The attached target has fixed backing storage.
+    NotRemovable {
+        /// Requested target ID.
+        target_id: u8,
+        /// Requested logical unit number.
+        lun: u8,
+    },
+    /// The removable slot already holds a medium.
+    MediumAlreadyPresent {
+        /// Requested target ID.
+        target_id: u8,
+        /// Requested logical unit number.
+        lun: u8,
+    },
+    /// The removable slot holds no medium.
+    MediumNotPresent {
+        /// Requested target ID.
+        target_id: u8,
+        /// Requested logical unit number.
+        lun: u8,
+    },
+    /// The initiator prevented removal of the installed medium.
+    MediumRemovalPrevented {
+        /// Requested target ID.
+        target_id: u8,
+        /// Requested logical unit number.
+        lun: u8,
+    },
+    /// The supplied medium does not satisfy the target's capacity contract.
+    InvalidMedium {
+        /// Capacity reported by the supplied storage object.
+        storage_bytes: u64,
+    },
+    /// A connection or transaction is in progress on the bus.
+    BusBusy,
+}
+
+impl fmt::Display for ScsiMediaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidAddress { target_id, lun } => {
+                write!(
+                    formatter,
+                    "invalid SCSI address: target {target_id}, LUN {lun}"
+                )
+            }
+            Self::NoTarget { target_id, lun } => {
+                write!(
+                    formatter,
+                    "no SCSI target is attached at target {target_id}, LUN {lun}"
+                )
+            }
+            Self::NotRemovable { target_id, lun } => write!(
+                formatter,
+                "SCSI target {target_id}, LUN {lun} does not use removable media"
+            ),
+            Self::MediumAlreadyPresent { target_id, lun } => write!(
+                formatter,
+                "SCSI target {target_id}, LUN {lun} already holds a medium"
+            ),
+            Self::MediumNotPresent { target_id, lun } => write!(
+                formatter,
+                "SCSI target {target_id}, LUN {lun} holds no medium"
+            ),
+            Self::MediumRemovalPrevented { target_id, lun } => write!(
+                formatter,
+                "medium removal is prevented for SCSI target {target_id}, LUN {lun}"
+            ),
+            Self::InvalidMedium { storage_bytes } => {
+                write!(formatter, "invalid SCSI medium size: {storage_bytes} bytes")
+            }
+            Self::BusBusy => formatter.write_str("SCSI bus is busy with a connection or transfer"),
+        }
+    }
+}
+
+impl Error for ScsiMediaError {}
 
 /// A caller error encountered while coordinating a SCSI transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,9 +540,38 @@ pub enum ScsiTransferResult {
     },
 }
 
+/// The storage behind one attached target.
+enum ScsiBacking {
+    /// The target always owns this storage object.
+    Fixed(Box<dyn StorageMedium>),
+    /// The target owns a slot holding at most one medium.
+    Removable(Option<Box<dyn StorageMedium>>),
+}
+
+impl ScsiBacking {
+    /// Returns the capacity of the installed medium, or `None` when the
+    /// backing holds no medium.
+    fn medium_size_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Fixed(medium) => Some(medium.size_bytes()),
+            Self::Removable(medium) => medium.as_ref().map(|medium| medium.size_bytes()),
+        }
+    }
+
+    /// Returns the installed medium for block transfer, or `None` when the
+    /// backing holds no medium.
+    fn medium_mut(&mut self) -> Option<&mut dyn StorageMedium> {
+        match self {
+            Self::Fixed(medium) => Some(&mut **medium),
+            Self::Removable(Some(medium)) => Some(&mut **medium),
+            Self::Removable(None) => None,
+        }
+    }
+}
+
 struct TargetAttachment {
     target: Box<dyn ScsiTarget>,
-    storage: Box<dyn StorageMedium>,
+    backing: ScsiBacking,
 }
 
 type TargetRegistry = [Option<TargetAttachment>; TARGET_SLOT_COUNT];
@@ -456,10 +668,16 @@ impl ScsiBus {
     /// Restores protocol state while retaining the currently attached storage
     /// objects.
     ///
+    /// A snapshot never carries host storage. A removable target therefore
+    /// restores its medium only when the cold machine already holds a medium
+    /// of the snapshot capacity, while a snapshot of an empty slot clears
+    /// whatever the cold machine installed.
+    ///
     /// # Errors
     ///
     /// Returns [`ScsiSnapshotError`] without changing state when target
-    /// topology, capacity, or an active transfer is incompatible.
+    /// topology, capacity, medium presence, or an active transfer is
+    /// incompatible.
     pub fn restore_snapshot(&mut self, snapshot: ScsiBusSnapshot) -> Result<(), ScsiSnapshotError> {
         let mut target_states: [Option<ScsiTargetSnapshot>; TARGET_SLOT_COUNT] =
             std::array::from_fn(|_| None);
@@ -475,12 +693,12 @@ impl ScsiBus {
                 (None, None) => {}
                 (Some(attachment), Some(state))
                     if attachment.target.accepts_snapshot(state)
-                        && state.storage_size_bytes() == attachment.storage.size_bytes() => {}
+                        && backing_accepts_snapshot(&attachment.backing, state) => {}
                 _ => return Err(ScsiSnapshotError),
             }
         }
         if let Some(transaction) = &snapshot.active_transaction {
-            validate_snapshot_transaction(transaction, &self.targets)?;
+            validate_snapshot_transaction(transaction, &self.targets, &target_states)?;
         }
         if let Some(connection) = &snapshot.connection
             && (!self.target_present(connection.target_id)
@@ -497,6 +715,11 @@ impl ScsiBus {
             let (Some(attachment), Some(state)) = (attachment, state) else {
                 continue;
             };
+            if let ScsiBacking::Removable(medium) = &mut attachment.backing
+                && state.medium_size_bytes().is_none()
+            {
+                *medium = None;
+            }
             if !attachment.target.restore_snapshot(state) {
                 return Err(ScsiSnapshotError);
             }
@@ -790,32 +1013,177 @@ impl ScsiBus {
 
     /// Attaches one target and its backing storage.
     ///
+    /// A removable target receives the storage as the medium it holds from
+    /// cold construction, which carries no unit attention.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScsiAttachError`] for an invalid or occupied address, or when
-    /// target and storage capacities differ.
+    /// Returns [`ScsiAttachError`] for an invalid or occupied address, when a
+    /// fixed target requires another capacity, or when the storage is not a
+    /// valid medium for a removable target.
     pub fn attach(
         &mut self,
         target_id: u8,
         lun: u8,
-        target: Box<dyn ScsiTarget>,
+        mut target: Box<dyn ScsiTarget>,
         storage: Box<dyn StorageMedium>,
+    ) -> Result<(), ScsiAttachError> {
+        let backing = match target.backing_requirement() {
+            ScsiBackingRequirement::Fixed { size_bytes } => {
+                let storage_bytes = storage.size_bytes();
+                if size_bytes != storage_bytes {
+                    return Err(ScsiAttachError::StorageSizeMismatch {
+                        target_bytes: size_bytes,
+                        storage_bytes,
+                    });
+                }
+                ScsiBacking::Fixed(storage)
+            }
+            ScsiBackingRequirement::Removable => {
+                let storage_bytes = storage.size_bytes();
+                let Some(removable) = target.removable_media() else {
+                    return Err(ScsiAttachError::NotRemovable { target_id, lun });
+                };
+                removable
+                    .validate_medium(storage_bytes)
+                    .map_err(|_| ScsiAttachError::InvalidMedium { storage_bytes })?;
+                ScsiBacking::Removable(Some(storage))
+            }
+        };
+        self.attach_backing(target_id, lun, target, backing)
+    }
+
+    /// Attaches one removable target whose slot holds no medium.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScsiAttachError`] for an invalid or occupied address, or when
+    /// the target does not use removable media.
+    pub fn attach_removable_empty(
+        &mut self,
+        target_id: u8,
+        lun: u8,
+        target: Box<dyn ScsiTarget>,
+    ) -> Result<(), ScsiAttachError> {
+        self.attach_backing(target_id, lun, target, ScsiBacking::Removable(None))
+    }
+
+    fn attach_backing(
+        &mut self,
+        target_id: u8,
+        lun: u8,
+        mut target: Box<dyn ScsiTarget>,
+        backing: ScsiBacking,
     ) -> Result<(), ScsiAttachError> {
         let slot = target_slot(target_id, lun)
             .ok_or(ScsiAttachError::InvalidAddress { target_id, lun })?;
         if self.targets[slot].is_some() {
             return Err(ScsiAttachError::AddressOccupied { target_id, lun });
         }
-        let target_bytes = target.storage_size_bytes();
-        let storage_bytes = storage.size_bytes();
-        if target_bytes != storage_bytes {
-            return Err(ScsiAttachError::StorageSizeMismatch {
-                target_bytes,
-                storage_bytes,
-            });
+        match &backing {
+            ScsiBacking::Fixed(_) => {}
+            ScsiBacking::Removable(medium) => {
+                let Some(removable) = target.removable_media() else {
+                    return Err(ScsiAttachError::NotRemovable { target_id, lun });
+                };
+                match medium {
+                    Some(medium) => removable
+                        .medium_inserted(medium.size_bytes(), ScsiMediaChangeOrigin::ColdAttach),
+                    None => removable.medium_removed(ScsiMediaChangeOrigin::ColdAttach),
+                }
+            }
         }
-        self.targets[slot] = Some(TargetAttachment { target, storage });
+        self.targets[slot] = Some(TargetAttachment { target, backing });
         Ok(())
+    }
+
+    /// Installs a medium in the empty removable slot of one attached target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScsiMediaError`] without changing the attachment when the
+    /// address is invalid or empty, the target is not removable or already
+    /// loaded, the bus is not free, or the medium does not satisfy the
+    /// target's capacity contract.
+    pub fn insert_medium(
+        &mut self,
+        target_id: u8,
+        lun: u8,
+        medium: Box<dyn StorageMedium>,
+    ) -> Result<(), ScsiMediaError> {
+        let slot =
+            target_slot(target_id, lun).ok_or(ScsiMediaError::InvalidAddress { target_id, lun })?;
+        let Some(attachment) = self.targets[slot].as_mut() else {
+            return Err(ScsiMediaError::NoTarget { target_id, lun });
+        };
+        let ScsiBacking::Removable(slot_medium) = &mut attachment.backing else {
+            return Err(ScsiMediaError::NotRemovable { target_id, lun });
+        };
+        if slot_medium.is_some() {
+            return Err(ScsiMediaError::MediumAlreadyPresent { target_id, lun });
+        }
+        if self.connection.is_some() || self.active_transaction.is_some() {
+            return Err(ScsiMediaError::BusBusy);
+        }
+        let Some(removable) = attachment.target.removable_media() else {
+            return Err(ScsiMediaError::NotRemovable { target_id, lun });
+        };
+        let medium_bytes = medium.size_bytes();
+        removable
+            .validate_medium(medium_bytes)
+            .map_err(|_| ScsiMediaError::InvalidMedium {
+                storage_bytes: medium_bytes,
+            })?;
+
+        *slot_medium = Some(medium);
+        removable.medium_inserted(medium_bytes, ScsiMediaChangeOrigin::External);
+        Ok(())
+    }
+
+    /// Removes the medium from the removable slot of one attached target.
+    ///
+    /// An eject that the initiator prevented fails unless `force` is set, and
+    /// a forced eject also clears the removal lock so the drive cannot stay
+    /// locked while empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScsiMediaError`] without changing the attachment when the
+    /// address is invalid or empty, the target is not removable or holds no
+    /// medium, the bus is not free, or the initiator prevented removal.
+    pub fn eject_medium(
+        &mut self,
+        target_id: u8,
+        lun: u8,
+        force: bool,
+    ) -> Result<Option<Box<dyn StorageMedium>>, ScsiMediaError> {
+        let slot =
+            target_slot(target_id, lun).ok_or(ScsiMediaError::InvalidAddress { target_id, lun })?;
+        let Some(attachment) = self.targets[slot].as_mut() else {
+            return Err(ScsiMediaError::NoTarget { target_id, lun });
+        };
+        let ScsiBacking::Removable(slot_medium) = &mut attachment.backing else {
+            return Err(ScsiMediaError::NotRemovable { target_id, lun });
+        };
+        if slot_medium.is_none() {
+            return Err(ScsiMediaError::MediumNotPresent { target_id, lun });
+        }
+        if self.connection.is_some() || self.active_transaction.is_some() {
+            return Err(ScsiMediaError::BusBusy);
+        }
+        let Some(removable) = attachment.target.removable_media() else {
+            return Err(ScsiMediaError::NotRemovable { target_id, lun });
+        };
+        if removable.removal_prevented() && !force {
+            return Err(ScsiMediaError::MediumRemovalPrevented { target_id, lun });
+        }
+
+        let medium = slot_medium.take();
+        if force {
+            removable.release_removal_prevention();
+        }
+        removable.medium_removed(ScsiMediaChangeOrigin::External);
+        Ok(medium)
     }
 
     /// Starts one command for the selected target and LUN.
@@ -864,7 +1232,11 @@ impl ScsiBus {
             }
             ScsiCommandPlan::ReceiveDataOut { byte_count } => {
                 if byte_count == 0 {
-                    let status = attachment.target.complete_data_out(cdb, &[]);
+                    let status = self.targets[slot]
+                        .as_mut()
+                        .map_or(ScsiStatus::CheckCondition, |attachment| {
+                            attachment.target.complete_data_out(cdb, &[])
+                        });
                     return Ok(ScsiCommandStart::Complete { status });
                 }
                 self.active_transaction = Some(ScsiTransaction {
@@ -877,6 +1249,31 @@ impl ScsiBus {
                 });
                 Ok(ScsiCommandStart::DataOut { byte_count })
             }
+            ScsiCommandPlan::EjectMedium => Ok(self.eject_guest_medium(slot)),
+        }
+    }
+
+    fn eject_guest_medium(&mut self, slot: usize) -> ScsiCommandStart {
+        let Some(attachment) = self.targets[slot].as_mut() else {
+            return ScsiCommandStart::Complete {
+                status: ScsiStatus::CheckCondition,
+            };
+        };
+        let ScsiBacking::Removable(slot_medium) = &mut attachment.backing else {
+            return ScsiCommandStart::Complete {
+                status: ScsiStatus::CheckCondition,
+            };
+        };
+        if slot_medium.take().is_none() {
+            return ScsiCommandStart::Complete {
+                status: ScsiStatus::Good,
+            };
+        }
+        if let Some(removable) = attachment.target.removable_media() {
+            removable.medium_removed(ScsiMediaChangeOrigin::GuestCommand);
+        }
+        ScsiCommandStart::Complete {
+            status: ScsiStatus::Good,
         }
     }
 
@@ -894,7 +1291,12 @@ impl ScsiBus {
         let range_is_valid = offset.checked_add(byte_count).is_some_and(|end| {
             self.targets[target_slot]
                 .as_ref()
-                .is_some_and(|attachment| end <= attachment.storage.size_bytes())
+                .is_some_and(|attachment| {
+                    attachment
+                        .backing
+                        .medium_size_bytes()
+                        .is_some_and(|size| end <= size)
+                })
         });
         if !range_is_valid {
             let status = self.complete_target_storage(target_slot, false);
@@ -1038,7 +1440,12 @@ impl ScsiBus {
 
         let write_succeeded = self.targets[target_slot]
             .as_mut()
-            .is_some_and(|attachment| attachment.storage.write_all_at(next_offset, &bytes).is_ok());
+            .is_some_and(|attachment| {
+                attachment
+                    .backing
+                    .medium_mut()
+                    .is_some_and(|medium| medium.write_all_at(next_offset, &bytes).is_ok())
+            });
         if !write_succeeded {
             self.active_transaction = None;
             let status = self.complete_target_storage(target_slot, false);
@@ -1213,9 +1620,9 @@ impl ScsiBus {
             .as_mut()
             .is_some_and(|attachment| {
                 attachment
-                    .storage
-                    .read_exact_at(next_offset, &mut bytes)
-                    .is_ok()
+                    .backing
+                    .medium_mut()
+                    .is_some_and(|medium| medium.read_exact_at(next_offset, &mut bytes).is_ok())
             });
         if !read_succeeded {
             self.active_transaction = None;
@@ -1266,14 +1673,44 @@ impl ScsiBus {
     }
 }
 
+fn backing_accepts_snapshot(backing: &ScsiBacking, state: &ScsiTargetSnapshot) -> bool {
+    match (backing, state.backing_requirement()) {
+        (ScsiBacking::Fixed(medium), ScsiBackingRequirement::Fixed { size_bytes }) => {
+            medium.size_bytes() == size_bytes
+        }
+        (ScsiBacking::Removable(medium), ScsiBackingRequirement::Removable) => {
+            match state.medium_size_bytes() {
+                None => true,
+                Some(medium_bytes) => medium
+                    .as_ref()
+                    .is_some_and(|medium| medium.size_bytes() == medium_bytes),
+            }
+        }
+        _ => false,
+    }
+}
+
 fn validate_snapshot_transaction(
     transaction: &ScsiTransaction,
     targets: &TargetRegistry,
+    target_states: &[Option<ScsiTargetSnapshot>; TARGET_SLOT_COUNT],
 ) -> Result<(), ScsiSnapshotError> {
     let attachment = targets
         .get(transaction.target_slot)
         .and_then(Option::as_ref)
         .ok_or(ScsiSnapshotError)?;
+    // A storage transfer must fit the medium the slot holds once the snapshot
+    // is committed. A removable state decides that on its own, and a still
+    // loaded state keeps the cold medium the backing validation matched.
+    let state = target_states
+        .get(transaction.target_slot)
+        .and_then(Option::as_ref);
+    let medium_size_bytes = match state {
+        Some(state) if state.backing_requirement() == ScsiBackingRequirement::Removable => {
+            state.medium_size_bytes()
+        }
+        _ => attachment.backing.medium_size_bytes(),
+    };
     match &transaction.transfer {
         ScsiTransfer::ImmediateDataIn {
             data, next_offset, ..
@@ -1288,7 +1725,7 @@ fn validate_snapshot_transaction(
         } if *remaining != 0
             && next_offset
                 .checked_add(*remaining)
-                .is_some_and(|end| end <= attachment.storage.size_bytes()) =>
+                .is_some_and(|end| medium_size_bytes.is_some_and(|size| end <= size)) =>
         {
             Ok(())
         }
@@ -1351,6 +1788,9 @@ impl SenseData {
     pub(crate) const WRITE_PROTECTED: Self = Self::new(7, 0x27, 0);
     pub(crate) const HOST_IO_ERROR: Self = Self::new(4, 0x44, 0);
     pub(crate) const NOT_READY: Self = Self::new(2, 0x04, 0x02);
+    pub(crate) const MEDIUM_NOT_PRESENT: Self = Self::new(2, 0x3a, 0);
+    pub(crate) const MEDIUM_CHANGED: Self = Self::new(6, 0x28, 0);
+    pub(crate) const MEDIUM_REMOVAL_PREVENTED: Self = Self::new(5, 0x53, 0x02);
 
     const fn new(key: u8, asc: u8, ascq: u8) -> Self {
         Self { key, asc, ascq }
@@ -1378,8 +1818,9 @@ mod tests {
     use se_core::storage::StorageMedium;
 
     use super::{
-        ScsiAttachError, ScsiBus, ScsiBusError, ScsiCommandPlan, ScsiCommandStart,
-        ScsiDataDirection, ScsiPhase, ScsiStatus, ScsiTarget, ScsiTransferResult,
+        ScsiAttachError, ScsiBackingRequirement, ScsiBus, ScsiBusError, ScsiCommandPlan,
+        ScsiCommandStart, ScsiDataDirection, ScsiMediaError, ScsiPhase, ScsiSnapshotError,
+        ScsiStatus, ScsiTarget, ScsiTargetSnapshot, ScsiTransferResult,
     };
 
     struct TestTarget {
@@ -1387,8 +1828,10 @@ mod tests {
     }
 
     impl ScsiTarget for TestTarget {
-        fn storage_size_bytes(&self) -> u64 {
-            self.storage_bytes
+        fn backing_requirement(&self) -> ScsiBackingRequirement {
+            ScsiBackingRequirement::Fixed {
+                size_bytes: self.storage_bytes,
+            }
         }
 
         fn execute(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
@@ -1445,8 +1888,10 @@ mod tests {
     }
 
     impl ScsiTarget for DataOutTarget {
-        fn storage_size_bytes(&self) -> u64 {
-            self.storage_bytes
+        fn backing_requirement(&self) -> ScsiBackingRequirement {
+            ScsiBackingRequirement::Fixed {
+                size_bytes: self.storage_bytes,
+            }
         }
 
         fn execute(&mut self, _cdb: &[u8]) -> ScsiCommandPlan {
@@ -1530,6 +1975,104 @@ mod tests {
         )
         .unwrap();
         bytes
+    }
+
+    const CDROM_TARGET: u8 = 4;
+    const CDROM_BYTES: u64 = 8192;
+    const TEST_UNIT_READY_CDB: [u8; 6] = [0x00, 0, 0, 0, 0, 0];
+    const REQUEST_SENSE_CDB: [u8; 6] = [0x03, 0, 0, 0, 18, 0];
+    const INQUIRY_CDB: [u8; 6] = [0x12, 0, 0, 0, 36, 0];
+    const READ_CDB: [u8; 10] = [0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0];
+    const EJECT_CDB: [u8; 6] = [0x1b, 0, 0, 0, 0x02, 0];
+    const PREVENT_CDB: [u8; 6] = [0x1e, 0, 0, 0, 1, 0];
+    const ALLOW_CDB: [u8; 6] = [0x1e, 0, 0, 0, 0, 0];
+
+    fn medium_storage(bytes: u64) -> Box<dyn StorageMedium> {
+        Box::new(TestStorage {
+            bytes: Arc::new(Mutex::new(vec![0; bytes as usize])),
+            fail_reads: false,
+            fail_writes: false,
+        })
+    }
+
+    fn attach_cdrom(bus: &mut ScsiBus) {
+        bus.attach(
+            CDROM_TARGET,
+            0,
+            Box::new(ScsiCdrom::try_new(CDROM_BYTES).unwrap()),
+            medium_storage(CDROM_BYTES),
+        )
+        .unwrap();
+    }
+
+    fn attach_empty_cdrom(bus: &mut ScsiBus) {
+        bus.attach_removable_empty(CDROM_TARGET, 0, Box::new(ScsiCdrom::new_empty()))
+            .unwrap();
+    }
+
+    fn run_cdrom_command(bus: &mut ScsiBus, cdb: &[u8]) -> (ScsiStatus, Vec<u8>) {
+        match bus.start_command(CDROM_TARGET, 0, cdb).unwrap() {
+            ScsiCommandStart::Complete { status } => (status, Vec::new()),
+            ScsiCommandStart::DataIn { .. } => {
+                let mut data = Vec::new();
+                let result = bus
+                    .transfer_data_in(CDROM_BYTES as usize, |chunk| {
+                        data.extend_from_slice(chunk);
+                        true
+                    })
+                    .unwrap();
+                let ScsiTransferResult::Complete { status, .. } = result else {
+                    panic!("a bounded SCSI data-in transfer completes in one call");
+                };
+                (status, data)
+            }
+            ScsiCommandStart::DataOut { byte_count } => {
+                let mut remaining = byte_count;
+                let mut status = ScsiStatus::CheckCondition;
+                while remaining != 0 {
+                    match bus
+                        .transfer_data_out(remaining as usize, |buffer| {
+                            buffer.fill(0);
+                            true
+                        })
+                        .unwrap()
+                    {
+                        ScsiTransferResult::More {
+                            remaining: left, ..
+                        } => remaining = left,
+                        ScsiTransferResult::Complete {
+                            status: final_status,
+                            ..
+                        } => {
+                            status = final_status;
+                            break;
+                        }
+                        ScsiTransferResult::Rejected => {
+                            panic!("the test provider never rejects a chunk");
+                        }
+                    }
+                }
+                (status, Vec::new())
+            }
+            ScsiCommandStart::SelectionTimeout => {
+                panic!("an attached CD-ROM target must stay selectable");
+            }
+        }
+    }
+
+    fn cdrom_status(bus: &mut ScsiBus, cdb: &[u8]) -> ScsiStatus {
+        run_cdrom_command(bus, cdb).0
+    }
+
+    fn eject(bus: &mut ScsiBus, target_id: u8, force: bool) -> Result<Option<u64>, ScsiMediaError> {
+        bus.eject_medium(target_id, 0, force)
+            .map(|medium| medium.map(|medium| medium.size_bytes()))
+    }
+
+    fn read_sense_code(bus: &mut ScsiBus) -> (u8, u8, u8) {
+        let (status, data) = run_cdrom_command(bus, &REQUEST_SENSE_CDB);
+        assert_eq!(status, ScsiStatus::Good);
+        (data[2], data[12], data[13])
     }
 
     #[test]
@@ -2009,6 +2552,428 @@ mod tests {
             bus.transfer_data_in(1, |_| true),
             Err(ScsiBusError::NoDataInTransaction)
         );
+    }
+
+    #[test]
+    fn guest_eject_keeps_the_target_attached_and_reports_medium_not_present() {
+        let mut bus = ScsiBus::new();
+        attach_cdrom(&mut bus);
+
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::Good
+        );
+        assert_eq!(cdrom_status(&mut bus, &EJECT_CDB), ScsiStatus::Good);
+
+        assert!(bus.target_present(CDROM_TARGET));
+        let (status, data) = run_cdrom_command(&mut bus, &INQUIRY_CDB);
+        assert_eq!(status, ScsiStatus::Good);
+        assert_eq!(data[0], 0x05);
+        assert_eq!(data[1] & 0x80, 0x80);
+
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (2, 0x3a, 0));
+        assert_eq!(
+            eject(&mut bus, CDROM_TARGET, false),
+            Err(ScsiMediaError::MediumNotPresent {
+                target_id: CDROM_TARGET,
+                lun: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn external_eject_raises_medium_changed_before_reporting_an_empty_slot() {
+        let mut bus = ScsiBus::new();
+        attach_cdrom(&mut bus);
+
+        assert_eq!(eject(&mut bus, CDROM_TARGET, false), Ok(Some(CDROM_BYTES)));
+
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (6, 0x28, 0));
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (2, 0x3a, 0));
+    }
+
+    #[test]
+    fn external_insert_raises_medium_changed_then_becomes_ready() {
+        let mut bus = ScsiBus::new();
+        attach_empty_cdrom(&mut bus);
+
+        assert_eq!(
+            bus.insert_medium(CDROM_TARGET, 0, medium_storage(CDROM_BYTES)),
+            Ok(())
+        );
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (6, 0x28, 0));
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::Good
+        );
+        assert_eq!(
+            bus.insert_medium(CDROM_TARGET, 0, medium_storage(CDROM_BYTES)),
+            Err(ScsiMediaError::MediumAlreadyPresent {
+                target_id: CDROM_TARGET,
+                lun: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn inquiry_and_request_sense_do_not_consume_pending_unit_attention() {
+        let mut bus = ScsiBus::new();
+        attach_cdrom(&mut bus);
+        bus.eject_medium(CDROM_TARGET, 0, false).unwrap();
+
+        assert_eq!(read_sense_code(&mut bus), (0, 0, 0));
+        assert_eq!(cdrom_status(&mut bus, &INQUIRY_CDB), ScsiStatus::Good);
+        assert_eq!(read_sense_code(&mut bus), (0, 0, 0));
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (6, 0x28, 0));
+    }
+
+    #[test]
+    fn prevent_allow_blocks_host_and_guest_ejection() {
+        let mut bus = ScsiBus::new();
+        attach_cdrom(&mut bus);
+
+        assert_eq!(cdrom_status(&mut bus, &PREVENT_CDB), ScsiStatus::Good);
+        assert_eq!(
+            eject(&mut bus, CDROM_TARGET, false),
+            Err(ScsiMediaError::MediumRemovalPrevented {
+                target_id: CDROM_TARGET,
+                lun: 0,
+            })
+        );
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::Good
+        );
+
+        assert_eq!(
+            cdrom_status(&mut bus, &EJECT_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (5, 0x53, 0x02));
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::Good
+        );
+
+        assert_eq!(cdrom_status(&mut bus, &ALLOW_CDB), ScsiStatus::Good);
+        assert_eq!(cdrom_status(&mut bus, &EJECT_CDB), ScsiStatus::Good);
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (2, 0x3a, 0));
+    }
+
+    #[test]
+    fn forced_eject_overrides_the_removal_lock_without_poisoning_the_next_medium() {
+        let mut bus = ScsiBus::new();
+        attach_cdrom(&mut bus);
+        cdrom_status(&mut bus, &PREVENT_CDB);
+
+        assert_eq!(eject(&mut bus, CDROM_TARGET, true), Ok(Some(CDROM_BYTES)));
+        assert!(bus.target_present(CDROM_TARGET));
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (6, 0x28, 0));
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (2, 0x3a, 0));
+
+        bus.insert_medium(CDROM_TARGET, 0, medium_storage(CDROM_BYTES))
+            .unwrap();
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (6, 0x28, 0));
+        assert_eq!(eject(&mut bus, CDROM_TARGET, false), Ok(Some(CDROM_BYTES)));
+    }
+
+    #[test]
+    fn host_media_changes_require_a_free_bus() {
+        let mut bus = ScsiBus::new();
+        attach_cdrom(&mut bus);
+        assert_eq!(bus.select(CDROM_TARGET, false), Ok(true));
+        assert_eq!(
+            bus.insert_medium(CDROM_TARGET, 0, medium_storage(CDROM_BYTES)),
+            Err(ScsiMediaError::MediumAlreadyPresent {
+                target_id: CDROM_TARGET,
+                lun: 0,
+            })
+        );
+        assert_eq!(
+            eject(&mut bus, CDROM_TARGET, false),
+            Err(ScsiMediaError::BusBusy)
+        );
+        bus.cancel_transaction();
+
+        let mut bus = ScsiBus::new();
+        attach_empty_cdrom(&mut bus);
+        assert_eq!(
+            bus.start_command(CDROM_TARGET, 0, &[0x15, 0, 0, 0, 12, 0]),
+            Ok(ScsiCommandStart::DataOut { byte_count: 12 })
+        );
+        assert_eq!(
+            bus.insert_medium(CDROM_TARGET, 0, medium_storage(CDROM_BYTES)),
+            Err(ScsiMediaError::BusBusy)
+        );
+        assert_eq!(
+            eject(&mut bus, CDROM_TARGET, false),
+            Err(ScsiMediaError::MediumNotPresent {
+                target_id: CDROM_TARGET,
+                lun: 0,
+            })
+        );
+        bus.cancel_transaction();
+        assert_eq!(
+            bus.insert_medium(CDROM_TARGET, 0, medium_storage(CDROM_BYTES)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn invalid_mediums_leave_an_empty_drive_untouched() {
+        let mut bus = ScsiBus::new();
+        attach_empty_cdrom(&mut bus);
+
+        for storage_bytes in [0, CDROM_BYTES + 512] {
+            assert_eq!(
+                bus.insert_medium(CDROM_TARGET, 0, medium_storage(storage_bytes)),
+                Err(ScsiMediaError::InvalidMedium { storage_bytes })
+            );
+        }
+        assert_eq!(
+            cdrom_status(&mut bus, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut bus), (2, 0x3a, 0));
+    }
+
+    #[test]
+    fn host_media_changes_report_addressing_and_capability_errors() {
+        let mut bus = ScsiBus::new();
+        assert_eq!(
+            bus.insert_medium(8, 0, medium_storage(CDROM_BYTES)),
+            Err(ScsiMediaError::InvalidAddress {
+                target_id: 8,
+                lun: 0,
+            })
+        );
+        assert_eq!(
+            eject(&mut bus, 1, false),
+            Err(ScsiMediaError::NoTarget {
+                target_id: 1,
+                lun: 0,
+            })
+        );
+
+        let mut bus = ScsiBus::new();
+        attach_test_target(&mut bus, false, false);
+        assert_eq!(
+            bus.insert_medium(1, 0, medium_storage(8)),
+            Err(ScsiMediaError::NotRemovable {
+                target_id: 1,
+                lun: 0,
+            })
+        );
+        assert_eq!(
+            eject(&mut bus, 1, false),
+            Err(ScsiMediaError::NotRemovable {
+                target_id: 1,
+                lun: 0,
+            })
+        );
+        let mut bus = ScsiBus::new();
+        assert_eq!(
+            bus.attach_removable_empty(1, 0, Box::new(TestTarget { storage_bytes: 8 })),
+            Err(ScsiAttachError::NotRemovable {
+                target_id: 1,
+                lun: 0,
+            })
+        );
+        assert_eq!(
+            bus.attach_removable_empty(1, 0, Box::new(ScsiCdrom::try_new(CDROM_BYTES).unwrap()),),
+            Ok(())
+        );
+        assert_eq!(
+            eject(&mut bus, 1, false),
+            Err(ScsiMediaError::MediumNotPresent {
+                target_id: 1,
+                lun: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn snapshot_restores_a_guest_ejected_medium_as_absent() {
+        let mut original = ScsiBus::new();
+        attach_cdrom(&mut original);
+        assert_eq!(cdrom_status(&mut original, &EJECT_CDB), ScsiStatus::Good);
+        let snapshot = original.snapshot().unwrap();
+
+        let mut restored = ScsiBus::new();
+        attach_cdrom(&mut restored);
+        restored.restore_snapshot(snapshot).unwrap();
+
+        assert!(restored.target_present(CDROM_TARGET));
+        assert_eq!(
+            cdrom_status(&mut restored, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut restored), (2, 0x3a, 0));
+        assert_eq!(
+            eject(&mut restored, CDROM_TARGET, false),
+            Err(ScsiMediaError::MediumNotPresent {
+                target_id: CDROM_TARGET,
+                lun: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_an_active_transfer_on_a_cleared_medium() {
+        let mut original = ScsiBus::new();
+        attach_cdrom(&mut original);
+        assert_eq!(
+            original.start_command(CDROM_TARGET, 0, &READ_CDB),
+            Ok(ScsiCommandStart::DataIn { byte_count: 512 })
+        );
+        let mut snapshot = original.snapshot().unwrap();
+
+        let mut restored = ScsiBus::new();
+        attach_cdrom(&mut restored);
+        assert_eq!(restored.restore_snapshot(snapshot.clone()), Ok(()));
+        assert_eq!(restored.active_address(), Some((CDROM_TARGET, 0)));
+
+        // An empty medium cannot hold a block transfer, so a snapshot pairing
+        // both describes a state the drive can never reach on its own.
+        snapshot.targets = snapshot
+            .targets
+            .into_iter()
+            .map(|(target_id, lun, state)| match state {
+                ScsiTargetSnapshot::Cdrom(_) => (
+                    target_id,
+                    lun,
+                    ScsiTargetSnapshot::Cdrom(ScsiCdrom::new_empty()),
+                ),
+                state => (target_id, lun, state),
+            })
+            .collect();
+
+        let mut poisoned = ScsiBus::new();
+        attach_cdrom(&mut poisoned);
+        assert_eq!(poisoned.restore_snapshot(snapshot), Err(ScsiSnapshotError));
+        assert_eq!(poisoned.active_address(), None);
+        assert_eq!(
+            cdrom_status(&mut poisoned, &TEST_UNIT_READY_CDB),
+            ScsiStatus::Good
+        );
+        assert_eq!(
+            eject(&mut poisoned, CDROM_TARGET, false),
+            Ok(Some(CDROM_BYTES))
+        );
+    }
+
+    #[test]
+    fn snapshot_never_supplies_a_medium_the_host_does_not_hold() {
+        let mut original = ScsiBus::new();
+        attach_cdrom(&mut original);
+        let snapshot = original.snapshot().unwrap();
+
+        let mut empty = ScsiBus::new();
+        attach_empty_cdrom(&mut empty);
+        assert_eq!(empty.restore_snapshot(snapshot), Err(ScsiSnapshotError));
+        assert_eq!(
+            cdrom_status(&mut empty, &TEST_UNIT_READY_CDB),
+            ScsiStatus::CheckCondition
+        );
+        assert_eq!(read_sense_code(&mut empty), (2, 0x3a, 0));
+
+        let mut original = ScsiBus::new();
+        attach_cdrom(&mut original);
+        let snapshot = original.snapshot().unwrap();
+        let mut other = ScsiBus::new();
+        other
+            .attach(
+                CDROM_TARGET,
+                0,
+                Box::new(ScsiCdrom::try_new(CDROM_BYTES * 2).unwrap()),
+                medium_storage(CDROM_BYTES * 2),
+            )
+            .unwrap();
+        assert_eq!(other.restore_snapshot(snapshot), Err(ScsiSnapshotError));
+    }
+
+    #[test]
+    fn snapshot_keeps_the_strict_fixed_disk_capacity_rule() {
+        let mut original = ScsiBus::new();
+        original
+            .attach(
+                1,
+                0,
+                Box::new(ScsiDisk::try_new(512).unwrap()),
+                medium_storage(512),
+            )
+            .unwrap();
+        let snapshot = original.snapshot().unwrap();
+
+        let mut other = ScsiBus::new();
+        other
+            .attach(
+                1,
+                0,
+                Box::new(ScsiDisk::try_new(1024).unwrap()),
+                medium_storage(1024),
+            )
+            .unwrap();
+        assert_eq!(other.restore_snapshot(snapshot), Err(ScsiSnapshotError));
+
+        let snapshot = {
+            let mut original = ScsiBus::new();
+            original
+                .attach(
+                    1,
+                    0,
+                    Box::new(ScsiDisk::try_new(512).unwrap()),
+                    medium_storage(512),
+                )
+                .unwrap();
+            original.snapshot().unwrap()
+        };
+        let mut matching = ScsiBus::new();
+        matching
+            .attach(
+                1,
+                0,
+                Box::new(ScsiDisk::try_new(512).unwrap()),
+                medium_storage(512),
+            )
+            .unwrap();
+        assert_eq!(matching.restore_snapshot(snapshot), Ok(()));
     }
 
     #[test]

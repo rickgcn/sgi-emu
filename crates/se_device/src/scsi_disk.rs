@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::scsi::{
-    ScsiCommandPlan, ScsiStatus, ScsiStorageSizeError, ScsiTarget, ScsiTargetSnapshot, SenseData,
+    ScsiBackingRequirement, ScsiCommandPlan, ScsiStatus, ScsiStorageSizeError, ScsiTarget,
+    ScsiTargetSnapshot, SenseData,
 };
 
 const BLOCK_BYTES: u32 = 512;
@@ -48,6 +49,12 @@ impl ScsiDisk {
             ready: true,
             sense: SenseData::NONE,
         })
+    }
+
+    /// Returns the capacity of the storage the disk always owns.
+    #[must_use]
+    pub(crate) fn storage_size_bytes(&self) -> u64 {
+        self.block_count * u64::from(BLOCK_BYTES)
     }
 
     fn request_sense(&mut self, allocation_length: u8) -> ScsiCommandPlan {
@@ -167,8 +174,10 @@ impl ScsiDisk {
 }
 
 impl ScsiTarget for ScsiDisk {
-    fn storage_size_bytes(&self) -> u64 {
-        self.block_count * u64::from(BLOCK_BYTES)
+    fn backing_requirement(&self) -> ScsiBackingRequirement {
+        ScsiBackingRequirement::Fixed {
+            size_bytes: self.storage_size_bytes(),
+        }
     }
 
     fn snapshot(&self) -> Option<ScsiTargetSnapshot> {

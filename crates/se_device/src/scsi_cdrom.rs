@@ -1,9 +1,10 @@
-//! Functional read-only SCSI CD-ROM target backed by a raw media image.
+//! Functional read-only SCSI CD-ROM drive with a removable medium slot.
 
 use serde::{Deserialize, Serialize};
 
 use crate::scsi::{
-    ScsiCommandPlan, ScsiStatus, ScsiStorageSizeError, ScsiTarget, ScsiTargetSnapshot, SenseData,
+    ScsiBackingRequirement, ScsiCommandPlan, ScsiMediaChangeOrigin, ScsiRemovableTarget,
+    ScsiStatus, ScsiStorageSizeError, ScsiTarget, ScsiTargetSnapshot, SenseData,
 };
 
 const INITIAL_LOGICAL_BLOCK_BYTES: u32 = 512;
@@ -23,17 +24,19 @@ const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2a;
 const SGI_HD_TO_CDROM: u8 = 0xc9;
 
-/// Software-visible state of one read-only SCSI CD-ROM target.
+/// Software-visible state of one read-only SCSI CD-ROM drive.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct ScsiCdrom {
-    storage_bytes: u64,
+    medium_bytes: Option<u64>,
     logical_block_bytes: u32,
-    ready: bool,
+    started: bool,
+    removal_prevented: bool,
+    pending_unit_attention: Option<SenseData>,
     sense: SenseData,
 }
 
 impl ScsiCdrom {
-    /// Creates a ready target for a validated raw-media capacity.
+    /// Creates a started drive holding a medium of the validated capacity.
     ///
     /// # Errors
     ///
@@ -41,18 +44,32 @@ impl ScsiCdrom {
     /// a multiple of 2048 bytes, or cannot be represented as 512-byte logical
     /// blocks by `READ CAPACITY(10)`.
     pub fn try_new(storage_bytes: u64) -> Result<Self, ScsiStorageSizeError> {
-        if storage_bytes == 0
-            || !storage_bytes.is_multiple_of(STORAGE_ALIGNMENT_BYTES)
-            || storage_bytes / u64::from(INITIAL_LOGICAL_BLOCK_BYTES) > u64::from(u32::MAX) + 1
-        {
-            return Err(ScsiStorageSizeError::new(storage_bytes));
-        }
+        validate_medium_size(storage_bytes)?;
         Ok(Self {
-            storage_bytes,
-            logical_block_bytes: INITIAL_LOGICAL_BLOCK_BYTES,
-            ready: true,
-            sense: SenseData::NONE,
+            medium_bytes: Some(storage_bytes),
+            started: true,
+            ..Self::new_empty()
         })
+    }
+
+    /// Creates a stopped drive whose slot holds no medium.
+    #[must_use]
+    pub fn new_empty() -> Self {
+        Self {
+            medium_bytes: None,
+            logical_block_bytes: INITIAL_LOGICAL_BLOCK_BYTES,
+            started: false,
+            removal_prevented: false,
+            pending_unit_attention: None,
+            sense: SenseData::NONE,
+        }
+    }
+
+    /// Returns the capacity of the installed medium, or `None` when the slot
+    /// is empty.
+    #[must_use]
+    pub(crate) fn medium_size_bytes(&self) -> Option<u64> {
+        self.medium_bytes
     }
 
     fn request_sense(&mut self, allocation_length: u8) -> ScsiCommandPlan {
@@ -101,10 +118,10 @@ impl ScsiCdrom {
         }
 
         let logical_block_bytes = u32::from_be_bytes([0, data[9], data[10], data[11]]);
-        if !SUPPORTED_LOGICAL_BLOCK_BYTES.contains(&logical_block_bytes)
-            || !self
-                .storage_bytes
-                .is_multiple_of(u64::from(logical_block_bytes))
+        let addresses_whole_medium = self
+            .medium_bytes
+            .is_none_or(|bytes| bytes.is_multiple_of(u64::from(logical_block_bytes)));
+        if !SUPPORTED_LOGICAL_BLOCK_BYTES.contains(&logical_block_bytes) || !addresses_whole_medium
         {
             return self.parameter_list_error();
         }
@@ -114,19 +131,52 @@ impl ScsiCdrom {
     }
 
     fn start_stop(&mut self, control: u8) -> ScsiCommandPlan {
-        if control & 0x02 != 0 {
+        let load_eject = control & 0x02 != 0;
+        let start = control & 0x01 != 0;
+        match (load_eject, start) {
+            (false, _) => {
+                self.started = start;
+                complete_good(Vec::new())
+            }
+            (true, true) => {
+                // A load request never manufactures a medium the host did not provide.
+                self.started = true;
+                complete_good(Vec::new())
+            }
+            (true, false) if self.medium_bytes.is_none() => complete_good(Vec::new()),
+            (true, false) if self.removal_prevented => {
+                self.check_condition(SenseData::MEDIUM_REMOVAL_PREVENTED)
+            }
+            (true, false) => ScsiCommandPlan::EjectMedium,
+        }
+    }
+
+    fn prevent_allow(&mut self, cdb: &[u8]) -> ScsiCommandPlan {
+        if cdb[2] != 0 || cdb[3] != 0 {
             return self.check_condition(SenseData::INVALID_CDB_FIELD);
         }
-        self.ready = control & 1 != 0;
+        self.removal_prevented = cdb[4] & 1 != 0;
         complete_good(Vec::new())
     }
 
-    fn read_capacity(&mut self) -> ScsiCommandPlan {
-        if !self.ready {
-            return self.check_condition(SenseData::NOT_READY);
+    /// Returns the installed medium capacity, or the failure plan reported by
+    /// every command that needs a started medium.
+    fn ready_medium_bytes(&mut self) -> Result<u64, ScsiCommandPlan> {
+        let Some(medium_bytes) = self.medium_bytes else {
+            return Err(self.check_condition(SenseData::MEDIUM_NOT_PRESENT));
+        };
+        if !self.started {
+            return Err(self.check_condition(SenseData::NOT_READY));
         }
-        let Some(last_lba) = self
-            .logical_block_count()
+        Ok(medium_bytes)
+    }
+
+    fn read_capacity(&mut self) -> ScsiCommandPlan {
+        let medium_bytes = match self.ready_medium_bytes() {
+            Ok(medium_bytes) => medium_bytes,
+            Err(plan) => return plan,
+        };
+        let Some(last_lba) = (medium_bytes / u64::from(self.logical_block_bytes))
             .checked_sub(1)
             .and_then(|last_lba| u32::try_from(last_lba).ok())
         else {
@@ -146,16 +196,17 @@ impl ScsiCdrom {
     }
 
     fn read_blocks(&mut self, lba: u32, block_count: u16) -> ScsiCommandPlan {
-        if !self.ready {
-            return self.check_condition(SenseData::NOT_READY);
-        }
+        let medium_bytes = match self.ready_medium_bytes() {
+            Ok(medium_bytes) => medium_bytes,
+            Err(plan) => return plan,
+        };
         if block_count == 0 {
             return complete_good(Vec::new());
         }
         let Some(end) = u64::from(lba).checked_add(u64::from(block_count)) else {
             return self.check_condition(SenseData::LBA_OUT_OF_RANGE);
         };
-        if end > self.logical_block_count() {
+        if end > medium_bytes / u64::from(self.logical_block_bytes) {
             return self.check_condition(SenseData::LBA_OUT_OF_RANGE);
         }
         let Some(offset) = u64::from(lba).checked_mul(u64::from(self.logical_block_bytes)) else {
@@ -169,16 +220,17 @@ impl ScsiCdrom {
         ScsiCommandPlan::ReadStorage { offset, byte_count }
     }
 
-    fn logical_block_count(&self) -> u64 {
-        self.storage_bytes / u64::from(self.logical_block_bytes)
-    }
-
     fn accepts_cdrom_snapshot(&self, state: &Self) -> bool {
-        state.storage_bytes == self.storage_bytes
-            && SUPPORTED_LOGICAL_BLOCK_BYTES.contains(&state.logical_block_bytes)
-            && state
-                .storage_bytes
-                .is_multiple_of(u64::from(state.logical_block_bytes))
+        if !SUPPORTED_LOGICAL_BLOCK_BYTES.contains(&state.logical_block_bytes) {
+            return false;
+        }
+        let Some(medium_bytes) = state.medium_bytes else {
+            return true;
+        };
+        // A snapshot never carries host storage, so a loaded state restores
+        // only into a drive already holding a medium of the same capacity.
+        self.medium_bytes == state.medium_bytes
+            && medium_bytes.is_multiple_of(u64::from(state.logical_block_bytes))
     }
 
     fn parameter_list_error(&mut self) -> ScsiStatus {
@@ -195,9 +247,43 @@ impl ScsiCdrom {
     }
 }
 
+impl ScsiRemovableTarget for ScsiCdrom {
+    fn validate_medium(&self, size_bytes: u64) -> Result<(), ScsiStorageSizeError> {
+        validate_medium_size(size_bytes)
+    }
+
+    fn medium_inserted(&mut self, size_bytes: u64, origin: ScsiMediaChangeOrigin) {
+        self.medium_bytes = Some(size_bytes);
+        self.started = true;
+        if origin == ScsiMediaChangeOrigin::External {
+            self.pending_unit_attention = Some(SenseData::MEDIUM_CHANGED);
+        }
+    }
+
+    fn medium_removed(&mut self, origin: ScsiMediaChangeOrigin) {
+        self.medium_bytes = None;
+        self.started = false;
+        if origin == ScsiMediaChangeOrigin::External {
+            self.pending_unit_attention = Some(SenseData::MEDIUM_CHANGED);
+        }
+    }
+
+    fn removal_prevented(&self) -> bool {
+        self.removal_prevented
+    }
+
+    fn release_removal_prevention(&mut self) {
+        self.removal_prevented = false;
+    }
+}
+
 impl ScsiTarget for ScsiCdrom {
-    fn storage_size_bytes(&self) -> u64 {
-        self.storage_bytes
+    fn backing_requirement(&self) -> ScsiBackingRequirement {
+        ScsiBackingRequirement::Removable
+    }
+
+    fn removable_media(&mut self) -> Option<&mut dyn ScsiRemovableTarget> {
+        Some(self)
     }
 
     fn snapshot(&self) -> Option<ScsiTargetSnapshot> {
@@ -225,21 +311,26 @@ impl ScsiTarget for ScsiCdrom {
             return self.check_condition(SenseData::INVALID_CDB_FIELD);
         };
 
+        // INQUIRY and REQUEST SENSE describe the drive itself, so they report
+        // a pending unit attention without consuming it.
+        if !matches!(opcode, INQUIRY | REQUEST_SENSE)
+            && let Some(attention) = self.pending_unit_attention.take()
+        {
+            return self.check_condition(attention);
+        }
+
         match opcode {
-            TEST_UNIT_READY if cdb.len() >= 6 => {
-                if self.ready {
-                    complete_good(Vec::new())
-                } else {
-                    self.check_condition(SenseData::NOT_READY)
-                }
-            }
+            TEST_UNIT_READY if cdb.len() >= 6 => match self.ready_medium_bytes() {
+                Ok(_) => complete_good(Vec::new()),
+                Err(plan) => plan,
+            },
             REQUEST_SENSE if cdb.len() >= 6 => self.request_sense(cdb[4]),
             READ_6 if cdb.len() >= 6 => self.read_6(cdb),
             INQUIRY if cdb.len() >= 6 => self.inquiry(cdb[4]),
             MODE_SELECT_6 if cdb.len() >= 6 => self.mode_select(cdb),
             MODE_SENSE_6 if cdb.len() >= 6 => self.mode_sense(cdb[4]),
             START_STOP_UNIT if cdb.len() >= 6 => self.start_stop(cdb[4]),
-            PREVENT_ALLOW_MEDIUM_REMOVAL if cdb.len() >= 6 => complete_good(Vec::new()),
+            PREVENT_ALLOW_MEDIUM_REMOVAL if cdb.len() >= 6 => self.prevent_allow(cdb),
             READ_CAPACITY_10 if cdb.len() >= 10 => self.read_capacity(),
             READ_10 if cdb.len() >= 10 => self.read_blocks(
                 u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]),
@@ -284,6 +375,16 @@ impl ScsiTarget for ScsiCdrom {
     }
 }
 
+fn validate_medium_size(storage_bytes: u64) -> Result<(), ScsiStorageSizeError> {
+    if storage_bytes == 0
+        || !storage_bytes.is_multiple_of(STORAGE_ALIGNMENT_BYTES)
+        || storage_bytes / u64::from(INITIAL_LOGICAL_BLOCK_BYTES) > u64::from(u32::MAX) + 1
+    {
+        return Err(ScsiStorageSizeError::new(storage_bytes));
+    }
+    Ok(())
+}
+
 fn complete_good(data_in: Vec<u8>) -> ScsiCommandPlan {
     ScsiCommandPlan::Complete {
         status: ScsiStatus::Good,
@@ -293,7 +394,10 @@ fn complete_good(data_in: Vec<u8>) -> ScsiCommandPlan {
 
 #[cfg(test)]
 mod tests {
-    use crate::scsi::{ScsiCommandPlan, ScsiStatus, ScsiTarget, ScsiTargetSnapshot};
+    use crate::scsi::{
+        ScsiBackingRequirement, ScsiCommandPlan, ScsiRemovableTarget, ScsiStatus, ScsiTarget,
+        ScsiTargetSnapshot,
+    };
 
     use super::{INITIAL_LOGICAL_BLOCK_BYTES, SUPPORTED_LOGICAL_BLOCK_BYTES, ScsiCdrom};
 
@@ -372,7 +476,7 @@ mod tests {
             ScsiStatus::Good
         );
         assert_eq!(cdrom.logical_block_bytes, selected_block_bytes);
-        assert_eq!(cdrom.storage_size_bytes(), 8192);
+        assert_eq!(cdrom.medium_size_bytes(), Some(8192));
 
         let ScsiCommandPlan::Complete { data_in, .. } = cdrom.execute(&[0x1a, 0, 0, 0, 12, 0])
         else {
@@ -439,24 +543,23 @@ mod tests {
         assert!(restored.accepts_snapshot(&snapshot));
         assert!(restored.restore_snapshot(snapshot));
         assert_eq!(restored.logical_block_bytes, selected_block_bytes);
-        assert_eq!(restored.storage_size_bytes(), 8192);
+        assert_eq!(restored.medium_size_bytes(), Some(8192));
 
         let incompatible = ScsiTargetSnapshot::Cdrom(ScsiCdrom::try_new(4096).unwrap());
         assert!(!restored.accepts_snapshot(&incompatible));
     }
 
     #[test]
-    fn prevent_allow_and_sgi_compatibility_commands_are_no_op_successes() {
+    fn sgi_hd_to_cdrom_remains_a_no_op_success() {
         let mut cdrom = cdrom(4);
-        for cdb in [&[0x1e, 0, 0, 0, 1, 0][..], &[0xc9, 0, 0, 0, 0, 0][..]] {
-            assert_eq!(
-                cdrom.execute(cdb),
-                ScsiCommandPlan::Complete {
-                    status: ScsiStatus::Good,
-                    data_in: Vec::new(),
-                }
-            );
-        }
+        assert_eq!(
+            cdrom.execute(&[0xc9, 0, 0, 0, 0, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                data_in: Vec::new(),
+            }
+        );
+        assert_eq!(cdrom.medium_size_bytes(), Some(2048));
     }
 
     #[test]
@@ -523,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn start_stop_changes_readiness_and_loej_is_rejected_without_state_change() {
+    fn start_stop_controls_the_motor_and_requests_ejection() {
         let mut cdrom = cdrom(4);
         let _ = cdrom.execute(&[0x1b, 0, 0, 0, 0, 0]);
 
@@ -558,20 +661,13 @@ mod tests {
             }
         ));
 
-        let _ = cdrom.execute(&[0x1b, 0, 0, 0, 3, 0]);
-        let data = sense(&mut cdrom, 18);
-        assert_eq!((data[2], data[12], data[13]), (5, 0x24, 0));
-        assert!(matches!(
-            cdrom.execute(&[0x00, 0, 0, 0, 0, 0]),
+        assert_eq!(
+            cdrom.execute(&[0x1b, 0, 0, 0, 3, 0]),
             ScsiCommandPlan::Complete {
-                status: ScsiStatus::CheckCondition,
-                ..
+                status: ScsiStatus::Good,
+                data_in: Vec::new(),
             }
-        ));
-        let data = sense(&mut cdrom, 18);
-        assert_eq!((data[2], data[12], data[13]), (2, 0x04, 0x02));
-
-        let _ = cdrom.execute(&[0x1b, 0, 0, 0, 1, 0]);
+        );
         assert!(matches!(
             cdrom.execute(&[0x00, 0, 0, 0, 0, 0]),
             ScsiCommandPlan::Complete {
@@ -579,6 +675,139 @@ mod tests {
                 ..
             }
         ));
+
+        assert_eq!(
+            cdrom.execute(&[0x1b, 0, 0, 0, 2, 0]),
+            ScsiCommandPlan::EjectMedium
+        );
+        assert_eq!(cdrom.medium_size_bytes(), Some(2048));
+    }
+
+    #[test]
+    fn prevent_allow_locks_the_slot_until_the_initiator_allows_removal() {
+        let mut cdrom = cdrom(4);
+        assert_eq!(
+            cdrom.execute(&[0x1e, 0, 0, 0, 1, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                data_in: Vec::new(),
+            }
+        );
+        assert!(matches!(
+            cdrom.execute(&[0x1b, 0, 0, 0, 2, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::CheckCondition,
+                ..
+            }
+        ));
+        let data = sense(&mut cdrom, 18);
+        assert_eq!((data[2], data[12], data[13]), (5, 0x53, 0x02));
+        assert_eq!(cdrom.medium_size_bytes(), Some(2048));
+
+        for cdb in [&[0x1e, 0, 1, 0, 1, 0][..], &[0x1e, 0, 0, 1, 1, 0][..]] {
+            let _ = cdrom.execute(cdb);
+            let data = sense(&mut cdrom, 18);
+            assert_eq!((data[2], data[12]), (5, 0x24));
+        }
+
+        assert_eq!(
+            cdrom.execute(&[0x1e, 0, 0, 0, 0, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                data_in: Vec::new(),
+            }
+        );
+        assert_eq!(
+            cdrom.execute(&[0x1b, 0, 0, 0, 2, 0]),
+            ScsiCommandPlan::EjectMedium
+        );
+    }
+
+    #[test]
+    fn empty_drive_reports_medium_not_present_without_touching_storage() {
+        let mut cdrom = ScsiCdrom::new_empty();
+        assert_eq!(
+            cdrom.backing_requirement(),
+            ScsiBackingRequirement::Removable
+        );
+        assert_eq!(cdrom.medium_size_bytes(), None);
+
+        for cdb in [
+            &[0x00, 0, 0, 0, 0, 0][..],
+            &[0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0][..],
+            &[0x08, 0, 0, 0, 1, 0][..],
+            &[0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0][..],
+        ] {
+            assert!(matches!(
+                cdrom.execute(cdb),
+                ScsiCommandPlan::Complete {
+                    status: ScsiStatus::CheckCondition,
+                    ..
+                }
+            ));
+            let data = sense(&mut cdrom, 18);
+            assert_eq!((data[2], data[12], data[13]), (2, 0x3a, 0));
+        }
+
+        for cdb in [
+            &[0x12, 0, 0, 0, 36, 0][..],
+            &[0x1a, 0, 0, 0, 12, 0][..],
+            &[0x1b, 0, 0, 0, 1, 0][..],
+            &[0x1e, 0, 0, 0, 1, 0][..],
+            &[0xc9, 0, 0, 0, 0, 0][..],
+        ] {
+            assert!(matches!(
+                cdrom.execute(cdb),
+                ScsiCommandPlan::Complete {
+                    status: ScsiStatus::Good,
+                    ..
+                }
+            ));
+        }
+
+        let cdb = [0x15, 0, 0, 0, 12, 0];
+        assert_eq!(
+            cdrom.execute(&cdb),
+            ScsiCommandPlan::ReceiveDataOut { byte_count: 12 }
+        );
+        assert_eq!(
+            cdrom.complete_data_out(&cdb, &mode_select_payload(2048)),
+            ScsiStatus::Good
+        );
+        assert_eq!(cdrom.logical_block_bytes, 2048);
+        assert_eq!(
+            cdrom.complete_data_out(&cdb, &mode_select_payload(1024)),
+            ScsiStatus::CheckCondition
+        );
+
+        assert_eq!(
+            cdrom.execute(&[0x1b, 0, 0, 0, 2, 0]),
+            ScsiCommandPlan::Complete {
+                status: ScsiStatus::Good,
+                data_in: Vec::new(),
+            }
+        );
+        assert_eq!(cdrom.medium_size_bytes(), None);
+    }
+
+    #[test]
+    fn medium_validation_matches_the_cold_construction_contract() {
+        let cdrom = ScsiCdrom::new_empty();
+        assert_eq!(
+            cdrom.validate_medium(0).map_err(|error| error.bytes()),
+            Err(0)
+        );
+        assert_eq!(
+            cdrom.validate_medium(2048).map_err(|error| error.bytes()),
+            Ok(())
+        );
+        let unaligned = 4096 + 512;
+        assert_eq!(
+            cdrom
+                .validate_medium(unaligned)
+                .map_err(|error| error.bytes()),
+            Err(unaligned)
+        );
     }
 
     #[test]
