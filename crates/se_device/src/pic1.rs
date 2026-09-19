@@ -571,8 +571,7 @@ impl Pic1 {
             self.three_way_substitution =
                 write_register(self.three_way_substitution, offset, data) & THREE_WAY_VALUE_MASK;
         } else if let Some(offset) = register_offset(start, end, DESCRIPTOR_ARRAY_BASE) {
-            self.descriptor_array_base =
-                write_register(self.descriptor_array_base, offset, data) & DESCRIPTOR_ADDRESS_MASK;
+            self.descriptor_array_base = write_register(self.descriptor_array_base, offset, data);
         } else if register_offset(start, end, GRAPHICS_BUFFER_ADDRESS).is_some()
             || register_offset(start, end, GRAPHICS_BUFFER_LENGTH).is_some()
             || register_offset(start, end, GRAPHICS_DESTINATION_ADDRESS).is_some()
@@ -581,7 +580,7 @@ impl Pic1 {
             return Err(BusError::UnimplementedAccess);
         } else if register_offset(start, end, GRAPHICS_START).is_some() {
             self.graphics_dma.start(
-                self.descriptor_array_base,
+                self.descriptor_array_base & DESCRIPTOR_ADDRESS_MASK,
                 self.cpu_control & GRAPHICS_DMA_SYNC_ENABLE != 0,
                 self.graphics_dma_sync_input,
             );
@@ -927,14 +926,17 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_array_base_masks_undefined_high_bits() {
+    fn descriptor_array_base_preserves_software_visible_high_bits() {
         let mut pic1 = pic1();
 
         assert_eq!(
-            pic1.write(DeviceAddr::new(DESCRIPTOR_ARRAY_BASE), &[0xff; 4]),
+            pic1.write(
+                DeviceAddr::new(DESCRIPTOR_ARRAY_BASE),
+                &0xdead_beef_u32.to_be_bytes()
+            ),
             Ok(())
         );
-        assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0x0fff_ffff));
+        assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0xdead_beef));
     }
 
     #[test]
@@ -1337,7 +1339,9 @@ mod tests {
     #[test]
     fn graphics_dma_start_captures_dabr_and_fetches_after_five_cycles() {
         let mut pic1 = pic1();
-        start_dma(&mut pic1, 0x1000);
+        start_dma(&mut pic1, 0xf000_1000);
+
+        assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0xf000_1000));
 
         assert_eq!(read_word(&pic1, SYSTEM_ID), Ok(0x80));
         assert_eq!(
@@ -1348,7 +1352,7 @@ mod tests {
         );
         pic1.write(
             DeviceAddr::new(DESCRIPTOR_ARRAY_BASE),
-            &0x2000_u32.to_be_bytes(),
+            &0xe000_2000_u32.to_be_bytes(),
         )
         .unwrap();
         pic1.write(DeviceAddr::new(GRAPHICS_START + 3), &[0xff])
@@ -1363,7 +1367,7 @@ mod tests {
             pic1.next_graphics_dma_request(),
             Some(GraphicsDmaRequest::ReadDescriptor { address: 0x1000 })
         );
-        assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0x2000));
+        assert_eq!(read_word(&pic1, DESCRIPTOR_ARRAY_BASE), Ok(0xe000_2000));
     }
 
     #[test]
