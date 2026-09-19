@@ -602,7 +602,7 @@ mod tests {
         assert_ne!(read_word(&mut bus, INT2_BASE).unwrap() & 8, 0);
         assert_eq!(
             format!("{:x}", digest.finalize()),
-            "e63ad8a7a209f7b4f03bfc78b261a2f561db9234b08ebd79cc14be6ce73dbcbd"
+            "2fba464c5870e7278bff609feaf3db47633c1d6429babc9717cdffac35050629"
         );
     }
 

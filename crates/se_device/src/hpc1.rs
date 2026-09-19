@@ -771,8 +771,8 @@ impl EthernetChannel {
         self.transmit_status = u32::from(status) << 16;
         if successful && let Some(context) = &context {
             self.previous_packet_first_transmit_descriptor_pointer = context.first_descriptor;
-            self.current_packet_first_transmit_descriptor_pointer = context.next_descriptor;
         }
+        // CPFXBDP changes only when the next packet's first descriptor is fetched.
         let end_of_chain = context.as_ref().is_none_or(|context| context.end_of_chain);
         if successful && !end_of_chain && continue_dma {
             self.transmit_status |= ETHERNET_TRANSMIT_ACTIVE;
@@ -1707,11 +1707,11 @@ mod tests {
         ETHERNET_PREVIOUS_PACKET_FIRST_TRANSMIT_DESCRIPTOR_POINTER, ETHERNET_RECEIVE_BYTE_COUNT,
         ETHERNET_RECEIVE_FIFO, ETHERNET_RECEIVE_FIFO_POINTER, ETHERNET_RESET, ETHERNET_TIMER,
         ETHERNET_TIMER_COUNT_MASK, ETHERNET_TIMER_COUNT_SHIFT, ETHERNET_TIMER_EXPIRED,
-        ETHERNET_TRANSMIT_BYTE_COUNT, ETHERNET_TRANSMIT_FIFO, ETHERNET_TRANSMIT_FIFO_POINTER,
-        FIFO_ENTRIES, FREE_RUNNING_COUNTER, FREE_RUNNING_COUNTER_MODULUS, HPC_CLOCK_FREQUENCY,
-        Hpc1, MISCELLANEOUS_CONTROL, PARALLEL_BYTE_COUNT, PARALLEL_CONTROL,
-        PARALLEL_CURRENT_BUFFER_POINTER, PARALLEL_FIFO, PARALLEL_FIFO_POINTER,
-        PARALLEL_NEXT_DESCRIPTOR_POINTER, SCSI_BYTE_COUNT, SCSI_CONTROL,
+        ETHERNET_TRANSMIT_ACTIVE, ETHERNET_TRANSMIT_BYTE_COUNT, ETHERNET_TRANSMIT_FIFO,
+        ETHERNET_TRANSMIT_FIFO_POINTER, FIFO_ENTRIES, FREE_RUNNING_COUNTER,
+        FREE_RUNNING_COUNTER_MODULUS, HPC_CLOCK_FREQUENCY, Hpc1, MISCELLANEOUS_CONTROL,
+        PARALLEL_BYTE_COUNT, PARALLEL_CONTROL, PARALLEL_CURRENT_BUFFER_POINTER, PARALLEL_FIFO,
+        PARALLEL_FIFO_POINTER, PARALLEL_NEXT_DESCRIPTOR_POINTER, SCSI_BYTE_COUNT, SCSI_CONTROL,
         SCSI_CURRENT_BUFFER_POINTER, SCSI_DESCRIPTOR_END, SCSI_FIFO, SCSI_FIFO_POINTER, SCSI_FLUSH,
         SCSI_NEXT_DESCRIPTOR_POINTER, SCSI_START_DMA, SCSI_TO_MEMORY,
     };
@@ -1846,6 +1846,85 @@ mod tests {
                         xie || (!successful && interrupt)
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn ethernet_current_packet_pointer_advances_only_when_next_packet_is_fetched() {
+        use super::{EthernetReadKind, EthernetRequest};
+
+        for end_of_chain in [false, true] {
+            let mut hpc1 = Hpc1::new();
+            write_word(&mut hpc1, 0x10, 0x1000);
+            write_word(&mut hpc1, 0x34, 0x0040_0000);
+            assert!(matches!(
+                hpc1.next_ethernet_request(true),
+                Some(EthernetRequest::Read {
+                    address: 0x1000,
+                    kind: EthernetReadKind::TransmitDescriptor,
+                    ..
+                })
+            ));
+            let descriptor = [
+                0x8000_0001_u32,
+                0x2000 | if end_of_chain { 0x8000_0000 } else { 0 },
+                0x1010,
+            ]
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+            hpc1.complete_ethernet_read(EthernetReadKind::TransmitDescriptor, Some(&descriptor));
+            assert_eq!(read_word(&hpc1, 0x24), Ok(0x1000));
+            hpc1.advance_time(VirtualDuration::from_attoseconds(
+                ATTOSECONDS_PER_SECOND / 1_000_000,
+            ));
+            assert!(matches!(
+                hpc1.next_ethernet_request(true),
+                Some(EthernetRequest::Read {
+                    kind: EthernetReadKind::TransmitData,
+                    ..
+                })
+            ));
+            hpc1.complete_ethernet_read(EthernetReadKind::TransmitData, Some(&[0x42]));
+            hpc1.advance_time(VirtualDuration::from_attoseconds(
+                ATTOSECONDS_PER_SECOND / 1_000_000,
+            ));
+            assert!(matches!(
+                hpc1.next_ethernet_request(true),
+                Some(EthernetRequest::Transmit(_))
+            ));
+            hpc1.complete_ethernet_transmit(0x08, false);
+
+            assert_eq!(read_word(&hpc1, 0x28), Ok(0x1000));
+            assert_eq!(read_word(&hpc1, 0x24), Ok(0x1000));
+            assert_eq!(
+                read_word(&hpc1, 0x34).unwrap() & ETHERNET_TRANSMIT_ACTIVE,
+                if end_of_chain {
+                    0
+                } else {
+                    ETHERNET_TRANSMIT_ACTIVE
+                }
+            );
+
+            if !end_of_chain {
+                assert!(matches!(
+                    hpc1.next_ethernet_request(true),
+                    Some(EthernetRequest::Read {
+                        address: 0x1010,
+                        kind: EthernetReadKind::TransmitDescriptor,
+                        ..
+                    })
+                ));
+                let next_descriptor = [0x8000_0001_u32, 0x8000_2100, 0]
+                    .into_iter()
+                    .flat_map(u32::to_be_bytes)
+                    .collect::<Vec<_>>();
+                hpc1.complete_ethernet_read(
+                    EthernetReadKind::TransmitDescriptor,
+                    Some(&next_descriptor),
+                );
+                assert_eq!(read_word(&hpc1, 0x24), Ok(0x1010));
             }
         }
     }
