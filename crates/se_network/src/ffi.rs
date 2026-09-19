@@ -1,6 +1,6 @@
 //! Private C ABI; native sockets never cross this boundary as signed integers.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
 #[repr(C)]
 pub(crate) struct Config {
@@ -9,6 +9,10 @@ pub(crate) struct Config {
     pub gateway: u32,
     pub dns: u32,
     pub dhcp_start: u32,
+    /// NUL-terminated host TFTP root; null leaves the built-in server disabled.
+    pub tftp_root: *const c_char,
+    /// NUL-terminated boot filename; null leaves BOOTP replies without one.
+    pub bootfile: *const c_char,
 }
 
 unsafe extern "C" {

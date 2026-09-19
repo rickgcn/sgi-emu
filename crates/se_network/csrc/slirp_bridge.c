@@ -147,6 +147,8 @@ SeSlirp *se_slirp_create(const SeSlirpConfig *config, uintptr_t wake_socket,
     native.vhost.s_addr = htonl(config->gateway);
     native.vnameserver.s_addr = htonl(config->dns);
     native.vdhcp_start.s_addr = htonl(config->dhcp_start);
+    native.tftp_path = config->tftp_root;
+    native.bootfile = config->bootfile;
     native.if_mtu = 1500;
     native.if_mru = 1500;
     native.enable_emu = false;

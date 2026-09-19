@@ -210,11 +210,16 @@ impl Drop for NetworkSession {
 mod tests {
     use super::*;
     use crate::config::{PortForwardRule, TransportProtocol};
+    use std::fs;
     use std::io::Write;
     use std::net::{Ipv4Addr, TcpListener};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
     use std::time::{Duration, Instant};
 
     const MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
+    const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+    const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 
     #[test]
     fn receive_readiness_tracks_bounded_fifo_contents() {
@@ -339,8 +344,8 @@ mod tests {
         arp[6..12].copy_from_slice(&MAC);
         arp[12..22].copy_from_slice(&[8, 6, 0, 1, 8, 0, 6, 4, 0, 1]);
         arp[22..28].copy_from_slice(&MAC);
-        arp[28..32].copy_from_slice(&[10, 0, 2, 15]);
-        arp[38..42].copy_from_slice(&[10, 0, 2, 2]);
+        arp[28..32].copy_from_slice(&GUEST_IP);
+        arp[38..42].copy_from_slice(&GATEWAY_IP);
         assert!(session.try_send_frame(&arp));
         receive(session, |frame| {
             frame.len() >= 42 && frame[12..14] == [8, 6]
@@ -367,8 +372,8 @@ mod tests {
         frame[16..18].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
         frame[22] = 64;
         frame[23] = protocol;
-        frame[26..30].copy_from_slice(&[10, 0, 2, 15]);
-        frame[30..34].copy_from_slice(&[10, 0, 2, 2]);
+        frame[26..30].copy_from_slice(&GUEST_IP);
+        frame[30..34].copy_from_slice(&GATEWAY_IP);
         let sum = checksum(&frame[14..34]);
         frame[24..26].copy_from_slice(&sum.to_be_bytes());
         frame[34..34 + payload.len()].copy_from_slice(payload);
@@ -388,6 +393,71 @@ mod tests {
         pseudo.extend(&segment);
         segment[16..18].copy_from_slice(&checksum(&pseudo).to_be_bytes());
         ipv4(6, &segment)
+    }
+
+    fn udp(source: u16, destination: u16, payload: &[u8]) -> Vec<u8> {
+        let length = (8 + payload.len()) as u16;
+        let mut datagram = vec![0; usize::from(length)];
+        datagram[..2].copy_from_slice(&source.to_be_bytes());
+        datagram[2..4].copy_from_slice(&destination.to_be_bytes());
+        datagram[4..6].copy_from_slice(&length.to_be_bytes());
+        datagram[8..].copy_from_slice(payload);
+        let mut pseudo = GUEST_IP.to_vec();
+        pseudo.extend_from_slice(&GATEWAY_IP);
+        pseudo.extend_from_slice(&[0, 17]);
+        pseudo.extend_from_slice(&length.to_be_bytes());
+        pseudo.extend_from_slice(&datagram);
+        datagram[6..8].copy_from_slice(&checksum(&pseudo).to_be_bytes());
+        ipv4(17, &datagram)
+    }
+
+    /// Traditional BOOTP request broadcast from the unconfigured client 0.0.0.0:68.
+    /// The request carries no DHCP magic cookie or DHCP options.
+    fn bootp_request(xid: u32, mac: [u8; 6], vendor: &[u8]) -> Vec<u8> {
+        let payload = 236 + vendor.len().max(64);
+        let mut frame = vec![0; 14 + 20 + 8 + payload];
+        frame[..6].fill(255);
+        frame[6..12].copy_from_slice(&mac);
+        frame[12..14].copy_from_slice(&[8, 0]);
+        let ip = &mut frame[14..34];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&((28 + payload) as u16).to_be_bytes());
+        ip[8] = 64;
+        ip[9] = 17;
+        ip[16..20].fill(255);
+        let header = checksum(ip);
+        ip[10..12].copy_from_slice(&header.to_be_bytes());
+        frame[34..36].copy_from_slice(&68u16.to_be_bytes());
+        frame[36..38].copy_from_slice(&67u16.to_be_bytes());
+        frame[38..40].copy_from_slice(&((8 + payload) as u16).to_be_bytes());
+        let bootp = &mut frame[42..];
+        bootp[..4].copy_from_slice(&[1, 1, 6, 0]);
+        bootp[4..8].copy_from_slice(&xid.to_be_bytes());
+        bootp[10] = 0x80;
+        bootp[28..34].copy_from_slice(&mac);
+        bootp[236..236 + vendor.len()].copy_from_slice(vendor);
+        frame
+    }
+
+    fn tftp_rrq(name: &str) -> Vec<u8> {
+        let mut request = vec![0, 1];
+        request.extend_from_slice(name.as_bytes());
+        request.push(0);
+        request.extend_from_slice(b"octet\0");
+        request
+    }
+
+    fn tftp_ack(block: u16) -> Vec<u8> {
+        let mut acknowledgement = vec![0, 4];
+        acknowledgement.extend_from_slice(&block.to_be_bytes());
+        acknowledgement
+    }
+
+    static NEXT_ROOT_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_root() -> PathBuf {
+        let id = NEXT_ROOT_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("sgi-emu-tftp-{}-{id}", std::process::id()))
     }
 
     #[test]
@@ -549,40 +619,26 @@ mod tests {
         let _rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, free_port)).unwrap();
     }
 
-    #[test]
-    fn native_dhcp_uses_configured_subnet_and_resolvers() {
-        let config = NatConfig {
+    fn isolated_subnet_config() -> NatConfig {
+        NatConfig {
             subnet: "192.168.73.0/24".into(),
             gateway: Ipv4Addr::new(192, 168, 73, 2),
             dns: Ipv4Addr::new(192, 168, 73, 3),
             dhcp_start: Ipv4Addr::new(192, 168, 73, 40),
             forwards: Vec::new(),
-        };
-        let session = NetworkSession::start(config, |_| {}).unwrap();
-        let mut frame = vec![0; 14 + 20 + 8 + 300];
-        frame[..6].fill(255);
-        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
-        frame[12..14].copy_from_slice(&[8, 0]);
-        let ip = &mut frame[14..34];
-        ip[0] = 0x45;
-        ip[2..4].copy_from_slice(&328u16.to_be_bytes());
-        ip[8] = 64;
-        ip[9] = 17;
-        ip[16..20].fill(255);
-        let sum: u32 = ip
-            .chunks_exact(2)
-            .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
-            .sum();
-        let sum = (sum & 0xffff) + (sum >> 16);
-        ip[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
-        frame[34..40].copy_from_slice(&[0, 68, 0, 67, 1, 52]);
-        let bootp = &mut frame[42..];
-        bootp[..4].copy_from_slice(&[1, 1, 6, 0]);
-        bootp[4..8].copy_from_slice(&[1, 2, 3, 4]);
-        bootp[10] = 0x80;
-        bootp[28..34].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
-        bootp[236..246].copy_from_slice(&[99, 130, 83, 99, 53, 1, 1, 55, 1, 6]);
-        bootp[246] = 255;
+            tftp_root: None,
+            bootfile: None,
+        }
+    }
+
+    #[test]
+    fn native_dhcp_uses_configured_subnet_and_resolvers() {
+        let session = NetworkSession::start(isolated_subnet_config(), |_| {}).unwrap();
+        let frame = bootp_request(
+            0x0102_0304,
+            [2, 0, 0, 0, 0, 2],
+            &[99, 130, 83, 99, 53, 1, 1, 55, 1, 6, 255],
+        );
         assert!(session.try_send_frame(&frame));
         let reply = receive(&session, |frame| {
             frame.len() > 282 && frame[12..14] == [8, 0] && frame[23] == 17
@@ -598,5 +654,154 @@ mod tests {
                 .windows(6)
                 .any(|option| option == [3, 4, 192, 168, 73, 2])
         );
+    }
+
+    #[test]
+    fn native_bootp_answers_legacy_clients() {
+        let session = NetworkSession::start(isolated_subnet_config(), |_| {}).unwrap();
+        let mac = [2, 0, 0, 0, 0, 2];
+        assert!(session.try_send_frame(&bootp_request(0x0bad_cafe, mac, &[])));
+        let reply = receive(&session, |frame| {
+            frame.len() > 282 && frame[23] == 17 && frame[42] == 2
+        });
+        assert_eq!(&reply[..6], &[255; 6]);
+        assert_eq!(&reply[26..30], &[192, 168, 73, 2]);
+        assert_eq!(&reply[30..34], &[255; 4]);
+        assert_eq!(&reply[34..36], &67u16.to_be_bytes());
+        assert_eq!(&reply[36..38], &68u16.to_be_bytes());
+        assert_eq!(&reply[42..50], &[2, 1, 6, 0, 0x0b, 0xad, 0xca, 0xfe]);
+        assert_eq!(&reply[58..62], &[192, 168, 73, 40]);
+        assert_eq!(&reply[62..66], &[192, 168, 73, 2]);
+        assert_eq!(&reply[70..76], &mac);
+        assert!(reply[86..278].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn native_bootp_reply_carries_the_configured_bootfile() {
+        let config = NatConfig {
+            bootfile: Some("stand/sa".into()),
+            ..NatConfig::default()
+        };
+        let session = NetworkSession::start(config, |_| {}).unwrap();
+        assert!(session.try_send_frame(&bootp_request(0x1234_5678, MAC, &[])));
+        let reply = receive(&session, |frame| {
+            frame.len() > 282 && frame[23] == 17 && frame[42] == 2
+        });
+        assert_eq!(&reply[150..158], b"stand/sa");
+        assert!(reply[158..278].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn native_tftp_serves_files_from_the_configured_root() {
+        let content = b"sgi-emu tftp integration test";
+        let root = temporary_root();
+        fs::create_dir_all(root.join("stand")).unwrap();
+        fs::write(root.join("stand/sa"), content).unwrap();
+        let config = NatConfig {
+            tftp_root: Some(root.to_str().unwrap().into()),
+            ..NatConfig::default()
+        };
+        let session = NetworkSession::start(config, |_| {}).unwrap();
+        learn_guest(&session);
+        assert!(session.try_send_frame(&udp(2000, 69, &tftp_rrq("stand/sa"))));
+        let reply = receive(&session, |frame| {
+            frame.len() >= 46 && frame[23] == 17 && frame[42..44] == [0, 3]
+        });
+        assert_eq!(&reply[..6], &MAC);
+        assert_eq!(&reply[6..12], &[0x52, 0x55, 10, 0, 2, 2]);
+        assert_eq!(&reply[26..30], &GATEWAY_IP);
+        assert_eq!(&reply[30..34], &GUEST_IP);
+        assert_eq!(&reply[34..36], &69u16.to_be_bytes());
+        assert_eq!(&reply[36..38], &2000u16.to_be_bytes());
+        assert_eq!(&reply[44..46], &[0, 1]);
+        assert_eq!(&reply[46..], content);
+        drop(session);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn native_tftp_acknowledgements_continue_a_multi_block_transfer() {
+        let content: Vec<u8> = (0..700).map(|index| (index % 251) as u8).collect();
+        let root = temporary_root();
+        fs::create_dir_all(root.join("stand")).unwrap();
+        fs::write(root.join("stand/sa"), &content).unwrap();
+        let config = NatConfig {
+            tftp_root: Some(root.to_str().unwrap().into()),
+            ..NatConfig::default()
+        };
+        let session = NetworkSession::start(config, |_| {}).unwrap();
+        learn_guest(&session);
+        assert!(session.try_send_frame(&udp(2000, 69, &tftp_rrq("stand/sa"))));
+        let first = receive(&session, |frame| {
+            frame.len() >= 46 && frame[23] == 17 && frame[42..44] == [0, 3]
+        });
+        assert_eq!(&first[34..36], &69u16.to_be_bytes());
+        assert_eq!(&first[36..38], &2000u16.to_be_bytes());
+        assert_eq!(&first[44..46], &[0, 1]);
+        assert_eq!(first[46..].len(), 512);
+        assert_eq!(&first[46..], &content[..512]);
+        assert!(session.try_send_frame(&udp(2000, 69, &tftp_ack(1))));
+        // Matching the block number keeps a repeated block 1 from satisfying
+        // the wait for the acknowledged continuation.
+        let second = receive(&session, |frame| {
+            frame.len() >= 46 && frame[23] == 17 && frame[42..46] == [0, 3, 0, 2]
+        });
+        assert_eq!(&second[34..36], &69u16.to_be_bytes());
+        assert_eq!(&second[36..38], &2000u16.to_be_bytes());
+        assert_eq!(&second[44..46], &[0, 2]);
+        assert!(second[46..].len() < 512);
+        assert_eq!(&second[46..], &content[512..]);
+        let mut transferred = first[46..].to_vec();
+        transferred.extend_from_slice(&second[46..]);
+        assert_eq!(transferred, content);
+        drop(session);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn native_tftp_serves_files_from_a_unicode_root() {
+        let content = b"sgi-emu unicode tftp integration test";
+        let base = temporary_root();
+        // Only the host root is non-ASCII. The guest requests the plain ASCII
+        // TFTP file name `stand/sa`, so the case under test is the host
+        // pathname encoding and never guest protocol encoding.
+        let root = base.join("tftp-测试-日本語-é");
+        assert!(!root.to_str().unwrap().is_ascii());
+        fs::create_dir_all(root.join("stand")).unwrap();
+        fs::write(root.join("stand/sa"), content).unwrap();
+        let config = NatConfig {
+            tftp_root: Some(root.to_str().unwrap().into()),
+            ..NatConfig::default()
+        };
+        let session = NetworkSession::start(config, |_| {}).unwrap();
+        learn_guest(&session);
+        let request = tftp_rrq("stand/sa");
+        assert!(request.is_ascii());
+        assert!(session.try_send_frame(&udp(2000, 69, &request)));
+        // Matching any TFTP reply first keeps a host that cannot address the
+        // non-ASCII directory reporting the returned error instead of a timeout.
+        let reply = receive(&session, |frame| {
+            frame.len() >= 44 && frame[23] == 17 && frame[42..43] == [0]
+        });
+        assert_eq!(
+            &reply[42..44],
+            &[0, 3],
+            "the built-in TFTP server must open a non-ASCII host root"
+        );
+        assert_eq!(&reply[46..], content);
+        drop(session);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn native_tftp_is_disabled_without_a_configured_root() {
+        let session = NetworkSession::start(NatConfig::default(), |_| {}).unwrap();
+        learn_guest(&session);
+        assert!(session.try_send_frame(&udp(2000, 69, &tftp_rrq("stand/sa"))));
+        let reply = receive(&session, |frame| {
+            frame.len() >= 63 && frame[23] == 17 && frame[42..44] == [0, 5]
+        });
+        assert_eq!(&reply[44..46], &[0, 2]);
+        assert_eq!(&reply[46..63], b"Access violation\0");
     }
 }

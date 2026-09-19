@@ -64,7 +64,11 @@ pub type ReplayMachineBuilder = Box<
 pub type MachinePreflight =
     Box<dyn Fn(MachineDraft) -> Result<Vec<Diagnostic>, String> + Send + Sync + 'static>;
 
-/// Validates editable network settings without constructing a machine or opening host resources.
+/// Validates editable network settings and checks the host resources they require.
+///
+/// The application provider reports both the semantic errors and the missing or
+/// unusable host resources, such as the TFTP root directory, so this runs off
+/// the user-interface thread instead of during a Qt event.
 pub type NetworkValidator =
     Box<dyn Fn(&NetworkConfiguration) -> Result<(), String> + Send + Sync + 'static>;
 
@@ -249,9 +253,13 @@ impl UiSession {
         self.runtime_command(RuntimeHandle::refresh_outputs)
     }
 
-    /// Validates network settings through the application without changing runtime state.
+    /// Validates network settings and their host resources through the
+    /// application without changing runtime state.
     ///
     /// Returns an empty string on success, or a user-visible validation error.
+    /// The result is a readiness check: host resources remain dynamic after it
+    /// succeeds, so applying the settings repeats it off the user-interface
+    /// thread and reports any failure there.
     pub fn validate_network_configuration(&self, configuration: &NetworkConfiguration) -> String {
         (self.network_validator)(configuration)
             .err()
@@ -1264,6 +1272,8 @@ mod tests {
             gateway: String::new(),
             dns: String::new(),
             dhcp_start: String::new(),
+            tftp_root: String::new(),
+            bootfile: String::new(),
             forwards: Vec::new(),
         }
     }

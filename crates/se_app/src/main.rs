@@ -61,7 +61,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Box::new(|draft| Ok(se_session::normal::preflight_configuration(&draft))),
         Box::new(build_normal_configuration),
         Box::new(|draft, network, path| {
-            let network = config::parse_network_configuration(network)?;
+            let network = config::prepare_network_configuration(network)?;
             se_session::recording::build_configuration(draft, network, path)
                 .map_err(|error| error.to_string())
         }),
@@ -69,7 +69,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             se_session::replay::build_configuration(draft, path, snapshot_id)
                 .map_err(|error| error.to_string())
         }),
-        Box::new(|network| config::parse_network_configuration(network).map(|_| ())),
+        Box::new(|network| config::prepare_network_configuration(network).map(|_| ())),
     );
     let exit = session.run(&startup);
     let committed = session.machine_draft_snapshot();
@@ -132,6 +132,6 @@ fn build_normal_configuration(
     draft: se_config::draft::MachineDraft,
     network: &NetworkConfiguration,
 ) -> Result<se_session::frontend::SessionBuild, String> {
-    let network = config::parse_network_configuration(network)?;
+    let network = config::prepare_network_configuration(network)?;
     se_session::normal::build_configuration(draft, network).map_err(|error| error.to_string())
 }

@@ -1,0 +1,29 @@
+--- a/3rdparty/libslirp/src/tftp.c
++++ b/3rdparty/libslirp/src/tftp.c
+@@ -28,5 +28,9 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <fcntl.h>
+-
++
++/* Downstream adaptation: a TFTP file name is a UTF-8 host path, and GLib
++ * resolves it so that non-ASCII names also reach the Windows filesystem. */
++#include <glib/gstdio.h>
++
+ #if defined(_WIN32)
+@@ -131,3 +135,3 @@
+     if (spt->fd < 0) {
+-        spt->fd = open(spt->filename, O_RDONLY | O_BINARY);
++        spt->fd = g_open(spt->filename, O_RDONLY | O_BINARY, 0);
+     }
+@@ -400,7 +404,7 @@
+             int tsize = atoi(value);
+-            struct stat stat_p;
+-
++            GStatBuf stat_p;
++
+             if (tsize == 0) {
+-                if (stat(spt->filename, &stat_p) == 0)
++                if (g_stat(spt->filename, &stat_p) == 0)
+                     tsize = stat_p.st_size;
+                 else {

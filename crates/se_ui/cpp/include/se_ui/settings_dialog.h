@@ -48,10 +48,15 @@ struct ForwardSettings {
 
 struct NetworkSettings {
     QString subnet, gateway, dns, dhcp_start;
+    /// Host directory served by the built-in TFTP server; empty disables it.
+    QString tftp_root;
+    /// Boot filename advertised in BOOTP replies; empty leaves it unset.
+    QString bootfile;
     QVector<ForwardSettings> forwards;
     bool operator==(const NetworkSettings& other) const {
         return subnet == other.subnet && gateway == other.gateway && dns == other.dns
-            && dhcp_start == other.dhcp_start && forwards == other.forwards;
+            && dhcp_start == other.dhcp_start && tftp_root == other.tftp_root
+            && bootfile == other.bootfile && forwards == other.forwards;
     }
 };
 
@@ -61,7 +66,9 @@ NetworkConfiguration to_network_configuration(const NetworkSettings& settings);
 class SettingsDialog final : public QDialog {
 public:
     using ApplyHandler = std::function<void(NetworkSettings)>;
-    using PreflightHandler = std::function<void()>;
+    /// Requests one background check of the supplied network snapshot, which the
+    /// handler identifies with the revision it returns the result for.
+    using PreflightHandler = std::function<void(NetworkSettings, std::uint64_t)>;
 
     explicit SettingsDialog(const UiSession& session, const NetworkSettings& settings,
         ApplyHandler apply_handler, PreflightHandler preflight_handler,
@@ -70,7 +77,9 @@ public:
 
     [[nodiscard]] NetworkSettings settings() const;
     void set_applying(bool applying);
-    void apply_preflight_result(MachinePreflightDto result);
+    /// Applies one background result to the machine and network snapshots it checked.
+    void apply_preflight_result(
+        MachinePreflightDto result, std::uint64_t network_revision, QString network_error);
     void show_apply_failure(const QString& message);
     void finish_apply_success();
 
@@ -92,8 +101,9 @@ private:
     void add_attachment_editor(QFormLayout* form, const QString& node_id,
         const MachineNodeDto& node);
     void add_property_editors(QFormLayout* form, const MachineNodeDto& node);
-    void schedule_machine_preflight();
+    void schedule_preflight();
     void update_preflight_status();
+    void update_network_status();
     void update_apply_enabled();
     void accept_machine_view(MachineConfigurationViewDto next);
     void clear_apply_failure_status();
@@ -113,6 +123,8 @@ private:
         bool bool_value, std::int64_t integer_value, const QString& text_value);
     void apply_attachment_edit(const QString& node_id, const QString& device_id);
     void add_forward(const ForwardSettings& rule);
+    void handle_network_changed();
+    void browse_tftp_root();
 
     const UiSession& session_;
     ApplyHandler apply_handler_;
@@ -152,7 +164,10 @@ private:
     QLineEdit* gateway_edit_;
     QLineEdit* dns_edit_;
     QLineEdit* dhcp_start_edit_;
+    QLineEdit* tftp_root_edit_;
+    QLineEdit* bootfile_edit_;
     QTableWidget* forwards_table_;
+    QLabel* network_status_;
     QLabel* reset_notice_;
     QLabel* apply_status_;
     QPushButton* apply_button_;
@@ -160,6 +175,9 @@ private:
     bool machine_rebuild_pending_;
     bool preflight_pending_;
     bool applying_;
+    std::uint64_t network_revision_;
+    bool network_preflight_current_;
+    QString network_error_;
 };
 
 } // namespace se_ui

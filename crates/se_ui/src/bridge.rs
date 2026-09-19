@@ -270,6 +270,10 @@ pub mod ffi {
         pub gateway: String,
         pub dns: String,
         pub dhcp_start: String,
+        /// Host directory served by the built-in TFTP server; empty disables it.
+        pub tftp_root: String,
+        /// Boot filename advertised in BOOTP replies; empty leaves it unset.
+        pub bootfile: String,
         pub forwards: Vec<NetworkForwardRule>,
     }
 

@@ -90,7 +90,8 @@ void clear_diagnostic_layout(QVBoxLayout* layout) {
 
 NetworkSettings from_network_configuration(const NetworkConfiguration& configuration) {
     NetworkSettings result { from_rust(configuration.subnet), from_rust(configuration.gateway),
-        from_rust(configuration.dns), from_rust(configuration.dhcp_start), {} };
+        from_rust(configuration.dns), from_rust(configuration.dhcp_start),
+        from_rust(configuration.tftp_root), from_rust(configuration.bootfile), {} };
     for (const auto& rule : configuration.forwards) {
         result.forwards.append({from_rust(rule.protocol), from_rust(rule.host_address),
             from_rust(rule.host_port), from_rust(rule.guest_address), from_rust(rule.guest_port)});
@@ -100,7 +101,8 @@ NetworkSettings from_network_configuration(const NetworkConfiguration& configura
 
 NetworkConfiguration to_network_configuration(const NetworkSettings& settings) {
     NetworkConfiguration result {to_rust(settings.subnet), to_rust(settings.gateway),
-        to_rust(settings.dns), to_rust(settings.dhcp_start), {}};
+        to_rust(settings.dns), to_rust(settings.dhcp_start), to_rust(settings.tftp_root),
+        to_rust(settings.bootfile), {}};
     for (const auto& rule : settings.forwards) {
         result.forwards.push_back({to_rust(rule.protocol), to_rust(rule.host_address),
             to_rust(rule.host_port), to_rust(rule.guest_address), to_rust(rule.guest_port)});
@@ -131,14 +133,20 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     , gateway_edit_(new QLineEdit(settings.gateway, this))
     , dns_edit_(new QLineEdit(settings.dns, this))
     , dhcp_start_edit_(new QLineEdit(settings.dhcp_start, this))
+    , tftp_root_edit_(new QLineEdit(settings.tftp_root, this))
+    , bootfile_edit_(new QLineEdit(settings.bootfile, this))
     , forwards_table_(new QTableWidget(0, 5, this))
+    , network_status_(new QLabel(this))
     , reset_notice_(new QLabel(QStringLiteral("Applying changes resets the emulated machine."), this))
     , apply_status_(new QLabel(this))
     , apply_button_(nullptr)
     , cancel_button_(nullptr)
     , machine_rebuild_pending_(false)
     , preflight_pending_(false)
-    , applying_(false) {
+    , applying_(false)
+    , network_revision_(0)
+    , network_preflight_current_(false)
+    , network_error_() {
     setWindowTitle(QStringLiteral("Settings"));
     setModal(true);
     setAttribute(Qt::WA_DeleteOnClose);
@@ -188,7 +196,9 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     preflight_timer_->setSingleShot(true);
     preflight_timer_->setInterval(275);
     connect(preflight_timer_, &QTimer::timeout, this, [this] {
-        if (preflight_pending_ && preflight_handler_) { preflight_handler_(); }
+        if (preflight_pending_ && preflight_handler_) {
+            preflight_handler_(this->settings(), network_revision_);
+        }
     });
 
     auto* network_tab = new QWidget(this);
@@ -198,7 +208,24 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     network_form->addRow(QStringLiteral("Gateway"), gateway_edit_);
     network_form->addRow(QStringLiteral("DNS proxy"), dns_edit_);
     network_form->addRow(QStringLiteral("DHCP start (16 addresses)"), dhcp_start_edit_);
+    auto* tftp_row = new QWidget(this);
+    auto* tftp_layout = new QHBoxLayout(tftp_row);
+    tftp_layout->setContentsMargins(0, 0, 0, 0);
+    auto* tftp_browse = new QToolButton(tftp_row);
+    tftp_browse->setText(QStringLiteral("..."));
+    tftp_browse->setFocusPolicy(Qt::NoFocus);
+    tftp_browse->setToolTip(QStringLiteral("Select the host directory served by TFTP."));
+    tftp_layout->addWidget(tftp_root_edit_);
+    tftp_layout->addWidget(tftp_browse);
+    network_form->addRow(QStringLiteral("TFTP root"), tftp_row);
+    bootfile_edit_->setToolTip(
+        QStringLiteral("Optional file name advertised in BOOTP replies, e.g. stand/sa."));
+    network_form->addRow(QStringLiteral("BOOTP boot filename"), bootfile_edit_);
+    connect(tftp_browse, &QToolButton::clicked, this, &SettingsDialog::browse_tftp_root);
     network_layout->addLayout(network_form);
+    network_status_->setWordWrap(true);
+    network_status_->hide();
+    network_layout->addWidget(network_status_);
     forwards_table_->setHorizontalHeaderLabels({QStringLiteral("Protocol"), QStringLiteral("Host address"),
         QStringLiteral("Host port"), QStringLiteral("Guest address"), QStringLiteral("Guest port")});
     forwards_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
@@ -211,9 +238,9 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     add->setAutoDefault(false);
     remove->setAutoDefault(false);
     connect(add, &QPushButton::clicked, this, [this] {
-        clear_apply_failure_status();
         add_forward({QStringLiteral("tcp"), QStringLiteral("127.0.0.1"), QString(),
             dhcp_start_edit_->text(), QString()});
+        handle_network_changed();
     });
     connect(remove, &QPushButton::clicked, this, [this] {
         bool removed = false;
@@ -223,7 +250,7 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
                 removed = true;
             }
         }
-        if (removed) { clear_apply_failure_status(); }
+        if (removed) { handle_network_changed(); }
     });
     forward_buttons->addWidget(add);
     forward_buttons->addWidget(remove);
@@ -239,24 +266,25 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     apply_button_->setAutoDefault(false);
     apply_button_->setDefault(false);
     cancel_button_->setAutoDefault(false);
+    // The button is enabled only for a current, successful network preflight;
+    // the background apply repeats the host check and reports through
+    // `show_apply_failure`, so the user-interface thread never probes the
+    // filesystem itself.
     connect(apply_button_, &QPushButton::clicked, this, [this] {
         if (!apply_button_->isEnabled()) { return; }
-        const auto error = session_.validate_network_configuration(to_network_configuration(this->settings()));
-        if (!error.empty()) {
-            QMessageBox::warning(this, QStringLiteral("Network configuration"), from_rust(error));
-            return;
-        }
         auto apply_handler = apply_handler_;
         apply_handler(this->settings());
     });
     connect(cancel_button_, &QPushButton::clicked, this, &SettingsDialog::reject);
-    const auto clear_network_failure = [this] { clear_apply_failure_status(); };
-    connect(subnet_edit_, &QLineEdit::textEdited, this, clear_network_failure);
-    connect(gateway_edit_, &QLineEdit::textEdited, this, clear_network_failure);
-    connect(dns_edit_, &QLineEdit::textEdited, this, clear_network_failure);
-    connect(dhcp_start_edit_, &QLineEdit::textEdited, this, clear_network_failure);
+    const auto handle_network_edit = [this] { handle_network_changed(); };
+    connect(subnet_edit_, &QLineEdit::textEdited, this, handle_network_edit);
+    connect(gateway_edit_, &QLineEdit::textEdited, this, handle_network_edit);
+    connect(dns_edit_, &QLineEdit::textEdited, this, handle_network_edit);
+    connect(dhcp_start_edit_, &QLineEdit::textEdited, this, handle_network_edit);
+    connect(tftp_root_edit_, &QLineEdit::textEdited, this, handle_network_edit);
+    connect(bootfile_edit_, &QLineEdit::textEdited, this, handle_network_edit);
     connect(forwards_table_, &QTableWidget::itemChanged, this,
-        [this](QTableWidgetItem*) { clear_apply_failure_status(); });
+        [this](QTableWidgetItem*) { handle_network_changed(); });
     auto* root = new QVBoxLayout(this);
     root->addWidget(tabs_);
     apply_status_->setWordWrap(true);
@@ -268,15 +296,17 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     actions->addWidget(button_box);
     root->addLayout(actions);
     rebuild_machine_view();
+    update_network_status();
     update_apply_enabled();
-    QTimer::singleShot(0, this, [this] { schedule_machine_preflight(); });
+    QTimer::singleShot(0, this, [this] { schedule_preflight(); });
     resize(820, 550);
 }
 
 SettingsDialog::~SettingsDialog() = default;
 
 NetworkSettings SettingsDialog::settings() const {
-    NetworkSettings network {subnet_edit_->text(), gateway_edit_->text(), dns_edit_->text(), dhcp_start_edit_->text(), {}};
+    NetworkSettings network {subnet_edit_->text(), gateway_edit_->text(), dns_edit_->text(),
+        dhcp_start_edit_->text(), tftp_root_edit_->text(), bootfile_edit_->text(), {}};
     for (int row = 0; row < forwards_table_->rowCount(); ++row) {
         const auto* protocol = qobject_cast<QComboBox*>(forwards_table_->cellWidget(row, 0));
         network.forwards.append({protocol->currentData().toString(), forwards_table_->item(row, 1)->text(),
@@ -297,11 +327,19 @@ void SettingsDialog::set_applying(bool applying) {
     update_apply_enabled();
 }
 
-void SettingsDialog::apply_preflight_result(MachinePreflightDto result) {
-    if (result.revision != machine_view_->revision) { return; }
-    preflight_timer_->stop();
-    preflight_pending_ = false;
-    preflight_result_ = std::make_unique<MachinePreflightDto>(std::move(result));
+void SettingsDialog::apply_preflight_result(
+    MachinePreflightDto result, std::uint64_t network_revision, QString network_error) {
+    const bool machine_current = result.revision == machine_view_->revision;
+    if (machine_current) {
+        preflight_result_ = std::make_unique<MachinePreflightDto>(std::move(result));
+    }
+    network_preflight_current_ = network_revision == network_revision_;
+    if (network_preflight_current_) { network_error_ = std::move(network_error); }
+    // A stale half must not cancel the check that is already queued for it.
+    if (machine_current && network_preflight_current_) {
+        preflight_timer_->stop();
+        preflight_pending_ = false;
+    }
     refresh_diagnostics_presentation();
 }
 
@@ -309,7 +347,7 @@ void SettingsDialog::show_apply_failure(const QString& message) {
     set_applying(false);
     apply_status_->setText(QStringLiteral("Could not apply settings: %1").arg(message));
     apply_status_->show();
-    schedule_machine_preflight();
+    schedule_preflight();
 }
 
 void SettingsDialog::finish_apply_success() {
@@ -566,6 +604,7 @@ void SettingsDialog::refresh_diagnostics_presentation() {
 
     refresh_inline_diagnostics();
     update_preflight_status();
+    update_network_status();
     update_apply_enabled();
 }
 
@@ -611,7 +650,7 @@ void SettingsDialog::refresh_inline_diagnostics() {
     }
 }
 
-void SettingsDialog::schedule_machine_preflight() {
+void SettingsDialog::schedule_preflight() {
     preflight_timer_->stop();
     preflight_result_.reset();
     if (applying_ || !machine_view_->success || has_semantic_error()) {
@@ -643,12 +682,43 @@ void SettingsDialog::update_preflight_status() {
     }
 }
 
+void SettingsDialog::update_network_status() {
+    if (preflight_pending_) {
+        network_status_->setText(QStringLiteral("Checking network settings..."));
+        network_status_->show();
+    } else if (network_preflight_current_ && !network_error_.isEmpty()) {
+        network_status_->setText(network_error_);
+        network_status_->show();
+    } else {
+        network_status_->clear();
+        network_status_->hide();
+    }
+}
+
 void SettingsDialog::update_apply_enabled() {
     const bool current_preflight = preflight_result_ != nullptr
         && preflight_result_->revision == machine_view_->revision;
     apply_button_->setEnabled(!applying_ && machine_view_->success
         && !has_semantic_error() && !preflight_pending_ && current_preflight
-        && preflight_result_->success && !has_host_error());
+        && preflight_result_->success && !has_host_error() && network_preflight_current_
+        && network_error_.isEmpty());
+}
+
+void SettingsDialog::handle_network_changed() {
+    if (applying_) { return; }
+    ++network_revision_;
+    network_preflight_current_ = false;
+    network_error_.clear();
+    clear_apply_failure_status();
+    schedule_preflight();
+}
+
+void SettingsDialog::browse_tftp_root() {
+    const auto directory = QFileDialog::getExistingDirectory(
+        this, QStringLiteral("Select TFTP root"), tftp_root_edit_->text());
+    if (directory.isEmpty() || directory == tftp_root_edit_->text()) { return; }
+    tftp_root_edit_->setText(directory);
+    handle_network_changed();
 }
 
 bool SettingsDialog::has_semantic_error() const {
@@ -1014,7 +1084,7 @@ void SettingsDialog::accept_machine_view(MachineConfigurationViewDto next) {
     QTimer::singleShot(0, this, [this] {
         machine_rebuild_pending_ = false;
         rebuild_machine_view();
-        schedule_machine_preflight();
+        schedule_preflight();
     });
 }
 
@@ -1032,7 +1102,7 @@ void SettingsDialog::add_forward(const ForwardSettings& rule) {
     protocol->addItem(QStringLiteral("UDP"), QStringLiteral("udp"));
     protocol->setCurrentIndex(rule.protocol == QStringLiteral("udp") ? 1 : 0);
     connect(protocol, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-        [this](int) { clear_apply_failure_status(); });
+        [this](int) { handle_network_changed(); });
     forwards_table_->setCellWidget(row, 0, protocol);
     forwards_table_->setItem(row, 1, new QTableWidgetItem(rule.host_address));
     forwards_table_->setItem(row, 2, new QTableWidgetItem(rule.host_port));

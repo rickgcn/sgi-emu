@@ -104,22 +104,31 @@ public:
     std::future<ReplaySnapshotCatalogDto> future;
 };
 
+/// One background check of the edited machine and one network snapshot.
+struct SettingsPreflightOutcome {
+    MachinePreflightDto machine;
+    std::uint64_t network_revision;
+    rust::String network_error;
+};
+
 class SettingsPreflightTask final {
 public:
     SettingsPreflightTask(
-        std::uint64_t dialog_generation, std::function<MachinePreflightDto()> command)
+        std::uint64_t dialog_generation, std::function<SettingsPreflightOutcome()> command)
         : generation(dialog_generation)
         , future(std::async(std::launch::async, std::move(command))) {
     }
 
     std::uint64_t generation;
-    std::future<MachinePreflightDto> future;
+    std::future<SettingsPreflightOutcome> future;
 };
 
 MainWindow::MainWindow(const UiSession& session, const UiStartupState& startup)
     : session_(session)
     , network_settings_(from_network_configuration(startup.network))
     , settings_preflight_task_()
+    , settings_preflight_network_()
+    , settings_preflight_network_revision_(0)
     , settings_preflight_pending_(false)
     , settings_preflight_pending_generation_(0)
     , settings_dialog_generation_(0)
@@ -783,7 +792,9 @@ void MainWindow::show_settings() {
         session_,
         network_settings_,
         [this](NetworkSettings selected) { apply_settings(std::move(selected)); },
-        [this] { request_settings_preflight(); },
+        [this](NetworkSettings network, std::uint64_t revision) {
+            request_settings_preflight(std::move(network), revision);
+        },
         this);
     settings_dialog_ = dialog;
     connect(dialog, &QDialog::rejected, this, [this, dialog, generation] {
@@ -822,17 +833,32 @@ void MainWindow::apply_settings(NetworkSettings selected) {
         [this, network] { return session_.configure_edited_machine(*network); });
 }
 
-void MainWindow::request_settings_preflight() {
+void MainWindow::request_settings_preflight(
+    NetworkSettings network, std::uint64_t network_revision) {
+    settings_preflight_network_ = std::move(network);
+    settings_preflight_network_revision_ = network_revision;
     if (settings_dialog_ == nullptr) { return; }
     if (settings_preflight_task_ != nullptr) {
         settings_preflight_pending_ = true;
         settings_preflight_pending_generation_ = settings_dialog_generation_;
         return;
     }
+    start_settings_preflight();
+}
+
+void MainWindow::start_settings_preflight() {
     const auto* session = &session_;
+    // The snapshot is converted on the GUI thread and then only read by the task.
+    auto network = std::make_shared<NetworkConfiguration>(
+        to_network_configuration(settings_preflight_network_));
+    const auto network_revision = settings_preflight_network_revision_;
     settings_preflight_task_ = std::make_unique<SettingsPreflightTask>(
-        settings_dialog_generation_,
-        [session] { return session->preflight_edited_machine(); });
+        settings_dialog_generation_, [session, network, network_revision] {
+            SettingsPreflightOutcome outcome {
+                session->preflight_edited_machine(), network_revision, rust::String()};
+            outcome.network_error = session->validate_network_configuration(*network);
+            return outcome;
+        });
 }
 
 void MainWindow::poll_settings_preflight() {
@@ -843,16 +869,17 @@ void MainWindow::poll_settings_preflight() {
     }
 
     const auto generation = settings_preflight_task_->generation;
-    auto result = settings_preflight_task_->future.get();
+    auto outcome = settings_preflight_task_->future.get();
     settings_preflight_task_.reset();
     if (settings_dialog_ != nullptr && generation == settings_dialog_generation_) {
-        settings_dialog_->apply_preflight_result(std::move(result));
+        settings_dialog_->apply_preflight_result(std::move(outcome.machine),
+            outcome.network_revision, from_rust_string(outcome.network_error));
     }
 
     const bool restart = settings_preflight_pending_ && settings_dialog_ != nullptr
         && settings_preflight_pending_generation_ == settings_dialog_generation_;
     settings_preflight_pending_ = false;
-    if (restart) { request_settings_preflight(); }
+    if (restart) { start_settings_preflight(); }
 }
 
 void MainWindow::update_runtime() {

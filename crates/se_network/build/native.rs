@@ -31,13 +31,18 @@ const SLIRP_SOURCES: &[&str] = &[
     "tcp_output",
     "tcp_subr",
     "tcp_timer",
-    "tftp",
     "udp",
     "udp6",
     "util",
     "version",
     "vmstate",
 ];
+
+/// Pinned libslirp translation unit that [`adapted_tftp_source`] rewrites.
+const ADAPTED_SOURCE: &str = "tftp";
+
+/// Downstream patch that routes the TFTP unit's host file access through GLib.
+const TFTP_PATCH: &str = "build/tftp-host-path.patch";
 
 pub fn compile() {
     for variable in [
@@ -88,6 +93,13 @@ pub fn compile() {
     let native = out.join(format!("native-{:016x}", key.finish()));
     let source = native.join("source");
     let build = native.join("build");
+    assert!(
+        !SLIRP_SOURCES.contains(&ADAPTED_SOURCE),
+        "{ADAPTED_SOURCE} must only be compiled from the adapted source"
+    );
+    // Adapting the pinned source first keeps a revision mismatch an immediate,
+    // cheap failure instead of one after the fixed GLib build.
+    let tftp = adapted_tftp_source(&manifest, &slirp, &native);
     if !source.join(".prepared").exists() {
         copy_tree(&glib, &source);
         fs::write(source.join(".prepared"), b"glib-2.88.3").unwrap();
@@ -207,7 +219,8 @@ pub fn compile() {
     for file in SLIRP_SOURCES {
         cc.file(slirp.join(format!("src/{file}.c")));
     }
-    cc.file(manifest.join("csrc/slirp_bridge.c"))
+    cc.file(tftp)
+        .file(manifest.join("csrc/slirp_bridge.c"))
         .compile("se_network_slirp");
     for library in libraries {
         assert!(
@@ -250,6 +263,143 @@ pub fn compile() {
             println!("cargo:rustc-link-lib=framework=Carbon");
         }
     }
+}
+
+/// Writes the adapted TFTP compilation unit and returns its generated path.
+///
+/// Pinned libslirp opens and examines TFTP files with the narrow-character CRT
+/// `open` and `stat`. On Windows those calls interpret their argument in the
+/// process ANSI code page, so a UTF-8 root such as `C:\Users\张三\SGI资料`
+/// cannot be reached there. GLib's `g_open` and `g_stat` take UTF-8 file names
+/// and convert them for the Win32 API; on Unix they are the plain POSIX calls,
+/// so every other platform keeps its current behaviour.
+///
+/// The submodule is never edited: the change lives in [`TFTP_PATCH`] and is
+/// applied in memory. A hunk that no longer matches the pinned source fails the
+/// build, so a new revision cannot silently drop the adaptation, and the
+/// original translation unit is not compiled beside the generated one.
+fn adapted_tftp_source(manifest: &Path, slirp: &Path, native: &Path) -> PathBuf {
+    let origin = slirp.join(format!("src/{ADAPTED_SOURCE}.c"));
+    let patch = manifest.join(TFTP_PATCH);
+    let source = fs::read_to_string(&origin).unwrap_or_else(|error| {
+        panic!("cannot read {}: {error}", origin.display());
+    });
+    let diff = fs::read_to_string(&patch).unwrap_or_else(|error| {
+        panic!("cannot read {}: {error}", patch.display());
+    });
+    fs::create_dir_all(native).unwrap();
+    let generated = native.join(format!("{ADAPTED_SOURCE}.c"));
+    fs::write(&generated, apply_patch(&source, &diff, ADAPTED_SOURCE)).unwrap();
+    generated
+}
+
+/// One whole-line hunk of a unified diff, addressed by its unpatched position.
+struct Hunk {
+    /// One-based first line this hunk covers in the unpatched file.
+    old_start: usize,
+    /// Hunk body in order, each line tagged with its ` `, `+` or `-` marker.
+    body: Vec<(char, String)>,
+}
+
+impl Hunk {
+    /// Counts the lines this hunk consumes from the unpatched file.
+    fn old_len(&self) -> usize {
+        self.body
+            .iter()
+            .filter(|(marker, _)| *marker != '+')
+            .count()
+    }
+
+    /// Iterates the lines this hunk expects in the unpatched file.
+    fn old_lines(&self) -> impl Iterator<Item = &str> {
+        self.body
+            .iter()
+            .filter(|(marker, _)| *marker != '+')
+            .map(|(_, line)| line.as_str())
+    }
+
+    /// Iterates the lines this hunk leaves in the patched file.
+    fn new_lines(&self) -> impl Iterator<Item = &str> {
+        self.body
+            .iter()
+            .filter(|(marker, _)| *marker != '-')
+            .map(|(_, line)| line.as_str())
+    }
+}
+
+/// Applies one unified diff to a pinned source file and returns the result.
+///
+/// Only whole-line hunks with context are supported, which is everything the
+/// downstream TFTP patch needs. Each hunk must match the pinned source at its
+/// recorded position, so an unexpected revision fails the build instead of
+/// producing a partially adapted compilation unit.
+fn apply_patch(source: &str, diff: &str, name: &str) -> String {
+    assert!(
+        source.ends_with('\n'),
+        "pinned libslirp {name}.c must end with a newline"
+    );
+    let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
+    let mut shift = 0isize;
+    let mut applied = 0usize;
+    for hunk in parse_hunks(diff) {
+        let start = usize::try_from(hunk.old_start as isize - 1 + shift).unwrap_or_else(|_| {
+            panic!(
+                "{TFTP_PATCH} addresses line {} before the pinned libslirp {name}.c",
+                hunk.old_start
+            )
+        });
+        assert!(
+            lines
+                .get(start..start + hunk.old_len())
+                .is_some_and(|window| window.iter().map(String::as_str).eq(hunk.old_lines())),
+            "pinned libslirp {name}.c does not match the hunk at line {}; \
+             review {TFTP_PATCH} against the pinned revision",
+            hunk.old_start
+        );
+        let replacement = hunk.new_lines().map(str::to_owned).collect::<Vec<_>>();
+        shift += replacement.len() as isize - hunk.old_len() as isize;
+        lines.splice(start..start + hunk.old_len(), replacement);
+        applied += 1;
+    }
+    assert!(applied > 0, "the TFTP host path patch must contain a hunk");
+    let mut result = lines.join("\n");
+    result.push('\n');
+    result
+}
+
+/// Parses the hunks of one unified diff, ignoring its file headers.
+fn parse_hunks(diff: &str) -> Vec<Hunk> {
+    let mut hunks: Vec<Hunk> = Vec::new();
+    for line in diff.lines() {
+        if let Some(header) = line.strip_prefix("@@ ") {
+            let old_start = header
+                .split(' ')
+                .next()
+                .and_then(|field| field.strip_prefix('-'))
+                .and_then(|field| field.split(',').next())
+                .and_then(|start| start.parse().ok())
+                .unwrap_or_else(|| panic!("unreadable hunk header {line:?}"));
+            hunks.push(Hunk {
+                old_start,
+                body: Vec::new(),
+            });
+            continue;
+        }
+        let Some(hunk) = hunks.last_mut() else {
+            continue;
+        };
+        let (marker, content) = match line.as_bytes().first() {
+            Some(b' ') => (' ', &line[1..]),
+            Some(b'+') => ('+', &line[1..]),
+            Some(b'-') => ('-', &line[1..]),
+            // Every hunk line carries its marker, so an empty context line is
+            // written as a single space and a blank addition as a lone plus.
+            None => panic!("{TFTP_PATCH} has a zero-length line inside a hunk"),
+            Some(_) => panic!("{TFTP_PATCH} has an unsupported line {line:?}"),
+        };
+        hunk.body.push((marker, content.to_owned()));
+    }
+    hunks
 }
 
 fn meson_string(value: &str) -> String {

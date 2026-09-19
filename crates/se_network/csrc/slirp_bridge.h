@@ -13,6 +13,10 @@ typedef struct SeSlirpConfig {
     uint32_t gateway;
     uint32_t dns;
     uint32_t dhcp_start;
+    /* Host directory served by the built-in TFTP server; NULL disables it */
+    const char *tftp_root;
+    /* Boot filename advertised in BOOTP replies; NULL leaves it empty */
+    const char *bootfile;
 } SeSlirpConfig;
 
 SeSlirp *se_slirp_create(const SeSlirpConfig *config, uintptr_t wake_socket,

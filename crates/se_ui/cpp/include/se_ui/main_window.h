@@ -83,7 +83,8 @@ private:
     void stop_replay();
     void show_settings();
     void apply_settings(NetworkSettings selected);
-    void request_settings_preflight();
+    void request_settings_preflight(NetworkSettings network, std::uint64_t network_revision);
+    void start_settings_preflight();
     void poll_settings_preflight();
     void update_runtime();
     void refresh_debuggers();
@@ -96,6 +97,8 @@ private:
     std::unique_ptr<NetworkSettings> pending_network_settings_;
     QPointer<SettingsDialog> settings_dialog_;
     std::unique_ptr<SettingsPreflightTask> settings_preflight_task_;
+    NetworkSettings settings_preflight_network_;
+    std::uint64_t settings_preflight_network_revision_;
     bool settings_preflight_pending_;
     std::uint64_t settings_preflight_pending_generation_;
     std::uint64_t settings_dialog_generation_;

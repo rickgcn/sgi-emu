@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 /// Number of contiguous DHCP client addresses in libslirp 4.9.4.
 pub const DHCP_CLIENTS: u32 = 16;
 
+/// Size of the BOOTP reply filename field in libslirp 4.9.4.
+const BOOTP_FILE_BYTES: usize = 128;
+
 /// An IPv4 network with a canonical network address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ipv4Subnet {
@@ -107,6 +110,12 @@ pub struct NatConfig {
     pub dhcp_start: Ipv4Addr,
     /// Explicit TCP/UDP host listeners.
     pub forwards: Vec<PortForwardRule>,
+    /// Host directory served by the built-in TFTP server; absent disables it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tftp_root: Option<String>,
+    /// Boot filename advertised in BOOTP replies; absent leaves the field empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootfile: Option<String>,
 }
 
 impl Default for NatConfig {
@@ -117,13 +126,16 @@ impl Default for NatConfig {
             dns: Ipv4Addr::new(10, 0, 2, 3),
             dhcp_start: Ipv4Addr::new(10, 0, 2, 15),
             forwards: Vec::new(),
+            tftp_root: None,
+            bootfile: None,
         }
     }
 }
 
 impl NatConfig {
-    /// Validates subnet membership, the entire DHCP pool, and listener conflicts.
-    /// Actual host binding is checked during session creation.
+    /// Validates subnet membership, the entire DHCP pool, listener conflicts, and
+    /// the network boot strings. Actual host binding is checked during session
+    /// creation.
     ///
     /// # Errors
     /// Returns an actionable configuration error for an invalid field or rule.
@@ -185,6 +197,24 @@ impl NatConfig {
                 )));
             }
         }
+        if let Some(root) = &self.tftp_root {
+            if root.is_empty() {
+                return Err(error("TFTP root must not be empty"));
+            }
+            if root.contains('\0') {
+                return Err(error("TFTP root must not contain NUL bytes"));
+            }
+        }
+        if let Some(bootfile) = &self.bootfile {
+            if bootfile.contains('\0') {
+                return Err(error("Boot filename must not contain NUL bytes"));
+            }
+            if bootfile.len() >= BOOTP_FILE_BYTES {
+                return Err(error(format!(
+                    "Boot filename must be shorter than {BOOTP_FILE_BYTES} bytes"
+                )));
+            }
+        }
         Ok(subnet)
     }
 }
@@ -234,5 +264,57 @@ mod tests {
         assert!(config.validate().is_err());
         config.forwards[1].protocol = TransportProtocol::Udp;
         assert!(config.validate().is_ok());
+    }
+    #[test]
+    fn network_boot_defaults_expose_no_host_directory_or_bootfile() {
+        let config = NatConfig::default();
+        assert_eq!(config.tftp_root, None);
+        assert_eq!(config.bootfile, None);
+        assert!(config.validate().is_ok());
+    }
+    #[test]
+    fn boot_filename_is_limited_to_the_native_field_in_bytes() {
+        let validate = |bootfile: String| {
+            NatConfig {
+                bootfile: Some(bootfile),
+                ..NatConfig::default()
+            }
+            .validate()
+            .map_err(|error| error.to_string())
+        };
+        assert!(validate("b".repeat(BOOTP_FILE_BYTES - 1)).is_ok());
+        assert_eq!(
+            validate("b".repeat(BOOTP_FILE_BYTES)).unwrap_err(),
+            "Boot filename must be shorter than 128 bytes"
+        );
+        assert!(validate("é".repeat(BOOTP_FILE_BYTES / 2 - 1)).is_ok());
+        assert!(validate("é".repeat(BOOTP_FILE_BYTES / 2)).is_err());
+    }
+    #[test]
+    fn network_boot_strings_reject_unrepresentable_values() {
+        let with_bootfile = |bootfile: &str| NatConfig {
+            bootfile: Some(bootfile.into()),
+            ..NatConfig::default()
+        };
+        let with_root = |root: &str| NatConfig {
+            tftp_root: Some(root.into()),
+            ..NatConfig::default()
+        };
+        assert_eq!(
+            with_bootfile("stand\0sa")
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "Boot filename must not contain NUL bytes"
+        );
+        assert_eq!(
+            with_root("/srv/tftp\0").validate().unwrap_err().to_string(),
+            "TFTP root must not contain NUL bytes"
+        );
+        assert_eq!(
+            with_root("").validate().unwrap_err().to_string(),
+            "TFTP root must not be empty"
+        );
+        assert!(with_root("/srv/tftp").validate().is_ok());
     }
 }

@@ -1,8 +1,9 @@
 //! Single-thread native ownership and panic-contained packet callbacks.
 
-use std::ffi::c_void;
+use std::ffi::{CString, c_void};
 use std::io;
 use std::net::UdpSocket;
+use std::ptr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc::SyncSender};
 
@@ -27,12 +28,22 @@ pub(crate) fn run(
     ready: SyncSender<Result<(), String>>,
 ) -> io::Result<()> {
     let subnet = config.validate().map_err(io::Error::other)?;
+    // libslirp duplicates both settings while creating the session, so these
+    // strings only have to outlive the call below.
+    let tftp_root = c_string(config.tftp_root.as_deref())?;
+    let bootfile = c_string(config.bootfile.as_deref())?;
     let config_native = ffi::Config {
         network: u32::from(subnet.network()),
         mask: u32::from(subnet.mask()),
         gateway: u32::from(config.gateway),
         dns: u32::from(config.dns),
         dhcp_start: u32::from(config.dhcp_start),
+        tftp_root: tftp_root
+            .as_ref()
+            .map_or(ptr::null(), |value| value.as_ptr()),
+        bootfile: bootfile
+            .as_ref()
+            .map_or(ptr::null(), |value| value.as_ptr()),
     };
     #[cfg(windows)]
     let socket = {
@@ -117,6 +128,14 @@ pub(crate) fn run(
         return Err(io::Error::other(failure));
     }
     Ok(())
+}
+
+/// Converts an optional setting for the C ABI; validation excludes NUL bytes.
+fn c_string(value: Option<&str>) -> io::Result<Option<CString>> {
+    value
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| io::Error::other("Network boot settings must not contain NUL bytes"))
 }
 
 unsafe extern "C" fn packet(bytes: *const u8, length: usize, opaque: *mut c_void) {
