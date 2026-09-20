@@ -16,7 +16,7 @@ const VME_INTERRUPT_STATUS: u64 = 0x10;
 const VME_INTERRUPT_0_MASK: u64 = 0x14;
 const VME_INTERRUPT_1_MASK: u64 = 0x18;
 const OUTPUT_PORT: u64 = 0x1c;
-const TIMER_ACKNOWLEDGE: u64 = 0x23;
+const TIMER_ACKNOWLEDGE_WINDOW: u64 = 0x20;
 const PROGRAMMABLE_TIMER_CLOCK: u64 = 0x30;
 const SYSTEM_TIMER_COUNTER_0: u64 = 0x33;
 const SYSTEM_TIMER_COUNTER_1: u64 = 0x37;
@@ -220,10 +220,7 @@ impl Int2 {
             return Ok(());
         }
 
-        if start == TIMER_ACKNOWLEDGE
-            || start == PROGRAMMABLE_TIMER_CLOCK
-            || start == SYSTEM_TIMER_CONTROL
-        {
+        if start == PROGRAMMABLE_TIMER_CLOCK || start == SYSTEM_TIMER_CONTROL {
             return Err(BusError::UnimplementedAccess);
         }
 
@@ -257,10 +254,7 @@ impl Int2 {
             return Ok(());
         }
 
-        if start == TIMER_ACKNOWLEDGE
-            || start == PROGRAMMABLE_TIMER_CLOCK
-            || start == SYSTEM_TIMER_CONTROL
-        {
+        if start == PROGRAMMABLE_TIMER_CLOCK || start == SYSTEM_TIMER_CONTROL {
             return Err(BusError::UnimplementedAccess);
         }
 
@@ -320,13 +314,10 @@ impl Int2 {
             return Ok(());
         }
 
-        if start == TIMER_ACKNOWLEDGE && end == start + 1 {
-            if data[0] & 1 != 0 {
-                self.timer_pending[0] = false;
-            }
-            if data[0] & 2 != 0 {
-                self.timer_pending[1] = false;
-            }
+        if let Some(offset) = decode_word_window(TIMER_ACKNOWLEDGE_WINDOW, start, end) {
+            let mut value = 0;
+            write_byte_register(&mut value, offset, data);
+            self.acknowledge_timers(value);
             return Ok(());
         }
 
@@ -345,8 +336,7 @@ impl Int2 {
             return self.timer.write_control(data[0]);
         }
 
-        if start == TIMER_ACKNOWLEDGE
-            || start == PROGRAMMABLE_TIMER_CLOCK
+        if start == PROGRAMMABLE_TIMER_CLOCK
             || decode_timer_counter(start).is_some()
             || start == SYSTEM_TIMER_CONTROL
         {
@@ -357,6 +347,15 @@ impl Int2 {
             return Err(BusError::HardwareFault);
         }
         Err(BusError::UnimplementedAccess)
+    }
+
+    fn acknowledge_timers(&mut self, value: u8) {
+        if value & 1 != 0 {
+            self.timer_pending[0] = false;
+        }
+        if value & 2 != 0 {
+            self.timer_pending[1] = false;
+        }
     }
 }
 
@@ -405,11 +404,16 @@ fn decode_word_register(start: u64, end: u64) -> Option<(Register, usize)> {
         (VME_INTERRUPT_1_MASK, Register::VmeInterrupt1Mask),
         (OUTPUT_PORT, Register::OutputPort),
     ] {
-        if start >= base && end <= base + REGISTER_BYTES {
-            return usize::try_from(start - base)
-                .ok()
-                .map(|offset| (register, offset));
+        if let Some(offset) = decode_word_window(base, start, end) {
+            return Some((register, offset));
         }
+    }
+    None
+}
+
+fn decode_word_window(base: u64, start: u64, end: u64) -> Option<usize> {
+    if start >= base && end <= base + REGISTER_BYTES {
+        return usize::try_from(start - base).ok();
     }
     None
 }
@@ -431,12 +435,14 @@ mod tests {
 
     use super::{
         Int2, LOCAL_INTERRUPT_0_MASK, LOCAL_INTERRUPT_0_STATUS, LOCAL_INTERRUPT_1_MASK,
-        LOCAL_INTERRUPT_1_STATUS, OUTPUT_PORT, PROGRAMMABLE_TIMER_CLOCK, SYSTEM_TIMER_CONTROL,
-        SYSTEM_TIMER_COUNTER_0, SYSTEM_TIMER_COUNTER_1, SYSTEM_TIMER_COUNTER_2, TIMER_ACKNOWLEDGE,
-        VME_INTERRUPT_0_MASK, VME_INTERRUPT_1_MASK, VME_INTERRUPT_STATUS,
+        LOCAL_INTERRUPT_1_STATUS, OUTPUT_PORT, PROGRAMMABLE_TIMER_CLOCK, REGISTER_BYTES,
+        SYSTEM_TIMER_CONTROL, SYSTEM_TIMER_COUNTER_0, SYSTEM_TIMER_COUNTER_1,
+        SYSTEM_TIMER_COUNTER_2, TIMER_ACKNOWLEDGE_WINDOW, VME_INTERRUPT_0_MASK,
+        VME_INTERRUPT_1_MASK, VME_INTERRUPT_STATUS,
     };
 
     const ATTOSECONDS_PER_MICROSECOND: u128 = 1_000_000_000_000;
+    const TIMER_ACKNOWLEDGE_BYTE: u64 = TIMER_ACKNOWLEDGE_WINDOW + REGISTER_BYTES - 1;
 
     fn read_word(int2: &mut Int2, address: u64) -> Result<u32, BusError> {
         let mut bytes = [0; 4];
@@ -551,23 +557,58 @@ mod tests {
         let mut int2 = Int2::new();
         int2.timer_pending = [true; 2];
 
-        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[0])
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE_BYTE), &[0])
             .unwrap();
         assert_eq!(int2.timer_pending, [true, true]);
-        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[1])
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE_BYTE), &[1])
             .unwrap();
         assert_eq!(int2.timer_pending, [false, true]);
-        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[0xfe])
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE_BYTE), &[0xfe])
             .unwrap();
         assert_eq!(int2.timer_pending, [false, false]);
         int2.timer_pending = [true; 2];
-        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[3])
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE_BYTE), &[3])
             .unwrap();
         assert_eq!(int2.timer_pending, [false, false]);
         assert_eq!(
-            int2.read(DeviceAddr::new(TIMER_ACKNOWLEDGE), &mut [0]),
+            int2.read(DeviceAddr::new(TIMER_ACKNOWLEDGE_BYTE), &mut [0]),
             Err(BusError::UnimplementedAccess)
         );
+    }
+
+    #[test]
+    fn timer_acknowledge_uses_the_low_byte_lane_of_its_word_window() {
+        let mut int2 = Int2::new();
+        int2.timer_pending = [true; 2];
+
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE_WINDOW), &[3, 0, 0, 0])
+            .unwrap();
+        assert_eq!(int2.timer_pending, [true, true]);
+
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE_WINDOW), &[0, 0, 0, 1])
+            .unwrap();
+        assert_eq!(int2.timer_pending, [false, true]);
+
+        int2.timer_pending = [true; 2];
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE_WINDOW + 2), &[0, 2])
+            .unwrap();
+        assert_eq!(int2.timer_pending, [true, false]);
+
+        int2.timer_pending = [true; 2];
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE_WINDOW), &[0, 0, 0, 3])
+            .unwrap();
+        assert_eq!(int2.timer_pending, [false, false]);
+        assert_eq!(
+            read_word(&mut int2, TIMER_ACKNOWLEDGE_WINDOW),
+            Err(BusError::UnimplementedAccess)
+        );
+
+        int2.timer_pending = [true; 2];
+        assert_eq!(
+            int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE_BYTE), &[3, 0]),
+            Err(BusError::HardwareFault)
+        );
+        assert_eq!(int2.timer_pending, [true, true]);
     }
 
     #[test]
@@ -711,7 +752,7 @@ mod tests {
         assert_eq!(int2.timer_pending, [true, true]);
         assert_eq!(int2.time_until_event(), None);
 
-        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE), &[1])
+        int2.write(DeviceAddr::new(TIMER_ACKNOWLEDGE_BYTE), &[1])
             .unwrap();
         assert_eq!(
             int2.time_until_event(),
