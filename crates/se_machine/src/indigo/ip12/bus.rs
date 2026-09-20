@@ -335,6 +335,10 @@ impl Ip12Bus {
         accepted
     }
 
+    pub(super) fn ethernet_receive_ready(&self) -> bool {
+        self.seeq8003.receive_ready()
+    }
+
     pub(super) fn hash_ethernet_state(&self, hasher: &mut Sha256) {
         let bytes = bincode::serde::encode_to_vec(
             (

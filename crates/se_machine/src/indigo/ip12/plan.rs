@@ -221,15 +221,19 @@ pub enum Ip12Port {
 }
 
 impl Ip12Port {
-    /// Returns the stable runtime interface identity associated with this port.
-    #[must_use]
-    pub fn endpoint_key(self) -> EndpointKey {
-        EndpointKey::new(match self {
+    pub(super) const fn endpoint_name(self) -> &'static str {
+        match self {
             Self::Keyboard => "keyboard.0",
             Self::Mouse => "pointer.0",
             Self::SerialA => "serial.external.a",
             Self::SerialB => "serial.external.b",
-        })
+        }
+    }
+
+    /// Returns the stable runtime interface identity associated with this port.
+    #[must_use]
+    pub fn endpoint_key(self) -> EndpointKey {
+        EndpointKey::new(self.endpoint_name())
     }
 }
 

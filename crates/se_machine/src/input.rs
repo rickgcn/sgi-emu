@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{EndpointKey, EndpointKind};
 
-const MAX_ETHERNET_FRAME_BYTES: usize = 16_384;
+pub(crate) const MAX_ETHERNET_FRAME_BYTES: usize = 16_384;
 
 /// One physical or logical key supported by the frontend.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

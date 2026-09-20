@@ -48,7 +48,7 @@ use crate::endpoint::{
 use crate::input::{
     KeyboardKey, KeyboardNamedKey, MachineInput, MachineInputPayload, PointerButton,
 };
-use crate::machine::{MachineInputError, MachineInputResult};
+use crate::machine::{MachineInputError, MachineInputReadiness, MachineInputResult};
 use crate::media::{
     MachineMediaError, MediaCatalog, MediaKind, MediaSlotDescriptor, MediaSlotKey, MediaSlotState,
 };
@@ -432,26 +432,45 @@ pub struct Ip12 {
 }
 
 impl Ip12 {
+    pub(crate) fn input_readiness(
+        &self,
+        input: &MachineInput,
+    ) -> Result<MachineInputReadiness, MachineInputError> {
+        self.validate_input_endpoint(input)?;
+        if let MachineInputPayload::Keyboard { key, .. } = input.payload()
+            && translate_keyboard_key(*key).is_none()
+        {
+            return Err(MachineInputError::UnsupportedKeyboardKey);
+        }
+        Ok(match input.payload() {
+            MachineInputPayload::EthernetFrame { .. } if !self.bus.ethernet_receive_ready() => {
+                MachineInputReadiness::WouldBlock
+            }
+            _ => MachineInputReadiness::Ready,
+        })
+    }
+
     pub(crate) fn try_receive_input(
         &mut self,
         input: &MachineInput,
     ) -> Result<MachineInputResult, MachineInputError> {
-        let endpoint = input.endpoint();
+        self.validate_input_endpoint(input)?;
+        let endpoint = input.endpoint().as_str();
         let consumed = match input.payload() {
             MachineInputPayload::SerialByte(value)
-                if endpoint == &Ip12Port::SerialA.endpoint_key() =>
+                if endpoint == Ip12Port::SerialA.endpoint_name() =>
             {
                 self.receive_serial_character(Channel::A, *value);
                 true
             }
             MachineInputPayload::SerialByte(value)
-                if endpoint == &Ip12Port::SerialB.endpoint_key() =>
+                if endpoint == Ip12Port::SerialB.endpoint_name() =>
             {
                 self.receive_serial_character(Channel::B, *value);
                 true
             }
             MachineInputPayload::Keyboard { key, pressed }
-                if endpoint == &Ip12Port::Keyboard.endpoint_key() =>
+                if endpoint == Ip12Port::Keyboard.endpoint_name() =>
             {
                 let key = translate_keyboard_key(*key)
                     .ok_or(MachineInputError::UnsupportedKeyboardKey)?;
@@ -459,13 +478,13 @@ impl Ip12 {
                 true
             }
             MachineInputPayload::PointerMotion { delta_x, delta_y }
-                if endpoint == &Ip12Port::Mouse.endpoint_key() =>
+                if endpoint == Ip12Port::Mouse.endpoint_name() =>
             {
                 self.move_sgi_mouse(*delta_x, *delta_y);
                 true
             }
             MachineInputPayload::PointerButton { button, pressed }
-                if endpoint == &Ip12Port::Mouse.endpoint_key() =>
+                if endpoint == Ip12Port::Mouse.endpoint_name() =>
             {
                 let button = match button {
                     PointerButton::Left => SgiMouseButton::Left,
@@ -475,7 +494,7 @@ impl Ip12 {
                 self.set_sgi_mouse_button_state(button, *pressed);
                 true
             }
-            MachineInputPayload::EthernetFrame { bytes } if endpoint.as_str() == "ethernet.0" => {
+            MachineInputPayload::EthernetFrame { bytes } if endpoint == "ethernet.0" => {
                 self.receive_ethernet(bytes)
             }
             _ => unreachable!("IP12 endpoint catalog and input routing must agree"),
@@ -485,6 +504,30 @@ impl Ip12 {
         } else {
             MachineInputResult::WouldBlock
         })
+    }
+
+    fn validate_input_endpoint(&self, input: &MachineInput) -> Result<(), MachineInputError> {
+        let endpoint = input.endpoint().as_str();
+        let endpoint_kind =
+            if endpoint == Ip12Port::Keyboard.endpoint_name() && self.bus.has_sgi_keyboard() {
+                EndpointKind::Keyboard
+            } else if endpoint == Ip12Port::Mouse.endpoint_name() && self.bus.has_sgi_mouse() {
+                EndpointKind::Pointer
+            } else if endpoint == Ip12Port::SerialA.endpoint_name()
+                || endpoint == Ip12Port::SerialB.endpoint_name()
+            {
+                EndpointKind::Serial
+            } else if endpoint == "ethernet.0" {
+                EndpointKind::Ethernet
+            } else if endpoint == "video.0" && self.bus.has_video_output() {
+                return Err(MachineInputError::OutputOnlyEndpoint);
+            } else {
+                return Err(MachineInputError::UnknownEndpoint);
+            };
+        if endpoint_kind != input.payload().kind() {
+            return Err(MachineInputError::PayloadKindMismatch);
+        }
+        Ok(())
     }
 
     /// Returns the active machine's frontend I/O endpoints in service order.
@@ -981,7 +1024,7 @@ mod tests {
 
     use crate::endpoint::{EndpointDirection, EndpointKey, EndpointKind};
     use crate::input::{KeyboardKey, MachineInput, MachineInputPayload, PointerButton};
-    use crate::machine::{Machine, MachineInputError, MachineInputResult};
+    use crate::machine::{Machine, MachineInputError, MachineInputReadiness, MachineInputResult};
     use crate::media::{MachineMediaError, MediaKind, MediaSlotState};
     use crate::output::{EndpointOutput, MachineOutput, VideoOutput};
     use se_core::bus::{PhysAddr, PhysicalBus};
@@ -1153,6 +1196,58 @@ mod tests {
                 }
             )),
             Ok(MachineInputResult::Consumed)
+        );
+    }
+
+    #[test]
+    fn ethernet_input_readiness_is_side_effect_free_and_rejects_oversized_frames() {
+        let mut machine = Machine::IndigoIp12(
+            Ip12::new(
+                vec![0; PROM_BYTES],
+                Backend::SoftFloat,
+                GioBus::new(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let input = MachineInput::new(
+            EndpointKey::new("ethernet.0"),
+            MachineInputPayload::EthernetFrame {
+                bytes: vec![0xff; 60],
+            },
+        );
+
+        assert_eq!(
+            machine.input_readiness(&input),
+            Ok(MachineInputReadiness::Ready)
+        );
+        assert_eq!(
+            machine.input_readiness(&input),
+            Ok(MachineInputReadiness::Ready)
+        );
+        assert_eq!(
+            machine.try_receive_input(&input),
+            Ok(MachineInputResult::Consumed)
+        );
+        assert_eq!(
+            machine.input_readiness(&input),
+            Ok(MachineInputReadiness::WouldBlock)
+        );
+
+        let oversized = MachineInput::new(
+            EndpointKey::new("ethernet.0"),
+            MachineInputPayload::EthernetFrame {
+                bytes: vec![0; 16_385],
+            },
+        );
+        assert_eq!(
+            machine.input_readiness(&oversized),
+            Err(MachineInputError::PayloadTooLarge)
+        );
+        assert_eq!(
+            machine.try_receive_input(&oversized),
+            Err(MachineInputError::PayloadTooLarge)
         );
     }
 

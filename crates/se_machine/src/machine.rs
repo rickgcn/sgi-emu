@@ -9,10 +9,10 @@ use se_cpu::mips1::r3000::StepError;
 use serde::{Deserialize, Serialize};
 
 use crate::debug::{DebugRequest, DebugResponse};
-use crate::endpoint::{EndpointCatalog, EndpointKind};
+use crate::endpoint::EndpointCatalog;
 use crate::indigo::ip12::snapshot::Ip12Snapshot;
 use crate::indigo::ip12::{Ip12, Ip12NonvolatileState, Ip12SnapshotError};
-use crate::input::MachineInput;
+use crate::input::{MAX_ETHERNET_FRAME_BYTES, MachineInput, MachineInputPayload};
 use crate::media::{MachineMediaError, MediaCatalog, MediaSlotKey};
 use crate::output::MachineOutput;
 
@@ -95,6 +95,15 @@ pub enum MachineInputResult {
     WouldBlock,
 }
 
+/// Readiness of one valid machine input at the current execution boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineInputReadiness {
+    /// The destination can accept the complete input now.
+    Ready,
+    /// The destination may accept the input at a later boundary.
+    WouldBlock,
+}
+
 /// An invalid endpoint or payload in a machine input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachineInputError {
@@ -106,6 +115,8 @@ pub enum MachineInputError {
     PayloadKindMismatch,
     /// The semantic keyboard key is outside the supported frontend set.
     UnsupportedKeyboardKey,
+    /// The input payload exceeds its allocation bound.
+    PayloadTooLarge,
 }
 
 impl fmt::Display for MachineInputError {
@@ -121,6 +132,7 @@ impl fmt::Display for MachineInputError {
             Self::UnsupportedKeyboardKey => {
                 formatter.write_str("unsupported frontend keyboard key")
             }
+            Self::PayloadTooLarge => formatter.write_str("machine input payload is too large"),
         }
     }
 }
@@ -296,6 +308,23 @@ impl Machine {
         }
     }
 
+    /// Reports whether one frontend-neutral input can be accepted at the
+    /// current machine boundary without changing machine state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineInputError`] when the endpoint or payload is invalid
+    /// for the configured machine.
+    pub fn input_readiness(
+        &self,
+        input: &MachineInput,
+    ) -> Result<MachineInputReadiness, MachineInputError> {
+        validate_input_allocation(input)?;
+        match self {
+            Self::IndigoIp12(machine) => machine.input_readiness(input),
+        }
+    }
+
     /// Attempts to accept one frontend-neutral input at the current machine
     /// boundary.
     ///
@@ -306,17 +335,7 @@ impl Machine {
         &mut self,
         input: &MachineInput,
     ) -> Result<MachineInputResult, MachineInputError> {
-        let catalog = self.endpoint_catalog();
-        let descriptor = catalog
-            .get(input.endpoint())
-            .ok_or(MachineInputError::UnknownEndpoint)?;
-        if !descriptor.direction().accepts_input() {
-            return Err(MachineInputError::OutputOnlyEndpoint);
-        }
-        if descriptor.kind() != input.payload().kind() {
-            return Err(MachineInputError::PayloadKindMismatch);
-        }
-        debug_assert_ne!(descriptor.kind(), EndpointKind::Video);
+        validate_input_allocation(input)?;
         match self {
             Self::IndigoIp12(machine) => machine.try_receive_input(input),
         }
@@ -342,4 +361,15 @@ impl Machine {
             }
         }
     }
+}
+
+fn validate_input_allocation(input: &MachineInput) -> Result<(), MachineInputError> {
+    if matches!(
+        input.payload(),
+        MachineInputPayload::EthernetFrame { bytes }
+            if bytes.len() > MAX_ETHERNET_FRAME_BYTES
+    ) {
+        return Err(MachineInputError::PayloadTooLarge);
+    }
+    Ok(())
 }

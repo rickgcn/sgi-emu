@@ -24,7 +24,9 @@ use se_core::time::{ATTOSECONDS_PER_SECOND, VirtualDuration, VirtualInstant};
 use se_machine::debug::{DebugRequest, DebugResponse};
 use se_machine::endpoint::{EndpointKey, EndpointKind};
 use se_machine::input::{KeyboardKey, MachineInput, MachineInputPayload, PointerButton};
-use se_machine::machine::{ExecutionError, Machine, MachineInputResult, MachineNonvolatileState};
+use se_machine::machine::{
+    ExecutionError, Machine, MachineInputReadiness, MachineInputResult, MachineNonvolatileState,
+};
 use se_machine::media::MachineMediaError;
 use se_machine::output::{EndpointOutput, MachineOutput};
 use se_network::config::NatConfig;
@@ -678,7 +680,7 @@ struct Worker {
     network_generation: u64,
     network_error: Option<String>,
     network_endpoint: Option<EndpointKey>,
-    pending_network_frame: Option<Vec<u8>>,
+    pending_network_input: Option<MachineInput>,
     command_sender: Option<Sender<Command>>,
     machine: Option<Machine>,
     cpu_clock: Option<CpuClock>,
@@ -776,7 +778,7 @@ impl Worker {
             network_generation: 0,
             network_error: None,
             network_endpoint,
-            pending_network_frame: None,
+            pending_network_input: None,
             command_sender: None,
             machine,
             cpu_clock,
@@ -1079,7 +1081,7 @@ impl Worker {
             .expect("runtime machine generation must not overflow");
         self.network_config = next_network;
         self.network_endpoint = next_network_endpoint;
-        self.pending_network_frame = None;
+        self.pending_network_input = None;
         self.network_error = None;
         self.cpu_clock = Some(cpu_clock);
         self.machine = Some(machine);
@@ -1456,7 +1458,7 @@ impl Worker {
             .expect("reset requires a CPU clock")
             .reset();
         self.virtual_instant = VirtualInstant::ZERO;
-        self.pending_network_frame = None;
+        self.pending_network_input = None;
         self.frontend_output = MachineOutput::default();
         self.last_error = None;
         self.ignore_breakpoint_once = None;
@@ -1791,7 +1793,7 @@ impl Worker {
     /// Host queue drops and sockets never become replay machine state.
     #[inline]
     fn process_network_boundary(&mut self) {
-        if self.pending_network_frame.is_none()
+        if self.pending_network_input.is_none()
             && !self
                 .network
                 .as_ref()
@@ -1804,20 +1806,41 @@ impl Worker {
 
     #[inline(never)]
     fn process_pending_network_boundary(&mut self) {
-        if self.pending_network_frame.is_none() {
-            self.pending_network_frame = self
+        if self.pending_network_input.is_none()
+            && let Some(frame) = self
                 .network
                 .as_ref()
-                .and_then(NetworkSession::try_receive_frame);
+                .and_then(NetworkSession::try_receive_frame)
+        {
+            self.pending_network_input = Some(self.network_input(frame));
         }
-        if let Some(frame) = self.pending_network_frame.take() {
-            match self.accept_network_frame(&frame) {
-                Ok(MachineInputResult::Consumed) => {}
-                Ok(MachineInputResult::WouldBlock) => self.pending_network_frame = Some(frame),
-                Err(error) => {
-                    self.fail_session(error.to_string());
-                    return;
+        let readiness = self.pending_network_input.as_ref().map(|input| {
+            self.machine
+                .as_ref()
+                .expect("network input requires a machine")
+                .input_readiness(input)
+        });
+        match readiness {
+            Some(Ok(MachineInputReadiness::Ready)) => {
+                let input = self
+                    .pending_network_input
+                    .take()
+                    .expect("ready network input must remain pending");
+                match self.accept_network_input(&input) {
+                    Ok(MachineInputResult::Consumed) => {}
+                    Ok(MachineInputResult::WouldBlock) => {
+                        self.pending_network_input = Some(input);
+                    }
+                    Err(error) => {
+                        self.fail_session(error.to_string());
+                        return;
+                    }
                 }
+            }
+            Some(Ok(MachineInputReadiness::WouldBlock)) | None => {}
+            Some(Err(error)) => {
+                self.fail_session(error.to_string());
+                return;
             }
         }
         if let Some(failure) = self.network.as_ref().and_then(NetworkSession::take_failure) {
@@ -1825,30 +1848,31 @@ impl Worker {
         }
     }
 
-    fn accept_network_frame(&mut self, frame: &[u8]) -> Result<MachineInputResult, io::Error> {
+    fn network_input(&self, frame: Vec<u8>) -> MachineInput {
         let key = self
             .network_endpoint
             .as_ref()
             .expect("a network session requires one bound machine endpoint")
             .clone();
-        let input = MachineInput::new(
-            key,
-            MachineInputPayload::EthernetFrame {
-                bytes: frame.to_vec(),
-            },
-        );
+        MachineInput::new(key, MachineInputPayload::EthernetFrame { bytes: frame })
+    }
+
+    fn accept_network_input(
+        &mut self,
+        input: &MachineInput,
+    ) -> Result<MachineInputResult, io::Error> {
         let accepted = self
             .machine
             .as_mut()
             .expect("network input requires a machine")
-            .try_receive_input(&input)
+            .try_receive_input(input)
             .map_err(io::Error::other)?;
         if accepted == MachineInputResult::Consumed
             && let ActiveMode::Recording(session) = &self.mode
         {
             session
                 .recorder
-                .record_machine_input(self.position, &input)
+                .record_machine_input(self.position, input)
                 .map_err(io::Error::other)?;
         }
         Ok(accepted)
@@ -3410,12 +3434,14 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         execute_instructions(&mut worker, 1);
         // RX is disabled. The external input must still be recorded and occupy
         // the wire, including its in-flight state at a replay snapshot.
-        worker.accept_network_frame(&[0xff; 60]).unwrap();
+        let input = worker.network_input(vec![0xff; 60]);
+        worker.accept_network_input(&input).unwrap();
         execute_instructions(&mut worker, 10);
         let (reply, response) = mpsc::channel();
         worker.handle_command(super::Command::Reset(reply));
         response.recv().unwrap().unwrap();
-        worker.accept_network_frame(&[0x55; 60]).unwrap();
+        let input = worker.network_input(vec![0x55; 60]);
+        worker.accept_network_input(&input).unwrap();
         execute_instructions(&mut worker, 2300);
         worker.stop_recording(RecordOutcome::UserStopped).unwrap();
         drop(worker);
@@ -3513,11 +3539,11 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
     #[test]
     fn local_network_frame_is_processed_without_host_pending_work() {
         let mut worker = super::Worker::new(Some(machine_with_instructions(&[0])));
-        worker.pending_network_frame = Some(vec![0xff; 60]);
+        worker.pending_network_input = Some(worker.network_input(vec![0xff; 60]));
 
         worker.process_network_boundary();
 
-        assert!(worker.pending_network_frame.is_none());
+        assert!(worker.pending_network_input.is_none());
         assert!(worker.session_error.is_none());
     }
 
@@ -3535,7 +3561,8 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
                 started_recorder(&path),
             ))
             .unwrap();
-        worker.accept_network_frame(&[0xff; 60]).unwrap();
+        let input = worker.network_input(vec![0xff; 60]);
+        worker.accept_network_input(&input).unwrap();
         let mut arp = vec![0; 60];
         let mac = [2, 0, 0, 0, 0, 1];
         arp[..6].fill(255);
@@ -3553,12 +3580,12 @@ setting secs=0 min=0 hour=0 day=1 month=1 year=0\r\n\
         }
         assert!(network.take_failure().is_none());
         worker.process_network_boundary();
-        assert!(worker.pending_network_frame.is_some());
+        assert!(worker.pending_network_input.is_some());
         execute_instructions(&mut worker, 100);
-        assert!(worker.pending_network_frame.is_some());
+        assert!(worker.pending_network_input.is_some());
         execute_instructions(&mut worker, 4900);
         assert!(!worker.network.as_ref().unwrap().has_pending_work());
-        assert!(worker.pending_network_frame.is_none());
+        assert!(worker.pending_network_input.is_none());
         let fingerprint = checkpoint_digest(worker.machine.as_ref().unwrap());
         worker.stop_recording(RecordOutcome::UserStopped).unwrap();
         drop(worker);
