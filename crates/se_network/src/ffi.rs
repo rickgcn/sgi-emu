@@ -13,6 +13,8 @@ pub(crate) struct Config {
     pub tftp_root: *const c_char,
     /// NUL-terminated boot filename; null leaves BOOTP replies without one.
     pub bootfile: *const c_char,
+    /// NUL-terminated DHCP option 17 value; null omits the option.
+    pub root_path: *const c_char,
 }
 
 unsafe extern "C" {

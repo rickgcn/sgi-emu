@@ -69,8 +69,8 @@ impl ApplicationConfig {
 /// Converts one optional network boot field between editable text and storage.
 ///
 /// Empty text means the setting is absent. Any other text is kept exactly as
-/// entered, including surrounding whitespace, because a host path may end in a
-/// space.
+/// entered, including surrounding whitespace, because path-like values may use
+/// it as significant data.
 fn network_boot_setting(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
@@ -96,6 +96,7 @@ pub fn parse_network_configuration(
         dhcp_start: address(&configuration.dhcp_start, "DHCP start")?,
         tftp_root: network_boot_setting(&configuration.tftp_root),
         bootfile: network_boot_setting(&configuration.bootfile),
+        root_path: network_boot_setting(&configuration.root_path),
         forwards: configuration
             .forwards
             .iter()
@@ -120,9 +121,9 @@ pub fn parse_network_configuration(
 
 /// Checks that the host resources required by a validated network configuration exist.
 ///
-/// Only the TFTP root names a host directory. The boot filename is a guest file
-/// name that the built-in server resolves against that root for each request, so
-/// it is never probed here.
+/// Only the TFTP root names a host directory. The boot filename and network boot
+/// root path are guest-facing values; the built-in server resolves only the boot
+/// filename against its host root, so neither value is probed here.
 ///
 /// This is a readiness check. Served files stay dynamic host resources, so a
 /// root that passes here may still disappear before it is used, and the built-in
@@ -169,6 +170,7 @@ fn network_configuration_dto(config: &NatConfig) -> NetworkConfiguration {
         dhcp_start: config.dhcp_start.to_string(),
         tftp_root: config.tftp_root.clone().unwrap_or_default(),
         bootfile: config.bootfile.clone().unwrap_or_default(),
+        root_path: config.root_path.clone().unwrap_or_default(),
         forwards: config
             .forwards
             .iter()
@@ -347,24 +349,30 @@ mod tests {
         let defaults = network_configuration_dto(&NatConfig::default());
         assert_eq!(defaults.tftp_root, "");
         assert_eq!(defaults.bootfile, "");
+        assert_eq!(defaults.root_path, "");
 
         let mut dto = defaults;
         dto.tftp_root = String::from("/srv/sgi ");
         dto.bootfile = String::from("stand/sa");
+        dto.root_path = String::from("server:/export/sgi ");
         let config = parse_network_configuration(&dto).unwrap();
         assert_eq!(config.tftp_root.as_deref(), Some("/srv/sgi "));
         assert_eq!(config.bootfile.as_deref(), Some("stand/sa"));
+        assert_eq!(config.root_path.as_deref(), Some("server:/export/sgi "));
         let restored = network_configuration_dto(&config);
         assert_eq!(restored.tftp_root, "/srv/sgi ");
         assert_eq!(restored.bootfile, "stand/sa");
+        assert_eq!(restored.root_path, "server:/export/sgi ");
         assert_eq!(parse_network_configuration(&restored).unwrap(), config);
 
         let mut cleared = dto;
         cleared.tftp_root = String::new();
         cleared.bootfile = String::from("   ");
+        cleared.root_path = String::new();
         let config = parse_network_configuration(&cleared).unwrap();
         assert_eq!(config.tftp_root, None);
         assert_eq!(config.bootfile.as_deref(), Some("   "));
+        assert_eq!(config.root_path, None);
         assert_eq!(network_configuration_dto(&config).tftp_root, "");
     }
 
@@ -373,10 +381,12 @@ mod tests {
         let serialized = toml::to_string(&ApplicationConfig::default()).unwrap();
         assert!(!serialized.contains("tftp_root"));
         assert!(!serialized.contains("bootfile"));
+        assert!(!serialized.contains("root_path"));
         // Without the optional keys this text is exactly an older configuration.
         let restored: ApplicationConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(restored.network.tftp_root, None);
         assert_eq!(restored.network.bootfile, None);
+        assert_eq!(restored.network.root_path, None);
     }
 
     #[test]
@@ -384,14 +394,20 @@ mod tests {
         let mut config = ApplicationConfig::default();
         config.network.tftp_root = Some(String::from("/srv/sgi"));
         config.network.bootfile = Some(String::from("stand/sa"));
+        config.network.root_path = Some(String::from("server:/export/sgi"));
 
         let serialized = toml::to_string(&config).unwrap();
         assert!(serialized.contains("tftp_root = \"/srv/sgi\""));
         assert!(serialized.contains("bootfile = \"stand/sa\""));
+        assert!(serialized.contains("root_path = \"server:/export/sgi\""));
         let restored: ApplicationConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(restored.network, config.network);
         assert_eq!(restored.network_configuration().tftp_root, "/srv/sgi");
         assert_eq!(restored.network_configuration().bootfile, "stand/sa");
+        assert_eq!(
+            restored.network_configuration().root_path,
+            "server:/export/sgi"
+        );
     }
 
     #[test]
@@ -406,6 +422,12 @@ mod tests {
         assert_eq!(
             parse_network_configuration(&dto).unwrap_err(),
             "Boot filename must not contain NUL bytes"
+        );
+        dto.bootfile = String::new();
+        dto.root_path = "b".repeat(256);
+        assert_eq!(
+            parse_network_configuration(&dto).unwrap_err(),
+            "Network boot root path must be at most 255 bytes"
         );
     }
 

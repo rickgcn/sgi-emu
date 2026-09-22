@@ -1,5 +1,6 @@
 #include "slirp_bridge.h"
 #include "libslirp.h"
+#include "slirp.h"
 #include <glib.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -39,6 +40,7 @@ struct SeSlirp {
     size_t poll_count;
     size_t poll_capacity;
     SeTimer *timers;
+    char *root_path;
     int failed;
     int notified;
 };
@@ -91,6 +93,11 @@ static void timer_mod(void *value, int64_t deadline, void *opaque) {
 static void notify(void *opaque) { ((SeSlirp *)opaque)->notified = 1; }
 static void register_socket(slirp_os_socket socket, void *opaque) { (void)socket; (void)opaque; }
 
+const char *se_slirp_root_path(const Slirp *slirp) {
+    const SeSlirp *session = slirp->opaque;
+    return session->root_path;
+}
+
 static int add_poll(slirp_os_socket socket, int events, void *opaque) {
     SeSlirp *session = opaque;
     if (session->poll_count == session->poll_capacity) {
@@ -129,6 +136,7 @@ SeSlirp *se_slirp_create(const SeSlirpConfig *config, uintptr_t wake_socket,
     session->packet = packet;
     session->opaque = opaque;
     session->wake_socket = (slirp_os_socket)wake_socket;
+    session->root_path = g_strdup(config->root_path);
     session->callbacks.send_packet = send_packet;
     session->callbacks.guest_error = guest_error;
     session->callbacks.clock_get_ns = clock_ns;
@@ -164,6 +172,7 @@ void se_slirp_destroy(SeSlirp *session) {
     if (!session) return;
     if (session->slirp) slirp_cleanup(session->slirp);
     while (session->timers) timer_free(session->timers, session);
+    g_free(session->root_path);
     free(session->pollfds);
     free(session);
 }

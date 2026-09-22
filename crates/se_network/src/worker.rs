@@ -28,10 +28,11 @@ pub(crate) fn run(
     ready: SyncSender<Result<(), String>>,
 ) -> io::Result<()> {
     let subnet = config.validate().map_err(io::Error::other)?;
-    // libslirp duplicates both settings while creating the session, so these
+    // The native session duplicates these settings while it is created, so the
     // strings only have to outlive the call below.
     let tftp_root = c_string(config.tftp_root.as_deref())?;
     let bootfile = c_string(config.bootfile.as_deref())?;
+    let root_path = c_string(config.root_path.as_deref())?;
     let config_native = ffi::Config {
         network: u32::from(subnet.network()),
         mask: u32::from(subnet.mask()),
@@ -42,6 +43,9 @@ pub(crate) fn run(
             .as_ref()
             .map_or(ptr::null(), |value| value.as_ptr()),
         bootfile: bootfile
+            .as_ref()
+            .map_or(ptr::null(), |value| value.as_ptr()),
+        root_path: root_path
             .as_ref()
             .map_or(ptr::null(), |value| value.as_ptr()),
     };

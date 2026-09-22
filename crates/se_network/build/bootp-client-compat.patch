@@ -1,5 +1,8 @@
 --- a/3rdparty/libslirp/src/bootp.c
 +++ b/3rdparty/libslirp/src/bootp.c
+@@ -25 +25,2 @@
+ #include "slirp.h"
++#include "slirp_bridge.h"
 @@ -33,6 +33,7 @@
  /* XXX: only DHCP is supported */
  
@@ -40,6 +43,22 @@
          }
  
          *q++ = RFC2132_SRV_ID;
+@@ -322 +333,14 @@
++        const char *root_path = se_slirp_root_path(slirp);
++        if (root_path) {
++            val = strlen(root_path);
++            if (q + val + 2 >= end) {
++                g_warning("DHCP packet size exceeded, "
++                          "omitting root path option.");
++            } else {
++                *q++ = RFC1533_ROOTPATH;
++                *q++ = val;
++                memcpy(q, root_path, val);
++                q += val;
++            }
++        }
++
+         if (slirp->tftp_server_name) {
 @@ -399,6 +410,10 @@
      assert(q < end);
      *q++ = RFC1533_END;

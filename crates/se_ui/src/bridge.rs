@@ -274,6 +274,8 @@ pub mod ffi {
         pub tftp_root: String,
         /// Boot filename advertised in BOOTP replies; empty leaves it unset.
         pub bootfile: String,
+        /// Root path advertised through DHCP option 17; empty leaves it unset.
+        pub root_path: String,
         pub forwards: Vec<NetworkForwardRule>,
     }
 

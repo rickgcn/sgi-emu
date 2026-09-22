@@ -91,7 +91,8 @@ void clear_diagnostic_layout(QVBoxLayout* layout) {
 NetworkSettings from_network_configuration(const NetworkConfiguration& configuration) {
     NetworkSettings result { from_rust(configuration.subnet), from_rust(configuration.gateway),
         from_rust(configuration.dns), from_rust(configuration.dhcp_start),
-        from_rust(configuration.tftp_root), from_rust(configuration.bootfile), {} };
+        from_rust(configuration.tftp_root), from_rust(configuration.bootfile),
+        from_rust(configuration.root_path), {} };
     for (const auto& rule : configuration.forwards) {
         result.forwards.append({from_rust(rule.protocol), from_rust(rule.host_address),
             from_rust(rule.host_port), from_rust(rule.guest_address), from_rust(rule.guest_port)});
@@ -102,7 +103,7 @@ NetworkSettings from_network_configuration(const NetworkConfiguration& configura
 NetworkConfiguration to_network_configuration(const NetworkSettings& settings) {
     NetworkConfiguration result {to_rust(settings.subnet), to_rust(settings.gateway),
         to_rust(settings.dns), to_rust(settings.dhcp_start), to_rust(settings.tftp_root),
-        to_rust(settings.bootfile), {}};
+        to_rust(settings.bootfile), to_rust(settings.root_path), {}};
     for (const auto& rule : settings.forwards) {
         result.forwards.push_back({to_rust(rule.protocol), to_rust(rule.host_address),
             to_rust(rule.host_port), to_rust(rule.guest_address), to_rust(rule.guest_port)});
@@ -135,6 +136,7 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     , dhcp_start_edit_(new QLineEdit(settings.dhcp_start, this))
     , tftp_root_edit_(new QLineEdit(settings.tftp_root, this))
     , bootfile_edit_(new QLineEdit(settings.bootfile, this))
+    , root_path_edit_(new QLineEdit(settings.root_path, this))
     , forwards_table_(new QTableWidget(0, 5, this))
     , network_status_(new QLabel(this))
     , reset_notice_(new QLabel(QStringLiteral("Applying changes resets the emulated machine."), this))
@@ -221,6 +223,9 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     bootfile_edit_->setToolTip(
         QStringLiteral("Optional BOOTP file name override, e.g. stand/sa."));
     network_form->addRow(QStringLiteral("BOOTP boot filename"), bootfile_edit_);
+    root_path_edit_->setToolTip(
+        QStringLiteral("Optional root path advertised through DHCP option 17."));
+    network_form->addRow(QStringLiteral("Network boot root path"), root_path_edit_);
     connect(tftp_browse, &QToolButton::clicked, this, &SettingsDialog::browse_tftp_root);
     network_layout->addLayout(network_form);
     network_status_->setWordWrap(true);
@@ -283,6 +288,7 @@ SettingsDialog::SettingsDialog(const UiSession& session, const NetworkSettings& 
     connect(dhcp_start_edit_, &QLineEdit::textEdited, this, handle_network_edit);
     connect(tftp_root_edit_, &QLineEdit::textEdited, this, handle_network_edit);
     connect(bootfile_edit_, &QLineEdit::textEdited, this, handle_network_edit);
+    connect(root_path_edit_, &QLineEdit::textEdited, this, handle_network_edit);
     connect(forwards_table_, &QTableWidget::itemChanged, this,
         [this](QTableWidgetItem*) { handle_network_changed(); });
     auto* root = new QVBoxLayout(this);
@@ -306,7 +312,8 @@ SettingsDialog::~SettingsDialog() = default;
 
 NetworkSettings SettingsDialog::settings() const {
     NetworkSettings network {subnet_edit_->text(), gateway_edit_->text(), dns_edit_->text(),
-        dhcp_start_edit_->text(), tftp_root_edit_->text(), bootfile_edit_->text(), {}};
+        dhcp_start_edit_->text(), tftp_root_edit_->text(), bootfile_edit_->text(),
+        root_path_edit_->text(), {}};
     for (int row = 0; row < forwards_table_->rowCount(); ++row) {
         const auto* protocol = qobject_cast<QComboBox*>(forwards_table_->cellWidget(row, 0));
         network.forwards.append({protocol->currentData().toString(), forwards_table_->item(row, 1)->text(),

@@ -1274,6 +1274,7 @@ mod tests {
             dhcp_start: String::new(),
             tftp_root: String::new(),
             bootfile: String::new(),
+            root_path: String::new(),
             forwards: Vec::new(),
         }
     }

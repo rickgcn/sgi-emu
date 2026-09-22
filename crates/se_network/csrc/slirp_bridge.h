@@ -17,7 +17,12 @@ typedef struct SeSlirpConfig {
     const char *tftp_root;
     /* BOOTP boot filename override; NULL permits a legacy request fallback */
     const char *bootfile;
+    /* DHCP option 17 value; NULL omits the option */
+    const char *root_path;
 } SeSlirpConfig;
+
+struct Slirp;
+const char *se_slirp_root_path(const struct Slirp *slirp);
 
 SeSlirp *se_slirp_create(const SeSlirpConfig *config, uintptr_t wake_socket,
                         SePacketCallback packet, void *opaque);

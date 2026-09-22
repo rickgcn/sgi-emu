@@ -52,11 +52,14 @@ struct NetworkSettings {
     QString tftp_root;
     /// Boot filename advertised in BOOTP replies; empty leaves it unset.
     QString bootfile;
+    /// Root path advertised through DHCP option 17; empty leaves it unset.
+    QString root_path;
     QVector<ForwardSettings> forwards;
     bool operator==(const NetworkSettings& other) const {
         return subnet == other.subnet && gateway == other.gateway && dns == other.dns
             && dhcp_start == other.dhcp_start && tftp_root == other.tftp_root
-            && bootfile == other.bootfile && forwards == other.forwards;
+            && bootfile == other.bootfile && root_path == other.root_path
+            && forwards == other.forwards;
     }
 };
 
@@ -166,6 +169,7 @@ private:
     QLineEdit* dhcp_start_edit_;
     QLineEdit* tftp_root_edit_;
     QLineEdit* bootfile_edit_;
+    QLineEdit* root_path_edit_;
     QTableWidget* forwards_table_;
     QLabel* network_status_;
     QLabel* reset_notice_;

@@ -12,6 +12,9 @@ pub const DHCP_CLIENTS: u32 = 16;
 /// Size of the BOOTP reply filename field in libslirp 4.9.4.
 const BOOTP_FILE_BYTES: usize = 128;
 
+/// Maximum payload size of one DHCP option.
+const DHCP_OPTION_BYTES: usize = 255;
+
 /// An IPv4 network with a canonical network address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ipv4Subnet {
@@ -119,6 +122,9 @@ pub struct NatConfig {
     /// TFTP root by naming it in the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bootfile: Option<String>,
+    /// Root path advertised to network boot clients through DHCP option 17.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<String>,
 }
 
 impl Default for NatConfig {
@@ -131,6 +137,7 @@ impl Default for NatConfig {
             forwards: Vec::new(),
             tftp_root: None,
             bootfile: None,
+            root_path: None,
         }
     }
 }
@@ -218,6 +225,16 @@ impl NatConfig {
                 )));
             }
         }
+        if let Some(root_path) = &self.root_path {
+            if root_path.contains('\0') {
+                return Err(error("Network boot root path must not contain NUL bytes"));
+            }
+            if root_path.len() > DHCP_OPTION_BYTES {
+                return Err(error(format!(
+                    "Network boot root path must be at most {DHCP_OPTION_BYTES} bytes"
+                )));
+            }
+        }
         Ok(subnet)
     }
 }
@@ -269,10 +286,11 @@ mod tests {
         assert!(config.validate().is_ok());
     }
     #[test]
-    fn network_boot_defaults_expose_no_host_directory_or_bootfile() {
+    fn network_boot_defaults_leave_all_settings_absent() {
         let config = NatConfig::default();
         assert_eq!(config.tftp_root, None);
         assert_eq!(config.bootfile, None);
+        assert_eq!(config.root_path, None);
         assert!(config.validate().is_ok());
     }
     #[test]
@@ -303,6 +321,10 @@ mod tests {
             tftp_root: Some(root.into()),
             ..NatConfig::default()
         };
+        let with_boot_root = |root_path: &str| NatConfig {
+            root_path: Some(root_path.into()),
+            ..NatConfig::default()
+        };
         assert_eq!(
             with_bootfile("stand\0sa")
                 .validate()
@@ -318,6 +340,32 @@ mod tests {
             with_root("").validate().unwrap_err().to_string(),
             "TFTP root must not be empty"
         );
+        assert_eq!(
+            with_boot_root("/srv\0sgi")
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "Network boot root path must not contain NUL bytes"
+        );
         assert!(with_root("/srv/tftp").validate().is_ok());
+    }
+
+    #[test]
+    fn network_boot_root_path_is_limited_to_one_dhcp_option() {
+        let validate = |root_path: String| {
+            NatConfig {
+                root_path: Some(root_path),
+                ..NatConfig::default()
+            }
+            .validate()
+            .map_err(|error| error.to_string())
+        };
+        assert!(validate("b".repeat(DHCP_OPTION_BYTES)).is_ok());
+        assert_eq!(
+            validate("b".repeat(DHCP_OPTION_BYTES + 1)).unwrap_err(),
+            "Network boot root path must be at most 255 bytes"
+        );
+        assert!(validate("é".repeat(DHCP_OPTION_BYTES / 2)).is_ok());
+        assert!(validate("é".repeat(DHCP_OPTION_BYTES / 2 + 1)).is_err());
     }
 }

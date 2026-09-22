@@ -643,6 +643,7 @@ mod tests {
             forwards: Vec::new(),
             tftp_root: None,
             bootfile: None,
+            root_path: None,
         }
     }
 
@@ -741,6 +742,31 @@ mod tests {
         });
         assert_eq!(&reply[150..158], b"stand/sa");
         assert!(reply[158..278].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn native_dhcp_reply_carries_the_configured_root_path() {
+        let config = NatConfig {
+            root_path: Some("/srv/sgi/root".into()),
+            ..NatConfig::default()
+        };
+        let session = NetworkSession::start(config, |_| {}).unwrap();
+        let request = bootp_request(
+            0x1234_5678,
+            MAC,
+            0,
+            None,
+            &[99, 130, 83, 99, 53, 1, 1, 55, 1, 17, 255],
+        );
+        assert!(session.try_send_frame(&request));
+        let reply = receive(&session, |frame| {
+            frame.len() > 282 && frame[23] == 17 && frame[42] == 2
+        });
+        assert!(
+            reply[282..]
+                .windows(15)
+                .any(|option| option == b"\x11\x0d/srv/sgi/root")
+        );
     }
 
     #[test]
