@@ -27,6 +27,7 @@ use self::{
 
 const MINIMUM_CACHE_BYTES: usize = 4 * 1024;
 const MAXIMUM_CACHE_BYTES: usize = 256 * 1024;
+const DECODE_CACHE_ENTRIES: usize = 1 << 16;
 
 #[cfg(test)]
 const TEST_CONFIG: R3000Config =
@@ -204,6 +205,7 @@ pub struct R3000 {
     state: State,
     cp0_condition: bool,
     frequency_hz: u64,
+    decoded_words: Box<[Option<(u64, u32, DecodeResult)>]>,
 }
 
 /// Complete restorable execution state of an R3000 and its attached R3010.
@@ -231,6 +233,7 @@ impl R3000 {
             state: State::new(config),
             cp0_condition: false,
             frequency_hz: config.frequency_hz(),
+            decoded_words: vec![None; DECODE_CACHE_ENTRIES].into_boxed_slice(),
         }
     }
 
@@ -372,7 +375,22 @@ impl R3000 {
             return Ok(());
         }
 
-        let instruction = match decode(word) {
+        let address = translation.address.get();
+        let index = ((address >> 2) as usize) & (DECODE_CACHE_ENTRIES - 1);
+        let slot = &mut self.decoded_words[index];
+        let decoded = match slot {
+            Some((cached_address, cached_word, cached))
+                if *cached_address == address && *cached_word == word =>
+            {
+                *cached
+            }
+            _ => {
+                let decoded = decode(word);
+                *slot = Some((address, word, decoded));
+                decoded
+            }
+        };
+        let instruction = match decoded {
             DecodeResult::Implemented(instruction) => instruction,
             DecodeResult::UnsupportedCoprocessor { unit } => {
                 if self.state.coprocessor_usable(unit) {
@@ -951,6 +969,45 @@ mod tests {
             })
         );
         assert!(hit_bus.read_addresses.is_empty());
+    }
+
+    #[test]
+    fn uncached_fetch_redecodes_changed_instruction_at_same_address() {
+        let mut processor = R3000::new(super::TEST_CONFIG);
+        enable_cp2(&mut processor);
+        let mut bus = TestBus::new(word_bytes(UNSUPPORTED_CP2_INSTRUCTION));
+
+        for (word, expected) in [
+            (
+                UNSUPPORTED_CP2_INSTRUCTION,
+                StepError::UnsupportedInstruction {
+                    pc: 0xbfc0_0000,
+                    instruction: UNSUPPORTED_CP2_INSTRUCTION,
+                },
+            ),
+            (
+                UNDEFINED_REGIMM_INSTRUCTION,
+                StepError::UndefinedInstruction {
+                    pc: 0xbfc0_0000,
+                    instruction: UNDEFINED_REGIMM_INSTRUCTION,
+                },
+            ),
+            (
+                UNSUPPORTED_CP2_INSTRUCTION,
+                StepError::UnsupportedInstruction {
+                    pc: 0xbfc0_0000,
+                    instruction: UNSUPPORTED_CP2_INSTRUCTION,
+                },
+            ),
+        ] {
+            bus.bytes = word_bytes(word);
+            assert_eq!(processor.step(&mut bus), Err(expected));
+        }
+
+        assert_eq!(
+            bus.read_addresses,
+            vec![PhysAddr::new(BOOT_PHYSICAL_ADDRESS); 3]
+        );
     }
 
     #[test]
